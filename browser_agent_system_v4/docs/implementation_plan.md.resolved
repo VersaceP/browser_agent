@@ -1,0 +1,236 @@
+# V4 多 Agent 系统完整落地实现计划
+
+> [!IMPORTANT]
+> 本计划的目标是将 V3 项目重构为 V4 架构，产出一套**可以在终端直接 `python main.py` 跑起来的完整代码**。浏览器实例部分使用 **CDP + Playwright** 进行模拟测试。
+
+---
+
+## 一、改造总览
+
+### 核心架构变化
+
+| 维度 | V3 (现状) | V4 (目标) |
+|------|-----------|-----------|
+| Agent 抽象 | `AsyncTeammate` 上帝对象 | `AgentDefinition` 数据 + `ExecutionLoop` 纯函数生成器 |
+| 状态管理 | 散落在 Teammate 成员变量 | `TeammateContext` 纯数据容器 |
+| 工具系统 | `ToolkitLoader` 函数反射 | `BaseTool` 契约基类 + `ToolRegistry` 池化路由 |
+| 消息通信 | `AsyncMessageBus` 全局广播 | Lead 直接 `await spawn()` 收集结果 |
+| 安全防御 | 仅 WorkTree 路径检查 | L1-L4 四层防御(Prompt隔离→熔断器→参数校验→浏览器隔离) |
+| 浏览器 | 无 | Playwright CDP 真实操作 |
+
+### 文件操作清单
+
+| 操作 | 文件 | 说明 |
+|------|------|------|
+| **保留增强** | `core/worktree.py` | 增加 `save_spilled_data()` 方法 |
+| **保留重构** | `core/llm_provider.py` | 移除对 `agent_config.ModelConfig` 依赖，自带 ModelConfig |
+| **重构包装** | `toolkits/file_tools.py` | 包装为 BaseTool 子类 |
+| **重命名重构** | `toolkits/portable_sandbox_tools.py` → `toolkits/code_tools.py` | 包装为 BaseTool 子类 |
+| **新增** | `core/__init__.py` | 包初始化 |
+| **新增** | `core/agent_definition.py` | Agent 人格数据定义 |
+| **新增** | `core/teammate_context.py` | 纯数据会话状态容器 |
+| **新增** | `core/execution_loop.py` | 核心驱动大循环 |
+| **新增** | `core/agent_spawner.py` | Agent 注册表与孵化 |
+| **新增** | `core/hook_registry.py` | 5 大生命周期 Hook |
+| **新增** | `core/context_compactor.py` | 两级上下文压缩 |
+| **新增** | `core/prompt_builder.py` | Prompt 安全装配 |
+| **新增** | `core/resource_manager.py` | 浏览器资源管理 |
+| **新增** | `permissions/__init__.py` | 包初始化 |
+| **新增** | `permissions/input_sanitizer.py` | L3 安全校验 |
+| **新增** | `permissions/denial_tracker.py` | L2 熔断器 |
+| **新增** | `toolkits/__init__.py` | 包初始化 |
+| **新增** | `toolkits/base_tool.py` | 工具契约基类 |
+| **新增** | `toolkits/tool_registry.py` | 全局工具池 |
+| **新增** | `toolkits/browser_tools.py` | Playwright CDP 浏览器工具 |
+| **新增** | `main.py` | 终端入口 |
+| **新增** | `requirements.txt` | 依赖清单 |
+| **废弃保留** | V3 旧文件 | 不删除，仅不再引用 |
+
+---
+
+## 二、分 Phase 实现步骤
+
+### Phase 1: 基础设施层（6 个文件）
+
+#### [NEW] `core/__init__.py`
+- 空文件，声明 Python 包
+
+#### [NEW] `core/agent_definition.py`
+- `TrustLevel` 枚举: `READONLY`, `WRITE`, `ADMIN`
+- `AgentDefinition` 数据类: agent_type, system_prompt, allowed_tools, disallowed_tools, trust_level, max_turns, is_read_only
+- `build_builtin_agents()` → 返回 4 个内建 Agent 定义 (Lead, Browser, Coding, Verification)
+
+#### [NEW] `core/teammate_context.py`
+- `TeammateContext` 数据类
+- 字段: agent_type, task, session_messages[], worktree_path, env_vars{}, token_usage, created_at
+- 方法: `append_message()`, `get_messages()`, `estimate_tokens()`, `to_summary()`
+
+#### [ENHANCE] `core/worktree.py`
+- 保留原有逻辑
+- 增加 `save_spilled_data(task_id, filename, content)` 方法用于落盘溢出
+
+#### [NEW] `permissions/__init__.py`
+- 空文件
+
+#### [NEW] `permissions/input_sanitizer.py`
+- `sanitize_path(path, worktree_root)` — 路径穿越防御
+- `sanitize_url(url)` — 协议白名单校验
+- `sanitize_shell_input(cmd)` — 危险字符拦截
+
+#### [NEW] `permissions/denial_tracker.py`
+- `DenialTracker` 类：连续 N 次权限拒绝后触发熔断
+- `record_denial()`, `record_approval()`, `is_circuit_broken()`
+
+---
+
+### Phase 2: 工具契约层（5 个文件）
+
+#### [NEW] `toolkits/__init__.py`
+- 空文件
+
+#### [NEW] `toolkits/base_tool.py`
+- `BaseTool(ABC)`: name, description, input_schema, is_destructive, max_result_chars, required_trust_level
+- `execute(**kwargs)` 抽象方法
+- `safe_execute(**kwargs)` 自动截断超限输出并落盘
+
+#### [NEW] `toolkits/browser_tools.py`
+- 基于 **Playwright CDP** 的 6 个浏览器工具:
+  - `NavigateTool`, `ClickElementTool`, `ExtractTextTool`, `ScreenshotTool`, `ScrollPageTool`, `FillFormTool`
+- 内部持有 `PlaywrightBrowserManager` 负责 CDP 连接生命周期
+
+#### [REFACTOR] `toolkits/file_tools.py`
+- 包装为 `WriteFileTool(BaseTool)` 和 `ReadFileTool(BaseTool)`
+
+#### [REFACTOR] `toolkits/code_tools.py` (从 portable_sandbox_tools.py 重构)
+- 包装为 `RunPythonTool(BaseTool)`
+- `required_trust_level = TrustLevel.ADMIN`
+
+#### [NEW] `toolkits/tool_registry.py`
+- `ToolRegistry`: register, filter_tools, get_schemas, dispatch
+
+---
+
+### Phase 3: 引擎与生命周期层（5 个文件）
+
+#### [NEW] `core/hook_registry.py`
+- `HookEvent` 枚举: SESSION_START, PRE_TOOL_EXECUTE, POST_TOOL_EXECUTE, PRE_COMPACT, PRE_TURN_COMPLETE
+- `HookResult`: action(allow/block/modify), reason, updated_payload
+- `HookRegistry`: register(), async emit()
+
+#### [NEW] `core/context_compactor.py`
+- 第一级: `truncate_and_spill()` — 即时截断落盘
+- 第二级: `compact_if_needed()` — Token 水位超 80% 触发 LLM 摘要压缩
+
+#### [NEW] `core/prompt_builder.py`
+- `build_system_prompt(agent_def)` — 静态区装配
+- `build_dynamic_context(context)` — 动态区标记
+
+#### [NEW] `core/execution_loop.py`
+- `execute_turn()` 异步生成器: 压缩检查 → Prompt 组装 → LLM 调用 → Hook 前置 → 工具执行 → Hook 后置 → 结果写回 → 结束判断
+
+#### [NEW] `core/resource_manager.py`
+- `ResourceManager`: acquire_browser() 启动 Playwright CDP, release_browser() 安全关闭
+
+---
+
+### Phase 4: Agent 调度层（2 个文件）
+
+#### [NEW] `core/agent_spawner.py`
+- `AgentSpawner`: register_builtin_agents(), async spawn() → 创建 Context → 过滤工具 → 执行 execution_loop → 收集结果
+
+#### [ENHANCE] `core/llm_provider.py`
+- 移除对 `agent_config.ModelConfig` 的依赖
+- 内建 `ModelConfig` 数据类
+- 保留 `AnthropicProvider`，完善 `OpenAIProvider` 骨架
+
+---
+
+### Phase 5: 入口与整合（2 个文件）
+
+#### [NEW] `main.py`
+- 初始化所有基础设施
+- 注册 4 个内建 Agent 和 Hook 处理器
+- 接受用户输入 → Lead Agent 解析 → 派生子 Agent → 完整协作流程
+- 安全回收所有资源
+
+#### [NEW] `requirements.txt`
+```
+anthropic>=0.40.0
+playwright>=1.48.0
+```
+
+---
+
+## 三、浏览器测试方案
+
+> [!IMPORTANT]
+> 使用 **Playwright + CDP** 进行模拟测试。后续切换到 ShadowPilot 只需修改 `resource_manager.py` 中的连接方式。
+
+```python
+# 测试模式（当前实现）
+browser = await playwright.chromium.launch(headless=True)
+page = await browser.new_page()
+
+# 生产模式（未来 ShadowPilot 切换）
+browser = await playwright.chromium.connect_over_cdp(ws_endpoint)
+page = browser.contexts[0].pages[0]
+```
+
+---
+
+## 四、最终目录结构
+
+```
+browser_agent_system_v3/
+├── main.py                         # 终端入口
+├── requirements.txt                # 依赖清单
+├── core/
+│   ├── __init__.py
+│   ├── agent_definition.py         # Agent 人格数据定义
+│   ├── teammate_context.py         # 纯数据会话状态容器
+│   ├── execution_loop.py           # 核心驱动大循环
+│   ├── agent_spawner.py            # Agent 注册表与孵化
+│   ├── hook_registry.py            # 5 大生命周期 Hook
+│   ├── context_compactor.py        # 两级上下文压缩
+│   ├── prompt_builder.py           # Prompt 安全装配
+│   ├── resource_manager.py         # 浏览器资源管理
+│   ├── llm_provider.py             # LLM 多厂商适配
+│   └── worktree.py                 # 物理隔离沙箱
+├── permissions/
+│   ├── __init__.py
+│   ├── input_sanitizer.py          # L3 安全校验
+│   └── denial_tracker.py           # L2 熔断器
+├── toolkits/
+│   ├── __init__.py
+│   ├── base_tool.py                # 工具契约基类
+│   ├── tool_registry.py            # 全局工具池
+│   ├── browser_tools.py            # Playwright CDP 浏览器工具
+│   ├── file_tools.py               # 文件读写工具
+│   └── code_tools.py               # Python 沙箱代码工具
+├── worktrees/                      # 运行时隔离目录
+└── docs/
+    ├── architecture_v4.md
+    └── implementation_plan_v4_merged.md
+```
+
+---
+
+## 五、验证计划
+
+### 自动化测试
+1. `python main.py` 正常启动，4 个 Agent 注册成功
+2. Browser Agent 能通过 Playwright 打开网页、提取文本
+3. 路径穿越、危险 URL 被 InputSanitizer 拦截
+4. 连续拒绝后 DenialTracker 触发熔断
+5. 超长输出触发第一级截断落盘
+6. pre_tool_execute 钩子拦截不安全操作
+7. 完整 4-Agent 协作流程输出正确结果
+
+---
+
+## Open Questions
+
+> [!IMPORTANT]
+> 1. **LLM 模型选择**: 默认使用 `claude-sonnet-4-20250514`。由于这是研究项目没有真实 API Key，`main.py` 入口将提供 **Mock LLM 模式**（不调真实 API，而是模拟 LLM 返回工具调用），确保代码能直接跑通。是否同意？
+> 2. **Playwright headless**: 测试时浏览器默认使用 headless 模式。是否需要 `headless=False` 以观察调试？
+> 3. **V3 旧文件处理**: 计划保留旧文件不删除（`teammate.py`, `message_bus.py` 等），仅不再在 V4 代码中引用。是否同意？

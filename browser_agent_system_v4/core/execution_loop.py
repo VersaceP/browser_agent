@@ -1,0 +1,240 @@
+"""
+execution_loop.py — 核心驱动大循环（纯函数异步生成器）
+
+V4 核心设计：执行引擎是无状态的纯函数生成器。
+所有 Agent 共享同一个 execute_turn()，行为差异完全由 AgentDefinition 驱动。
+
+执行流程（每个 Turn）：
+1. 压缩检查 → 是否触发第二级上下文压缩
+2. Prompt 组装 → build_system_prompt + 历史消息
+3. LLM 调用 → 获取文本回复和工具调用列表
+4. Hook: pre_tool_execute → 安全校验
+5. 工具执行 → ToolRegistry.dispatch()
+6. Hook: post_tool_execute → 日志记录
+7. 结果写回 → Context.append_message()
+8. 判断结束 → stop_reason != "tool_use" 则退出
+
+使用 AsyncGenerator 的 yield 机制向调用方实时报告事件。
+"""
+
+import asyncio
+import json
+from typing import Any, AsyncGenerator, Dict, List, Optional
+
+from core.agent_definition import AgentDefinition
+from core.teammate_context import TeammateContext
+from core.hook_registry import HookRegistry, HookEvent, HookAction
+from core.context_compactor import ContextCompactor
+from core.prompt_builder import build_system_prompt, build_dynamic_context
+from toolkits.tool_registry import ToolRegistry
+
+
+async def execute_turn(
+    context: TeammateContext,
+    tool_registry: ToolRegistry,
+    hook_registry: HookRegistry,
+    llm_provider: Any,
+    agent_def: AgentDefinition,
+    compactor: ContextCompactor,
+) -> AsyncGenerator[Dict[str, Any], None]:
+    """
+    核心驱动大循环 — 纯函数异步生成器。
+    
+    这是 V4 架构的心脏。它不持有任何状态，所有输入通过参数传入，
+    所有输出通过 yield 事件流式传递给调用方。
+    
+    :param context: 会话状态容器（纯数据）
+    :param tool_registry: 全局工具注册表
+    :param hook_registry: 生命周期 Hook 注册表  
+    :param llm_provider: LLM 提供方（BaseLLMProvider 实例）
+    :param agent_def: Agent 人格定义（决定行为差异）
+    :param compactor: 上下文压缩器
+    
+    :yields: 事件字典，格式为 {"event": str, ...附加数据}
+    """
+    # ── 0. 触发 SESSION_START Hook ──
+    session_payload = {
+        "agent_type": agent_def.agent_type,
+        "task": context.task,
+        "env_vars": context.env_vars,
+        "context": context,
+    }
+    session_result = await hook_registry.emit(HookEvent.SESSION_START, session_payload)
+    if session_result.action == HookAction.BLOCK:
+        yield {"event": "session_blocked", "reason": session_result.reason}
+        return
+
+    yield {"event": "turn_started", "agent": agent_def.agent_type, "task": context.task}
+
+    # ── 1. 组装 System Prompt ──
+    system_prompt = build_system_prompt(agent_def)
+
+    # ── 2. 如果是首条消息，注入任务描述 ──
+    if not context.session_messages:
+        task_message = build_dynamic_context(
+            task=context.task,
+            worktree_path=context.worktree_path,
+            env_vars=context.env_vars,
+        )
+        context.append_message("user", task_message)
+
+    # ── 3. 获取可用工具 Schema ──
+    available_tools = tool_registry.get_schemas(agent_def)
+
+    turns = 0
+    while turns < agent_def.max_turns:
+        turns += 1
+
+        yield {"event": "turn_loop", "turn": turns, "max_turns": agent_def.max_turns}
+
+        # ── 3.1 压缩检查 ──
+        if compactor.should_compact(context):
+            # 触发 PRE_COMPACT Hook
+            compact_payload = {"context": context, "turn": turns}
+            compact_result = await hook_registry.emit(HookEvent.PRE_COMPACT, compact_payload)
+            
+            if compact_result.action != HookAction.BLOCK:
+                compressed = await compactor.compact_if_needed(context)
+                if compressed:
+                    yield {"event": "context_compacted", "turn": turns}
+
+        # ── 3.2 LLM 调用 ──
+        try:
+            response_text, tool_calls, stop_reason = await llm_provider.generate_response(
+                system_prompt=system_prompt,
+                messages=context.get_messages(),
+                tools=available_tools if available_tools else [],
+            )
+        except Exception as e:
+            yield {"event": "llm_error", "error": str(e), "turn": turns}
+            # 注入错误消息到上下文，让 LLM 自行修正
+            context.append_message("user", f"[系统提示] LLM 调用出错: {e}。请调整策略重试。")
+            await asyncio.sleep(1)
+            continue
+
+        # ── 3.3 组装 assistant 消息写回上下文 ──
+        assistant_blocks = []
+        if response_text:
+            assistant_blocks.append({"type": "text", "text": response_text})
+        for tc in tool_calls:
+            assistant_blocks.append({
+                "type": "tool_use",
+                "id": tc["id"],
+                "name": tc["name"],
+                "input": tc["input"],
+            })
+
+        if assistant_blocks:
+            context.append_message("assistant", assistant_blocks)
+
+        # ── 3.4 如果没有工具调用，Agent 认为任务完成 ──
+        if stop_reason != "tool_use" or not tool_calls:
+            yield {
+                "event": "agent_response",
+                "text": response_text,
+                "turn": turns,
+            }
+            break
+
+        # ── 3.5 处理工具调用 ──
+        tool_results = []
+        for tc in tool_calls:
+            tool_name = tc["name"]
+            tool_input = tc["input"]
+            tool_id = tc["id"]
+
+            yield {
+                "event": "tool_call",
+                "tool": tool_name,
+                "input": tool_input,
+                "turn": turns,
+            }
+
+            # ── Hook: PRE_TOOL_EXECUTE ──
+            pre_payload = {
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+                "agent_type": agent_def.agent_type,
+                "worktree_path": context.worktree_path,
+            }
+            pre_result = await hook_registry.emit(HookEvent.PRE_TOOL_EXECUTE, pre_payload)
+
+            if pre_result.action == HookAction.BLOCK:
+                # 安全拦截，将拒绝原因作为工具结果返回
+                tool_result_str = f"[安全拦截] {pre_result.reason}"
+                yield {"event": "tool_blocked", "tool": tool_name, "reason": pre_result.reason}
+            else:
+                # 如果 Hook 修改了参数，使用修改后的
+                if pre_result.action == HookAction.MODIFY and pre_result.updated_payload:
+                    tool_input = pre_result.updated_payload.get("tool_input", tool_input)
+
+                # ── 执行工具 ──
+                tool_result_str = await tool_registry.dispatch(
+                    tool_name=tool_name,
+                    params=tool_input,
+                    agent_def=agent_def,
+                    worktree_path=context.worktree_path,
+                    task_id=context.worktree_path.split("/")[-1] if context.worktree_path else "",
+                )
+
+            yield {
+                "event": "tool_result",
+                "tool": tool_name,
+                "result_preview": tool_result_str[:200],
+                "turn": turns,
+            }
+
+            # ── Hook: POST_TOOL_EXECUTE ──
+            post_payload = {
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+                "tool_result": tool_result_str,
+                "agent_type": agent_def.agent_type,
+            }
+            await hook_registry.emit(HookEvent.POST_TOOL_EXECUTE, post_payload)
+
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": tool_id,
+                "content": tool_result_str,
+            })
+
+        # ── 3.6 将工具结果写回上下文 ──
+        if tool_results:
+            context.append_message("user", tool_results)
+
+    # ── 4. Turn 结束，触发 PRE_TURN_COMPLETE Hook ──
+    # 提取最终回复文本
+    final_text = ""
+    if context.session_messages:
+        last_msg = context.session_messages[-1]
+        if last_msg.get("role") == "assistant":
+            content = last_msg.get("content", "")
+            if isinstance(content, str):
+                final_text = content
+            elif isinstance(content, list):
+                texts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+                final_text = "\n".join(texts)
+
+    complete_payload = {
+        "agent_type": agent_def.agent_type,
+        "final_text": final_text,
+        "turns_used": turns,
+        "context": context,
+    }
+    complete_result = await hook_registry.emit(HookEvent.PRE_TURN_COMPLETE, complete_payload)
+
+    if complete_result.action == HookAction.BLOCK:
+        # Verification 拒绝，注入错误信息继续循环（但此处循环已结束）
+        yield {
+            "event": "verification_rejected",
+            "reason": complete_result.reason,
+            "turns_used": turns,
+        }
+    else:
+        yield {
+            "event": "turn_completed",
+            "result": final_text,
+            "turns_used": turns,
+            "agent": agent_def.agent_type,
+        }
