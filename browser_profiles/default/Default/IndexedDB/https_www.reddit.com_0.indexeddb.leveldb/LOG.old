@@ -1,7 +1,0 @@
-2026/04/07-21:28:25.660 13684 Reusing MANIFEST D:\agent_research\browser_profiles\default\Default\IndexedDB\https_www.reddit.com_0.indexeddb.leveldb/MANIFEST-000001
-2026/04/07-21:28:25.660 13684 Recovering log #3
-2026/04/07-21:28:25.660 13684 Reusing old log D:\agent_research\browser_profiles\default\Default\IndexedDB\https_www.reddit.com_0.indexeddb.leveldb/000003.log 
-2026/04/07-21:28:57.683 9ee4 Level-0 table #5: started
-2026/04/07-21:28:57.685 9ee4 Level-0 table #5: 1744 bytes OK
-2026/04/07-21:28:57.689 9ee4 Delete type=0 #3
-2026/04/07-21:28:57.689 9ee4 Manual compaction at level-0 from (begin) .. (end); will stop at (end)
