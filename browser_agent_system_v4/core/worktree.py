@@ -13,8 +13,14 @@ from pathlib import Path
 class WorkTreeManager:
     """管理针对不同任务/Agent 专属分配的文件级物理软隔离沙箱"""
 
-    def __init__(self, base_dir: str = "./worktrees"):
-        self.base_dir = Path(base_dir)
+    def __init__(self, base_dir: str = None):
+        if base_dir is None:
+            # 锁定在项目根目录（core 的上一级）下的 worktrees
+            project_root = Path(__file__).parent.parent.absolute()
+            self.base_dir = project_root / "worktrees"
+        else:
+            self.base_dir = Path(base_dir)
+            
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
     def get_or_create_worktree(self, task_id: str) -> Path:

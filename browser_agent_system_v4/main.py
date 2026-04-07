@@ -410,11 +410,13 @@ async def run_security_test():
 
 async def run_interactive(spawner: AgentSpawner):
     """交互模式：用户输入任务，Lead Agent 执行"""
-    print("\n" + "=" * 60)
     print("  🤖 V4 多 Agent 系统 - 交互模式")
     print("  输入任务描述，Lead Agent 将自动拆解并调度子 Agent 执行")
-    print("  输入 'quit' 或 'exit' 退出")
+    print("  输入 'quit' 或 'exit' 退出 | 输入 '/reset' 重置会话")
     print("=" * 60)
+
+    # 🚀 V4.1 升级：持久化 Lead Agent 上下文，支持多轮对话
+    active_lead_context = None
 
     while True:
         try:
@@ -423,14 +425,25 @@ async def run_interactive(spawner: AgentSpawner):
 
             if not task:
                 continue
-            if task.lower() in ("quit", "exit", "q"):
-                print("👋 再见!")
-                break
+            if task.lower() in ("/reset", "clear"):
+                active_lead_context = None
+                print("🧹 会话已重置，记忆已清空。")
+                continue
 
-            result = await spawner.spawn(
-                agent_type="lead",
-                task=task,
-            )
+            if active_lead_context:
+                result = await spawner.chat(
+                    context=active_lead_context,
+                    message=task,
+                )
+            else:
+                result = await spawner.spawn(
+                    agent_type="lead",
+                    task=task,
+                )
+
+            # 持久化上下文以便下轮对话使用
+            if result.get("success"):
+                active_lead_context = result.get("context")
 
             print("\n📊 执行结果:")
             print(json.dumps(result, ensure_ascii=False, indent=2, default=str))

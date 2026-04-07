@@ -63,7 +63,9 @@ class DPBrowserManager:
         co.set_proxy(proxy_server)
         
         # 2. 配置用户数据目录 (Session 隔离与指纹模拟)
-        profile_path = Path("./browser_profiles") / self.profile_id
+        # 锁定在项目根目录下的 browser_profiles
+        project_root = Path(__file__).parent.parent.absolute()
+        profile_path = project_root / "browser_profiles" / self.profile_id
         profile_path.mkdir(parents=True, exist_ok=True)
         co.set_user_data_path(str(profile_path.absolute()))
 

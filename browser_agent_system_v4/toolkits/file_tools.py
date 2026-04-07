@@ -109,9 +109,74 @@ class ReadFileTool(BaseTool):
             return f"[读取失败] {e}"
 
 
+class ListFilesTool(BaseTool):
+    """列出 WorkTree 沙箱内的文件列表"""
+
+    name = "list_files"
+    description = (
+        "列出你的 WorkTree 沙箱中指定目录下的文件和子目录。"
+        "如果不提供 path，则默认列出沙箱根目录。"
+    )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "要列出的目录路径（相对于 WorkTree 根目录，默认为 '.'）"
+            },
+            "recursive": {
+                "type": "boolean",
+                "description": "是否递归列出所有子目录。默认为 false"
+            }
+        },
+        "required": []
+    }
+    is_destructive = False
+    max_result_chars = 3000
+    required_trust_level = TrustLevel.READONLY
+
+    async def execute(self, path: str = ".", recursive: bool = False,
+                      _worktree_path: str = "", **kwargs) -> str:
+        if not _worktree_path:
+            return "[安全错误] 未检测到 WorkTree 路径"
+
+        worktree = Path(_worktree_path)
+        target_dir = (worktree / path).resolve()
+
+        # 路径穿越防御
+        if not str(target_dir).startswith(str(worktree.resolve())):
+            return f"[安全拦截] 禁止访问沙箱外: {path}"
+
+        if not target_dir.exists():
+            return f"[列表失败] 目录不存在: {path}"
+
+        try:
+            items = []
+            pattern = "**/*" if recursive else "*"
+            for p in target_dir.glob(pattern):
+                rel = p.relative_to(worktree)
+                type_str = "[DIR]" if p.is_dir() else "[FILE]"
+                items.append(f"{type_str} {rel}")
+
+            if not items:
+                return f"[列表成功] 目录 '{path}' 是空的"
+
+            items.sort()
+            content = "\n".join(items)
+            return (
+                f"[列表成功] 目录: {path}\n"
+                f"---文件列表---\n"
+                f"{content}\n"
+                f"---列表结束---"
+            )
+        except Exception as e:
+            return f"[列表失败] {e}"
+
+
 def get_all_file_tools() -> list[BaseTool]:
     """获取所有文件工具实例的列表"""
     return [
         WriteFileTool(),
         ReadFileTool(),
+        ListFilesTool(),
     ]

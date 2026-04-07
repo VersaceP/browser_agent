@@ -181,6 +181,58 @@ class AgentSpawner:
             f"(任务摘要: {task[:50]}...)"
         )
 
+        return await self._drive_execution(context, agent_def)
+
+    async def chat(
+        self,
+        context: TeammateContext,
+        message: str,
+    ) -> Dict[str, Any]:
+        """
+        在已有会话上下文的基础上继续对话。
+        
+        :param context: 已有的 TeammateContext 实例
+        :param message: 用户的新指令/增量任务
+        :return: 执行结果摘要字典
+        """
+        agent_def = self._agent_defs.get(context.agent_type)
+        if not agent_def:
+            return {"success": False, "error": f"未找到 Agent 定义: {context.agent_type}"}
+
+        print(f"\n[AgentSpawner] 💬 继续 {context.agent_type.upper()} 会话 (新指令: {message[:50]}...)")
+        
+        # 将新指令作为 user 消息追加到上下文
+        context.append_message("user", message)
+        
+        return await self._drive_execution(context, agent_def)
+
+    async def _drive_execution(
+        self,
+        context: TeammateContext,
+        agent_def: AgentDefinition,
+    ) -> Dict[str, Any]:
+        """
+        驱动执行引擎完成一轮或多轮 Tool-Use 循环。
+        """
+        agent_type = agent_def.agent_type
+        worktree_path = context.worktree_path
+
+        # ✨ V4.1 优化：注入当前工作区文件列表快照，减少 Agent 盲目探索
+        try:
+            items = []
+            wt_path = pathlib.Path(worktree_path)
+            if wt_path.exists():
+                for p in wt_path.glob("*"):
+                    items.append(f"{'[DIR]' if p.is_dir() else '[FILE]'} {p.name}")
+            
+            if items:
+                snapshot = "\n".join(items)
+                env_hint = f"\n[System Hint] Current WorkTree File Snapshot:\n{snapshot}\n"
+                # 注入到最新的一条 user 消息中，或者作为新消息
+                context.append_message("user", env_hint)
+        except Exception as e:
+            print(f"  [{agent_type}] ⚠️ 环境快照注入失败: {e}")
+
         # 4. 执行引擎驱动
         events = []
         final_result = ""
@@ -231,6 +283,7 @@ class AgentSpawner:
         summary["success"] = True
         summary["events_count"] = len(events)
         summary["worktree_path"] = str(worktree_path)
+        summary["context"] = context  # 返回 context 引用，方便调用方持久化
 
         print(f"[AgentSpawner] ✅ {agent_type.upper()} Agent 完成 (共 {len(events)} 事件)")
 
