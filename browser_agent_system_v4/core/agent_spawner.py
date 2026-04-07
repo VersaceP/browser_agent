@@ -9,6 +9,8 @@ Lead Agent 通过 spawn_agent 工具调用此模块来派生子 Agent。
 递归防护：Verification Agent 禁止再 spawn。
 """
 
+import os
+import pathlib
 import time
 import asyncio
 from typing import Any, AsyncGenerator, Dict, List, Optional
@@ -149,6 +151,24 @@ class AgentSpawner:
         task_id = f"{agent_type}_{int(time.time())}_{self._spawn_count}"
         worktree_path = self.worktree_manager.get_or_create_worktree(task_id)
 
+        # ✨ V4.1 优化：如果任务内容过大，自动溢出到物理文件以防止 504 超时
+        PAYLOAD_THRESHOLD = 10_000
+        original_task = task
+        if len(task) > PAYLOAD_THRESHOLD:
+            payload_file = pathlib.Path(worktree_path) / "input_payload.md"
+            try:
+                payload_file.write_text(task, encoding="utf-8")
+                # 重写任务，引导 Agent 去读文件
+                task = (
+                    f"⚠️ [NOTICE] Your task description and data are too large for the direct prompt.\n"
+                    f"They have been successfully saved to '{payload_file.name}' in your worktree.\n"
+                    f"PLEASE READ THAT FILE FIRST to get the complete task instructions and data.\n"
+                    f"\nTask Snippet (first 200 chars):\n{task[:200]}..."
+                )
+                print(f"  [{agent_type}] 📦 任务 Payload 过大 ({len(original_task)} 字符)，已溢出到: {payload_file.name}")
+            except Exception as e:
+                print(f"  [{agent_type}] ⚠️ 溢出文件保存失败: {e}")
+
         context = TeammateContext(
             agent_type=agent_type,
             task=task,
@@ -158,7 +178,7 @@ class AgentSpawner:
 
         print(
             f"\n[AgentSpawner] 🚀 孵化 {agent_type.upper()} Agent "
-            f"(任务: {task[:50]}...)"
+            f"(任务摘要: {task[:50]}...)"
         )
 
         # 4. 执行引擎驱动

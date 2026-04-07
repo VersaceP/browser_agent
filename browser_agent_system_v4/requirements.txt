@@ -1,3 +1,11 @@
-# V4 多 Agent 系统依赖清单
+# V4 多 Agent 系统核心依赖
 anthropic>=0.40.0
 DrissionPage>=4.0.0
+
+# 数据处理与 Excel 导出 (Coding Agent 必备)
+pandas>=2.0.0
+openpyxl>=3.1.0
+
+# 辅助工具
+beautifulsoup4>=4.12.0
+python-dotenv>=1.0.0

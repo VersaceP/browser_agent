@@ -34,7 +34,8 @@ class DPBrowserManager:
     - 安全关闭（确保无头/有头浏览器进程已被正确回收）
     """
 
-    def __init__(self):
+    def __init__(self, profile_id: str = "default"):
+        self.profile_id = profile_id
         self._page = None
         self._lock = asyncio.Lock()
 
@@ -49,20 +50,31 @@ class DPBrowserManager:
             return self._page
 
     def _launch(self) -> None:
-        """启动 DrissionPage 浏览器实例"""
+        """启动 DrissionPage 浏览器实例 (带增强指纹与代理)"""
         try:
             from DrissionPage import ChromiumPage, ChromiumOptions
         except ImportError:
             raise ImportError("未安装 DrissionPage，请执行 pip install DrissionPage")
 
         co = ChromiumOptions()
-        # 用户指定：默认仅使用有头模式（Headed），方便开发与调试
-        co.headless(False)  
-        # 禁止图片和静音等以提速
+        
+        # 1. 配置代理 (Clash/VPN 端口)
+        proxy_server = "http://127.0.0.1:7890"
+        co.set_proxy(proxy_server)
+        
+        # 2. 配置用户数据目录 (Session 隔离与指纹模拟)
+        profile_path = Path("./browser_profiles") / self.profile_id
+        profile_path.mkdir(parents=True, exist_ok=True)
+        co.set_user_data_path(str(profile_path.absolute()))
+
+        # 3. 常规风控优化
+        co.headless(False)  # 有头模式对 Reddit 等网站更友好
         co.mute(True)
+        co.set_argument('--no-sandbox')
+        co.set_argument('--disable-gpu')
 
         self._page = ChromiumPage(co)
-        print("[BrowserManager] 🥷 DrissionPage (有头风控接管模式) 已启动")
+        print(f"[BrowserManager] 🥷 浏览器扩展模式启动 | 代理: {proxy_server} | Profile: {self.profile_id}")
 
     async def close(self) -> None:
         """安全关闭浏览器实例并回收资源"""

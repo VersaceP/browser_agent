@@ -13,7 +13,7 @@ from pathlib import Path
 class WorkTreeManager:
     """管理针对不同任务/Agent 专属分配的文件级物理软隔离沙箱"""
 
-    def __init__(self, base_dir: str = "d:/agent_research/browser_agent_system_v3/worktrees"):
+    def __init__(self, base_dir: str = "./worktrees"):
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
 

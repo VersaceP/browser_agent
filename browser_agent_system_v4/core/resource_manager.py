@@ -53,8 +53,8 @@ class ResourceManager:
                     print(f"[ResourceManager] ♻️ 复用已有浏览器实例: {profile_id}")
                     return manager
 
-            # 测试模式：使用全局单例
-            manager = get_browser_manager()
+            # 🚀 V4.1 升级：为每个 profile_id 创建独立的隔离管理器（及文件夹）
+            manager = DPBrowserManager(profile_id=profile_id)
             # 预热浏览器（确保已启动）
             await manager.get_page()
             self._browsers[profile_id] = manager
