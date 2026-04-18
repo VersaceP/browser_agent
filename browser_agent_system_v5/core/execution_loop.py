@@ -150,9 +150,14 @@ async def execute_turn(
     consecutive_errors = 0      # 连续 LLM 错误计数
     MAX_CONSECUTIVE_ERRORS = 3  # 连续错误阈值
     idle_turns = 0              # 连续无有效产出的轮次
-    MAX_IDLE_TURNS = 5          # 早停阈值：连续N轮无产出则自动终止
-    # 有产出的工具：写入文件、提取文本、执行代码（产出代码结果）
-    PRODUCTIVE_TOOLS = {"write_file", "extract_text", "run_python"}
+    MAX_IDLE_TURNS = 8          # 早停阈值：连续N轮无产出则自动终止（从5提高到8，给浏览器操作更多容错）
+    # 有产出的工具（本轮只要调用了其中任意一个，就不算 idle）：
+    # - 所有浏览器操作都是有效产出（navigate/click/screenshot/extract_text/scroll/fill_form/run_js）
+    # - 文件操作中的写入是产出（read_file/list_files 仅是读取，不算产出）
+    # - 代码执行是产出
+    # - Agent 编排操作是产出（spawn_agent/submit_plan/init_progress/update_progress）
+    # 不算产出的：wait_user（纯等待）、read_file（纯读取）、list_files（纯列举）
+    NON_PRODUCTIVE_TOOLS = {"wait_user", "read_file", "list_files"}
     while turns < agent_def.max_turns:
         turns += 1
 
@@ -206,7 +211,9 @@ async def execute_turn(
             unrecoverable_keywords = [
                 "api key", "unauthorized", "auth", "not found",
                 "401", "404", "model not found",
-                "invalid_request_error", "tool call result does not follow",
+                "invalid_request_error",
+                # 注意："tool call result does not follow" 已从不可恢复列表移除
+                # 该错误由消息格式问题导致，配合消息修复器可自动恢复
             ]
             if any(k in error_str for k in unrecoverable_keywords):
                 break
@@ -334,14 +341,29 @@ async def execute_turn(
                 "content": tool_result_str,
             }])
 
+            # ── 延迟注入：Hook 产生的额外消息在 tool_result 之后注入 ──
+            # 这确保 tool_result 紧跟 assistant 的 tool_use，不破坏 Anthropic 消息交替约束
+            inject_content = (post_result.updated_payload or {}).get("inject_after_tool_result")
+            if inject_content:
+                context.append_message("user", inject_content)
+
             # ── 早停检测：标记本轮是否有产出工具 ──
-            if tool_name in PRODUCTIVE_TOOLS:
+            # 使用黑名单逻辑：不在 NON_PRODUCTIVE_TOOLS 中的工具都算有产出
+            if tool_name not in NON_PRODUCTIVE_TOOLS:
                 turn_has_productive_tool = True
 
-            # AUTO_COMPACT：RepetitionCompactor 已向 context 注入了压缩摘要，
-            # 这里删掉刚才追加的重复工具结果，让 LLM 只看到摘要即可继续
+            # AUTO_COMPACT：RepetitionCompactor 已将压缩摘要放入 updated_payload，
+            # 由上方延迟注入逻辑在 tool_result 之后写入。
+            # 这里删掉刚才追加的重复工具结果和紧随的摘要消息，让 LLM 重新开始
             if post_result.action == HookAction.AUTO_COMPACT:
                 yield {"event": "auto_compact", "tool": tool_name, "reason": post_result.reason, "turn": turns}
+                # 删除紧随 tool_result 注入的摘要消息（如果有的话）
+                if inject_content and context.session_messages and context.session_messages[-1]["role"] == "user":
+                    last = context.session_messages[-1]
+                    last_content = last.get("content", "")
+                    # 摘要消息的特征：content 为字符串且以 "[系统自动压缩]" 开头
+                    if isinstance(last_content, str) and last_content.startswith("[系统自动压缩]"):
+                        context.session_messages.pop()
                 # 删掉刚才 append 的那条重复工具结果
                 if context.session_messages and context.session_messages[-1]["role"] == "user":
                     last_content = context.session_messages[-1]["content"]
@@ -360,7 +382,7 @@ async def execute_turn(
             if idle_turns >= MAX_IDLE_TURNS:
                 yield {
                     "event": "early_stop",
-                    "reason": f"连续 {idle_turns} 轮无有效产出（未调用 {PRODUCTIVE_TOOLS} 中的工具），自动终止",
+                    "reason": f"连续 {idle_turns} 轮仅调用了非产出工具({NON_PRODUCTIVE_TOOLS})，自动终止",
                     "turns_used": turns,
                 }
                 break

@@ -826,7 +826,7 @@ async def main():
 
     try:
         llm_provider = LLMFactory.create_provider(config)
-        print(f"[LLM] ✅ 已连接 {args.provider} ({args.model})")
+        print(f"[LLM] ✅ 已连接 {config.provider} ({config.model_id})")
     except ValueError as e:
         print(f"[LLM] ❌ {e}")
         print("[提示] 请设置环境变量 ANTHROPIC_AUTH_TOKEN 和 ANTHROPIC_BASE_URL")

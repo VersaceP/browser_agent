@@ -137,15 +137,20 @@ class VisionAnalyzer:
         :return: 分析结果字典
         """
         try:
-            # 获取或创建事件循环
+            # 检查是否已在事件循环中
             try:
                 loop = asyncio.get_running_loop()
-                # 如果已经在事件循环中，创建任务
-                return asyncio.create_task(
-                    self.analyze_screenshot_async(image_path, query, find_element)
-                )
+                # 已在事件循环中，不能使用 asyncio.run()
+                # 使用新线程来运行异步方法，避免 create_task 返回 Task 对象的问题
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(
+                        asyncio.run,
+                        self.analyze_screenshot_async(image_path, query, find_element)
+                    )
+                    return future.result(timeout=120)
             except RuntimeError:
-                # 没有运行中的事件循环，创建新的
+                # 没有运行中的事件循环，直接创建新的
                 return asyncio.run(
                     self.analyze_screenshot_async(image_path, query, find_element)
                 )

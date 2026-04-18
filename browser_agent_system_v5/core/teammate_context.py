@@ -148,8 +148,60 @@ class TeammateContext:
         return "\n".join(lines)
 
     def get_messages(self) -> List[Dict[str, Any]]:
-        """获取完整的会话消息列表（Anthropic Messages API 格式）"""
-        return self.session_messages
+        """
+        获取完整的会话消息列表（Anthropic Messages API 格式）。
+        
+        内置消息格式修复器：确保所有 tool_use→tool_result 配对正确，
+        将意外插入在 tool_result 之前的纯文本 user 消息合并到 tool_result 消息中，
+        避免触发 Anthropic API 的 2013 错误。
+        
+        注意：此方法返回修复后的副本，不会修改原始 session_messages。
+        """
+        messages = self.session_messages
+        if not messages:
+            return list(messages)  # 返回副本，避免外部修改影响原始数据
+        
+        # 深拷贝消息列表，确保修复过程不修改原始数据
+        import copy
+        fixed = copy.deepcopy(messages)
+        
+        # 第二遍：修复 tool_use → tool_result 配对
+        repaired = []
+        i = 0
+        while i < len(fixed):
+            msg = fixed[i]
+            role = msg.get("role")
+            content = msg.get("content", "")
+            
+            # 检查：当前是 user 消息且包含 tool_result
+            if role == "user" and isinstance(content, list):
+                has_tool_result = any(
+                    isinstance(b, dict) and b.get("type") == "tool_result"
+                    for b in content
+                )
+                if has_tool_result and repaired and repaired[-1].get("role") == "user":
+                    # 前一条也是 user 消息（纯文本），违反交替规则
+                    # 将前一条合并到当前 tool_result 消息中
+                    prev = repaired.pop()
+                    prev_content = prev.get("content", "")
+                    if isinstance(prev_content, str) and prev_content:
+                        # 将纯文本作为 text block 合并到 content 数组开头
+                        merged_blocks = [{"type": "text", "text": prev_content}]
+                        merged_blocks.extend(content)
+                        repaired.append({"role": "user", "content": merged_blocks})
+                    elif isinstance(prev_content, list) and prev_content:
+                        merged_blocks = list(prev_content) + list(content)
+                        repaired.append({"role": "user", "content": merged_blocks})
+                    else:
+                        repaired.append(msg)
+                else:
+                    repaired.append(msg)
+            else:
+                repaired.append(msg)
+            
+            i += 1
+        
+        return repaired
 
     def estimate_tokens(self) -> int:
         """

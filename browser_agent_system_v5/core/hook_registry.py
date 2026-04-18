@@ -425,11 +425,13 @@ class RepetitionCompactor:
                 turn=payload.get("turn", 0),
             )
             if advice:
-                ctx = self.get_context()
-                if ctx is not None:
-                    ctx.append_message("user", advice)
-                # 不返回 AUTO_COMPACT，仅注入提醒后继续放行
-                # 这样成功的工具结果仍会正常写回上下文
+                # 不再直接注入 user 消息（会破坏 tool_use→tool_result 配对），
+                # 改为通过 updated_payload 传递给 execution_loop，
+                # 由其在 tool_result 写入后再注入（方案A：延迟注入）
+                return HookResult(
+                    action=HookAction.ALLOW,
+                    updated_payload={"inject_after_tool_result": advice},
+                )
 
             return HookResult(action=HookAction.ALLOW)
 
@@ -477,10 +479,10 @@ class RepetitionCompactor:
             f"建议：检查工具调用参数是否正确，或该操作在当前环境下不可行。"
         )
 
-        # 向上下文注入压缩摘要消息（如果能拿到 context）
-        ctx = self.get_context()
-        if ctx is not None:
-            ctx.append_message("user", summary)
+        # 向上下文注入压缩摘要消息——改为延迟注入
+        # 不再直接调用 ctx.append_message()（会破坏 tool_use→tool_result 配对），
+        # 改为通过 HookResult.updated_payload 传递给 execution_loop，
+        # 由其在 tool_result 写入后再注入（方案A：延迟注入）
 
         # 重置所有该工具相关的计数（压缩后重新开始计数）
         for k in list(self._failure_counts.keys()):
@@ -494,4 +496,5 @@ class RepetitionCompactor:
         return HookResult(
             action=HookAction.AUTO_COMPACT,
             reason=f"连续失败 {total_count} 次，触发自动压缩",
+            updated_payload={"inject_after_tool_result": summary},
         )

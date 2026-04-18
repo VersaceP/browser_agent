@@ -152,7 +152,20 @@ class DPBrowserManager:
     async def get_page(self) -> Any:
         async with self._lock:
             if self._page is None:
-                await asyncio.to_thread(self._launch)
+                try:
+                    # 浏览器启动添加超时保护（60秒），避免卡死
+                    await asyncio.wait_for(
+                        asyncio.to_thread(self._launch),
+                        timeout=60.0,
+                    )
+                except asyncio.TimeoutError:
+                    print(f"[BrowserManager] ❌ 浏览器启动超时（60秒），可能代理不可用或进程冲突")
+                    raise RuntimeError(
+                        "浏览器启动超时，请检查：\n"
+                        "  1. 代理 127.0.0.1:7890 是否可用\n"
+                        "  2. 是否有残留的 Chrome 进程占用 profile\n"
+                        "  3. 手动关闭所有 Chrome 窗口后重试"
+                    )
             return self._page
 
     def _launch(self) -> None:
