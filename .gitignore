@@ -1,0 +1,6 @@
+# Ignore everything outside browser_agent_system_v5
+.kiro/
+learn_agent/
+unit_test/
+*.log
+__pycache__/
