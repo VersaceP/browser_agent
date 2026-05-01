@@ -18,7 +18,7 @@ from core.resource_manager import ResourceManager
 from core.skill_registry import SkillRegistry
 from core.agent_definition import AgentDefinition, build_builtin_agents
 from core.teammate_context import TeammateContext
-from core.execution_loop import execute_turn
+from core.execution_loop import execute_turn, evaluate_completion, extract_pending_goals
 from core.hook_registry import HookRegistry
 from core.context_compactor import ContextCompactor
 from core.worktree import WorkTreeManager
@@ -156,13 +156,57 @@ class AgentSpawner:
             env_vars=env_vars or {},
         )
 
+        # ── Browser Agent 技能注入 ──
+        # 在 append 第一条 user 消息之前完成技能选择和注入。
+        injected_skills_content = ""
+        if agent_type == "browser" and self.skill_registry:
+            from core.hook_registry import HookEvent, HookAction
+            from core.prompt_builder import format_skills
+
+            selected_skills = self.skill_registry.select_skills(context.task)
+            if selected_skills:
+                skill_payload = {
+                    "agent_type": agent_type,
+                    "session_id": session_id,
+                    "task": context.task,
+                    "selected_skills": selected_skills,
+                    "skill_names": [s.name for s in selected_skills],
+                }
+                skill_result = await self.hook_registry.emit(HookEvent.PRE_SKILL_INJECT, skill_payload)
+                if skill_result.action == HookAction.BLOCK:
+                    print(f"  [{agent_type}] ⚠️ 技能注入被阻止: {skill_result.reason}")
+                else:
+                    injected_skills_content = format_skills(selected_skills)
+                    estimated_tokens = sum(len(s.content) / 4 for s in selected_skills)
+                    await self.hook_registry.emit(HookEvent.POST_SKILL_INJECT, {
+                        "agent_type": agent_type,
+                        "session_id": session_id,
+                        "injected_skills": [s.name for s in selected_skills],
+                        "total_tokens": int(estimated_tokens),
+                    })
+                    print(
+                        f"  [{agent_type}] 🧠 注入 {len(selected_skills)} 个技能: "
+                        f"{[s.name for s in selected_skills]}（约 {int(estimated_tokens)} tokens）"
+                    )
+
         from core.prompt_builder import build_dynamic_context
         task_msg = build_dynamic_context(
             task=context.task,
             worktree_path=context.worktree_path,
             env_vars=context.env_vars,
+            skills=injected_skills_content,
         )
-        context.append_message("user", task_msg)
+        if injected_skills_content:
+            # 技能内容较大，加上 cache_control 让 Anthropic 缓存这块前缀
+            context.append_message("user", [
+                {
+                    "type": "text",
+                    "text": task_msg,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ])
+        else:
+            context.append_message("user", task_msg)
 
         print(
             f"\n[AgentSpawner] 🚀 孵化 {agent_type.upper()} Agent "
@@ -337,10 +381,6 @@ class AgentSpawner:
         agent_type = agent_def.agent_type
         worktree_path = context.worktree_path
 
-        # 注入当前 context，让 RepetitionCompactor 能注入压缩摘要
-        if self._repetition_compactor:
-            self._repetition_compactor.set_context(context)
-
         try:
             items = []
             wt_path = pathlib.Path(worktree_path)
@@ -368,6 +408,7 @@ class AgentSpawner:
         events = []
         final_result = ""
         needs_verification = False
+        has_fatal_error = False  # 追踪致命错误（LLM 熔断/不可恢复/早停）
 
         try:
             async for event in execute_turn(
@@ -377,7 +418,6 @@ class AgentSpawner:
                 llm_provider=self.llm_provider,
                 agent_def=agent_def,
                 compactor=self.compactor,
-                skill_registry=self.skill_registry,
             ):
                 events.append(event)
                 event_type = event.get("event", "")
@@ -401,6 +441,11 @@ class AgentSpawner:
                     print(f"  [{agent_type}] 🔍 PRE_TURN_COMPLETE 触发自动质检请求")
                 elif event_type == "llm_error":
                     print(f"  [{agent_type}] ❌ LLM 错误: {event['error']}")
+                    if event.get("fatal"):
+                        has_fatal_error = True
+                elif event_type == "early_stop":
+                    print(f"  [{agent_type}] ⏹️ 早停: {event.get('reason', '')}")
+                    has_fatal_error = True  # 连续 idle 说明 Agent 无法完成任务
                 elif event_type == "context_compacted":
                     print(f"  [{agent_type}] 📦 上下文已压缩")
 
@@ -481,13 +526,28 @@ class AgentSpawner:
 
         # 7. 收集结果
         summary = context.to_summary()
-        summary["success"] = True
         summary["events_count"] = len(events)
         summary["worktree_path"] = str(worktree_path)
         summary["context"] = context
         if verification_report:
             summary["verification_report"] = verification_report
 
-        print(f"[AgentSpawner] ✅ {agent_type.upper()} Agent 完成 (共 {len(events)} 事件)")
+        # ── 完成度判定（语义在 execution_loop.evaluate_completion，此处只调用）──
+        # Lead Agent 看 progress_board：
+        #   complete → 全部子目标 completed
+        #   partial  → 还有 pending/in_progress（即使早停或致命错误，只要部分已完成都算）
+        #   failed   → 没有任何子目标 completed 且发生致命错误
+        # 非 Lead Agent 沿用二元判定（fatal → failed，否则 complete）
+        # 注：partial 也算 success=True，让 main.py 持久化 context，用户下一轮可继续未完成任务
+        completion = evaluate_completion(agent_type, has_fatal_error, context.progress_board)
+        summary["completion"] = completion
+        summary["success"] = (completion != "failed")
+        if completion == "partial":
+            summary["pending_goals"] = extract_pending_goals(context.progress_board)
+
+        print(
+            f"[AgentSpawner] ✅ {agent_type.upper()} Agent 完成 "
+            f"(共 {len(events)} 事件, completion={completion})"
+        )
 
         return summary

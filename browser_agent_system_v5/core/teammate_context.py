@@ -108,10 +108,18 @@ class TeammateContext:
             g["notes"] = notes[-5:]
 
         # 自动推进状态
-        if g["status"] == "pending" and g.get("current", 0) > 0:
+        # - pending → in_progress：current 由 0 变正
+        # - in_progress → completed：current 达到 target
+        # - completed → in_progress：current 跌破 target（支持负 increment 回退）
+        target = g.get("target")
+        current = g.get("current", 0)
+        if g["status"] == "pending" and current > 0:
             g["status"] = "in_progress"
-        if g.get("target") and g.get("current", 0) >= g["target"]:
-            g["status"] = "completed"
+        if target is not None:
+            if current >= target:
+                g["status"] = "completed"
+            elif g["status"] == "completed":
+                g["status"] = "in_progress"
 
         return True
 

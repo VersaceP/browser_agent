@@ -68,12 +68,26 @@ class ContextCompactor:
         # 分割消息：首条 | 中间待压缩 | 尾部保留
         first_message = messages[0]
         to_compact = messages[1:-self.keep_recent]
-        to_keep = messages[-self.keep_recent:]
+        to_keep = list(messages[-self.keep_recent:])
+
+        # 切片可能切在 tool_use ↔ tool_result 配对中间：tool_use 落在 to_compact 末尾
+        # 被吃进摘要文本（id 消失），tool_result 落在 to_keep 头部成为孤儿。
+        # Anthropic API 会校验 tool_result.tool_use_id 必须能匹配前文 assistant 的 tool_use 块，找不到匹配就会报错。这里把头部所有孤儿 tool_result 消息丢弃。
+        # （只丢头部：to_keep 中部/尾部的 tool_result 其 tool_use 也在 to_keep 内，仍然成对。）
+        dropped_orphans = 0
+        while to_keep and self._is_tool_result_message(to_keep[0]):
+            to_keep.pop(0)
+            dropped_orphans += 1
+        if dropped_orphans:
+            print(f"[ContextCompactor] 🧹 剥离 to_keep 头部 {dropped_orphans} 条孤儿 tool_result")
 
         # 生成压缩摘要
         if llm_summarize_fn:
             try:
                 summary = await llm_summarize_fn(to_compact)
+                # 摘要函数可能返回 None（如 LLM 调用失败），降级为规则压缩
+                if not summary:
+                    summary = self._rule_based_summary(to_compact)
             except Exception as e:
                 print(f"[ContextCompactor] ⚠️ LLM 摘要失败，使用规则压缩: {e}")
                 summary = self._rule_based_summary(to_compact)
@@ -100,6 +114,19 @@ class ContextCompactor:
         )
 
         return True
+
+    @staticmethod
+    def _is_tool_result_message(msg: Dict[str, Any]) -> bool:
+        """判断该消息是否包含 tool_result 块（用于检测切片产生的孤儿）"""
+        if msg.get("role") != "user":
+            return False
+        content = msg.get("content", "")
+        if not isinstance(content, list):
+            return False
+        return any(
+            isinstance(b, dict) and b.get("type") == "tool_result"
+            for b in content
+        )
 
     def _rule_based_summary(self, messages: List[Dict[str, Any]]) -> str:
         """

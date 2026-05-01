@@ -34,15 +34,18 @@ class ResourceManager:
     async def acquire_browser(self, profile_id: str = "default") -> DPBrowserManager:
         """
         获取或创建浏览器实例。
-        
-        测试模式（当前实现）：
-        - 直接使用全局 PlaywrightBrowserManager
-        - profile_id 仅作为标识符
-        
-        生产模式（未来 ShadowPilot）：
-        - 根据 profile_id 调用 ShadowPilot API 拉起环境
-        - 获取 ws_endpoint 后通过 CDP 连接
-        
+
+        复用策略（重要）：
+        - 浏览器实例在同一进程生命周期内跨任务复用，避免冷启动开销。
+        - 单个 browser/verification agent 完成任务后【不释放】实例，
+          下一个使用浏览器的 agent 直接继承登录状态、Cookie、已开页签。
+        - 仅在实例失活（is_active=False，如崩溃 / 远端断开）时才创建新实例，
+          并在覆盖前对旧实例做一次 best-effort close 释放残留进程/句柄。
+        - 释放只发生在进程退出时（resource_manager.release_all()）。
+
+        测试模式（当前实现）：profile_id 仅作为标识符，复用同一 Playwright 实例。
+        生产模式（未来 ShadowPilot）：根据 profile_id 调用 API 拉起远程环境后 CDP 连接。
+
         :param profile_id: 浏览器环境 ID
         :return: 浏览器管理器实例
         """
@@ -52,6 +55,11 @@ class ResourceManager:
                 if manager.is_active:
                     print(f"[ResourceManager] ♻️ 复用已有浏览器实例: {profile_id}")
                     return manager
+                try:
+                    await manager.close()
+                    print(f"[ResourceManager] 🧹 旧浏览器实例已失活，已清理: {profile_id}")
+                except Exception as e:
+                    print(f"[ResourceManager] ⚠️ 旧浏览器实例 close 失败（已忽略）: {e}")
 
             manager = DPBrowserManager(profile_id=profile_id)
             await manager.get_page()

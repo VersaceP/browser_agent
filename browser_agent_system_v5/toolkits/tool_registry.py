@@ -116,6 +116,16 @@ class ToolRegistry:
         if not tool:
             return f"[系统错误] 工具 '{tool_name}' 不存在于注册表中"
 
+        # 1.5 LLM 工具参数 JSON 解析失败的短路分支：
+        # OpenAIProvider 在 JSON 解析失败时会塞入 _parse_error / _raw_arguments 哨兵，这里直接返回有意义的错误信息，避免下游 ** 展开触发 TypeError
+        if isinstance(params, dict) and "_parse_error" in params:
+            raw = str(params.get("_raw_arguments", ""))[:500]
+            err = params["_parse_error"]
+            return (
+                f"[参数解析失败] LLM 返回的工具参数 JSON 无法解析: {err}。"
+                f"原始参数片段: {raw}"
+            )
+
         # 2. 权限校验
         if tool.required_trust_level > agent_def.trust_level:
             return (

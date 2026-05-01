@@ -4,12 +4,15 @@ llm_provider.py — LLM 多厂商适配网关
 
 import os
 import json
+import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
+
+_LLM_API_TIMEOUT = 180
 
 
 @dataclass
@@ -118,12 +121,15 @@ class AnthropicProvider(BaseLLMProvider):
             "max_tokens": 4096,
         }
         if tools:
-            kwargs["tools"] = tools
+            tools_with_cache = list(tools[:-1]) + [
+                {**tools[-1], "cache_control": {"type": "ephemeral"}}
+            ]
+            kwargs["tools"] = tools_with_cache
 
-        if tools and len(tools) > 0:
-            tools[-1]["cache_control"] = {"type": "ephemeral"}
-
-        response = await self.client.messages.create(**kwargs)
+        response = await asyncio.wait_for(
+            self.client.messages.create(**kwargs),
+            timeout=_LLM_API_TIMEOUT,
+        )
 
         # 解析返回内容
         response_text = ""
@@ -325,8 +331,11 @@ class OpenAIProvider(BaseLLMProvider):
             request_params["tools"] = openai_tools
             request_params["tool_choice"] = self.config.extra_params.get("tool_choice", "auto")
         
-        # 调用 OpenAI API
-        response = await self.client.chat.completions.create(**request_params)
+        # 调用 OpenAI API（带超时保护）
+        response = await asyncio.wait_for(
+            self.client.chat.completions.create(**request_params),
+            timeout=_LLM_API_TIMEOUT,
+        )
         
         # 解析响应
         message = response.choices[0].message
@@ -336,10 +345,17 @@ class OpenAIProvider(BaseLLMProvider):
         # 解析工具调用（转换回 Anthropic 格式）
         if message.tool_calls:
             for tc in message.tool_calls:
+                try:
+                    parsed_input = json.loads(tc.function.arguments) if tc.function.arguments else {}
+                except json.JSONDecodeError as e:
+                    parsed_input = {
+                        "_parse_error": str(e),
+                        "_raw_arguments": tc.function.arguments or "",
+                    }
                 tool_calls.append({
                     "id": tc.id,
                     "name": tc.function.name,
-                    "input": json.loads(tc.function.arguments)
+                    "input": parsed_input,
                 })
         
         # 映射 finish_reason 到 Anthropic 的 stop_reason

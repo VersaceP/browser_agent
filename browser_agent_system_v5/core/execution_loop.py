@@ -1,5 +1,5 @@
 """
-execution_loop.py — 核心驱动大循环（纯函数异步生成器）
+execution_loop.py — 核心驱动大循环（纯函数异步生成器）+ 执行结果语义解读
 
 V4 核心设计：执行引擎是无状态的纯函数生成器。
 所有 Agent 共享同一个 execute_turn()，行为差异完全由 AgentDefinition 驱动。
@@ -15,6 +15,11 @@ V4 核心设计：执行引擎是无状态的纯函数生成器。
 8. 判断结束 → stop_reason != "tool_use" 则退出
 
 使用 AsyncGenerator 的 yield 机制向调用方实时报告事件。
+
+本模块还提供一组纯函数辅助器（属于"执行层语义解读"，不依赖 Spawner 状态）：
+- evaluate_completion(): 根据 progress_board 判定 complete / partial / failed
+- extract_pending_goals(): 提取未完成的子目标列表
+这些函数由 AgentSpawner._drive_execution 在 execute_turn 结束后调用，用于组装 summary。
 """
 
 import asyncio
@@ -25,13 +30,70 @@ from core.agent_definition import AgentDefinition
 from core.teammate_context import TeammateContext
 from core.hook_registry import HookRegistry, HookEvent, HookAction
 from core.context_compactor import ContextCompactor
-from core.prompt_builder import build_system_prompt, build_dynamic_context, format_skills
+from core.prompt_builder import build_system_prompt
 from toolkits.tool_registry import ToolRegistry
 from core.llm_provider import BaseLLMProvider
 
-# 延迟导入以避免循环依赖
-from typing import TYPE_CHECKING
-from core.skill_registry import SkillRegistry
+
+# ══════════════════════════════════════════════════════════════════════
+#  完成度判定（execution 层语义；AgentSpawner 在 execute_turn 结束后调用）
+# ══════════════════════════════════════════════════════════════════════
+
+def evaluate_completion(
+    agent_type: str,
+    has_fatal_error: bool,
+    progress_board: Dict[str, Any],
+) -> str:
+    """
+    判定一次 execute_turn 结束后的完成度。
+
+    返回值：
+    - "complete" — 全部子目标完成（或非 lead agent 且无致命错误）
+    - "partial"  — 部分子目标完成 / 仍有未完成项；session 应保留以便用户继续
+    - "failed"   — 完全失败（致命错误且无任何完成进度，或非 lead agent + 致命错误）
+
+    判定规则：
+    - 非 lead agent：没有进度板，沿用二元判定（has_fatal_error → failed，否则 complete）
+    - lead agent：
+        * progress_board 未初始化 → 二元判定
+        * 全部 goals 是 completed → "complete"
+        * 没有任何 goal completed 且 has_fatal_error → "failed"
+        * 其他情况（部分完成 / 无致命错误但仍有 pending）→ "partial"
+    """
+    if agent_type != "lead":
+        return "failed" if has_fatal_error else "complete"
+
+    goals = (progress_board or {}).get("goals", {}) or {}
+    if not goals:
+        return "failed" if has_fatal_error else "complete"
+
+    statuses = [g.get("status", "pending") for g in goals.values()]
+    all_done = all(s == "completed" for s in statuses)
+    any_done = any(s == "completed" for s in statuses)
+
+    if all_done:
+        return "complete"
+    if has_fatal_error and not any_done:
+        return "failed"
+    return "partial"
+
+
+def extract_pending_goals(progress_board: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    提取未完成的子目标列表，给 UI 层 / chat 续作时提示用户后续应该补做什么。
+    """
+    goals = (progress_board or {}).get("goals", {}) or {}
+    return [
+        {
+            "id": gid,
+            "description": g.get("description", gid),
+            "status": g.get("status", "pending"),
+            "current": g.get("current", 0),
+            "target": g.get("target"),
+        }
+        for gid, g in goals.items()
+        if g.get("status") != "completed"
+    ]
 
 
 async def execute_turn(
@@ -41,22 +103,23 @@ async def execute_turn(
     llm_provider: BaseLLMProvider,
     agent_def: AgentDefinition,
     compactor: ContextCompactor,
-    skill_registry: Optional["SkillRegistry"] = None,  # 新增参数
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """
     核心驱动大循环 — 纯函数异步生成器。
-    
+
     这是 V4 架构的心脏。它不持有任何状态，所有输入通过参数传入，
     所有输出通过 yield 事件流式传递给调用方。
-    
+
+    Browser Agent 的技能注入由 AgentSpawner.spawn() 在创建第一条 user 消息前完成，
+    本函数不再负责该逻辑。
+
     :param context: 会话状态容器（纯数据）
     :param tool_registry: 全局工具注册表
-    :param hook_registry: 生命周期 Hook 注册表  
+    :param hook_registry: 生命周期 Hook 注册表
     :param llm_provider: LLM 提供方（BaseLLMProvider 实例）
     :param agent_def: Agent 人格定义（决定行为差异）
     :param compactor: 上下文压缩器
-    :param skill_registry: 技能注册表（可选，用于 Browser Agent）
-    
+
     :yields: 事件字典，格式为 {"event": str, ...附加数据}
     """
     # ── 0. 触发 SESSION_START Hook ──
@@ -73,67 +136,6 @@ async def execute_turn(
         return
 
     yield {"event": "turn_started", "agent": agent_def.agent_type, "task": context.task}
-
-    # ── 0.5 技能注入（仅 Browser Agent 的第一个 Turn）──
-    injected_skills_content = ""
-    if skill_registry and agent_def.agent_type == "browser" and not context.session_messages:
-        # 选择相关技能
-        selected_skills = skill_registry.select_skills(context.task)
-        
-        if selected_skills:
-            # 触发 PRE_SKILL_INJECT Hook（安全验证）
-            skill_payload = {
-                "agent_type": agent_def.agent_type,
-                "session_id": context.session_id,
-                "task": context.task,
-                "selected_skills": selected_skills,
-                "skill_names": [s.name for s in selected_skills],
-            }
-            skill_result = await hook_registry.emit(HookEvent.PRE_SKILL_INJECT, skill_payload)
-            
-            if skill_result.action == HookAction.BLOCK:
-                yield {"event": "skill_inject_blocked", "reason": skill_result.reason}
-                # 技能注入被阻止，但继续执行（不注入技能）
-                print(f"[ExecutionLoop] ⚠️ 技能注入被阻止: {skill_result.reason}")
-            else:
-                # 格式化技能内容
-                injected_skills_content = format_skills(selected_skills)
-                
-                # 估算 token 数量
-                estimated_tokens = sum(len(s.content) / 4 for s in selected_skills)
-                
-                # 触发 POST_SKILL_INJECT Hook（审计日志）
-                await hook_registry.emit(HookEvent.POST_SKILL_INJECT, {
-                    "agent_type": agent_def.agent_type,
-                    "session_id": context.session_id,
-                    "injected_skills": [s.name for s in selected_skills],
-                    "total_tokens": int(estimated_tokens),
-                })
-                
-                yield {
-                    "event": "skills_injected",
-                    "skills": [s.name for s in selected_skills],
-                    "estimated_tokens": int(estimated_tokens),
-                }
-        
-        # 创建第一条 user message（包含任务和技能）
-        first_message_content = build_dynamic_context(
-            task=context.task,
-            worktree_path=context.worktree_path,
-            env_vars=context.env_vars,
-            skills=injected_skills_content
-        )
-
-        if injected_skills_content:
-            context.append_message("user", [
-                {
-                    "type": "text",
-                    "text": first_message_content,
-                    "cache_control": {"type": "ephemeral"}
-                }
-            ])
-        else:
-            context.append_message("user", first_message_content)
 
     # ── 1. 组装 System Prompt ──
     system_prompt = build_system_prompt(agent_def)
@@ -178,13 +180,17 @@ async def execute_turn(
                         # 仅保留截断版本以防止摘要本身Token过长
                         content_str = str(m.get("content", ""))[:2000]
                         msg_text += f"[{role}]: {content_str}...\n"
-                        
-                    res_text, _, _ = await llm_provider.generate_response(
-                        system_prompt=summary_prompt,
-                        messages=[{"role": "user", "content": "需要摘要的历史对话记录:\n" + msg_text}],
-                        tools=[]
-                    )
-                    return res_text
+                    
+                    try:
+                        res_text, _, _ = await llm_provider.generate_response(
+                            system_prompt=summary_prompt,
+                            messages=[{"role": "user", "content": "需要摘要的历史对话记录:\n" + msg_text}],
+                            tools=[]
+                        )
+                        return res_text
+                    except Exception as e:
+                        print(f"[ContextCompactor] ⚠️ LLM 摘要调用失败: {e}")
+                        return None  # 返回 None 让 compactor 降级为规则压缩
                     
                 compressed = await compactor.compact_if_needed(context, llm_summarize_fn=_summarize_fn)
                 if compressed:
@@ -204,28 +210,65 @@ async def execute_turn(
             )
             consecutive_errors = 0  # LLM 调用成功，重置连续错误计数
         except Exception as e:
-            error_str = str(e).lower()
-            yield {"event": "llm_error", "error": str(e), "turn": turns}
+            # 超时类异常 str(e) 为空字符串，单独识别以保证错误信息和 backoff 都能正常工作
+            is_timeout = isinstance(e, (asyncio.TimeoutError, TimeoutError))
+            if is_timeout:
+                error_msg = "LLM API 调用超时（无响应）"
+            else:
+                error_msg = str(e) or type(e).__name__
+            error_str = error_msg.lower()
 
-            # ── 不可恢复错误：直接退出避免无限死循环 ──
-            unrecoverable_keywords = [
-                "api key", "unauthorized", "auth", "not found",
-                "401", "404", "model not found",
+            # ── 不可恢复错误识别 ──
+            # 优先匹配 Anthropic/OpenAI SDK 抛出的结构化错误类型（高置信度，不易和正常文本歧义）
+            # 注意："tool call result does not follow" 不属于不可恢复 —— 由消息修复器处理
+            unrecoverable_error_types = (
+                "authentication_error",
+                "permission_error",
+                "not_found_error",
                 "invalid_request_error",
-                # 注意："tool call result does not follow" 已从不可恢复列表移除
-                # 该错误由消息格式问题导致，配合消息修复器可自动恢复
-            ]
-            if any(k in error_str for k in unrecoverable_keywords):
+                "billing_hard_limit_reached",
+                "insufficient_quota",
+                "model_not_found",
+                "account_disabled",
+                "account_deactivated",
+                "subscription_expired",
+                "rate_limit_error",
+            )
+            # 兜底的具体短语（直接由网关/上游返回的原始错误文本）
+            unrecoverable_phrases = (
+                "invalid api key",
+                "incorrect api key",
+                "invalid x-api-key",
+                "x-api-key header",
+                "api key not valid",
+                "token plan not support",
+            )
+            is_unrecoverable = (
+                any(t in error_str for t in unrecoverable_error_types)
+                or any(p in error_str for p in unrecoverable_phrases)
+            )
+            yield {
+                "event": "llm_error",
+                "error": error_msg,
+                "turn": turns,
+                "fatal": is_unrecoverable,
+            }
+            if is_unrecoverable:
                 break
 
             # ── 连续错误熔断：防止非致命但持续的错误无限循环 ──
             consecutive_errors += 1
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                yield {"event": "llm_error", "error": f"连续 {consecutive_errors} 次 LLM 错误，自动终止", "turn": turns}
+                yield {
+                    "event": "llm_error",
+                    "error": f"连续 {consecutive_errors} 次 LLM 错误，自动终止",
+                    "turn": turns,
+                    "fatal": True,
+                }
                 break
 
             # ── 安全注入错误提示：确保不破坏 user/assistant 交替结构 ──
-            error_hint = f"[系统提示] LLM 调用出错: {e}。请调整策略重试。"
+            error_hint = f"[系统提示] LLM 调用出错: {error_msg}。请调整策略重试。"
             if context.session_messages and context.session_messages[-1]["role"] == "user":
                 # 最后一条已是 user 消息 → 合并到已有消息中，避免连续 user
                 last = context.session_messages[-1]
@@ -236,8 +279,8 @@ async def execute_turn(
             else:
                 context.append_message("user", error_hint)
 
-            # ── 对于 529 (overloaded) 和 500 错误使用更长的等待时间 ──
-            if "529" in error_str or "overloaded" in error_str or "500" in error_str:
+            # ── 对于 529 (overloaded)、500 错误和超时使用更长的等待时间 ──
+            if is_timeout or "529" in error_str or "overloaded" in error_str or "500" in error_str:
                 backoff_time = min(2 ** consecutive_errors, 30)  # 最多等待 30 秒
                 yield {"event": "llm_backoff", "wait_seconds": backoff_time, "consecutive_errors": consecutive_errors}
                 await asyncio.sleep(backoff_time)
@@ -353,26 +396,30 @@ async def execute_turn(
                 turn_has_productive_tool = True
 
             # AUTO_COMPACT：RepetitionCompactor 已将压缩摘要放入 updated_payload，
-            # 由上方延迟注入逻辑在 tool_result 之后写入。
-            # 这里删掉刚才追加的重复工具结果和紧随的摘要消息，让 LLM 重新开始
+            # 由上方延迟注入逻辑在 tool_result 之后写入为独立 user 消息。
+            # 新策略：
+            #   1) pop 掉独立 append 的摘要 user 消息（避免摘要重复出现两次）
+            #   2) 把摘要内容就地回填到刚 append 的 tool_result.content 中
+            #      —— 既保留 tool_use ↔ tool_result 配对，又起到压缩失败信息的效果
+            #   3) 不再 break：继续处理本轮剩余 tool_call，避免它们的 tool_use 也变成孤儿
             if post_result.action == HookAction.AUTO_COMPACT:
                 yield {"event": "auto_compact", "tool": tool_name, "reason": post_result.reason, "turn": turns}
-                # 删除紧随 tool_result 注入的摘要消息（如果有的话）
-                if inject_content and context.session_messages and context.session_messages[-1]["role"] == "user":
-                    last = context.session_messages[-1]
-                    last_content = last.get("content", "")
-                    # 摘要消息的特征：content 为字符串且以 "[系统自动压缩]" 开头
-                    if isinstance(last_content, str) and last_content.startswith("[系统自动压缩]"):
-                        context.session_messages.pop()
-                # 删掉刚才 append 的那条重复工具结果
-                if context.session_messages and context.session_messages[-1]["role"] == "user":
-                    last_content = context.session_messages[-1]["content"]
-                    if isinstance(last_content, list) and last_content[0].get("type") == "tool_result":
-                        context.session_messages.pop()
-                # 跳过本轮剩余工具，退出 for 循环 → 进入下一轮（重新调用 LLM）
-                break
-
-        # for 正常结束后进入下一轮 while（重新调用 LLM）
+                if inject_content:
+                    # (1) 回收独立 append 的摘要消息
+                    if context.session_messages and context.session_messages[-1]["role"] == "user":
+                        last = context.session_messages[-1]
+                        last_content = last.get("content", "")
+                        if isinstance(last_content, str) and last_content.startswith("[系统自动压缩]"):
+                            context.session_messages.pop()
+                    # (2) 回填到 tool_result.content
+                    if context.session_messages and context.session_messages[-1]["role"] == "user":
+                        last = context.session_messages[-1]
+                        last_content = last.get("content")
+                        if isinstance(last_content, list):
+                            for block in last_content:
+                                if isinstance(block, dict) and block.get("type") == "tool_result":
+                                    block["content"] = inject_content
+                                    break
 
         # ── 早停检测：连续无产出则自动终止 ──
         if turn_has_productive_tool:

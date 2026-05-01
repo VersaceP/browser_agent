@@ -784,8 +784,21 @@ async def run_interactive(spawner: AgentSpawner):
                 )
 
             # 持久化上下文以便下轮对话使用
-            if result.get("success") and "context" in result:
+            # completion = complete/partial 都保留 context（partial 表示部分子目标未完成，
+            # 用户可在下一次输入中继续未完成任务）；只有 failed 才不保留
+            completion = result.get("completion")
+            if completion != "failed" and "context" in result:
                 active_lead_context = result.pop("context")
+
+            # 部分完成时把未完成的子目标列出来，提示用户后续可以继续什么
+            if completion == "partial" and result.get("pending_goals"):
+                print("\n⏸️  部分完成 — 以下子目标尚未完成（可在下一条指令中继续）:")
+                for g in result["pending_goals"]:
+                    desc = g.get("description", g.get("id", ""))
+                    cur = g.get("current", 0)
+                    tgt = g.get("target")
+                    progress = f"{cur}/{tgt}" if tgt else f"{cur}"
+                    print(f"  • {desc} — 进度 {progress} (status={g.get('status')})")
 
             print("\n📊 执行结果:")
             print(json.dumps(result, ensure_ascii=False, indent=2, default=str))

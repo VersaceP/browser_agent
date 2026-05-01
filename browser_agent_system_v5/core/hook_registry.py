@@ -165,7 +165,6 @@ class RepetitionCompactor:
         compactor = RepetitionCompactor(
             threshold=5,
             success_repetition_threshold=3,
-            get_context=lambda: current_context,
         )
         hook_registry.register(HookEvent.POST_TOOL_EXECUTE, compactor.handler)
 
@@ -177,13 +176,10 @@ class RepetitionCompactor:
         threshold: int = 5,
         success_repetition_threshold: int = 3,
         similarity_threshold: float = 0.7,
-        get_context: Callable[[], "TeammateContext"] = None,  # type: ignore
     ):
         self.threshold = threshold
         self.success_repetition_threshold = success_repetition_threshold
         self.similarity_threshold = similarity_threshold
-        self._get_context = get_context
-        self._current_context = None  # 由 AgentSpawner 在每次执行前注入
 
         # {(session_id, agent_type, tool_name, error_type): count}  — 错误类型维度
         self._failure_counts: dict = {}
@@ -203,14 +199,6 @@ class RepetitionCompactor:
         self._success_counts: dict = {}
         # {(session_id, agent_type, tool_name): [tool_input, ...]}  — 最近的工具输入
         self._success_inputs: dict = {}
-
-    def set_context(self, ctx: "TeammateContext") -> None:  # type: ignore
-        """由 AgentSpawner 在每次 execute_turn 前调用，注入当前 context"""
-        self._current_context = ctx
-
-    def get_context(self) -> "TeammateContext":  # type: ignore
-        """优先返回注入的上下文，其次返回回调"""
-        return self._current_context or (self._get_context() if self._get_context else None)
 
     def _error_key(self, payload: dict) -> tuple:
         """从 payload 提取失败指纹键"""
