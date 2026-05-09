@@ -1,0 +1,47 @@
+{
+  "provider": "Openai",
+  "model_id": "deepseek-v3.1",
+  "api_key": "sk-27d8d460e2bc48f196adf3002659a440",
+  "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+  "extra_params": {
+    "temperature": 1.0,
+    "max_tokens": 4096
+  },
+  "vision": {
+    "provider": "qwen",
+    "model_id": "qwen3.5-omni-plus-2026-03-15",
+    "api_key": "sk-27d8d460e2bc48f196adf3002659a440",
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "extra_params": {
+      "temperature": 1.0,
+      "max_tokens": 2048
+    }
+  },
+  "summarizer": {
+    "_comment": "Haiku-class 低成本模型,用于 read_file 大文件摘要(文件 > 50000 chars 时触发,摘要 <= 50000 chars)",
+    "provider": "openai",
+    "model_id": "glm-4.5",
+    "api_key": "sk-27d8d460e2bc48f196adf3002659a440",
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "extra_params": {
+      "temperature": 1.0,
+      "max_tokens": 10000
+    }
+  },
+  "browser": {
+    "remote_debugging_port": 9222,
+    "user_data_dir": null,
+    "binary_path": null,
+    "headless": false
+  },
+  "sandbox": {
+    "warm_pool_size": 3,
+    "exec_timeout_seconds": 120,
+    "blocked_imports": ["requests", "httpx", "aiohttp", "urllib", "urllib2", "urllib3"],
+    "allowed_env_passthrough": ["PATH", "PYTHONPATH", "HOME", "USERPROFILE", "TEMP", "TMP", "LANG", "LC_ALL", "SYSTEMROOT", "APPDATA", "LOCALAPPDATA"],
+    "allowed_env_prefix": ["LARK_", "FEISHU_"]
+  },
+  "agent": {
+    "force_single_step_browser": false
+  }
+}

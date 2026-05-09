@@ -1,0 +1,110 @@
+
+# >>>>>>>>>>>>>>>>>>>>>> ERROR REPORT <<<<<<<<<<<<<<<<<<<<<<
+
+    Traceback (most recent call last):
+      File "D:\miniconda\Lib\site-packages\conda\exception_handler.py", line 30, in __call__
+        return func(*args, **kwargs)
+      File "D:\miniconda\Lib\site-packages\conda\cli\main.py", line 62, in main_subshell
+        exit_code = do_call(args, parser)
+      File "D:\miniconda\Lib\site-packages\conda\cli\conda_argparse.py", line 205, in do_call
+        result = getattr(module, func_name)(args, parser)
+      File "D:\miniconda\Lib\site-packages\conda\cli\main_run.py", line 135, in execute
+        print(response.stdout, file=sys.stdout, end="")
+        ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    UnicodeEncodeError: 'gbk' codec can't encode character '\ufffd' in position 509: illegal multibyte sequence
+
+`$ D:\miniconda\Scripts\conda-script.py run -n agent python _test_b3_session_state.py`
+
+  environment variables:
+                 CIO_TEST=<not set>
+     CLAUDE_CODE_EXECPATH=C:\Users\69537\.kiro\extensions\anthropic.claude-
+                          code-2.1.128-win32-x64\resources\native-binary\claude.exe
+               CONDA_ROOT=D:\miniconda
+           CURL_CA_BUNDLE=<not set>
+                  EXEPATH=D:\Git\bin
+                 HOMEPATH=\Users\69537
+               HTTP_PROXY=<set>
+               LD_PRELOAD=<not set>
+NODEFAULTCURRENTDIRECTORYINEXEPATH=1
+          NVTOOLSEXT_PATH=C:\Program Files\NVIDIA Corporation\NvToolsExt\
+                     PATH=C:\Users\69537\.local\bin;C:\Users\69537\bin;D:\Git\mingw64\bin;D:\Git
+                          \usr\local\bin;D:\Git\usr\bin;D:\Git\usr\bin;D:\Git\mingw64\bin;D:\Git
+                          \usr\bin;C:\Users\69537\bin;D:\python
+                          3.13.5\Scripts;E:\ShadowBot;C:\Program Files\NVIDIA GPU Computing
+                          Toolkit\CUDA\v11.8\bin;C:\Program Files\NVIDIA GPU Computing
+                          Toolkit\CUDA\v11.8\libnvvp;C:\Program Files (x86)\Common Files\Oracle\
+                          Java\javapath;C:\Users\69537\AppData\Local\Programs\cursor\resources\a
+                          pp\bin;C:\WINDOWS\system32;C:\WINDOWS;C:\WINDOWS\System32\Wbem;C:\WIND
+                          OWS\System32\WindowsPowerShell\v1.0;C:\WINDOWS\System32\OpenSSH;D:\Git
+                          \cmd;C:\Users\69537\AppData\Local\Microsoft\WindowsApps;C:\Users\69537
+                          \AppData\Local\Programs\cursor\resources\app\bin;C:\Program
+                          Files\dotnet;C:\Program Files\NVIDIA Corporation\NVIDIA app\NvDLISR;D:
+                          \anaconda;D:\anaconda\Scripts;D:\anaconda\Scripts\Library\bin;C:\Progr
+                          am Files (x86)\NVIDIA Corporation\PhysX\Common;C:\Program Files\NVIDIA
+                          Corporation\Nsight Compute
+                          2022.3.0;E:\cursor\cursor\resources\app\bin;C:\Program
+                          Files\nodejs;C:\ProgramData\chocolatey\bin;C:\Program Files\Docker\Doc
+                          ker\resources\bin;E:\ShadowBot;D:\miniconda;D:\miniconda\Library\mingw
+                          -w64\bin;D:\miniconda\Library\usr\bin;D:\miniconda\Library\bin;D:\mini
+                          conda\Scripts;D:\python 3.13.5\Scripts;D:\python 3.13.5;C:\Users\69537
+                          \AppData\Local\Programs\Python\Launcher;C:\Users\69537\.local\bin;E:\t
+                          rae\Trae\bin;C:\Users\69537\AppData\Local\Microsoft\WindowsApps;D:\Mic
+                          rosoft VS Code\bin;E:\Kiro\bin;C:\Users\69537\AppData\Roaming\npm;E:\A
+                          ntigravity\bin;C:\Users\69537\AppData\Local\Microsoft\WinGet\Packages\
+                          Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1-
+                          full_build\bin;E:\CodeBuddy
+                          CN\bin;D:\Git\usr\bin\vendor_perl;D:\Git\usr\bin\core_perl
+             PSMODULEPATH=C:\Program Files\WindowsPowerShell\Modules;C:\WINDOWS\system32\Windows
+                          PowerShell\v1.0\Modules
+       REQUESTS_CA_BUNDLE=<not set>
+            SSL_CERT_FILE=<not set>
+   VSCODE_CODE_CACHE_PATH=C:\Users\69537\AppData\Roaming\Kiro\CachedData\f7f7d41b94b715768e6eaf5
+                          3c0e0845e698a5587
+
+     active environment : None
+       user config file : C:\Users\69537\.condarc
+ populated config files : D:\miniconda\.condarc
+                          D:\miniconda\condarc.d\anaconda-auth.yml
+                          C:\Users\69537\.condarc
+          conda version : 26.1.1
+    conda-build version : not installed
+         python version : 3.13.12.final.0
+                 solver : libmamba (default)
+       virtual packages : __archspec=1=skylake
+                          __conda=26.1.1=0
+                          __cuda=13.1=0
+                          __win=10.0.26200=0
+       base environment : D:\miniconda  (writable)
+      conda av data dir : D:\miniconda\etc\conda
+  conda av metadata url : None
+           channel URLs : https://repo.anaconda.com/pkgs/main/win-64
+                          https://repo.anaconda.com/pkgs/main/noarch
+                          https://repo.anaconda.com/pkgs/r/win-64
+                          https://repo.anaconda.com/pkgs/r/noarch
+                          https://repo.anaconda.com/pkgs/msys2/win-64
+                          https://repo.anaconda.com/pkgs/msys2/noarch
+          package cache : D:\miniconda\pkgs
+                          C:\Users\69537\.conda\pkgs
+                          C:\Users\69537\AppData\Local\conda\conda\pkgs
+       envs directories : D:\miniconda\envs
+                          C:\Users\69537\.conda\envs
+                          C:\Users\69537\AppData\Local\conda\conda\envs
+    temporary directory : C:\Users\69537\AppData\Local\Temp
+               platform : win-64
+             user-agent : conda/26.1.1 requests/2.32.5 CPython/3.13.12 Windows/11 Windows/10.0.26200 solver/libmamba conda-libmamba-solver/25.11.0 libmambapy/2.3.2 aau/0.7.5 c/. s/. e/.
+          administrator : False
+             netrc file : None
+           offline mode : False
+
+
+An unexpected error has occurred. Conda has prepared the above report.
+If you suspect this error is being caused by a malfunctioning plugin,
+consider using the --no-plugins option to turn off plugins.
+
+Example: conda --no-plugins install <package>
+
+Alternatively, you can set the CONDA_NO_PLUGINS environment variable on
+the command line to run the command without plugins enabled.
+
+Example: CONDA_NO_PLUGINS=true conda install <package>
+

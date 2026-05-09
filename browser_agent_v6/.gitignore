@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+*.log
+worktrees/
+sessions/
+.env
+chrome_profile/
+.CLAUDE.MD
