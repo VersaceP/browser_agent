@@ -1,0 +1,20 @@
+{
+  "method": "Download.list",
+  "description": "Lists recent download history entries.",
+  "params": {
+    "limit": {
+      "default": 100,
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000,
+      "required": true
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you are viewing downloads, e.g., checking if a download has completed",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you are viewing downloads, e.g., checking if a download has completed"
+}

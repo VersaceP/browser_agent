@@ -1,0 +1,88 @@
+{
+  "version": 1,
+  "description": "Read-only v1 strategy bank. Raw attempts belong in strategy_attempts.jsonl; only stable, reusable strategies should live here.",
+  "strategies": [
+    {
+      "id": "web_scrape.list_cards.extract_dom_records.pos_sort",
+      "task_types": ["web_scrape", "browser_data_collection"],
+      "stage": "list_extraction",
+      "phase_keywords": ["list", "rank", "card", "url", "href", "product"],
+      "applies_when": [
+        "The page contains repeated product/article/list cards.",
+        "Items expose stable anchors such as /ai/, /product/, /tool/, or article URLs.",
+        "Visual order matters, including multi-column grids."
+      ],
+      "preferred_tools": ["navigate_verified", "extract_dom_records", "record_extraction"],
+      "avoid_tools": ["DOM.getSemanticTree", "raw Runtime.evaluate", "large AXTree as final data source"],
+      "procedure": [
+        "Open or reuse a page, then navigate with navigate_verified.",
+        "Use extract_dom_records on repeated anchors/cards with includeRect=true.",
+        "Sort rows by rect.y, then rect.x, then DOM order.",
+        "Filter/dedupe target rows and call record_extraction within one step."
+      ],
+      "success_criteria": ["required row count", "unique URLs", "order/rank evidence"],
+      "failure_signatures": ["no anchors found", "lazy-load did not trigger", "rows lack hrefs"],
+      "stats": {"success_count": 0, "fail_count": 0}
+    },
+    {
+      "id": "web_scrape.list_cards.eval_js_json.pos_sort_fallback",
+      "task_types": ["web_scrape", "browser_data_collection"],
+      "stage": "list_extraction",
+      "phase_keywords": ["list", "rank", "card", "url", "href", "product"],
+      "applies_when": [
+        "extract_dom_records cannot express the required relationship.",
+        "The target requires custom DOM traversal, computed style, or pageY/pageX sorting."
+      ],
+      "preferred_tools": ["eval_js_json", "record_extraction"],
+      "avoid_tools": ["raw Runtime.evaluate", "DOM.getSemanticTree"],
+      "procedure": [
+        "Use eval_js_json, not raw Runtime.evaluate, for structured JS return values.",
+        "Return JSON-serializable values only; do not return functions or DOM nodes.",
+        "Collect text, href, image alt, and bounding rect/page coordinates.",
+        "Call record_extraction immediately if rows are target data."
+      ],
+      "success_criteria": ["JSON value returned", "row objects have target fields"],
+      "failure_signatures": ["Runtime.evaluate returned null", "non-serializable return value"],
+      "stats": {"success_count": 0, "fail_count": 0}
+    },
+    {
+      "id": "web_scrape.detail_sections.dom_then_eval",
+      "task_types": ["web_scrape", "browser_data_collection"],
+      "stage": "detail_extraction",
+      "phase_keywords": ["detail", "reviews", "pros", "cons", "q&a", "qa", "faq"],
+      "applies_when": [
+        "A detail page contains named sections, tabs, anchors, reviews, FAQs, or pros/cons blocks."
+      ],
+      "preferred_tools": ["navigate_verified", "extract_dom_records", "eval_js_json", "record_extraction"],
+      "avoid_tools": ["DOM.getSemanticTree", "large AXTree as final data source"],
+      "procedure": [
+        "Navigate and verify URL/title first.",
+        "Use extract_dom_records for obvious repeated section rows.",
+        "Use eval_js_json for section-scoped text extraction when selectors are nested.",
+        "Persist a structured artifact with empty arrays for missing optional sections."
+      ],
+      "success_criteria": ["required fields present", "evidence URL matches target"],
+      "failure_signatures": ["section hidden behind tab", "accordion/lazy content not loaded"],
+      "stats": {"success_count": 0, "fail_count": 0}
+    },
+    {
+      "id": "fill_form.axtree_input_verify",
+      "task_types": ["fill_form", "browser_action"],
+      "stage": "form_fill",
+      "phase_keywords": ["form", "input", "submit", "login", "field"],
+      "applies_when": [
+        "The task requires filling standard form fields and submitting or saving."
+      ],
+      "preferred_tools": ["navigate_verified", "DOM.getAXTree", "Input.type", "Input.click", "Page.getState"],
+      "avoid_tools": ["DOM.getSemanticTree", "raw Runtime.evaluate"],
+      "procedure": [
+        "Use AXTree to locate form controls and labels.",
+        "Use Input.type/Input.click with purpose fields.",
+        "Use Page.getState and visual_verify only for outcome/layout verification."
+      ],
+      "success_criteria": ["field values entered", "submit outcome verified"],
+      "failure_signatures": ["captcha", "login wall", "occluding modal"],
+      "stats": {"success_count": 0, "fail_count": 0}
+    }
+  ]
+}

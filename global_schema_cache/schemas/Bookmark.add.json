@@ -1,0 +1,39 @@
+{
+  "method": "Bookmark.add",
+  "description": "Adds a new bookmark.",
+  "params": {
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "required": true
+    },
+    "title": {
+      "type": "string",
+      "required": true
+    },
+    "faviconUrl": {
+      "type": "string",
+      "required": false
+    },
+    "folderId": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "minimum": -9007199254740991,
+          "maximum": 9007199254740991
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "required": false
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you are adding a bookmark, e.g., saving an important page for later",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you are adding a bookmark, e.g., saving an important page for later"
+}

@@ -1,0 +1,13 @@
+{
+  "method": "Memory.get",
+  "description": "Retrieve the memory context for a specific scope.",
+  "params": {
+    "scope": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The scope to query memory for.",
+      "required": true
+    }
+  },
+  "requiresPurpose": false
+}

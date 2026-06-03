@@ -1,0 +1,29 @@
+{
+  "method": "DOM.getText",
+  "description": "Gets the text content of the specified element.",
+  "params": {
+    "pageId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "required": true
+    },
+    "selector": {
+      "type": "string",
+      "minLength": 1,
+      "required": false
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^\\d+:\\d+:\\d+$",
+      "required": false
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you need this text, e.g., verifying a login success message",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you need this text, e.g., verifying a login success message"
+}

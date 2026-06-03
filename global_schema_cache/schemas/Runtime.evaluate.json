@@ -1,0 +1,29 @@
+{
+  "method": "Runtime.evaluate",
+  "description": "Executes JavaScript code in the context of the page.",
+  "params": {
+    "pageId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "required": true
+    },
+    "expression": {
+      "type": "string",
+      "minLength": 1,
+      "required": true
+    },
+    "returnByValue": {
+      "default": true,
+      "type": "boolean",
+      "required": true
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you are executing JavaScript, e.g., extracting dynamic page data",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you are executing JavaScript, e.g., extracting dynamic page data"
+}

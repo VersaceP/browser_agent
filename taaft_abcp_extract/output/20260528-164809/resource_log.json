@@ -1,0 +1,43 @@
+{
+  "agentId": "recon-shared",
+  "maxAbcpInstances": 2,
+  "startedAt": "2026-05-28T08:48:10+00:00",
+  "acquire": {
+    "mode": "reused",
+    "pageId": "e3ff38fc-d134-480c-a082-c6dbce267dc8",
+    "attempts": [
+      {
+        "round": 1,
+        "fleetCount": 2,
+        "pageCount": 4,
+        "pages": [
+          {
+            "pageId": "3a3e7e12-e580-40bc-8fde-29f068f62ce2",
+            "status": "idle",
+            "url": null,
+            "fleetId": "ad8759bb-8617-43cf-8dbf-c8632b558c36"
+          },
+          {
+            "pageId": "9349d82e-e670-44cb-8b25-e70543d2a600",
+            "status": "idle",
+            "url": null,
+            "fleetId": "ad8759bb-8617-43cf-8dbf-c8632b558c36"
+          },
+          {
+            "pageId": "e3ff38fc-d134-480c-a082-c6dbce267dc8",
+            "status": "idle",
+            "url": null,
+            "fleetId": "44c29b84-e4d7-41eb-b86f-b4d7d0e8497f"
+          },
+          {
+            "pageId": "89ecb591-06cb-4e29-9d32-678357b5af72",
+            "status": "idle",
+            "url": null,
+            "fleetId": "44c29b84-e4d7-41eb-b86f-b4d7d0e8497f"
+          }
+        ]
+      }
+    ]
+  },
+  "workingPageId": "e3ff38fc-d134-480c-a082-c6dbce267dc8"
+}

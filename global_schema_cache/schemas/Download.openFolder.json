@@ -1,0 +1,19 @@
+{
+  "method": "Download.openFolder",
+  "description": "Opens the folder containing a downloaded file in the system file manager.",
+  "params": {
+    "downloadId": {
+      "type": "integer",
+      "minimum": -9007199254740991,
+      "maximum": 9007199254740991,
+      "required": true
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you are opening the folder, e.g., confirming where files are saved",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you are opening the folder, e.g., confirming where files are saved"
+}

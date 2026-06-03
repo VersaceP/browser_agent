@@ -1,0 +1,26 @@
+{
+  "method": "Bookmark.listFolders",
+  "description": "Lists bookmark folders, optionally filtered by parent folder.",
+  "params": {
+    "parentId": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "minimum": -9007199254740991,
+          "maximum": 9007199254740991
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "required": false
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you are listing bookmark folders, e.g., understanding the bookmark organization",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you are listing bookmark folders, e.g., understanding the bookmark organization"
+}

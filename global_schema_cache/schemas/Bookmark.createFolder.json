@@ -1,0 +1,31 @@
+{
+  "method": "Bookmark.createFolder",
+  "description": "Creates a new bookmark folder.",
+  "params": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "required": true
+    },
+    "parentId": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "minimum": -9007199254740991,
+          "maximum": 9007199254740991
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "required": false
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you are creating a bookmark folder, e.g., organizing bookmarks by project",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you are creating a bookmark folder, e.g., organizing bookmarks by project"
+}

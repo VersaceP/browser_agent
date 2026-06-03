@@ -1,0 +1,12 @@
+{
+  "method": "Fleet.create",
+  "description": "Creates a new browser instance (Electron window).",
+  "params": {
+    "scope": {
+      "description": "A semantic label for this fleet, used as memory key. If omitted, fleetId is used as the implicit scope.",
+      "type": "string",
+      "required": false
+    }
+  },
+  "requiresPurpose": false
+}

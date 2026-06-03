@@ -1,0 +1,19 @@
+{
+  "method": "History.deleteItem",
+  "description": "Deletes a single browsing history entry by ID.",
+  "params": {
+    "id": {
+      "type": "integer",
+      "minimum": -9007199254740991,
+      "maximum": 9007199254740991,
+      "required": true
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you are deleting this history item, e.g., removing sensitive access records",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you are deleting this history item, e.g., removing sensitive access records"
+}

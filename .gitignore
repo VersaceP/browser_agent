@@ -1,0 +1,13 @@
+__pycache__/
+abcp browser/
+abcp/
+venv/
+env/
+ENV/
+.venv/
+worktree/
+tests/
+dist/
+config.json
+.pycache/
+.pytest_cache/

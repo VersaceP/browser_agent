@@ -1,0 +1,19 @@
+{
+  "method": "Download.remove",
+  "description": "Removes a download record from history.",
+  "params": {
+    "downloadId": {
+      "type": "integer",
+      "minimum": -9007199254740991,
+      "maximum": 9007199254740991,
+      "required": true
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you are removing this download entry, e.g., cleaning up unneeded downloads",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you are removing this download entry, e.g., cleaning up unneeded downloads"
+}

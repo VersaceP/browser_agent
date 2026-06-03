@@ -1,0 +1,18 @@
+{
+  "method": "Hitl.resolvePause",
+  "description": "Resumes AI operation and resolves a previous Human-In-The-Loop (HITL) pause state on the specified page.",
+  "params": {
+    "pageId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "required": true
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe your intent for this action",
+      "required": true
+    }
+  },
+  "requiresPurpose": true
+}

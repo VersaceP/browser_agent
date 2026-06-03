@@ -1,0 +1,12 @@
+{
+  "method": "System.getCapabilities",
+  "description": "Get a list of all supported API capabilities for AI decision making, along with the high-level cognitive agent skills guide.",
+  "params": {
+    "skillFile": {
+      "description": "If true, the returned skillsGuide contains a path value (type: \"path\"). If false or omitted, it contains the full markdown content value (type: \"content\").",
+      "type": "boolean",
+      "required": false
+    }
+  },
+  "requiresPurpose": false
+}

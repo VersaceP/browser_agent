@@ -1,0 +1,63 @@
+{
+  "method": "Input.drag",
+  "description": "Drags an element or from a position to another element, position, or relative distance.",
+  "params": {
+    "pageId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "required": true
+    },
+    "selector": {
+      "type": "string",
+      "minLength": 1,
+      "required": false
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^\\d+:\\d+:\\d+$",
+      "required": false
+    },
+    "x": {
+      "type": "number",
+      "required": false
+    },
+    "y": {
+      "type": "number",
+      "required": false
+    },
+    "toSelector": {
+      "type": "string",
+      "minLength": 1,
+      "required": false
+    },
+    "toId": {
+      "type": "string",
+      "pattern": "^\\d+:\\d+:\\d+$",
+      "required": false
+    },
+    "toX": {
+      "type": "number",
+      "required": false
+    },
+    "toY": {
+      "type": "number",
+      "required": false
+    },
+    "dx": {
+      "type": "number",
+      "required": false
+    },
+    "dy": {
+      "type": "number",
+      "required": false
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you are dragging, e.g., moving a slider to a specific position",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you are dragging, e.g., moving a slider to a specific position"
+}

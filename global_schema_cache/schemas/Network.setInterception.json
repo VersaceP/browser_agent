@@ -1,0 +1,46 @@
+{
+  "method": "Network.setInterception",
+  "description": "Sets network request interception rules to filter unwanted requests and improve performance.",
+  "params": {
+    "pageId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "required": true
+    },
+    "patterns": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "urlPattern": {
+            "type": "string"
+          },
+          "resourceType": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "block",
+              "allow"
+            ]
+          }
+        },
+        "required": [
+          "urlPattern",
+          "action"
+        ],
+        "additionalProperties": false
+      },
+      "required": true
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you are intercepting requests, e.g., blocking ad requests to improve performance",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you are intercepting requests, e.g., blocking ad requests to improve performance"
+}

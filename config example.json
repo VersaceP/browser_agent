@@ -1,0 +1,47 @@
+{
+  "provider": "anthropic",
+  "model_id": "kimi-2.6",
+  "api_key": "sk-kimi-Du2NGogKdNeI9ZkBrctGLT7fdAaVGDlbx74ptVyRjzzW1ocBUGepeFhW0I3zZSsS",
+  "base_url": "https://api.kimi.com/coding/",
+  "extra_params": {
+    "temperature": 0.5,
+    "max_tokens": 4096,
+    "cache_control_mode": "auto"
+  },
+  "vl": {
+    "enabled": false,
+    "provider": "openai",
+    "model_id": "qwen-vl-xxx",
+    "base_url": "https://your-qwen-compatible-endpoint.example/v1",
+    "api_key": "",
+    "max_checks_per_worker": 5,
+    "default_timeout_seconds": 60
+  },
+  "browser": {
+    "agent_id": "abcp-agent",
+    "ws_url": "ws://localhost:9300/ws",
+    "jwt_token_env": "ABCP_JWT_TOKEN",
+    "request_shape": "jsonrpc",
+    "max_message_size_bytes": 16777216,
+    "connect_timeout_seconds": 15,
+    "call_timeout_seconds": 60,
+    "ping_interval_seconds": 20
+  },
+  "harness": {
+    "mode": "lead",
+    "max_steps": 30,
+    "lead_max_steps": 20,
+    "worker_max_steps": 30,
+    "max_browser_agents": 5,
+    "default_worker_concurrency": 3,
+    "worktree_dir": "worktree",
+    "memory_context": "ABCP agent harness: 使用浏览器原子能力完成用户任务；方法语义和参数以 System.getCapabilities 的 description 与 paramsSchema 为准。",
+    "screenshot_max_base64_chars": 0,
+    "max_observation_chars": 24000,
+    "offload_threshold_bytes": 8000,
+    "tool_result_offload_threshold_bytes": 50000,
+    "local_fs_max_read_bytes": 20000,
+    "progress_no_artifact_limit": 8,
+    "log_browser_payloads": true
+  }
+}

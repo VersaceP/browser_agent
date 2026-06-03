@@ -1,0 +1,23 @@
+{
+  "method": "Hitl.requestPause",
+  "description": "Pauses AI operation on the specified page for human intervention (CAPTCHA, login, manual review, etc.).",
+  "params": {
+    "pageId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "required": true
+    },
+    "reason": {
+      "type": "string",
+      "required": false
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you are requesting a pause, e.g., needing human input for a CAPTCHA",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you are requesting a pause, e.g., needing human input for a CAPTCHA"
+}

@@ -1,0 +1,18 @@
+{
+  "method": "Bookmark.isBookmarked",
+  "description": "Checks if a given URL is already bookmarked.",
+  "params": {
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "required": true
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you are checking the bookmark status, e.g., avoiding duplicating bookmarks",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you are checking the bookmark status, e.g., avoiding duplicating bookmarks"
+}

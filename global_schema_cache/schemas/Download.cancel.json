@@ -1,0 +1,19 @@
+{
+  "method": "Download.cancel",
+  "description": "Cancels an active or paused download.",
+  "params": {
+    "downloadId": {
+      "type": "integer",
+      "minimum": -9007199254740991,
+      "maximum": 9007199254740991,
+      "required": true
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you are canceling the download, e.g., realized the wrong file was being downloaded",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you are canceling the download, e.g., realized the wrong file was being downloaded"
+}

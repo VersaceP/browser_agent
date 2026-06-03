@@ -1,0 +1,13 @@
+{
+  "method": "History.clearAll",
+  "description": "Clears all browsing history entries.",
+  "params": {
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you are clearing all history, e.g., cleaning up traces after a task",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you are clearing all history, e.g., cleaning up traces after a task"
+}

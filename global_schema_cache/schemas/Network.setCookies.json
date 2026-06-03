@@ -1,0 +1,51 @@
+{
+  "method": "Network.setCookies",
+  "description": "Sets page cookies.",
+  "params": {
+    "pageId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "required": true
+    },
+    "cookies": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          },
+          "domain": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "httpOnly": {
+            "type": "boolean"
+          },
+          "secure": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "value"
+        ],
+        "additionalProperties": false
+      },
+      "required": true
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you are setting cookies, e.g., maintaining login state",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you are setting cookies, e.g., maintaining login state"
+}

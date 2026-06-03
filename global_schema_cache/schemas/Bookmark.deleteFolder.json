@@ -1,0 +1,19 @@
+{
+  "method": "Bookmark.deleteFolder",
+  "description": "Deletes a bookmark folder. Bookmarks inside are moved to root.",
+  "params": {
+    "id": {
+      "type": "integer",
+      "minimum": -9007199254740991,
+      "maximum": 9007199254740991,
+      "required": true
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you are deleting this folder, e.g., this category is no longer needed",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you are deleting this folder, e.g., this category is no longer needed"
+}

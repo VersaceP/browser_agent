@@ -1,0 +1,13 @@
+{
+  "method": "Memory.delete",
+  "description": "Delete the memory context for a specific scope.",
+  "params": {
+    "scope": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The scope to delete memory for.",
+      "required": true
+    }
+  },
+  "requiresPurpose": false
+}

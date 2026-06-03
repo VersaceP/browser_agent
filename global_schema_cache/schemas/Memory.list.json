@@ -1,0 +1,6 @@
+{
+  "method": "Memory.list",
+  "description": "List all memory entries for the current agent.",
+  "params": {},
+  "requiresPurpose": false
+}

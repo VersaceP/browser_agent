@@ -1,0 +1,12 @@
+{
+  "method": "System.describeAction",
+  "description": "Describe the schema and parameter details of a specific action.",
+  "params": {
+    "method": {
+      "type": "string",
+      "description": "The full method name to describe, e.g. \"DOM.click\"",
+      "required": true
+    }
+  },
+  "requiresPurpose": false
+}

@@ -1,0 +1,19 @@
+{
+  "method": "Bookmark.remove",
+  "description": "Removes a bookmark by ID.",
+  "params": {
+    "id": {
+      "type": "integer",
+      "minimum": -9007199254740991,
+      "maximum": 9007199254740991,
+      "required": true
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you are removing this bookmark, e.g., cleaning up unneeded saves",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you are removing this bookmark, e.g., cleaning up unneeded saves"
+}

@@ -1,0 +1,25 @@
+{
+  "agentId": "recon-shared",
+  "maxAbcpInstances": 2,
+  "startedAt": "2026-05-28T08:59:07+00:00",
+  "acquire": {
+    "mode": "reused",
+    "pageId": "9fbed207-c68c-4522-9d03-8bcab58cab5b",
+    "attempts": [
+      {
+        "round": 1,
+        "fleetCount": 2,
+        "pageCount": 1,
+        "pages": [
+          {
+            "pageId": "9fbed207-c68c-4522-9d03-8bcab58cab5b",
+            "status": "idle",
+            "url": null,
+            "fleetId": "ad8759bb-8617-43cf-8dbf-c8632b558c36"
+          }
+        ]
+      }
+    ]
+  },
+  "workingPageId": "9fbed207-c68c-4522-9d03-8bcab58cab5b"
+}

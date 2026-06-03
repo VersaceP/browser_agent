@@ -1,0 +1,6 @@
+{
+  "method": "Fleet.list",
+  "description": "Lists all active browser instances owned by the current Agent.",
+  "params": {},
+  "requiresPurpose": false
+}

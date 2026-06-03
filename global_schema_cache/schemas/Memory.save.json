@@ -1,0 +1,19 @@
+{
+  "method": "Memory.save",
+  "description": "Save or update context memory for a given scope. This memory identifies your role and mission within a fleet.",
+  "params": {
+    "scope": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The scope to bind this memory to. Use the same scope as your fleet for automatic association.",
+      "required": true
+    },
+    "context": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Free-text context describing your identity, role, and mission in this scope. Consider including: target website, current task status, login account, and any important notes.",
+      "required": true
+    }
+  },
+  "requiresPurpose": false
+}

@@ -1,0 +1,19 @@
+{
+  "method": "Download.openFile",
+  "description": "Opens a downloaded file with the system default application.",
+  "params": {
+    "downloadId": {
+      "type": "integer",
+      "minimum": -9007199254740991,
+      "maximum": 9007199254740991,
+      "required": true
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you are opening this file, e.g., viewing a downloaded PDF",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you are opening this file, e.g., viewing a downloaded PDF"
+}

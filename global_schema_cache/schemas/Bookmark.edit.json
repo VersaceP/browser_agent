@@ -1,0 +1,28 @@
+{
+  "method": "Bookmark.edit",
+  "description": "Edits an existing bookmark's title and/or URL.",
+  "params": {
+    "id": {
+      "type": "integer",
+      "minimum": -9007199254740991,
+      "maximum": 9007199254740991,
+      "required": true
+    },
+    "title": {
+      "type": "string",
+      "required": false
+    },
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "required": false
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you are editing this bookmark, e.g., correcting the title or URL",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you are editing this bookmark, e.g., correcting the title or URL"
+}

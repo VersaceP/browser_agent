@@ -1,0 +1,29 @@
+{
+  "method": "File.download",
+  "description": "Download a file from a URL to a specified local path via the browser session.",
+  "params": {
+    "pageId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "required": true
+    },
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "required": true
+    },
+    "savePath": {
+      "type": "string",
+      "minLength": 1,
+      "required": true
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you are downloading this file, e.g., saving report data",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you are downloading this file, e.g., saving report data"
+}

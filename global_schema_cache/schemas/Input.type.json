@@ -1,0 +1,39 @@
+{
+  "method": "Input.type",
+  "description": "Types text into the specified element. Target via CSS selector or canonical element id.",
+  "params": {
+    "pageId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "required": true
+    },
+    "selector": {
+      "type": "string",
+      "minLength": 1,
+      "required": false
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^\\d+:\\d+:\\d+$",
+      "required": false
+    },
+    "text": {
+      "type": "string",
+      "required": true
+    },
+    "delay": {
+      "default": 50,
+      "type": "number",
+      "minimum": 0,
+      "required": true
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you are typing this content, e.g., filling in a search keyword",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you are typing this content, e.g., filling in a search keyword"
+}

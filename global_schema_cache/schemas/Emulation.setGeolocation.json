@@ -1,0 +1,37 @@
+{
+  "method": "Emulation.setGeolocation",
+  "description": "Simulates geolocation information.",
+  "params": {
+    "pageId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "required": true
+    },
+    "latitude": {
+      "type": "number",
+      "minimum": -90,
+      "maximum": 90,
+      "required": true
+    },
+    "longitude": {
+      "type": "number",
+      "minimum": -180,
+      "maximum": 180,
+      "required": true
+    },
+    "accuracy": {
+      "default": 1,
+      "type": "number",
+      "minimum": 0,
+      "required": true
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you are emulating a geolocation, e.g., testing region-restricted content",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you are emulating a geolocation, e.g., testing region-restricted content"
+}

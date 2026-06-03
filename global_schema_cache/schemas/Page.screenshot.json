@@ -1,0 +1,83 @@
+{
+  "method": "Page.screenshot",
+  "description": "Takes a screenshot of the current page. Supports fullpage, region, selector, or canonical element id captures.",
+  "params": {
+    "pageId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "required": true
+    },
+    "fullPage": {
+      "default": false,
+      "type": "boolean",
+      "required": true
+    },
+    "x": {
+      "type": "integer",
+      "minimum": -9007199254740991,
+      "maximum": 9007199254740991,
+      "required": false
+    },
+    "y": {
+      "type": "integer",
+      "minimum": -9007199254740991,
+      "maximum": 9007199254740991,
+      "required": false
+    },
+    "width": {
+      "type": "integer",
+      "minimum": -9007199254740991,
+      "maximum": 9007199254740991,
+      "required": false
+    },
+    "height": {
+      "type": "integer",
+      "minimum": -9007199254740991,
+      "maximum": 9007199254740991,
+      "required": false
+    },
+    "selector": {
+      "type": "string",
+      "required": false
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^\\d+:\\d+:\\d+$",
+      "required": false
+    },
+    "options": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "default": "file",
+          "type": "string",
+          "enum": [
+            "base64",
+            "png",
+            "jpeg",
+            "dataUrl",
+            "file"
+          ]
+        },
+        "path": {
+          "type": "string"
+        },
+        "quality": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        }
+      },
+      "required": false,
+      "additionalProperties": false
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe what you want to verify with this screenshot, e.g., confirming search results have loaded",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe what you want to verify with this screenshot, e.g., confirming search results have loaded"
+}

@@ -1,0 +1,24 @@
+{
+  "method": "Bookmark.renameFolder",
+  "description": "Renames an existing bookmark folder.",
+  "params": {
+    "id": {
+      "type": "integer",
+      "minimum": -9007199254740991,
+      "maximum": 9007199254740991,
+      "required": true
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "required": true
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you are renaming this folder, e.g., better reflecting its contents",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you are renaming this folder, e.g., better reflecting its contents"
+}

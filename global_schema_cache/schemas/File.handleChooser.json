@@ -1,0 +1,30 @@
+{
+  "method": "File.handleChooser",
+  "description": "Handles native page file choosers.",
+  "params": {
+    "pageId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "required": true
+    },
+    "accept": {
+      "type": "boolean",
+      "required": true
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "required": false
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe your intent for handling this file chooser, e.g., uploading a document",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe your intent for handling this file chooser, e.g., uploading a document"
+}
