@@ -1,0 +1,6 @@
+{
+  "method": "System.listEvents",
+  "description": "Lists agent-visible push events; use it to understand notifications that may interrupt or update automation, not to invoke browser behavior.",
+  "params": {},
+  "requiresPurpose": false
+}

@@ -41,6 +41,9 @@
     "offload_threshold_bytes": 8000,
     "tool_result_offload_threshold_bytes": 50000,
     "local_fs_max_read_bytes": 20000,
+    "hitl_no_repause_cooldown_seconds": 8.0,
+    "hitl_post_resume_guard_seconds": 30.0,
+    "hitl_post_resume_confirm_max_rounds": 3,
     "progress_no_artifact_limit": 8,
     "log_browser_payloads": true
   }

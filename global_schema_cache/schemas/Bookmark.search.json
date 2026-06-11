@@ -5,10 +5,12 @@
     "query": {
       "type": "string",
       "minLength": 1,
+      "description": "Search text matched against bookmark title or URL.",
       "required": true
     },
     "limit": {
       "default": 200,
+      "description": "Maximum bookmark matches to return.",
       "type": "integer",
       "minimum": 1,
       "maximum": 1000,

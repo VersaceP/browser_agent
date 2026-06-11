@@ -1,24 +1,26 @@
 {
   "method": "Page.navigate",
-  "description": "Navigates to the specified URL.",
+  "description": "Navigates an existing pageId to a URL and starts an asynchronous page load; use Page.create when a new tab is needed.",
   "params": {
     "pageId": {
       "type": "string",
       "format": "uuid",
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Page ID to navigate.",
       "required": true
     },
     "url": {
       "type": "string",
       "format": "uri",
+      "description": "Destination URL to load.",
       "required": true
     },
     "purpose": {
       "type": "string",
-      "description": "Describe why you are navigating to this URL, e.g., visiting a product detail page",
+      "description": "Describe why this URL is needed for the task, e.g., opening a product detail page or returning to search results",
       "required": true
     }
   },
   "requiresPurpose": true,
-  "purposeHint": "Describe why you are navigating to this URL, e.g., visiting a product detail page"
+  "purposeHint": "Describe why this URL is needed for the task, e.g., opening a product detail page or returning to search results"
 }

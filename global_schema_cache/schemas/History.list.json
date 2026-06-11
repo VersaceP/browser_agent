@@ -4,6 +4,7 @@
   "params": {
     "limit": {
       "default": 200,
+      "description": "Maximum recent history entries to return.",
       "type": "integer",
       "minimum": 1,
       "maximum": 1000,

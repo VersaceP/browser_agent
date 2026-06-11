@@ -1,87 +1,379 @@
 {
   "version": 1,
-  "description": "Read-only v1 strategy bank. Raw attempts belong in strategy_attempts.jsonl; only stable, reusable strategies should live here.",
+  "description": "Read-only v1 strategy bank. Strategies are mode-level procedural defaults, not permissions and not task-specific scripts. Raw attempts belong in strategy_attempts.jsonl.",
   "strategies": [
     {
-      "id": "web_scrape.list_cards.extract_dom_records.pos_sort",
+      "id": "web_scrape.collection.repeated_dom",
       "task_types": ["web_scrape", "browser_data_collection"],
-      "stage": "list_extraction",
-      "phase_keywords": ["list", "rank", "card", "url", "href", "product"],
+      "stage": "collection",
+      "applies_to_stages": ["collection"],
+      "fallback": false,
+      "phase_keywords": ["collection", "list", "table", "grid", "card", "row", "item", "repeated"],
       "applies_when": [
-        "The page contains repeated product/article/list cards.",
-        "Items expose stable anchors such as /ai/, /product/, /tool/, or article URLs.",
-        "Visual order matters, including multi-column grids."
+        "A page exposes repeated items such as a list, table, grid, or card collection.",
+        "Target fields are visible text or attributes within each repeated item.",
+        "The collection can be explored through semantic perception and ordinary scrolling."
       ],
-      "preferred_tools": ["navigate_verified", "extract_dom_records", "record_extraction"],
-      "avoid_tools": ["DOM.getSemanticTree", "raw Runtime.evaluate", "large AXTree as final data source"],
+      "preferred_tools": [
+        "Page.getState",
+        "DOM.getAXTree",
+        "Input.scroll",
+        "DOM.getText",
+        "DOM.getAttribute",
+        "record_extraction"
+      ],
+      "cautioned_tools": ["extract_dom_records"],
+      "avoid_tools": ["Runtime.evaluate", "eval_js_json", "DOM.getSemanticTree"],
       "procedure": [
-        "Open or reuse a page, then navigate with navigate_verified.",
-        "Use extract_dom_records on repeated anchors/cards with includeRect=true.",
-        "Sort rows by rect.y, then rect.x, then DOM order.",
-        "Filter/dedupe target rows and call record_extraction within one step."
+        "Confirm page state, then use DOM.getAXTree to identify item boundaries, labels, controls, and stable anchors.",
+        "Scroll only when more items must be materialized; refresh DOM.getAXTree after scrolls.",
+        "Use DOM.getText for visible fields and DOM.getAttribute for attributes.",
+        "Use extract_dom_records only if the repeated structure is uniform and the preferred DOM path is insufficient.",
+        "Persist rows with record_extraction using exact expected_artifact field names."
       ],
-      "success_criteria": ["required row count", "unique URLs", "order/rank evidence"],
-      "failure_signatures": ["no anchors found", "lazy-load did not trigger", "rows lack hrefs"],
+      "success_criteria": [
+        "required row count is satisfied",
+        "row keys match expected_artifact",
+        "critical fields have page evidence",
+        "duplicates or empty critical fields are handled by validators"
+      ],
+      "failure_signatures": [
+        "items are not materialized after scroll",
+        "rows lack stable text or attributes",
+        "critical fields are derived only from loop index or visual position",
+        "record_extraction field names do not match expected_artifact"
+      ],
       "stats": {"success_count": 0, "fail_count": 0}
     },
     {
-      "id": "web_scrape.list_cards.eval_js_json.pos_sort_fallback",
+      "id": "web_scrape.collection.attribute_links",
       "task_types": ["web_scrape", "browser_data_collection"],
-      "stage": "list_extraction",
-      "phase_keywords": ["list", "rank", "card", "url", "href", "product"],
+      "stage": "attribute_links",
+      "applies_to_stages": ["attribute_links", "collection"],
+      "fallback": false,
+      "phase_keywords": ["href", "src", "link", "url", "attribute", "data-", "aria", "id"],
       "applies_when": [
-        "extract_dom_records cannot express the required relationship.",
-        "The target requires custom DOM traversal, computed style, or pageY/pageX sorting."
+        "The target output is mainly non-text attributes such as href, src, id, aria-*, data-*, or value.",
+        "The visible label and attribute source should be tied back to the same semantic item or control."
       ],
-      "preferred_tools": ["eval_js_json", "record_extraction"],
-      "avoid_tools": ["raw Runtime.evaluate", "DOM.getSemanticTree"],
+      "preferred_tools": [
+        "Page.getState",
+        "DOM.getAXTree",
+        "DOM.getAttribute",
+        "DOM.getText",
+        "record_extraction"
+      ],
+      "cautioned_tools": ["extract_dom_records"],
+      "avoid_tools": ["Runtime.evaluate", "eval_js_json", "DOM.getSemanticTree"],
       "procedure": [
-        "Use eval_js_json, not raw Runtime.evaluate, for structured JS return values.",
-        "Return JSON-serializable values only; do not return functions or DOM nodes.",
-        "Collect text, href, image alt, and bounding rect/page coordinates.",
-        "Call record_extraction immediately if rows are target data."
+        "Use DOM.getAXTree to locate the item/control/anchor associated with each attribute.",
+        "Use DOM.getAttribute for the target attribute value.",
+        "Use DOM.getText only to bind visible labels to the extracted attributes.",
+        "Avoid building URLs or attributes from string guesses when DOM.getAttribute can read them.",
+        "Persist rows with sourceSelectorOrAxId and pageUrl when attributes are critical."
       ],
-      "success_criteria": ["JSON value returned", "row objects have target fields"],
-      "failure_signatures": ["Runtime.evaluate returned null", "non-serializable return value"],
+      "success_criteria": [
+        "attributes are non-empty when required",
+        "URLs or ids satisfy validators",
+        "visible labels are bound to the same source element or item",
+        "row keys match expected_artifact"
+      ],
+      "failure_signatures": [
+        "attribute value is guessed from visible text",
+        "label and attribute come from unrelated nodes",
+        "relative/absolute URL handling is undocumented",
+        "selector is too fuzzy to identify one source element"
+      ],
       "stats": {"success_count": 0, "fail_count": 0}
     },
     {
-      "id": "web_scrape.detail_sections.dom_then_eval",
+      "id": "web_scrape.detail_sections.reveal_then_text",
       "task_types": ["web_scrape", "browser_data_collection"],
-      "stage": "detail_extraction",
-      "phase_keywords": ["detail", "reviews", "pros", "cons", "q&a", "qa", "faq"],
+      "stage": "detail_sections",
+      "applies_to_stages": ["detail_sections"],
+      "fallback": false,
+      "phase_keywords": ["detail", "section", "heading", "tab", "accordion", "expand", "show more", "anchor", "body"],
       "applies_when": [
-        "A detail page contains named sections, tabs, anchors, reviews, FAQs, or pros/cons blocks."
+        "A page contains named sections or detail regions whose bodies may need reveal actions.",
+        "Reveal mechanisms may include tabs, accordions, show-more buttons, anchor links, or scroll-triggered lazy loading.",
+        "The target output is section text, section structure, or section availability."
       ],
-      "preferred_tools": ["navigate_verified", "extract_dom_records", "eval_js_json", "record_extraction"],
-      "avoid_tools": ["DOM.getSemanticTree", "large AXTree as final data source"],
+      "preferred_tools": [
+        "Page.getState",
+        "DOM.getAXTree",
+        "Input.click",
+        "Input.scroll",
+        "DOM.getText",
+        "DOM.getAttribute",
+        "record_extraction"
+      ],
+      "cautioned_tools": ["visual_verify"],
+      "avoid_tools": ["Runtime.evaluate", "eval_js_json", "extract_dom_records", "DOM.getSemanticTree"],
       "procedure": [
-        "Navigate and verify URL/title first.",
-        "Use extract_dom_records for obvious repeated section rows.",
-        "Use eval_js_json for section-scoped text extraction when selectors are nested.",
-        "Persist a structured artifact with empty arrays for missing optional sections."
+        "Use DOM.getAXTree to locate headings, controls, tab labels, accordion buttons, show-more controls, anchor links, and section bodies.",
+        "Reveal hidden or lazy content through Input.click or Input.scroll only when the AXTree shows an appropriate control or target.",
+        "Refresh DOM.getAXTree after each reveal action and verify the intended state or subtree changed.",
+        "Use DOM.getText for final section text and DOM.getAttribute only for associated ids, hrefs, or state attributes.",
+        "If a section is absent or blocked, record an explicit empty/missing value with evidence rather than fabricating text."
       ],
-      "success_criteria": ["required fields present", "evidence URL matches target"],
-      "failure_signatures": ["section hidden behind tab", "accordion/lazy content not loaded"],
+      "success_criteria": [
+        "section presence or absence is explicit",
+        "final text comes from DOM.getText or cited AXTree text",
+        "reveal actions are verified before extraction",
+        "row keys match expected_artifact"
+      ],
+      "failure_signatures": [
+        "text is only a form prompt or placeholder",
+        "click did not change target state or subtree",
+        "visible selector points to a container unrelated to the target section",
+        "section body was summarized without DOM text evidence"
+      ],
       "stats": {"success_count": 0, "fail_count": 0}
     },
     {
-      "id": "fill_form.axtree_input_verify",
-      "task_types": ["fill_form", "browser_action"],
-      "stage": "form_fill",
-      "phase_keywords": ["form", "input", "submit", "login", "field"],
+      "id": "web_scrape.computed_relationship.eval_js",
+      "task_types": ["web_scrape", "browser_data_collection"],
+      "stage": "computed_relationship",
+      "applies_to_stages": ["computed_relationship"],
+      "fallback": false,
+      "phase_keywords": ["computed", "geometry", "coordinate", "relationship", "shadow", "iframe", "frame", "state", "javascript"],
       "applies_when": [
-        "The task requires filling standard form fields and submitting or saving."
+        "Native DOM.getAXTree, DOM.getText, and DOM.getAttribute cannot express a required computed relationship.",
+        "The required relation involves geometry, cross-node aggregation, shadow DOM, cross-frame content, or non-DOM browser state.",
+        "A native DOM cross-check can still validate at least one target field."
       ],
-      "preferred_tools": ["navigate_verified", "DOM.getAXTree", "Input.type", "Input.click", "Page.getState"],
-      "avoid_tools": ["DOM.getSemanticTree", "raw Runtime.evaluate"],
+      "preferred_tools": [
+        "DOM.getAXTree",
+        "eval_js_json",
+        "DOM.getText",
+        "DOM.getAttribute",
+        "record_extraction"
+      ],
+      "cautioned_tools": ["Runtime.evaluate"],
+      "avoid_tools": ["DOM.getSemanticTree", "unverified generated values"],
       "procedure": [
-        "Use AXTree to locate form controls and labels.",
-        "Use Input.type/Input.click with purpose fields.",
-        "Use Page.getState and visual_verify only for outcome/layout verification."
+        "State a valid reason_kind before eval_js_json: computed_geometry, cross_node_relationship, shadow_dom_traversal, cross_frame_aggregation, non_dom_state, or legacy_no_dom_equivalent.",
+        "Keep JavaScript scoped to the computed relationship; do not use it for text or attributes native DOM tools can read.",
+        "Return JSON-serializable values only.",
+        "Cross-check target fields with DOM.getText or DOM.getAttribute before record_extraction.",
+        "If cross-check is impossible, finalize with an explicit blocker rather than handing off unverified target data."
       ],
-      "success_criteria": ["field values entered", "submit outcome verified"],
-      "failure_signatures": ["captcha", "login wall", "occluding modal"],
+      "success_criteria": [
+        "reason_kind is valid",
+        "computed value is JSON-serializable",
+        "critical fields have native DOM cross-check evidence",
+        "record_extraction documents source and cross-check"
+      ],
+      "failure_signatures": [
+        "reason is generic or circular",
+        "JavaScript returns non-serializable objects",
+        "target fields have no DOM cross-check",
+        "Runtime.evaluate is used for ordinary text/attribute extraction"
+      ],
+      "stats": {"success_count": 0, "fail_count": 0}
+    },
+    {
+      "id": "browser_action.form_interaction.axtree_input",
+      "task_types": ["form_fill", "browser_action"],
+      "stage": "form_interaction",
+      "applies_to_stages": ["form_interaction"],
+      "fallback": false,
+      "phase_keywords": ["form", "field", "input", "select", "checkbox", "submit", "save", "login"],
+      "applies_when": [
+        "The task requires interacting with controls, entering values, submitting a form, or verifying an action result.",
+        "Controls can be found through labels, roles, names, or accessible state."
+      ],
+      "preferred_tools": [
+        "Page.getState",
+        "DOM.getAXTree",
+        "Input.click",
+        "Input.type",
+        "Input.press",
+        "DOM.getAttribute",
+        "DOM.getText",
+        "record_extraction"
+      ],
+      "cautioned_tools": ["visual_verify"],
+      "avoid_tools": ["Runtime.evaluate", "eval_js_json", "DOM.getSemanticTree"],
+      "procedure": [
+        "Locate controls and labels with DOM.getAXTree.",
+        "Fill values with Input.type/Input.press and toggle/select with Input.click using AXTree ids or stable selectors.",
+        "Verify entered values with DOM.getAttribute(value) or refreshed AXTree state.",
+        "Before submit/save, call Page.getState to catch unexpected dialogs or navigation state.",
+        "After submit/save, verify the result with Page.getState, DOM.getAXTree, DOM.getText, or visual_verify only when DOM evidence is insufficient."
+      ],
+      "success_criteria": [
+        "target controls receive intended values",
+        "submit/save result is verified",
+        "blocking dialogs/overlays are handled or reported",
+        "final state evidence is persisted when required"
+      ],
+      "failure_signatures": [
+        "control label cannot be tied to input",
+        "entered value is not reflected in DOM state",
+        "submission outcome is assumed without verification",
+        "CAPTCHA/login/payment/permission wall blocks completion"
+      ],
+      "stats": {"success_count": 0, "fail_count": 0}
+    },
+    {
+      "id": "browser_action.overlay.dismiss_ladder",
+      "task_types": ["general", "web_search", "web_scrape", "form_fill", "browser_action"],
+      "stage": "overlay_recovery",
+      "applies_to_stages": [
+        "collection",
+        "detail_sections",
+        "attribute_links",
+        "form_interaction",
+        "computed_relationship",
+        "generic"
+      ],
+      "fallback": true,
+      "cross_cutting": true,
+      "phase_keywords": [
+        "occluded",
+        "overlay",
+        "modal",
+        "dialog",
+        "blocked",
+        "sign in",
+        "popup",
+        "banner",
+        "backdrop"
+      ],
+      "applies_when": [
+        "Input.click reports that the target element is occluded or mouse action is blocked.",
+        "DOM.getText or DOM.getAttribute returns a visibility, viewport, or occlusion warning.",
+        "DOM.getAXTree shows a dialog, alertdialog, login prompt, banner, or overlay covering target content."
+      ],
+      "preferred_tools": [
+        "Page.getState",
+        "DOM.getAXTree",
+        "Input.click",
+        "Input.press",
+        "DOM.getText",
+        "DOM.getAttribute",
+        "eval_js_json"
+      ],
+      "cautioned_tools": ["visual_verify", "Runtime.evaluate"],
+      "avoid_tools": ["DOM.getSemanticTree", "repeating the same blocked click"],
+      "procedure": [
+        "Refresh DOM.getAXTree and identify the blocking overlay, modal, or dialog text before retrying the original action.",
+        "If a close, dismiss, not-now, skip, or X control is visible in the current AXTree, click it with its canonical id.",
+        "If no explicit close control is available, try Input.press with Escape and refresh DOM.getAXTree.",
+        "If Escape fails and the prompt appears dismissible, verify a backdrop/outside click target before clicking: use eval_js_json with reason_kind=computed_geometry to inspect document.elementFromPoint at a proposed outside point and confirm it maps to the overlay/backdrop/container, not a login, payment, provider, consent-submit, navigation, or content control.",
+        "Use Input.click with x/y only after that elementFromPoint verification; otherwise report the blocker.",
+        "After each dismiss attempt, verify the overlay text disappeared with DOM.getAXTree before retrying the original blocked action once.",
+        "If the overlay persists, report the blocker or switch to an auth/session strategy instead of looping."
+      ],
+      "success_criteria": [
+        "overlay disappearance is verified",
+        "the original action is retried at most once after dismissal",
+        "sensitive login/payment/provider buttons are not clicked automatically"
+      ],
+      "failure_signatures": [
+        "overlay persists after Escape/backdrop/close attempts",
+        "dismiss action caused navigation or clicked a sensitive submit control",
+        "the same occluded click is repeated without refreshing DOM.getAXTree"
+      ],
+      "stats": {"success_count": 0, "fail_count": 0}
+    },
+    {
+      "id": "browser_action.overlay.auth_persist_fleet",
+      "task_types": ["general", "web_search", "web_scrape", "form_fill", "browser_action"],
+      "stage": "overlay_recovery",
+      "applies_to_stages": [
+        "collection",
+        "detail_sections",
+        "attribute_links",
+        "form_interaction",
+        "computed_relationship",
+        "generic"
+      ],
+      "fallback": true,
+      "cross_cutting": true,
+      "phase_keywords": [
+        "login wall",
+        "auth",
+        "sign in to continue",
+        "sign in with google",
+        "account",
+        "session",
+        "fleet"
+      ],
+      "applies_when": [
+        "A login or account prompt blocks the task and the dismiss ladder cannot clear it.",
+        "The user may have an existing authenticated fleet/session for the same origin.",
+        "The task should avoid repeated manual login across workers."
+      ],
+      "preferred_tools": [
+        "Memory.get",
+        "Fleet.status",
+        "Page.create",
+        "Page.getState",
+        "DOM.getAXTree",
+        "Hitl.requestPause",
+        "Memory.save"
+      ],
+      "cautioned_tools": ["Network.getCookies", "Network.setCookies"],
+      "avoid_tools": ["storing passwords", "storing private tokens", "clicking provider login buttons automatically"],
+      "procedure": [
+        "Treat auth memory as an index only: use Memory scope auth_fleet_sessions_v1 with kind auth_fleet_session_index for origin/account label to fleetId and verification timestamps, never as a credential store.",
+        "Before using a remembered fleetId, verify Fleet.status or Page.create can revive it, then open the origin and confirm the login prompt is gone.",
+        "If the remembered session is stale, mark it stale in Memory and continue with the normal blocker flow.",
+        "If no reusable session exists, call Hitl.requestPause with a purpose that asks the user to complete login and keep the tab/fleet open.",
+        "After HITL login resumes, verify the page is usable and save a refreshed auth-session memory entry for future workers."
+      ],
+      "success_criteria": [
+        "a reused fleet is verified before task continuation",
+        "expired sessions are marked stale instead of reused blindly",
+        "no plaintext credentials or private tokens are stored in Memory"
+      ],
+      "failure_signatures": [
+        "remembered fleet is archived, missing, or still shows the auth prompt",
+        "Memory contains credentials instead of session metadata",
+        "worker repeatedly asks for login without checking auth memory"
+      ],
+      "stats": {"success_count": 0, "fail_count": 0}
+    },
+    {
+      "id": "hitl.guard.before_request_pause",
+      "task_types": ["general", "web_search", "web_scrape", "form_fill", "browser_action"],
+      "stage": "hitl_guard",
+      "applies_to_stages": [
+        "collection",
+        "detail_sections",
+        "attribute_links",
+        "form_interaction",
+        "computed_relationship",
+        "generic"
+      ],
+      "fallback": true,
+      "cross_cutting": true,
+      "phase_keywords": ["hitl", "captcha", "challenge", "login", "approval", "manual"],
+      "applies_when": [
+        "A page may require human login, CAPTCHA, approval, payment confirmation, or manual review.",
+        "The worker is considering Hitl.requestPause or has just resumed from HITL."
+      ],
+      "preferred_tools": ["Page.getState", "DOM.getAXTree", "Hitl.requestPause"],
+      "cautioned_tools": ["Hitl.resolvePause"],
+      "avoid_tools": ["calling Hitl.resolvePause from the worker after requestPause", "polling browser tools while paused"],
+      "procedure": [
+        "Before requesting HITL for ordinary overlays, first verify page state and run the overlay dismiss ladder when it is safe.",
+        "Use Hitl.requestPause only for CAPTCHA, hard auth walls, sensitive approval, manual review, or overlays that cannot be safely dismissed.",
+        "After Hitl.requestPause succeeds, the harness owns wait, resolve, and confirmation; do not call Hitl.resolvePause yourself.",
+        "Continue only when hitl_wait.status is resumed; otherwise finalize with a blocker."
+      ],
+      "success_criteria": [
+        "HITL is reserved for genuine user action requirements",
+        "the worker does not self-resolve its own pause",
+        "post-HITL page state is re-synchronized before DOM/Input actions"
+      ],
+      "failure_signatures": [
+        "Hitl.requestPause is used for a dismissible overlay before trying safe dismissal",
+        "Hitl.resolvePause is called by the worker after requestPause",
+        "worker continues DOM/Input calls while the page is paused"
+      ],
       "stats": {"success_count": 0, "fail_count": 0}
     }
   ]

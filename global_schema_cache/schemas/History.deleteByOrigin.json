@@ -5,6 +5,7 @@
     "origin": {
       "type": "string",
       "minLength": 1,
+      "description": "Origin string to delete history for, such as \"https://example.com\".",
       "required": true
     },
     "purpose": {

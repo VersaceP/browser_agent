@@ -1,29 +1,32 @@
 {
   "method": "Runtime.evaluate",
-  "description": "Executes JavaScript code in the context of the page.",
+  "description": "Executes custom JavaScript in the page as a high-risk fallback; use only when structured DOM, Page, Network, or Input actions cannot access the required data or behavior.",
   "params": {
     "pageId": {
       "type": "string",
       "format": "uuid",
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Page ID where the JavaScript should run.",
       "required": true
     },
     "expression": {
       "type": "string",
       "minLength": 1,
+      "description": "JavaScript expression to evaluate in the page context.",
       "required": true
     },
     "returnByValue": {
       "default": true,
+      "description": "Return JSON-serializable values directly when true.",
       "type": "boolean",
       "required": true
     },
     "purpose": {
       "type": "string",
-      "description": "Describe why you are executing JavaScript, e.g., extracting dynamic page data",
+      "description": "Describe why custom JavaScript is necessary and why structured actions are insufficient",
       "required": true
     }
   },
   "requiresPurpose": true,
-  "purposeHint": "Describe why you are executing JavaScript, e.g., extracting dynamic page data"
+  "purposeHint": "Describe why custom JavaScript is necessary and why structured actions are insufficient"
 }

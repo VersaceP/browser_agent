@@ -1,0 +1,12 @@
+{
+  "method": "Workflow.getGuide",
+  "description": "Retrieve the workflow orchestration guide and syntax documentation to write correct sequential steps.",
+  "params": {
+    "skillFile": {
+      "description": "Return the workflow guide as a file path instead of inline content when true.",
+      "type": "boolean",
+      "required": false
+    }
+  },
+  "requiresPurpose": false
+}

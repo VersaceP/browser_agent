@@ -5,17 +5,21 @@
     "url": {
       "type": "string",
       "format": "uri",
+      "description": "Bookmark target URL.",
       "required": true
     },
     "title": {
       "type": "string",
+      "description": "Bookmark title to save.",
       "required": true
     },
     "faviconUrl": {
+      "description": "Optional favicon URL to store with the bookmark.",
       "type": "string",
       "required": false
     },
     "folderId": {
+      "description": "Destination folder ID; use null or omit for the root folder.",
       "anyOf": [
         {
           "type": "integer",

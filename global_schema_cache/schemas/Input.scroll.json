@@ -1,24 +1,28 @@
 {
   "method": "Input.scroll",
-  "description": "Scrolls the page or a specific element. Target via CSS selector or canonical element id, or omit both to scroll the viewport.",
+  "description": "Scrolls the viewport or a known scrollable element to reveal more content; prefer canonical ids or stable selectors for nested containers, and omit both for viewport scrolling.",
   "params": {
     "pageId": {
       "type": "string",
       "format": "uuid",
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Page ID whose viewport or element should be scrolled.",
       "required": true
     },
     "selector": {
+      "description": "Fallback CSS selector for the scroll container.",
       "type": "string",
       "required": false
     },
     "id": {
+      "description": "Preferred canonical element ID for the scroll container.",
       "type": "string",
       "pattern": "^\\d+:\\d+:\\d+$",
       "required": false
     },
     "direction": {
       "default": "down",
+      "description": "Scroll direction.",
       "type": "string",
       "enum": [
         "up",
@@ -30,16 +34,17 @@
     },
     "amount": {
       "default": 300,
+      "description": "Scroll distance in CSS pixels.",
       "type": "number",
       "minimum": 0,
       "required": true
     },
     "purpose": {
       "type": "string",
-      "description": "Describe why you are scrolling, e.g., viewing content at the bottom of the page",
+      "description": "Describe why scrolling is needed, e.g., loading more results, revealing a target section, or moving inside a nested scroll container",
       "required": true
     }
   },
   "requiresPurpose": true,
-  "purposeHint": "Describe why you are scrolling, e.g., viewing content at the bottom of the page"
+  "purposeHint": "Describe why scrolling is needed, e.g., loading more results, revealing a target section, or moving inside a nested scroll container"
 }

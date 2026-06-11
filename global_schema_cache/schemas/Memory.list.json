@@ -1,6 +1,6 @@
 {
   "method": "Memory.list",
-  "description": "List all memory entries for the current agent.",
+  "description": "Lists all agent-scoped task memory records so the agent can choose the correct scope before resuming, recovering, or updating context.",
   "params": {},
   "requiresPurpose": false
 }

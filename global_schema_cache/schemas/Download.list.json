@@ -4,6 +4,7 @@
   "params": {
     "limit": {
       "default": 100,
+      "description": "Maximum recent download records to return.",
       "type": "integer",
       "minimum": 1,
       "maximum": 1000,

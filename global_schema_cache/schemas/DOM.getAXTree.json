@@ -1,19 +1,20 @@
 {
   "method": "DOM.getAXTree",
-  "description": "Retrieves a noise-reduced accessibility tree in \"Golden Format\". Hierarchy is shown by space indentation. Each element is represented as: [id] role \"name\" (val: v) [checked] [disabled] [#]. The \"[id]\" is the canonical element id in \"frameId:axNodeId:domNodeId\" format for subsequent element-targeting actions.",
+  "description": "Retrieves a noise-reduced accessibility tree as the default page perception entry for locating interactive targets and canonical ids; do not use it when you specifically need raw DOM tag hierarchy or attributes.",
   "params": {
     "pageId": {
       "type": "string",
       "format": "uuid",
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Page ID whose accessibility tree should be returned.",
       "required": true
     },
     "purpose": {
       "type": "string",
-      "description": "Describe why you need the accessibility tree, e.g., locating interactive elements",
+      "description": "Describe why you need accessibility semantics, e.g., locating a clickable target, checking enabled/checked state, or refreshing canonical element ids",
       "required": true
     }
   },
   "requiresPurpose": true,
-  "purposeHint": "Describe why you need the accessibility tree, e.g., locating interactive elements"
+  "purposeHint": "Describe why you need accessibility semantics, e.g., locating a clickable target, checking enabled/checked state, or refreshing canonical element ids"
 }

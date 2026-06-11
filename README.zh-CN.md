@@ -229,26 +229,10 @@ Harness 会记录 provider 返回的单次调用 cache 指标：
 - `spawn_browser_agent`: 启动一个隔离的 BrowserAgent。
 - `wait_browser_agents`: 等待一个或多个 browser worker。
 - `list_browser_agents`: 查看当前 worker 状态。
-- `run_skill_agent`: 将浏览器 trace 总结为可复用策略或 ABCP step 模板。
-- `execute_abcp_plan`: 对单个 item 执行确定性的 ABCP method steps。
-- `run_abcp_plan_batch`: 对多个 item 复用同一个确定性 plan，并支持先验证再并发。
-- `run_browser_batch`: 为异构页面或需要 LLM 判断的任务派生多个 BrowserAgent。
+- `lead_save_artifact`: 基于可信 extraction 证据保存 LeadAgent 重塑后的结构化行。
 - `final_answer`: 结束 LeadAgent 运行。
 
-复杂结构参数会以 JSON 字符串形式传入，以兼容 strict tool schema。例如：
-
-```json
-{
-  "items_json": "[{\"url\":\"https://example.com\"}]",
-  "variables_json": "{}",
-  "steps_json": "[{\"method\":\"Page.navigate\",\"params\":{\"pageId\":\"...\",\"url\":\"{item.url}\"},\"save_as\":\"page\"}]",
-  "context_template": "采集 {item.url}",
-  "concurrency": 3,
-  "validate_first_n": 1
-}
-```
-
-BrowserAgent 的 `browser_call` 使用：
+LeadAgent 应通过 BrowserAgent phase 编排任务。BrowserAgent 的 `browser_call` 使用：
 
 ```json
 {
@@ -261,18 +245,14 @@ BrowserAgent 的 `browser_call` 使用：
 }
 ```
 
-## 典型批量流程
+## 典型编排流程
 
 ```text
 LeadAgent 接收任务
-  -> spawn_browser_agent: 探索列表页并收集详情页 URL
-  -> spawn_browser_agent: 探索一个详情页并验证字段/selector
-  -> run_skill_agent: 将 trace 转成确定性 ABCP steps
-  -> run_abcp_plan_batch(validate_first_n=2 or 3): 先验证样本，再并发执行剩余 item
-     -> validation_failed: 查看 failed_details，修正 steps，重试样本
-     -> validation_hitl_required: 等待人工介入后重试
-     -> partial_failed / partial_hitl_required: 仅重试或降级失败 item
+  -> emit_task_plan: 按 task_type 和 phase 拆分
+  -> spawn_browser_agent: 用精确 expected fields 处理第一个 pending phase
+  -> 校验 extraction artifacts 和 resultLevels
+  -> lead_save_artifact: 仅在 schema_mismatch 且证据可信时重塑并保存
+  -> 缺证/错证时 replan，或只派一个更聚焦的 continuation
   -> final_answer: 汇总成功、失败和阻塞项
 ```
-
-只有在确定性 ABCP plan 不可复用，或页面确实需要 LLM 判断时，才建议使用 `run_browser_batch`。

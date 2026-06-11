@@ -32,7 +32,7 @@ SKILLS_DOC_CAPABILITY = "System.skillsDoc"
 @dataclass
 class CapabilityBundle:
     """All capability/schema info derived at bootstrap. Passed by reference
-    to BrowserAgent, ABCPPlanExecutor, and prompt builders."""
+    to BrowserAgent and prompt builders."""
 
     capabilities: List[JsonDict] = field(default_factory=list)
     capability_methods: Set[str] = field(default_factory=set)
@@ -248,7 +248,7 @@ def build_capability_digest(bundle: CapabilityBundle) -> str:
     }
     lines: List[str] = []
     for method in sorted(bundle.capability_methods):
-        schema = bundle.method_schemas.get(method)
+        schema: dict[str, Any] | None = bundle.method_schemas.get(method)
         description = ""
         required: List[str] = []
         if isinstance(schema, dict):

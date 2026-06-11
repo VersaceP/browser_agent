@@ -147,12 +147,28 @@ class AnthropicProvider(BaseLLMProvider):
             else False if prior_reject_fallback else None,
             fallback=prior_reject_fallback,
         )
+        timeout_retries = 0
+
+        async def request_with_timeout(request_kwargs: Dict[str, Any]):
+            nonlocal timeout_retries
+            try:
+                return await asyncio.wait_for(
+                    self.client.messages.create(**request_kwargs),
+                    timeout=LLM_API_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                timeout_retries += 1
+                _emit_cache_log(
+                    "[Anthropic] messages.create timed out; retrying once"
+                )
+                await asyncio.sleep(1.0)
+                return await asyncio.wait_for(
+                    self.client.messages.create(**request_kwargs),
+                    timeout=LLM_API_TIMEOUT,
+                )
 
         try:
-            response = await asyncio.wait_for(
-                self.client.messages.create(**kwargs),
-                timeout=LLM_API_TIMEOUT,
-            )
+            response = await request_with_timeout(kwargs)
         except Exception as exc:
             if not effective_cache_enabled or not _is_cache_control_rejection(exc):
                 raise
@@ -168,10 +184,7 @@ class AnthropicProvider(BaseLLMProvider):
             _emit_cache_log(
                 "[Anthropic Cache] cache_control rejected; retrying without markers"
             )
-            response = await asyncio.wait_for(
-                self.client.messages.create(**fallback_kwargs),
-                timeout=LLM_API_TIMEOUT,
-            )
+            response = await request_with_timeout(fallback_kwargs)
             self._cache_control_disabled_after_reject = True
 
         # 缓存命中观测(设置环境变量 LLM_CACHE_DEBUG=1 打开)
@@ -224,6 +237,7 @@ class AnthropicProvider(BaseLLMProvider):
             "uncached_input": uncached_input,
             "output": output_tokens,
             "cache_diagnostics": cache_diagnostics,
+            "timeout_retries": timeout_retries,
             "_assistant_prefix_blocks": assistant_prefix_blocks,
         }
 

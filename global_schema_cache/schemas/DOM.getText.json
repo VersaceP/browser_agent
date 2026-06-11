@@ -1,29 +1,32 @@
 {
   "method": "DOM.getText",
-  "description": "Gets the text content of the specified element.",
+  "description": "Performs a focused text read from a known element by selector or canonical id for verification or extraction; use DOM.getAXTree first when the target element is not yet identified.",
   "params": {
     "pageId": {
       "type": "string",
       "format": "uuid",
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Page ID containing the target element.",
       "required": true
     },
     "selector": {
+      "description": "Fallback CSS selector for the target element.",
       "type": "string",
       "minLength": 1,
       "required": false
     },
     "id": {
+      "description": "Preferred canonical element ID from DOM.getAXTree.",
       "type": "string",
       "pattern": "^\\d+:\\d+:\\d+$",
       "required": false
     },
     "purpose": {
       "type": "string",
-      "description": "Describe why you need this text, e.g., verifying a login success message",
+      "description": "Describe why this element text is needed, e.g., verifying a success message, reading a result section, or extracting submitted feedback",
       "required": true
     }
   },
   "requiresPurpose": true,
-  "purposeHint": "Describe why you need this text, e.g., verifying a login success message"
+  "purposeHint": "Describe why this element text is needed, e.g., verifying a success message, reading a result section, or extracting submitted feedback"
 }

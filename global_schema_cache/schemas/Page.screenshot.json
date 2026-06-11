@@ -1,56 +1,66 @@
 {
   "method": "Page.screenshot",
-  "description": "Takes a screenshot of the current page. Supports fullpage, region, selector, or canonical element id captures.",
+  "description": "Captures visual evidence for rendering, canvas/graphics, layout, or audit proof; do not use screenshots to read ordinary text that DOM actions can retrieve.",
   "params": {
     "pageId": {
       "type": "string",
       "format": "uuid",
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Page ID to capture.",
       "required": true
     },
     "fullPage": {
       "default": false,
+      "description": "Capture the full scrollable page when true.",
       "type": "boolean",
       "required": true
     },
     "x": {
+      "description": "Left coordinate for region capture.",
       "type": "integer",
       "minimum": -9007199254740991,
       "maximum": 9007199254740991,
       "required": false
     },
     "y": {
+      "description": "Top coordinate for region capture.",
       "type": "integer",
       "minimum": -9007199254740991,
       "maximum": 9007199254740991,
       "required": false
     },
     "width": {
+      "description": "Region width for partial capture.",
       "type": "integer",
       "minimum": -9007199254740991,
       "maximum": 9007199254740991,
       "required": false
     },
     "height": {
+      "description": "Region height for partial capture.",
       "type": "integer",
       "minimum": -9007199254740991,
       "maximum": 9007199254740991,
       "required": false
     },
     "selector": {
+      "description": "Fallback CSS selector for element capture.",
       "type": "string",
       "required": false
     },
     "id": {
+      "description": "Preferred canonical element ID for element capture.",
       "type": "string",
       "pattern": "^\\d+:\\d+:\\d+$",
       "required": false
     },
     "options": {
+      "description": "Output options for the screenshot result.",
       "type": "object",
       "properties": {
         "format": {
           "default": "file",
+          "description": "Output format for the screenshot payload.",
           "type": "string",
           "enum": [
             "base64",
@@ -61,9 +71,11 @@
           ]
         },
         "path": {
+          "description": "Output path when format is \"file\".",
           "type": "string"
         },
         "quality": {
+          "description": "JPEG quality when format is \"jpeg\".",
           "type": "integer",
           "minimum": 1,
           "maximum": 100
@@ -74,10 +86,10 @@
     },
     "purpose": {
       "type": "string",
-      "description": "Describe what you want to verify with this screenshot, e.g., confirming search results have loaded",
+      "description": "Describe the visual condition to verify, e.g., canvas output, layout overlap, CAPTCHA state, or proof-of-work screen",
       "required": true
     }
   },
   "requiresPurpose": true,
-  "purposeHint": "Describe what you want to verify with this screenshot, e.g., confirming search results have loaded"
+  "purposeHint": "Describe the visual condition to verify, e.g., canvas output, layout overlap, CAPTCHA state, or proof-of-work screen"
 }

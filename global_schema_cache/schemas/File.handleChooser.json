@@ -6,13 +6,16 @@
       "type": "string",
       "format": "uuid",
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Page ID with the pending file chooser.",
       "required": true
     },
     "accept": {
       "type": "boolean",
+      "description": "True to accept the chooser, false to cancel it.",
       "required": true
     },
     "files": {
+      "description": "File paths to submit when accepting the chooser.",
       "type": "array",
       "items": {
         "type": "string"

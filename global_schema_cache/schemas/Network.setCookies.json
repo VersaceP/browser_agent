@@ -6,6 +6,7 @@
       "type": "string",
       "format": "uuid",
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Page ID whose session should receive the cookies.",
       "required": true
     },
     "cookies": {
@@ -14,21 +15,27 @@
         "type": "object",
         "properties": {
           "name": {
-            "type": "string"
+            "type": "string",
+            "description": "Cookie name."
           },
           "value": {
-            "type": "string"
+            "type": "string",
+            "description": "Cookie value."
           },
           "domain": {
+            "description": "Cookie domain; omit to use the current page domain.",
             "type": "string"
           },
           "path": {
+            "description": "Cookie path; omit for the default path.",
             "type": "string"
           },
           "httpOnly": {
+            "description": "Mark the cookie as HttpOnly when true.",
             "type": "boolean"
           },
           "secure": {
+            "description": "Mark the cookie as Secure when true.",
             "type": "boolean"
           }
         },
@@ -38,6 +45,7 @@
         ],
         "additionalProperties": false
       },
+      "description": "Cookies to set for the page session.",
       "required": true
     },
     "purpose": {

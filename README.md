@@ -229,26 +229,10 @@ The harness records per-call cache metrics returned by the provider:
 - `spawn_browser_agent`: start an isolated BrowserAgent.
 - `wait_browser_agents`: wait for one or more browser workers.
 - `list_browser_agents`: inspect active workers.
-- `run_skill_agent`: summarize browser traces into reusable strategies or ABCP step templates.
-- `execute_abcp_plan`: run deterministic ABCP method steps for one item.
-- `run_abcp_plan_batch`: run one deterministic plan across many items with validation-first batching.
-- `run_browser_batch`: spawn multiple BrowserAgents for heterogeneous or judgment-heavy pages.
+- `lead_save_artifact`: persist LeadAgent-reshaped rows from trusted extraction evidence.
 - `final_answer`: finish the LeadAgent run.
 
-Complex structure arguments are passed as JSON strings for strict tool compatibility. For example:
-
-```json
-{
-  "items_json": "[{\"url\":\"https://example.com\"}]",
-  "variables_json": "{}",
-  "steps_json": "[{\"method\":\"Page.navigate\",\"params\":{\"pageId\":\"...\",\"url\":\"{item.url}\"},\"save_as\":\"page\"}]",
-  "context_template": "Collect {item.url}",
-  "concurrency": 3,
-  "validate_first_n": 1
-}
-```
-
-BrowserAgent's `browser_call` uses:
+LeadAgent should use BrowserAgent phases. BrowserAgent's `browser_call` uses:
 
 ```json
 {
@@ -261,18 +245,14 @@ BrowserAgent's `browser_call` uses:
 }
 ```
 
-## Typical Batch Flow
+## Typical Orchestration Flow
 
 ```text
 LeadAgent receives task
-  -> spawn_browser_agent: inspect list page and collect detail URLs
-  -> spawn_browser_agent: inspect one detail page and validate fields/selectors
-  -> run_skill_agent: convert traces into deterministic ABCP steps
-  -> run_abcp_plan_batch(validate_first_n=2 or 3): validate samples, then run remaining items concurrently
-     -> validation_failed: inspect failed_details, fix steps, retry samples
-     -> validation_hitl_required: wait for human intervention, then retry
-     -> partial_failed / partial_hitl_required: retry or downgrade only failed_items
+  -> emit_task_plan: split by task_type and phase
+  -> spawn_browser_agent: collect the first pending phase with exact expected fields
+  -> validate extraction artifacts and resultLevels
+  -> lead_save_artifact: reshape trusted rows only when validation is schema_mismatch
+  -> replan or spawn one focused continuation when evidence is missing/wrong
   -> final_answer: summarize successes, failures, and blocked items
 ```
-
-Use `run_browser_batch` only when deterministic ABCP plans are not reusable or the page requires LLM judgment.

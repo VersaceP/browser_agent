@@ -15,10 +15,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 JsonDict = Dict[str, Any]
 EventSink = Callable[[str, JsonDict], None]
-LLM_HIDDEN_FIELDS = {"suggested_prompt"}
-_SUGGESTED_PROMPT_STRING_RE = re.compile(
-    r'\s*,?\s*"suggested_prompt"\s*:\s*"(?:\\.|[^"\\])*"\s*,?'
-)
+LLM_HIDDEN_FIELDS: Set[str] = set()
 
 
 def _resolve_context_file(context_file: Optional[str]) -> Optional[Path]:
@@ -75,6 +72,7 @@ class UsageBucket:
     cache_creation: int = 0
     uncached_input: int = 0
     output: int = 0
+    timeout_retries: int = 0
 
     def add(
         self,
@@ -82,12 +80,14 @@ class UsageBucket:
         cache_creation: int,
         uncached_input: int,
         output: int,
+        timeout_retries: int = 0,
     ) -> None:
         self.calls += 1
         self.cache_read += cache_read
         self.cache_creation += cache_creation
         self.uncached_input += uncached_input
         self.output += output
+        self.timeout_retries += timeout_retries
 
     def summary(self) -> JsonDict:
         return {
@@ -96,6 +96,7 @@ class UsageBucket:
             "cache_creation": self.cache_creation,
             "uncached_input": self.uncached_input,
             "output": self.output,
+            "timeout_retries": self.timeout_retries,
             "cache_read_rate": _cache_rate(
                 self.cache_read,
                 self.cache_creation,
@@ -130,10 +131,23 @@ class UsageAggregator:
         cache_creation = _usage_int(usage, "cache_creation")
         uncached_input = _usage_int(usage, "uncached_input")
         output = _usage_int(usage, "output")
+        timeout_retries = _usage_int(usage, "timeout_retries")
 
-        self.total.add(cache_read, cache_creation, uncached_input, output)
+        self.total.add(
+            cache_read,
+            cache_creation,
+            uncached_input,
+            output,
+            timeout_retries,
+        )
         bucket = self.by_source.setdefault(source, UsageBucket())
-        bucket.add(cache_read, cache_creation, uncached_input, output)
+        bucket.add(
+            cache_read,
+            cache_creation,
+            uncached_input,
+            output,
+            timeout_retries,
+        )
         if context_hash:
             self.context_hashes.add(context_hash)
 
@@ -180,6 +194,7 @@ class UsageAggregator:
             "cache_creation": cache_creation,
             "uncached_input": uncached_input,
             "output": output,
+            "timeout_retries": timeout_retries,
             "cache_read_rate": _cache_rate(
                 cache_read,
                 cache_creation,
@@ -298,11 +313,13 @@ def trim_large_strings(value: Any, max_chars: int) -> Any:
 
 
 def strip_llm_hidden_fields(value: Any) -> Any:
-    """Remove server steering fields from model-facing payloads.
+    """Remove fields configured as hidden from model-facing payloads.
 
-    Raw run logs keep the original ABCP response. This function is only for
-    values that are about to be placed back into the LLM conversation.
+    `suggested_prompt` is intentionally model-facing: ABCP uses it for
+    next-step and recovery guidance, so it must remain in context.
     """
+    if not LLM_HIDDEN_FIELDS:
+        return value
     if isinstance(value, dict):
         return {
             key: strip_llm_hidden_fields(item)
@@ -311,12 +328,11 @@ def strip_llm_hidden_fields(value: Any) -> Any:
         }
     if isinstance(value, list):
         return [strip_llm_hidden_fields(item) for item in value]
-    if isinstance(value, str) and "suggested_prompt" in value:
+    if isinstance(value, str) and any(field in value for field in LLM_HIDDEN_FIELDS):
         try:
             parsed = json.loads(value)
         except json.JSONDecodeError:
-            cleaned = _SUGGESTED_PROMPT_STRING_RE.sub("", value)
-            return cleaned.replace("{,", "{").replace(",}", "}")
+            return value
         return json.dumps(
             strip_llm_hidden_fields(parsed),
             ensure_ascii=False,

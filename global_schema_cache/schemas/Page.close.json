@@ -1,19 +1,20 @@
 {
   "method": "Page.close",
-  "description": "Closes a tab by its page ID.",
+  "description": "Closes a browser tab by pageId; use only after preserving needed state, screenshots, downloads, or memory checkpoints.",
   "params": {
     "pageId": {
       "type": "string",
       "format": "uuid",
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Page ID to close.",
       "required": true
     },
     "purpose": {
       "type": "string",
-      "description": "Describe why you are closing this page",
+      "description": "Describe why closing this tab is safe and useful, e.g., cleanup after completing a workflow",
       "required": true
     }
   },
   "requiresPurpose": true,
-  "purposeHint": "Describe why you are closing this page"
+  "purposeHint": "Describe why closing this tab is safe and useful, e.g., cleanup after completing a workflow"
 }

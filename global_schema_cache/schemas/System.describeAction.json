@@ -1,10 +1,10 @@
 {
   "method": "System.describeAction",
-  "description": "Describe the schema and parameter details of a specific action.",
+  "description": "Describes the exact schema, parameter constraints, and purpose requirement for one callable action before invocation.",
   "params": {
     "method": {
       "type": "string",
-      "description": "The full method name to describe, e.g. \"DOM.click\"",
+      "description": "Full action method name, such as \"Input.click\" or \"DOM.getAXTree\".",
       "required": true
     }
   },

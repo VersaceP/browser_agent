@@ -1,11 +1,11 @@
 {
   "method": "Memory.get",
-  "description": "Retrieve the memory context for a specific scope.",
+  "description": "Retrieves agent-scoped task context, constraints, and milestones for a scope; this is not a page data or browser state query.",
   "params": {
     "scope": {
       "type": "string",
       "minLength": 1,
-      "description": "The scope to query memory for.",
+      "description": "Memory scope key to read.",
       "required": true
     }
   },

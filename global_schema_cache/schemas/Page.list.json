@@ -1,11 +1,12 @@
 {
   "method": "Page.list",
-  "description": "Lists all tabs under the specified browser instance.",
+  "description": "Lists all tracked tabs for a fleet so the agent can select, switch to, inspect, or close the correct pageId.",
   "params": {
     "fleetId": {
       "type": "string",
       "format": "uuid",
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Fleet ID whose tracked pages should be listed.",
       "required": true
     }
   },

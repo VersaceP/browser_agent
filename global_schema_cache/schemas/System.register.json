@@ -1,10 +1,11 @@
 {
   "method": "System.register",
-  "description": "Agent online registration, reclaim existing assets or initialize session.",
+  "description": "Registers an agent session, reclaims existing fleets, and reports whether task memory must be restored or initialized before browser work.",
   "params": {
     "agentId": {
       "type": "string",
       "minLength": 1,
+      "description": "Stable agent session ID to register or resume.",
       "required": true
     }
   },

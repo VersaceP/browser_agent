@@ -6,13 +6,16 @@
       "type": "integer",
       "minimum": -9007199254740991,
       "maximum": 9007199254740991,
+      "description": "Bookmark ID to update.",
       "required": true
     },
     "title": {
+      "description": "New bookmark title, if changing it.",
       "type": "string",
       "required": false
     },
     "url": {
+      "description": "New bookmark URL, if changing it.",
       "type": "string",
       "format": "uri",
       "required": false

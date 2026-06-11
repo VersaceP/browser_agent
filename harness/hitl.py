@@ -1,5 +1,5 @@
 """
-harness.hitl - Shared HITL wait helper for BrowserAgent and plan_executor.
+harness.hitl - Shared HITL wait helper for BrowserAgent callers.
 
 After Hitl.requestPause succeeds, the agent must NOT continue calling tools —
 ABCP rejects most tools while the page is paused (see prior investigation:
@@ -15,7 +15,7 @@ analysis).
 
 import asyncio
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from abcp_client import ABCPClient
 from harness.challenge_detector import is_lingering_loading_title
@@ -39,8 +39,12 @@ def _normalize_notification_type(value: Any) -> str:
 # short Page.getState confirmation below decides whether ABCP also unpaused.
 _RESUME_NOTIFICATION_TYPES = frozenset(_normalize_notification_type(item) for item in {
     "hitl_resumed",
+    "Hitl.resumeEvent",
+    "Hitl.resumed",
     "page_resumed",
+    "Page.resumed",
     "hitl_completed",
+    "Hitl.completed",
     "human_intervention_completed",
 })
 _PAGE_TITLE_UPDATED_TYPES = frozenset(_normalize_notification_type(item) for item in {
@@ -58,6 +62,15 @@ _CHALLENGE_URL_MARKERS = (
 )
 
 _PAUSED_STATE_MARKERS = ("paused", "err_page_paused", "human intervention")
+_CHALLENGE_STATE_MARKERS = (
+    "captcha",
+    "cf-chl",
+    "cloudflare security",
+    "performing security verification",
+    "verify you are human",
+    "验证码",
+    "人机验证",
+)
 
 
 def _is_challenge_url(url: Any) -> bool:
@@ -65,16 +78,41 @@ def _is_challenge_url(url: Any) -> bool:
     return bool(value and any(marker in value for marker in _CHALLENGE_URL_MARKERS))
 
 
+def _notification_view(msg: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a normalized event view for both legacy and current envelopes.
+
+    Current ABCP notifications look like:
+      params.type == "event"
+      params.data.event == "Page.loaded"
+      params.data.payload.pageId/url/title == ...
+
+    Some tests and older dispatchers use the flatter form:
+      params.type == "Page.loaded"
+      params.data.pageId/url/title == ...
+    """
+    params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+    data = params.get("data") if isinstance(params.get("data"), dict) else {}
+    payload = data.get("payload") if isinstance(data.get("payload"), dict) else {}
+
+    raw_type = data.get("event") or params.get("type")
+    ntype = _normalize_notification_type(raw_type)
+    return {
+        "type": ntype,
+        "pageId": payload.get("pageId") or data.get("pageId"),
+        "title": payload.get("title") or data.get("title"),
+        "url": payload.get("url") or data.get("url"),
+    }
+
+
 def _notification_signal(msg: Dict[str, Any], page_id: str) -> Optional[str]:
     if not isinstance(msg, dict):
         return None
-    params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
-    ntype = _normalize_notification_type(params.get("type"))
+    view = _notification_view(msg)
+    ntype = view.get("type")
     if not ntype:
         return None
 
-    data = params.get("data") if isinstance(params.get("data"), dict) else {}
-    msg_page_id = data.get("pageId")
+    msg_page_id = view.get("pageId")
 
     if ntype in _RESUME_NOTIFICATION_TYPES:
         if not msg_page_id or str(msg_page_id) == str(page_id):
@@ -85,13 +123,13 @@ def _notification_signal(msg: Dict[str, Any], page_id: str) -> Optional[str]:
         return None
 
     if ntype in _PAGE_TITLE_UPDATED_TYPES:
-        title = data.get("title")
+        title = view.get("title")
         if isinstance(title, str) and title.strip() and not is_lingering_loading_title(title):
             return "page_settled"
         return None
 
     if ntype in _PAGE_LOADED_TYPES:
-        url = data.get("url")
+        url = view.get("url")
         if isinstance(url, str) and url.strip() and not _is_challenge_url(url):
             return "page_settled"
 
@@ -124,17 +162,80 @@ def _make_resume_predicate_strict(page_id: str):
     def predicate(msg: Dict[str, Any]) -> bool:
         if not isinstance(msg, dict):
             return False
-        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
-        ntype = _normalize_notification_type(params.get("type"))
+        view = _notification_view(msg)
+        ntype = view.get("type")
         if ntype not in _RESUME_NOTIFICATION_TYPES:
             return False
-        data = params.get("data") if isinstance(params.get("data"), dict) else {}
-        msg_page_id = data.get("pageId")
+        msg_page_id = view.get("pageId")
         if not msg_page_id:
             return True
         return str(msg_page_id) == page_id_str
 
     return predicate
+
+
+def _page_state_body(state_response: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    if not isinstance(state_response, dict):
+        return {}, {}
+    response = state_response.get("response")
+    body = response if isinstance(response, dict) else state_response
+    data = body.get("data") if isinstance(body.get("data"), dict) else {}
+    return body, data
+
+
+def _meaningful_error_text(source: Any) -> str:
+    if source is None or source is False:
+        return ""
+    if isinstance(source, str):
+        return source.strip().lower()
+    if isinstance(source, dict):
+        for key in ("message", "error", "data", "description", "errorMessage"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip().lower()
+            if isinstance(value, dict):
+                nested = _meaningful_error_text(value)
+                if nested:
+                    return nested
+        # Some successful Page.getState responses include a benign shape like
+        # {"code": -3, "description": ""}. Treat code-only empty descriptions
+        # as non-evidence; non-empty text above remains conservative.
+        return ""
+    return str(source).strip().lower()
+
+
+def _pause_marker_reason(state_response: Any) -> str:
+    if not isinstance(state_response, dict):
+        return ""
+    body, data = _page_state_body(state_response)
+    hitl = data.get("hitl") if isinstance(data.get("hitl"), dict) else {}
+    if hitl.get("isPaused") is True:
+        context_parts: List[str] = []
+        for key in ("title", "url", "status", "errorMessage"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                context_parts.append(f"{key}={value.strip()[:120]!r}")
+        suffix = f"; {' '.join(context_parts)}" if context_parts else ""
+        return f"Page.getState data.hitl.isPaused=true{suffix}"
+
+    haystack_parts: List[str] = []
+    for key in ("observation", "suggested_prompt"):
+        value = body.get(key)
+        if isinstance(value, str) and value:
+            haystack_parts.append(value.lower())
+    for key in ("status", "errorMessage"):
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            haystack_parts.append(value.lower())
+    for source in (state_response.get("error"), body.get("error"), data.get("error")):
+        text = _meaningful_error_text(source)
+        if text:
+            haystack_parts.append(text)
+
+    haystack = " ".join(haystack_parts).strip()
+    if any(marker in haystack for marker in _PAUSED_STATE_MARKERS):
+        return haystack[:300]
+    return ""
 
 
 def _state_indicates_still_paused(state_response: Any) -> bool:
@@ -158,12 +259,12 @@ def _state_indicates_still_paused(state_response: Any) -> bool:
     if not isinstance(state_response, dict):
         return True
 
+    body, data = _page_state_body(state_response)
     haystack_parts: List[str] = []
     for key in ("observation", "suggested_prompt"):
-        val = state_response.get(key)
+        val = body.get(key)
         if isinstance(val, str) and val:
             haystack_parts.append(val.lower())
-    data = state_response.get("data") if isinstance(state_response.get("data"), dict) else {}
     hitl = data.get("hitl") if isinstance(data.get("hitl"), dict) else {}
     if hitl.get("isPaused") is True:
         return True
@@ -173,16 +274,10 @@ def _state_indicates_still_paused(state_response: Any) -> bool:
             haystack_parts.append(val.lower())
 
     error_payloads: List[str] = []
-    for source in (state_response.get("error"), data.get("error")):
-        if isinstance(source, str) and source:
-            error_payloads.append(source.lower())
-        elif isinstance(source, dict):
-            try:
-                error_payloads.append(
-                    str(source.get("message") or source.get("data") or source).lower()
-                )
-            except Exception:
-                error_payloads.append("[unparseable error]")
+    for source in (state_response.get("error"), body.get("error"), data.get("error")):
+        text = _meaningful_error_text(source)
+        if text:
+            error_payloads.append(text)
 
     haystack = " ".join(haystack_parts + error_payloads)
     if any(marker in haystack for marker in _PAUSED_STATE_MARKERS):
@@ -195,6 +290,30 @@ def _state_indicates_still_paused(state_response: Any) -> bool:
     return False
 
 
+def _state_looks_like_challenge_surface(state_response: Any) -> bool:
+    if not isinstance(state_response, dict):
+        return False
+    body, data = _page_state_body(state_response)
+    title = str(data.get("title") or "")
+    url = str(data.get("url") or "")
+    if title and is_lingering_loading_title(title):
+        return True
+    if _is_challenge_url(url):
+        return True
+
+    haystack_parts: List[str] = []
+    for key in ("observation", "suggested_prompt"):
+        value = body.get(key)
+        if isinstance(value, str) and value:
+            haystack_parts.append(value.lower())
+    for key in ("title", "url", "status", "errorMessage"):
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            haystack_parts.append(value.lower())
+    haystack = " ".join(haystack_parts)
+    return any(marker in haystack for marker in _CHALLENGE_STATE_MARKERS)
+
+
 async def _confirm_unpaused_after_settlement(
     *,
     browser: ABCPClient,
@@ -204,29 +323,39 @@ async def _confirm_unpaused_after_settlement(
 ) -> Dict[str, Any]:
     checks: List[Any] = []
     interval = min(max(0.5, poll_interval_seconds), 2.0)
+    max_resolve_attempts = 3
+    resolve_attempts = 0
+    last_blocker_reason = ""
 
-    remaining = deadline - time.monotonic()
-    if remaining > 0:
+    async def resolve_once(purpose: str) -> None:
+        nonlocal resolve_attempts
+        resolve_attempts += 1
         try:
             resolved = await browser.call(
                 "Hitl.resolvePause",
                 {
                     "pageId": page_id,
-                    "purpose": RESOLVE_PAUSE_PURPOSE,
+                    "purpose": purpose,
                 },
             )
             checks.append({
                 "method": "Hitl.resolvePause",
+                "attempt": resolve_attempts,
                 "result": _slim_evidence(resolved),
             })
         except Exception as exc:
             checks.append({
                 "method": "Hitl.resolvePause",
+                "attempt": resolve_attempts,
                 "errorType": type(exc).__name__,
                 "error": str(exc)[:300],
             })
 
-    for attempt in range(3):
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        await resolve_once(RESOLVE_PAUSE_PURPOSE)
+
+    for attempt in range(5):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
@@ -246,20 +375,50 @@ async def _confirm_unpaused_after_settlement(
                 "errorType": type(exc).__name__,
                 "error": str(exc)[:300],
             })
+            error_text = str(exc).lower()
+            if (
+                any(marker in error_text for marker in _PAUSED_STATE_MARKERS)
+                and resolve_attempts < max_resolve_attempts
+            ):
+                last_blocker_reason = error_text[:300]
+                await resolve_once(
+                    f"{RESOLVE_PAUSE_PURPOSE} Retrying because Page.getState still reports paused."
+                )
             continue
         checks.append({
             "method": "Page.getState",
             "result": _slim_evidence(state),
         })
-        if not _state_indicates_still_paused(state):
+        if (
+            not _state_indicates_still_paused(state)
+            and not _state_looks_like_challenge_surface(state)
+        ):
             return {
                 "status": "resumed",
                 "state": state,
                 "checks": checks,
             }
+        pause_reason = _pause_marker_reason(state)
+        if pause_reason:
+            last_blocker_reason = pause_reason
+            if resolve_attempts < max_resolve_attempts:
+                await resolve_once(
+                    f"{RESOLVE_PAUSE_PURPOSE} Retrying because Page.getState still reports paused."
+                )
+                continue
+        elif _state_looks_like_challenge_surface(state):
+            last_blocker_reason = (
+                "Page.getState no longer looks paused, but it still looks like"
+                " a challenge surface."
+            )
+        elif _state_indicates_still_paused(state):
+            last_blocker_reason = (
+                "Page.getState did not confirm a usable unpaused page."
+            )
     return {
         "status": PAGE_SETTLED_AFTER_HITL,
         "checks": checks,
+        "reason": last_blocker_reason,
     }
 
 
@@ -274,8 +433,8 @@ async def wait_for_hitl_resume(
 ) -> Dict[str, Any]:
     """Block until the paused page resumes or `timeout_seconds` elapses.
 
-    Returns a structured outcome consumed by the caller (BrowserAgent enriches
-    the tool_result; plan_executor stores it on step_result.hitl).
+    Returns a structured outcome consumed by the caller. BrowserAgent enriches
+    the tool_result with the HITL wait outcome.
     """
     if diagnostics is not None:
         diagnostics.mark_hitl_wait_entered()
@@ -375,6 +534,7 @@ async def wait_for_hitl_resume(
         if confirmation.get("status") != "resumed":
             if diagnostics is not None:
                 diagnostics.mark_hitl_page_settled()
+            confirmation_reason = str(confirmation.get("reason") or "").strip()
             outcome = {
                 "status": PAGE_SETTLED_AFTER_HITL,
                 "via": via,
@@ -385,11 +545,16 @@ async def wait_for_hitl_resume(
                     "confirmation": confirmation.get("checks", []),
                 },
                 "reason": (
-                    "The page appears to have loaded past the challenge, but"
-                    " ABCP still reports the tab as paused for human"
-                    " intervention. The ABCP control channel has not released"
-                    " this paused page yet; wait for platform auto-recovery or"
-                    " restart the browser phase with a fresh page."
+                    "Hitl.resolvePause was attempted after a post-HITL page"
+                    " settlement signal, but Page.getState still reports the"
+                    f" page as paused: {confirmation_reason}"
+                    if confirmation_reason
+                    else (
+                        "The page produced a post-HITL settlement signal, but"
+                        " Page.getState did not confirm a usable unpaused page."
+                        " Wait for platform auto-recovery or restart the browser"
+                        " phase with a fresh page."
+                    )
                 ),
             }
             if logger is not None:

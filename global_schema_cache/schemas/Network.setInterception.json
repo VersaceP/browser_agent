@@ -6,6 +6,7 @@
       "type": "string",
       "format": "uuid",
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Page ID whose network requests should be filtered.",
       "required": true
     },
     "patterns": {
@@ -14,9 +15,11 @@
         "type": "object",
         "properties": {
           "urlPattern": {
-            "type": "string"
+            "type": "string",
+            "description": "URL match pattern for the request rule."
           },
           "resourceType": {
+            "description": "Optional request resource type to narrow the rule.",
             "type": "string"
           },
           "action": {
@@ -24,7 +27,8 @@
             "enum": [
               "block",
               "allow"
-            ]
+            ],
+            "description": "Whether matching requests should be blocked or explicitly allowed."
           }
         },
         "required": [
@@ -33,6 +37,7 @@
         ],
         "additionalProperties": false
       },
+      "description": "Interception rules to apply in order.",
       "required": true
     },
     "purpose": {

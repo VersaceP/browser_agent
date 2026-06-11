@@ -1,23 +1,25 @@
 {
   "method": "Hitl.requestPause",
-  "description": "Pauses AI operation on the specified page for human intervention (CAPTCHA, login, manual review, etc.).",
+  "description": "Actively pauses automation on a page and hands control to a human for CAPTCHA, login, manual confirmation, sensitive approval, or review.",
   "params": {
     "pageId": {
       "type": "string",
       "format": "uuid",
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Page ID to pause for human intervention.",
       "required": true
     },
     "reason": {
+      "description": "Short explanation of what the human needs to do.",
       "type": "string",
       "required": false
     },
     "purpose": {
       "type": "string",
-      "description": "Describe why you are requesting a pause, e.g., needing human input for a CAPTCHA",
+      "description": "Describe the exact human intervention needed, e.g., solving a CAPTCHA, completing login, approving a purchase, or reviewing ambiguous content",
       "required": true
     }
   },
   "requiresPurpose": true,
-  "purposeHint": "Describe why you are requesting a pause, e.g., needing human input for a CAPTCHA"
+  "purposeHint": "Describe the exact human intervention needed, e.g., solving a CAPTCHA, completing login, approving a purchase, or reviewing ambiguous content"
 }

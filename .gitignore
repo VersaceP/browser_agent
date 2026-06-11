@@ -11,3 +11,13 @@ dist/
 config.json
 .pycache/
 .pytest_cache/
+strategy_attempts.jsonl
+claude_code_scrape/
+.claude
+.codebuddy
+.codex
+.qoder
+.understand-anything
+.DS_Store
+*.py[cod]
+*$py.class

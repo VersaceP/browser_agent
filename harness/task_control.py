@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import copy
+import hashlib
 import re
 from difflib import SequenceMatcher
 from datetime import datetime
@@ -13,11 +14,87 @@ from pathlib import Path
 from typing import AbstractSet, Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
+from harness.constants import (
+    WORKER_STATUS_API_CONTRACT_ERROR,
+    WORKER_STATUS_BLOCKED_BY_CHALLENGE,
+    WORKER_STATUS_HITL_REQUIRED,
+    WORKER_STATUS_HITL_TIMEOUT,
+    WORKER_STATUS_HITL_WAITING,
+    WORKER_STATUS_PAGE_CRASHED,
+    WORKER_STATUS_PAGE_SETTLED_AFTER_HITL,
+)
+from harness.extraction_artifacts import field_name_from_spec, field_names_from_specs
 from harness.utils import JsonDict, RunLogger, safe_path_component, trim_large_strings
 
 
 TASK_PLAN_FILE = "task_plan.json"
 TASK_STATE_FILE = "task_state.json"
+REPEAT_GUARD_REJECTION_LOCK_THRESHOLD = 3
+
+AXTREE_ID_ANYWHERE_RE = re.compile(r"\b\d+:-?\d+:-?\d+\b")
+VOLATILE_HANDLE_KEYS = {
+    "pageId",
+    "page_id",
+    "fleetId",
+    "fleet_id",
+    "axTreeId",
+    "axNodeId",
+    "domNodeId",
+    "nodeId",
+    "selector",
+    "sourceSelectorOrAxId",
+}
+
+TASK_TYPE_ALIASES = {
+    "browser_data_collection": "web_scrape",
+    "browser_action": "form_fill",
+}
+
+VALID_TASK_TYPES = {
+    "general",
+    "web_search",
+    "web_scrape",
+    "form_fill",
+    "download_file",
+    "browser_state_management",
+}
+
+VALID_STAGE_HINTS = {
+    "collection",
+    "detail_sections",
+    "attribute_links",
+    "form_interaction",
+    "computed_relationship",
+    "generic",
+}
+
+SENSITIVE_PROVENANCE_FIELD_MARKERS = {
+    "rank",
+    "order",
+    "index",
+    "position",
+    "priority",
+    "price",
+    "score",
+    "status",
+    "count",
+    "timestamp",
+    "date",
+    "quantity",
+    "qty",
+    "total",
+    "rating",
+    "stars",
+    "views",
+    "votes",
+    "published_at",
+    "publishedat",
+    "created_at",
+    "createdat",
+    "updated_at",
+    "updatedat",
+    "version",
+}
 
 VALIDATOR_TYPES = {
     "artifact_required",
@@ -34,6 +111,7 @@ VALIDATOR_TYPES = {
     "field_pattern",
     "cross_field_contains",
     "action_outcome",
+    "field_provenance",
 }
 
 
@@ -57,9 +135,34 @@ def validate_task_plan(
     if not isinstance(raw_plan, dict):
         return None, ["plan must be a JSON object"]
 
+    warnings: List[JsonDict] = []
     goal = str(raw_plan.get("goal") or "").strip()
     if not goal:
         errors.append("goal is required")
+
+    task_type = str(raw_plan.get("task_type") or "").strip()
+    if not task_type:
+        errors.append(
+            "task_type is required; use an explicit value such as web_scrape,"
+            " form_fill, download_file, web_search, or general"
+        )
+        task_type = "general"
+    elif task_type in TASK_TYPE_ALIASES:
+        canonical = TASK_TYPE_ALIASES[task_type]
+        warnings.append({
+            "type": "task_type_alias",
+            "input": task_type,
+            "canonical": canonical,
+            "message": (
+                f"task_type {task_type!r} is accepted as an alias; use"
+                f" canonical task_type {canonical!r} in future plans."
+            ),
+        })
+        task_type = canonical
+    elif task_type not in VALID_TASK_TYPES:
+        errors.append(
+            f"task_type must be one of {sorted(VALID_TASK_TYPES | set(TASK_TYPE_ALIASES))}; got {task_type!r}"
+        )
 
     raw_phases = raw_plan.get("phases")
     if not isinstance(raw_phases, list) or not raw_phases:
@@ -90,6 +193,22 @@ def validate_task_plan(
             errors.append(f"phase {phase_id}: objective is required")
         if not worker_task:
             errors.append(f"phase {phase_id}: worker_task is required")
+
+        stage_hint = str(raw_phase.get("stage_hint") or "").strip()
+        if not stage_hint:
+            errors.append(f"phase {phase_id}: stage_hint is required")
+            stage_hint = "generic"
+        elif stage_hint not in VALID_STAGE_HINTS:
+            errors.append(
+                f"phase {phase_id}: stage_hint must be one of"
+                f" {sorted(VALID_STAGE_HINTS)}; got {stage_hint!r}"
+            )
+        stage_hint_reason = str(raw_phase.get("stage_hint_reason") or "").strip()
+        if len(stage_hint_reason) < 40:
+            errors.append(
+                f"phase {phase_id}: stage_hint_reason must explain the stage choice"
+                " in at least 40 characters"
+            )
 
         expected_artifact = raw_phase.get("expected_artifact") or {}
         if expected_artifact is not None and not isinstance(expected_artifact, dict):
@@ -125,6 +244,8 @@ def validate_task_plan(
             "type": phase_type,
             "objective": objective,
             "worker_task": worker_task,
+            "stage_hint": stage_hint,
+            "stage_hint_reason": stage_hint_reason,
             "context": str(raw_phase.get("context") or ""),
             "max_steps": raw_phase.get("max_steps"),
             "depends_on": raw_phase.get("depends_on") or [],
@@ -133,15 +254,17 @@ def validate_task_plan(
             "expected_artifact": expected_artifact,
             "validators": validators,
             "worker_contract": worker_contract or {},
-            "max_attempts": _positive_int(raw_phase.get("max_attempts"), default=2),
+            "max_attempts": _positive_int(raw_phase.get("max_attempts"), default=3),
         })
 
     normalized = {
         "version": "v1",
         "goal": goal,
-        "task_type": str(raw_plan.get("task_type") or "general").strip() or "general",
+        "task_type": task_type,
         "phases": phases,
     }
+    if warnings:
+        normalized["warnings"] = warnings
     if errors:
         return None, errors
     return normalized, []
@@ -183,7 +306,12 @@ def _validate_worker_contract_methods(
                 )
 
 
-def phase_contract(phase: JsonDict, override: Optional[JsonDict] = None) -> JsonDict:
+def phase_contract(
+    phase: JsonDict,
+    override: Optional[JsonDict] = None,
+    *,
+    default_task_type: str = "general",
+) -> JsonDict:
     contract: JsonDict = dict(phase.get("worker_contract") or {})
     if override:
         contract.update(override)
@@ -201,7 +329,18 @@ def phase_contract(phase: JsonDict, override: Optional[JsonDict] = None) -> Json
     return {
         "version": "v1",
         "phase_id": str(contract.get("phase_id") or phase.get("id") or ""),
-        "task_type": str(contract.get("task_type") or phase.get("task_type") or "general"),
+        "task_type": str(
+            contract.get("task_type")
+            or phase.get("task_type")
+            or default_task_type
+            or "general"
+        ),
+        "stage_hint": str(contract.get("stage_hint") or phase.get("stage_hint") or "generic"),
+        "stage_hint_reason": str(
+            contract.get("stage_hint_reason")
+            or phase.get("stage_hint_reason")
+            or ""
+        ),
         "objective": str(contract.get("objective") or phase.get("objective") or ""),
         "input_artifacts": contract.get("input_artifacts") or [],
         "expected_artifact": expected_artifact,
@@ -374,6 +513,425 @@ def write_task_state(logger: RunLogger, state: JsonDict) -> str:
     return str(path.resolve())
 
 
+def contract_hash_for_phase(
+    phase: Optional[JsonDict],
+    worker_contract: Optional[JsonDict],
+    *,
+    task: str = "",
+    result_contract: str = "",
+) -> str:
+    phase = phase if isinstance(phase, dict) else {}
+    worker_contract = worker_contract if isinstance(worker_contract, dict) else {}
+    payload = {
+        "phaseId": str(phase.get("id") or worker_contract.get("phase_id") or ""),
+        "taskType": str(
+            worker_contract.get("task_type")
+            or phase.get("task_type")
+            or "general"
+        ),
+        "stageHint": str(
+            worker_contract.get("stage_hint")
+            or phase.get("stage_hint")
+            or ""
+        ),
+        "objective": str(
+            worker_contract.get("objective")
+            or phase.get("objective")
+            or ""
+        ),
+        "workerTask": str(task or phase.get("worker_task") or ""),
+        "resultContract": str(result_contract or ""),
+        "workerContract": worker_contract,
+        "expectedArtifact": (
+            worker_contract.get("expected_artifact")
+            if isinstance(worker_contract.get("expected_artifact"), dict)
+            else phase.get("expected_artifact")
+        ),
+        "validators": (
+            worker_contract.get("validators")
+            if isinstance(worker_contract.get("validators"), list)
+            else phase.get("validators")
+        ),
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def build_attempt_digest(
+    worker_result: JsonDict,
+    *,
+    phase: Optional[JsonDict],
+    worker_contract: Optional[JsonDict],
+    task: str = "",
+    result_contract: str = "",
+) -> JsonDict:
+    artifact_validation = (
+        worker_result.get("artifactValidation")
+        if isinstance(worker_result.get("artifactValidation"), dict)
+        else {}
+    )
+    classification = _classification_from_worker_result(worker_result)
+    row_count = _attempt_row_count(worker_result, artifact_validation)
+    artifact_paths = _attempt_artifact_paths(worker_result, artifact_validation)
+    trace_path = str(worker_result.get("tracePath") or "")
+    status = str(worker_result.get("status") or "unknown")
+    status_category = str(worker_result.get("statusCategory") or "unknown")
+    validated_status = str(worker_result.get("validatedStatus") or "")
+    digest: JsonDict = {
+        "status": status,
+        "statusCategory": status_category,
+        "validatedStatus": validated_status,
+        "classification": classification,
+        "rowCount": row_count,
+        "artifactPaths": artifact_paths,
+        "tracePath": trace_path,
+        "blocker": _attempt_primary_blocker(worker_result),
+        "failureSignature": failure_signature_from_result(worker_result),
+        "contractHash": contract_hash_for_phase(
+            phase,
+            worker_contract,
+            task=task,
+            result_contract=result_contract,
+        ),
+    }
+    return trim_large_strings(_strip_volatile_handles(digest), 4000)
+
+
+def failure_signature_from_result(worker_result: JsonDict) -> List[Any]:
+    classification = _classification_from_worker_result(worker_result)
+    artifact_validation = (
+        worker_result.get("artifactValidation")
+        if isinstance(worker_result.get("artifactValidation"), dict)
+        else {}
+    )
+    status = str(worker_result.get("status") or "")
+    category = str(classification.get("category") or "").strip() if classification else ""
+    if not category and status and status not in {"done", "partial"}:
+        category = f"status:{status}"
+    validation_failure_type = _primary_validation_failure_type(
+        artifact_validation,
+        classification,
+    )
+    hint_key = _classification_hint_key(classification)
+    primary_blocker_method = (
+        str(classification.get("method") or "").strip()
+        if isinstance(classification, dict)
+        else ""
+    )
+    progress_reason = _progress_intervention_reason(worker_result)
+    return [
+        category or None,
+        validation_failure_type or None,
+        hint_key or None,
+        primary_blocker_method or None,
+        progress_reason or None,
+    ]
+
+
+def repeated_phase_attempt_guard(
+    logger: RunLogger,
+    *,
+    phase_id: Optional[str],
+    contract_hash: str,
+) -> Optional[JsonDict]:
+    if not phase_id or not contract_hash:
+        return None
+    state = load_task_state(logger)
+    phase_state = _phase_state(state, str(phase_id))
+    if phase_state is None:
+        return None
+    block = should_block_repeated_phase_attempt(
+        phase_state,
+        contract_hash=contract_hash,
+    )
+    if block is None:
+        if phase_state.pop("repeat_guard", None) is not None:
+            write_task_state(logger, state)
+        return None
+
+    guard_key = json.dumps(
+        {
+            "contractHash": contract_hash,
+            "signature": block.get("lockedSignature"),
+        },
+        sort_keys=True,
+        default=str,
+    )
+    previous = phase_state.get("repeat_guard")
+    previous_key = previous.get("key") if isinstance(previous, dict) else ""
+    rejection_count = (
+        int(previous.get("rejectionCount") or 0) + 1
+        if isinstance(previous, dict) and previous_key == guard_key
+        else 1
+    )
+    phase_state["repeat_guard"] = {
+        "key": guard_key,
+        "rejectionCount": rejection_count,
+        "lockedSignature": block.get("lockedSignature"),
+        "contractHash": contract_hash,
+        "updated_at": utc_now_iso(),
+    }
+    write_task_state(logger, state)
+
+    status = (
+        "phase_locked_must_finalize"
+        if rejection_count >= REPEAT_GUARD_REJECTION_LOCK_THRESHOLD
+        else "phase_classification_repeated"
+    )
+    result = {
+        "status": status,
+        "phaseId": str(phase_id),
+        "lockedSignature": block.get("lockedSignature"),
+        "contractHash": contract_hash,
+        "consecutiveSameSignatureCount": block.get("consecutiveSameSignatureCount"),
+        "repeatSpawnRejectionCount": rejection_count,
+        "recentDigests": block.get("recentDigests"),
+        "tool_was_executed": False,
+        "next_instruction": (
+            "Emit a revised task_plan with replan_reason that changes objective,"
+            " worker_task, worker_contract, expected_artifact, validators, or"
+            " task_type; or call final_answer with the blocker."
+            if status == "phase_classification_repeated" else
+            "This phase has repeatedly hit the same failure signature under the"
+            " same contract. Do not spawn another worker for this phase; call"
+            " final_answer with the blocker or emit a substantially revised"
+            " task_plan before continuing."
+        ),
+    }
+    return _strip_volatile_handles(result)
+
+
+def should_block_repeated_phase_attempt(
+    phase_state: JsonDict,
+    *,
+    contract_hash: str,
+) -> Optional[JsonDict]:
+    attempts = phase_state.get("attempts") if isinstance(phase_state, dict) else []
+    if not isinstance(attempts, list):
+        return None
+    digests = [
+        item.get("attemptDigest")
+        for item in attempts
+        if isinstance(item, dict) and isinstance(item.get("attemptDigest"), dict)
+    ]
+    if len(digests) < 2:
+        return None
+    recent = digests[-2:]
+    if not all(_attempt_digest_is_failure(item) for item in recent):
+        return None
+    if not all(str(item.get("contractHash") or "") == contract_hash for item in recent):
+        return None
+    signatures = [item.get("failureSignature") for item in recent]
+    if not all(isinstance(signature, list) and any(signature) for signature in signatures):
+        return None
+    if signatures[0] != signatures[1]:
+        return None
+    consecutive_count = 0
+    for digest in reversed(digests):
+        if (
+            _attempt_digest_is_failure(digest)
+            and str(digest.get("contractHash") or "") == contract_hash
+            and digest.get("failureSignature") == signatures[0]
+        ):
+            consecutive_count += 1
+            continue
+        break
+    return {
+        "lockedSignature": signatures[0],
+        "consecutiveSameSignatureCount": consecutive_count,
+        "recentDigests": [_strip_volatile_handles(item) for item in recent],
+    }
+
+
+def _classification_from_worker_result(worker_result: JsonDict) -> JsonDict:
+    artifact_validation = (
+        worker_result.get("artifactValidation")
+        if isinstance(worker_result.get("artifactValidation"), dict)
+        else {}
+    )
+    classification = artifact_validation.get("classification")
+    if isinstance(classification, dict):
+        return dict(classification)
+    result_levels = (
+        worker_result.get("resultLevels")
+        if isinstance(worker_result.get("resultLevels"), dict)
+        else {}
+    )
+    l1 = result_levels.get("l1") if isinstance(result_levels.get("l1"), dict) else {}
+    failure = l1.get("failureClassification")
+    if isinstance(failure, dict):
+        return dict(failure)
+    if isinstance(failure, str) and failure.strip():
+        return {"category": failure.strip(), "source": "resultLevels.l1"}
+    return {}
+
+
+def _attempt_row_count(worker_result: JsonDict, artifact_validation: JsonDict) -> int:
+    try:
+        return int(artifact_validation.get("rowCount") or 0)
+    except (TypeError, ValueError):
+        pass
+    result_levels = (
+        worker_result.get("resultLevels")
+        if isinstance(worker_result.get("resultLevels"), dict)
+        else {}
+    )
+    l2 = result_levels.get("l2") if isinstance(result_levels.get("l2"), dict) else {}
+    data = l2.get("data") if isinstance(l2.get("data"), dict) else {}
+    try:
+        return int(data.get("totalExtractedRows") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _attempt_artifact_paths(
+    worker_result: JsonDict,
+    artifact_validation: JsonDict,
+) -> List[str]:
+    paths: List[str] = []
+    for raw_list in (
+        worker_result.get("artifacts"),
+        artifact_validation.get("artifacts"),
+        artifact_validation.get("allExtractionArtifacts"),
+    ):
+        if not isinstance(raw_list, list):
+            continue
+        for item in raw_list:
+            path = str(item or "").strip()
+            if path and path not in paths:
+                paths.append(path)
+    return paths[:20]
+
+
+def _attempt_primary_blocker(worker_result: JsonDict) -> Optional[JsonDict]:
+    result_levels = (
+        worker_result.get("resultLevels")
+        if isinstance(worker_result.get("resultLevels"), dict)
+        else {}
+    )
+    l2 = result_levels.get("l2") if isinstance(result_levels.get("l2"), dict) else {}
+    blockers = l2.get("blockers") if isinstance(l2.get("blockers"), list) else []
+    for blocker in blockers:
+        if isinstance(blocker, dict):
+            return trim_large_strings(_strip_volatile_handles(blocker), 1000)
+    artifact_validation = worker_result.get("artifactValidation")
+    if isinstance(artifact_validation, dict) and artifact_validation.get("status") == "failed":
+        return {
+            "type": "artifact_validation_failed",
+            "classification": _classification_from_worker_result(worker_result),
+        }
+    return None
+
+
+def _primary_validation_failure_type(
+    artifact_validation: JsonDict,
+    classification: JsonDict,
+) -> str:
+    failure_types = classification.get("failureTypes") if isinstance(classification, dict) else None
+    if isinstance(failure_types, list):
+        values = sorted(str(item) for item in failure_types if str(item).strip())
+        if values:
+            return values[0]
+    failures = artifact_validation.get("failures")
+    if isinstance(failures, list):
+        for failure in failures:
+            if isinstance(failure, dict) and str(failure.get("type") or "").strip():
+                return str(failure.get("type")).strip()
+    return ""
+
+
+def _classification_hint_key(classification: JsonDict) -> str:
+    if not isinstance(classification, dict):
+        return ""
+    for key in (
+        "expectedArtifactName",
+        "workerStatus",
+        "source",
+        "task_type",
+    ):
+        value = str(classification.get(key) or "").strip()
+        if value:
+            return f"{key}={value[:120]}"
+    return ""
+
+
+def _progress_intervention_reason(worker_result: JsonDict) -> str:
+    trace_summary = (
+        worker_result.get("traceSummary")
+        if isinstance(worker_result.get("traceSummary"), dict)
+        else {}
+    )
+    interventions = trace_summary.get("progressInterventions")
+    if isinstance(interventions, list):
+        for item in reversed(interventions):
+            if isinstance(item, dict):
+                reason = str(item.get("reason") or "").strip()
+                if reason:
+                    return reason
+    loop_nudges = trace_summary.get("loopNudges")
+    if isinstance(loop_nudges, list):
+        for item in reversed(loop_nudges):
+            if isinstance(item, dict):
+                reason = str(item.get("reason") or "").strip()
+                action = str(item.get("action") or "").strip()
+                if reason and action:
+                    return f"loop_nudge:{action}:{reason}"
+                if reason:
+                    return f"loop_nudge:{reason}"
+    return ""
+
+
+def _attempt_digest_is_failure(digest: JsonDict) -> bool:
+    if not isinstance(digest, dict):
+        return False
+    status = str(digest.get("status") or "")
+    if status == "partial":
+        return False
+    validated_status = str(digest.get("validatedStatus") or "")
+    if validated_status == "validation_failed":
+        return True
+    status_category = str(digest.get("statusCategory") or "")
+    return status_category in {"recoverable", "fatal"}
+
+
+def _strip_volatile_handles(value: Any) -> Any:
+    if isinstance(value, dict):
+        cleaned: JsonDict = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if key_text in VOLATILE_HANDLE_KEYS:
+                continue
+            cleaned[key_text] = _strip_volatile_handles(item)
+        return cleaned
+    if isinstance(value, list):
+        return [
+            _strip_volatile_handles(item)
+            for item in value
+            if not _is_volatile_string(item)
+        ]
+    if _is_volatile_string(value):
+        return None
+    return value
+
+
+def _is_volatile_string(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not text:
+        return False
+    if AXTREE_ID_ANYWHERE_RE.search(text):
+        return True
+    lowered = text.lower()
+    return lowered.startswith("pageid=") or lowered.startswith("fleetid=")
+
+
 def mark_phase_running(
     logger: RunLogger,
     *,
@@ -405,6 +963,7 @@ def mark_phase_result(
     worker_id: str,
     validation: Optional[JsonDict],
     result_status: str,
+    attempt_digest: Optional[JsonDict] = None,
 ) -> None:
     if not phase_id:
         return
@@ -426,6 +985,11 @@ def mark_phase_result(
     attempt["status"] = result_status
     if validation:
         attempt["validation"] = trim_large_strings(validation, 2000)
+    if attempt_digest:
+        attempt["attemptDigest"] = trim_large_strings(
+            _strip_volatile_handles(attempt_digest),
+            4000,
+        )
 
     if result_status in {
         "blocked_by_challenge",
@@ -451,14 +1015,84 @@ def mark_phase_result(
         artifacts = validation.get("artifacts") or []
         phase_state["validated_artifacts"] = artifacts
         phase_state["last_failure"] = None
+        phase_state["last_failure_classification"] = None
         _append_unique(state.setdefault("artifacts", []), artifacts)
     else:
         phase_state["status"] = "validation_failed" if validation else result_status
         phase_state["last_failure"] = (
             validation.get("failures") if isinstance(validation, dict) else None
         )
+        phase_state["last_failure_classification"] = (
+            validation.get("classification") if isinstance(validation, dict) else None
+        )
 
     write_task_state(logger, state)
+
+
+def mark_phase_exhausted_if_needed(
+    plan: Optional[JsonDict],
+    logger: RunLogger,
+) -> List[JsonDict]:
+    if not plan:
+        return []
+    state = load_task_state(logger)
+    raw_phases_state = state.get("phases")
+    phases: JsonDict = raw_phases_state if isinstance(raw_phases_state, dict) else {}
+    raw_plan_phases = plan.get("phases")
+    plan_phases = raw_plan_phases if isinstance(raw_plan_phases, list) else []
+    exhausted: List[JsonDict] = []
+    for phase in plan_phases:
+        if not isinstance(phase, dict):
+            continue
+        phase_id = str(phase.get("id") or "")
+        phase_state = phases.get(phase_id)
+        if not isinstance(phase_state, dict):
+            continue
+        status = str(phase_state.get("status") or "")
+        if status in {
+            "validated_done",
+            "phase_failed",
+            "blocked_by_challenge",
+            "hitl_required",
+            "hitl_timeout",
+            "page_settled_after_hitl",
+        }:
+            continue
+        attempts = phase_state.get("attempts") if isinstance(phase_state, dict) else []
+        attempts_count = len(attempts) if isinstance(attempts, list) else 0
+        max_attempts = _positive_int(phase.get("max_attempts"), default=3)
+        if attempts_count < max_attempts or status not in {
+            "validation_failed",
+            "failed",
+            "cancelled",
+            "unknown",
+        }:
+            continue
+        classification = phase_state.get("last_failure_classification")
+        if not isinstance(classification, dict) and isinstance(attempts, list) and attempts:
+            validation = attempts[-1].get("validation")
+            if isinstance(validation, dict):
+                classification = validation.get("classification")
+        payload = {
+            "phaseId": phase_id,
+            "status": "phase_failed",
+            "previousStatus": status,
+            "attempts": attempts_count,
+            "max_attempts": max_attempts,
+            "last_failure": phase_state.get("last_failure"),
+            "classification": classification if isinstance(classification, dict) else None,
+        }
+        phase_state["status"] = "phase_failed"
+        phase_state["exhausted_at"] = utc_now_iso()
+        phase_state["max_attempts"] = max_attempts
+        exhausted.append(payload)
+
+    if exhausted:
+        state["current_phase"] = _first_active_phase_id(plan, phases)
+        write_task_state(logger, state)
+        for payload in exhausted:
+            logger.write("task_phase.exhausted", payload)
+    return exhausted
 
 
 def next_pending_phase(plan: Optional[JsonDict], logger: RunLogger) -> Optional[JsonDict]:
@@ -469,7 +1103,6 @@ def next_pending_phase(plan: Optional[JsonDict], logger: RunLogger) -> Optional[
     phases: JsonDict = raw_phases_state if isinstance(raw_phases_state, dict) else {}
     raw_plan_phases = plan.get("phases")
     plan_phases = raw_plan_phases if isinstance(raw_plan_phases, list) else []
-    changed = False
     for phase in plan_phases:
         if not isinstance(phase, dict):
             continue
@@ -488,24 +1121,16 @@ def next_pending_phase(plan: Optional[JsonDict], logger: RunLogger) -> Optional[
             continue
         attempts = phase_state.get("attempts") if isinstance(phase_state, dict) else []
         attempts_count = len(attempts) if isinstance(attempts, list) else 0
-        max_attempts = _positive_int(phase.get("max_attempts"), default=2)
+        max_attempts = _positive_int(phase.get("max_attempts"), default=3)
         if attempts_count >= max_attempts and status in {
             "validation_failed",
             "failed",
             "cancelled",
             "unknown",
         }:
-            phase_state["status"] = "phase_failed"
-            phase_state["exhausted_at"] = utc_now_iso()
-            phase_state["max_attempts"] = max_attempts
-            changed = True
             continue
         if status not in {"validated_done"}:
-            if changed:
-                write_task_state(logger, state)
             return phase
-    if changed:
-        write_task_state(logger, state)
     return None
 
 
@@ -523,6 +1148,7 @@ def validate_worker_artifacts(
     contract: Optional[JsonDict],
     artifacts: List[str],
     task_dir: Path,
+    attempt_artifacts: Optional[List[str]] = None,
 ) -> JsonDict:
     if not contract:
         return {"status": "skipped", "reason": "no worker_contract"}
@@ -539,29 +1165,66 @@ def validate_worker_artifacts(
         path for path in artifacts
         if "/artifacts/extractions/" in str(path)
     ]
+    extraction_attempt_artifacts = [
+        path for path in (attempt_artifacts or [])
+        if "/artifacts/extractions/" in str(path)
+    ]
+    all_extraction_artifacts = _unique_paths([
+        *extraction_artifacts,
+        *extraction_attempt_artifacts,
+    ])
     failures: List[JsonDict] = []
     loaded = _load_extraction_artifacts(extraction_artifacts, task_dir)
+    loaded_attempts = _load_extraction_artifacts(
+        [
+            path for path in extraction_attempt_artifacts
+            if path not in extraction_artifacts
+        ],
+        task_dir,
+    )
     expected_name = str(expected.get("name") or "").strip()
     candidates = [
         item for item in loaded
         if not expected_name or item.get("payload", {}).get("name") == expected_name
     ]
+    attempt_candidates = [
+        item for item in loaded_attempts
+        if not expected_name or item.get("payload", {}).get("name") == expected_name
+    ]
 
     must_record = bool(contract.get("must_record_extraction", True))
-    if must_record and not candidates:
+    if must_record and not candidates and not attempt_candidates:
         failures.append({
             "type": "artifact_required",
             "message": (
                 f"expected record_extraction artifact"
                 + (f" named {expected_name!r}" if expected_name else "")
             ),
-            "availableArtifacts": extraction_artifacts,
+            "availableArtifacts": all_extraction_artifacts,
         })
 
-    selected = candidates[0] if candidates else (loaded[0] if loaded else None)
+    selected = (
+        candidates[0]
+        if candidates
+        else attempt_candidates[0]
+        if attempt_candidates
+        else loaded[0]
+        if loaded
+        else loaded_attempts[0]
+        if loaded_attempts
+        else None
+    )
     rows: List[JsonDict] = []
     if selected:
         payload = selected.get("payload") or {}
+        schema_warnings = payload.get("schemaWarnings")
+        if isinstance(schema_warnings, list) and schema_warnings:
+            failures.append({
+                "type": "schema",
+                "message": "selected record_extraction artifact has schemaWarnings",
+                "path": selected.get("path"),
+                "schemaWarnings": schema_warnings[:5],
+            })
         raw_rows = payload.get("rows")
         if isinstance(raw_rows, list):
             rows = [row for row in raw_rows if isinstance(row, dict)]
@@ -575,16 +1238,278 @@ def validate_worker_artifacts(
     for validator in validators:
         failures.extend(_run_validator(validator, rows))
 
+    placeholder_failures = _detect_placeholder_rows(rows)
+    failures.extend(placeholder_failures)
+    failures.extend(_detect_stub_rows(rows, expected))
+    warnings = _detect_near_stub_rows(rows, expected)
+
     status = "done" if not failures else "failed"
-    return {
+    result = {
         "status": status,
         "phase_id": contract.get("phase_id"),
         "expectedArtifact": expected,
         "rowCount": len(rows),
         "artifacts": [selected.get("path")] if selected else [],
-        "allExtractionArtifacts": extraction_artifacts,
+        "allExtractionArtifacts": all_extraction_artifacts,
+        "validExtractionArtifacts": extraction_artifacts,
+        "attemptExtractionArtifacts": extraction_attempt_artifacts,
         "failures": failures,
     }
+    if warnings:
+        result["warnings"] = warnings
+    if failures:
+        result["classification"] = classify_artifact_validation_failures(
+            failures,
+            rows=rows,
+            expected_artifact=expected,
+        )
+    return result
+
+
+PLACEHOLDER_TEXT_PATTERNS = tuple(
+    re.compile(pattern, re.I)
+    for pattern in (
+        r"^\s*loading(?:\.\.\.)?\s*$",
+        r"^\s*(?:<\s*)?placeholder(?:\s*>)?\s*$",
+        r"\bplaceholder\b",
+        r"^\s*be the first to\b.*$",
+        r"^\s*sign in to (?:view|continue|see)\b.*$",
+        r"^\s*ask a question\s*$",
+        r"^\s*no data(?: available)?\s*$",
+        r"^\s*no reviews? yet\s*$",
+        r"^\s*no comments? yet\s*$",
+        r"^\s*coming soon\s*$",
+        r"^\s*nothing (?:here|found)\s*$",
+    )
+)
+
+
+def _detect_placeholder_rows(rows: List[JsonDict]) -> List[JsonDict]:
+    bad: List[JsonDict] = []
+    for index, row in enumerate(rows):
+        if _row_self_reports_placeholder(row):
+            bad.append({
+                "type": "data_placeholder",
+                "row": index,
+                "reason": "row_self_reported_placeholder",
+            })
+            continue
+        matched_fields: List[JsonDict] = []
+        for field, value in row.items():
+            if not isinstance(value, str):
+                continue
+            text = value.strip()
+            if not text or len(text) > 120:
+                continue
+            pattern = _placeholder_pattern(text)
+            if pattern:
+                matched_fields.append({
+                    "field": str(field),
+                    "value": text[:120],
+                    "pattern": pattern,
+                })
+        if matched_fields:
+            bad.append({
+                "type": "data_placeholder",
+                "row": index,
+                "fields": matched_fields[:5],
+            })
+    return bad[:20]
+
+
+def _detect_stub_rows(rows: List[JsonDict], expected_artifact: JsonDict) -> List[JsonDict]:
+    array_fields = _expected_array_fields(expected_artifact)
+    if not array_fields:
+        return []
+    bad: List[JsonDict] = []
+    for index, row in enumerate(rows):
+        present = [field for field in array_fields if field in row]
+        if not present:
+            continue
+        empty = [
+            field for field in present
+            if isinstance(row.get(field), list) and len(row.get(field) or []) == 0
+        ]
+        if len(empty) < max(2, len(present)):
+            continue
+        if _row_has_blocker_explanation(row):
+            continue
+        bad.append({
+            "type": "data_stub",
+            "row": index,
+            "emptyArrayFields": empty,
+            "reason": "detail-like row has empty arrays without blocker or absence note",
+        })
+    return bad[:20]
+
+
+def _detect_near_stub_rows(rows: List[JsonDict], expected_artifact: JsonDict) -> List[JsonDict]:
+    array_fields = _expected_array_fields(expected_artifact)
+    if len(array_fields) < 3:
+        return []
+    warnings: List[JsonDict] = []
+    for index, row in enumerate(rows):
+        present = [field for field in array_fields if field in row]
+        if len(present) < 3:
+            continue
+        empty = [
+            field for field in present
+            if isinstance(row.get(field), list) and len(row.get(field) or []) == 0
+        ]
+        if len(empty) < max(2, len(present) - 1):
+            continue
+        if len(empty) >= len(present):
+            continue
+        if _row_has_blocker_explanation(row):
+            continue
+        non_empty = [
+            field for field in present
+            if field not in empty
+        ]
+        warnings.append({
+            "type": "near_stub_row",
+            "row": index,
+            "emptyArrayFields": empty,
+            "nonEmptyArrayFields": non_empty,
+            "reason": "most detail array fields are empty; verify this is real page absence, not padding",
+        })
+    return warnings[:20]
+
+
+def _expected_array_fields(expected_artifact: JsonDict) -> List[str]:
+    raw_fields = expected_artifact.get("fields")
+    if not isinstance(raw_fields, list):
+        return []
+    out: List[str] = []
+    for field in raw_fields:
+        if not isinstance(field, dict):
+            continue
+        name = field_name_from_spec(field)
+        field_type = str(field.get("type") or "").strip().lower()
+        if name and field_type == "array":
+            out.append(name)
+    return out
+
+
+def _row_has_blocker_explanation(row: JsonDict) -> bool:
+    for key in (
+        "_note",
+        "note",
+        "notes",
+        "blocker",
+        "blockers",
+        "status",
+        "reason",
+        "absence_reason",
+        "missing_reason",
+    ):
+        value = row.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+        if isinstance(value, list) and value:
+            return True
+        if isinstance(value, dict) and value:
+            return True
+    return False
+
+
+def _row_self_reports_placeholder(row: JsonDict) -> bool:
+    for key in (
+        "placeholderDetected",
+        "placeholder_detected",
+        "isPlaceholder",
+        "is_placeholder",
+        "dataPlaceholder",
+        "data_placeholder",
+    ):
+        if row.get(key) is True:
+            return True
+        value = row.get(key)
+        if isinstance(value, str) and value.strip().lower() in {"true", "yes", "1"}:
+            return True
+    return False
+
+
+def _placeholder_pattern(text: str) -> str:
+    for pattern in PLACEHOLDER_TEXT_PATTERNS:
+        if pattern.search(text):
+            return pattern.pattern
+    return ""
+
+
+def classify_artifact_validation_failures(
+    failures: List[JsonDict],
+    *,
+    rows: Optional[List[JsonDict]] = None,
+    expected_artifact: Optional[JsonDict] = None,
+) -> JsonDict:
+    failure_types = {
+        str(item.get("type") or "")
+        for item in failures
+        if isinstance(item, dict)
+    }
+    if failure_types & {"data_placeholder", "data_stub"}:
+        category = "data_placeholder"
+        hint = "Observed rows look like placeholder or stub content; reveal/load the real content or report absence."
+    elif "artifact_required" in failure_types:
+        category = "data_missing"
+        hint = "No matching record_extraction artifact was produced; collect and save the target rows."
+    elif failure_types & {"schema", "required_fields", "field_provenance"}:
+        category = "schema_mismatch"
+        hint = "Rows exist but do not match the expected artifact schema; reshape from evidence before re-scraping."
+    elif failure_types & {"min_rows", "max_rows", "exact_rows"}:
+        category = "data_wrong_shape"
+        hint = "The number of rows does not satisfy the expected shape; adjust range/materialization or scope."
+    elif failure_types & {
+        "unique",
+        "url_pattern",
+        "allowed_domain",
+        "set_equals",
+        "range",
+        "field_pattern",
+        "cross_field_contains",
+        "action_outcome",
+        "field_nonempty",
+    }:
+        category = "data_wrong_value"
+        hint = "Rows were saved, but one or more values failed semantic validators."
+    else:
+        category = "data_wrong_value" if failures else "unknown"
+        hint = "Validation failed; inspect failures and choose a different recovery path."
+    return {
+        "category": category,
+        "hint": hint,
+        "failureTypes": sorted(ft for ft in failure_types if ft),
+        "rowCount": len(rows or []),
+        "expectedArtifactName": (
+            str((expected_artifact or {}).get("name") or "")
+            if isinstance(expected_artifact, dict)
+            else ""
+        ),
+    }
+
+
+def classification_for_worker_status(status: str) -> Optional[JsonDict]:
+    text = str(status or "")
+    if text in {
+        WORKER_STATUS_BLOCKED_BY_CHALLENGE,
+        WORKER_STATUS_HITL_REQUIRED,
+        WORKER_STATUS_HITL_WAITING,
+        WORKER_STATUS_HITL_TIMEOUT,
+        WORKER_STATUS_PAGE_SETTLED_AFTER_HITL,
+    }:
+        return {
+            "category": "blocked_user_action_required",
+            "hint": "Human action or challenge resolution is required before retrying this phase.",
+            "workerStatus": text,
+        }
+    if text in {WORKER_STATUS_PAGE_CRASHED, WORKER_STATUS_API_CONTRACT_ERROR}:
+        return {
+            "category": "blocked_infrastructure",
+            "hint": "Infrastructure or browser state failed; rebuild the page/fleet or switch platform path.",
+            "workerStatus": text,
+        }
+    return None
 
 
 def _run_validator(validator: JsonDict, rows: List[JsonDict]) -> List[JsonDict]:
@@ -608,17 +1533,28 @@ def _run_validator(validator: JsonDict, rows: List[JsonDict]) -> List[JsonDict]:
 
     if validator_type == "field_nonempty":
         fields = _string_list(validator.get("fields"))
+        if not fields:
+            field = str(validator.get("field") or "").strip()
+            fields = [field] if field else []
         for index, row in enumerate(rows):
             empty = [
                 field for field in fields
-                if row.get(field) is None or str(row.get(field)).strip() == ""
+                if _is_empty_value(row.get(field))
             ]
             if empty:
                 failures.append({"type": validator_type, "row": index, "empty": empty})
         return failures
 
     if validator_type in {"min_rows", "max_rows", "exact_rows"}:
-        value = _positive_int(validator.get("value"), default=0)
+        raw_value = validator.get("value")
+        if raw_value is None:
+            if validator_type == "min_rows":
+                raw_value = validator.get("min")
+            elif validator_type == "max_rows":
+                raw_value = validator.get("max")
+            else:
+                raw_value = validator.get("count") or validator.get("exact")
+        value = _positive_int(raw_value, default=0)
         count = len(rows)
         ok = (
             count >= value if validator_type == "min_rows"
@@ -718,6 +1654,10 @@ def _run_validator(validator: JsonDict, rows: List[JsonDict]) -> List[JsonDict]:
 
     if validator_type == "action_outcome":
         failures.extend(_validate_action_outcome(validator, rows))
+        return failures
+
+    if validator_type == "field_provenance":
+        failures.extend(_validate_field_provenance(validator, rows))
         return failures
 
     if validator_type == "allowed_domain":
@@ -848,6 +1788,60 @@ def _validate_action_outcome(
     return [{"type": "action_outcome", "bad": bad[:20]}]
 
 
+def _validate_field_provenance(
+    validator: JsonDict,
+    rows: List[JsonDict],
+) -> List[JsonDict]:
+    raw_fields = validator.get("fields") or validator.get("field_provenance")
+    if isinstance(raw_fields, list):
+        specs = {str(field): {} for field in raw_fields if str(field).strip()}
+    elif isinstance(raw_fields, dict):
+        specs = {
+            str(field): spec if isinstance(spec, dict) else {}
+            for field, spec in raw_fields.items()
+            if str(field).strip()
+        }
+    else:
+        field = str(validator.get("field") or "").strip()
+        specs = {field: {}} if field else {}
+
+    bad: List[JsonDict] = []
+    for index, row in enumerate(rows):
+        for field, spec in specs.items():
+            evidence_field = str(
+                spec.get("evidence_field")
+                or validator.get("evidence_field")
+                or f"{field}EvidenceText"
+            ).strip()
+            source_tool_field = str(
+                spec.get("source_tool_field")
+                or validator.get("source_tool_field")
+                or "sourceTool"
+            ).strip()
+            selector_field = str(
+                spec.get("selector_field")
+                or validator.get("selector_field")
+                or "sourceSelectorOrAxId"
+            ).strip()
+            missing = []
+            if row.get(field) is None or str(row.get(field)).strip() == "":
+                missing.append(field)
+            if not evidence_field or str(row.get(evidence_field) or "").strip() == "":
+                missing.append(evidence_field or "evidence_field")
+            if bool(spec.get("require_source_tool", validator.get("require_source_tool", False))):
+                if str(row.get(source_tool_field) or "").strip() == "":
+                    missing.append(source_tool_field)
+            if bool(spec.get("require_selector", validator.get("require_selector", False))):
+                if str(row.get(selector_field) or "").strip() == "":
+                    missing.append(selector_field)
+            if missing:
+                bad.append({"row": index, "field": field, "missing": missing})
+
+    if not bad:
+        return []
+    return [{"type": "field_provenance", "bad": bad[:20]}]
+
+
 def _compile_validator_regex(pattern: str, validator: JsonDict) -> re.Pattern[str]:
     flags = re.I if bool(validator.get("case_insensitive", False)) else 0
     return re.compile(pattern or r"$^", flags)
@@ -888,10 +1882,25 @@ def _normalize_validators(
         normalized.append({"type": "max_rows", "value": expected_artifact.get("max_rows")})
     if expected_artifact.get("exact_rows") is not None:
         normalized.append({"type": "exact_rows", "value": expected_artifact.get("exact_rows")})
+    count_range = expected_artifact.get("count_range")
+    if isinstance(count_range, list) and len(count_range) >= 2:
+        normalized.append({"type": "min_rows", "value": count_range[0]})
+        normalized.append({"type": "max_rows", "value": count_range[1]})
     fields = expected_artifact.get("required_fields")
-    if isinstance(fields, list) and fields:
-        normalized.append({"type": "required_fields", "fields": fields})
-        normalized.append({"type": "field_nonempty", "fields": fields})
+    if not isinstance(fields, list) or not fields:
+        fields = expected_artifact.get("fields")
+    field_names = field_names_from_specs(fields)
+    if field_names:
+        normalized.append({"type": "required_fields", "fields": field_names})
+        normalized.append({"type": "field_nonempty", "fields": field_names})
+        provenance_fields = _provenance_required_fields(expected_artifact, field_names)
+        if provenance_fields and not _has_field_provenance_validator(validators, provenance_fields):
+            normalized.append({
+                "type": "field_provenance",
+                "fields": provenance_fields,
+                "require_source_tool": True,
+                "require_selector": True,
+            })
 
     for index, validator in enumerate(validators):
         if not isinstance(validator, dict):
@@ -904,6 +1913,49 @@ def _normalize_validators(
             )
         normalized.append(dict(validator))
     return normalized
+
+
+def _has_field_provenance_validator(
+    validators: List[Any],
+    fields: List[str],
+) -> bool:
+    wanted = set(field_names_from_specs(fields))
+    if not wanted:
+        return True
+    for validator in validators:
+        if not isinstance(validator, dict):
+            continue
+        if str(validator.get("type") or "") != "field_provenance":
+            continue
+        raw_fields = validator.get("fields") or validator.get("field_provenance")
+        if isinstance(raw_fields, dict):
+            present = {str(field).strip() for field in raw_fields.keys()}
+        elif isinstance(raw_fields, list):
+            present = set(field_names_from_specs(raw_fields))
+        else:
+            present = {str(validator.get("field") or "").strip()}
+        if wanted.issubset({field for field in present if field}):
+            return True
+    return False
+
+
+def _provenance_required_fields(
+    expected_artifact: JsonDict,
+    fields: List[Any],
+) -> List[str]:
+    override = expected_artifact.get("provenance_required")
+    if isinstance(override, list):
+        return field_names_from_specs(override)
+    out: List[str] = []
+    for field in fields:
+        text = field_name_from_spec(field)
+        if not text:
+            continue
+        lowered = text.lower()
+        tokens = {token for token in re.split(r"[_\W]+", lowered) if token}
+        if lowered in SENSITIVE_PROVENANCE_FIELD_MARKERS or tokens & SENSITIVE_PROVENANCE_FIELD_MARKERS:
+            out.append(text)
+    return out
 
 
 def _load_extraction_artifacts(paths: List[str], task_dir: Path) -> List[JsonDict]:
@@ -944,9 +1996,28 @@ def _phase_state(state: JsonDict, phase_id: str) -> Optional[JsonDict]:
 
 
 def _string_list(value: Any) -> List[str]:
-    if not isinstance(value, list):
-        return []
-    return [str(item).strip() for item in value if str(item).strip()]
+    return field_names_from_specs(value)
+
+
+def _is_empty_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip() == ""
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) == 0
+    return False
+
+
+def _unique_paths(values: List[Any]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in seen:
+            out.append(text)
+            seen.add(text)
+    return out
 
 
 def _positive_int(value: Any, default: int) -> int:

@@ -5,6 +5,7 @@ harness.progress - Lightweight per-worker progress accounting.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 from typing import Any, Dict, List, Optional
 
 from harness.utils import JsonDict
@@ -16,9 +17,37 @@ ARTIFACT_PROGRESS_TOOLS = {
     "extract_dom_records",
     "eval_js_json",
     "navigate_verified",
+    "local_fs_search",
+    "local_fs_read",
+    "local_fs_jsonpath",
+    "System.describeAction",
+    "System.describeEvent",
+    "System.getCapabilities",
+    "Memory.get",
+    "Memory.save",
     "Runtime.evaluate",
+    "DOM.getAXTree",
     "DOM.getText",
+    "DOM.getAttribute",
+    "Input.click",
+    "Input.type",
+    "Input.press",
+    "Input.scroll",
+    "Page.getState",
 }
+
+PRODUCTIVE_PRIMITIVE_TOOLS = {
+    "DOM.getAXTree",
+    "DOM.getText",
+    "DOM.getAttribute",
+    "Input.click",
+    "Input.type",
+    "Input.press",
+    "Input.scroll",
+    "Page.getState",
+}
+
+PRODUCTIVE_WITHOUT_ARTIFACT_HARD_LIMIT = 30
 
 
 @dataclass
@@ -57,6 +86,28 @@ class ProgressAccountant:
         if (
             requires_artifact
             and artifact_count == 0
+            and tool_name in PRODUCTIVE_PRIMITIVE_TOOLS
+            and self.turns_since_artifact_progress >= PRODUCTIVE_WITHOUT_ARTIFACT_HARD_LIMIT
+        ):
+            intervention = {
+                "status": "progress_intervention",
+                "reason": "productive_primitives_without_artifact",
+                "tool": tool_name,
+                "turnsSinceArtifactProgress": self.turns_since_artifact_progress,
+                "toolCalls": self.tool_calls,
+                "tool_was_executed": False,
+                "next_instruction": (
+                    "This worker has spent many productive browser steps without"
+                    " producing record_extraction. Persist verified rows now,"
+                    " narrow the target using params derived from the latest"
+                    " DOM/response feedback, or finalize with the blocker."
+                ),
+            }
+            self.interventions.append(intervention)
+            return intervention
+        if (
+            requires_artifact
+            and artifact_count == 0
             and tool_name not in ARTIFACT_PROGRESS_TOOLS
             and self.turns_since_artifact_progress >= no_artifact_limit
         ):
@@ -70,8 +121,9 @@ class ProgressAccountant:
                 "next_instruction": (
                     "This worker has not produced any record_extraction artifact"
                     " after several tool calls. Stop repeating the current surface:"
-                    " call record_extraction with verified rows, pivot to a different"
-                    " extraction method, or finalize with the blocker."
+                    " call record_extraction with verified rows, pivot with fresh"
+                    " params from DOM.getAXTree/DOM.getText/DOM.getAttribute,"
+                    " or finalize with the blocker."
                 ),
             }
             self.interventions.append(intervention)
@@ -96,7 +148,8 @@ class ProgressAccountant:
                 "next_instruction": (
                     "Local file searches have not produced any record_extraction"
                     " artifact. Return to browser extraction, call record_extraction"
-                    " with verified rows, or finalize with a blocker."
+                    " with verified rows, or finalize with a blocker. Do not reuse"
+                    " stale AXTree ids or selectors from old offload files."
                 ),
             }
             self.interventions.append(intervention)
@@ -114,8 +167,8 @@ class ProgressAccountant:
                 "tool_was_executed": False,
                 "next_instruction": (
                     "This worker has only searched/read local files recently."
-                    " Use a browser extraction method such as extract_dom_records,"
-                    " navigate_verified, Runtime.evaluate with explicit return, or"
+                    " Use browser primitives such as DOM.getAXTree,"
+                    " DOM.getText/DOM.getAttribute, Input.*, or"
                     " finalize with a blocker."
                 ),
             }
@@ -160,7 +213,8 @@ class ProgressAccountant:
                     "next_instruction": (
                         "The last local search/read returned the same file/line"
                         " evidence again. Do not keep searching the same offload;"
-                        " pivot to extract_dom_records / browser action or finalize."
+                        " pivot to DOM/Page/Input browser action with fresh params"
+                        " from the current page, or finalize."
                     ),
                 }
             return
@@ -211,6 +265,12 @@ def _local_result_signature(result: Optional[JsonDict]) -> Optional[str]:
     if not isinstance(results, list):
         path = result.get("path") or result.get("relativePath")
         if path:
+            line_offset = result.get("lineOffset")
+            line_limit = result.get("lineLimit")
+            if line_offset is not None or line_limit is not None:
+                content = str(result.get("content") or "")
+                digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:16]
+                return f"{path}:lines:{line_offset or 0}:{line_limit or ''}:sha:{digest}"
             return str(path)
         return None
     keys: List[str] = []

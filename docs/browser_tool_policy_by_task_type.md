@@ -37,7 +37,7 @@ Disabled domains:
 
 ## web_scrape
 
-Use for deterministic list/detail extraction.
+Use for list/detail extraction.
 
 Default ABCP surface:
 

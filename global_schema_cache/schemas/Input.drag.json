@@ -1,63 +1,74 @@
 {
   "method": "Input.drag",
-  "description": "Drags an element or from a position to another element, position, or relative distance.",
+  "description": "Performs a physical drag from a known source to a target, coordinate, or relative offset; prefer canonical ids, use stable selectors as fallback, and use coordinates only as a last resort.",
   "params": {
     "pageId": {
       "type": "string",
       "format": "uuid",
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Page ID containing the drag source and destination.",
       "required": true
     },
     "selector": {
+      "description": "Fallback CSS selector for the drag source.",
       "type": "string",
       "minLength": 1,
       "required": false
     },
     "id": {
+      "description": "Preferred canonical element ID for the drag source.",
       "type": "string",
       "pattern": "^\\d+:\\d+:\\d+$",
       "required": false
     },
     "x": {
+      "description": "Fallback source X coordinate.",
       "type": "number",
       "required": false
     },
     "y": {
+      "description": "Fallback source Y coordinate.",
       "type": "number",
       "required": false
     },
     "toSelector": {
+      "description": "Fallback CSS selector for the drag destination.",
       "type": "string",
       "minLength": 1,
       "required": false
     },
     "toId": {
+      "description": "Preferred canonical element ID for the drag destination.",
       "type": "string",
       "pattern": "^\\d+:\\d+:\\d+$",
       "required": false
     },
     "toX": {
+      "description": "Fallback destination X coordinate.",
       "type": "number",
       "required": false
     },
     "toY": {
+      "description": "Fallback destination Y coordinate.",
       "type": "number",
       "required": false
     },
     "dx": {
+      "description": "Relative horizontal drag offset when not using an explicit destination.",
       "type": "number",
       "required": false
     },
     "dy": {
+      "description": "Relative vertical drag offset when not using an explicit destination.",
       "type": "number",
       "required": false
     },
     "purpose": {
       "type": "string",
-      "description": "Describe why you are dragging, e.g., moving a slider to a specific position",
+      "description": "Describe the intended drag effect, e.g., moving a slider, reordering an item, or dragging one element onto another",
       "required": true
     }
   },
   "requiresPurpose": true,
-  "purposeHint": "Describe why you are dragging, e.g., moving a slider to a specific position"
+  "purposeHint": "Describe the intended drag effect, e.g., moving a slider, reordering an item, or dragging one element onto another"
 }

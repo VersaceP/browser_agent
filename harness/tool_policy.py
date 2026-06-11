@@ -18,6 +18,7 @@ HARNESS_DEFAULT_ALLOWED_TOOLS: FrozenSet[str] = frozenset({
     "local_fs_search",
     "local_fs_read",
     "local_fs_jsonpath",
+    "find_in_axtree",
     "extract_dom_records",
     "eval_js_json",
     "navigate_verified",
@@ -33,6 +34,7 @@ ALWAYS_FORBIDDEN_ABCP_METHODS: FrozenSet[str] = frozenset({
     "DOM.getSemanticTree",
     "Hitl.getTaskSummary",
     "Hitl.resumeEvent",
+    "Memory.delete",
 })
 
 TASK_TYPE_DISABLED_DOMAINS = {
@@ -43,7 +45,15 @@ TASK_TYPE_DISABLED_DOMAINS = {
 }
 
 TASK_TYPE_ALLOWED_EXCEPTIONS = {
-    "form_fill": frozenset({"File.handleChooser"}),
+    "web_search": frozenset({"Memory.get", "Memory.save"}),
+    "web_scrape": frozenset({"Memory.get", "Memory.save"}),
+    "form_fill": frozenset({"File.handleChooser", "Memory.get", "Memory.save"}),
+    "download_file": frozenset({"Memory.get", "Memory.save"}),
+}
+
+TASK_TYPE_ALIASES = {
+    "browser_data_collection": "web_scrape",
+    "browser_action": "form_fill",
 }
 
 
@@ -53,7 +63,8 @@ def method_domain(method: str) -> str:
 
 
 def normalize_task_type(task_type: object) -> str:
-    return str(task_type or "general").strip() or "general"
+    normalized = str(task_type or "general").strip() or "general"
+    return TASK_TYPE_ALIASES.get(normalized, normalized)
 
 
 def disabled_reason_for_method(method: str, task_type: object) -> str:

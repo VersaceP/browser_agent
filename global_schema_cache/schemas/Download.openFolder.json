@@ -6,6 +6,7 @@
       "type": "integer",
       "minimum": -9007199254740991,
       "maximum": 9007199254740991,
+      "description": "Download record ID whose parent folder should be opened.",
       "required": true
     },
     "purpose": {

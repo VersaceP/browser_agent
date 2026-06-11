@@ -9,12 +9,13 @@
 - `main.py`
 - `agent_harness.py`
 - `abcp_client.py`
-- `harness/**`
+- `harness/**`（含新增 `error_classification.py`, `lifecycle.py`, `worker_result.py`）
 - `harness/tools/**`
 - `llm/**`
 - `llm_provider.py`
 - `probe_schema.py`
 - `probe_runtime_eval.py`
+- `strategy_bank/strategy_bank.json`
 
 默认不纳入核心 harness：
 
@@ -39,34 +40,35 @@ flowchart TB
     Mode -->|single| WorkerSingle[BrowserAgent]
 
     Lead --> LeadTools[Lead tools dispatcher]
+    LeadTools --> LifecycleLead[LifecycleManager<br/>tool_pre/post_call hooks]
     LeadTools --> Spawner[BrowserAgentSpawner]
     LeadTools --> LocalFSLead[local_fs tools]
     Spawner --> WorkerSpawned[BrowserAgent worker]
-    Spawner --> Skill[SkillAgent<br/>LLM only]
-    Spawner --> PlanExec[ABCPPlanExecutor]
+    Spawner --> WorkerResult[Worker Result L1/L2/L3<br/>结构化结果信封]
 
     WorkerSingle --> BrowserTools[Browser tools dispatcher]
     WorkerSpawned --> BrowserTools
+    BrowserTools --> LifecycleBrowser[LifecycleManager<br/>tool_pre/post_call hooks]
     BrowserTools --> RenderRecovery[RenderRecoveryRunner]
     BrowserTools --> HITL[HITL wait helper]
     BrowserTools --> VL[visual_verify<br/>optional VL model]
     BrowserTools --> LocalFSWorker[local_fs tools]
     BrowserTools --> Offload[offload/artifacts]
+    BrowserTools --> ErrClass[ErrorClassification<br/>attach_error_classification]
 
-    PlanExec --> RenderRecovery
-    PlanExec --> HITL
+    Lead --> StrategyBank[Strategy Bank<br/>strategy_bank.json]
+    Lead --> ChallengeTracker[ChallengeTracker<br/>suspected_pages]
+    WorkerSpawned --> ChallengeTracker
 
     Lead --> LLMFactory[LLMFactory]
     WorkerSingle --> LLMFactory
     WorkerSpawned --> LLMFactory
-    Skill --> LLMFactory
     LLMFactory --> OpenAI[OpenAIProvider]
     LLMFactory --> Anthropic[AnthropicProvider]
     OpenAI --> ExternalLLM[外部 LLM API]
     Anthropic --> ExternalLLM
 
     RenderRecovery --> ABCPClient[ABCPClient]
-    PlanExec --> ABCPClient
     ABCPClient -->|WebSocket RPC| ABCPBrowser[外部 ABCP Browser]
     ABCPClient --> NotificationHub[NotificationHub<br/>System.notification replay/broadcast]
 
@@ -81,12 +83,15 @@ flowchart TB
 | 层 | 模块 | 职责 |
 | --- | --- | --- |
 | CLI/配置层 | `main.py`, `harness/config.py`, `llm/config.py`, `abcp_client.py:ABCPClientConfig` | 读取 `config.json`、命令行任务、运行模式、模型配置、浏览器连接配置。 |
-| 编排层 | `LeadAgent`, `BrowserAgent`, `BrowserAgentSpawner`, `ABCPPlanExecutor` | Lead 拆解任务并调度 worker/skill/plan；BrowserAgent 执行浏览器工具循环；PlanExecutor 执行确定性 ABCP step。 |
-| 工具层 | `harness/tools/browser_tools.py`, `harness/tools/lead_tools.py` | 将模型 tool call 映射到本地工具、ABCP method、文件读取、批处理、最终回答。 |
+| 编排层 | `LeadAgent`, `BrowserAgent`, `BrowserAgentSpawner` | Lead 拆解任务并调度 BrowserAgent phase；BrowserAgent 执行浏览器工具循环。 |
+| 生命周期中间件层 | `harness/lifecycle.py` | 可插拔的同步中间件链：`session_context_build` / `agent_before_step` / `tool_pre_call` / `tool_post_call` / `compact_before` / `compact_after` / `worker_before_return`。贯穿所有 agent 和工具调用。 |
+| 工具层 | `harness/tools/browser_tools.py`, `harness/tools/lead_tools.py` | 将模型 tool call 映射到本地工具、ABCP method、文件读取、artifact 保存、最终回答。通过 `LifecycleManager` 注入 hooks。 |
 | 传输层 | `ABCPClient`, `NotificationHub` | WebSocket 连接、请求封装、单飞 RPC、响应识别、通知广播与 replay。 |
 | LLM 适配层 | `llm/base.py`, `llm/openai_provider.py`, `llm/anthropic_provider.py`, `llm/cache_control.py` | 统一 provider 接口，转换 Anthropic 风格 messages/tools 到具体厂商协议，处理 prompt cache marker 和回退。 |
 | 数据/可观测层 | `RunLogger`, `offload`, `local_fs`, `schema_loader`, `compaction` | 写 JSONL 日志、artifact、schema 缓存、大响应下沉、上下文压缩、任务内只读查询。 |
-| 安全/恢复层 | `diagnostics`, `hitl`, `render_recovery`, `progress`, `loop_guard`, `task_control` | 终态分类、HITL 等待、render 丢失恢复、循环防护、任务计划状态和 artifact 验收。 |
+| 安全/恢复层 | `diagnostics`, `hitl`, `render_recovery`, `progress`, `loop_guard`, `task_control`, `error_classification` | 终态分类、HITL 等待、render 丢失恢复、循环防护、任务计划状态、artifact 验收、浏览器错误分类提示。 |
+| Worker 结果标准化层 | `harness/worker_result.py` | L1/L2/L3 三级结果信封：L1 路由、L2 语义数据、L3 引用。确保 worker→LeadAgent 交接数据结构稳定。 |
+| 策略/模板层 | `strategy_bank`, `harness/strategy_bank.py`, `harness/tool_policy.py` | 只读 v1 策略库加载和按 task_type/phase 匹配；ABCP 方法按 task_type 禁用策略。 |
 | 可选视觉层 | `harness/vl.py` | 对截图做有限视觉验收，不承担批量数据抽取。 |
 
 ## 核心数据流
@@ -102,12 +107,16 @@ flowchart LR
     Messages --> LLMCall[provider.generate_response]
     SystemPrompt --> LLMCall
     ToolSpecs --> LLMCall
+    StrategyBank[Strategy Bank] --> SystemPrompt
     LLMCall --> ToolCalls[tool_calls]
-    ToolCalls --> Dispatch[tool dispatcher]
+    ToolCalls --> LifecyclePre[LifecycleManager.tool_pre_call]
+    LifecyclePre --> Dispatch[tool dispatcher]
     Dispatch --> BrowserRPC[ABCPClient.call]
     BrowserRPC --> BrowserResponse[response/observation/data]
-    BrowserResponse --> Capture[strip image/offload large fields]
-    Capture --> Artifacts[artifacts/observations/tool_results]
+    BrowserResponse --> ErrorClass[ErrorClassification]
+    ErrorClass --> Capture[strip image/offload large fields]
+    Capture --> LifecyclePost[LifecycleManager.tool_post_call]
+    LifecyclePost --> Artifacts[artifacts/observations/tool_results]
     Capture --> ToolResult[tool_result JSON]
     ToolResult --> Messages
     Logger[RunLogger] --> RunLog[run.jsonl]
@@ -283,36 +292,29 @@ sequenceDiagram
     Helper-->>Tool: status=resumed or timeout
 ```
 
-### 确定性 ABCP Plan 批处理时序
+### Lead 编排时序
+
+LeadAgent 通过 v1 task_plan 把复杂任务拆成明确 phase，每个 phase 派一个 BrowserAgent；校验失败时根据 artifactValidation / resultLevels 重塑可信 artifact、replan，或只派一个更聚焦的 continuation。
 
 ```mermaid
 sequenceDiagram
     participant Lead as LeadAgent
     participant LT as lead_tools
     participant Sp as BrowserAgentSpawner
-    participant PE as ABCPPlanExecutor
-    participant Client as ABCPClient
-    participant ABCP as ABCP Browser
+    participant Worker as BrowserAgent
 
-    Lead->>LT: run_abcp_plan_batch(items_json, steps_json, validate_first_n)
-    LT->>Sp: run_abcp_plan_batch()
-    Sp->>PE: run_abcp_plan_batch()
-    loop validation items serially
-        PE->>Client: System.register
-        PE->>Client: load capability bundle for purpose metadata
-        loop steps
-            PE->>PE: render_templates(params, variables)
-            PE->>PE: ensure purpose
-            PE->>Client: call step method
-            Client->>ABCP: RPC
-            ABCP-->>Client: response
-            PE->>PE: save_as variables, detect challenge/HITL/error
-        end
-    end
-    alt validation passed
-        PE->>PE: run remaining items with bounded concurrency
-    else validation failed
-        PE-->>Lead: validation_failed or validation_hitl_required
+    Lead->>LT: emit_task_plan(task_type, phases)
+    Lead->>LT: spawn_browser_agent(phase_id, result_contract)
+    LT->>Sp: spawn_browser_agent()
+    Sp->>Worker: run(worker_task + worker_contract)
+    Worker-->>Sp: answer, artifacts, resultLevels, tracePath
+    Sp-->>Lead: spawner.browser.result
+    alt schema_mismatch with trusted rows
+        Lead->>LT: lead_save_artifact(rows, source_artifacts)
+    else missing/wrong/placeholder evidence
+        Lead->>LT: emit_task_plan(replan_reason)
+    else complete or blocked
+        Lead->>LT: final_answer(status, answer)
     end
 ```
 
@@ -482,15 +484,9 @@ sequenceDiagram
 | 符号 | 功能/用途 | 入参 | 返回/出参 | 副作用 |
 | --- | --- | --- | --- | --- |
 | `BrowserAgentHandle` | worker 句柄元数据 | dataclass fields | handle | 无 |
-| `BrowserAgentSpawner` | 创建和管理 BrowserAgent、SkillAgent、PlanExecutor | `runtime`, `logger`, `browser_agent_factory` | spawner | 持有 handles |
+| `BrowserAgentSpawner` | 创建和管理 BrowserAgent | `runtime`, `logger`, `browser_agent_factory` | spawner | 持有 handles |
 | `spawn_browser_agent` | 异步启动一个 BrowserAgent | `task`, `context=''`, `name=None`, `max_steps=None`, `result_contract=''`, `phase_id=None`, `worker_contract=None` | `JsonDict` | 创建 asyncio task、更新 task_state、写日志 |
 | `wait_browser_agents` | 等待指定/all workers | `worker_ids=None`, `mode='all'`, `timeout_seconds=None` | `JsonDict` | 等待 asyncio tasks |
-| `run_browser_batch` | 模板化并发跑多个 BrowserAgent | `items`, `task_template`, `context_template=''`, `concurrency=None`, `max_steps=None` | `JsonDict` | 创建多个 worker |
-| `run_skill_agent` | 无浏览器 SkillAgent 总结策略/模板 | `task`, `input_context=''`, `output_schema=''`, `evidence_artifacts=None` | `JsonDict` | 调 LLM、读 evidence artifact、写日志 |
-| `_render_evidence_block` | 安全读取 extraction artifacts 供 SkillAgent | `paths` | `(block_text, summary)` | 读文件 |
-| `_evidence_allowed_root` | evidence sandbox 根路径 | 无 | `Optional[Path]` | 无 |
-| `execute_abcp_plan` | 代理到 `ABCPPlanExecutor.execute_abcp_plan` | `steps`, `variables=None`, `agent_name=None`, `context=''` | `JsonDict` | 调 plan executor |
-| `run_abcp_plan_batch` | 代理到 plan batch | `items`, `steps`, `variables=None`, `context_template=''`, `concurrency=None`, `validate_first_n=None` | `JsonDict` | 调 plan executor |
 | `list_browser_agents` | 列 worker 状态 | 无 | `JsonDict` | 读取 task 状态 |
 | `shutdown` | 取消未完成 workers | 无 | `None` | cancel tasks |
 | `_run_browser_worker` | 单 worker 实际执行体 | `worker_id`, `agent_id`, `name`, `task`, `context`, `max_steps`, `result_contract`, `phase_id`, `worker_contract` | `JsonDict` | 创建 ABCPClient、跑 BrowserAgent、写 trace/log/state |
@@ -499,30 +495,6 @@ sequenceDiagram
 | `_select_handles` | 选择 worker handles | `worker_ids` | `List[BrowserAgentHandle]` | 无 |
 | `_task_result` | 安全取 asyncio task result | `handle` | `JsonDict` | 无 |
 | `_next_id` | 生成递增 worker id | `prefix` | `str` | 更新 counter |
-
-### `harness/plan_executor.py`
-
-| 符号 | 功能/用途 | 入参 | 返回/出参 | 副作用 |
-| --- | --- | --- | --- | --- |
-| `ABCPPlanExecutor` | 确定性 ABCP step 执行器 | `runtime`, `logger`, `next_id` | executor | 持有 purpose metadata |
-| `execute_abcp_plan` | 单 item 串行执行 steps | `steps`, `variables=None`, `agent_name=None`, `context=''` | `JsonDict` | 创建 plan worker |
-| `run_abcp_plan_batch` | 多 item plan 批执行，支持前 N 个串行验证 | `items`, `steps`, `variables=None`, `context_template=''`, `concurrency=None`, `validate_first_n=None` | `JsonDict` | 并发创建 plan workers、写日志 |
-| `_summarize_plan_batch_item` | 压缩单个 batch 结果 | `result` | `JsonDict` | 无 |
-| `_summarize_plan_batch_failure` | 压缩失败详情 | `result` | `JsonDict` | 无 |
-| `_summarize_failed_step_results` | 从 step results 取失败信号样本 | `step_results` | `List[JsonDict]` | 无 |
-| `_extract_plan_batch_output` | 从成功 step results 中提取 output | `result` | `Any` | 无 |
-| `_detect_challenge` | 关键词识别 CAPTCHA/人机验证 | `value` | `Optional[str]` | 无 |
-| `_detect_navigation_title_challenge` | 从导航标题识别 challenge | `method`, `response` | `Optional[str]` | 无 |
-| `_extract_title` | 深搜 title 字段 | `value` | `Optional[str]` | 无 |
-| `_is_page_paused_error` | 判断 paused error | `value` | `bool` | 无 |
-| `_request_pause_and_wait_for_hitl` | 主动发 HITL pause 并等待恢复 | `browser`, `page_id`, `reason`, `worker_id`, `step_index` | `JsonDict` | 调 ABCP/HITL helper、写日志 |
-| `_wait_for_hitl_resume` | 包装共享 HITL helper | `browser`, `page_id`, `worker_id`, `step_index` | `JsonDict` | 等待通知/轮询 |
-| `_probe_challenge_after_failure` | 失败后用 AXTree 探测 challenge | `browser`, `page_id` | `Optional[JsonDict]` | 调 ABCP |
-| `_ensure_purpose_capabilities` | 懒加载 requiresPurpose metadata | `browser` | `None` | 调 schema loader |
-| `_ensure_plan_step_purpose` | 为 plan step 自动填 purpose | `method`, `params`, `step`, `step_index`, `context`, `variables` | `None` | 修改 `params` |
-| `_execute_abcp_plan_worker` | 单 plan worker 执行主体 | `worker_id`, `agent_id`, `steps`, `variables`, `agent_name`, `context` | `JsonDict` | 创建 ABCPClient、执行 steps、写 artifact/log |
-| `_capture_plan_artifact` | plan 截图响应落盘 | `worker_id`, `method`, `response`, `artifacts` | `JsonDict` | 写 artifacts |
-| `_offload_plan_response` | plan 大响应下沉 | `worker_id`, `method`, `params`, `response`, `step` | `Any` | 写 observations |
 
 ### `harness/task_control.py`
 
@@ -628,7 +600,7 @@ sequenceDiagram
 | `_call_anthropic_compatible` | Anthropic 视觉调用 | 同上 | `(text, usage)` | 网络调用 |
 | `_parse_json_object` | 从 VL 文本中解析 JSON object | `text` | `Optional[JsonDict]` | 无 |
 
-注意：`ProgressAccountant` 当前没有在 `BrowserAgent.__init__` 或 `_run_browser_worker` 中实例化，`browser_tools` 只是通过 `getattr(agent, "progress", None)` 兼容调用。因此进度干预逻辑目前默认不生效，除非外部代码给 agent 注入 `progress`。
+注意：`ProgressAccountant` 已在 `BrowserAgent.__init__` 中实例化，并由 `browser_tools` 的 `_check_progress_before` / `_observe_progress_after` 接入。`getattr(agent, "progress", None)` 只是为了兼容测试替身和未来的轻量 agent，不代表进度干预默认关闭。
 
 ### `harness/utils.py`
 
@@ -708,6 +680,59 @@ sequenceDiagram
 | `probe_runtime_eval.short` | 压缩 JSON 输出 | `value`, `n=200` | `str` | 无 |
 | `probe_runtime_eval.main` | 创建 fleet/page 并测试 Runtime.evaluate 表达式形态 | 无 | exit code `int` | 调 ABCP |
 
+### `harness/error_classification.py`（新增）
+
+| 符号 | 功能/用途 | 入参 | 返回/出参 | 副作用 |
+| --- | --- | --- | --- | --- |
+| `classify_browser_error` | 对浏览器错误文本结构化分类（hitl_required / render_lost / page_crashed / timeout / contract_error / unknown） | `error_text`, `method` | `JsonDict {type, suggested_action, method}` | 无 |
+| `attach_error_classification` | 将分类结果附加到 tool result 的 `errorClassification` 字段 | `result`, `method` | `result` (mutated) | 修改 result |
+| `_extract_error_message` | 从 result 中提取 error 字符串（直接 error / response.error / observation） | `result` | `Optional[str]` | 无 |
+| `_looks_like_error` | 判断 observation 文本是否像错误信息 | `text` | `bool` | 无 |
+
+设计要点：HITL/paused 信号优先于 render/page-dead marker，防止 agent 在等待人工干预时继续发出浏览器操作。
+
+### `harness/lifecycle.py`（新增）
+
+| 符号 | 功能/用途 | 入参 | 返回/出参 | 副作用 |
+| --- | --- | --- | --- | --- |
+| `LifecycleContext` | 生命周期上下文 dataclass（actor, step, metadata） | fields | context 实例 | 无 |
+| `LifecycleMiddleware` | 中间件基类，提供 7 个同步钩子：`session_context_build`、`agent_before_step`、`tool_pre_call`、`tool_post_call`、`compact_before`、`compact_after`、`worker_before_return` | 各钩子签名 | `JsonDict` | 无（默认透传） |
+| `LifecycleManager` | 中间件链管理器，通过 `_fold` 按序调用所有中间件对应方法 | `middlewares` | manager 实例 | 无 |
+| `default_lifecycle_manager` | 创建空 LifecycleManager | 无 | `LifecycleManager` | 无 |
+| `lifecycle_for` | 从 owner 对象上取 LifecycleManager，不存在则创建默认并赋值 | `owner` | `LifecycleManager` | 可能修改 owner.lifecycle |
+
+设计要点：第一版全同步设计，中间件方法同步执行不变换返回类型。`tool_post_call` 单独展开 fold（因签名不同）。`_fold` 通过 `getattr` 动态调用，支持未来新钩子。
+
+### `harness/worker_result.py`（新增）
+
+| 符号 | 功能/用途 | 入参 | 返回/出参 | 副作用 |
+| --- | --- | --- | --- | --- |
+| `build_worker_result_levels` | 构造 L1/L2/L3 三级 worker 结果信封 | status, status_category, validated_status, worker_id, agent_id, name, phase_id, answer, artifacts, artifact_validation, trace_path, trace_summary, progress_snapshot, offloaded_files, diagnostics, task_dir | `JsonDict {schemaVersion, l1, l2, l3}` | 无 |
+| `parse_worker_answer` | 解析 worker answer 文本，检测 JSON 格式 | `answer` | `JsonDict {format, raw, truncated, [parsed]}` | 无 |
+| `summarize_extraction_artifacts` | 从 artifacts 列表中提取 extraction 产物的结构化摘要 | `artifacts`, `task_dir` | `List[JsonDict]` | 读文件（仅 extraction artifacts） |
+| `_worker_blockers` | 从 trace errors、artifact_validation 状态、terminal status 聚合阻塞信息 | status, trace_summary, diagnostics, artifact_validation | `List[JsonDict]` | 无 |
+| `_semantic_trace_summary` | 提取 trace 语义摘要（steps, methods, pageIds, errors, challenge pages） | `trace_summary` | `JsonDict` | 无 |
+
+L1 用于路由决策（status, artifactCount, errorCount），L2 为默认语义负载（answer, data, evidence, blockers, traceSummary, progress, nextSteps），L3 为按需引用（tracePath, full artifacts, diagnostics）。`build_worker_result_levels` 在 `spawner._prepare_worker_result` 中调用。
+
+### 策略库 / 工具策略层（新增）
+
+| 文件/符号 | 功能/用途 | 入参 | 返回/出参 | 副作用 |
+| --- | --- | --- | --- | --- |
+| `harness/strategy_bank.py:load_strategy_bank` | 加载策略库 JSON 文件 | `path` | `JsonDict` | 读文件 |
+| `compact_strategy_bank` | 压缩策略库（移除冗余字段）供 prompt 内联 | `bank` | `JsonDict` | 无 |
+| `select_strategies_for_phase` | 按 task_type 和 phase.id/phase.objective 匹配策略 | `bank`, `task_type`, `phase`, `limit=3` | `List[JsonDict]` | 无 |
+| `render_strategy_guidance` | 将策略列表渲染为 prompt 文本块 | `strategies` | `str` | 无 |
+| `harness/tool_policy.py:filter_capability_methods_for_task_type` | 按 task_type 过滤 ABCP 方法（form_filling / general 等） | `methods`, `task_type` | `Set[str]` | 无 |
+| `disabled_reason_for_method` | 返回方法被禁用的原因文本 | `method`, `task_type` | `Optional[str]` | 无 |
+| `HARNESS_TOOL_NAMES` | 所有 harness 本地工具名集合 | 无 | `Set[str]` | 无 |
+| `ALWAYS_FORBIDDEN_ABCP_METHODS` | 全局禁用的 ABCP 方法 | 无 | `Set[str]` | 无 |
+| `harness/challenge_detector.py:ChallengeTracker` | 跟踪疑似人机验证页面的 pageId 和标题 | records | tracker | 无 |
+| `ChallengeTracker.record` | 记录页面标题/URL 包含 challenge 关键字的页面 | `page_id`, `title`, `url` | `None` | 更新记录 |
+| `ChallengeTracker.suspected_pages` | 返回疑似 challenge 页面列表 | 无 | `List[JsonDict]` | 无 |
+| `is_lingering_loading_title` | 判断标题是否仍为 loading 状态 | `title` | `bool` | 无 |
+| `extract_page_id` | 深搜 pageId | `value` | `Optional[str]` | 无 |
+
 ## 关键工程判断
 
 1. 架构核心边界清楚：LLM 只看统一 messages/tools，浏览器只通过 `ABCPClient.call()` 暴露，ABCP Browser 服务端被隔离成外部能力。
@@ -722,10 +747,26 @@ sequenceDiagram
 
 6. Render recovery 目前是保守策略：能自动重试的读操作会重试；DOM anchor 相关 action 在恢复后通常要求重新抓 DOM，避免用过期节点。
 
-7. `ProgressAccountant` 当前定义但默认未接入，这是一个真实维护风险。若希望 progress intervention 生效，应在 `BrowserAgent.__init__` 或 spawner 创建 worker 后设置 `self.progress = ProgressAccountant()`。
+7. `ProgressAccountant` 当前在 `BrowserAgent.__init__` 中实例化并接入 worker 合约检查。进度干预通过 `browser_tools._check_progress_before` / `_observe_progress_after` 执行。
 
 8. `harness/hitl 2.py` 和 `llm/anthropic_provider 2.py` 是非标准文件名副本，容易误导维护者。若确认无用，建议后续删除或迁移到明确的备份目录。
 
 9. 任务状态目前是线性 phase 调度，不是 DAG。`depends_on`、`fanout_from` 字段只做向前兼容，调度逻辑仍按 `next_pending_phase` 顺序推进。
 
 10. 工具 schema 严格度总体较高，但部分 contract 和 progress gate 依赖 agent 动态属性。维护时要留意这些属性是否在所有创建路径中一致初始化。
+
+11. **【新增】生命周期中间件**：`harness/lifecycle.py` 提供可插拔的同步中间件链，当前默认空链（透传）。钩子位置已编织进 `browser_tools`、`lead_tools`、`agent_harness`（step 级别）、`spawner`（worker_before_return），但不锁定任何特定中间件实现。未来可以注入认证、配额、审计等横切关注点。
+
+12. **【新增】错误分类**：`harness/error_classification.py` 将原始浏览器错误文本结构化，返回 `type`（hitl_required / render_lost / page_crashed / timeout / contract_error / unknown）和 `suggested_action`。优先级：HITL > render_lost > page_crashed > timeout > contract_error。分类结果作为 `errorClassification` 附加到 tool result 上，供 LLM 在下一步失败时参考。
+
+13. **【新增】Worker 结果标准化**：`harness/worker_result.py` 定义 L1/L2/L3 三级信封。`spawner._prepare_worker_result` 在每次 worker 结束后自动注入 `resultLevels` + `workerResultProtocol`。LeadAgent 的 system prompt 明确要求 LLM 默认用 `l1` 路由、`l2` 获取数据，避免完整 trace 进入上下文。
+
+14. **【新增】策略库集成**：`strategy_bank/strategy_bank.json` 是只读 v1 策略文件，`harness/strategy_bank.py` 提供加载和按 phase + task_type 匹配。LeadAgent 的 system prompt 内联压缩后的策略库 JSON，LLM 可以据此指导 worker 行为。
+
+15. **【新增】Worker 状态分类体系**：`harness/constants.py` 现在定义完整的 worker 状态分类体系，包括 16 种细粒度状态、硬信号优先级列表、软状态白名单 `MODEL_ALLOWED_SOFT_STATUSES`、以及 `WORKER_STATUS_CATEGORIES` 映射（done / recoverable / needs_human / fatal / unknown）。
+
+16. **【新增】Capability Bundle 共享**：`BrowserAgentSpawner` 维护 `_capability_bundle` 缓存（带 `asyncio.Lock`），同一批次多个 worker 复用 schema 加载结果，避免每个 worker 重启时重复 `describeAction`。
+
+17. **【新增】Challenge 检测**：`ChallengeTracker` 在 worker 运行期间跨步骤记录疑似挑战页面（CAPTCHA、Cloudflare 等），结果汇总到 `traceSummary.suspectedChallengePages`，LeaderAgent 可以据此判断是否需要人工介入。
+
+18. Worker 编译期属性完整性：`BrowserAgent.__init__` 现在显式初始化 `progress`、`diagnostics`、`challenge_tracker`、`lifecycle`、`preloaded_capability_bundle`、`preloaded_registration` 等关键动态属性，确保 spawner 注入后不出现 `AttributeError`。

@@ -6,11 +6,13 @@
       "type": "integer",
       "minimum": -9007199254740991,
       "maximum": 9007199254740991,
+      "description": "Folder ID to rename.",
       "required": true
     },
     "name": {
       "type": "string",
       "minLength": 1,
+      "description": "New folder name.",
       "required": true
     },
     "purpose": {

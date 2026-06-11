@@ -5,6 +5,7 @@
     "url": {
       "type": "string",
       "format": "uri",
+      "description": "URL to check in bookmark storage.",
       "required": true
     },
     "purpose": {

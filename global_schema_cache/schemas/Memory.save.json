@@ -1,17 +1,17 @@
 {
   "method": "Memory.save",
-  "description": "Save or update context memory for a given scope. This memory identifies your role and mission within a fleet.",
+  "description": "Saves or updates agent-scoped task context for a scope, including objective, constraints, credentials notes, and milestones; it does not store page content.",
   "params": {
     "scope": {
       "type": "string",
       "minLength": 1,
-      "description": "The scope to bind this memory to. Use the same scope as your fleet for automatic association.",
+      "description": "Memory scope key, usually matching the fleet scope.",
       "required": true
     },
     "context": {
       "type": "string",
       "minLength": 1,
-      "description": "Free-text context describing your identity, role, and mission in this scope. Consider including: target website, current task status, login account, and any important notes.",
+      "description": "Free-text task context for this scope, such as goal, constraints, credentials notes, and current milestone.",
       "required": true
     }
   },

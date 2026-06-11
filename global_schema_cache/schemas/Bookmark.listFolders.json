@@ -3,6 +3,7 @@
   "description": "Lists bookmark folders, optionally filtered by parent folder.",
   "params": {
     "parentId": {
+      "description": "Parent folder ID to list children for; use null or omit for root folders.",
       "anyOf": [
         {
           "type": "integer",

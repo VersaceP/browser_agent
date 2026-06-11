@@ -50,19 +50,26 @@ SCREENSHOT_METHODS = {"Page.screenshot", "DOM.getElementScreenshot"}
 GENERIC_TOOL_RESULT_KEEP_KEYS = (
     "method",
     "status",
+    "statusCategory",
+    "validatedStatus",
     "workerId",
     "agentId",
     "name",
+    "phaseId",
     "tracePath",
+    "resultLevels",
+    "workerResultProtocol",
     "observation",
     "suggested_prompt",
     "error",
+    "errorClassification",
     "taskId",
 )
 GENERIC_TOOL_RESULT_RESPONSE_KEEP_KEYS = (
     "observation",
     "suggested_prompt",
     "error",
+    "errorClassification",
     "taskId",
 )
 GENERIC_TOOL_RESULT_KEEP_FIELD_BYTES = 2000

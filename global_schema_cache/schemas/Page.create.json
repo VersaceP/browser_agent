@@ -1,14 +1,16 @@
 {
   "method": "Page.create",
-  "description": "Creates a new tab in the specified browser instance.",
+  "description": "Creates a new tab and optionally opens an initial URL; if fleetId is omitted, the dispatcher auto-selects or creates a fleet for the current agent.",
   "params": {
     "fleetId": {
+      "description": "Optional fleet ID that should own the new page.",
       "type": "string",
       "format": "uuid",
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
       "required": false
     },
     "url": {
+      "description": "Optional initial URL to open in the new page.",
       "type": "string",
       "format": "uri",
       "required": false

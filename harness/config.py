@@ -55,9 +55,9 @@ class VLConfig:
 @dataclass
 class HarnessConfig:
     mode: str = "lead"
-    max_steps: int = 30
-    lead_max_steps: int = 20
-    worker_max_steps: int = 30
+    max_steps: int = 40
+    lead_max_steps: int = 40
+    worker_max_steps: int = 40
     max_browser_agents: int = 8
     default_worker_concurrency: int = 3
     worktree_dir: str = "worktree"
@@ -85,6 +85,9 @@ class HarnessConfig:
     hitl_poll_interval_seconds: float = 2.0
     hitl_wait_timeout_seconds: float = 1200.0
     hitl_max_step_retries: int = 1
+    hitl_no_repause_cooldown_seconds: float = 8.0
+    hitl_post_resume_guard_seconds: float = 30.0
+    hitl_post_resume_confirm_max_rounds: int = 3
     progress_local_fs_without_extraction_limit: int = 5
     progress_no_artifact_limit: int = 8
     vl: VLConfig = field(default_factory=VLConfig)
@@ -173,6 +176,24 @@ class HarnessConfig:
             ),
             hitl_max_step_retries=int(
                 data.get("hitl_max_step_retries", cls.hitl_max_step_retries)
+            ),
+            hitl_no_repause_cooldown_seconds=float(
+                data.get(
+                    "hitl_no_repause_cooldown_seconds",
+                    cls.hitl_no_repause_cooldown_seconds,
+                )
+            ),
+            hitl_post_resume_guard_seconds=float(
+                data.get(
+                    "hitl_post_resume_guard_seconds",
+                    cls.hitl_post_resume_guard_seconds,
+                )
+            ),
+            hitl_post_resume_confirm_max_rounds=int(
+                data.get(
+                    "hitl_post_resume_confirm_max_rounds",
+                    cls.hitl_post_resume_confirm_max_rounds,
+                )
             ),
             progress_local_fs_without_extraction_limit=int(
                 data.get(

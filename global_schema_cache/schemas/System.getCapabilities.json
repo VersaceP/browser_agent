@@ -1,9 +1,9 @@
 {
   "method": "System.getCapabilities",
-  "description": "Get a list of all supported API capabilities for AI decision making, along with the high-level cognitive agent skills guide.",
+  "description": "Discovers callable actions and the high-level agent SOP guide; use it first, then query unfamiliar action schemas with System.describeAction or event contracts with System.listEvents.",
   "params": {
     "skillFile": {
-      "description": "If true, the returned skillsGuide contains a path value (type: \"path\"). If false or omitted, it contains the full markdown content value (type: \"content\").",
+      "description": "Return the SOP guide as a file path instead of inline content when true.",
       "type": "boolean",
       "required": false
     }

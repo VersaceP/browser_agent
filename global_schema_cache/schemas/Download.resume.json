@@ -6,6 +6,7 @@
       "type": "integer",
       "minimum": -9007199254740991,
       "maximum": 9007199254740991,
+      "description": "Paused download record ID to resume.",
       "required": true
     },
     "purpose": {

@@ -4,9 +4,7 @@ harness.spawner - Worker BrowserAgent spawning and lifecycle management.
 
 import asyncio
 import json
-import uuid
 from dataclasses import dataclass, replace
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from abcp_client import ABCPClient
@@ -17,14 +15,22 @@ from harness.constants import (
 from harness.diagnostics import status_category
 from harness.render_recovery import extract_page_id_from_values
 from harness.config import RuntimeConfig
+from harness.lifecycle import LifecycleContext, default_lifecycle_manager
 from harness.model_config import browser_agent_model_config
-from harness.plan_executor import ABCPPlanExecutor
+from harness.schema_cache import global_schemas_dir
+from harness.schema_loader import CapabilityBundle, load_capability_bundle
 from harness.task_control import (
+    build_attempt_digest,
+    classification_for_worker_status,
+    contract_hash_for_phase,
     mark_phase_result,
     mark_phase_running,
+    repeated_phase_attempt_guard,
     validate_worker_artifacts,
 )
-from harness.templates import get_path, render_templates
+from harness.strategy_telemetry import append_strategy_attempt
+from harness.tool_policy import ALWAYS_FORBIDDEN_ABCP_METHODS
+from harness.templates import get_path
 from harness.utils import (
     JsonDict,
     RunLogger,
@@ -37,6 +43,7 @@ from harness.utils import (
     task_subdir,
     trim_large_strings,
 )
+from harness.worker_result import build_worker_result_levels
 from llm import LLMFactory
 
 
@@ -57,7 +64,7 @@ class BrowserAgentHandle:
 
 
 class BrowserAgentSpawner:
-    """Creates isolated browser agents and direct ABCP executors."""
+    """Creates isolated browser agents and manages their lifecycle."""
 
     def __init__(
         self,
@@ -73,7 +80,9 @@ class BrowserAgentSpawner:
         self.static_context_block, self.static_context_hash = build_static_context_block(
             self.runtime.harness.context_file
         )
-        self.plan_executor = ABCPPlanExecutor(runtime, logger, self._next_id)
+        self.lifecycle = default_lifecycle_manager()
+        self._capability_bundle: Optional[CapabilityBundle] = None
+        self._capability_bundle_lock = None
 
     async def spawn_browser_agent(
         self,
@@ -84,7 +93,24 @@ class BrowserAgentSpawner:
         result_contract: str = "",
         phase_id: Optional[str] = None,
         worker_contract: Optional[JsonDict] = None,
+        phase: Optional[JsonDict] = None,
     ) -> JsonDict:
+        effective_contract = worker_contract or {}
+        current_contract_hash = contract_hash_for_phase(
+            phase,
+            effective_contract,
+            task=task,
+            result_contract=result_contract,
+        )
+        repeated_guard = repeated_phase_attempt_guard(
+            self.logger,
+            phase_id=phase_id,
+            contract_hash=current_contract_hash,
+        )
+        if repeated_guard is not None:
+            self.logger.write("spawner.browser.repeated_guard", repeated_guard)
+            return repeated_guard
+
         running_count = sum(
             1 for handle in self._handles.values()
             if not handle.async_task.done()
@@ -110,7 +136,8 @@ class BrowserAgentSpawner:
                 max_steps=optional_int(max_steps),
                 result_contract=result_contract,
                 phase_id=phase_id,
-                worker_contract=worker_contract or {},
+                worker_contract=effective_contract,
+                phase=phase or {},
             )
         )
         mark_phase_running(
@@ -127,7 +154,7 @@ class BrowserAgentSpawner:
             context=context,
             result_contract=result_contract,
             phase_id=phase_id,
-            worker_contract=worker_contract or {},
+            worker_contract=effective_contract,
             async_task=async_task,
         )
         self.logger.write(
@@ -139,7 +166,8 @@ class BrowserAgentSpawner:
                 "task": task,
                 "resultContract": result_contract,
                 "phaseId": phase_id,
-                "workerContract": trim_large_strings(worker_contract or {}, 2000),
+                "workerContract": trim_large_strings(effective_contract, 2000),
+                "contractHash": current_contract_hash,
             },
         )
         return {
@@ -186,303 +214,6 @@ class BrowserAgentSpawner:
             "pending": pending_ids,
         }
 
-    async def run_browser_batch(
-        self,
-        items: List[Any],
-        task_template: str,
-        context_template: str = "",
-        concurrency: Optional[int] = None,
-        max_steps: Optional[int] = None,
-    ) -> JsonDict:
-        if not isinstance(items, list):
-            return {"status": "failed", "error": "items must be a JSON array"}
-
-        default_concurrency = self.runtime.harness.default_worker_concurrency
-        effective_concurrency = optional_int(concurrency, default_concurrency)
-        if effective_concurrency is None:
-            effective_concurrency = default_concurrency
-        effective_concurrency = max(1, min(
-            effective_concurrency,
-            self.runtime.harness.max_browser_agents,
-        ))
-        semaphore = asyncio.Semaphore(effective_concurrency)
-
-        async def run_one(index: int, raw_item: Any) -> JsonDict:
-            item = raw_item if isinstance(raw_item, dict) else {"value": raw_item}
-            variables = {"item": item, "index": index}
-            task = str(render_templates(task_template, variables))
-            context = str(render_templates(context_template, variables))
-            worker_id = self._next_id("batch")
-            agent_id = f"{self.runtime.agent_id}-{worker_id}"
-            async with semaphore:
-                return await self._run_browser_worker(
-                    worker_id=worker_id,
-                    agent_id=agent_id,
-                    name=worker_id,
-                    task=task,
-                    context=context,
-                    max_steps=optional_int(max_steps),
-                    result_contract=(
-                        "Return a JSON string: "
-                        "{\"outcome\":\"done|partial|blocked|failed\","
-                        "\"data\":<structured result requested by the task>,"
-                        "\"evidence\":[{\"step\":<step number>,\"page_id\":\"...\",\"why\":\"...\"}],"
-                        "\"next_steps\":[]}"
-                    ),
-                    phase_id=None,
-                    worker_contract={},
-                )
-
-        results = await asyncio.gather(
-            *(run_one(index, item) for index, item in enumerate(items)),
-            return_exceptions=True,
-        )
-        normalized = [
-            result if isinstance(result, dict)
-            else {"status": "failed", "error": str(result)}
-            for result in results
-        ]
-        failed_count = sum(
-            1 for result in normalized
-            if result.get("status") != "done"
-        )
-        return {
-            "status": "done" if failed_count == 0 else "partial_failed",
-            "concurrency": effective_concurrency,
-            "count": len(normalized),
-            "success_count": len(normalized) - failed_count,
-            "failed_count": failed_count,
-            "results": normalized,
-        }
-
-    async def run_skill_agent(
-        self,
-        task: str,
-        input_context: str = "",
-        output_schema: str = "",
-        evidence_artifacts: Optional[List[str]] = None,
-    ) -> JsonDict:
-        provider = LLMFactory.create_provider(self.runtime.model)
-        system_prompt = """You are the ABCP SkillAgent.
-
-Your job is to distil a verified browser execution trace into a reusable extraction / form-filling strategy, an ABCP step template, or a worker-task template.
-Prefer producing a deterministic ABCP-steps template — declare variable placeholders, success criteria, field-integrity checks, and recoverable failure points. In the `steps_json` consumed by LeadAgent tools, every step has `method`, `params`, and optional `save_as` fields; `params` MUST be a JSON object; for extraction templates, persist the final lightweight field set with `save_as="output"`. Only fall back to a BrowserAgent worker-task template when the page structure is unstable or genuine semantic judgement is unavoidable.
-Your output must be drop-in usable by LeadAgent. If the user asked for JSON, output JSON only — no markdown wrapping.
-
-**Evidence contract (mandatory)**:
-1. Every URL / href / id / slug / primary-key field in your output MUST be findable verbatim in the `<evidence>` block. Never infer values from product names or naming conventions.
-2. If the relevant field is absent from `<evidence>`, write the literal string `"<unverified>"` or `null`. Do not fabricate.
-3. Within a single record, fields with evidence keep their verbatim value; fields without evidence are marked `"<unverified>"`.
-4. The `<evidence>` block is read-only input. If it is empty or carries no artifact, mark EVERY field that requires external evidence as `"<unverified>"`.
-""" + self.static_context_block
-
-        evidence_block, evidence_summary = self._render_evidence_block(
-            evidence_artifacts or []
-        )
-        sections = [f"Task:\n{task}"]
-        if evidence_block:
-            sections.append(f"<evidence>\n{evidence_block}\n</evidence>")
-        else:
-            sections.append("<evidence>\n(empty — mark every externally sourced field as \"<unverified>\")\n</evidence>")
-        if input_context:
-            sections.append(f"Input context:\n{input_context}")
-        sections.append(
-            f"Expected output format:\n{output_schema or 'a clear set of executable steps or a template'}"
-        )
-
-        messages = [{"role": "user", "content": "\n\n".join(sections)}]
-        text, tool_calls, stop_reason, usage = await provider.generate_response(
-            system_prompt=system_prompt,
-            messages=messages,
-            tools=[],
-        )
-        self.logger.record_llm_usage(
-            source="skill_agent",
-            provider=self.runtime.model.provider,
-            model=self.runtime.model.model_id,
-            usage=usage,
-            conversation_id=f"skill:{uuid.uuid4().hex}",
-            context_hash=self.static_context_hash,
-        )
-        result = {
-            "status": "done",
-            "answer": text.strip(),
-            "tool_calls_ignored": tool_calls,
-            "stop_reason": stop_reason,
-            "evidence_summary": evidence_summary,
-        }
-        self.logger.write("spawner.skill.result", trim_large_strings(result, 8000))
-        return result
-
-    def _render_evidence_block(self, paths: List[str]) -> tuple:
-        """Read evidence files into a bounded inline block plus a summary
-        list for the result envelope. Returns (block_text, summary_list).
-
-        Security: evidence paths are model-controlled. We:
-          1. Resolve each path (following symlinks) and reject anything that
-             escapes the current task worktree (`logger.task_dir`).
-          2. Further constrain to `<task_dir>/artifacts/extractions/` so the
-             only files an evidence_artifacts arg can surface are ones a
-             BrowserAgent legitimately wrote via record_extraction.
-          3. Refuse non-regular files (avoid /dev/*, FIFOs, etc.).
-        """
-        if not paths:
-            return "", []
-        max_total_bytes = max(
-            8000,
-            min(80000, self.runtime.harness.max_observation_chars),
-        )
-        per_file_cap = max(2000, max_total_bytes // max(1, len(paths)))
-        rendered_parts: List[str] = []
-        summary: List[JsonDict] = []
-        total = 0
-
-        allowed_root = self._evidence_allowed_root()
-
-        for raw_path in paths:
-            raw_str = str(raw_path)
-            try:
-                # Resolve once we know the base. Reject obviously malformed.
-                if Path(raw_str).is_absolute():
-                    resolved = Path(raw_str).resolve(strict=False)
-                else:
-                    base = allowed_root or Path(
-                        self.runtime.harness.runs_dir or "."
-                    ).resolve(strict=False)
-                    resolved = (base / raw_str).resolve(strict=False)
-            except (OSError, ValueError) as exc:
-                summary.append({
-                    "path": raw_str,
-                    "status": "rejected",
-                    "error": f"path resolution failed: {exc}",
-                })
-                rendered_parts.append(
-                    f"### evidence: {raw_str}\n(rejected: path resolution failed)"
-                )
-                continue
-
-            if allowed_root is None:
-                # No task_dir configured — refuse model-controlled paths.
-                summary.append({
-                    "path": str(resolved),
-                    "status": "rejected",
-                    "error": "no task_dir configured; evidence sandbox unavailable",
-                })
-                rendered_parts.append(
-                    f"### evidence: {resolved}\n(rejected: sandbox unavailable)"
-                )
-                continue
-
-            try:
-                resolved.relative_to(allowed_root)
-            except ValueError:
-                summary.append({
-                    "path": str(resolved),
-                    "status": "rejected",
-                    "error": (
-                        f"path escapes evidence sandbox {allowed_root}"
-                    ),
-                })
-                rendered_parts.append(
-                    f"### evidence: {resolved}\n"
-                    f"(rejected: outside {allowed_root})"
-                )
-                continue
-
-            if not resolved.exists() or not resolved.is_file():
-                summary.append({"path": str(resolved), "status": "missing"})
-                rendered_parts.append(
-                    f"### evidence: {resolved}\n"
-                    "(missing — treat all fields it should provide as <unverified>)"
-                )
-                continue
-
-            try:
-                raw_bytes = resolved.read_bytes()
-            except OSError as exc:
-                summary.append({
-                    "path": str(resolved),
-                    "status": "unreadable",
-                    "error": str(exc),
-                })
-                rendered_parts.append(f"### evidence: {resolved}\n(unreadable: {exc})")
-                continue
-
-            original_size = len(raw_bytes)
-            if total + min(original_size, per_file_cap) > max_total_bytes:
-                summary.append({
-                    "path": str(resolved),
-                    "status": "skipped_budget",
-                    "originalBytes": original_size,
-                })
-                rendered_parts.append(
-                    f"### evidence: {resolved}\n"
-                    f"(skipped — would exceed inline evidence budget; "
-                    f"originalBytes={original_size})"
-                )
-                continue
-            text = raw_bytes.decode("utf-8", errors="replace")
-            truncated = False
-            if len(text) > per_file_cap:
-                text = text[:per_file_cap] + f"\n... <truncated {len(text) - per_file_cap} chars>"
-                truncated = True
-            rendered_parts.append(f"### evidence: {resolved}\n{text}")
-            total += len(text)
-            summary.append({
-                "path": str(resolved),
-                "status": "included",
-                "bytes": min(original_size, per_file_cap),
-                "originalBytes": original_size,
-                "truncated": truncated,
-            })
-        return "\n\n".join(rendered_parts), summary
-
-    def _evidence_allowed_root(self) -> Optional[Path]:
-        """The directory tree evidence_artifacts paths must resolve under.
-        Restricted to <task_dir>/artifacts/extractions/ — the only place
-        record_extraction is allowed to write.
-        """
-        runs_dir = self.runtime.harness.runs_dir
-        if not runs_dir:
-            return None
-        try:
-            base = Path(runs_dir).resolve(strict=False)
-        except (OSError, ValueError):
-            return None
-        return base / "artifacts" / "extractions"
-
-    async def execute_abcp_plan(
-        self,
-        steps: List[JsonDict],
-        variables: Optional[JsonDict] = None,
-        agent_name: Optional[str] = None,
-        context: str = "",
-    ) -> JsonDict:
-        return await self.plan_executor.execute_abcp_plan(
-            steps=steps,
-            variables=variables,
-            agent_name=agent_name,
-            context=context,
-        )
-
-    async def run_abcp_plan_batch(
-        self,
-        items: List[Any],
-        steps: List[JsonDict],
-        variables: Optional[JsonDict] = None,
-        context_template: str = "",
-        concurrency: Optional[int] = None,
-        validate_first_n: Optional[int] = None,
-    ) -> JsonDict:
-        return await self.plan_executor.run_abcp_plan_batch(
-            items=items,
-            steps=steps,
-            variables=variables,
-            context_template=context_template,
-            concurrency=concurrency,
-            validate_first_n=validate_first_n,
-        )
-
     def list_browser_agents(self) -> JsonDict:
         agents = []
         for handle in self._handles.values():
@@ -524,6 +255,7 @@ Your output must be drop-in usable by LeadAgent. If the user asked for JSON, out
         result_contract: str,
         phase_id: Optional[str],
         worker_contract: JsonDict,
+        phase: Optional[JsonDict],
     ) -> JsonDict:
         worker_runtime = replace(
             self.runtime,
@@ -553,8 +285,18 @@ Your output must be drop-in usable by LeadAgent. If the user asked for JSON, out
 
         try:
             async with ABCPClient(worker_runtime.browser, on_event=event_logger) as browser:
+                registration = await browser.call(
+                    "System.register",
+                    {"agentId": worker_runtime.agent_id},
+                )
+                bundle = await self._capability_bundle_for_worker(
+                    browser,
+                    worker_runtime,
+                )
                 harness = self.browser_agent_factory(provider, browser, worker_runtime, self.logger)
                 harness.worker_contract = worker_contract or {}
+                harness.preloaded_registration = registration
+                harness.preloaded_capability_bundle = bundle
                 answer = await harness.run(worker_task)
             trace_path = self._write_worker_trace(worker_id, harness.trace)
             trace_summary = self._summarize_worker_trace(harness.trace)
@@ -571,8 +313,21 @@ Your output must be drop-in usable by LeadAgent. If the user asked for JSON, out
             artifact_validation = validate_worker_artifacts(
                 contract=worker_contract,
                 artifacts=harness.artifacts,
+                attempt_artifacts=getattr(harness, "extraction_attempt_artifacts", []),
                 task_dir=self.logger.task_dir,
             )
+            terminal_classification = classification_for_worker_status(
+                harness.final_status
+            )
+            if terminal_classification is not None:
+                artifact_validation["classification"] = terminal_classification
+            elif artifact_validation.get("status") != "done":
+                feedback_classification = _worker_feedback_classification(
+                    harness.trace,
+                    answer,
+                )
+                if feedback_classification is not None:
+                    artifact_validation["classification"] = feedback_classification
             validated_status = (
                 "validated_done"
                 if artifact_validation.get("status") == "done"
@@ -591,6 +346,11 @@ Your output must be drop-in usable by LeadAgent. If the user asked for JSON, out
                 "phaseId": phase_id,
                 "answer": answer,
                 "artifacts": harness.artifacts,
+                "extractionAttemptArtifacts": getattr(
+                    harness,
+                    "extraction_attempt_artifacts",
+                    [],
+                ),
                 "artifactValidation": artifact_validation,
                 "tracePath": trace_path,
                 "traceSummary": trace_summary,
@@ -613,6 +373,12 @@ Your output must be drop-in usable by LeadAgent. If the user asked for JSON, out
                 "name": name,
                 "phaseId": phase_id,
             }
+            result = self._prepare_worker_result(
+                result,
+                worker_id=worker_id,
+                agent_id=agent_id,
+                phase_id=phase_id,
+            )
             self.logger.write(
                 "spawner.browser.result",
                 trim_large_strings(result, 8000),
@@ -629,6 +395,20 @@ Your output must be drop-in usable by LeadAgent. If the user asked for JSON, out
                 "error": str(exc),
             }
 
+        result = self._prepare_worker_result(
+            result,
+            worker_id=worker_id,
+            agent_id=agent_id,
+            phase_id=phase_id,
+        )
+        attempt_digest = build_attempt_digest(
+            result,
+            phase=phase or {},
+            worker_contract=worker_contract or {},
+            task=task,
+            result_contract=result_contract,
+        )
+        result["attemptDigest"] = attempt_digest
         worker_status = str(result.get("status") or "unknown")
         phase_result_status = (
             worker_status
@@ -646,8 +426,110 @@ Your output must be drop-in usable by LeadAgent. If the user asked for JSON, out
             worker_id=worker_id,
             validation=result.get("artifactValidation"),
             result_status=phase_result_status,
+            attempt_digest=attempt_digest,
+        )
+        append_strategy_attempt(
+            logger=self.logger,
+            worker_contract=worker_contract or {},
+            result=result,
         )
         self.logger.write("spawner.browser.result", trim_large_strings(result, 8000))
+        return result
+
+    def _prepare_worker_result(
+        self,
+        result: JsonDict,
+        *,
+        worker_id: str,
+        agent_id: str,
+        phase_id: Optional[str],
+    ) -> JsonDict:
+        result = self._attach_worker_result_levels(result)
+        return self.lifecycle.worker_before_return(
+            LifecycleContext(
+                actor="browser_worker",
+                metadata={
+                    "worker_id": worker_id,
+                    "agent_id": agent_id,
+                    "phase_id": phase_id,
+                },
+            ),
+            result,
+        )
+
+    async def _capability_bundle_for_worker(
+        self,
+        browser: ABCPClient,
+        worker_runtime: RuntimeConfig,
+    ) -> CapabilityBundle:
+        if self._capability_bundle_lock is None:
+            self._capability_bundle_lock = asyncio.Lock()
+        async with self._capability_bundle_lock:
+            if self._capability_bundle is not None:
+                self.logger.write(
+                    "schema.bundle.reused",
+                    {
+                        "capability_count": len(self._capability_bundle.capability_methods),
+                        "schema_count": len(self._capability_bundle.method_schemas),
+                    },
+                )
+                return _clone_capability_bundle(self._capability_bundle)
+            bundle = await load_capability_bundle(
+                browser,
+                logger=self.logger,
+                blocked_methods=ALWAYS_FORBIDDEN_ABCP_METHODS,
+                schema_cache_dir=global_schemas_dir(worker_runtime.harness.worktree_dir),
+            )
+            self._capability_bundle = _clone_capability_bundle(bundle)
+            return _clone_capability_bundle(bundle)
+
+    def _attach_worker_result_levels(self, result: JsonDict) -> JsonDict:
+        if result.get("resultLevels"):
+            return result
+        status = str(result.get("status") or "unknown")
+        levels = build_worker_result_levels(
+            status=status,
+            status_category=str(result.get("statusCategory") or status_category(status)),
+            validated_status=str(result.get("validatedStatus") or "not_validated"),
+            worker_id=str(result.get("workerId") or ""),
+            agent_id=str(result.get("agentId") or ""),
+            name=str(result.get("name") or ""),
+            phase_id=(
+                str(result.get("phaseId"))
+                if result.get("phaseId") is not None
+                else None
+            ),
+            answer=str(result.get("answer") or ""),
+            artifacts=_safe_str_list(result.get("artifacts")),
+            extraction_attempt_artifacts=_safe_str_list(
+                result.get("extractionAttemptArtifacts")
+            ),
+            artifact_validation=(
+                result.get("artifactValidation")
+                if isinstance(result.get("artifactValidation"), dict)
+                else {}
+            ),
+            trace_path=str(result.get("tracePath") or ""),
+            trace_summary=(
+                result.get("traceSummary")
+                if isinstance(result.get("traceSummary"), dict)
+                else {}
+            ),
+            progress_snapshot=(
+                result.get("progressSnapshot")
+                if isinstance(result.get("progressSnapshot"), dict)
+                else {}
+            ),
+            offloaded_files=_safe_str_list(result.get("offloadedFiles")),
+            diagnostics=(
+                result.get("diagnostics")
+                if isinstance(result.get("diagnostics"), dict)
+                else {}
+            ),
+            task_dir=getattr(self.logger, "task_dir", None),
+        )
+        result["resultLevels"] = levels
+        result["workerResultProtocol"] = "L1/L2/L3"
         return result
 
     def _write_worker_trace(self, worker_id: str, trace: List[JsonDict]) -> str:
@@ -663,6 +545,10 @@ Your output must be drop-in usable by LeadAgent. If the user asked for JSON, out
         errors: List[str] = []
         page_ids: Set[str] = set()
         offloaded: List[str] = []
+        progress_interventions: List[JsonDict] = []
+        loop_nudges: List[JsonDict] = []
+        page_stats_events: List[JsonDict] = []
+        snapshot_diffs: List[JsonDict] = []
         tool_calls = 0
         max_step = 0
         for item in trace:
@@ -692,15 +578,90 @@ Your output must be drop-in usable by LeadAgent. If the user asked for JSON, out
                 error = get_path(item, "result.error")
                 if error:
                     errors.append(str(error)[:500])
-        return {
+            elif item.get("type") in {"progress_intervention", "progress_gate"}:
+                result = item.get("result")
+                if isinstance(result, dict):
+                    progress_interventions.append({
+                        "type": item.get("type"),
+                        "reason": str(result.get("reason") or "")[:120],
+                        "tool": str(result.get("tool") or result.get("method") or "")[:120],
+                    })
+            elif item.get("type") == "loop_nudge":
+                result = item.get("result")
+                if isinstance(result, dict):
+                    loop_nudges.append({
+                        "reason": str(result.get("reason") or "")[:120],
+                        "action": str(result.get("action") or "")[:120],
+                        "repeatCount": optional_int(result.get("repeatCount"), 0) or 0,
+                        "pageStalledFor": optional_int(result.get("pageStalledFor"), 0) or 0,
+                    })
+            elif item.get("type") == "page_stats":
+                result = item.get("result")
+                if isinstance(result, dict):
+                    page_stats_events.append({
+                        "step": optional_int(item.get("step"), 0) or 0,
+                        "pageId": str(result.get("pageId") or "")[:120],
+                        "url": str(result.get("url") or "")[:240],
+                        "title": str(result.get("title") or "")[:160],
+                        "nodes": optional_int(result.get("nodes"), 0) or 0,
+                        "actionable": optional_int(result.get("actionable"), 0) or 0,
+                        "semanticItems": optional_int(result.get("semanticItems"), 0) or 0,
+                        "links": optional_int(result.get("links"), 0) or 0,
+                        "hint": str(result.get("hint") or "")[:240],
+                    })
+            elif item.get("type") == "snapshot_diff":
+                result = item.get("result")
+                if isinstance(result, dict):
+                    snapshot_diffs.append({
+                        "fromStep": optional_int(result.get("fromStep"), 0) or 0,
+                        "toStep": optional_int(result.get("toStep"), 0) or 0,
+                        "crossPageDiff": bool(result.get("crossPageDiff")),
+                        "semanticAdded": optional_int(result.get("semanticAdded"), 0) or 0,
+                        "semanticRemoved": optional_int(result.get("semanticRemoved"), 0) or 0,
+                        "physicalAdded": optional_int(result.get("physicalAdded"), 0) or 0,
+                        "physicalRemoved": optional_int(result.get("physicalRemoved"), 0) or 0,
+                        "totalNodeDelta": optional_int(result.get("totalNodeDelta"), 0) or 0,
+                        "semanticChanged": bool(result.get("semanticChanged")),
+                        "physicalChanged": bool(result.get("physicalChanged")),
+                    })
+        progress_intervention_count = len(progress_interventions)
+        loop_nudge_count = len(loop_nudges)
+        stall_signal_count = progress_intervention_count + loop_nudge_count
+        stall_replan = None
+        if stall_signal_count >= 2:
+            stall_replan = {
+                "type": "stall_replan_recommended",
+                "signalCount": stall_signal_count,
+                "progressInterventionCount": progress_intervention_count,
+                "loopNudgeCount": loop_nudge_count,
+                "recentProgressInterventions": progress_interventions[-3:],
+                "recentLoopNudges": loop_nudges[-3:],
+                "next_instruction": (
+                    "This worker emitted repeated stall signals inside one"
+                    " attempt. If the phase is retried, revise the approach"
+                    " instead of spawning another worker with the same path."
+                ),
+            }
+        summary = {
             "steps": max_step,
             "traceEvents": len(trace),
             "toolCalls": tool_calls,
             "methods": method_counts,
             "pageIds": sorted(page_ids),
             "errors": errors[:10],
+            "progressInterventions": progress_interventions[-5:],
+            "progressInterventionCount": progress_intervention_count,
+            "loopNudges": loop_nudges[-5:],
+            "loopNudgeCount": loop_nudge_count,
+            "latestPageStats": page_stats_events[-1] if page_stats_events else None,
+            "pageStatsCount": len(page_stats_events),
+            "snapshotDiffs": snapshot_diffs[-5:],
+            "snapshotDiffCount": len(snapshot_diffs),
             "offloadedFiles": sorted(set(offloaded))[:100],
         }
+        if stall_replan is not None:
+            summary["stallReplanRecommended"] = stall_replan
+        return summary
 
     def _select_handles(self, worker_ids: Optional[List[str]]) -> List[BrowserAgentHandle]:
         if not worker_ids:
@@ -715,25 +676,129 @@ Your output must be drop-in usable by LeadAgent. If the user asked for JSON, out
         try:
             return handle.async_task.result()
         except asyncio.CancelledError:
-            return {
-                "status": WORKER_STATUS_CANCELLED,
-                "statusCategory": status_category(WORKER_STATUS_CANCELLED),
-                "workerId": handle.worker_id,
-                "agentId": handle.agent_id,
-                "name": handle.name,
-                "phaseId": handle.phase_id,
-            }
+            return self._prepare_worker_result(
+                {
+                    "status": WORKER_STATUS_CANCELLED,
+                    "statusCategory": status_category(WORKER_STATUS_CANCELLED),
+                    "workerId": handle.worker_id,
+                    "agentId": handle.agent_id,
+                    "name": handle.name,
+                    "phaseId": handle.phase_id,
+                },
+                worker_id=handle.worker_id,
+                agent_id=handle.agent_id,
+                phase_id=handle.phase_id,
+            )
         except Exception as exc:
-            return {
-                "status": WORKER_STATUS_FAILED,
-                "statusCategory": status_category(WORKER_STATUS_FAILED),
-                "workerId": handle.worker_id,
-                "agentId": handle.agent_id,
-                "name": handle.name,
-                "phaseId": handle.phase_id,
-                "error": str(exc),
-            }
+            return self._prepare_worker_result(
+                {
+                    "status": WORKER_STATUS_FAILED,
+                    "statusCategory": status_category(WORKER_STATUS_FAILED),
+                    "workerId": handle.worker_id,
+                    "agentId": handle.agent_id,
+                    "name": handle.name,
+                    "phaseId": handle.phase_id,
+                    "error": str(exc),
+                },
+                worker_id=handle.worker_id,
+                agent_id=handle.agent_id,
+                phase_id=handle.phase_id,
+            )
 
     def _next_id(self, prefix: str) -> str:
         self._counter += 1
         return f"{prefix}-{self._counter:03d}"
+
+
+def _safe_str_list(value: Any) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if item is not None]
+
+
+def _worker_feedback_classification(
+    trace: List[JsonDict],
+    answer: str,
+) -> Optional[JsonDict]:
+    """Recover route-relevant classifications from worker feedback.
+
+    Contract/tool-policy blockers are first surfaced as ordinary tool results
+    inside the BrowserAgent loop. If the worker later finalizes cleanly or runs
+    out of steps without a matching artifact, validation would otherwise report
+    only data_missing. Preserve the more useful routing classification.
+    """
+    trace_classification = _classification_from_contract_violation(trace)
+    if trace_classification is not None:
+        return trace_classification
+    return _classification_from_final_answer(answer)
+
+
+def _classification_from_contract_violation(
+    trace: List[JsonDict],
+) -> Optional[JsonDict]:
+    for item in reversed(trace or []):
+        if not isinstance(item, dict) or item.get("type") != "contract_violation":
+            continue
+        result = item.get("result")
+        if not isinstance(result, dict):
+            continue
+        classification = result.get("classification")
+        if not isinstance(classification, dict):
+            continue
+        category = str(classification.get("category") or "").strip()
+        if category != "blocked_cross_task_type_required":
+            continue
+        recovered = dict(classification)
+        recovered.setdefault("hint", "LeadAgent should replan with a task_type that permits the required method.")
+        recovered["source"] = "contract_violation"
+        return recovered
+    return None
+
+
+def _classification_from_final_answer(answer: str) -> Optional[JsonDict]:
+    try:
+        payload = json.loads(str(answer or ""))
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    blockers = payload.get("blockers")
+    if not isinstance(blockers, list):
+        return None
+    for blocker in blockers:
+        if not isinstance(blocker, dict):
+            continue
+        raw_classification = blocker.get("classification")
+        if isinstance(raw_classification, dict):
+            category = str(raw_classification.get("category") or "").strip()
+            classification = dict(raw_classification)
+        else:
+            category = str(raw_classification or "").strip()
+            classification = {"category": category}
+        if category != "blocked_cross_task_type_required":
+            continue
+        hint = (
+            blocker.get("hint")
+            or blocker.get("message")
+            or blocker.get("reason")
+            or "LeadAgent should replan with a task_type that permits the required method."
+        )
+        classification.setdefault("hint", str(hint)[:500])
+        if blocker.get("method"):
+            classification.setdefault("method", blocker.get("method"))
+        if blocker.get("task_type"):
+            classification.setdefault("task_type", blocker.get("task_type"))
+        classification["source"] = "final_answer.blockers"
+        return classification
+    return None
+
+
+def _clone_capability_bundle(bundle: CapabilityBundle) -> CapabilityBundle:
+    return CapabilityBundle(
+        capabilities=list(bundle.capabilities),
+        capability_methods=set(bundle.capability_methods),
+        method_schemas=dict(bundle.method_schemas),
+        methods_requiring_purpose=set(bundle.methods_requiring_purpose),
+        purpose_hints=dict(bundle.purpose_hints),
+        skills_doc=bundle.skills_doc,
+    )

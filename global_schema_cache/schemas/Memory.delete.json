@@ -1,11 +1,11 @@
 {
   "method": "Memory.delete",
-  "description": "Delete the memory context for a specific scope.",
+  "description": "Deletes agent-scoped task memory for a scope; use only when a task context is obsolete, not for clearing page data or browser state.",
   "params": {
     "scope": {
       "type": "string",
       "minLength": 1,
-      "description": "The scope to delete memory for.",
+      "description": "Memory scope key to delete.",
       "required": true
     }
   },

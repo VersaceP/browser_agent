@@ -1,18 +1,20 @@
 {
   "method": "Hitl.resolvePause",
-  "description": "Resumes AI operation and resolves a previous Human-In-The-Loop (HITL) pause state on the specified page.",
+  "description": "Resumes automation for a page after human intervention has completed and clears the previous HITL pause state.",
   "params": {
     "pageId": {
       "type": "string",
       "format": "uuid",
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Page ID whose HITL pause should be cleared.",
       "required": true
     },
     "purpose": {
       "type": "string",
-      "description": "Describe your intent for this action",
+      "description": "Describe why it is safe to resume automation, e.g., human completed CAPTCHA, login, approval, or manual review",
       "required": true
     }
   },
-  "requiresPurpose": true
+  "requiresPurpose": true,
+  "purposeHint": "Describe why it is safe to resume automation, e.g., human completed CAPTCHA, login, approval, or manual review"
 }

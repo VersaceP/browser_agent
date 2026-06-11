@@ -1,19 +1,22 @@
 {
   "method": "DOM.getAttribute",
-  "description": "Gets the value of a specific attribute for a given element.",
+  "description": "Performs a focused attribute read from a known element, such as href, class, aria-*, value, or data-*; use DOM.getAXTree first when the target element is not yet identified.",
   "params": {
     "pageId": {
       "type": "string",
       "format": "uuid",
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Page ID containing the target element.",
       "required": true
     },
     "selector": {
+      "description": "Fallback CSS selector for the target element.",
       "type": "string",
       "minLength": 1,
       "required": false
     },
     "id": {
+      "description": "Preferred canonical element ID from DOM.getAXTree.",
       "type": "string",
       "pattern": "^\\d+:\\d+:\\d+$",
       "required": false
@@ -21,14 +24,15 @@
     "attribute": {
       "type": "string",
       "minLength": 1,
+      "description": "Attribute name to read, such as \"href\", \"value\", or \"aria-checked\".",
       "required": true
     },
     "purpose": {
       "type": "string",
-      "description": "Describe why you need this attribute, e.g., checking a link URL",
+      "description": "Describe why this attribute is needed, e.g., checking a link href, validating aria state, reading an input value, or debugging selector stability",
       "required": true
     }
   },
   "requiresPurpose": true,
-  "purposeHint": "Describe why you need this attribute, e.g., checking a link URL"
+  "purposeHint": "Describe why this attribute is needed, e.g., checking a link href, validating aria state, reading an input value, or debugging selector stability"
 }

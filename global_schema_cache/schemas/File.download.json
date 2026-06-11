@@ -6,16 +6,19 @@
       "type": "string",
       "format": "uuid",
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Page ID whose session should perform the download.",
       "required": true
     },
     "url": {
       "type": "string",
       "format": "uri",
+      "description": "Direct file URL to download.",
       "required": true
     },
     "savePath": {
       "type": "string",
       "minLength": 1,
+      "description": "Workspace-relative or absolute save path for the downloaded file.",
       "required": true
     },
     "purpose": {

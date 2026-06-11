@@ -5,9 +5,11 @@
     "name": {
       "type": "string",
       "minLength": 1,
+      "description": "Folder name to create.",
       "required": true
     },
     "parentId": {
+      "description": "Parent folder ID; use null or omit to create a root-level folder.",
       "anyOf": [
         {
           "type": "integer",

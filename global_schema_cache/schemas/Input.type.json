@@ -1,39 +1,50 @@
 {
   "method": "Input.type",
-  "description": "Types text into the specified element. Target via CSS selector or canonical element id.",
+  "description": "Types text into a known editable target; prefer a canonical id from DOM.getAXTree, use a stable selector as fallback, and set clear=true when replacing existing content.",
   "params": {
     "pageId": {
       "type": "string",
       "format": "uuid",
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Page ID containing the editable target.",
       "required": true
     },
     "selector": {
+      "description": "Fallback CSS selector for the editable target.",
       "type": "string",
       "minLength": 1,
       "required": false
     },
     "id": {
+      "description": "Preferred canonical element ID from DOM.getAXTree.",
       "type": "string",
       "pattern": "^\\d+:\\d+:\\d+$",
       "required": false
     },
     "text": {
       "type": "string",
+      "description": "Text to type into the target.",
+      "required": true
+    },
+    "clear": {
+      "default": false,
+      "description": "Clear existing content before typing when true.",
+      "type": "boolean",
       "required": true
     },
     "delay": {
       "default": 50,
+      "description": "Delay in milliseconds between keystrokes.",
       "type": "number",
       "minimum": 0,
       "required": true
     },
     "purpose": {
       "type": "string",
-      "description": "Describe why you are typing this content, e.g., filling in a search keyword",
+      "description": "Describe why this exact text is being entered, e.g., filling a search query, username, password, or form field",
       "required": true
     }
   },
   "requiresPurpose": true,
-  "purposeHint": "Describe why you are typing this content, e.g., filling in a search keyword"
+  "purposeHint": "Describe why this exact text is being entered, e.g., filling a search query, username, password, or form field"
 }

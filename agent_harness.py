@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 from abcp_client import ABCPClient, ABCPClientConfig, ABCPTransportError
+from harness.auth_fleet import AUTH_FLEET_MEMORY_SCOPE, auth_fleet_memory_guidance
 from harness.compaction import compact_messages_if_needed, validate_tool_pairing
 from harness.config import HarnessConfig, RuntimeConfig, VLConfig
 from harness.challenge_detector import ChallengeTracker
@@ -32,13 +33,18 @@ from harness.diagnostics import (
     status_category,
 )
 from harness.local_fs import local_fs_jsonpath, local_fs_read, local_fs_search
+from harness.lifecycle import LifecycleContext, default_lifecycle_manager
 from harness.model_config import browser_agent_model_config, lead_agent_model_config
+from harness.observation.loop_nudge import ActionLoopNudge
 from harness.offload import (
     offload_large_response_fields,
     offload_large_tool_result,
     strip_image_payload,
 )
-from harness.plan_executor import ABCPPlanExecutor
+from harness.observation.page_fingerprint import (
+    PageObservationTracker,
+    render_page_stats_for_prompt,
+)
 from harness.progress import ProgressAccountant
 from harness.render_recovery import (
     RenderRecoveryOutcome,
@@ -73,6 +79,7 @@ from harness.task_control import (
     find_phase,
     initialize_task_state,
     load_task_state,
+    mark_phase_exhausted_if_needed,
     next_pending_phase,
     phase_contract,
     validate_task_plan,
@@ -169,11 +176,22 @@ class BrowserAgent:
         self.purpose_hints: Dict[str, str] = {}
         self.skills_doc: str = ""
         self.artifacts: List[str] = []
+        self.extraction_attempt_artifacts: List[str] = []
         self.trace: List[JsonDict] = []
         self.final_status = WORKER_STATUS_RUNNING
         self.diagnostics = WorkerDiagnostics()
         self.progress = ProgressAccountant()
+        self.loop_nudge = ActionLoopNudge()
+        self.page_observer = PageObservationTracker()
         self.challenge_tracker = ChallengeTracker()
+        self.hitl_no_repause_until: float = 0.0
+        self.lifecycle = default_lifecycle_manager()
+        self.preloaded_capability_bundle: Optional[CapabilityBundle] = None
+        self.preloaded_registration: Optional[JsonDict] = None
+        self.axtree_epoch = 0
+        self.axtree_ids: Set[str] = set()
+        self.axtree_page_id = ""
+        self.axtree_invalidated = True
         self._render_recovery_recent: Dict[str, float] = {}
         self.render_recovery_runner = None
         self.recent_tool_signatures: List[str] = []
@@ -193,7 +211,7 @@ class BrowserAgent:
         messages: List[JsonDict] = []
 
         try:
-            bootstrap = await self._bootstrap_browser()
+            bootstrap = await self._bootstrap_browser(task)
             system_prompt = self._build_system_prompt()
             tools = build_browser_agent_tool_specs(self._visible_capability_methods())
             dispatch_tool = build_browser_tool_dispatcher(self)
@@ -225,8 +243,20 @@ class BrowserAgent:
                     messages=messages,
                     tools=tools,
                     config=self.runtime.harness,
+                    lifecycle=self.lifecycle,
                 )
                 self.logger.write("agent.step.start", {"step": step})
+                self.lifecycle.agent_before_step(
+                    LifecycleContext(
+                        actor="browser_agent",
+                        step=step,
+                        metadata={"agent_id": self.runtime.agent_id},
+                    ),
+                    {
+                        "messageCount": len(messages),
+                        "toolCount": len(tools),
+                    },
+                )
                 step_system_prompt = self._maybe_apply_step_cap_reminder(
                     system_prompt=system_prompt,
                     step=step,
@@ -296,8 +326,45 @@ class BrowserAgent:
 
                 tool_results: List[JsonDict] = []
                 for tool_call in tool_calls:
+                    self.loop_nudge.record_action(tool_call, step=step)
                     result, should_stop = await dispatch_tool(tool_call, step)
                     self._observe_tool_result(tool_call, result)
+                    page_observation = self.page_observer.observe_result(
+                        tool_call,
+                        result,
+                        step=step,
+                        agent=self,
+                    )
+                    page_stats = page_observation.get("pageStats")
+                    if isinstance(page_stats, dict):
+                        self.logger.write("page_stats.detected", page_stats)
+                        self.trace.append({
+                            "type": "page_stats",
+                            "step": step,
+                            "result": page_stats,
+                        })
+                    snapshot_diff = page_observation.get("snapshotDiff")
+                    if isinstance(snapshot_diff, dict):
+                        self.logger.write("snapshot_diff.detected", snapshot_diff)
+                        self.trace.append({
+                            "type": "snapshot_diff",
+                            "step": step,
+                            "result": snapshot_diff,
+                        })
+                    nudge = self.loop_nudge.observe_result(
+                        tool_call,
+                        result,
+                        step=step,
+                        agent=self,
+                        fingerprint=page_observation.get("fingerprint"),
+                    )
+                    if nudge is not None:
+                        self.logger.write("loop_nudge.detected", nudge)
+                        self.trace.append({
+                            "type": "loop_nudge",
+                            "step": step,
+                            "result": nudge,
+                        })
                     model_result = offload_tool_result_for_model(
                         logger=self.logger,
                         runtime=self.runtime,
@@ -320,6 +387,23 @@ class BrowserAgent:
                         should_finish = True
                         break
 
+                if not should_finish:
+                    page_stats = self.page_observer.consume_page_stats()
+                    if page_stats is not None:
+                        tool_results.append({
+                            "type": "text",
+                            "text": render_page_stats_for_prompt(page_stats),
+                        })
+                    nudge = self.loop_nudge.consume_nudge()
+                    if nudge is not None:
+                        tool_results.append({
+                            "type": "text",
+                            "text": (
+                                "<loop_nudge>\n"
+                                f"{json.dumps(nudge, ensure_ascii=False, default=str)}\n"
+                                "</loop_nudge>"
+                            ),
+                        })
                 messages.append({"role": "user", "content": tool_results})
                 if should_finish:
                     break
@@ -415,16 +499,21 @@ class BrowserAgent:
                     },
                 )
 
-    async def _bootstrap_browser(self) -> JsonDict:
-        registration = await self.browser.call(
-            "System.register", {"agentId": self.runtime.agent_id}
-        )
-        bundle: CapabilityBundle = await load_capability_bundle(
-            self.browser,
-            logger=self.logger,
-            blocked_methods=_BLOCKED_CAPABILITIES,
-            schema_cache_dir=global_schemas_dir(self.runtime.harness.worktree_dir),
-        )
+    async def _bootstrap_browser(self, task: str = "") -> JsonDict:
+        registration = self.preloaded_registration
+        if registration is None:
+            registration = await self.browser.call(
+                "System.register", {"agentId": self.runtime.agent_id}
+            )
+        bundle = self.preloaded_capability_bundle
+        preloaded = bundle is not None
+        if bundle is None:
+            bundle = await load_capability_bundle(
+                self.browser,
+                logger=self.logger,
+                blocked_methods=_BLOCKED_CAPABILITIES,
+                schema_cache_dir=global_schemas_dir(self.runtime.harness.worktree_dir),
+            )
 
         self.capabilities = list(bundle.capabilities)
         self.capability_methods = set(bundle.capability_methods)
@@ -432,14 +521,22 @@ class BrowserAgent:
         self.methods_requiring_purpose = set(bundle.methods_requiring_purpose)
         self.purpose_hints = dict(bundle.purpose_hints)
         self.skills_doc = bundle.skills_doc
+        memory_bootstrap = await self._ensure_task_memory(task)
 
         vl_cfg = self.runtime.harness.vl
         bootstrap = {
-            "registration": self._trim_for_log(registration),
+            "registration": self._trim_for_log(
+                self._sanitize_registration_memory(
+                    registration,
+                    current_task_scope=str(memory_bootstrap.get("scope") or ""),
+                )
+            ),
             "capability_count": len(self.capabilities),
             "schema_count": len(self.method_schemas),
             "requires_purpose_count": len(self.methods_requiring_purpose),
             "skills_doc_chars": len(self.skills_doc),
+            "memory": memory_bootstrap,
+            "preloaded_capability_bundle": preloaded,
             "vl": {
                 "enabled": bool(getattr(vl_cfg, "enabled", False)),
                 "provider": str(getattr(vl_cfg, "provider", "") or ""),
@@ -452,12 +549,106 @@ class BrowserAgent:
         self.logger.write("browser.bootstrap", bootstrap)
         return bootstrap
 
+    async def _ensure_task_memory(self, task: str = "") -> JsonDict:
+        """Initialize ABCP Memory with task context when Memory.save/get exist.
+
+        Memory is used for agent task context only. It is not page state, and it
+        must not hold secrets or extracted page data.
+        """
+        methods = set(getattr(self, "capability_methods", set()) or set())
+        if not {"Memory.get", "Memory.save"}.issubset(methods):
+            return {"status": "skipped", "reason": "Memory.get/save unavailable"}
+        scope = self._task_memory_scope()
+        try:
+            existing = await self.browser.call("Memory.get", {"scope": scope})
+            data = existing.get("data") if isinstance(existing, dict) else None
+            context = data.get("context") if isinstance(data, dict) else None
+            if context:
+                result = {"status": "loaded", "scope": scope}
+                self.logger.write("memory.bootstrap", result)
+                return result
+        except Exception as exc:
+            self.logger.write(
+                "memory.bootstrap.get_failed",
+                exception_payload(exc, scope=scope),
+            )
+
+        contract = getattr(self, "worker_contract", None)
+        context = {
+            "agentId": self.runtime.agent_id,
+            "task": str(task or "")[:4000],
+            "memoryContext": self.runtime.harness.memory_context,
+            "workerContract": contract if isinstance(contract, dict) else {},
+            "constraints": [
+                "Store task constraints, milestones, and recovery notes only.",
+                "Do not store plaintext passwords, tokens, private keys, or page data.",
+            ],
+        }
+        context_payload = json.dumps(context, ensure_ascii=False)
+        try:
+            saved = await self.browser.call(
+                "Memory.save",
+                {
+                    "scope": scope,
+                    "context": context_payload,
+                },
+            )
+            result = {
+                "status": "saved",
+                "scope": scope,
+                "response": self._trim_for_log(saved),
+            }
+            self.logger.write("memory.bootstrap", result)
+            return result
+        except Exception as exc:
+            result = exception_payload(exc, scope=scope)
+            result["status"] = "failed"
+            self.logger.write("memory.bootstrap.failed", result)
+            return result
+
+    def _task_memory_scope(self) -> str:
+        task_id = getattr(getattr(self, "logger", None), "task_dir", Path("")).name
+        return f"{self.runtime.agent_id}:{task_id}:task"
+
+    def _sanitize_registration_memory(
+        self,
+        registration: Any,
+        *,
+        current_task_scope: str,
+    ) -> Any:
+        if not isinstance(registration, dict):
+            return registration
+        cleaned = json.loads(json.dumps(registration, ensure_ascii=False, default=str))
+        data = cleaned.get("data")
+        if not isinstance(data, dict):
+            return cleaned
+        memories = data.get("memories")
+        if not isinstance(memories, list):
+            return cleaned
+        allowed_scopes = {current_task_scope, AUTH_FLEET_MEMORY_SCOPE}
+        for item in memories:
+            if not isinstance(item, dict):
+                continue
+            scope = str(item.get("scope") or "")
+            if scope in allowed_scopes:
+                continue
+            if "context" in item:
+                item["context"] = ""
+            item["ignored"] = True
+            item["ignoreReason"] = "task memory scope does not match current worker task"
+        return cleaned
+
     def _build_dynamic_context(self, bootstrap: JsonDict) -> str:
+        payload = {
+            "bootstrap": bootstrap,
+            "memory_context": self.runtime.harness.memory_context,
+        }
+        payload = self.lifecycle.session_context_build(
+            LifecycleContext(actor="browser_agent"),
+            payload,
+        )
         return json.dumps(
-            {
-                "bootstrap": bootstrap,
-                "memory_context": self.runtime.harness.memory_context,
-            },
+            payload,
             ensure_ascii=False,
             indent=2,
             sort_keys=True,
@@ -481,47 +672,59 @@ class BrowserAgent:
             skills_doc=self.skills_doc,
         )
         digest = build_capability_digest(bundle)
-        skills_section = (
-            f"""
-
-==================== ABCP Official Skills Manual (System.skillsDoc) ====================
-{self.skills_doc}
-=========================================================================================
-"""
-            if self.skills_doc
-            else """
-
-(System.skillsDoc unavailable on this server; rely on the capability list and the cached schemas below.)
-"""
+        auth_fleet_json = json.dumps(
+            auth_fleet_memory_guidance(),
+            ensure_ascii=False,
+            sort_keys=True,
         )
 
         return f"""You are the control core of the ABCP Browser agent harness.
 
-ABCP automation is performed by invoking atomic browser capabilities — never CDP, Playwright, pixel-coordinate guessing, or hand-crafted selector exploration.
-{skills_section}
-Available capabilities for this task_type (method · required params · summary; full schemas cached globally at global_schema_cache/schemas/<Method>.json):
+ABCP automation is performed only through browser_call and harness tools. Do not use CDP, Playwright, pixel-coordinate guessing, or undocumented params.
+
+ABCP skillsGuide has been fused into this harness SOP. System.skillsDoc is retained for audit/bootstrap metadata but is not injected verbatim.
+
+Available capabilities for this task_type (method, required params, summary; full schemas cached globally at global_schema_cache/schemas/<Method>.json):
 {digest}
 
-Harness-specific protocol (NOT covered by the official manual above, but mandatory):
-- browser_call arguments always go inside `params` as a JSON object; pass {{}} when there are no params.
-- ABCP `suggested_prompt` fields are intentionally hidden from the model; use the factual `observation`/`data` plus harness `next_instruction` instead.
-- On call errors the tool_result attaches `methodSchema` (sourced from the cached System.describeAction); inspect its `params` field, fix the call, retry. The canonical schema cache is `global_schema_cache/schemas/<Method>.json`; do not search the task worktree for schema files.
-- For methods whose schema marks `requiresPurpose: true`, the harness auto-fills `purpose` from your `browser_call.reason` when you omit it; if `reason` is empty it falls back to the schema's `purposeHint`. Provide a clear `reason` whenever you can.
-- Large DOM/text/attribute/screenshot results and generic tool_results are auto-offloaded under worktree/<task>/observations/; the in-context payload only retains `savedPath`, `outline`, `format`, and `query_with`. When you need the details, follow `query_with` and call `local_fs_search`, `local_fs_read`, or `local_fs_jsonpath` against the current task worktree.
-- Screenshots produce a `savedPath`. When a VL model is configured, use `visual_verify` for bounded visual checks; otherwise treat screenshots as evidence artifacts only.
-- Never fabricate pageId, fleetId, downloadId, bookmarkId, or similar ids — read them from the previous browser_call's `response.data`.
-- After a successful Hitl.requestPause, the harness handles the wait itself via System.notification, Hitl.resolvePause, and a short confirmation check after settled page lifecycle events. The response will include a `hitl_wait` field: continue only when `status="resumed"`, and on `status="timeout"` or `status="page_settled_after_hitl"` call final_answer with an incomplete/blocker status. **Do not call any Hitl.* method again or poll Page.getState yourself.**
-- Use `extract_dom_records` for repeated lists, tables, cards, product tiles, search results, and link collections.
-- Use `eval_js_json` instead of raw Runtime.evaluate when you need structured JS data returned. It wraps the expression with an explicit return and falls back to the title side-channel.
-- Use `navigate_verified` instead of raw Page.navigate when the next step depends on being on the exact URL/page.
-- Use `visual_verify` only as a bounded visual arbiter after click/navigation uncertainty, validator failure, overlays/CAPTCHA, or layout mismatch. Do not use it for bulk data extraction.
-- The harness may consume one or more `vl.max_checks_per_worker` slots automatically for challenge adjudication. Plan explicit `visual_verify` use accordingly.
-- Do not call DOM.getSemanticTree. Current ABCP builds have reproduced renderer crashes after this call; use DOM.getAXTree, extract_dom_records, or eval_js_json instead.
-- Harness tools are default-allowed by contract policy: final_answer, record_extraction, local_fs_search/read/jsonpath, extract_dom_records, eval_js_json, navigate_verified, visual_verify. ABCP atomic methods are governed by task_type tool policy plus explicit forbidden_methods, not by LLM-authored allowed_methods.
-- AXTree is for discovering structure and interaction anchors; do not treat a large AXTree/offload file as the final data source for bulk extraction.
-- The `[id]` tokens returned by DOM.getAXTree are rigid physical anchors; prefer them as the `selector` for subsequent Input.click / Input.type / Input.scroll calls.
-- **Structured data MUST be persisted as an artifact.** Any list / row / field value (URLs, ids, titles, prices, …) that you plan to hand off to LeadAgent / SkillAgent must, immediately after extraction, be passed to `record_extraction({{name, rows[, schema, description]}})`. Only data that has gone through this call counts as verified. The `answer` field of `final_answer` should reference these savedPaths instead of inlining the full row set.
-- When you finish the task — or determine that it cannot continue — call `final_answer` with a concise summary of the outcome, the key page state, and any items requiring human follow-up.
+L1. Contracts, Feedback, Memory
+- browser_call input is always {{"method":"Domain.action","params":{{...}},"reason":"..."}}. `params` must be an object; pass {{}} when empty.
+- Treat ActionFeedback `observation` and `data` as facts. Treat `suggested_prompt` as next-step advice to verify against schemas, worker_contract, and harness `next_instruction`.
+- Call shapes come from the live capability digest or cached System.describeAction `methodSchema`; on schema errors, inspect `methodSchema.params`, change params, then retry once.
+- For methods with `requiresPurpose`, the harness fills `purpose` from browser_call.reason or schema `purposeHint`; still provide a specific reason.
+- Never fabricate fleetId, pageId, canonical ids, selectors, URLs, credentials, or extracted values. They must come from response.data, worker input, current DOM/Page evidence, Memory.get task context, or record_extraction artifacts.
+- Memory.save/Memory.get are for task context, constraints, milestones, and recovery notes only. They are not browser state and must not store plaintext passwords, tokens, private keys, or page data.
+- Reusable authenticated fleet memory uses this exact JSON contract: {auth_fleet_json}. Treat it as a verified session index only, never as a credential store.
+
+L2. Perception And Evidence
+- DOM.getAXTree is the default perception tool for structure, labels, controls, state, and canonical ids. DOM.getText reads exact visible text for a known target. DOM.getAttribute reads href/src/id/aria-/data-/value and other attributes.
+- AXTree ids are epoch-bound physical anchors. Any Page.navigate, Page.recovered, Page.create/switch/close, Runtime.evaluate, Hitl transition, or Input.* action can invalidate them. After such a change, call Page.getState as needed, then DOM.getAXTree and derive fresh ids before targeting. For multi-page workflows, prefer split phases; never assume a snapshot from one page remains valid after Page.create or Page.switchTo.
+- Large DOM/text/attribute/tool results are offloaded under observations/. The model-visible stub includes `savedPath`, `outline`, `format`, and `query_with`; inspect savedPath with local_fs_search, local_fs_read, or local_fs_jsonpath before deriving params from offloaded evidence.
+- Screenshots produce a `savedPath` only. You cannot see the image from Page.screenshot output. Do not call Page.screenshot to read text, understand layout, identify selectors, or extract data. Use visual_verify only for bounded visual checks after visual uncertainty, overlays/CAPTCHA, canvas/image UI, layout mismatch, or DOM/visual disagreement.
+
+L3. Lifecycle And HITL
+- Page.* handles lifecycle/navigation/dialogs/screenshots/page state. Event names such as Page.loaded, Page.dialogOpened, or Hitl.resumeEvent are not actions.
+- After navigation/loading/download/state changes, wait for live feedback/events when provided; if uncertain, call Page.getState once to resync, then DOM.getAXTree.
+- After a successful Hitl.requestPause, the harness owns wait, resolve, visual recovery checks, and terminal confirmation. Do not call any Hitl.* method again. Continue only when `hitl_wait.status="resumed"`; on `timeout`, `page_settled_after_hitl`, `still_challenge_after_hitl`, or `browser_error_after_hitl`, call final_answer with a blocker.
+- Before critical or destructive actions, call Page.getState once if there is any doubt about loading, crash, HITL, dialog, file chooser, page identity, or viewport shift.
+
+L4. Actions, Verification, Data
+- Prefer Input.* for focus, scrolling, stabilization, and occlusion-aware interactions. Use canonical ids from the latest AXTree when possible; stable semantic selectors are fallback; raw coordinates are last resort.
+- Verify every state-changing action with the cheapest reliable signal: ActionFeedback, Page.getState for navigation/lifecycle, refreshed DOM.getAXTree, DOM.getText, or DOM.getAttribute(value).
+- Use extract_dom_records for uniform lists/cards/tables. Use eval_js_json only when DOM primitives cannot express the relationship; give a valid reason_kind and cross-check at least one target field with DOM evidence before record_extraction.
+- Any reusable data handed to LeadAgent must go through record_extraction. Row keys must match expected_artifact fields exactly. Critical fields need sourceTool, sourceSelectorOrAxId or selector, pageUrl, and evidence text/attribute where applicable.
+- Reject empty, guessed, order-only, placeholder, sample, or template values. If the page truly shows absence/placeholder content, set `placeholderDetected: true` so validation can classify it.
+
+L5. Recovery
+- Do not repeat an identical failed call. Read the failure ActionFeedback and suggested_prompt, call Page.getState if lifecycle may be stale, refresh DOM.getAXTree if the target may be stale/hidden/disabled, then retry only with changed params.
+- Do not call DOM.getSemanticTree; current ABCP builds have reproduced renderer crashes after it. Prefer DOM.getAXTree and focused DOM.getText/DOM.getAttribute.
+- local_fs_* inspects offloaded evidence; it is not live page state. If repeated local_fs searches return the same evidence, pivot to fresh DOM/Page/Input perception or finalize with a blocker.
+- If a needed method is blocked by task_type policy, final_answer with status="incomplete" and include {{"classification":"blocked_cross_task_type_required","method":"...","task_type":"...","reason":"..."}} for LeadAgent replan.
+
+L6. Termination
+- Track remaining step budget. Near the cap, stop probing and call final_answer.
+- final_answer.status must be one of the tool schema values: done, partial, incomplete, extraction_inconclusive.
+- final_answer.answer must be JSON shaped like {{"outcome":"done|partial|blocked|failed","data":{{}},"evidence":[],"blockers":[],"next_steps":[]}}. Put large rows in record_extraction artifacts and reference their savedPath, not inline data.
 """ + self.static_context_block
 
     def _visible_capability_methods(self) -> Set[str]:
@@ -715,6 +918,7 @@ class LeadAgent:
         self.static_context_block, self.static_context_hash = build_static_context_block(
             self.runtime.harness.context_file
         )
+        self.lifecycle = default_lifecycle_manager()
         self.task_plan: Optional[JsonDict] = None
         self.strategy_bank = load_strategy_bank(
             self.runtime.harness.strategy_bank_path
@@ -780,6 +984,13 @@ class LeadAgent:
             return result
 
         plan_path = write_task_plan(self.logger, plan)
+        plan_warnings = (
+            plan.get("warnings") if isinstance(plan.get("warnings"), list) else []
+        )
+        if plan_warnings:
+            self.logger.write("task_plan.accepted_with_warnings", {
+                "warnings": plan_warnings,
+            })
         preserve_from = load_task_state(self.logger) if replan_reason else None
         state = initialize_task_state(
             self.logger,
@@ -788,7 +999,7 @@ class LeadAgent:
             replan_reason=replan_reason,
         )
         self.task_plan = plan
-        return {
+        result = {
             "status": "done",
             "planPath": plan_path,
             "phaseCount": len(plan.get("phases", [])),
@@ -798,6 +1009,9 @@ class LeadAgent:
                 " that later become phase_failed."
             ),
         }
+        if plan_warnings:
+            result["warnings"] = plan_warnings
+        return result
 
     def _cached_abcp_methods(self) -> Set[str]:
         return read_schema_methods_from_dirs([
@@ -959,6 +1173,7 @@ class LeadAgent:
     def resolve_phase_for_spawn(self, phase_id: Optional[str]) -> Optional[JsonDict]:
         if self.task_plan is None:
             return None
+        mark_phase_exhausted_if_needed(self.task_plan, self.logger)
         if phase_id:
             phase = find_phase(self.task_plan, phase_id)
             if phase is None:
@@ -979,21 +1194,29 @@ class LeadAgent:
         phase: JsonDict,
         override: Optional[JsonDict] = None,
     ) -> JsonDict:
-        contract = phase_contract(phase, override)
+        plan_task_type = "general"
         if isinstance(self.task_plan, dict):
-            contract.setdefault("task_type", self.task_plan.get("task_type") or "general")
+            plan_task_type = str(self.task_plan.get("task_type") or "general")
+        contract = phase_contract(
+            phase,
+            override,
+            default_task_type=plan_task_type,
+        )
         return contract
 
-    def strategy_guidance_for_phase(self, phase: JsonDict) -> str:
+    def strategies_for_phase(self, phase: JsonDict) -> List[JsonDict]:
         task_type = None
         if isinstance(self.task_plan, dict):
             task_type = str(self.task_plan.get("task_type") or "") or None
-        strategies = select_strategies_for_phase(
+        return select_strategies_for_phase(
             self.strategy_bank,
             task_type=task_type,
             phase=phase,
             limit=3,
         )
+
+    def strategy_guidance_for_phase(self, phase: JsonDict) -> str:
+        strategies = self.strategies_for_phase(phase)
         return render_strategy_guidance(strategies)
 
     async def run(self, task: str) -> str:
@@ -1025,7 +1248,7 @@ class LeadAgent:
                 "content": (
                     f"<user_task>\n{task}\n</user_task>\n\n"
                     f"<runtime_limits>\n{runtime_limits}\n</runtime_limits>\n\n"
-                    "Act as the LeadAgent: decompose the task, spawn BrowserAgent / SkillAgent as needed, "
+                    "Act as the LeadAgent: decompose the task, spawn BrowserAgent phases as needed, "
                     "and call final_answer with the final result."
                 ),
             }
@@ -1044,11 +1267,28 @@ class LeadAgent:
                     messages=messages,
                     tools=tools,
                     config=self.runtime.harness,
+                    lifecycle=self.lifecycle,
                 )
                 self.logger.write("lead.step.start", {"step": step})
                 self._current_step = step
-                text, tool_calls, stop_reason, usage = await self.provider.generate_response(
+                self.lifecycle.agent_before_step(
+                    LifecycleContext(
+                        actor="lead_agent",
+                        step=step,
+                        metadata={"agent_id": self.runtime.agent_id},
+                    ),
+                    {
+                        "messageCount": len(messages),
+                        "toolCount": len(tools),
+                    },
+                )
+                step_system_prompt = self._maybe_apply_step_cap_reminder(
                     system_prompt=system_prompt,
+                    step=step,
+                    max_steps=self.runtime.harness.lead_max_steps,
+                )
+                text, tool_calls, stop_reason, usage = await self.provider.generate_response(
+                    system_prompt=step_system_prompt,
                     messages=messages,
                     tools=tools,
                 )
@@ -1180,6 +1420,27 @@ class LeadAgent:
         self.logger.write("lead.final", {"answer": final_answer})
         return final_answer
 
+    def _maybe_apply_step_cap_reminder(
+        self, *, system_prompt: str, step: int, max_steps: int,
+    ) -> str:
+        remaining = max_steps - step
+        if remaining > 2:
+            return system_prompt
+        if remaining <= 0:
+            remaining = 1
+        reminder = (
+            "\n\n[LEAD-CHECKPOINT-REMINDER]\n"
+            f"You have {remaining} orchestration step(s) left. Do not start a"
+            " new broad phase. If current evidence is enough, call final_answer;"
+            " otherwise report the blocker, failed phase, and next concrete"
+            " replan direction."
+        )
+        self.logger.write(
+            "lead.step_cap.reminder",
+            {"step": step, "max_steps": max_steps, "remaining": remaining},
+        )
+        return system_prompt + reminder
+
     def _build_system_prompt(self) -> str:
         strategy_bank_json = json.dumps(
             compact_strategy_bank(self.strategy_bank),
@@ -1187,61 +1448,61 @@ class LeadAgent:
             indent=2,
             default=str,
         )
-        return """You are the ABCP LeadAgent, responsible for orchestrating multiple agents to perform complex web data collection and form-filling tasks.
+        return """You are the ABCP LeadAgent, responsible for decomposing the user task, spawning BrowserAgent phases, validating artifacts, and returning the final result.
 
-You cannot drive the browser directly; you MUST go through the harness tools to spawn a BrowserAgent or to run a SkillAgent / ABCP plan.
+You cannot drive the browser directly. Use Lead tools only. Express complex browser work as BrowserAgent phases and validate their artifacts before returning the final result.
 
-Strategy bank is read-only v1 guidance, not a hard script. Prefer matching strategies before free exploration; if they fail, summarize the failure signature and switch strategy on the next worker instead of retrying the same surface.
+Strategy bank entries are procedural defaults, not permissions and not hard scripts. Prefer matching strategies before free exploration; if you diverge, include a short decision_note in the worker context explaining why. If a strategy fails, summarize the failure signature and switch strategy instead of retrying the same surface.
 <strategy_bank>
 """ + strategy_bank_json + """
 </strategy_bank>
 
-Recommended state flow (token-thrifty by default):
-0. You MUST first call `emit_task_plan` with a v1 linear phase plan. Each phase needs objective, worker_task, expected_artifact, validators, worker_contract, and max_attempts. Do not spawn a BrowserAgent before the plan is accepted.
-   Do not hand-author ABCP allow-lists. BrowserAgent tool access is governed by task_type policy plus explicit forbidden_methods; strategy_bank guidance recommends tool order but does not grant permissions.
-1. spawn_browser_agent × 1 for the first pending phase: explore the list page — obtain the URL list, pagination rules, and a sample detail URL.
-2. spawn_browser_agent × 1 for the next pending phase: explore the first detail page — confirm target fields, stable selectors / node ids, required wait conditions, and abnormal signals.
-3. run_skill_agent: distill a deterministic ABCP-steps template from the previous two traces. The template MUST declare variables (e.g. item.url), output fields, success criteria, and recoverable failure points; capture extraction output with `save_as="output"` whenever possible.
-4. Prefer `run_abcp_plan_batch(validate_first_n=2 or 3)` for the trial run. It serially validates the first N items first, and only fans out to the rest after the validation set fully passes.
-5. If it returns `validation_hitl_required`, the validation sample triggered human-in-the-loop intervention. Wait for / prompt the user, then retry the same batch or the failed item — do NOT immediately fall back to an LLM.
-6. If it returns `validation_failed`, the template is not yet ready to scale. Inspect `failed_details.step_results` / `failed_step`, fix the steps, and retry on a small sample.
-7. If it returns `partial_hitl_required` or `partial_failed`, the template works in the aggregate but a few items failed. Treat results whose `status != done` (failed_items) as input for subsequent retries or fallbacks.
-8. Only fall back to `run_browser_batch` or a per-item BrowserAgent for `failed_items` when the page structure is fundamentally different, visual/semantic judgement is required, a CAPTCHA/login/payment/anti-bot wall blocks deterministic steps, or the step cannot be repaired.
-9. Do NOT run `run_browser_batch` over the remaining URLs before the template has passed reuse validation — it is a fallback for heterogeneous pages and failed deterministic plans, not the default path.
-10. Stay within the concurrency limits declared in `runtime_limits` (browser agents / plan executors). Use `concurrency` to bound batch tasks.
-11. Every subtask must have a clear list of target fields, an explicit output format, and an explicit stop condition.
-12. LeadAgent tools use strict schemas: structured arguments (`steps`, `items`, `variables`) are passed as JSON-string fields. Pass `"{}"` for empty variables; each step's `params` in `steps_json` MUST be a JSON object.
-13. When generating an ABCP plan template, every method whose schema marks `requiresPurpose: true` (e.g. Page.navigate, DOM.*, Input.*, Runtime.*, Hitl.*) must carry a `purpose` field inside `step.params`. The dispatcher enforces this; the plan executor will additionally auto-fill from the schema's `purposeHint` as a last resort, but explicit purposes lead to cleaner traces.
-14. BrowserAgent returns only `answer`, `traceSummary`, `tracePath`, and artifact/offload paths — the full trace never lives in your context. Use `local_fs_search`, `local_fs_read`, or `local_fs_jsonpath` against the returned `tracePath` / `savedPath` under the current task worktree when you need the details.
-15. When you spawn a BrowserAgent, use `result_contract` to spell out the fields, evidence, and blocking conditions you expect in the worker's `answer`. This stops workers from returning vague summaries.
-16. **Evidence-chain enforcement**: when calling `run_skill_agent`, you MUST pass the upstream BrowserAgent's extraction artifact paths (from `spawner.browser.result.artifacts`, the entries under `/artifacts/extractions/*.json`) into the `evidence_artifacts` parameter. SkillAgent may only synthesise URLs / hrefs / ids and similar critical fields from those artifacts. If the upstream worker produced no extraction artifact, **do not spawn a SkillAgent that would have to infer the fields** — re-spawn a BrowserAgent task that explicitly calls `record_extraction` first, then continue.
-17. If a phase is returned as `phase_failed` or `spawn_browser_agent` says phase not found / no pending phase, do not retry that phase id. Report the blocker or emit a new plan in a later system version.
+Lead state flow:
+0. First call `emit_task_plan` with a v1 linear phase plan. The plan must include task_type. Each phase needs objective, worker_task, stage_hint, stage_hint_reason, expected_artifact, validators, worker_contract, and max_attempts. Use max_attempts=3 by default unless the task is trivial or unsafe to retry.
+   Valid stage_hint values: collection, detail_sections, attribute_links, form_interaction, computed_relationship, generic. Use generic only when the phase truly cannot be classified.
+   Do not hand-author ABCP allow-lists. BrowserAgent access is governed by task_type policy plus explicit forbidden_methods. If a workflow crosses task types, split phases and replan with the correct task_type.
+1. Spawn one BrowserAgent for the first pending phase. Give it a narrow worker_task, exact target fields, exact output format, explicit stop condition, and a `result_contract`.
+2. When spawning a BrowserAgent, copy expected_artifact.fields / required_fields verbatim and state that record_extraction row keys must use those exact names.
+3. Never turn an unverified assumption into a worker instruction. Dynamic params must be described as observable labels, roles, headings, hrefs, artifact paths, or current-page evidence. Do not pass hard-coded pageId, fleetId, AXTree ids, CSS selectors, ranks, or list indexes unless they came from cited recent evidence.
+4. After each BrowserAgent result, route from `resultLevels.l1` and `statusCategory`; use `resultLevels.l2` for data/evidence/blockers. `traceSummary`, `tracePath`, artifact paths, and offload paths are detail surfaces only; inspect them with local_fs_search/local_fs_read/local_fs_jsonpath when needed, not by pasting large traces into context.
+5. If artifact validation fails with schema_mismatch but the rows are trustworthy, use lead_save_artifact to reshape from trusted extraction artifacts. Do not re-scrape only to rename fields.
+6. A phase with validatedStatus="validation_failed" or task_state status="validation_failed" is not complete. Do not describe it as done/completed/successful, mark it DONE/SKIP, or build later phases as if it were validated unless you first use lead_save_artifact to create a replacement artifact that passes validation.
+7. If validation reports data_placeholder, data_wrong_value, missing rank/range evidence, or the worker only found off-target rows, replan with a narrower BrowserAgent task or report partial/blocker. Do not accept placeholder artifacts as progress.
+8. If a phase is returned as phase_failed or phase_exhausted, do not retry that phase id directly. Either final_answer with the blocker or emit a revised task_plan with replan_reason that changes stage_hint, contract, decomposition, or strategy.
+9. If spawn_browser_agent returns phase_classification_repeated, do not call spawn_browser_agent again for the same phase/contract. Emit a revised task_plan with replan_reason that changes objective, worker_task, worker_contract, expected_artifact, validators, or task_type; otherwise final_answer with the blocker. If it returns phase_locked_must_finalize, call final_answer unless you can immediately emit a substantially revised task_plan.
+10. If resultLevels.l2.blockers contains stall_replan_recommended, the worker saw repeated within-attempt stall signals. Do not re-spawn the same phase with the same worker_task. Either emit a revised task_plan that changes the phase procedure, preferred tools, expected_artifact, validators, stage_hint, or worker_contract; or final_answer with the blocker, citing signalCount, loopNudgeCount, and progressInterventionCount as evidence. This is advisory, not an automatic failure, but ignoring it wastes another worker attempt.
+11. If a worker returns partial, step_budget_exhausted with usable extraction artifacts, or validation with attemptExtractionArtifacts, continue serially with a focused worker. The continuation task must explicitly state remainingRange / remainingItems, existingArtifactPath, and which rows are already trusted so the next worker does not re-collect completed rows.
+12. Prefer serial continuation over same-fleet multi-tab control. Do not ask one fleet/page owner to control multiple tabs concurrently; this can create memory and handle contention.
+13. If the same category fails repeatedly, stop broad retries. Use the evidence you have, spawn at most one focused continuation, or final_answer.
+14. Stay within runtime_limits. Use multiple BrowserAgents only as separate explicit phases, not as blind batch fan-out.
 
-Worker terminal-status decision table — apply this immediately after every `spawner.browser.result`:
-- done / partial: data is usable; advance with the `answer`. `partial` means the worker explicitly only finished a subset — note the uncovered range in your final answer.
-- step_budget_exhausted: steps ran out but progress may still exist. Check `traceSummary` for usable evidence first; if there is some, relay (spawn a more focused continuation), otherwise change strategy.
-- context_limit_exceeded: context window overflowed. Do NOT retry verbatim — spawn with narrower task boundaries and a slimmer `result_contract`; ban `DOM.getSemanticTree`.
-- page_crashed: the page's render context is broken. The next spawn must explicitly rebuild the fleet or open a fresh page; do not reuse the old pageId.
-- extraction_inconclusive: the current extraction surface (JS / AXTree) cannot reach the data. Swap probing strategy (e.g. AXTree → JS or vice versa, or screenshot + VL when configured); otherwise route to human fallback.
-- hitl_waiting: a human pause was requested but the harness did not absorb the wait — this is an infrastructure regression signal. **Do NOT auto-spawn the same task again**; report to the user and stop this subtask.
-- hitl_timeout: the wait elapsed without human action. Surface the request to the user; do not retry by default.
-- page_settled_after_hitl: the page appears past the challenge, but ABCP still rejects tools as paused. Treat this as platform HITL auto-recovery not yet releasing the control channel; do not auto-spawn the same task.
-- browser_api_contract_error: the ABCP contract rejected the call (method missing / routing error / etc). **Do NOT retry along the same path**; switch method or report the platform-side bug.
-- failed / cancelled / unknown: inspect `error` and `diagnostics`. Be conservative — do not auto-scale further execution.
+BrowserAgent terminal-status decision table:
+- done / partial: data is usable; advance with the answer. partial means the worker explicitly finished only a subset; include the uncovered range in final_answer.
+- step_budget_exhausted: check resultLevels.l2 data/evidence and extraction artifacts first. If usable, continue narrowly; otherwise change strategy.
+- context_limit_exceeded: do not retry verbatim; spawn with narrower task boundaries and a slimmer result_contract.
+- page_crashed: next worker must rebuild the fleet/page or open a fresh page.
+- extraction_inconclusive: switch probing strategy; for visual uncertainty, use BrowserAgent visual_verify guidance, not raw screenshot interpretation.
+- hitl_waiting, hitl_timeout, page_settled_after_hitl, still_challenge_after_hitl, browser_error_after_hitl: do not auto-spawn the same task. Surface the user/platform blocker.
+- browser_api_contract_error: switch method or report the platform-side bug.
+- blocked_cross_task_type_required: replan a new phase with the appropriate task_type.
+- failed / cancelled / unknown: inspect error and diagnostics; be conservative before scaling.
 
-The `statusCategory` field is the coarse bucket of the above (done / recoverable / needs_human / fatal / unknown) and is suitable for fast branching.
+Artifact and evidence rules:
+- record_extraction artifacts are the trusted handoff format. Final data should reference artifact savedPath paths when large.
+- lead_save_artifact is only for reshaping trustworthy evidence already present in extraction artifacts, not for inventing missing data.
+- For order/rank/date/price/count/status fields, require explicit page evidence or provenance. Do not infer from position alone unless the page evidence proves that relation.
+- eval_js_json is a BrowserAgent harness tool, not an ABCP browser_call method. In BrowserAgent tasks, mention it as a preferred harness tool with reason_kind and a cross-check plan; do not instruct the worker to call browser_call with method="eval_js_json". Valid reason_kind values: computed_geometry, cross_node_relationship, shadow_dom_traversal, cross_frame_aggregation, non_dom_state, legacy_no_dom_equivalent.
 
-The final answer must include:
-- The completed data range or the location of the collected results.
-- The failing / blocking URLs and their reasons (with worker status / statusCategory).
-- Whether the reusable strategy succeeded.
+The final_answer must include:
+- Completed data range or artifact locations.
+- Failing/blocking URLs, ranks, or phases with worker status/statusCategory.
+- Whether the selected strategy completed, partially completed, or was blocked.
 """ + self.static_context_block
 
 
 __all__ = [
     "ABCPClient",
     "ABCPClientConfig",
-    "ABCPPlanExecutor",
     "ABCPTransportError",
     "BaseLLMProvider",
     "BrowserAgent",

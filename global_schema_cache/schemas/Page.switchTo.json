@@ -1,19 +1,20 @@
 {
   "method": "Page.switchTo",
-  "description": "Switches the active tab to the specified page.",
+  "description": "Switches active focus to an existing tab by pageId so subsequent DOM, Input, screenshot, and dialog actions target the intended page.",
   "params": {
     "pageId": {
       "type": "string",
       "format": "uuid",
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Page ID to bring into focus.",
       "required": true
     },
     "purpose": {
       "type": "string",
-      "description": "Describe why you are switching to this tab, e.g., operating across multiple tabs",
+      "description": "Describe why this tab needs focus, e.g., continuing a multi-tab workflow or returning to a results page",
       "required": true
     }
   },
   "requiresPurpose": true,
-  "purposeHint": "Describe why you are switching to this tab, e.g., operating across multiple tabs"
+  "purposeHint": "Describe why this tab needs focus, e.g., continuing a multi-tab workflow or returning to a results page"
 }

@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 from harness.config import HarnessConfig
+from harness.lifecycle import LifecycleContext, LifecycleManager
 from harness.utils import (
     JsonDict,
     RunLogger,
@@ -143,10 +144,18 @@ def split_message_pairs(messages: List[JsonDict]) -> Tuple[List[JsonDict], List[
     return head, groups
 
 
-def summarize_messages_for_compaction(groups: List[List[JsonDict]]) -> JsonDict:
+def summarize_messages_for_compaction(
+    groups: List[List[JsonDict]],
+    *,
+    actor: str = "",
+) -> JsonDict:
     tool_counts: Dict[str, int] = {}
     errors: List[str] = []
     offloaded: List[str] = []
+    artifacts: List[str] = []
+    worker_results: List[JsonDict] = []
+    blockers: List[JsonDict] = []
+    verified_data: List[JsonDict] = []
     page_ids: Dict[str, JsonDict] = {}
     fleet_ids: Dict[str, JsonDict] = {}
     recent_page_states: List[JsonDict] = []
@@ -184,6 +193,17 @@ def summarize_messages_for_compaction(groups: List[List[JsonDict]]) -> JsonDict:
                     parsed = raw
                 offloaded.extend(extract_offloaded_paths(parsed))
                 if isinstance(parsed, dict):
+                    artifacts.extend(_collect_artifact_paths(parsed))
+                    for candidate in _result_candidates(parsed):
+                        worker_result = _summarize_worker_result(candidate)
+                        if worker_result:
+                            worker_results.append(worker_result)
+                        blocker = _summarize_blocker(candidate)
+                        if blocker:
+                            blockers.append(blocker)
+                        verified = _summarize_verified_data(candidate)
+                        if verified:
+                            verified_data.append(verified)
                     _collect_runtime_handles(
                         parsed,
                         source=str(parsed.get("method") or "tool_result"),
@@ -197,18 +217,152 @@ def summarize_messages_for_compaction(groups: List[List[JsonDict]]) -> JsonDict:
                     response = parsed.get("response")
                     if isinstance(response, dict) and response.get("error"):
                         errors.append(str(response.get("error"))[:500])
+    scope = "lead" if "lead" in str(actor).lower() else "browser"
     return {
+        "schemaVersion": "context_compaction.v2",
+        "actor": actor,
+        "scope": scope,
         "messageGroups": len(groups),
         "toolResults": total_tool_results,
+        "toolUsage": {
+            "counts": tool_counts,
+        },
+        # Legacy alias retained for existing readers/tests.
         "toolCounts": tool_counts,
         "errors": errors[:10],
         "offloadedFiles": sorted(set(offloaded))[:100],
+        "artifacts": sorted(set(artifacts))[:100],
+        "workerResults": worker_results[-20:],
+        "verifiedData": verified_data[-20:],
+        "blockers": blockers[-20:],
         "runtimeHandles": {
             "pageIds": list(page_ids.values())[-20:],
             "fleetIds": list(fleet_ids.values())[-20:],
             "recentPageStates": recent_page_states[-10:],
         },
     }
+
+
+def _collect_artifact_paths(value: JsonDict) -> List[str]:
+    paths: List[str] = []
+    for key in ("artifacts", "offloadedFiles"):
+        raw = value.get(key)
+        if isinstance(raw, list):
+            paths.extend(str(item) for item in raw if item)
+    if isinstance(value.get("savedPath"), str):
+        paths.append(str(value.get("savedPath")))
+    completed = value.get("completed")
+    if isinstance(completed, list):
+        for item in completed:
+            if isinstance(item, dict):
+                paths.extend(_collect_artifact_paths(item))
+    result_levels = value.get("resultLevels")
+    if isinstance(result_levels, dict):
+        l2 = result_levels.get("l2")
+        if isinstance(l2, dict):
+            evidence = l2.get("evidence")
+            if isinstance(evidence, dict):
+                raw_artifacts = evidence.get("artifacts")
+                if isinstance(raw_artifacts, list):
+                    paths.extend(str(item) for item in raw_artifacts if item)
+    return paths
+
+
+def _result_candidates(value: JsonDict) -> List[JsonDict]:
+    candidates = [value]
+    completed = value.get("completed")
+    if isinstance(completed, list):
+        candidates.extend(item for item in completed if isinstance(item, dict))
+    results = value.get("results")
+    if isinstance(results, list):
+        candidates.extend(item for item in results if isinstance(item, dict))
+    return candidates
+
+
+def _summarize_worker_result(value: JsonDict) -> Optional[JsonDict]:
+    result_levels = value.get("resultLevels")
+    if isinstance(result_levels, dict):
+        l1 = result_levels.get("l1")
+        if isinstance(l1, dict):
+            trace_path = _trace_path_from_result_levels(result_levels)
+            return {
+                "workerId": l1.get("workerId"),
+                "phaseId": l1.get("phaseId"),
+                "status": l1.get("status"),
+                "statusCategory": l1.get("statusCategory"),
+                "validatedStatus": l1.get("validatedStatus"),
+                "artifactCount": l1.get("artifactCount"),
+                "errorCount": l1.get("errorCount"),
+                "traceSaved": l1.get("traceSaved"),
+                "tracePath": trace_path,
+            }
+    if value.get("workerId") and value.get("traceSummary"):
+        return {
+            "workerId": value.get("workerId"),
+            "phaseId": value.get("phaseId"),
+            "status": value.get("status"),
+            "statusCategory": value.get("statusCategory"),
+            "validatedStatus": value.get("validatedStatus"),
+            "tracePath": value.get("tracePath"),
+        }
+    return None
+
+
+def _trace_path_from_result_levels(result_levels: JsonDict) -> Optional[str]:
+    for level_name in ("l2", "l3"):
+        level = result_levels.get(level_name)
+        if not isinstance(level, dict):
+            continue
+        direct = level.get("tracePath")
+        if isinstance(direct, str) and direct:
+            return direct
+        evidence = level.get("evidence")
+        if isinstance(evidence, dict):
+            path = evidence.get("tracePath")
+            if isinstance(path, str) and path:
+                return path
+    return None
+
+
+def _summarize_blocker(value: JsonDict) -> Optional[JsonDict]:
+    status = str(value.get("status") or "")
+    if status and status not in {"done", "running"}:
+        return {
+            "status": status,
+            "workerId": value.get("workerId"),
+            "phaseId": value.get("phaseId"),
+            "error": str(value.get("error") or "")[:500],
+            "errorClassification": value.get("errorClassification"),
+        }
+    classification = value.get("errorClassification")
+    if isinstance(classification, dict):
+        return {
+            "status": value.get("status"),
+            "type": classification.get("type"),
+            "suggested_action": classification.get("suggested_action"),
+            "error": str(value.get("error") or "")[:500],
+        }
+    return None
+
+
+def _summarize_verified_data(value: JsonDict) -> Optional[JsonDict]:
+    if value.get("rowCount") is not None and value.get("savedPath"):
+        return {
+            "name": value.get("name"),
+            "rowCount": value.get("rowCount"),
+            "savedPath": value.get("savedPath"),
+        }
+    result_levels = value.get("resultLevels")
+    if isinstance(result_levels, dict):
+        l2 = result_levels.get("l2")
+        if isinstance(l2, dict):
+            data = l2.get("data")
+            if isinstance(data, dict):
+                return {
+                    "totalExtractedRows": data.get("totalExtractedRows"),
+                    "extractionArtifacts": data.get("extractionArtifacts"),
+                }
+    return None
 
 
 def _collect_runtime_handles(
@@ -298,7 +452,27 @@ def compact_messages_if_needed(
     messages: List[JsonDict],
     tools: List[JsonDict],
     config: HarnessConfig,
+    lifecycle: Optional[LifecycleManager] = None,
 ) -> List[JsonDict]:
+    if lifecycle is not None:
+        payload = lifecycle.compact_before(
+            LifecycleContext(actor=actor, step=step),
+            {
+                "messageCount": len(messages),
+                "toolCount": len(tools),
+            },
+        )
+        if payload.get("skip") is True:
+            logger.write(
+                "context.compaction_skipped",
+                {
+                    "actor": actor,
+                    "step": step,
+                    "reason": "lifecycle_skip",
+                },
+            )
+            return messages
+
     estimated = estimate_prompt_tokens(system_prompt, messages, tools)
     threshold = int(
         max(1, config.model_context_window_tokens)
@@ -413,7 +587,7 @@ def compact_messages_if_needed(
 
     compacted_message = None
     if strategy == "summary":
-        summary = summarize_messages_for_compaction(middle_groups)
+        summary = summarize_messages_for_compaction(middle_groups, actor=actor)
         summary["originalSavedPath"] = str(path.resolve())
         summary["estimatedTokensBefore"] = estimated
         summary["thresholdTokens"] = threshold
@@ -459,4 +633,14 @@ def compact_messages_if_needed(
             "validationFailures": validation_failures[:10],
         },
     )
+    if lifecycle is not None:
+        lifecycle.compact_after(
+            LifecycleContext(actor=actor, step=step),
+            {
+                "strategy": strategy,
+                "messageCountBefore": len(messages),
+                "messageCountAfter": len(new_messages),
+                "savedPath": str(path.resolve()),
+            },
+        )
     return new_messages

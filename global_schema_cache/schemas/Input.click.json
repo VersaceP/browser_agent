@@ -1,37 +1,50 @@
 {
   "method": "Input.click",
-  "description": "Clicks the specified element. Target via CSS selector or canonical element id.",
+  "description": "Dispatches a physical mouse click on a known target; prefer a canonical id from DOM.getAXTree, use a stable selector as fallback, and use coordinates only as a last resort.",
   "params": {
     "pageId": {
       "type": "string",
       "format": "uuid",
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Page ID containing the click target.",
       "required": true
     },
     "selector": {
+      "description": "Fallback CSS selector for the click target.",
       "type": "string",
       "minLength": 1,
       "required": false
     },
     "id": {
+      "description": "Preferred canonical element ID from DOM.getAXTree.",
       "type": "string",
       "pattern": "^\\d+:\\d+:\\d+$",
       "required": false
     },
     "x": {
+      "description": "Fallback X coordinate for coordinate-based clicking.",
       "type": "number",
       "required": false
     },
     "y": {
+      "description": "Fallback Y coordinate for coordinate-based clicking.",
       "type": "number",
       "required": false
     },
+    "clickCount": {
+      "default": 1,
+      "description": "Number of clicks to dispatch: 1 or 2.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2,
+      "required": true
+    },
     "purpose": {
       "type": "string",
-      "description": "Describe your goal for clicking this element, e.g., submitting a login form",
+      "description": "Describe the intended effect of this click, e.g., opening a menu, selecting a result, or submitting a form",
       "required": true
     }
   },
   "requiresPurpose": true,
-  "purposeHint": "Describe your goal for clicking this element, e.g., submitting a login form"
+  "purposeHint": "Describe the intended effect of this click, e.g., opening a menu, selecting a result, or submitting a form"
 }

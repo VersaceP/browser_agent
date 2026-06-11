@@ -1,19 +1,22 @@
 {
   "method": "Input.press",
-  "description": "Simulates a keyboard key press (e.g., Enter, Escape, Tab).",
+  "description": "Dispatches a physical keyboard key press to the currently focused page or element; establish or verify focus before using it for form submission or shortcuts.",
   "params": {
     "pageId": {
       "type": "string",
       "format": "uuid",
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Page ID that should receive the key press.",
       "required": true
     },
     "key": {
       "type": "string",
       "minLength": 1,
+      "description": "Key value to press, such as \"Enter\", \"Escape\", or \"a\".",
       "required": true
     },
     "modifiers": {
+      "description": "Optional modifier keys held while pressing the main key.",
       "type": "array",
       "items": {
         "type": "string",
@@ -28,10 +31,10 @@
     },
     "purpose": {
       "type": "string",
-      "description": "Describe why you are pressing this key, e.g., pressing Enter to submit a search",
+      "description": "Describe why this key is needed, e.g., pressing Enter to submit, Escape to close an overlay, Tab to move focus, or a shortcut with modifiers",
       "required": true
     }
   },
   "requiresPurpose": true,
-  "purposeHint": "Describe why you are pressing this key, e.g., pressing Enter to submit a search"
+  "purposeHint": "Describe why this key is needed, e.g., pressing Enter to submit, Escape to close an overlay, Tab to move focus, or a shortcut with modifiers"
 }
