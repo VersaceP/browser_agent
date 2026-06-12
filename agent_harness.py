@@ -698,21 +698,22 @@ L1. Contracts, Feedback, Memory
 
 L2. Perception And Evidence
 - DOM.getAXTree is the default perception tool for structure, labels, controls, state, and canonical ids. DOM.getText reads exact visible text for a known target. DOM.getAttribute reads href/src/id/aria-/data-/value and other attributes.
-- AXTree ids are epoch-bound physical anchors. Any Page.navigate, Page.recovered, Page.create/switch/close, Runtime.evaluate, Hitl transition, or Input.* action can invalidate them. After such a change, call Page.getState as needed, then DOM.getAXTree and derive fresh ids before targeting. For multi-page workflows, prefer split phases; never assume a snapshot from one page remains valid after Page.create or Page.switchTo.
+- AXTree ids are epoch-bound physical anchors. Any Page.navigate, Page.recovered, Page.create/switch/close, Runtime.evaluate, Hitl transition, or Input.* action can invalidate them. After such a change, call Page.getState as needed, then DOM.getAXTree and derive fresh ids before targeting. For same-instance multi-page workflows, track each pageId with its URL/title/purpose, switch serially with Page.switchTo, and never assume a snapshot from one page remains valid after Page.create or Page.switchTo.
 - Large DOM/text/attribute/tool results are offloaded under observations/. The model-visible stub includes `savedPath`, `outline`, `format`, and `query_with`; inspect savedPath with local_fs_search, local_fs_read, or local_fs_jsonpath before deriving params from offloaded evidence.
 - Screenshots produce a `savedPath` only. You cannot see the image from Page.screenshot output. Do not call Page.screenshot to read text, understand layout, identify selectors, or extract data. Use visual_verify only for bounded visual checks after visual uncertainty, overlays/CAPTCHA, canvas/image UI, layout mismatch, or DOM/visual disagreement.
 
 L3. Lifecycle And HITL
 - Page.* handles lifecycle/navigation/dialogs/screenshots/page state. Event names such as Page.loaded, Page.dialogOpened, or Hitl.resumeEvent are not actions.
 - After navigation/loading/download/state changes, wait for live feedback/events when provided; if uncertain, call Page.getState once to resync, then DOM.getAXTree.
-- After a successful Hitl.requestPause, the harness owns wait, resolve, visual recovery checks, and terminal confirmation. Do not call any Hitl.* method again. Continue only when `hitl_wait.status="resumed"`; on `timeout`, `page_settled_after_hitl`, `still_challenge_after_hitl`, or `browser_error_after_hitl`, call final_answer with a blocker.
+- A BrowserAgent may manage multiple tabs/pages inside its own instance. Use Page.create for additional pages and Page.switchTo/Page.list to select the active page. Control pages serially, not concurrently, and refresh Page/DOM perception after every switch before acting.
+- After a successful Hitl.requestPause, the harness owns wait, resolve, visual recovery checks, and terminal confirmation. Do not call any Hitl.* method again. Continue only when `hitl_wait.status="resumed"`; on `timeout`, `page_settled_after_hitl`, `stale_pause_deadlock`, `still_challenge_after_hitl`, or `browser_error_after_hitl`, call final_answer with a blocker.
 - Before critical or destructive actions, call Page.getState once if there is any doubt about loading, crash, HITL, dialog, file chooser, page identity, or viewport shift.
 
 L4. Actions, Verification, Data
 - Prefer Input.* for focus, scrolling, stabilization, and occlusion-aware interactions. Use canonical ids from the latest AXTree when possible; stable semantic selectors are fallback; raw coordinates are last resort.
 - Verify every state-changing action with the cheapest reliable signal: ActionFeedback, Page.getState for navigation/lifecycle, refreshed DOM.getAXTree, DOM.getText, or DOM.getAttribute(value).
 - Use extract_dom_records for uniform lists/cards/tables. Use eval_js_json only when DOM primitives cannot express the relationship; give a valid reason_kind and cross-check at least one target field with DOM evidence before record_extraction.
-- Any reusable data handed to LeadAgent must go through record_extraction. Row keys must match expected_artifact fields exactly. Critical fields need sourceTool, sourceSelectorOrAxId or selector, pageUrl, and evidence text/attribute where applicable.
+- Any reusable data handed to LeadAgent must go through record_extraction. Row keys must match expected_artifact fields exactly. Critical fields need sourceTool, sourceSelectorOrAxId, pageUrl, and canonical <field>EvidenceText evidence fields such as rankEvidenceText where applicable.
 - Reject empty, guessed, order-only, placeholder, sample, or template values. If the page truly shows absence/placeholder content, set `placeholderDetected: true` so validation can classify it.
 
 L5. Recovery
@@ -925,6 +926,12 @@ class LeadAgent:
         )
         self.recent_tool_signatures: List[str] = []
         self._current_step: int = 0
+
+    def refresh_strategy_bank(self) -> JsonDict:
+        self.strategy_bank = load_strategy_bank(
+            self.runtime.harness.strategy_bank_path
+        )
+        return self.strategy_bank
 
     def accept_task_plan(self, raw_plan: Any) -> JsonDict:
         replan_reason = ""
@@ -1202,12 +1209,62 @@ class LeadAgent:
             override,
             default_task_type=plan_task_type,
         )
+        contract["orchestration_policy"] = self._browser_worker_orchestration_policy()
         return contract
+
+    def _browser_worker_orchestration_policy(self) -> JsonDict:
+        max_instances = getattr(
+            self.runtime.harness,
+            "max_browser_agent_instances",
+            3,
+        )
+        return {
+            "max_browser_agent_instances": int(max_instances or 3),
+            "prefer_same_instance_multi_page": True,
+            "allow_same_instance_multi_page": True,
+            "prefer_related_idle_slot_reuse": True,
+            "tab_control_mode": "serial_switching_only",
+            "rules": [
+                (
+                    "Prefer the same idle BrowserAgent slot for related"
+                    " continuation work that shares a site, session, search"
+                    " result set, or artifact contract."
+                ),
+                (
+                    "Unless the spawn is an explicit continuation with"
+                    " reuse_from_worker_id or preferred_slot_id, treat the slot"
+                    " as a connection-only reuse and start with a fresh page."
+                ),
+                (
+                    "Within one BrowserAgent, open additional pages with Page.create"
+                    " and move focus with Page.switchTo/Page.list as needed."
+                ),
+                (
+                    "Do not attempt concurrent control of multiple tabs; finish or"
+                    " pause work on the current page before switching."
+                ),
+                (
+                    "After every Page.create, Page.switchTo, or Page.navigate,"
+                    " re-check page state when uncertain and refresh DOM.getAXTree"
+                    " before targeting elements."
+                ),
+                (
+                    "Track pageId, URL/title, and purpose for every opened page;"
+                    " close pages that are no longer needed."
+                ),
+                (
+                    "Treat slot_context pageIds as reusable candidates only;"
+                    " verify Page.getState/Page.switchTo and refresh DOM.getAXTree"
+                    " before acting."
+                ),
+            ],
+        }
 
     def strategies_for_phase(self, phase: JsonDict) -> List[JsonDict]:
         task_type = None
         if isinstance(self.task_plan, dict):
             task_type = str(self.task_plan.get("task_type") or "") or None
+        self.refresh_strategy_bank()
         return select_strategies_for_phase(
             self.strategy_bank,
             task_type=task_type,
@@ -1225,12 +1282,16 @@ class LeadAgent:
         tools: List[JsonDict] = []
         step = 0
         final_answer = ""
+        final_trigger = ""
         should_finish = False
         completed = False
 
         await self._bootstrap_schema_cache()
         runtime_limits = json.dumps(
             {
+                "max_browser_agent_instances": (
+                    self.runtime.harness.max_browser_agent_instances
+                ),
                 "max_browser_agents": self.runtime.harness.max_browser_agents,
                 "default_worker_concurrency": (
                     self.runtime.harness.default_worker_concurrency
@@ -1269,7 +1330,23 @@ class LeadAgent:
                     config=self.runtime.harness,
                     lifecycle=self.lifecycle,
                 )
-                self.logger.write("lead.step.start", {"step": step})
+                remaining = self.runtime.harness.lead_max_steps - step
+                step_reason = (
+                    "cap_reached"
+                    if remaining <= 0
+                    else "near_cap"
+                    if remaining <= 3
+                    else "running"
+                )
+                self.logger.write(
+                    "lead.step.start",
+                    {
+                        "step": step,
+                        "max_steps": self.runtime.harness.lead_max_steps,
+                        "remaining": remaining,
+                        "reason": step_reason,
+                    },
+                )
                 self._current_step = step
                 self.lifecycle.agent_before_step(
                     LifecycleContext(
@@ -1313,6 +1390,7 @@ class LeadAgent:
 
                 if not tool_calls:
                     final_answer = text.strip()
+                    final_trigger = "model_text"
                     should_finish = True
                     break
 
@@ -1355,6 +1433,7 @@ class LeadAgent:
                     })
                     if should_stop:
                         final_answer = result.get("answer", "")
+                        final_trigger = str(result.get("trigger") or "lead_decided")
                         should_finish = True
                         break
 
@@ -1394,6 +1473,7 @@ class LeadAgent:
                         "last_step": step,
                         "completed": completed,
                         "final_answer": snapshot_final_answer,
+                        "final_trigger": final_trigger,
                         "has_task_plan": self.task_plan is not None,
                     },
                 )
@@ -1417,7 +1497,16 @@ class LeadAgent:
                 "LeadAgent reached the maximum orchestration step count without an explicit completion. "
                 f"See run log: {self.logger.path}"
             )
-        self.logger.write("lead.final", {"answer": final_answer})
+            final_trigger = "step_cap"
+        self.logger.write(
+            "lead.final",
+            {
+                "answer": final_answer,
+                "trigger": final_trigger or "unknown",
+                "last_step": step,
+                "max_steps": self.runtime.harness.lead_max_steps,
+            },
+        )
         return final_answer
 
     def _maybe_apply_step_cap_reminder(
@@ -1461,8 +1550,9 @@ Lead state flow:
 0. First call `emit_task_plan` with a v1 linear phase plan. The plan must include task_type. Each phase needs objective, worker_task, stage_hint, stage_hint_reason, expected_artifact, validators, worker_contract, and max_attempts. Use max_attempts=3 by default unless the task is trivial or unsafe to retry.
    Valid stage_hint values: collection, detail_sections, attribute_links, form_interaction, computed_relationship, generic. Use generic only when the phase truly cannot be classified.
    Do not hand-author ABCP allow-lists. BrowserAgent access is governed by task_type policy plus explicit forbidden_methods. If a workflow crosses task types, split phases and replan with the correct task_type.
+   BrowserAgent slots are expensive and pooled. Keep live slots within runtime_limits.max_browser_agent_instances. A normal new worker reuses only the slot connection and must start browser work from a fresh page. For related continuations only, inspect list_browser_agents slots and pass reuse_from_worker_id or preferred_slot_id so the spawner can expose that idle slot's existing fleet/page registry.
 1. Spawn one BrowserAgent for the first pending phase. Give it a narrow worker_task, exact target fields, exact output format, explicit stop condition, and a `result_contract`.
-2. When spawning a BrowserAgent, copy expected_artifact.fields / required_fields verbatim and state that record_extraction row keys must use those exact names.
+2. When spawning a BrowserAgent, copy expected_artifact.fields / required_fields verbatim and state that record_extraction row keys must use those exact names. For provenance-sensitive fields, state the literal keys from worker_contract.validators: pageUrl, sourceTool, sourceSelectorOrAxId, and canonical <field>EvidenceText such as rankEvidenceText. The validator accepts legacy evidence/<field>Evidence aliases only as compatibility fallback; prefer the canonical keys.
 3. Never turn an unverified assumption into a worker instruction. Dynamic params must be described as observable labels, roles, headings, hrefs, artifact paths, or current-page evidence. Do not pass hard-coded pageId, fleetId, AXTree ids, CSS selectors, ranks, or list indexes unless they came from cited recent evidence.
 4. After each BrowserAgent result, route from `resultLevels.l1` and `statusCategory`; use `resultLevels.l2` for data/evidence/blockers. `traceSummary`, `tracePath`, artifact paths, and offload paths are detail surfaces only; inspect them with local_fs_search/local_fs_read/local_fs_jsonpath when needed, not by pasting large traces into context.
 5. If artifact validation fails with schema_mismatch but the rows are trustworthy, use lead_save_artifact to reshape from trusted extraction artifacts. Do not re-scrape only to rename fields.
@@ -1472,9 +1562,9 @@ Lead state flow:
 9. If spawn_browser_agent returns phase_classification_repeated, do not call spawn_browser_agent again for the same phase/contract. Emit a revised task_plan with replan_reason that changes objective, worker_task, worker_contract, expected_artifact, validators, or task_type; otherwise final_answer with the blocker. If it returns phase_locked_must_finalize, call final_answer unless you can immediately emit a substantially revised task_plan.
 10. If resultLevels.l2.blockers contains stall_replan_recommended, the worker saw repeated within-attempt stall signals. Do not re-spawn the same phase with the same worker_task. Either emit a revised task_plan that changes the phase procedure, preferred tools, expected_artifact, validators, stage_hint, or worker_contract; or final_answer with the blocker, citing signalCount, loopNudgeCount, and progressInterventionCount as evidence. This is advisory, not an automatic failure, but ignoring it wastes another worker attempt.
 11. If a worker returns partial, step_budget_exhausted with usable extraction artifacts, or validation with attemptExtractionArtifacts, continue serially with a focused worker. The continuation task must explicitly state remainingRange / remainingItems, existingArtifactPath, and which rows are already trusted so the next worker does not re-collect completed rows.
-12. Prefer serial continuation over same-fleet multi-tab control. Do not ask one fleet/page owner to control multiple tabs concurrently; this can create memory and handle contention.
+12. Prefer related idle-slot reuse and same-instance serial multi-page work over creating a fresh slot. Normal new workers must create or navigate a fresh page even when assigned to a reused slot. It is acceptable to ask one worker to open/manage multiple tabs with Page.create, Page.list, and Page.switchTo when the task stays within one task_type and contract; prohibit concurrent multi-tab control, and require fresh Page.getState/DOM.getAXTree after switching or navigation before targeting.
 13. If the same category fails repeatedly, stop broad retries. Use the evidence you have, spawn at most one focused continuation, or final_answer.
-14. Stay within runtime_limits. Use multiple BrowserAgents only as separate explicit phases, not as blind batch fan-out.
+14. Stay within runtime_limits. Never exceed runtime_limits.max_browser_agent_instances live BrowserAgent slots, even if max_browser_agents is higher. Do not create a fresh slot just to visit another URL/listing/detail page. Put related page work inside one worker, or spawn a continuation with reuse_from_worker_id/preferred_slot_id so it reuses the prior idle slot and may see prior page candidates. Use separate slots only for deliberate parallelism, different task_type/session/account, or a hard reset after page_crashed / hitl_* terminal status; never as blind batch fan-out.
 
 BrowserAgent terminal-status decision table:
 - done / partial: data is usable; advance with the answer. partial means the worker explicitly finished only a subset; include the uncovered range in final_answer.
@@ -1482,7 +1572,7 @@ BrowserAgent terminal-status decision table:
 - context_limit_exceeded: do not retry verbatim; spawn with narrower task boundaries and a slimmer result_contract.
 - page_crashed: next worker must rebuild the fleet/page or open a fresh page.
 - extraction_inconclusive: switch probing strategy; for visual uncertainty, use BrowserAgent visual_verify guidance, not raw screenshot interpretation.
-- hitl_waiting, hitl_timeout, page_settled_after_hitl, still_challenge_after_hitl, browser_error_after_hitl: do not auto-spawn the same task. Surface the user/platform blocker.
+- hitl_waiting, hitl_timeout, page_settled_after_hitl, stale_pause_deadlock, still_challenge_after_hitl, browser_error_after_hitl: do not auto-spawn the same task. Surface the user/platform blocker or replan with a fresh page/fleet for stale pause deadlocks.
 - browser_api_contract_error: switch method or report the platform-side bug.
 - blocked_cross_task_type_required: replan a new phase with the appropriate task_type.
 - failed / cancelled / unknown: inspect error and diagnostics; be conservative before scaling.

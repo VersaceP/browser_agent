@@ -1,0 +1,112 @@
+{
+  "method": "Workflow.execute",
+  "description": "Execute a sequence of steps (actions, conditions, loops, listeners, transforms) in a single workflow.",
+  "params": {
+    "description": {
+      "description": "Optional summary of what the workflow is trying to accomplish.",
+      "type": "string",
+      "required": false
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/__schema0"
+      },
+      "description": "Ordered workflow steps to execute.",
+      "required": true
+    },
+    "variables": {
+      "description": "Initial workflow variables available to all steps.",
+      "type": "object",
+      "propertyNames": {
+        "type": "string"
+      },
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "number"
+          },
+          {
+            "type": "boolean"
+          }
+        ]
+      },
+      "required": false
+    },
+    "pageId": {
+      "description": "Default page ID injected into steps that omit one.",
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "required": false
+    },
+    "fleetId": {
+      "description": "Default fleet ID injected into steps that omit one.",
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "required": false
+    },
+    "timeout": {
+      "default": 600000,
+      "description": "Total workflow timeout in milliseconds.",
+      "type": "integer",
+      "minimum": 1000,
+      "maximum": 3600000,
+      "required": true
+    },
+    "stepTimeout": {
+      "default": 30000,
+      "description": "Per-step timeout in milliseconds.",
+      "type": "integer",
+      "minimum": 1000,
+      "maximum": 300000,
+      "required": true
+    },
+    "errorConfig": {
+      "description": "Optional retry and failure-handling policy for workflow errors.",
+      "type": "object",
+      "properties": {
+        "onError": {
+          "default": "stop",
+          "type": "string",
+          "enum": [
+            "stop",
+            "continue",
+            "retry"
+          ]
+        },
+        "maxRetries": {
+          "default": 2,
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10
+        },
+        "retryDelay": {
+          "default": 1000,
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 30000
+        },
+        "backoffMultiplier": {
+          "default": 2,
+          "type": "number",
+          "minimum": 1,
+          "maximum": 5
+        },
+        "maxBackoffDelay": {
+          "default": 10000,
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 60000
+        }
+      },
+      "required": false,
+      "additionalProperties": false
+    }
+  },
+  "requiresPurpose": false
+}

@@ -135,7 +135,8 @@ Anthropic 示例：
     "mode": "lead",
     "lead_max_steps": 20,
     "worker_max_steps": 30,
-    "max_browser_agents": 8,
+    "max_browser_agent_instances": 3,
+    "max_browser_agents": 3,
     "default_worker_concurrency": 3,
     "hitl_poll_interval_seconds": 2,
     "hitl_wait_timeout_seconds": 600,
@@ -149,7 +150,8 @@ Anthropic 示例：
 - `mode`: `lead` 使用多 agent 编排；`single` 直接运行单个 BrowserAgent。
 - `lead_max_steps`: LeadAgent 最大决策轮数。
 - `worker_max_steps`: BrowserAgent 最大执行轮数。
-- `max_browser_agents`: 同时运行的 browser worker 上限。
+- `max_browser_agent_instances`: 可复用池里最多保留的长期存活 BrowserAgent slot 数。idle slot 会保留 ABCP 连接和页面 registry。普通新 worker 只复用连接并从新页面开始；显式 continuation 才会复用旧页面候选。
+- `max_browser_agents`: 同时运行的 browser worker 上限；实际 browser slot 并发仍受 `max_browser_agent_instances` 限制。
 - `default_worker_concurrency`: batch browser/plan 工具的默认并发数。
 - `hitl_poll_interval_seconds`: `Hitl.requestPause` 后轮询恢复状态的间隔。
 - `hitl_wait_timeout_seconds`: 等待人工介入的最长时间。

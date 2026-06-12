@@ -253,6 +253,7 @@ def validate_task_plan(
             "join": raw_phase.get("join"),
             "expected_artifact": expected_artifact,
             "validators": validators,
+            "validators_normalized": True,
             "worker_contract": worker_contract or {},
             "max_attempts": _positive_int(raw_phase.get("max_attempts"), default=3),
         })
@@ -323,12 +324,32 @@ def phase_contract(
         expected_artifact = merged
 
     validators = contract.get("validators")
-    if not isinstance(validators, list):
+    validators_from_contract = isinstance(validators, list)
+    if not validators_from_contract:
         validators = list(phase.get("validators") or [])
+    phase_id = str(contract.get("phase_id") or phase.get("id") or "")
+    validator_errors: List[str] = []
+    already_normalized = bool(
+        contract.get("validators_normalized")
+        if validators_from_contract
+        else phase.get("validators_normalized")
+    )
+    if already_normalized:
+        validators = [
+            dict(validator) for validator in validators
+            if isinstance(validator, dict)
+        ]
+    else:
+        validators = _normalize_validators(
+            expected_artifact,
+            validators,
+            validator_errors,
+            phase_id=phase_id or "worker",
+        )
 
-    return {
+    payload: JsonDict = {
         "version": "v1",
-        "phase_id": str(contract.get("phase_id") or phase.get("id") or ""),
+        "phase_id": phase_id,
         "task_type": str(
             contract.get("task_type")
             or phase.get("task_type")
@@ -345,6 +366,7 @@ def phase_contract(
         "input_artifacts": contract.get("input_artifacts") or [],
         "expected_artifact": expected_artifact,
         "validators": validators,
+        "validators_normalized": True,
         "allowed_methods": _string_list(contract.get("allowed_methods")),
         "forbidden_methods": _string_list(contract.get("forbidden_methods")),
         "max_surface_attempts": (
@@ -362,6 +384,9 @@ def phase_contract(
             or "Record the required extraction artifact, then call final_answer."
         ),
     }
+    if validator_errors:
+        payload["contract_warnings"] = validator_errors
+    return payload
 
 
 def write_task_plan(logger: RunLogger, plan: JsonDict) -> str:
@@ -996,15 +1021,16 @@ def mark_phase_result(
         "hitl_required",
         "hitl_timeout",
         "page_settled_after_hitl",
+        "stale_pause_deadlock",
     }:
         phase_state["status"] = result_status
         phase_state["last_failure"] = [{
             "type": "challenge_blocker",
             "status": result_status,
             "message": (
-                "Worker reported a challenge/HITL blocker; do not retry this"
-                " phase with the same browser strategy without user action or"
-                " a deliberate pivot."
+                "Worker reported a challenge/HITL blocker or stale pause"
+                " deadlock; do not retry this phase with the same browser"
+                " strategy without user action or a deliberate pivot."
             ),
         }]
         write_task_state(logger, state)
@@ -1013,7 +1039,9 @@ def mark_phase_result(
     if validation and validation.get("status") == "done":
         phase_state["status"] = "validated_done"
         artifacts = validation.get("artifacts") or []
-        phase_state["validated_artifacts"] = artifacts
+        validated_artifacts = list(phase_state.get("validated_artifacts") or [])
+        _append_unique(validated_artifacts, artifacts)
+        phase_state["validated_artifacts"] = validated_artifacts
         phase_state["last_failure"] = None
         phase_state["last_failure_classification"] = None
         _append_unique(state.setdefault("artifacts", []), artifacts)
@@ -1027,6 +1055,48 @@ def mark_phase_result(
         )
 
     write_task_state(logger, state)
+
+
+def phase_prior_artifact_paths(
+    logger: RunLogger,
+    *,
+    phase_id: Optional[str],
+    exclude_worker_id: Optional[str] = None,
+) -> List[str]:
+    if not phase_id:
+        return []
+    state = load_task_state(logger)
+    phase_state = _phase_state(state, str(phase_id))
+    if phase_state is None:
+        return []
+    attempts = phase_state.get("attempts")
+    if not isinstance(attempts, list):
+        return []
+    paths: List[Any] = []
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            continue
+        if exclude_worker_id and str(attempt.get("workerId") or "") == str(exclude_worker_id):
+            continue
+        validation = attempt.get("validation")
+        if isinstance(validation, dict):
+            for key in (
+                "artifacts",
+                "allExtractionArtifacts",
+                "validExtractionArtifacts",
+                "attemptExtractionArtifacts",
+                "priorExtractionArtifacts",
+            ):
+                value = validation.get(key)
+                if isinstance(value, list):
+                    paths.extend(value)
+        digest = attempt.get("attemptDigest")
+        if isinstance(digest, dict) and isinstance(digest.get("artifactPaths"), list):
+            paths.extend(digest.get("artifactPaths") or [])
+    return [
+        path for path in _unique_paths(paths)
+        if "/artifacts/extractions/" in str(path)
+    ]
 
 
 def mark_phase_exhausted_if_needed(
@@ -1056,6 +1126,7 @@ def mark_phase_exhausted_if_needed(
             "hitl_required",
             "hitl_timeout",
             "page_settled_after_hitl",
+            "stale_pause_deadlock",
         }:
             continue
         attempts = phase_state.get("attempts") if isinstance(phase_state, dict) else []
@@ -1117,6 +1188,7 @@ def next_pending_phase(plan: Optional[JsonDict], logger: RunLogger) -> Optional[
             "hitl_required",
             "hitl_timeout",
             "page_settled_after_hitl",
+            "stale_pause_deadlock",
         }:
             continue
         attempts = phase_state.get("attempts") if isinstance(phase_state, dict) else []
@@ -1149,6 +1221,7 @@ def validate_worker_artifacts(
     artifacts: List[str],
     task_dir: Path,
     attempt_artifacts: Optional[List[str]] = None,
+    prior_artifacts: Optional[List[str]] = None,
 ) -> JsonDict:
     if not contract:
         return {"status": "skipped", "reason": "no worker_contract"}
@@ -1159,7 +1232,18 @@ def validate_worker_artifacts(
     validators = contract.get("validators") if isinstance(contract, dict) else []
     if not isinstance(validators, list):
         validators = []
-    validators = _normalize_validators(expected, validators, [], phase_id=str(contract.get("phase_id") or "worker"))
+    if bool(contract.get("validators_normalized", False)):
+        validators = [
+            dict(validator) for validator in validators
+            if isinstance(validator, dict)
+        ]
+    else:
+        validators = _normalize_validators(
+            expected,
+            validators,
+            [],
+            phase_id=str(contract.get("phase_id") or "worker"),
+        )
 
     extraction_artifacts = [
         path for path in artifacts
@@ -1169,9 +1253,14 @@ def validate_worker_artifacts(
         path for path in (attempt_artifacts or [])
         if "/artifacts/extractions/" in str(path)
     ]
+    prior_extraction_artifacts = [
+        path for path in (prior_artifacts or [])
+        if "/artifacts/extractions/" in str(path)
+    ]
     all_extraction_artifacts = _unique_paths([
         *extraction_artifacts,
         *extraction_attempt_artifacts,
+        *prior_extraction_artifacts,
     ])
     failures: List[JsonDict] = []
     loaded = _load_extraction_artifacts(extraction_artifacts, task_dir)
@@ -1179,6 +1268,14 @@ def validate_worker_artifacts(
         [
             path for path in extraction_attempt_artifacts
             if path not in extraction_artifacts
+        ],
+        task_dir,
+    )
+    loaded_prior = _load_extraction_artifacts(
+        [
+            path for path in prior_extraction_artifacts
+            if path not in extraction_artifacts
+            and path not in extraction_attempt_artifacts
         ],
         task_dir,
     )
@@ -1191,9 +1288,13 @@ def validate_worker_artifacts(
         item for item in loaded_attempts
         if not expected_name or item.get("payload", {}).get("name") == expected_name
     ]
+    prior_candidates = [
+        item for item in loaded_prior
+        if not expected_name or item.get("payload", {}).get("name") == expected_name
+    ]
 
     must_record = bool(contract.get("must_record_extraction", True))
-    if must_record and not candidates and not attempt_candidates:
+    if must_record and not candidates and not attempt_candidates and not prior_candidates:
         failures.append({
             "type": "artifact_required",
             "message": (
@@ -1212,6 +1313,10 @@ def validate_worker_artifacts(
         if loaded
         else loaded_attempts[0]
         if loaded_attempts
+        else prior_candidates[0]
+        if prior_candidates
+        else loaded_prior[0]
+        if loaded_prior
         else None
     )
     rows: List[JsonDict] = []
@@ -1243,18 +1348,45 @@ def validate_worker_artifacts(
     failures.extend(_detect_stub_rows(rows, expected))
     warnings = _detect_near_stub_rows(rows, expected)
 
+    cumulative = False
+    cumulative_sources: List[str] = []
+    if failures:
+        cumulative_rows, cumulative_sources, cumulative_failures = (
+            _validate_cumulative_artifacts(
+                validators=validators,
+                expected=expected,
+                candidates=[
+                    *prior_candidates,
+                    *attempt_candidates,
+                    *candidates,
+                ],
+            )
+        )
+        if cumulative_rows and not cumulative_failures:
+            rows = cumulative_rows
+            failures = []
+            warnings = _detect_near_stub_rows(rows, expected)
+            cumulative = True
+
     status = "done" if not failures else "failed"
+    result_artifacts = cumulative_sources if cumulative else (
+        [selected.get("path")] if selected else []
+    )
     result = {
         "status": status,
         "phase_id": contract.get("phase_id"),
         "expectedArtifact": expected,
         "rowCount": len(rows),
-        "artifacts": [selected.get("path")] if selected else [],
+        "artifacts": result_artifacts,
         "allExtractionArtifacts": all_extraction_artifacts,
         "validExtractionArtifacts": extraction_artifacts,
         "attemptExtractionArtifacts": extraction_attempt_artifacts,
+        "priorExtractionArtifacts": prior_extraction_artifacts,
         "failures": failures,
     }
+    if cumulative:
+        result["cumulative"] = True
+        result["sourceArtifactCount"] = len(cumulative_sources)
     if warnings:
         result["warnings"] = warnings
     if failures:
@@ -1409,6 +1541,25 @@ def _row_has_blocker_explanation(row: JsonDict) -> bool:
         if isinstance(value, list) and value:
             return True
         if isinstance(value, dict) and value:
+            return True
+    absence_markers = (
+        "absent",
+        "empty",
+        "missing",
+        "no ",
+        "none",
+        "not visible",
+        "not shown",
+        "unavailable",
+        "未显示",
+        "没有",
+        "无",
+    )
+    for key, value in row.items():
+        if not str(key).endswith("EvidenceText"):
+            continue
+        text = str(value or "").strip().lower()
+        if text and any(marker in text for marker in absence_markers):
             return True
     return False
 
@@ -1823,10 +1974,16 @@ def _validate_field_provenance(
                 or validator.get("selector_field")
                 or "sourceSelectorOrAxId"
             ).strip()
+            evidence_aliases = _provenance_evidence_aliases(
+                field,
+                evidence_field,
+                spec,
+                validator,
+            )
             missing = []
             if row.get(field) is None or str(row.get(field)).strip() == "":
                 missing.append(field)
-            if not evidence_field or str(row.get(evidence_field) or "").strip() == "":
+            if not evidence_field or not _row_has_nonempty_value(row, evidence_aliases):
                 missing.append(evidence_field or "evidence_field")
             if bool(spec.get("require_source_tool", validator.get("require_source_tool", False))):
                 if str(row.get(source_tool_field) or "").strip() == "":
@@ -1840,6 +1997,35 @@ def _validate_field_provenance(
     if not bad:
         return []
     return [{"type": "field_provenance", "bad": bad[:20]}]
+
+
+def _provenance_evidence_aliases(
+    field: str,
+    evidence_field: str,
+    spec: JsonDict,
+    validator: JsonDict,
+) -> List[str]:
+    aliases: List[Any] = [
+        evidence_field,
+        f"{field}EvidenceText",
+        f"{field}Evidence",
+    ]
+    raw_aliases = spec.get("evidence_aliases")
+    if raw_aliases is None:
+        raw_aliases = validator.get("evidence_aliases")
+    if isinstance(raw_aliases, list):
+        aliases.extend(raw_aliases)
+    elif isinstance(raw_aliases, str):
+        aliases.append(raw_aliases)
+    aliases.extend(["evidence", "evidenceText"])
+    return field_names_from_specs(aliases)
+
+
+def _row_has_nonempty_value(row: JsonDict, fields: List[str]) -> bool:
+    for field in fields:
+        if str(row.get(field) or "").strip():
+            return True
+    return False
 
 
 def _compile_validator_regex(pattern: str, validator: JsonDict) -> re.Pattern[str]:
@@ -1892,12 +2078,14 @@ def _normalize_validators(
     field_names = field_names_from_specs(fields)
     if field_names:
         normalized.append({"type": "required_fields", "fields": field_names})
-        normalized.append({"type": "field_nonempty", "fields": field_names})
+        nonempty_fields = _nonempty_fields_from_expected(expected_artifact, fields)
+        if nonempty_fields:
+            normalized.append({"type": "field_nonempty", "fields": nonempty_fields})
         provenance_fields = _provenance_required_fields(expected_artifact, field_names)
         if provenance_fields and not _has_field_provenance_validator(validators, provenance_fields):
             normalized.append({
                 "type": "field_provenance",
-                "fields": provenance_fields,
+                "fields": _provenance_field_specs(provenance_fields),
                 "require_source_tool": True,
                 "require_selector": True,
             })
@@ -1911,8 +2099,79 @@ def _normalize_validators(
             errors.append(
                 f"phase {phase_id}: validators[{index}].type must be one of {sorted(VALIDATOR_TYPES)}"
             )
-        normalized.append(dict(validator))
+        normalized_validator = dict(validator)
+        if validator_type == "field_provenance":
+            normalized_validator["fields"] = _normalize_provenance_validator_fields(
+                normalized_validator
+            )
+        normalized.append(normalized_validator)
     return normalized
+
+
+def _nonempty_fields_from_expected(expected_artifact: JsonDict, fields: Any) -> List[str]:
+    explicit = expected_artifact.get("nonempty_fields")
+    if explicit is None:
+        explicit = expected_artifact.get("field_nonempty")
+    out = field_names_from_specs(explicit if isinstance(explicit, list) else [])
+    seen = set(out)
+    if not isinstance(fields, list):
+        return out
+    scalar_types = {"str", "string", "text", "number", "integer", "int", "float", "url"}
+    for spec in fields:
+        if not isinstance(spec, dict):
+            continue
+        name = field_name_from_spec(spec)
+        if not name or name in seen:
+            continue
+        if spec.get("allow_empty") is True or spec.get("optional_empty") is True:
+            continue
+        if spec.get("nonempty") is True or spec.get("required_nonempty") is True:
+            out.append(name)
+            seen.add(name)
+            continue
+        type_name = str(spec.get("type") or "").strip().lower()
+        if type_name in scalar_types and spec.get("nullable") is not True:
+            out.append(name)
+            seen.add(name)
+    return out
+
+
+def _normalize_provenance_validator_fields(validator: JsonDict) -> JsonDict:
+    raw_fields = validator.get("fields") or validator.get("field_provenance")
+    if isinstance(raw_fields, dict):
+        specs: JsonDict = {}
+        for field, raw_spec in raw_fields.items():
+            field_name = str(field or "").strip()
+            if not field_name:
+                continue
+            spec = dict(raw_spec) if isinstance(raw_spec, dict) else {}
+            merged = _default_provenance_field_spec(field_name)
+            merged.update({key: value for key, value in spec.items() if value is not None})
+            specs[field_name] = merged
+        return specs
+    fields = field_names_from_specs(raw_fields if isinstance(raw_fields, list) else [])
+    if not fields:
+        field = str(validator.get("field") or "").strip()
+        fields = [field] if field else []
+    return _provenance_field_specs(fields)
+
+
+def _provenance_field_specs(fields: List[str]) -> JsonDict:
+    specs: JsonDict = {}
+    for field in field_names_from_specs(fields):
+        specs[field] = _default_provenance_field_spec(field)
+    return specs
+
+
+def _default_provenance_field_spec(field: str) -> JsonDict:
+    return {
+        "evidence_field": f"{field}EvidenceText",
+        "evidence_aliases": ["evidence", f"{field}Evidence"],
+        "source_tool_field": "sourceTool",
+        "selector_field": "sourceSelectorOrAxId",
+        "require_source_tool": True,
+        "require_selector": True,
+    }
 
 
 def _has_field_provenance_validator(
@@ -1956,6 +2215,156 @@ def _provenance_required_fields(
         if lowered in SENSITIVE_PROVENANCE_FIELD_MARKERS or tokens & SENSITIVE_PROVENANCE_FIELD_MARKERS:
             out.append(text)
     return out
+
+
+def _validate_cumulative_artifacts(
+    *,
+    validators: List[JsonDict],
+    expected: JsonDict,
+    candidates: List[JsonDict],
+) -> Tuple[List[JsonDict], List[str], List[JsonDict]]:
+    rows_by_key: Dict[str, JsonDict] = {}
+    source_paths: List[str] = []
+    schema_failures: List[JsonDict] = []
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "")
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        schema_warnings = payload.get("schemaWarnings")
+        if isinstance(schema_warnings, list) and schema_warnings:
+            schema_failures.append({
+                "type": "schema",
+                "message": "cumulative artifact has schemaWarnings",
+                "path": path,
+                "schemaWarnings": schema_warnings[:5],
+            })
+            continue
+        raw_rows = payload.get("rows")
+        if not isinstance(raw_rows, list):
+            schema_failures.append({
+                "type": "schema",
+                "message": "cumulative artifact has no rows array",
+                "path": path,
+            })
+            continue
+        if path:
+            source_paths.append(path)
+        for row in raw_rows:
+            if not isinstance(row, dict):
+                continue
+            key = _cumulative_row_key(row, expected)
+            existing = rows_by_key.get(key)
+            if existing is None or _prefer_cumulative_row(
+                row,
+                existing,
+                validators=validators,
+                expected=expected,
+            ):
+                rows_by_key[key] = row
+
+    source_paths = _unique_paths(source_paths)
+    if len(source_paths) < 2:
+        return [], source_paths, schema_failures
+
+    rows = list(rows_by_key.values())
+    failures: List[JsonDict] = []
+    for validator in validators:
+        failures.extend(_run_validator(validator, rows))
+    failures.extend(_detect_placeholder_rows(rows))
+    failures.extend(_detect_stub_rows(rows, expected))
+    return rows, source_paths, [*schema_failures, *failures]
+
+
+def _prefer_cumulative_row(
+    candidate: JsonDict,
+    current: JsonDict,
+    *,
+    validators: List[JsonDict],
+    expected: JsonDict,
+) -> bool:
+    return _cumulative_row_quality(candidate, validators, expected) >= _cumulative_row_quality(
+        current,
+        validators,
+        expected,
+    )
+
+
+def _cumulative_row_quality(
+    row: JsonDict,
+    validators: List[JsonDict],
+    expected: JsonDict,
+) -> tuple:
+    row_failures: List[JsonDict] = []
+    for validator in validators:
+        validator_type = str(validator.get("type") or "").strip()
+        if validator_type in {"min_rows", "max_rows", "exact_rows", "unique", "set_equals"}:
+            continue
+        row_failures.extend(_run_validator(validator, [row]))
+    row_failures.extend(_detect_placeholder_rows([row]))
+    row_failures.extend(_detect_stub_rows([row], expected))
+
+    expected_fields = field_names_from_specs(
+        expected.get("required_fields") or expected.get("fields") or []
+    )
+    present = sum(1 for field in expected_fields if field in row)
+    nonempty_expected = sum(
+        1 for field in expected_fields
+        if field in row and not _is_empty_value(row.get(field))
+    )
+    evidence = sum(
+        1 for key, value in row.items()
+        if str(key).endswith("EvidenceText") and str(value or "").strip()
+    )
+    source = sum(
+        1 for key in ("sourceTool", "sourceSelectorOrAxId", "pageUrl")
+        if str(row.get(key) or "").strip()
+    )
+    nonempty_total = sum(1 for value in row.values() if not _is_empty_value(value))
+    return (
+        -len(row_failures),
+        present,
+        evidence,
+        source,
+        nonempty_expected,
+        nonempty_total,
+    )
+
+
+def _cumulative_row_key(row: JsonDict, expected: JsonDict) -> str:
+    fields = field_names_from_specs(
+        expected.get("required_fields") or expected.get("fields") or []
+    )
+    # url-class keys first: a rank/position only identifies a row within one
+    # source page, so re-scrapes from a different surface could collide on
+    # rank while pointing at different products.
+    priority_fields = [
+        "url",
+        "href",
+        "detailUrl",
+        "detail_url",
+        "productUrl",
+        "product_url",
+        "rank",
+        "position",
+        "name",
+        "title",
+    ]
+    for field in [*priority_fields, *fields]:
+        value = row.get(field)
+        text = str(value or "").strip()
+        if text:
+            return f"{field}:{text.lower()}"
+    canonical = json.dumps(
+        row,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+        separators=(",", ":"),
+    )
+    return "rowhash:" + hashlib.sha256(
+        canonical.encode("utf-8", errors="replace")
+    ).hexdigest()[:16]
 
 
 def _load_extraction_artifacts(paths: List[str], task_dir: Path) -> List[JsonDict]:

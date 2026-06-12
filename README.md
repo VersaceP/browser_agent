@@ -135,7 +135,8 @@ Common harness options:
     "mode": "lead",
     "lead_max_steps": 20,
     "worker_max_steps": 30,
-    "max_browser_agents": 8,
+    "max_browser_agent_instances": 3,
+    "max_browser_agents": 3,
     "default_worker_concurrency": 3,
     "hitl_poll_interval_seconds": 2,
     "hitl_wait_timeout_seconds": 600,
@@ -149,7 +150,8 @@ Common harness options:
 - `mode`: `lead` uses the multi-agent planner; `single` runs one BrowserAgent directly.
 - `lead_max_steps`: maximum LeadAgent decision rounds.
 - `worker_max_steps`: maximum BrowserAgent rounds.
-- `max_browser_agents`: maximum concurrent browser workers.
+- `max_browser_agent_instances`: maximum live BrowserAgent slots kept in the reusable pool. Idle slots keep their ABCP connection and page registry. Normal new workers reuse only the connection and start from a fresh page; explicit continuations can reuse prior page candidates.
+- `max_browser_agents`: maximum concurrently running browser workers. Effective browser-slot concurrency is still bounded by `max_browser_agent_instances`.
 - `default_worker_concurrency`: default concurrency for batch browser/plan tools.
 - `hitl_poll_interval_seconds`: polling interval after `Hitl.requestPause`.
 - `hitl_wait_timeout_seconds`: maximum wait time for human intervention.

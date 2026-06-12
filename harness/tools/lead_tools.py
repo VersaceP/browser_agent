@@ -76,6 +76,22 @@ def _spawn_browser_agent_schema(_: Any = None) -> JsonDict:
                 **_nullable("integer"),
                 "description": "Override the worker's max step count; pass null to use the default.",
             },
+            "preferred_slot_id": {
+                **_nullable("string"),
+                "description": (
+                    "Optional idle BrowserAgent slotId for an explicit related"
+                    " continuation. Passing it allows reusable page candidates"
+                    " from that slot to be exposed to the worker."
+                ),
+            },
+            "reuse_from_worker_id": {
+                **_nullable("string"),
+                "description": (
+                    "Optional previous workerId whose idle slot should be reused"
+                    " for an explicit related continuation. Passing it allows"
+                    " reusable page candidates from that slot to be exposed."
+                ),
+            },
             "worker_contract": {
                 "type": "object",
                 "additionalProperties": True,
@@ -317,7 +333,14 @@ async def _lead_emit_task_plan(ctx: ToolContext) -> JsonDict:
 @LEAD_TOOLS.register(
     name="spawn_browser_agent",
     description=(
-        "Asynchronously spawn a BrowserAgent with its own context and independent ABCP WebSocket."
+        "Asynchronously run a BrowserAgent worker in a pooled browser slot."
+        " Normal workers reuse only the slot connection and must start from a"
+        " fresh page. For related continuation work, pass reuse_from_worker_id"
+        " or preferred_slot_id when you know which prior slot/page set should"
+        " continue."
+        " Keep BrowserAgent slots scarce; when related work only needs additional"
+        " pages/tabs, put that into one worker as serial Page.create and"
+        " Page.switchTo work instead of fan-out."
         " The task/context should state which fields to collect and how to derive dynamic"
         " params from live feedback (response.data handles, DOM.getAXTree ids,"
         " DOM.getText/DOM.getAttribute evidence, or cited record_extraction artifacts),"
@@ -389,6 +412,8 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
         phase_id=str(phase.get("id") or ""),
         worker_contract=worker_contract,
         phase=phase,
+        preferred_slot_id=tool_input.get("preferred_slot_id"),
+        reuse_from_worker_id=tool_input.get("reuse_from_worker_id"),
     )
 
 
@@ -432,7 +457,11 @@ async def _lead_wait_browser_agents(ctx: ToolContext) -> JsonDict:
 
 @LEAD_TOOLS.register(
     name="list_browser_agents",
-    description="Inspect the runtime status of currently spawned BrowserAgents.",
+    description=(
+        "Inspect workers and the pooled BrowserAgent slots. Use idle slotId or"
+        " a previous workerId only when spawning explicit related continuation"
+        " work that should see reusable page candidates."
+    ),
     input_schema=_list_browser_agents_schema,
 )
 async def _lead_list_browser_agents(ctx: ToolContext) -> JsonDict:
@@ -636,6 +665,7 @@ async def _lead_final_answer(ctx: ToolContext) -> JsonDict:
     return {
         "status": ctx.tool_input.get("status", "done"),
         "answer": str(ctx.tool_input.get("answer", "")).strip(),
+        "trigger": "lead_decided",
     }
 
 

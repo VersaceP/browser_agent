@@ -58,7 +58,8 @@ class HarnessConfig:
     max_steps: int = 40
     lead_max_steps: int = 40
     worker_max_steps: int = 40
-    max_browser_agents: int = 8
+    max_browser_agent_instances: int = 3
+    max_browser_agents: int = 3
     default_worker_concurrency: int = 3
     worktree_dir: str = "worktree"
     runs_dir: str = "runs"
@@ -99,6 +100,12 @@ class HarnessConfig:
             max_steps=int(data.get("max_steps", cls.max_steps)),
             lead_max_steps=int(data.get("lead_max_steps", cls.lead_max_steps)),
             worker_max_steps=int(data.get("worker_max_steps", cls.worker_max_steps)),
+            max_browser_agent_instances=int(
+                data.get(
+                    "max_browser_agent_instances",
+                    cls.max_browser_agent_instances,
+                )
+            ),
             max_browser_agents=int(
                 data.get("max_browser_agents", cls.max_browser_agents)
             ),

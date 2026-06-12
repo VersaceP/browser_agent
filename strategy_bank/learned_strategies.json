@@ -1,0 +1,140 @@
+{
+  "version": 1,
+  "strategies": [
+    {
+      "id": "learned.theresanaiforthat.com.collection.d91a86748c",
+      "learned": true,
+      "task_types": [
+        "web_scrape"
+      ],
+      "stage": "collection",
+      "applies_to_stages": [
+        "collection"
+      ],
+      "fallback": false,
+      "cross_cutting": false,
+      "site_domains": [
+        "theresanaiforthat.com"
+      ],
+      "site_entry_urls": [
+        "https://theresanaiforthat.com/trending/week/.",
+        "https://theresanaiforthat.com/ai/",
+        "https://theresanaiforthat.com/trending/week/",
+        "https://theresanaiforthat.com/ai/flot-ai/",
+        "https://theresanaiforthat.com/ai/gptkit/"
+      ],
+      "phase_keywords": [
+        "phase_1_collect_listing",
+        "Navigate to the trending/week page, scroll to products ranked 25-35, and collect each product's name, detail page URL, and rank.",
+        "collection",
+        "Go to https://theresanaiforthat.com/trending/week/. The page lists AI products in rank order. Scroll down until products ranked 25 through 35 are visible and materialized in the DOM. For each product in ranks 25-35 inclusive, record: (1) rank as shown on the page, (2) product name as visible text, (3) the full absolute URL to the product's detail page. Stop after collecting all 11 products (ranks 25-35). If the page lazy-loads, keep scrolling until all 11 are found. If less than 35 products are available, collect whatever is available in that range and report the actual count.",
+        "theresanaiforthat.com"
+      ],
+      "applies_when": [
+        "A future phase targets the same site/domain and stage.",
+        "The current task can reuse the validated entry points, page flow, or extraction shape from this successful attempt."
+      ],
+      "preferred_tools": [
+        "Page.getState",
+        "Memory.save",
+        "Page.navigate",
+        "DOM.getAXTree",
+        "Input.scroll",
+        "DOM.getAttribute",
+        "Runtime.evaluate",
+        "record_extraction"
+      ],
+      "cautioned_tools": [],
+      "avoid_tools": [],
+      "procedure": [
+        "Start from the validated same-site entry URL when the task scope matches: https://theresanaiforthat.com/trending/week/.",
+        "Use the previously validated listing/leaderboard surface before broad search or alternate pages.",
+        "Persist the handoff as record_extraction name 'product_listing_25_35' with exact contract fields.",
+        "Include pageUrl, sourceTool, sourceSelectorOrAxId, and canonical <field>EvidenceText provenance for sensitive fields."
+      ],
+      "success_criteria": [
+        "record_extraction row keys match the worker contract exactly",
+        "validated artifacts satisfy the phase validators",
+        "source URLs and provenance are persisted for handoff"
+      ],
+      "failure_signatures": [
+        "same-domain task ignores the learned successful entry point",
+        "re-scrapes already validated rows instead of continuing from trusted artifacts",
+        "creates repeated fresh pages where same-tab navigation would reuse the working session"
+      ],
+      "stats": {
+        "success_count": 1,
+        "fail_count": 0
+      },
+      "first_seen_at": "2026-06-12T03:49:02Z",
+      "last_seen_at": "2026-06-12T03:49:02Z"
+    },
+    {
+      "id": "learned.theresanaiforthat.com.detail_sections.02851ca4ae",
+      "learned": true,
+      "task_types": [
+        "web_scrape"
+      ],
+      "stage": "detail_sections",
+      "applies_to_stages": [
+        "detail_sections"
+      ],
+      "fallback": false,
+      "cross_cutting": false,
+      "site_domains": [
+        "theresanaiforthat.com"
+      ],
+      "site_entry_urls": [
+        "https://theresanaiforthat.com/ai/gptkit/",
+        "https://theresanaiforthat.com/ai/flot-ai/"
+      ],
+      "phase_keywords": [
+        "phase_2_detail_pages",
+        "For each product collected in phase 1 (ranks 25-35), visit its detail page and extract reviews, pros & cons, and Q&A details.",
+        "detail_sections",
+        "You are given an artifact containing product listing data (ranks 25-35) with detail URLs. For each product, navigate to its detailUrl, wait for the page to settle, and extract: (1) Reviews - all user reviews with reviewer name, rating, date, and review text; (2) Pros & Cons - pros list and cons list as shown on the page; (3) Q&A - all questions and answers with question text, answer text, and any metadata like dates or asker/answerer names. After collecting all detail data for all products, return the combined results. If a detail page does not have reviews/pros-cons/QA sections, note them as empty/absent with evidence.",
+        "theresanaiforthat.com"
+      ],
+      "applies_when": [
+        "A future phase targets the same site/domain and stage.",
+        "The current task can reuse the validated entry points, page flow, or extraction shape from this successful attempt."
+      ],
+      "preferred_tools": [
+        "Page.switchTo",
+        "Page.navigate",
+        "Page.getState",
+        "DOM.getAXTree",
+        "Input.click",
+        "DOM.getText",
+        "Input.scroll",
+        "Page.screenshot",
+        "record_extraction"
+      ],
+      "cautioned_tools": [],
+      "avoid_tools": [],
+      "procedure": [
+        "Start from the validated same-site entry URL when the task scope matches: https://theresanaiforthat.com/ai/gptkit/",
+        "Prefer one browser page and Page.navigate/Page.getState between detail URLs instead of opening a fresh Page.create for every item.",
+        "Persist the handoff as record_extraction name 'product_details_25_35' with exact contract fields.",
+        "Include pageUrl, sourceTool, sourceSelectorOrAxId, and canonical <field>EvidenceText provenance for sensitive fields."
+      ],
+      "success_criteria": [
+        "record_extraction row keys match the worker contract exactly",
+        "validated artifacts satisfy the phase validators",
+        "source URLs and provenance are persisted for handoff"
+      ],
+      "failure_signatures": [
+        "same-domain task ignores the learned successful entry point",
+        "re-scrapes already validated rows instead of continuing from trusted artifacts",
+        "creates repeated fresh pages where same-tab navigation would reuse the working session"
+      ],
+      "stats": {
+        "success_count": 1,
+        "fail_count": 0
+      },
+      "first_seen_at": "2026-06-12T03:55:15Z",
+      "last_seen_at": "2026-06-12T03:55:15Z"
+    }
+  ],
+  "updated_at": "2026-06-12T03:55:15Z"
+}

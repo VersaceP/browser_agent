@@ -92,6 +92,11 @@ async def load_capability_bundle(
         bundle.capability_methods.add(method)
         methods_to_describe.append(method)
 
+    pruned_schema_cache_files = _prune_stale_cached_schemas(
+        schema_cache_dir,
+        bundle.capability_methods,
+    )
+
     methods_missing_cache: List[str] = []
     for method in methods_to_describe:
         cached_schema = _read_cached_schema(schema_cache_dir, method)
@@ -144,6 +149,7 @@ async def load_capability_bundle(
             "schema_cache_dir": str(schema_cache_dir) if schema_cache_dir else None,
             "schema_cache_hits": len(methods_to_describe) - len(methods_missing_cache),
             "schema_cache_misses": len(methods_missing_cache),
+            "schema_cache_pruned": pruned_schema_cache_files,
         },
     )
     return bundle
@@ -193,6 +199,31 @@ def _schema_cache_path(schema_cache_dir: Optional[Path], method: str) -> Optiona
         return None
     safe = method.replace("/", "_")
     return schema_cache_dir / f"{safe}.json"
+
+
+def _prune_stale_cached_schemas(
+    schema_cache_dir: Optional[Path],
+    live_methods: Set[str],
+) -> int:
+    if schema_cache_dir is None:
+        return 0
+    if not schema_cache_dir.exists() or not schema_cache_dir.is_dir():
+        return 0
+    pruned = 0
+    for path in schema_cache_dir.glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        method = str(data.get("method") or path.stem).strip()
+        if method and method in live_methods:
+            continue
+        try:
+            path.unlink()
+            pruned += 1
+        except OSError:
+            pass
+    return pruned
 
 
 def _read_cached_schema(schema_cache_dir: Optional[Path], method: str) -> Optional[JsonDict]:

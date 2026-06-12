@@ -7,6 +7,7 @@ LeadAgent can route on.
 
 Priority of hard signals (see WORKER_STATUS_HARD_PRIORITY in constants.py):
     context_limit_exceeded
+  > stale_pause_deadlock (ABCP pause flag cannot be cleared by resolvePause)
   > page_settled_after_hitl (page passed challenge but ABCP pause remains)
   > hitl_waiting           (Hitl.requestPause issued but harness never entered wait)
   > hitl_timeout           (harness entered wait but timed out — PR #4 wires this)
@@ -43,6 +44,8 @@ from harness.constants import (
     WORKER_STATUS_HITL_WAITING,
     WORKER_STATUS_PAGE_SETTLED_AFTER_HITL,
     WORKER_STATUS_PAGE_CRASHED,
+    WORKER_STATUS_PARTIAL,
+    WORKER_STATUS_STALE_PAUSE_DEADLOCK,
     WORKER_STATUS_STEP_BUDGET,
     WORKER_STATUS_UNKNOWN,
 )
@@ -63,6 +66,7 @@ class WorkerDiagnostics:
     hitl_wait_timed_out: bool = False
     hitl_resumed_observed: bool = False
     hitl_page_settled_observed: bool = False
+    hitl_stale_pause_deadlock_observed: bool = False
 
     # Contract errors are always recorded for diagnostics, even if the final
     # status ends up being something else.
@@ -119,6 +123,9 @@ class WorkerDiagnostics:
     def mark_hitl_page_settled(self) -> None:
         self.hitl_page_settled_observed = True
 
+    def mark_hitl_stale_pause_deadlock(self) -> None:
+        self.hitl_stale_pause_deadlock_observed = True
+
     def to_log_payload(self) -> Dict[str, Any]:
         return {
             "last_exception_type": self.last_exception_type,
@@ -128,6 +135,7 @@ class WorkerDiagnostics:
             "hitl_wait_timed_out": self.hitl_wait_timed_out,
             "hitl_resumed_observed": self.hitl_resumed_observed,
             "hitl_page_settled_observed": self.hitl_page_settled_observed,
+            "hitl_stale_pause_deadlock_observed": self.hitl_stale_pause_deadlock_observed,
             "contract_error_count": len(self.contract_errors),
             "contract_errors_sample": self.contract_errors[:5],
             "recent_call_count": len(self.recent_calls),
@@ -157,6 +165,19 @@ def classify_terminal_status(
 
     if model_reported_status:
         soft = _normalize_model_status(model_reported_status)
+        if (
+            hard == WORKER_STATUS_STALE_PAUSE_DEADLOCK
+            and soft in {WORKER_STATUS_DONE, WORKER_STATUS_PARTIAL}
+            and not reached_step_cap
+            and has_extraction_artifact
+        ):
+            # Deadlock recovery exception: the deadlocked page was closed by
+            # the harness and the sanctioned playbook is "continue from a
+            # fresh page". A worker that then finished within budget AND
+            # recorded extraction artifacts demonstrably was not stuck behind
+            # the pause — honor its own outcome. The event stays visible via
+            # hitl_stale_pause_deadlock_observed in the diagnostics payload.
+            hard = None
         if soft == WORKER_STATUS_DONE and hard is None:
             return WORKER_STATUS_DONE, None
         if hard is not None and hard != soft:
@@ -200,7 +221,10 @@ def _classify_hard(
     done — claiming success while one of these is active would be a lie:
       - context_limit_exceeded: the LLM call literally failed; no answer
       - hitl_*: a page is paused for human; the agent can't have legitimately
-        proceeded past it (this is the strict Q1 semantic for HITL)
+        proceeded past it (this is the strict Q1 semantic for HITL).
+        Exception (handled in classify_terminal_status): stale_pause_deadlock
+        closes the paused page and sanctions recovery on a fresh one, so a
+        done/partial outcome with recorded extractions is allowed to stand.
 
     Evidence-of-failure signals only fire when the worker did NOT successfully
     complete (i.e. it hit the step cap, or it raised before final_answer):
@@ -248,11 +272,15 @@ def _classify_hitl(diag: WorkerDiagnostics) -> Optional[str]:
         hitl_wait_entered flag remains in diagnostics for forensics.
       - page_settled_after_hitl: lifecycle notifications show the page got
         past the challenge, but ABCP still rejects tools as paused.
+      - stale_pause_deadlock: resolvePause itself is rejected as paused, usually
+        because the installed ABCP build did not exempt the unlock method.
     """
     if not diag.last_pause_pageId:
         return None
     if diag.hitl_resumed_observed:
         return None
+    if diag.hitl_stale_pause_deadlock_observed:
+        return WORKER_STATUS_STALE_PAUSE_DEADLOCK
     if diag.hitl_page_settled_observed:
         return WORKER_STATUS_PAGE_SETTLED_AFTER_HITL
     if diag.hitl_wait_timed_out:

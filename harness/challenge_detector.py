@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from harness.constants import CHALLENGE_KEYWORDS, NAVIGATION_CHALLENGE_TITLE_KEYWORDS
 from harness.utils import JsonDict
 
 
@@ -37,10 +38,40 @@ LINGERING_LOADING_TITLES = (
     "loading",
 )
 
+# Union of every challenge/loading title vocabulary in the harness, for gates
+# that must decide "is this title safe to treat as past-the-challenge?".
+# Deliberately broad: these gates control auto-resume of a HITL pause, where a
+# false "challenge" only means waiting for VL adjudication or the timeout,
+# while a false "clear" silently bypasses a human verification step.
+CHALLENGE_TITLE_KEYWORDS = tuple(dict.fromkeys((
+    *LINGERING_LOADING_TITLES,
+    *NAVIGATION_CHALLENGE_TITLE_KEYWORDS,
+    *HIGH_CONFIDENCE_CHALLENGE_KEYWORDS,
+    *CHALLENGE_KEYWORDS,
+    "attention required",
+    "performing security verification",
+    "security check",
+    "ddos protection",
+    "bot verification",
+    "安全验证",
+)))
+
 
 def is_lingering_loading_title(title: str) -> bool:
     title_lower = str(title or "").lower()
     return bool(title_lower and any(marker in title_lower for marker in LINGERING_LOADING_TITLES))
+
+
+def title_looks_like_challenge(title: str) -> bool:
+    """True if a page title matches any known challenge/interstitial wording.
+
+    Use for resume/clearance gates (e.g. the HITL verified-settlement title
+    fallback), NOT for challenge *detection* — detection stays behavioral with
+    only the small HIGH_CONFIDENCE_CHALLENGE_KEYWORDS fallback, while this
+    union is intentionally over-broad in the safe direction.
+    """
+    title_lower = str(title or "").lower()
+    return bool(title_lower and any(marker in title_lower for marker in CHALLENGE_TITLE_KEYWORDS))
 
 CHALLENGE_TEXT_KEYS = {
     "accessibletext",

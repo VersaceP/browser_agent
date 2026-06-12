@@ -30,8 +30,8 @@ def classify_browser_error(
 
     if _contains(lower, "err_page_paused", "paused for human intervention"):
         return {
-            "type": "hitl_required",
-            "suggested_action": "wait_for_hitl_or_report_to_lead",
+            "type": "hitl_paused_state",
+            "suggested_action": "wait_for_explicit_hitl_resume_or_quarantine_stale_page",
             "method": method_name,
         }
     if _contains(

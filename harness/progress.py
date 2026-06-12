@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import re
 from typing import Any, Dict, List, Optional
 
 from harness.utils import JsonDict
@@ -49,6 +50,34 @@ PRODUCTIVE_PRIMITIVE_TOOLS = {
 
 PRODUCTIVE_WITHOUT_ARTIFACT_HARD_LIMIT = 30
 
+DIAGNOSTIC_TOOLS_AFTER_INFRA_ERROR = {
+    "System.register",
+    "System.describeAction",
+    "System.describeEvent",
+    "System.getCapabilities",
+    "Fleet.status",
+    "Fleet.list",
+    "Fleet.close",
+    "Page.list",
+    "Page.getState",
+    "Memory.get",
+    "Memory.save",
+}
+
+INFRA_ERROR_RE = re.compile(
+    r"("
+    r"-32603|internal error|transport|websocket|connection[_ ]closed|"
+    r"err_connection_closed|err_connection_reset|err_connection_refused|"
+    r"err_connection_aborted|err_timed_out|err_network|"
+    r"cannot read properties of undefined|abcptransporterror"
+    r")",
+    re.I,
+)
+PAUSED_ERROR_RE = re.compile(
+    r"(err_page_paused|paused for human intervention)",
+    re.I,
+)
+
 
 @dataclass
 class ProgressAccountant:
@@ -69,6 +98,9 @@ class ProgressAccountant:
     interventions: List[JsonDict] = field(default_factory=list)
     last_local_result_signature: Optional[str] = None
     pending_intervention: Optional[JsonDict] = None
+    infra_error_streak: int = 0
+    last_infra_error: Optional[JsonDict] = None
+    infra_diagnostic_bypass_count: int = 0
 
     def before_tool(
         self,
@@ -105,6 +137,14 @@ class ProgressAccountant:
             }
             self.interventions.append(intervention)
             return intervention
+        if (
+            requires_artifact
+            and artifact_count == 0
+            and self.infra_error_streak > 0
+            and tool_name in DIAGNOSTIC_TOOLS_AFTER_INFRA_ERROR
+        ):
+            self.infra_diagnostic_bypass_count += 1
+            return None
         if (
             requires_artifact
             and artifact_count == 0
@@ -185,8 +225,24 @@ class ProgressAccountant:
     ) -> None:
         self.tool_calls += 1
         self.distinct_tools[tool_name] = self.distinct_tools.get(tool_name, 0) + 1
+        infra_error = _infra_error_summary(result)
+        if infra_error:
+            self.infra_error_streak += 1
+            self.last_infra_error = {
+                "tool": tool_name,
+                **infra_error,
+            }
+        elif (
+            self.infra_error_streak
+            and tool_name not in DIAGNOSTIC_TOOLS_AFTER_INFRA_ERROR
+            and _tool_result_success(result)
+        ):
+            self.infra_error_streak = 0
+            self.last_infra_error = None
         if artifact_count > self.extraction_artifact_count:
             self.extraction_artifact_count = artifact_count
+            self.infra_error_streak = 0
+            self.last_infra_error = None
             self.turns_since_artifact_progress = 0
             self.local_fs_without_extraction = 0
             self.local_fs_streak = 0
@@ -247,6 +303,9 @@ class ProgressAccountant:
             "localFsStreak": self.local_fs_streak,
             "repeatedLocalResultCount": self.repeated_local_result_count,
             "turnsSinceArtifactProgress": self.turns_since_artifact_progress,
+            "infraErrorStreak": self.infra_error_streak,
+            "lastInfraError": self.last_infra_error,
+            "infraDiagnosticBypassCount": self.infra_diagnostic_bypass_count,
             "distinctTools": dict(sorted(self.distinct_tools.items())),
             "interventionCount": len(self.interventions),
         }
@@ -286,3 +345,59 @@ def _local_result_signature(result: Optional[JsonDict]) -> Optional[str]:
     if not keys:
         return None
     return "|".join(keys)
+
+
+def _infra_error_summary(result: Optional[JsonDict]) -> Optional[JsonDict]:
+    if not isinstance(result, dict):
+        return None
+    text = _flatten_error_text(result)
+    if PAUSED_ERROR_RE.search(text):
+        return None
+    match = INFRA_ERROR_RE.search(text)
+    if not match:
+        return None
+    return {
+        "pattern": match.group(0)[:80],
+        "status": str(result.get("status") or "")[:80],
+        "message": text[:500],
+    }
+
+
+def _flatten_error_text(value: Any, *, depth: int = 0) -> str:
+    if depth > 4:
+        return ""
+    if isinstance(value, dict):
+        chunks: List[str] = []
+        for key, item in value.items():
+            if str(key).lower() in {
+                "error",
+                "message",
+                "reason",
+                "status",
+                "details",
+                "exception",
+                "classification",
+            }:
+                chunks.append(_flatten_error_text(item, depth=depth + 1))
+            elif isinstance(item, (dict, list)):
+                chunks.append(_flatten_error_text(item, depth=depth + 1))
+        return " ".join(chunk for chunk in chunks if chunk)
+    if isinstance(value, list):
+        return " ".join(
+            chunk for chunk in (_flatten_error_text(item, depth=depth + 1) for item in value)
+            if chunk
+        )
+    if isinstance(value, str):
+        return value
+    return ""
+
+
+def _tool_result_success(result: Optional[JsonDict]) -> bool:
+    if not isinstance(result, dict):
+        return False
+    status = str(result.get("status") or "").strip().lower()
+    if status in {"done", "ok", "success", "navigation_success"}:
+        return True
+    if status in {"error", "failed", "rejected", "needs_fix", "progress_intervention"}:
+        return False
+    return not _infra_error_summary(result)

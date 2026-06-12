@@ -4,10 +4,13 @@ harness.spawner - Worker BrowserAgent spawning and lifecycle management.
 
 import asyncio
 import json
-from dataclasses import dataclass, replace
+import re
+import time
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Optional, Set
+from urllib.parse import urlparse
 
-from abcp_client import ABCPClient
+from abcp_client import ABCPClient, ABCPTransportError
 from harness.constants import (
     WORKER_STATUS_CANCELLED,
     WORKER_STATUS_FAILED,
@@ -25,9 +28,11 @@ from harness.task_control import (
     contract_hash_for_phase,
     mark_phase_result,
     mark_phase_running,
+    phase_prior_artifact_paths,
     repeated_phase_attempt_guard,
     validate_worker_artifacts,
 )
+from harness.strategy_bank import record_learned_strategy
 from harness.strategy_telemetry import append_strategy_attempt
 from harness.tool_policy import ALWAYS_FORBIDDEN_ABCP_METHODS
 from harness.templates import get_path
@@ -61,6 +66,33 @@ class BrowserAgentHandle:
     phase_id: Optional[str]
     worker_contract: JsonDict
     async_task: Any
+    slot_id: Optional[str] = None
+
+
+@dataclass
+class BrowserAgentSlot:
+    slot_id: str
+    agent_id: str
+    client: Optional[ABCPClient] = None
+    registration: JsonDict = field(default_factory=dict)
+    status: str = "new"
+    current_worker_id: Optional[str] = None
+    last_worker_id: Optional[str] = None
+    last_phase_id: Optional[str] = None
+    last_task_type: str = ""
+    last_contract_hash: str = ""
+    last_result_summary: JsonDict = field(default_factory=dict)
+    last_sync_at: float = 0.0
+    fleet_ids: Set[str] = field(default_factory=set)
+    page_registry: Dict[str, JsonDict] = field(default_factory=dict)
+    page_quarantine: Dict[str, JsonDict] = field(default_factory=dict)
+    origins: Set[str] = field(default_factory=set)
+    sync_errors: List[str] = field(default_factory=list)
+    idle_event_logger: Optional[Callable[[str, JsonDict], None]] = None
+
+
+URL_RE = re.compile(r"https?://[^\s\"'<>]+")
+SLOT_FULL_SYNC_TTL_SECONDS = 30.0
 
 
 class BrowserAgentSpawner:
@@ -76,7 +108,9 @@ class BrowserAgentSpawner:
         self.browser_agent_factory = browser_agent_factory
         self.logger = logger
         self._handles: Dict[str, BrowserAgentHandle] = {}
+        self._slots: Dict[str, BrowserAgentSlot] = {}
         self._counter = 0
+        self._slot_counter = 0
         self.static_context_block, self.static_context_hash = build_static_context_block(
             self.runtime.harness.context_file
         )
@@ -94,6 +128,8 @@ class BrowserAgentSpawner:
         phase_id: Optional[str] = None,
         worker_contract: Optional[JsonDict] = None,
         phase: Optional[JsonDict] = None,
+        preferred_slot_id: Optional[str] = None,
+        reuse_from_worker_id: Optional[str] = None,
     ) -> JsonDict:
         effective_contract = worker_contract or {}
         current_contract_hash = contract_hash_for_phase(
@@ -111,25 +147,41 @@ class BrowserAgentSpawner:
             self.logger.write("spawner.browser.repeated_guard", repeated_guard)
             return repeated_guard
 
-        running_count = sum(
-            1 for handle in self._handles.values()
-            if not handle.async_task.done()
-        )
-        if running_count >= self.runtime.harness.max_browser_agents:
-            return {
-                "status": "rejected",
-                "error": "Reached the max_browser_agents limit",
-                "running": running_count,
-                "max_browser_agents": self.runtime.harness.max_browser_agents,
-            }
-
         worker_id = self._next_id("browser")
         agent_name = name or worker_id
-        agent_id = f"{self.runtime.agent_id}-{worker_id}"
+        try:
+            slot = await self._acquire_slot(
+                worker_id=worker_id,
+                phase_id=phase_id,
+                task=task,
+                context=context,
+                result_contract=result_contract,
+                worker_contract=effective_contract,
+                contract_hash=current_contract_hash,
+                preferred_slot_id=preferred_slot_id,
+                reuse_from_worker_id=reuse_from_worker_id,
+            )
+        except Exception as exc:
+            result = {
+                "status": "failed",
+                "error": str(exc),
+                "workerId": worker_id,
+                "name": agent_name,
+            }
+            self.logger.write("spawner.slot.acquire_failed", result)
+            return result
+        if isinstance(slot, dict):
+            return slot
+
+        expose_reusable_pages = bool(
+            str(preferred_slot_id or "").strip()
+            or str(reuse_from_worker_id or "").strip()
+        )
         async_task = asyncio.create_task(
             self._run_browser_worker(
+                slot=slot,
+                expose_reusable_pages=expose_reusable_pages,
                 worker_id=worker_id,
-                agent_id=agent_id,
                 name=agent_name,
                 task=task,
                 context=context,
@@ -148,7 +200,7 @@ class BrowserAgentSpawner:
         )
         self._handles[worker_id] = BrowserAgentHandle(
             worker_id=worker_id,
-            agent_id=agent_id,
+            agent_id=slot.agent_id,
             name=agent_name,
             task=task,
             context=context,
@@ -156,12 +208,16 @@ class BrowserAgentSpawner:
             phase_id=phase_id,
             worker_contract=effective_contract,
             async_task=async_task,
+            slot_id=slot.slot_id,
         )
         self.logger.write(
             "spawner.browser.spawn",
             {
                 "workerId": worker_id,
-                "agentId": agent_id,
+                "agentId": slot.agent_id,
+                "slotId": slot.slot_id,
+                "slotReuse": bool(slot.last_worker_id),
+                "pageReuseAllowed": expose_reusable_pages,
                 "name": agent_name,
                 "task": task,
                 "resultContract": result_contract,
@@ -173,10 +229,859 @@ class BrowserAgentSpawner:
         return {
             "status": "running",
             "workerId": worker_id,
-            "agentId": agent_id,
+            "agentId": slot.agent_id,
+            "slotId": slot.slot_id,
             "name": agent_name,
             "phaseId": phase_id,
         }
+
+    async def _acquire_slot(
+        self,
+        *,
+        worker_id: str,
+        phase_id: Optional[str],
+        task: str,
+        context: str,
+        result_contract: str,
+        worker_contract: JsonDict,
+        contract_hash: str,
+        preferred_slot_id: Optional[str],
+        reuse_from_worker_id: Optional[str],
+    ) -> Any:
+        self._cleanup_retired_slots()
+        max_slots = (
+            optional_int(
+                getattr(self.runtime.harness, "max_browser_agent_instances", None),
+                0,
+            )
+            or optional_int(self.runtime.harness.max_browser_agents, 0)
+            or 3
+        )
+        running_slots = [
+            slot for slot in self._slots.values()
+            if slot.status == "running"
+        ]
+        live_slots = [
+            slot for slot in self._slots.values()
+            if slot.status not in {"broken", "closed"}
+        ]
+        if len(running_slots) >= self.runtime.harness.max_browser_agents:
+            return {
+                "status": "rejected",
+                "error": "Reached the max_browser_agents limit",
+                "running": len(running_slots),
+                "max_browser_agents": self.runtime.harness.max_browser_agents,
+                "max_browser_agent_instances": max_slots,
+                "limit_semantics": {
+                    "max_browser_agents": "maximum concurrently running BrowserAgent workers",
+                    "max_browser_agent_instances": "maximum live reusable BrowserAgent slots",
+                },
+                "slots": [self._slot_summary(slot) for slot in self._slots.values()],
+                "next_instruction": (
+                    "Do not create another worker now. Call wait_browser_agents"
+                    " for one running worker to finish, then reuse an idle slot."
+                ),
+            }
+
+        explicit_rejection = self._explicit_slot_rejection(
+            preferred_slot_id=preferred_slot_id,
+            reuse_from_worker_id=reuse_from_worker_id,
+        )
+        if explicit_rejection is not None:
+            return explicit_rejection
+
+        slot = self._select_idle_slot(
+            phase_id=phase_id,
+            task=task,
+            context=context,
+            result_contract=result_contract,
+            worker_contract=worker_contract,
+            preferred_slot_id=preferred_slot_id,
+            reuse_from_worker_id=reuse_from_worker_id,
+        )
+        if slot is None:
+            if len(live_slots) >= max_slots:
+                return {
+                    "status": "rejected",
+                    "error": "No idle BrowserAgent slot available",
+                    "running": len(running_slots),
+                    "max_browser_agents": self.runtime.harness.max_browser_agents,
+                    "max_browser_agent_instances": max_slots,
+                    "limit_semantics": {
+                        "max_browser_agents": "maximum concurrently running BrowserAgent workers",
+                        "max_browser_agent_instances": "maximum live reusable BrowserAgent slots",
+                    },
+                    "slots": [self._slot_summary(item) for item in self._slots.values()],
+                    "next_instruction": (
+                        "The slot pool is full. Call wait_browser_agents, then"
+                        " spawn the continuation with reuse_from_worker_id or"
+                        " preferred_slot_id for the related idle slot."
+                    ),
+                }
+            slot = await self._create_slot()
+
+        slot.status = "running"
+        slot.current_worker_id = worker_id
+        slot.last_contract_hash = contract_hash
+        return slot
+
+    def _explicit_slot_rejection(
+        self,
+        *,
+        preferred_slot_id: Optional[str],
+        reuse_from_worker_id: Optional[str],
+    ) -> Optional[JsonDict]:
+        preferred = str(preferred_slot_id or "").strip()
+        if preferred:
+            slot = self._slots.get(preferred)
+            if slot is None:
+                return {
+                    "status": "rejected",
+                    "error": f"preferred_slot_id not found: {preferred}",
+                    "slots": [self._slot_summary(item) for item in self._slots.values()],
+                }
+            if slot.status != "idle":
+                return {
+                    "status": "rejected",
+                    "error": f"preferred_slot_id is not idle: {preferred}",
+                    "slot": self._slot_summary(slot),
+                    "next_instruction": (
+                        "Call wait_browser_agents for the slot's running worker,"
+                        " then retry with the same preferred_slot_id."
+                    ),
+                }
+        reuse_worker = str(reuse_from_worker_id or "").strip()
+        if reuse_worker:
+            handle = self._handles.get(reuse_worker)
+            if handle is None or not handle.slot_id:
+                return {
+                    "status": "rejected",
+                    "error": f"reuse_from_worker_id not found: {reuse_worker}",
+                    "slots": [self._slot_summary(item) for item in self._slots.values()],
+                }
+            slot = self._slots.get(handle.slot_id)
+            if slot is None:
+                return {
+                    "status": "rejected",
+                    "error": f"slot for reuse_from_worker_id not found: {reuse_worker}",
+                    "workerId": reuse_worker,
+                    "slots": [self._slot_summary(item) for item in self._slots.values()],
+                }
+            if slot.status != "idle":
+                return {
+                    "status": "rejected",
+                    "error": f"slot for reuse_from_worker_id is not idle: {reuse_worker}",
+                    "workerId": reuse_worker,
+                    "slot": self._slot_summary(slot),
+                    "next_instruction": (
+                        "Wait for the related worker/slot to finish before"
+                        " spawning this continuation."
+                    ),
+                }
+        return None
+
+    def _select_idle_slot(
+        self,
+        *,
+        phase_id: Optional[str],
+        task: str,
+        context: str,
+        result_contract: str,
+        worker_contract: JsonDict,
+        preferred_slot_id: Optional[str],
+        reuse_from_worker_id: Optional[str],
+    ) -> Optional[BrowserAgentSlot]:
+        idle_slots = [
+            slot for slot in self._slots.values()
+            if slot.status == "idle"
+        ]
+        if not idle_slots:
+            return None
+
+        preferred = str(preferred_slot_id or "").strip()
+        if preferred:
+            slot = self._slots.get(preferred)
+            if slot is not None and slot.status == "idle":
+                return slot
+
+        reuse_worker = str(reuse_from_worker_id or "").strip()
+        if reuse_worker:
+            handle = self._handles.get(reuse_worker)
+            if handle is not None and handle.slot_id:
+                slot = self._slots.get(handle.slot_id)
+                if slot is not None and slot.status == "idle":
+                    return slot
+
+        task_origins = _origins_from_text(
+            "\n".join([task, context, result_contract, json.dumps(worker_contract, default=str)])
+        )
+        scored = [
+            (
+                self._slot_relevance_score(
+                    slot,
+                    phase_id=phase_id,
+                    task_origins=task_origins,
+                    worker_contract=worker_contract,
+                ),
+                slot,
+            )
+            for slot in idle_slots
+        ]
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return scored[0][1] if scored else None
+
+    def _slot_relevance_score(
+        self,
+        slot: BrowserAgentSlot,
+        *,
+        phase_id: Optional[str],
+        task_origins: Set[str],
+        worker_contract: JsonDict,
+    ) -> int:
+        score = 0
+        phase_text = str(phase_id or "")
+        if phase_text and slot.last_phase_id == phase_text:
+            score += 40
+        elif phase_text and _phase_family(slot.last_phase_id) == _phase_family(phase_text):
+            score += 24
+        task_type = str(worker_contract.get("task_type") or "")
+        if task_type and slot.last_task_type == task_type:
+            score += 12
+        overlap = task_origins.intersection(slot.origins)
+        score += min(len(overlap), 3) * 8
+        if slot.last_result_summary.get("validatedStatus") == "validated_done":
+            score += 4
+        if slot.last_result_summary.get("status") in {"done", "partial"}:
+            score += 3
+        return score
+
+    async def _create_slot(self) -> BrowserAgentSlot:
+        slot_id = self._next_slot_id()
+        agent_id = f"{self.runtime.agent_id}-{slot_id}"
+        event_logger = make_browser_event_logger(
+            self.logger,
+            self.runtime.harness.log_browser_payloads,
+            prefix=f"{slot_id}.transport",
+        )
+        client = ABCPClient(self.runtime.browser, on_event=event_logger)
+        await client.connect()
+        slot = BrowserAgentSlot(
+            slot_id=slot_id,
+            agent_id=agent_id,
+            client=client,
+            status="idle",
+            idle_event_logger=event_logger,
+        )
+        try:
+            registration = await client.call("System.register", {"agentId": agent_id})
+        except Exception:
+            await client.close()
+            raise
+        slot.registration = registration
+        self._update_slot_registry_from_value(slot, registration)
+        self._slots[slot_id] = slot
+        self.logger.write(
+            "spawner.slot.created",
+            self._slot_summary(slot),
+        )
+        return slot
+
+    def _cleanup_retired_slots(self) -> None:
+        retired = [
+            slot_id
+            for slot_id, slot in self._slots.items()
+            if slot.status in {"broken", "closed"} and not slot.current_worker_id
+        ]
+        for slot_id in retired:
+            slot = self._slots.pop(slot_id, None)
+            if slot is not None:
+                self.logger.write(
+                    "spawner.slot.retired",
+                    self._slot_summary(slot),
+                )
+
+    async def _prepare_slot_for_worker(
+        self,
+        slot: BrowserAgentSlot,
+        worker_id: str,
+        *,
+        expose_reusable_pages: bool,
+    ) -> JsonDict:
+        if slot.client is None:
+            raise ABCPTransportError(f"Slot {slot.slot_id} has no browser client")
+        registration = await slot.client.call(
+            "System.register",
+            {"agentId": slot.agent_id},
+        )
+        slot.registration = registration
+        self._update_slot_registry_from_value(slot, registration)
+        if expose_reusable_pages or self._slot_sync_due(slot):
+            await self._sync_slot_registry(slot, worker_id=worker_id)
+        return registration
+
+    def _slot_sync_due(self, slot: BrowserAgentSlot) -> bool:
+        if slot.last_sync_at <= 0:
+            return True
+        if slot.sync_errors:
+            return True
+        return (time.monotonic() - slot.last_sync_at) >= SLOT_FULL_SYNC_TTL_SECONDS
+
+    async def _sync_slot_registry(
+        self,
+        slot: BrowserAgentSlot,
+        *,
+        worker_id: str,
+    ) -> None:
+        if slot.client is None:
+            return
+        slot.sync_errors = []
+        try:
+            fleet_response = await slot.client.call("Fleet.list", {})
+            self._update_slot_registry_from_value(slot, fleet_response)
+        except Exception as exc:
+            slot.sync_errors.append(f"Fleet.list: {str(exc)[:240]}")
+
+        for fleet_id in sorted(slot.fleet_ids)[:6]:
+            try:
+                pages_response = await slot.client.call(
+                    "Page.list",
+                    {"fleetId": fleet_id},
+                )
+                self._replace_fleet_pages_from_list(
+                    slot,
+                    fleet_id=fleet_id,
+                    pages_response=pages_response,
+                )
+                self._update_slot_registry_from_value(slot, pages_response)
+            except Exception as exc:
+                slot.sync_errors.append(f"Page.list({fleet_id}): {str(exc)[:240]}")
+
+        for page_id in sorted(slot.page_registry.keys())[:12]:
+            try:
+                state_response = await slot.client.call(
+                    "Page.getState",
+                    {
+                        "pageId": page_id,
+                        "purpose": (
+                            "Synchronize reusable slot page state before assigning"
+                            f" worker {worker_id}."
+                        ),
+                    },
+                )
+                state_data = (
+                    state_response.get("data")
+                    if isinstance(state_response, dict)
+                    and isinstance(state_response.get("data"), dict)
+                    else {}
+                )
+                self._update_slot_registry_from_value(
+                    slot,
+                    {"pageId": page_id, **state_data, "state": state_response},
+                )
+                if _state_response_indicates_paused(state_response):
+                    self._mark_page_quarantined(
+                        slot,
+                        page_id,
+                        reason="Page.getState reports the page is still paused.",
+                        worker_id=worker_id,
+                        status="paused",
+                    )
+                else:
+                    self._clear_page_quarantine(
+                        slot,
+                        page_id,
+                        reason="Page.getState confirmed the page is usable.",
+                    )
+                    self._mark_page_fresh(slot, page_id)
+            except Exception as exc:
+                error_text = str(exc)[:240]
+                if _text_indicates_paused_error(error_text):
+                    self._mark_page_quarantined(
+                        slot,
+                        page_id,
+                        reason=error_text,
+                        worker_id=worker_id,
+                        status="paused",
+                    )
+                else:
+                    page = dict(slot.page_registry.get(page_id) or {"pageId": page_id})
+                    page["status"] = "stale"
+                    page["lastStateError"] = error_text
+                    slot.page_registry[page_id] = page
+                slot.sync_errors.append(f"Page.getState({page_id}): {str(exc)[:240]}")
+        slot.last_sync_at = time.monotonic()
+        if slot.sync_errors:
+            self.logger.write(
+                "spawner.slot.sync_warning",
+                {
+                    "slotId": slot.slot_id,
+                    "workerId": worker_id,
+                    "errors": slot.sync_errors[-5:],
+                },
+            )
+
+    def _render_slot_context(
+        self,
+        slot: BrowserAgentSlot,
+        *,
+        expose_reusable_pages: bool,
+    ) -> str:
+        payload = self._slot_context_summary(
+            slot,
+            expose_reusable_pages=expose_reusable_pages,
+        )
+        payload["reuseRules"] = [
+            "Input.* actions are focus-affecting and must be serialized.",
+            "After any Page.switchTo, Page.create, or Page.navigate, refresh DOM.getAXTree before targeting elements.",
+        ]
+        if expose_reusable_pages:
+            payload["reuseRules"].extend([
+                (
+                    "This is an explicit continuation. Existing pageIds are"
+                    " candidates only; verify with Page.getState/Page.switchTo"
+                    " before acting."
+                ),
+                (
+                    "Use an existing page only when it clearly belongs to this"
+                    " continuation; otherwise create a fresh page."
+                ),
+            ])
+        else:
+            payload["reuseRules"].extend([
+                (
+                    "This assignment reuses only the browser connection. Do not"
+                    " use pageIds left by previous workers."
+                ),
+                (
+                    "Start browser work by creating or navigating a fresh page"
+                    " for this task, then use Page.getState to record its current"
+                    " pageId/fleetId/url/title/status."
+                ),
+            ])
+        return (
+            "<slot_context>\n"
+            f"{json.dumps(payload, ensure_ascii=False, indent=2, default=str)}\n"
+            "</slot_context>"
+        )
+
+    def _replace_fleet_pages_from_list(
+        self,
+        slot: BrowserAgentSlot,
+        *,
+        fleet_id: str,
+        pages_response: Any,
+    ) -> None:
+        page_items = self._extract_page_items(pages_response)
+        if page_items is None:
+            return
+        current_page_ids = {
+            str(item.get("pageId") or item.get("page_id") or "")
+            for item in page_items
+            if isinstance(item, dict)
+        }
+        current_page_ids.discard("")
+        removed_page_ids = {
+            page_id
+            for page_id, page in slot.page_registry.items()
+            if (
+                str(page.get("fleetId") or "") == fleet_id
+                and page_id not in current_page_ids
+            )
+        }
+        slot.page_registry = {
+            page_id: page
+            for page_id, page in slot.page_registry.items()
+            if (
+                str(page.get("fleetId") or "") != fleet_id
+                or page_id in current_page_ids
+            )
+        }
+        for page_id in removed_page_ids:
+            slot.page_quarantine.pop(page_id, None)
+        for item in page_items:
+            if not isinstance(item, dict):
+                continue
+            page_id = str(item.get("pageId") or item.get("page_id") or "")
+            if not page_id:
+                continue
+            page = dict(slot.page_registry.get(page_id) or {})
+            self._clear_stale_fields(page)
+            page.update(item)
+            self._clear_stale_fields(page)
+            page["pageId"] = page_id
+            page["fleetId"] = str(page.get("fleetId") or fleet_id)
+            self._apply_page_quarantine(slot, page_id, page)
+            slot.page_registry[page_id] = page
+
+    def _mark_page_fresh(self, slot: BrowserAgentSlot, page_id: str) -> None:
+        page = slot.page_registry.get(page_id)
+        if isinstance(page, dict):
+            self._clear_stale_fields(page)
+
+    def _clear_stale_fields(self, page: JsonDict) -> None:
+        page.pop("lastStateError", None)
+        if str(page.get("status") or "") == "stale":
+            page.pop("status", None)
+
+    def _mark_page_quarantined(
+        self,
+        slot: BrowserAgentSlot,
+        page_id: str,
+        *,
+        reason: str,
+        worker_id: str = "",
+        phase_id: Optional[str] = None,
+        status: str = "stale_pause_deadlock",
+    ) -> None:
+        page_id = str(page_id or "").strip()
+        if not page_id:
+            return
+        quarantine = {
+            "pageId": page_id,
+            "status": status or "quarantined",
+            "reason": str(reason or "")[:300],
+            "workerId": str(worker_id or "")[:120],
+            "phaseId": str(phase_id or "")[:120],
+            "quarantinedAt": time.time(),
+            "doNotUse": True,
+        }
+        slot.page_quarantine[page_id] = quarantine
+        page = dict(slot.page_registry.get(page_id) or {"pageId": page_id})
+        self._apply_page_quarantine(slot, page_id, page)
+        slot.page_registry[page_id] = page
+        self.logger.write(
+            "spawner.slot.page_quarantined",
+            {
+                "slotId": slot.slot_id,
+                "pageId": page_id,
+                "reason": quarantine["reason"],
+                "status": quarantine["status"],
+                "workerId": quarantine["workerId"],
+                "phaseId": quarantine["phaseId"],
+            },
+        )
+
+    def _clear_page_quarantine(
+        self,
+        slot: BrowserAgentSlot,
+        page_id: str,
+        *,
+        reason: str = "",
+    ) -> None:
+        page_id = str(page_id or "").strip()
+        if not page_id or page_id not in slot.page_quarantine:
+            return
+        slot.page_quarantine.pop(page_id, None)
+        page = slot.page_registry.get(page_id)
+        if isinstance(page, dict):
+            page.pop("quarantineReason", None)
+            page.pop("quarantineStatus", None)
+            page.pop("quarantinedAt", None)
+            page.pop("doNotUse", None)
+            if str(page.get("status") or "") == "quarantined":
+                page.pop("status", None)
+        self.logger.write(
+            "spawner.slot.page_quarantine_cleared",
+            {
+                "slotId": slot.slot_id,
+                "pageId": page_id,
+                "reason": str(reason or "")[:300],
+            },
+        )
+
+    def _apply_page_quarantine(
+        self,
+        slot: BrowserAgentSlot,
+        page_id: str,
+        page: JsonDict,
+    ) -> None:
+        quarantine = slot.page_quarantine.get(page_id)
+        if not isinstance(quarantine, dict):
+            return
+        page["status"] = "quarantined"
+        page["quarantineStatus"] = quarantine.get("status") or "quarantined"
+        page["quarantineReason"] = quarantine.get("reason") or ""
+        page["quarantinedAt"] = quarantine.get("quarantinedAt")
+        page["doNotUse"] = True
+
+    def _extract_page_items(self, value: Any) -> Optional[List[JsonDict]]:
+        def normalize_list(items: Any) -> Optional[List[JsonDict]]:
+            if not isinstance(items, list):
+                return None
+            pages = [item for item in items if isinstance(item, dict)]
+            if not pages:
+                return []
+            if any(item.get("pageId") or item.get("page_id") for item in pages):
+                return pages
+            return None
+
+        if isinstance(value, dict):
+            for key in ("pages", "tabs"):
+                pages = normalize_list(value.get(key))
+                if pages is not None:
+                    return pages
+            data = value.get("data")
+            if isinstance(data, dict):
+                for key in ("pages", "tabs"):
+                    pages = normalize_list(data.get(key))
+                    if pages is not None:
+                        return pages
+            elif isinstance(data, list):
+                pages = normalize_list(data)
+                if pages is not None:
+                    return pages
+        return normalize_list(value)
+
+    def _update_slot_after_worker(
+        self,
+        slot: BrowserAgentSlot,
+        *,
+        worker_id: str,
+        phase_id: Optional[str],
+        worker_contract: JsonDict,
+        result: JsonDict,
+        trace: List[JsonDict],
+    ) -> None:
+        self._record_slot_result(
+            slot,
+            worker_id=worker_id,
+            phase_id=phase_id,
+            worker_contract=worker_contract,
+            result=result,
+            trace=trace,
+        )
+        self._mark_slot_idle(slot, worker_id=worker_id, result=result)
+
+    def _record_slot_result(
+        self,
+        slot: BrowserAgentSlot,
+        *,
+        worker_id: str,
+        phase_id: Optional[str],
+        worker_contract: JsonDict,
+        result: JsonDict,
+        trace: Optional[List[JsonDict]] = None,
+    ) -> None:
+        if trace is not None:
+            self._update_slot_registry_from_trace(slot, trace)
+        slot.last_phase_id = phase_id
+        slot.last_task_type = str(worker_contract.get("task_type") or "")
+        slot.last_result_summary = {
+            "workerId": worker_id,
+            "phaseId": phase_id,
+            "status": result.get("status"),
+            "statusCategory": result.get("statusCategory"),
+            "validatedStatus": result.get("validatedStatus"),
+            "artifactCount": len(result.get("artifacts") or []),
+            "traceSummary": trim_large_strings(result.get("traceSummary") or {}, 2000),
+        }
+        self._quarantine_deadlock_page_from_result(
+            slot,
+            worker_id=worker_id,
+            phase_id=phase_id,
+            result=result,
+        )
+
+    def _quarantine_deadlock_page_from_result(
+        self,
+        slot: BrowserAgentSlot,
+        *,
+        worker_id: str,
+        phase_id: Optional[str],
+        result: JsonDict,
+    ) -> None:
+        if str(result.get("status") or "") != "stale_pause_deadlock":
+            return
+        diagnostics = result.get("diagnostics")
+        page_id = ""
+        if isinstance(diagnostics, dict):
+            page_id = str(diagnostics.get("last_pause_pageId") or "").strip()
+        if not page_id:
+            return
+        self._mark_page_quarantined(
+            slot,
+            page_id,
+            reason=(
+                "Worker ended with stale_pause_deadlock; do not reuse this"
+                " paused page unless a later Page.getState confirms it is usable."
+            ),
+            worker_id=worker_id,
+            phase_id=phase_id,
+            status="stale_pause_deadlock",
+        )
+
+    def _mark_slot_idle(
+        self,
+        slot: BrowserAgentSlot,
+        *,
+        worker_id: str,
+        result: JsonDict,
+    ) -> None:
+        slot.last_worker_id = worker_id
+        slot.current_worker_id = None
+        if slot.status not in {"broken", "closed"}:
+            slot.status = "idle"
+        if slot.client is not None and slot.idle_event_logger is not None:
+            slot.client.on_event = slot.idle_event_logger
+        self.logger.write(
+            "spawner.slot.released",
+            self._slot_summary(slot),
+        )
+
+    def _update_slot_registry_from_trace(
+        self,
+        slot: BrowserAgentSlot,
+        trace: List[JsonDict],
+    ) -> None:
+        for item in trace or []:
+            if not isinstance(item, dict) or item.get("type") != "browser_call":
+                continue
+            method = str(item.get("method") or "")
+            params = item.get("params")
+            if method == "Page.close" and isinstance(params, dict):
+                page_id = str(params.get("pageId") or "")
+                if page_id:
+                    slot.page_registry.pop(page_id, None)
+                    slot.page_quarantine.pop(page_id, None)
+            if method == "Fleet.close" and isinstance(params, dict):
+                fleet_id = str(params.get("fleetId") or "")
+                if fleet_id:
+                    slot.fleet_ids.discard(fleet_id)
+                    removed_page_ids = [
+                        page_id
+                        for page_id, page in slot.page_registry.items()
+                        if str(page.get("fleetId") or "") == fleet_id
+                    ]
+                    slot.page_registry = {
+                        page_id: page
+                        for page_id, page in slot.page_registry.items()
+                        if str(page.get("fleetId") or "") != fleet_id
+                    }
+                    for page_id in removed_page_ids:
+                        slot.page_quarantine.pop(page_id, None)
+            self._update_slot_registry_from_value(slot, params)
+            self._update_slot_registry_from_value(slot, item.get("result"))
+
+    def _update_slot_registry_from_value(
+        self,
+        slot: BrowserAgentSlot,
+        value: Any,
+    ) -> None:
+        def visit(item: Any) -> None:
+            if isinstance(item, dict):
+                fleet_id = str(item.get("fleetId") or item.get("fleet_id") or "")
+                page_id = str(item.get("pageId") or item.get("page_id") or "")
+                url = str(item.get("url") or item.get("currentUrl") or "")
+                title = str(item.get("title") or "")
+                status = str(item.get("status") or "")
+                if fleet_id:
+                    slot.fleet_ids.add(fleet_id)
+                if page_id:
+                    page = dict(slot.page_registry.get(page_id) or {})
+                    page["pageId"] = page_id
+                    if fleet_id:
+                        page["fleetId"] = fleet_id
+                    if url:
+                        page["url"] = url
+                        origin = _origin_from_url(url)
+                        if origin:
+                            page["origin"] = origin
+                            slot.origins.add(origin)
+                    if title:
+                        page["title"] = title
+                    if status:
+                        page["status"] = status
+                    self._apply_page_quarantine(slot, page_id, page)
+                    slot.page_registry[page_id] = page
+                for nested in item.values():
+                    visit(nested)
+            elif isinstance(item, list):
+                for nested in item:
+                    visit(nested)
+
+        visit(value)
+
+    def _slot_summary(self, slot: BrowserAgentSlot) -> JsonDict:
+        return {
+            "slotId": slot.slot_id,
+            "agentId": slot.agent_id,
+            "status": slot.status,
+            "currentWorkerId": slot.current_worker_id,
+            "lastWorkerId": slot.last_worker_id,
+            "lastPhaseId": slot.last_phase_id,
+            "lastTaskType": slot.last_task_type,
+            "fleetIds": sorted(slot.fleet_ids),
+            "origins": sorted(slot.origins),
+            "pages": [
+                dict(page)
+                for page in list(slot.page_registry.values())[:20]
+            ],
+            "quarantinedPages": [
+                dict(page)
+                for page in list(slot.page_quarantine.values())[:20]
+            ],
+            "syncErrors": slot.sync_errors[-5:],
+            "lastResult": slot.last_result_summary,
+        }
+
+    def _slot_context_summary(
+        self,
+        slot: BrowserAgentSlot,
+        *,
+        expose_reusable_pages: bool,
+    ) -> JsonDict:
+        payload = {
+            "slotId": slot.slot_id,
+            "agentId": slot.agent_id,
+            "status": slot.status,
+            "lastWorkerId": slot.last_worker_id,
+            "lastPhaseId": slot.last_phase_id,
+            "lastTaskType": slot.last_task_type,
+            "pageReuseMode": (
+                "explicit_continuation" if expose_reusable_pages else "fresh_page_required"
+            ),
+            "existingPageCount": len(slot.page_registry),
+            "quarantinedPageCount": len(slot.page_quarantine),
+            "fleetCount": len(slot.fleet_ids),
+            "originCount": len(slot.origins),
+            "syncErrors": slot.sync_errors[-5:],
+            "isolation": (
+                "Only browser connection and page registry are reused. Worker"
+                " AXTree snapshots, diagnostics, progress, artifacts, and challenge"
+                " state are reset for this assignment."
+            ),
+        }
+        if not expose_reusable_pages:
+            return payload
+        payload["fleetIds"] = sorted(slot.fleet_ids)
+        payload["origins"] = sorted(slot.origins)
+        payload["pages"] = [
+            dict(page)
+            for page in list(slot.page_registry.values())[:20]
+            if not _page_hidden_from_reuse(slot, page)
+        ]
+        payload["stalePages"] = [
+            {
+                "pageId": page.get("pageId"),
+                "fleetId": page.get("fleetId"),
+                "url": page.get("url"),
+                "lastStateError": page.get("lastStateError"),
+            }
+            for page in list(slot.page_registry.values())[:20]
+            if str(page.get("status") or "") == "stale"
+        ]
+        payload["quarantinedPages"] = [
+            {
+                "pageId": quarantine.get("pageId"),
+                "status": quarantine.get("status"),
+                "reason": quarantine.get("reason"),
+                "workerId": quarantine.get("workerId"),
+                "phaseId": quarantine.get("phaseId"),
+                "doNotUse": True,
+            }
+            for quarantine in list(slot.page_quarantine.values())[:20]
+        ]
+        return payload
 
     async def wait_browser_agents(
         self,
@@ -184,6 +1089,7 @@ class BrowserAgentSpawner:
         mode: str = "all",
         timeout_seconds: Optional[float] = None,
     ) -> JsonDict:
+        self._cleanup_retired_slots()
         handles = self._select_handles(worker_ids)
         if not handles:
             return {"status": "empty", "completed": [], "pending": []}
@@ -208,13 +1114,19 @@ class BrowserAgentSpawner:
             for handle in handles
             if handle.async_task in pending and not handle.async_task.done()
         ]
+        self._cleanup_retired_slots()
         return {
             "status": "done" if not pending_ids else "partial",
             "completed": completed,
             "pending": pending_ids,
+            "slots": [
+                self._slot_summary(slot)
+                for slot in self._slots.values()
+            ],
         }
 
     def list_browser_agents(self) -> JsonDict:
+        self._cleanup_retired_slots()
         agents = []
         for handle in self._handles.values():
             if handle.async_task.cancelled():
@@ -227,12 +1139,20 @@ class BrowserAgentSpawner:
             agents.append({
                 "workerId": handle.worker_id,
                 "agentId": handle.agent_id,
+                "slotId": handle.slot_id,
                 "name": handle.name,
                 "phaseId": handle.phase_id,
                 "status": status,
                 "task": handle.task,
             })
-        return {"status": "done", "agents": agents}
+        return {
+            "status": "done",
+            "agents": agents,
+            "slots": [
+                self._slot_summary(slot)
+                for slot in self._slots.values()
+            ],
+        }
 
     async def shutdown(self) -> None:
         pending = [
@@ -243,11 +1163,17 @@ class BrowserAgentSpawner:
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        for slot in list(self._slots.values()):
+            slot.status = "closed"
+            slot.current_worker_id = None
+            if slot.client is not None:
+                await slot.client.close()
 
     async def _run_browser_worker(
         self,
+        slot: BrowserAgentSlot,
+        expose_reusable_pages: bool,
         worker_id: str,
-        agent_id: str,
         name: str,
         task: str,
         context: str,
@@ -259,7 +1185,7 @@ class BrowserAgentSpawner:
     ) -> JsonDict:
         worker_runtime = replace(
             self.runtime,
-            agent_id=agent_id,
+            agent_id=slot.agent_id,
             harness=replace(
                 self.runtime.harness,
                 max_steps=max_steps or self.runtime.harness.worker_max_steps,
@@ -273,31 +1199,41 @@ class BrowserAgentSpawner:
             worker_runtime.harness.log_browser_payloads,
             prefix=f"{worker_id}.transport",
         )
-        worker_task = (
-            f"BrowserAgent name: {name}\n"
-            f"Independent context:\n{context or '(none)'}\n\n"
-            f"<worker_contract>\n"
-            f"{json.dumps(worker_contract or {}, ensure_ascii=False, indent=2, default=str)}\n"
-            f"</worker_contract>\n\n"
-            f"Result contract:\n{result_contract or 'Return a structured JSON string containing outcome, data, evidence, next_steps.'}\n\n"
-            f"Assigned task:\n{task}"
-        )
 
         try:
-            async with ABCPClient(worker_runtime.browser, on_event=event_logger) as browser:
-                registration = await browser.call(
-                    "System.register",
-                    {"agentId": worker_runtime.agent_id},
-                )
-                bundle = await self._capability_bundle_for_worker(
-                    browser,
-                    worker_runtime,
-                )
-                harness = self.browser_agent_factory(provider, browser, worker_runtime, self.logger)
-                harness.worker_contract = worker_contract or {}
-                harness.preloaded_registration = registration
-                harness.preloaded_capability_bundle = bundle
-                answer = await harness.run(worker_task)
+            if slot.client is None:
+                raise ABCPTransportError(f"Slot {slot.slot_id} has no browser client")
+            slot.client.on_event = event_logger
+            registration = await self._prepare_slot_for_worker(
+                slot,
+                worker_id,
+                expose_reusable_pages=expose_reusable_pages,
+            )
+            bundle = await self._capability_bundle_for_worker(
+                slot.client,
+                worker_runtime,
+            )
+            slot_context = self._render_slot_context(
+                slot,
+                expose_reusable_pages=expose_reusable_pages,
+            )
+            effective_context = context or "(none)"
+            if slot_context:
+                effective_context = f"{effective_context}\n\n{slot_context}".strip()
+            worker_task = (
+                f"BrowserAgent name: {name}\n"
+                f"Independent context:\n{effective_context}\n\n"
+                f"<worker_contract>\n"
+                f"{json.dumps(worker_contract or {}, ensure_ascii=False, indent=2, default=str)}\n"
+                f"</worker_contract>\n\n"
+                f"Result contract:\n{result_contract or 'Return a structured JSON string containing outcome, data, evidence, next_steps.'}\n\n"
+                f"Assigned task:\n{task}"
+            )
+            harness = self.browser_agent_factory(provider, slot.client, worker_runtime, self.logger)
+            harness.worker_contract = worker_contract or {}
+            harness.preloaded_registration = registration
+            harness.preloaded_capability_bundle = bundle
+            answer = await harness.run(worker_task)
             trace_path = self._write_worker_trace(worker_id, harness.trace)
             trace_summary = self._summarize_worker_trace(harness.trace)
             challenge_tracker = getattr(harness, "challenge_tracker", None)
@@ -314,6 +1250,11 @@ class BrowserAgentSpawner:
                 contract=worker_contract,
                 artifacts=harness.artifacts,
                 attempt_artifacts=getattr(harness, "extraction_attempt_artifacts", []),
+                prior_artifacts=phase_prior_artifact_paths(
+                    self.logger,
+                    phase_id=phase_id,
+                    exclude_worker_id=worker_id,
+                ),
                 task_dir=self.logger.task_dir,
             )
             terminal_classification = classification_for_worker_status(
@@ -341,7 +1282,8 @@ class BrowserAgentSpawner:
                 "statusCategory": status_category(harness.final_status),
                 "validatedStatus": validated_status,
                 "workerId": worker_id,
-                "agentId": agent_id,
+                "agentId": slot.agent_id,
+                "slotId": slot.slot_id,
                 "name": name,
                 "phaseId": phase_id,
                 "answer": answer,
@@ -364,41 +1306,92 @@ class BrowserAgentSpawner:
                 if diagnostics is not None
                 else {},
             }
+            self._update_slot_after_worker(
+                slot,
+                worker_id=worker_id,
+                phase_id=phase_id,
+                worker_contract=worker_contract,
+                result=result,
+                trace=getattr(harness, "trace", []),
+            )
         except asyncio.CancelledError:
+            harness_obj = locals().get("harness")
+            trace = (
+                getattr(harness_obj, "trace", [])
+                if harness_obj is not None
+                else []
+            )
             result = {
                 "status": WORKER_STATUS_CANCELLED,
                 "statusCategory": status_category(WORKER_STATUS_CANCELLED),
                 "workerId": worker_id,
-                "agentId": agent_id,
+                "agentId": slot.agent_id,
+                "slotId": slot.slot_id,
                 "name": name,
                 "phaseId": phase_id,
             }
             result = self._prepare_worker_result(
                 result,
                 worker_id=worker_id,
-                agent_id=agent_id,
+                agent_id=slot.agent_id,
                 phase_id=phase_id,
             )
             self.logger.write(
                 "spawner.browser.result",
                 trim_large_strings(result, 8000),
             )
+            self._record_slot_result(
+                slot,
+                worker_id=worker_id,
+                phase_id=phase_id,
+                worker_contract=worker_contract,
+                result=result,
+                trace=trace,
+            )
+            self._mark_slot_idle(slot, worker_id=worker_id, result=result)
             raise
         except Exception as exc:
+            harness_obj = locals().get("harness")
+            trace = (
+                getattr(harness_obj, "trace", [])
+                if harness_obj is not None
+                else []
+            )
+            if harness_obj is not None:
+                self._update_slot_registry_from_trace(
+                    slot,
+                    trace,
+                )
+            if isinstance(exc, ABCPTransportError):
+                slot.status = "broken"
+                slot.sync_errors.append(str(exc)[:500])
+                if slot.client is not None:
+                    await slot.client.close()
+                    slot.client = None
             result = {
                 "status": WORKER_STATUS_FAILED,
                 "statusCategory": status_category(WORKER_STATUS_FAILED),
                 "workerId": worker_id,
-                "agentId": agent_id,
+                "agentId": slot.agent_id,
+                "slotId": slot.slot_id,
                 "name": name,
                 "phaseId": phase_id,
                 "error": str(exc),
             }
+            self._record_slot_result(
+                slot,
+                worker_id=worker_id,
+                phase_id=phase_id,
+                worker_contract=worker_contract,
+                result=result,
+                trace=None,
+            )
+            self._mark_slot_idle(slot, worker_id=worker_id, result=result)
 
         result = self._prepare_worker_result(
             result,
             worker_id=worker_id,
-            agent_id=agent_id,
+            agent_id=slot.agent_id,
             phase_id=phase_id,
         )
         attempt_digest = build_attempt_digest(
@@ -409,17 +1402,7 @@ class BrowserAgentSpawner:
             result_contract=result_contract,
         )
         result["attemptDigest"] = attempt_digest
-        worker_status = str(result.get("status") or "unknown")
-        phase_result_status = (
-            worker_status
-            if worker_status in {
-                "blocked_by_challenge",
-                "hitl_required",
-                "hitl_timeout",
-                "page_settled_after_hitl",
-            }
-            else str(result.get("validatedStatus") or result.get("status") or "unknown")
-        )
+        phase_result_status = phase_result_status_for(result)
         mark_phase_result(
             self.logger,
             phase_id=phase_id,
@@ -433,6 +1416,17 @@ class BrowserAgentSpawner:
             worker_contract=worker_contract or {},
             result=result,
         )
+        learned_strategy = record_learned_strategy(
+            self.runtime.harness.strategy_bank_path,
+            worker_contract=worker_contract or {},
+            result=result,
+            phase=phase or {},
+            logger=self.logger,
+        )
+        if learned_strategy:
+            result["learnedStrategy"] = learned_strategy
+        if slot.status == "running":
+            self._mark_slot_idle(slot, worker_id=worker_id, result=result)
         self.logger.write("spawner.browser.result", trim_large_strings(result, 8000))
         return result
 
@@ -682,6 +1676,7 @@ class BrowserAgentSpawner:
                     "statusCategory": status_category(WORKER_STATUS_CANCELLED),
                     "workerId": handle.worker_id,
                     "agentId": handle.agent_id,
+                    "slotId": handle.slot_id,
                     "name": handle.name,
                     "phaseId": handle.phase_id,
                 },
@@ -696,6 +1691,7 @@ class BrowserAgentSpawner:
                     "statusCategory": status_category(WORKER_STATUS_FAILED),
                     "workerId": handle.worker_id,
                     "agentId": handle.agent_id,
+                    "slotId": handle.slot_id,
                     "name": handle.name,
                     "phaseId": handle.phase_id,
                     "error": str(exc),
@@ -709,11 +1705,106 @@ class BrowserAgentSpawner:
         self._counter += 1
         return f"{prefix}-{self._counter:03d}"
 
+    def _next_slot_id(self) -> str:
+        self._slot_counter += 1
+        return f"slot-{self._slot_counter:03d}"
+
+
+CHALLENGE_PHASE_STATUSES = frozenset({
+    "blocked_by_challenge",
+    "hitl_required",
+    "hitl_timeout",
+    "page_settled_after_hitl",
+    "stale_pause_deadlock",
+})
+
+
+def phase_result_status_for(result: JsonDict) -> str:
+    """Map a worker result to the status recorded against its phase.
+
+    A challenge/HITL status normally freezes the phase ("do not retry without
+    user action"). But when the worker recovered and its artifacts passed
+    validation, the phase contract IS fulfilled — marking it as a challenge
+    blocker would hide a validated success (observed in task 3b346d7e:
+    browser-001 hit a stale-pause deadlock, recovered on a fresh page, and
+    delivered the full validated phase-1 artifact).
+    """
+    worker_status = str(result.get("status") or "unknown")
+    validation = result.get("artifactValidation")
+    validation_done = (
+        isinstance(validation, dict) and validation.get("status") == "done"
+    )
+    if worker_status in CHALLENGE_PHASE_STATUSES and not validation_done:
+        return worker_status
+    return str(result.get("validatedStatus") or result.get("status") or "unknown")
+
 
 def _safe_str_list(value: Any) -> List[str]:
     if not isinstance(value, list):
         return []
     return [str(item) for item in value if item is not None]
+
+
+def _origins_from_text(text: str) -> Set[str]:
+    origins: Set[str] = set()
+    for match in URL_RE.findall(str(text or "")):
+        origin = _origin_from_url(match.rstrip(".,);]"))
+        if origin:
+            origins.add(origin)
+    return origins
+
+
+def _origin_from_url(url: str) -> str:
+    try:
+        parsed = urlparse(str(url or ""))
+    except ValueError:
+        return ""
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme}://{parsed.netloc}".lower()
+
+
+def _phase_family(phase_id: Optional[str]) -> str:
+    text = str(phase_id or "").strip()
+    if not text:
+        return ""
+    # phase_2a, phase_2b, phase_2c should prefer the same reusable slot.
+    return re.sub(r"(?<=\d)[a-z]$", "", text)
+
+
+def _page_hidden_from_reuse(slot: BrowserAgentSlot, page: JsonDict) -> bool:
+    page_id = str(page.get("pageId") or "").strip()
+    if page_id and page_id in slot.page_quarantine:
+        return True
+    status = str(page.get("status") or "").strip().lower()
+    if status in {"stale", "quarantined", "stale_pause_deadlock"}:
+        return True
+    return bool(page.get("doNotUse"))
+
+
+def _text_indicates_paused_error(text: Any) -> bool:
+    lowered = str(text or "").lower()
+    return "err_page_paused" in lowered or "paused for human intervention" in lowered
+
+
+def _state_response_indicates_paused(value: Any) -> bool:
+    if _text_indicates_paused_error(value):
+        return True
+    if isinstance(value, dict):
+        data = value.get("data")
+        if isinstance(data, dict):
+            if data.get("paused") is True:
+                return True
+            status = str(data.get("status") or "").strip().lower()
+            if status == "paused":
+                return True
+            hitl = data.get("hitl")
+            if isinstance(hitl, dict) and hitl.get("isPaused") is True:
+                return True
+        response = value.get("response")
+        if isinstance(response, dict) and _state_response_indicates_paused(response):
+            return True
+    return False
 
 
 def _worker_feedback_classification(

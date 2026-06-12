@@ -33,6 +33,7 @@ from harness.local_fs import local_fs_jsonpath, local_fs_read, local_fs_search
 from harness.offload import offload_large_tool_result
 from harness.progress import extraction_artifact_count
 from harness.render_recovery import build_render_recovery_runner
+from harness.task_control import phase_prior_artifact_paths, validate_worker_artifacts
 from harness.tool_policy import disabled_reason_for_method
 from harness.tools.loop_guard import check_tool_call_loop
 from harness.tools.parsers import (
@@ -42,7 +43,7 @@ from harness.tools.parsers import (
     parse_direct_capability_params,
 )
 from harness.tools.registry import ToolContext, ToolRegistry
-from harness.utils import JsonDict, exception_payload, optional_int
+from harness.utils import JsonDict, exception_payload, optional_int, trim_large_strings
 from harness.vl import visual_verify_image
 
 
@@ -313,6 +314,7 @@ async def _browser_navigate_verified(ctx: ToolContext) -> JsonDict:
         "hitl_required",
         "hitl_timeout",
         "page_settled_after_hitl",
+        "stale_pause_deadlock",
     }:
         result = await _maybe_auto_hitl_for_challenge(
             ctx.agent,
@@ -610,6 +612,7 @@ async def _execute_browser_capability_tool(
                 "purpose": params.get("purpose"),
             },
         )
+    _ensure_hitl_request_reason(method, params, reason)
 
     try:
         runner = getattr(agent, "render_recovery_runner", None)
@@ -685,6 +688,7 @@ async def _invoke_browser_method(
     count_progress: bool = True,
 ) -> JsonDict:
     try:
+        _ensure_hitl_request_reason(method, params, str(params.get("purpose") or ""))
         runner = getattr(agent, "render_recovery_runner", None)
         if runner is None:
             runner = build_render_recovery_runner(
@@ -1363,7 +1367,7 @@ def _navigate_hitl_result(page_id: str, attempt: int, result: JsonDict) -> JsonD
         response = auto_hitl.get("response")
         if isinstance(response, dict) and isinstance(response.get("hitl_wait"), dict):
             wait = response.get("hitl_wait") or {}
-    if wait.get("status") in {"timeout", "page_settled_after_hitl"}:
+    if wait.get("status") in {"timeout", "page_settled_after_hitl", "stale_pause_deadlock"}:
         status = str(wait.get("status"))
     else:
         status = "hitl_required"
@@ -1373,6 +1377,9 @@ def _navigate_hitl_result(page_id: str, attempt: int, result: JsonDict) -> JsonD
         " status=\"page_settled_after_hitl\" and surface that the ABCP control"
         " channel has not released the paused page yet."
         if status == "page_settled_after_hitl" else
+        "The page is in a stale HITL pause deadlock. Do not request HITL again;"
+        " continue from a fresh page/fleet or report the platform blocker."
+        if status == "stale_pause_deadlock" else
         "Human intervention was requested for a suspected challenge. Do not"
         " keep polling this page while it is paused; inspect autoHitl.hitl_wait."
     )
@@ -2304,6 +2311,20 @@ async def _maybe_auto_hitl_for_challenge(
         return result
     if getattr(agent, "challenge_adjudicating", False):
         return result
+    if _result_has_paused_error(result):
+        enriched = dict(result)
+        enriched["pausedState"] = {
+            "type": "hitl_paused_state",
+            "pageId": extract_page_id(params, result),
+            "triggerMethod": method,
+        }
+        enriched["next_instruction"] = (
+            "This is an existing HITL paused-state error, not a newly detected"
+            " page challenge. Do not call Hitl.requestPause again for this"
+            " page. Wait for an explicit HITL resume event, or let LeadAgent"
+            " restart with a fresh page if the pause is stale."
+        )
+        return enriched
     tracker = getattr(agent, "challenge_tracker", None)
     if tracker is None:
         tracker = ChallengeTracker()
@@ -2351,6 +2372,30 @@ async def _maybe_auto_hitl_for_challenge(
         }
         return enriched
     return await _adjudicate_and_maybe_hitl(agent, page_id, method, result, step)
+
+
+def _result_has_paused_error(value: Any, *, depth: int = 0) -> bool:
+    if depth > 5:
+        return False
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_text = str(key).lower()
+            if key_text in {
+                "error",
+                "message",
+                "reason",
+                "status",
+                "observation",
+                "suggested_prompt",
+            } and _result_has_paused_error(item, depth=depth + 1):
+                return True
+            if isinstance(item, (dict, list)) and _result_has_paused_error(item, depth=depth + 1):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(_result_has_paused_error(item, depth=depth + 1) for item in value)
+    text = str(value or "").lower()
+    return "err_page_paused" in text or "paused for human intervention" in text
 
 
 def _post_hitl_repause_guard_ms(agent: Any, page_id: str) -> int:
@@ -2409,6 +2454,7 @@ async def _post_hitl_recovery_loop(
                     "still_challenge_after_hitl",
                     "timeout",
                     "page_settled_after_hitl",
+                    "stale_pause_deadlock",
                     "hitl_waiting",
                 }
                 recovery_status = (
@@ -2674,6 +2720,10 @@ async def _refresh_and_wait_for_post_hitl_retry(
         }
 
     harness_cfg = agent.runtime.harness
+    retry_snapshot = {
+        "url": str(_response_data(navigate_call).get("url") or current_url or ""),
+        "title": str(_response_data(navigate_call).get("title") or ""),
+    }
     wait_result = await wait_for_hitl_resume(
         browser=agent.browser,
         page_id=str(page_id),
@@ -2681,6 +2731,8 @@ async def _refresh_and_wait_for_post_hitl_retry(
         poll_interval_seconds=getattr(harness_cfg, "hitl_poll_interval_seconds", 2.0),
         diagnostics=getattr(agent, "diagnostics", None),
         logger=agent.logger,
+        challenge_verifier=_make_hitl_challenge_verifier(agent, str(page_id), step),
+        pause_snapshot=retry_snapshot,
     )
     wait_result = dict(wait_result)
     wait_result["postHitlRetry"] = {
@@ -2702,6 +2754,7 @@ async def _post_hitl_raw_browser_call(
     step: int,
 ) -> JsonDict:
     try:
+        _ensure_hitl_request_reason(method, params, str(params.get("purpose") or ""))
         runner = getattr(agent, "render_recovery_runner", None)
         if runner is None:
             runner = build_render_recovery_runner(
@@ -2796,6 +2849,7 @@ async def _adjudicate_and_maybe_hitl(
                 trigger_method,
                 step,
                 reason=str(vl_result.get("reason") or "VL confirmed challenge"),
+                trigger_result=result,
             )
             enriched["next_instruction"] = (
                 "The visual adjudicator confirmed a challenge and the harness"
@@ -2825,6 +2879,7 @@ async def _adjudicate_and_maybe_hitl(
             trigger_method,
             step,
             reason="High-confidence CAPTCHA/challenge keyword with VL disabled",
+            trigger_result=result,
         )
         enriched["next_instruction"] = (
             "VL is disabled, but a high-confidence challenge keyword was found."
@@ -2852,13 +2907,29 @@ async def _request_hitl_for_challenge(
     step: int,
     *,
     reason: str,
+    trigger_result: Optional[JsonDict] = None,
 ) -> JsonDict:
+    # Capture the pre-pause surface here so every auto-HITL path (VL-confirmed,
+    # VL-disabled high-confidence, future callers) records the snapshot that the
+    # verified-settlement title gate compares against.
+    trigger_data = _response_data(trigger_result) if trigger_result else {}
+    snapshot = {
+        "url": str(trigger_data.get("url") or ""),
+        "title": str(trigger_data.get("title") or ""),
+    }
+    if snapshot["url"] or snapshot["title"]:
+        snapshots = getattr(agent, "hitl_pause_snapshots", None)
+        if not isinstance(snapshots, dict):
+            snapshots = {}
+            agent.hitl_pause_snapshots = snapshots
+        snapshots[str(page_id)] = snapshot
     agent.logger.write(
         "hitl.auto_request_pause",
         {
             "pageId": page_id,
             "triggerMethod": trigger_method,
             "reason": reason,
+            "pauseSnapshot": snapshot,
         },
     )
     agent.challenge_adjudicating = True
@@ -2872,6 +2943,7 @@ async def _request_hitl_for_challenge(
                     "Anti-bot verification or CAPTCHA-like challenge was"
                     " detected; pause for user intervention."
                 ),
+                "reason": reason,
             },
             step,
         )
@@ -3081,7 +3153,78 @@ def _record_extraction(agent: Any, tool_input: JsonDict) -> JsonDict:
         saved_path = str(result.get("savedPath") or "")
         if saved_path and saved_path not in attempts:
             attempts.append(saved_path)
+    validation = _validate_recorded_extraction(agent, str(result.get("savedPath") or ""))
+    if validation:
+        result["artifactValidation"] = trim_large_strings(validation, 3000)
+        if validation.get("status") == "failed":
+            failures = [
+                failure for failure in (validation.get("failures") or [])
+                if isinstance(failure, dict)
+            ]
+            blocking = [
+                failure for failure in failures
+                if not _is_advisory_record_failure(failure)
+            ]
+            if blocking:
+                result["status"] = "needs_fix"
+                result["next_instruction"] = (
+                    "record_extraction saved the rows but the current worker_contract"
+                    " validators failed. Fix the row keys, artifact name, or values"
+                    " shown in artifactValidation before final_answer."
+                )
+            elif result.get("status") == "done":
+                result["validationPending"] = sorted({
+                    str(failure.get("type") or "") for failure in failures
+                })
+                result["next_instruction"] = (
+                    "Rows saved. Phase validation is not satisfied yet:"
+                    " keep collecting until the expected row count is reached,"
+                    " and include sourceTool/sourceSelectorOrAxId/pageUrl plus"
+                    " the canonical <field>EvidenceText keys (e.g. rankEvidenceText)"
+                    " before final_answer."
+                )
     return result
+
+
+def _is_advisory_record_failure(failure: JsonDict) -> bool:
+    """Failures an in-progress worker resolves by continuing (row-count
+    shortfall) or enriching rows on a later save (provenance) — not signals
+    that the just-saved rows are wrong."""
+    failure_type = str(failure.get("type") or "")
+    if failure_type in {"min_rows", "field_provenance"}:
+        return True
+    if failure_type == "exact_rows":
+        expected = failure.get("expected")
+        actual = failure.get("actual")
+        if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
+            return actual < expected
+    return False
+
+
+def _validate_recorded_extraction(agent: Any, saved_path: str) -> JsonDict:
+    contract = getattr(agent, "worker_contract", None)
+    if not isinstance(contract, dict) or not saved_path:
+        return {}
+    phase_id = str(contract.get("phase_id") or "")
+    try:
+        prior_artifacts = phase_prior_artifact_paths(
+            agent.logger,
+            phase_id=phase_id,
+            exclude_worker_id=getattr(agent, "worker_id", None),
+        )
+        return validate_worker_artifacts(
+            contract=contract,
+            artifacts=list(getattr(agent, "artifacts", []) or []),
+            attempt_artifacts=[saved_path],
+            prior_artifacts=prior_artifacts,
+            task_dir=agent.logger.task_dir,
+        )
+    except Exception as exc:
+        return {
+            "status": "skipped",
+            "reason": "record_extraction_validation_error",
+            "error": str(exc)[:500],
+        }
 
 
 def _record_extraction_schema_warnings(agent: Any, rows: List[JsonDict]) -> List[JsonDict]:
@@ -3181,6 +3324,83 @@ def _hitl_pause_succeeded(response: Any) -> bool:
     return False
 
 
+def _ensure_hitl_request_reason(method: str, params: JsonDict, reason: str = "") -> None:
+    if method != "Hitl.requestPause" or not isinstance(params, dict):
+        return
+    if str(params.get("reason") or "").strip():
+        return
+    purpose = str(params.get("purpose") or "").strip()
+    fallback = str(reason or "").strip()
+    text = purpose or fallback
+    if text:
+        params["reason"] = text
+
+
+def _make_hitl_challenge_verifier(agent: Any, page_id: str, step: int):
+    """Build the verified-settlement adjudicator for wait_for_hitl_resume.
+
+    Called by the HITL wait loop when lifecycle events suggest the human may
+    have finished the challenge. Returns the VL verdict dict; any failure mode
+    (VL disabled, screenshot blocked while paused, budget) degrades to
+    verdict="unavailable" so the wait falls back to title evidence.
+    """
+    async def verify(evidence: JsonDict) -> JsonDict:
+        agent.challenge_adjudicating = True
+        try:
+            vl_result = await _visual_verify(
+                agent,
+                {
+                    "pageId": page_id,
+                    "selector": "",
+                    "id": "",
+                    "fullPage": False,
+                    "mode": "challenge_detection",
+                    "question": (
+                        "This page was paused for a human to handle a"
+                        " CAPTCHA/Cloudflare-style challenge and has since"
+                        " emitted load/title events. Is a challenge still"
+                        " visible, or is this the normal target page now?"
+                    ),
+                    "expected": {
+                        "pageId": page_id,
+                        "settlementEvidence": evidence,
+                    },
+                    "_force": True,
+                },
+                step,
+            )
+        except Exception as exc:
+            return {
+                "verdict": "unavailable",
+                "errorType": type(exc).__name__,
+                "error": str(exc)[:300],
+            }
+        finally:
+            agent.challenge_adjudicating = False
+        if not isinstance(vl_result, dict):
+            return {"verdict": "unavailable"}
+        status = str(vl_result.get("status") or "").strip().lower()
+        if status in {"disabled", "rejected", "failed", "error"}:
+            return {
+                "verdict": "unavailable",
+                "status": status,
+                "reason": str(
+                    vl_result.get("reason") or vl_result.get("error") or ""
+                )[:300],
+            }
+        return vl_result
+
+    return verify
+
+
+def _hitl_pause_snapshot(agent: Any, page_id: str) -> Optional[JsonDict]:
+    snapshots = getattr(agent, "hitl_pause_snapshots", None)
+    if not isinstance(snapshots, dict):
+        return None
+    snapshot = snapshots.get(str(page_id))
+    return snapshot if isinstance(snapshot, dict) else None
+
+
 async def _enrich_pause_with_wait(
     agent: Any,
     params: JsonDict,
@@ -3203,6 +3423,8 @@ async def _enrich_pause_with_wait(
         poll_interval_seconds=getattr(harness_cfg, "hitl_poll_interval_seconds", 2.0),
         diagnostics=diagnostics,
         logger=agent.logger,
+        challenge_verifier=_make_hitl_challenge_verifier(agent, str(page_id), step),
+        pause_snapshot=_hitl_pause_snapshot(agent, str(page_id)),
     )
     if wait_result.get("status") == "resumed":
         wait_result = await _post_hitl_recovery_loop(
@@ -3239,13 +3461,22 @@ async def _enrich_pause_with_wait(
     elif wait_result.get("status") in {
         "still_challenge_after_hitl",
         "browser_error_after_hitl",
+        "stale_pause_deadlock",
     }:
-        enriched["suggested_prompt"] = (
-            "Post-HITL recovery did not confirm a usable page. Do NOT call"
-            " more browser tools or Hitl.* methods in this worker; call"
-            " final_answer(status=\"incomplete\") and report hitl_wait.status,"
-            " postHitlRecovery evidence, screenshotPath, and pageId to LeadAgent."
-        )
+        if wait_result.get("status") == "stale_pause_deadlock":
+            enriched["suggested_prompt"] = (
+                "HITL pause is deadlocked: Hitl.resolvePause is blocked by"
+                " ERR_PAGE_PAUSED. Do NOT call Hitl.requestPause again for this"
+                " page; report status=stale_pause_deadlock and let LeadAgent"
+                " continue from a fresh page/fleet."
+            )
+        else:
+            enriched["suggested_prompt"] = (
+                "Post-HITL recovery did not confirm a usable page. Do NOT call"
+                " more browser tools or Hitl.* methods in this worker; call"
+                " final_answer(status=\"incomplete\") and report hitl_wait.status,"
+                " postHitlRecovery evidence, screenshotPath, and pageId to LeadAgent."
+            )
     elif wait_result.get("status") == "page_settled_after_hitl":
         enriched["suggested_prompt"] = (
             "The page appears to be past the challenge, but ABCP still reports"
@@ -3504,8 +3735,10 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                     "items": {"type": "object", "additionalProperties": True},
                     "description": (
                         "Structured rows; every row must be a JSON object. Use exact expected_artifact"
-                        " field names and include sourceTool/sourceSelectorOrAxId/pageUrl/evidence"
-                        " for sensitive fields when applicable."
+                        " field names. For sensitive fields include pageUrl, sourceTool,"
+                        " sourceSelectorOrAxId, and the canonical <field>EvidenceText"
+                        " key, e.g. rankEvidenceText. Legacy evidence/<field>Evidence"
+                        " aliases may validate but should not be preferred."
                     ),
                 },
                 "schema": {
