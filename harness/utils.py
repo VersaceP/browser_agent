@@ -360,6 +360,34 @@ def task_subdir(logger: RunLogger, name: str) -> Path:
     return path
 
 
+def _sanitize_messages_for_snapshot(messages: List[JsonDict]) -> List[JsonDict]:
+    """Return a copy of messages with sensitive tool_use inputs masked, so the
+    on-disk context snapshot never persists secrets. Done lazily-imported to
+    avoid a load-time dependency from this low-level module on tool_policy."""
+    from harness.tool_policy import sanitize_tool_input_for_log
+
+    sanitized: List[JsonDict] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            sanitized.append(message)
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            sanitized.append(message)
+            continue
+        new_content = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                new_content.append({
+                    **block,
+                    "input": sanitize_tool_input_for_log(block.get("name"), block.get("input", {})),
+                })
+            else:
+                new_content.append(block)
+        sanitized.append({**message, "content": new_content})
+    return sanitized
+
+
 def write_context_snapshot(
     logger: RunLogger,
     *,
@@ -378,7 +406,10 @@ def write_context_snapshot(
         "name": name,
         "metadata": metadata or {},
         "system_prompt": system_prompt,
-        "messages": messages,
+        # The live `messages` carry raw tool_use inputs (incl. masked fields like
+        # a password typed via fill_field_verified). Sanitize a copy for the
+        # on-disk snapshot; the live conversation is untouched.
+        "messages": _sanitize_messages_for_snapshot(messages),
         "tools": tools,
     }
     path.write_text(

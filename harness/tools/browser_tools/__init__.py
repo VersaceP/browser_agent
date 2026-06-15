@@ -30,11 +30,32 @@ from harness.extraction_artifacts import (
 from harness.hitl import wait_for_hitl_resume
 from harness.lifecycle import LifecycleContext, lifecycle_for
 from harness.local_fs import local_fs_jsonpath, local_fs_read, local_fs_search
+from harness.observation.overlay_actions import (
+    compute_backdrop_point,
+    backdrop_point_is_safe,
+    find_close_control,
+    is_sensitive_method,
+    is_sensitive_target,
+    normalized_point_to_css,
+    visible_layers_occluded,
+    vl_dismiss_target_is_safe,
+)
+from harness.observation.overlay_detector import detect_overlay_from_result
+from harness.observation.semantic_index import discover_selector_candidates
+from harness.observation.verifiers import (
+    build_read_only_oracle,
+    collect_rows,
+    probe_occluder,
+    probe_viewport_metrics,
+    SemanticLocator,
+    verify_field_value,
+    verify_overlay_gone,
+)
 from harness.offload import offload_large_tool_result
 from harness.progress import extraction_artifact_count
 from harness.render_recovery import build_render_recovery_runner
 from harness.task_control import phase_prior_artifact_paths, validate_worker_artifacts
-from harness.tool_policy import disabled_reason_for_method
+from harness.tool_policy import disabled_reason_for_method, mask_params
 from harness.tools.loop_guard import check_tool_call_loop
 from harness.tools.parsers import (
     attach_method_schema,
@@ -44,42 +65,26 @@ from harness.tools.parsers import (
 )
 from harness.tools.registry import ToolContext, ToolRegistry
 from harness.utils import JsonDict, exception_payload, optional_int, trim_large_strings
+from .schemas import EVAL_JS_REASON_KINDS, _browser_input_schemas
+from .axtree_state import (
+    AXTREE_INVALIDATING_METHODS,
+    _apply_recovered_target,
+    _axtree_ids_from_params,
+    _axtree_ids_from_value,
+    _axtree_lines_from_value,
+    _axtree_nodes_from_lines,
+    _axtree_seen_ids,
+    _axtree_seen_signature,
+    _browser_side_rematch_mode,
+    _check_stale_axtree_target,
+    _invalidate_axtree_snapshot,
+    _observe_axtree_state_after,
+    _precompute_axtree_snapshot,
+    _record_axtree_history,
+)
 from harness.vl import visual_verify_image
 
 
-EVAL_JS_REASON_KINDS = {
-    "computed_geometry",
-    "cross_node_relationship",
-    "shadow_dom_traversal",
-    "cross_frame_aggregation",
-    "non_dom_state",
-    "legacy_no_dom_equivalent",
-}
-
-AXTREE_ID_RE = re.compile(r"^\d+:-?\d+:-?\d+$")
-AXTREE_ID_TOKEN_RE = re.compile(r"\[(\d+:-?\d+:-?\d+)\]")
-AXTREE_ID_ANYWHERE_RE = re.compile(r"\b\d+:-?\d+:-?\d+\b")
-AXTREE_LINE_RE = re.compile(
-    r"^(?P<indent>\s*)\[(?P<id>\d+:-?\d+:-?\d+)\]\s+"
-    r"(?P<role>[^\s\"]+)(?:\s+\"(?P<name>.*?)\")?(?P<rest>.*)$"
-)
-
-AXTREE_INVALIDATING_METHODS = {
-    "Page.create",
-    "Page.navigate",
-    "Page.recovered",
-    "Page.close",
-    "Page.switchTo",
-    "Page.handleDialog",
-    "File.handleChooser",
-    "Runtime.evaluate",
-    "Input.click",
-    "Input.type",
-    "Input.press",
-    "Input.scroll",
-    "Input.drag",
-    "Hitl.requestPause",
-}
 
 SCREENSHOT_MISUSE_RE = re.compile(
     r"\b("
@@ -324,6 +329,64 @@ async def _browser_navigate_verified(ctx: ToolContext) -> JsonDict:
             ctx.step,
         )
     return result
+
+
+@BROWSER_TOOLS.register(
+    name="dismiss_overlay",
+    description=(
+        "Dismiss an overlay/modal/cookie-banner blocking a target action. Runs"
+        " the dismiss ladder internally (find close control -> click -> verify"
+        " -> Escape -> verify -> verified backdrop click -> verify) and reports"
+        " a structured result. Auth/login and paywall overlays are never"
+        " auto-dismissed (returns status=blocked). Optionally retries the"
+        " original action after the overlay is gone, but never a consequential"
+        " one (submit/pay/login -> status=dismissed_pending_action)."
+    ),
+    input_schema=_browser_schema_for("dismiss_overlay"),
+    contract_check=True,
+    trace_type="dismiss_overlay",
+)
+async def _browser_dismiss_overlay(ctx: ToolContext) -> JsonDict:
+    return await _dismiss_overlay(ctx.agent, ctx.tool_input, ctx.step)
+
+
+@BROWSER_TOOLS.register(
+    name="collect_items",
+    description=(
+        "Collect a repeated list/card/row collection that grows by scrolling or"
+        " a load-more button, without burning a model step per round. Harvests"
+        " rows every round and dedups by a stable key, so lazy-loaded AND"
+        " virtualized lists (rows recycled out of the DOM) are fully captured."
+        " Stops on target count, stagnation, or the round budget, then persists"
+        " the rows via record_extraction. Use a freshly created tab (a reused"
+        " tab can cap some sites' lazy-loader). Not for filter/search/sort,"
+        " which change the data set."
+    ),
+    input_schema=_browser_schema_for("collect_items"),
+    contract_check=True,
+    trace_type="collect_items",
+)
+async def _browser_collect_items(ctx: ToolContext) -> JsonDict:
+    return await _collect_items(ctx.agent, ctx.tool_input, ctx.step)
+
+
+@BROWSER_TOOLS.register(
+    name="fill_field_verified",
+    description=(
+        "Type a value into a form field and verify it was actually accepted by"
+        " reading the field's live value back (handles React/controlled inputs"
+        " where the DOM attribute lags). On mismatch it clears harder and"
+        " retries once; if the field can't be uniquely located it yields"
+        " (ambiguous/field_not_found) instead of claiming success. Recovers from"
+        " an occluding overlay. Never submits the form — do that as a separate"
+        " verified action."
+    ),
+    input_schema=_browser_schema_for("fill_field_verified"),
+    contract_check=True,
+    trace_type="fill_field_verified",
+)
+async def _browser_fill_field_verified(ctx: ToolContext) -> JsonDict:
+    return await _fill_field_verified(ctx.agent, ctx.tool_input, ctx.step)
 
 
 @BROWSER_TOOLS.register(
@@ -587,7 +650,14 @@ async def _execute_browser_capability_tool(
         agent.trace.append({"type": "browser_call_params_error", "result": target_param_guard})
         return target_param_guard, False
 
-    stale_target = _check_stale_axtree_target(agent, method, params)
+    stale_target = _check_stale_axtree_target(
+        agent,
+        method,
+        params,
+        # Model-initiated calls only bypass the guard in the explicit "on"
+        # mode; composite tools opt in per-call regardless ("composite_only").
+        allow_rematch=_browser_side_rematch_mode(agent) == "on",
+    )
     if stale_target is not None:
         agent.logger.write("browser.call.stale_axtree_target", stale_target)
         agent.trace.append({"type": "stale_axtree_target", "result": stale_target})
@@ -624,6 +694,18 @@ async def _execute_browser_capability_tool(
                 recent_recoveries=agent._render_recovery_recent,
             )
             agent.render_recovery_runner = runner
+        # Sample the event serial + held page before the call so post-action
+        # invalidation can detect a same-page DOM.axTreeUpdated that landed
+        # mid-call (race fix) without letting a cross-page event suppress it.
+        event_serial_before = int(getattr(agent, "axtree_event_serial", 0) or 0)
+        page_before = str(getattr(agent, "axtree_page_id", "") or "")
+        if method == "Hitl.requestPause":
+            await _capture_hitl_pause_snapshot(
+                agent,
+                runner,
+                str(params.get("pageId") or ""),
+                step,
+            )
         response, _recovery = await runner.call(method, params)
         response = agent._capture_artifacts(method, response)
         axtree_snapshot = _precompute_axtree_snapshot(method, params, response)
@@ -652,13 +734,27 @@ async def _execute_browser_capability_tool(
     result = _attach_runtime_strategy_hints(result, method=method)
     result = await _maybe_auto_hitl_for_challenge(agent, method, params, result, step)
     result = _attach_normalized_handles(result)
+    # Record THIS call's AXTree snapshot first (precomputed_snapshot is the
+    # pre-auto-intercept tree). Auto-intercept runs AFTER: its dismiss_overlay
+    # mutates the page and its own internal calls invalidate/refresh the snapshot,
+    # so the last word on agent.axtree_* reflects the post-dismiss page. If
+    # auto-intercept ran before this, the stale precomputed DOM.getAXTree snapshot
+    # would be written back as clean even though the page just changed.
     _observe_axtree_state_after(
         agent,
         method,
         params,
         result,
         precomputed_snapshot=axtree_snapshot if "axtree_snapshot" in locals() else None,
+        event_serial_before=event_serial_before if "event_serial_before" in locals() else None,
+        page_before=page_before if "page_before" in locals() else None,
     )
+    # Phase 7.2: optionally auto-run the dismiss_overlay micro-loop (gated by
+    # config auto_intercept). dismiss_overlay uses _invoke_browser_method (not
+    # this model path), so there is no recursion; its internal clicks/re-inspects
+    # leave agent.axtree_* either invalidated or refreshed to the post-dismiss
+    # tree — never a stale snapshot marked clean.
+    result = await _maybe_auto_intercept_overlay(agent, method, params, result, step)
     agent.logger.write("browser.call.result", agent._trim_for_log(result))
     model_result = agent._clean_for_model(result)
     model_result = offload_large_tool_result(
@@ -686,7 +782,38 @@ async def _invoke_browser_method(
     step: int,
     *,
     count_progress: bool = True,
+    read_only_eval: bool = False,
+    allow_rematch: bool = False,
+    internal: bool = False,
+    redact_params: Optional[Set[str]] = None,
 ) -> JsonDict:
+    # internal=True marks a harness plumbing call (e.g. the title side-channel's
+    # PENDING/READY/CHUNK markers): it must not enter the observation chain —
+    # no challenge adjudication, diagnostics, progress, or model-facing trace —
+    # only a compact audit log. Such calls also never count as progress.
+    if internal:
+        count_progress = False
+    # redact_params: the browser still receives the real values, but these keys
+    # are masked everywhere the call surfaces (result/log/trace/model_result,
+    # and the render-recovery logs/advisory), so secrets (e.g. Input.type text
+    # for a password) never hit logs or trace.
+    def _shown_params(p: JsonDict) -> JsonDict:
+        return mask_params(p, redact_params)
+    # Composite tools opt in with allow_rematch=True so previously-seen stale
+    # ids pass through to the browser-side rematch while never-seen ids and
+    # page mismatches are still blocked. Default (False) preserves the legacy
+    # behavior of internal calls: no stale guard at this layer. The model
+    # path keeps its own guard in _execute_browser_capability_tool.
+    if allow_rematch:
+        stale_target = _check_stale_axtree_target(
+            agent, method, params, allow_rematch=True
+        )
+        if stale_target is not None:
+            logger = getattr(agent, "logger", None)
+            if logger is not None:
+                logger.write("browser.call.stale_axtree_target", stale_target)
+            agent.trace.append({"type": "stale_axtree_target", "result": stale_target})
+            return stale_target
     try:
         _ensure_hitl_request_reason(method, params, str(params.get("purpose") or ""))
         runner = getattr(agent, "render_recovery_runner", None)
@@ -698,7 +825,22 @@ async def _invoke_browser_method(
                 recent_recoveries=agent._render_recovery_recent,
             )
             agent.render_recovery_runner = runner
-        response, _recovery = await runner.call(method, params)
+        # Only forward redact_params when set, so runners that predate the kwarg
+        # (test fakes) keep working for the common non-redacted path.
+        runner_kwargs = {"redact_params": redact_params} if redact_params else {}
+        # Sample the event serial + held page before the call so post-action
+        # invalidation can detect a same-page DOM.axTreeUpdated that landed
+        # mid-call (race fix) without letting a cross-page event suppress it.
+        event_serial_before = int(getattr(agent, "axtree_event_serial", 0) or 0)
+        page_before = str(getattr(agent, "axtree_page_id", "") or "")
+        if method == "Hitl.requestPause":
+            await _capture_hitl_pause_snapshot(
+                agent,
+                runner,
+                str(params.get("pageId") or ""),
+                step,
+            )
+        response, _recovery = await runner.call(method, params, **runner_kwargs)
         response = agent._capture_artifacts(method, response)
         axtree_snapshot = _precompute_axtree_snapshot(method, params, response)
         response = agent._offload_response(method, params, response, step)
@@ -706,19 +848,20 @@ async def _invoke_browser_method(
             response = await _enrich_pause_with_wait(agent, params, response, step)
         result = {
             "method": method,
-            "params": params,
+            "params": _shown_params(params),
             "response": response,
         }
         if isinstance(response, dict) and response.get("error"):
             attach_method_schema(result, method, agent.method_schemas)
     except ABCPTransportError as exc:
-        result = {"method": method, "params": params, "error": str(exc)}
+        result = {"method": method, "params": _shown_params(params), "error": str(exc)}
         attach_method_schema(result, method, agent.method_schemas)
 
     attach_error_classification(result, method=method)
     result = _attach_navigation_check(result, method=method, params=params)
     result = _attach_runtime_strategy_hints(result, method=method)
-    result = await _maybe_auto_hitl_for_challenge(agent, method, params, result, step)
+    if not internal:
+        result = await _maybe_auto_hitl_for_challenge(agent, method, params, result, step)
     result = _attach_normalized_handles(result)
     _observe_axtree_state_after(
         agent,
@@ -726,7 +869,13 @@ async def _invoke_browser_method(
         params,
         result,
         precomputed_snapshot=axtree_snapshot if "axtree_snapshot" in locals() else None,
+        read_only_eval=read_only_eval,
+        event_serial_before=event_serial_before if "event_serial_before" in locals() else None,
+        page_before=page_before if "page_before" in locals() else None,
     )
+    if internal:
+        agent.logger.write("browser.call.internal", {"method": method})
+        return agent._clean_for_model(result)
     agent.diagnostics.observe_browser_call(method, params, result)
     agent.logger.write("browser.call.result", agent._trim_for_log(result))
     model_result = agent._clean_for_model(result)
@@ -736,7 +885,7 @@ async def _invoke_browser_method(
         "type": "browser_call",
         "step": step,
         "method": method,
-        "params": params,
+        "params": _shown_params(params),
         "result": agent._clean_for_model(model_result),
     })
     return model_result
@@ -1393,6 +1542,219 @@ def _navigate_hitl_result(page_id: str, attempt: int, result: JsonDict) -> JsonD
     }
 
 
+def _loop_interrupt_summary(
+    status: str,
+    *,
+    autoHitl: Optional[JsonDict] = None,
+    pausedState: Optional[JsonDict] = None,
+) -> JsonDict:
+    """Summary a composite loop returns when a HITL/challenge interrupt aborts it.
+
+    For the blocked statuses needsHuman=True tells the LLM that resuming/retrying
+    is futile until a human clears the page. The `hitl_resumed` status is
+    different: a human ALREADY resolved the challenge mid-loop, so needsHuman is
+    False — but the loop still STOPS (loopInterrupted) because the page may have
+    changed under the human (navigation, closed dialogs, altered form state) and
+    the loop's local assumptions / target ids are no longer trustworthy. The
+    model must re-observe and re-issue rather than the loop blindly continuing."""
+    instructions = {
+        "hitl_required": (
+            "A human verification (e.g. Cloudflare/CAPTCHA) blocked this page and"
+            " the loop paused for HITL. Do NOT resume the loop or retry browser"
+            " actions; wait for the human resume event or report the blocker to"
+            " LeadAgent."
+        ),
+        "timeout": (
+            "Human intervention was requested for a challenge but did not complete"
+            " in time. Do NOT resume the loop or retry; report the blocker or hand"
+            " off to LeadAgent."
+        ),
+        "page_settled_after_hitl": (
+            "The page looks past the challenge but ABCP still reports it paused."
+            " Do NOT resume the loop; surface that the control channel has not"
+            " released the page."
+        ),
+        "stale_pause_deadlock": (
+            "The page is in a stale HITL pause deadlock. Do NOT request HITL again"
+            " or resume the loop; continue from a fresh page/fleet or report the"
+            " platform blocker."
+        ),
+        "hitl_resumed": (
+            "A human resolved a challenge (e.g. Cloudflare) mid-loop, so the page"
+            " may have changed (navigation, closed dialogs, altered form state)."
+            " The loop stopped WITHOUT acting on possibly-stale state. Re-observe"
+            " with Page.getState + DOM.getAXTree, then re-issue the action/tool"
+            " with fresh ids if it is still valid. Any partial results are included."
+        ),
+    }
+    needs_human = status != "hitl_resumed"
+    if status == "hitl_resumed":
+        resume = "reobserve_then_reissue"
+    elif status in {"hitl_required", "timeout"}:
+        resume = "wait_for_human"
+    else:
+        resume = "fresh_page_or_report"
+    summary: JsonDict = {
+        "status": status,
+        "loopInterrupted": True,
+        "needsHuman": needs_human,
+        "resumeRecommendation": resume,
+        "next_instruction": instructions.get(status, instructions["hitl_required"]),
+    }
+    # Layer 2 discipline: surface only a compact digest to the model. The full
+    # autoHitl payload (pause request, VL adjudication, nested response) is
+    # verbose and already in the run log via browser.call.result; the model only
+    # needs the wait status + where/why.
+    if autoHitl is not None:
+        summary["hitlDigest"] = _hitl_digest(autoHitl)
+    if pausedState is not None:
+        summary["pausedState"] = pausedState
+    return summary
+
+
+def _hitl_digest(auto_hitl: Any) -> JsonDict:
+    """Compact, model-facing digest of an autoHitl payload."""
+    if not isinstance(auto_hitl, dict):
+        return {}
+    response = auto_hitl.get("response") if isinstance(auto_hitl.get("response"), dict) else {}
+    wait = response.get("hitl_wait") if isinstance(response.get("hitl_wait"), dict) else {}
+    suspected = (
+        auto_hitl.get("suspected_challenge")
+        if isinstance(auto_hitl.get("suspected_challenge"), dict) else {}
+    )
+    recovery = wait.get("postHitlRecovery") if isinstance(wait.get("postHitlRecovery"), dict) else {}
+    digest = {
+        "hitlWaitStatus": wait.get("status"),
+        "pageId": auto_hitl.get("pageId") or wait.get("pageId") or response.get("pageId"),
+        "reason": auto_hitl.get("reason") or suspected.get("reason") or suspected.get("adjudication"),
+        "postHitlRecoveryStatus": recovery.get("status"),
+        "screenshotPath": auto_hitl.get("screenshotPath") or suspected.get("screenshotPath"),
+    }
+    return {key: value for key, value in digest.items() if value is not None}
+
+
+def _loop_interrupt_from_result(result: Any) -> Optional[JsonDict]:
+    """Detect a HITL/challenge interrupt on a composite-loop internal browser
+    call. Composite tools run with the model OUT of the loop, so when a call
+    triggers auto-HITL (Cloudflare/CAPTCHA) or hits an already-paused page, the
+    loop must STOP and surface a human-needed summary rather than keep
+    clicking/scrolling or degrade to a generic stagnant/failed reason.
+
+    Returns a summary to return immediately, or None when there is no interrupt
+    and the loop may continue. NOTE: a `resumed` wait is NOT None — a human
+    touched the page mid-loop, so the loop stops with a non-terminal
+    `hitl_resumed` summary (needsHuman=False) for the model to re-observe; the
+    loop must not keep acting on possibly-stale local state. The pause+wait happen
+    synchronously inside the triggering _invoke_browser_method call, so the
+    outcome is on THAT result."""
+    if not isinstance(result, dict):
+        return None
+    if _result_has_auto_hitl(result):
+        auto = result.get("autoHitl")
+        wait: JsonDict = {}
+        response = auto.get("response") if isinstance(auto, dict) else None
+        if isinstance(response, dict) and isinstance(response.get("hitl_wait"), dict):
+            wait = response.get("hitl_wait") or {}
+        status = str(wait.get("status") or "")
+        if status == "resumed":
+            # A human cleared the challenge, but the page may have changed under
+            # them: stop and make the model re-observe rather than continue on
+            # stale ids/assumptions.
+            return _loop_interrupt_summary(
+                "hitl_resumed", autoHitl=auto if isinstance(auto, dict) else None
+            )
+        terminal = (
+            status
+            if status in {"timeout", "page_settled_after_hitl", "stale_pause_deadlock"}
+            else "hitl_required"
+        )
+        return _loop_interrupt_summary(
+            terminal, autoHitl=auto if isinstance(auto, dict) else None
+        )
+    paused_state = result.get("pausedState")
+    if isinstance(paused_state, dict) or _result_has_paused_error(result):
+        return _loop_interrupt_summary(
+            "hitl_required",
+            pausedState=paused_state if isinstance(paused_state, dict) else None,
+        )
+    return None
+
+
+def _invoke_result_failed(result: Any) -> bool:
+    """True when an _invoke_browser_method result represents a failed action.
+
+    Browser-side action errors surface in response.error / response.data.error
+    (top-level `error` is only set on transport exceptions), so a check that
+    only reads result["error"] would report a failed retry as succeeded."""
+    if not isinstance(result, dict):
+        return False
+    if result.get("error"):
+        return True
+    if result.get("status") == "stale_element_reference":
+        return True
+    response = result.get("response")
+    if isinstance(response, dict):
+        if response.get("error"):
+            return True
+        data = response.get("data")
+        if isinstance(data, dict) and data.get("error"):
+            return True
+    classification = result.get("errorClassification")
+    if isinstance(classification, dict) and classification.get("type"):
+        return True
+    return False
+
+
+def _result_occlusion_blocked(result: Any) -> bool:
+    """True when an action failed specifically because an overlay occluded the
+    target. Distinct from generic failure: an occluded load-more is recoverable
+    (dismiss the overlay and retry), not exhaustion."""
+    if not isinstance(result, dict):
+        return False
+    classification = result.get("errorClassification")
+    return isinstance(classification, dict) and classification.get("type") == "occlusion_blocked"
+
+
+def _layers_from_result(result: JsonDict) -> List[JsonDict]:
+    data = _response_data(result)
+    layers = data.get("layers")
+    return [layer for layer in layers if isinstance(layer, dict)] if isinstance(layers, list) else []
+
+
+def _viewport_from_layers(layers: List[JsonDict]) -> JsonDict:
+    for layer in layers:
+        if layer.get("isMainFrame"):
+            bounds = layer.get("viewportBounds")
+            if isinstance(bounds, dict):
+                return bounds
+    for layer in layers:
+        bounds = layer.get("viewportBounds")
+        if isinstance(bounds, dict):
+            return bounds
+    return {}
+
+
+def _log_dismiss_overlay(
+    agent: Any,
+    page_id: str,
+    status: str,
+    overlay: Optional[JsonDict],
+    attempts: List[JsonDict],
+) -> None:
+    logger = getattr(agent, "logger", None)
+    if logger is not None:
+        logger.write(
+            "dismiss_overlay.result",
+            {
+                "pageId": page_id,
+                "status": status,
+                "subtype": (overlay or {}).get("subtype"),
+                "attemptCount": len(attempts),
+                "attempts": attempts,
+            },
+        )
+
+
 async def _visual_verify(agent: Any, tool_input: JsonDict, step: int) -> JsonDict:
     vl_config = getattr(agent.runtime.harness, "vl", None)
     if vl_config is None or not getattr(vl_config, "enabled", False):
@@ -1739,6 +2101,8 @@ async def _eval_json_via_title(
     max_chunks: int = 300,
     ready_timeout_seconds: float = 30.0,
     poll_interval_seconds: float = 0.25,
+    read_only_eval: bool = False,
+    internal: bool = False,
 ) -> Optional[Any]:
     prefix = "__ABCP_JSON__"
     setup = f"""
@@ -1773,6 +2137,8 @@ async def _eval_json_via_title(
             "purpose": f"{purpose}; initialize JSON title side-channel",
         },
         step,
+        read_only_eval=read_only_eval,
+        internal=internal,
     )
     title = ""
     deadline = asyncio.get_running_loop().time() + max(1.0, ready_timeout_seconds)
@@ -1783,6 +2149,8 @@ async def _eval_json_via_title(
             "Page.getState",
             {"pageId": page_id, "purpose": "Read JSON side-channel ready marker"},
             step,
+            read_only_eval=read_only_eval,
+            internal=internal,
         )
         title = str(_response_data(ready).get("title") or "")
         if title.startswith(f"{prefix}|READY|"):
@@ -1838,12 +2206,16 @@ async def _eval_json_via_title(
                 "purpose": "Emit JSON title side-channel chunk",
             },
             step,
+            read_only_eval=read_only_eval,
+            internal=internal,
         )
         state = await _invoke_browser_method(
             agent,
             "Page.getState",
             {"pageId": page_id, "purpose": "Read JSON title side-channel chunk"},
             step,
+            read_only_eval=read_only_eval,
+            internal=internal,
         )
         title = str(_response_data(state).get("title") or "")
         parts = title.split("|", 3)
@@ -1939,34 +2311,265 @@ def _attach_runtime_strategy_hints(result: JsonDict, *, method: str) -> JsonDict
     if classification.get("type") != "occlusion_blocked":
         return result
     enriched = dict(result)
+    blocked_target = ""
+    params = result.get("params") if isinstance(result.get("params"), dict) else {}
+    for key in ("id", "nodeId", "targetId", "selector"):
+        value = params.get(key)
+        if isinstance(value, str) and value.strip():
+            blocked_target = value.strip()
+            break
     enriched["runtimeStrategy"] = {
-        "id": "browser_action.overlay.dismiss_ladder",
+        "id": "browser_action.overlay.dismiss_overlay",
         "trigger": "occlusion_blocked",
         "method": method,
-        "safeSequence": [
-            "refresh DOM.getAXTree and inspect page_stats.overlay",
-            "use a visible close/dismiss control if present",
-            "try Escape for a dismissible business overlay",
-            "try a verified backdrop click outside the modal content",
-            "refresh DOM.getAXTree before retrying the blocked action once",
-        ],
+        "preferredTool": "dismiss_overlay",
+        "call": {
+            "tool": "dismiss_overlay",
+            "pageId": params.get("pageId") or "",
+            "targetId": blocked_target,
+            # Only Input.click is auto-retried after dismissal; for any other
+            # blocked method the tool returns dismissed_pending_action.
+            "targetMethod": method if method == "Input.click" else "",
+        },
         "safetyBoundary": (
-            "Do not click login, payment, provider sign-in, or other sensitive"
-            " submit buttons automatically."
+            "dismiss_overlay never auto-clicks login/payment/provider buttons"
+            " and never auto-retries consequential targets."
         ),
     }
     existing = str(enriched.get("next_instruction") or "").strip()
     overlay_instruction = (
-        "Occlusion blocked this action. Apply browser_action.overlay.dismiss_ladder:"
-        " refresh DOM.getAXTree, dismiss only non-sensitive overlay surfaces"
-        " (visible close/dismiss, Escape, or verified backdrop), then refresh DOM"
-        " and retry the original action once with a fresh id/selector."
+        "Occlusion blocked this action. Call the dismiss_overlay tool with this"
+        " pageId (and targetId=the blocked element id to auto-retry a safe"
+        " action); it runs the close -> Escape -> verified-backdrop ladder"
+        " internally and verifies the overlay is gone. Do not hand-run the"
+        " ladder step by step."
     )
     enriched["next_instruction"] = (
         f"{existing} {overlay_instruction}".strip()
         if existing
         else overlay_instruction
     )
+    return enriched
+
+
+# Cap auto-intercept runs per page so a recurring/unclearable overlay cannot make
+# the harness loop dismiss_overlay (and the VL arbiter) indefinitely. Once hit,
+# the action falls back to the suggest-only hint for the model to decide.
+AUTO_INTERCEPT_MAX_PER_PAGE = 3
+
+
+def _auto_intercept_mode(agent: Any) -> str:
+    harness = getattr(getattr(agent, "runtime", None), "harness", None)
+    mode = str(getattr(harness, "auto_intercept", "p0p1") or "p0p1")
+    return mode if mode in {"off", "suggest", "p0", "p0p1"} else "p0p1"
+
+
+def _blocked_target_id(params: Any) -> str:
+    if not isinstance(params, dict):
+        return ""
+    for key in ("id", "nodeId", "targetId", "selector"):
+        value = params.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _record_microloop_telemetry(
+    agent: Any,
+    loop: str,
+    outcome: str,
+    detail: Optional[JsonDict] = None,
+) -> None:
+    """Per-loop micro-loop telemetry. Granularity (one row per loop invocation
+    with trigger/outcome) does not fit strategy_telemetry's worker-result rows,
+    so this is a dedicated in-memory aggregate + an auditable log event."""
+    agg = getattr(agent, "_microloop_telemetry", None)
+    if not isinstance(agg, dict):
+        agg = {}
+        agent._microloop_telemetry = agg
+    bucket = agg.setdefault(loop, {})
+    bucket["attempts"] = int(bucket.get("attempts", 0)) + 1
+    bucket[outcome] = int(bucket.get(outcome, 0)) + 1
+    logger = getattr(agent, "logger", None)
+    if logger is not None:
+        logger.write(
+            "microloop.telemetry",
+            {"loop": loop, "outcome": outcome, **(detail or {})},
+        )
+
+
+async def _maybe_auto_intercept_overlay(
+    agent: Any,
+    method: str,
+    params: JsonDict,
+    result: JsonDict,
+    step: int,
+) -> JsonDict:
+    """Phase 7.2 auto-intercept. When an action is overlay-blocked and config
+    permits, run dismiss_overlay automatically (saving the model a step) instead
+    of only suggesting it, then fold an honest digest into the result.
+
+    Triggers, by escalating config mode:
+      p0  -> P0: errorClassification == occlusion_blocked on this result
+      p0p1 -> also P1: an AXTree layer reports occlusionState == occluded
+    P2 (text soft-detect) and P3 (observation keywords) are never auto-run:
+    soft text has false positives, so they keep the suggest-only hint.
+
+    Auth/paywall overlays are still never auto-clicked: dismiss_overlay returns
+    `blocked` for those, and the original error/hint is preserved."""
+    if not isinstance(result, dict):
+        return result
+    mode = _auto_intercept_mode(agent)
+    if mode in {"off", "suggest"}:
+        return result
+
+    p0 = _result_occlusion_blocked(result)
+    p1 = False
+    if mode == "p0p1" and not p0:
+        p1 = bool(visible_layers_occluded(_layers_from_result(result)))
+    if not (p0 or p1):
+        return result
+
+    page_id = str(params.get("pageId") or "").strip() if isinstance(params, dict) else ""
+    if not page_id:
+        return result
+
+    counts = getattr(agent, "_auto_intercept_counts", None)
+    if not isinstance(counts, dict):
+        counts = {}
+        agent._auto_intercept_counts = counts
+    if int(counts.get(page_id, 0)) >= AUTO_INTERCEPT_MAX_PER_PAGE:
+        _record_microloop_telemetry(
+            agent, "auto_intercept", "capped", {"pageId": page_id}
+        )
+        enriched = dict(result)
+        enriched["autoIntercept"] = {
+            "trigger": "occlusion_blocked" if p0 else "occluded_layers",
+            "mode": mode,
+            "skipped": "per_page_cap_reached",
+            "cap": AUTO_INTERCEPT_MAX_PER_PAGE,
+        }
+        return enriched
+    counts[page_id] = int(counts.get(page_id, 0)) + 1
+
+    trigger = "occlusion_blocked" if p0 else "occluded_layers"
+    blocked_target = _blocked_target_id(params)
+    # Only Input.click is auto-retry-safe; dismiss_overlay re-checks the target's
+    # sensitivity before any retry and returns dismissed_pending_action otherwise.
+    target_method = method if method == "Input.click" else ""
+    dismiss = await _dismiss_overlay(
+        agent,
+        {"pageId": page_id, "targetId": blocked_target, "targetMethod": target_method},
+        step,
+    )
+    dismiss_status = str(dismiss.get("status") or "")
+    resolved = dismiss_status == "dismissed_and_retried"
+    cleared = dismiss_status in {"dismissed", "dismissed_and_retried", "dismissed_pending_action"}
+    # The dismiss interacted with the page (clicks/Escape) or could not clear it;
+    # either way any snapshot recorded for THIS call (e.g. a DOM.getAXTree tree
+    # written by _observe_axtree_state_after just before this) is now stale.
+    # Invalidate so the next action re-fetches rather than trusting a pre-dismiss
+    # tree. "blocked" = auth/paywall: dismiss made no page mutation, so the
+    # snapshot stays valid.
+    if dismiss_status != "blocked":
+        _invalidate_axtree_snapshot(
+            agent, "auto_intercept", params if isinstance(params, dict) else {}
+        )
+    # If the model's own call was DOM.getAXTree and we cleared the overlay, the
+    # lines it would read are the PRE-dismiss tree. Re-fetch a fresh tree (no
+    # model step), which both replaces those lines below and re-establishes a
+    # clean current snapshot, so the model sees the post-dismiss page map and its
+    # next action does not trip the stale guard on an obsolete id.
+    tree_refreshed = False
+    fresh_lines: List[Any] = []
+    fresh_data: JsonDict = {}
+    if cleared and method == "DOM.getAXTree":
+        fresh = await _invoke_browser_method(
+            agent,
+            "DOM.getAXTree",
+            {"pageId": page_id, "purpose": "auto_intercept: refresh tree after overlay cleared"},
+            step,
+            count_progress=False,
+        )
+        candidate_data = _response_data(fresh)
+        fresh_data = candidate_data if isinstance(candidate_data, dict) else {}
+        fresh_lines = list(getattr(agent, "axtree_lines", []) or [])
+        tree_refreshed = bool(fresh_lines)
+    outcome = (
+        "resolved" if resolved
+        else "cleared" if cleared
+        else "blocked" if dismiss_status == "blocked"
+        else "failed"
+    )
+    _record_microloop_telemetry(
+        agent,
+        "auto_intercept",
+        outcome,
+        {"pageId": page_id, "trigger": trigger, "dismissStatus": dismiss_status},
+    )
+
+    enriched = dict(result)
+    # Replace the stale pre-dismiss tree the model would otherwise read with the
+    # freshly re-fetched post-dismiss tree. Swap the WHOLE data block (so
+    # layers/nodeCount/truncated no longer contradict the refreshed lines — the
+    # P1 trigger was a stale layers.occlusionState), then overlay the raw,
+    # never-offloaded lines/nodes from the agent snapshot.
+    if tree_refreshed:
+        response = enriched.get("response")
+        if isinstance(response, dict) and isinstance(response.get("data"), dict):
+            if fresh_data:
+                new_data = dict(fresh_data)
+            else:
+                new_data = dict(response["data"])
+            new_data["lines"] = fresh_lines
+            new_data["nodes"] = list(getattr(agent, "axtree_nodes", []) or [])
+            response["data"] = new_data
+    enriched["autoIntercept"] = {
+        "trigger": trigger,
+        "mode": mode,
+        "dismissStatus": dismiss_status,
+        "resolved": resolved,
+        "cleared": cleared,
+        "retried": bool(dismiss.get("retried")),
+        "treeRefreshed": tree_refreshed,
+        "overlay": dismiss.get("overlay"),
+        "vlArbiter": dismiss.get("vlArbiter"),
+    }
+    stale_tree_note = ""
+    if cleared and method == "DOM.getAXTree" and not tree_refreshed:
+        # Could not refresh: be explicit that the returned map is pre-dismiss.
+        stale_tree_note = (
+            " NOTE: response.data.lines is the PRE-dismiss tree and is now stale;"
+            " call DOM.getAXTree again before using any element id from it."
+        )
+    if resolved:
+        instruction = (
+            "Occlusion auto-intercept: the overlay was dismissed and your original"
+            " action was retried successfully. Continue — do NOT re-issue it."
+        )
+    elif cleared:
+        if method == "DOM.getAXTree" and tree_refreshed:
+            instruction = (
+                "Occlusion auto-intercept: the overlay was dismissed and"
+                " response.data.lines was refreshed to the post-dismiss tree. Use"
+                " these ids."
+            )
+        else:
+            instruction = (
+                "Occlusion auto-intercept: the overlay was dismissed but your action"
+                " was not auto-retried (not auto-retry-safe or a consequential"
+                " target). Re-issue the action if it is still needed."
+            ) + stale_tree_note
+    else:
+        # blocked (auth/paywall) or failed: keep the original suggest hint intent.
+        instruction = (
+            "Occlusion auto-intercept ran dismiss_overlay but could not clear the"
+            f" overlay (status={dismiss_status or 'unknown'}). It may be an"
+            " auth/paywall wall (never auto-clicked); request HITL or report a"
+            " blocker."
+        )
+    existing = str(enriched.get("next_instruction") or "").strip()
+    enriched["next_instruction"] = f"{existing} {instruction}".strip() if existing else instruction
     return enriched
 
 
@@ -2062,227 +2665,6 @@ def _check_screenshot_misuse(
             " visual_verify for bounded visual arbitration."
         ),
     }
-
-
-def _precompute_axtree_snapshot(
-    method: str,
-    params: JsonDict,
-    response: Any,
-) -> Optional[JsonDict]:
-    if method != "DOM.getAXTree":
-        return None
-    page_id = ""
-    if isinstance(params, dict):
-        page_id = str(params.get("pageId") or "")
-    lines = _axtree_lines_from_value(response)
-    nodes = _axtree_nodes_from_lines(lines)
-    ids = _axtree_ids_from_value(response)
-    if nodes:
-        ids.update(str(node.get("id") or "") for node in nodes if node.get("id"))
-    return {
-        "ids": ids,
-        "lines": lines,
-        "nodes": nodes,
-        "pageId": page_id,
-    }
-
-
-def _axtree_lines_from_value(value: Any, *, limit: int = 10000) -> List[str]:
-    lines: List[str] = []
-
-    def append_line(line: str) -> None:
-        if len(lines) >= limit:
-            return
-        text = line.rstrip("\n")
-        if AXTREE_LINE_RE.match(text):
-            lines.append(text)
-
-    def visit(item: Any) -> None:
-        if len(lines) >= limit:
-            return
-        if isinstance(item, dict):
-            for nested in item.values():
-                visit(nested)
-        elif isinstance(item, list):
-            for nested in item:
-                visit(nested)
-                if len(lines) >= limit:
-                    return
-        elif isinstance(item, str):
-            if "\n" in item:
-                for line in item.splitlines():
-                    append_line(line)
-                    if len(lines) >= limit:
-                        return
-            else:
-                append_line(item)
-
-    visit(value)
-    return lines
-
-
-def _axtree_nodes_from_lines(lines: List[str]) -> List[JsonDict]:
-    nodes: List[JsonDict] = []
-    for index, line in enumerate(lines, start=1):
-        match = AXTREE_LINE_RE.match(line)
-        if not match:
-            continue
-        rest = str(match.group("rest") or "")
-        name = str(match.group("name") or "")
-        nodes.append({
-            "id": match.group("id"),
-            "role": match.group("role"),
-            "name": name,
-            "interactive": "#" in rest,
-            "line": line,
-            "lineNumber": index,
-            "depth": len(str(match.group("indent") or "")) // 2,
-        })
-    return nodes
-
-
-def _check_stale_axtree_target(
-    agent: Any,
-    method: str,
-    params: JsonDict,
-) -> Optional[JsonDict]:
-    if method == "DOM.getAXTree" or not isinstance(params, dict):
-        return None
-    target_ids = _axtree_ids_from_params(params)
-    if not target_ids:
-        return None
-
-    current_ids = set(getattr(agent, "axtree_ids", set()) or set())
-    epoch = int(getattr(agent, "axtree_epoch", 0) or 0)
-    invalidated = bool(getattr(agent, "axtree_invalidated", True))
-    current_page_id = str(getattr(agent, "axtree_page_id", "") or "")
-    page_id = str(params.get("pageId") or "")
-    missing = sorted(target_ids - current_ids)
-    if not current_ids or invalidated:
-        reason = "axtree_snapshot_invalidated" if invalidated else "no_current_axtree_snapshot"
-    elif page_id and current_page_id and page_id != current_page_id:
-        reason = "axtree_page_mismatch"
-    elif missing:
-        reason = "axtree_id_not_in_current_snapshot"
-    else:
-        return None
-
-    return {
-        "status": "stale_element_reference",
-        "reason": reason,
-        "method": method,
-        "pageId": page_id or None,
-        "currentAXTreePageId": current_page_id or None,
-        "axTreeEpoch": epoch,
-        "targetIds": sorted(target_ids),
-        "missingIds": missing,
-        "tool_was_executed": False,
-        "next_instruction": (
-            "DOM changed or the target id is not from the current AXTree epoch."
-            " Call Page.getState if lifecycle is uncertain, then DOM.getAXTree"
-            " for this page and derive a fresh id/selector before retrying."
-        ),
-    }
-
-
-def _axtree_ids_from_params(params: JsonDict) -> Set[str]:
-    ids: Set[str] = set()
-    for key in ("id", "nodeId", "targetId", "selector"):
-        value = params.get(key)
-        if isinstance(value, str) and AXTREE_ID_RE.match(value.strip()):
-            ids.add(value.strip())
-    return ids
-
-
-def _observe_axtree_state_after(
-    agent: Any,
-    method: str,
-    params: JsonDict,
-    result: JsonDict,
-    *,
-    precomputed_snapshot: Optional[JsonDict] = None,
-) -> None:
-    if method == "DOM.getAXTree":
-        snapshot = precomputed_snapshot if isinstance(precomputed_snapshot, dict) else {}
-        raw_ids = snapshot.get("ids")
-        ids = {str(item) for item in raw_ids if str(item).strip()} if isinstance(raw_ids, set) else set()
-        if not ids:
-            ids = _axtree_ids_from_value(result)
-        page_id = ""
-        if isinstance(params, dict):
-            page_id = str(params.get("pageId") or "")
-        if not page_id:
-            page_id = str(snapshot.get("pageId") or "")
-        if not page_id:
-            page_id = str(_response_data(result).get("pageId") or "")
-        if ids:
-            agent.axtree_epoch = int(getattr(agent, "axtree_epoch", 0) or 0) + 1
-            agent.axtree_ids = ids
-            agent.axtree_page_id = page_id
-            agent.axtree_invalidated = False
-            agent.axtree_lines = list(snapshot.get("lines") or _axtree_lines_from_value(result))
-            agent.axtree_nodes = list(snapshot.get("nodes") or _axtree_nodes_from_lines(agent.axtree_lines))
-            logger = getattr(agent, "logger", None)
-            if logger is not None:
-                logger.write(
-                    "axtree.snapshot",
-                    {
-                        "pageId": page_id or None,
-                        "epoch": agent.axtree_epoch,
-                        "idCount": len(ids),
-                    },
-                )
-        return
-
-    if method in AXTREE_INVALIDATING_METHODS:
-        _invalidate_axtree_snapshot(agent, method, params)
-
-
-def _invalidate_axtree_snapshot(agent: Any, method: str, params: JsonDict) -> None:
-    agent.axtree_invalidated = True
-    agent.axtree_lines = []
-    agent.axtree_nodes = []
-    logger = getattr(agent, "logger", None)
-    if logger is not None:
-        logger.write(
-            "axtree.invalidated",
-            {
-                "method": method,
-                "pageId": str(params.get("pageId") or "") if isinstance(params, dict) else "",
-                "epoch": int(getattr(agent, "axtree_epoch", 0) or 0),
-            },
-        )
-
-
-def _axtree_ids_from_value(value: Any, *, limit: int = 5000) -> Set[str]:
-    ids: Set[str] = set()
-
-    def visit(item: Any) -> None:
-        if len(ids) >= limit:
-            return
-        if isinstance(item, dict):
-            for key, nested in item.items():
-                key_text = str(key)
-                if key_text in {"id", "nodeId", "axNodeId", "domNodeId"}:
-                    if isinstance(nested, str) and AXTREE_ID_RE.match(nested.strip()):
-                        ids.add(nested.strip())
-                visit(nested)
-        elif isinstance(item, list):
-            for nested in item:
-                visit(nested)
-        elif isinstance(item, str):
-            for match in AXTREE_ID_TOKEN_RE.findall(item):
-                ids.add(match)
-                if len(ids) >= limit:
-                    return
-            if len(item) < 2000:
-                for match in AXTREE_ID_ANYWHERE_RE.findall(item):
-                    ids.add(match)
-                    if len(ids) >= limit:
-                        return
-
-    visit(value)
-    return ids
 
 
 def _attach_normalized_handles(result: JsonDict) -> JsonDict:
@@ -3324,6 +3706,58 @@ def _hitl_pause_succeeded(response: Any) -> bool:
     return False
 
 
+async def _capture_hitl_pause_snapshot(
+    agent: Any,
+    runner: Any,
+    page_id: str,
+    step: int,
+) -> None:
+    page_id = str(page_id or "").strip()
+    if not page_id:
+        return
+    try:
+        response, _recovery = await runner.call(
+            "Page.getState",
+            {
+                "pageId": page_id,
+                "purpose": "Capture URL/title before HITL pause for resume verification.",
+            },
+        )
+    except Exception as exc:
+        logger = getattr(agent, "logger", None)
+        if logger is not None:
+            logger.write(
+                "hitl.pause_snapshot.failed",
+                {
+                    "pageId": page_id,
+                    "step": step,
+                    "errorType": type(exc).__name__,
+                    "error": str(exc)[:300],
+                },
+            )
+        return
+    data = response.get("data") if isinstance(response, dict) else None
+    if not isinstance(data, dict):
+        return
+    snapshot = {
+        "url": str(data.get("url") or data.get("currentUrl") or "").strip(),
+        "title": str(data.get("title") or "").strip(),
+    }
+    if not (snapshot["url"] or snapshot["title"]):
+        return
+    snapshots = getattr(agent, "hitl_pause_snapshots", None)
+    if not isinstance(snapshots, dict):
+        snapshots = {}
+        agent.hitl_pause_snapshots = snapshots
+    snapshots[page_id] = snapshot
+    logger = getattr(agent, "logger", None)
+    if logger is not None:
+        logger.write(
+            "hitl.pause_snapshot.captured",
+            {"pageId": page_id, "step": step, **snapshot},
+        )
+
+
 def _ensure_hitl_request_reason(method: str, params: JsonDict, reason: str = "") -> None:
     if method != "Hitl.requestPause" or not isinstance(params, dict):
         return
@@ -3493,376 +3927,36 @@ async def _enrich_pause_with_wait(
     return enriched
 
 
-def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, JsonDict]:
-    method_schema: JsonDict = {
-        "type": "string",
-        "description": "ABCP capability method, e.g. Fleet.create, Page.navigate, DOM.getAXTree.",
-    }
-    if capability_methods:
-        method_schema["enum"] = list(capability_methods)
-
-    return {
-        "browser_call": {
-            "type": "object",
-            "properties": {
-                "method": method_schema,
-                "params": {
-                    "type": "object",
-                    "description": (
-                        "JSON object of params for the ABCP method; pass {} when there are none."
-                        " Do not invent handles, copy placeholder ids, reuse stale AXTree ids,"
-                        " or encode assumed page order as factual params."
-                    ),
-                    "additionalProperties": True,
-                },
-                "reason": {
-                    "type": "string",
-                    "description": "Short reason for this call (used in logs and as fallback for the `purpose` field).",
-                },
-            },
-            "required": ["method", "params", "reason"],
-            "additionalProperties": False,
-        },
-        "extract_dom_records": {
-            "type": "object",
-            "properties": {
-                "pageId": {"type": "string"},
-                "selector": {
-                    "type": "string",
-                    "description": "CSS selector for repeated elements, e.g. a[href], article, .card.",
-                },
-                "fields": {
-                    "type": "object",
-                    "additionalProperties": {"type": "string"},
-                    "description": (
-                        "Map output field names to built-in extractors: text, href,"
-                        " imgAlt, visible, rect, boundingRect, ancestorText, tag, id,"
-                        " class, ariaLabel, role, attr:<name>, src."
-                    ),
-                },
-                "visibleOnly": {"type": "boolean"},
-                "includeRect": {"type": "boolean"},
-                "includeAncestorText": {"type": "boolean"},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
-                "record_name": {
-                    "type": "string",
-                    "description": (
-                        "If non-empty, automatically persist the rows via record_extraction"
-                        " under this dataset name. Pass \"\" to inspect rows first."
-                    ),
-                },
-            },
-            "required": [
-                "pageId",
-                "selector",
-                "fields",
-                "visibleOnly",
-                "includeRect",
-                "includeAncestorText",
-                "limit",
-                "record_name",
-            ],
-            "additionalProperties": False,
-        },
-        "eval_js_json": {
-            "type": "object",
-            "properties": {
-                "pageId": {"type": "string"},
-                "expression": {
-                    "type": "string",
-                    "description": (
-                        "JavaScript expression whose value is JSON-serializable."
-                        " The harness wraps it and returns JSON.stringify({value})."
-                    ),
-                },
-                "record_name": {
-                    "type": "string",
-                    "description": (
-                        "If the value is rows or {rows:[...]}, persist it via"
-                        " record_extraction under this name. Pass \"\" to inspect."
-                    ),
-                },
-                "description": {
-                    "type": "string",
-                    "description": "Optional artifact description when record_name is set.",
-                },
-                "why_dom_primitives_insufficient": {
-                    "type": "string",
-                    "description": (
-                        "Explain why DOM.getAXTree plus DOM.getText/"
-                        "DOM.getAttribute cannot satisfy this extraction."
-                        " Required because eval_js_json is a last-resort fallback."
-                    ),
-                },
-                "reason_kind": {
-                    "type": "string",
-                    "enum": sorted(EVAL_JS_REASON_KINDS),
-                    "description": (
-                        "Why native DOM primitives are insufficient."
-                        " Required for eval_js_json."
-                    ),
-                },
-                "cross_check_plan": {
-                    "type": "string",
-                    "description": (
-                        "How at least one target field will be checked with"
-                        " DOM.getText or DOM.getAttribute before handoff."
-                    ),
-                },
-            },
-            "required": [
-                "pageId",
-                "expression",
-                "record_name",
-                "description",
-                "why_dom_primitives_insufficient",
-                "reason_kind",
-                "cross_check_plan",
-            ],
-            "additionalProperties": False,
-        },
-        "navigate_verified": {
-            "type": "object",
-            "properties": {
-                "pageId": {"type": "string"},
-                "url": {"type": "string"},
-                "expectedUrlPattern": {
-                    "type": "string",
-                    "description": "Regex that must match the final URL; pass \"\" to require exact target URL.",
-                },
-                "expectedTitlePattern": {
-                    "type": "string",
-                    "description": "Optional regex for final title; pass \"\" to skip title check.",
-                },
-                "timeoutSeconds": {"type": "number"},
-                "pollIntervalSeconds": {"type": "number"},
-                "maxRetries": {"type": "integer", "minimum": 1, "maximum": 3},
-            },
-            "required": [
-                "pageId",
-                "url",
-                "expectedUrlPattern",
-                "expectedTitlePattern",
-                "timeoutSeconds",
-                "pollIntervalSeconds",
-                "maxRetries",
-            ],
-            "additionalProperties": False,
-        },
-        "visual_verify": {
-            "type": "object",
-            "properties": {
-                "pageId": {"type": "string"},
-                "selector": {
-                    "type": "string",
-                    "description": "Optional CSS selector to crop; pass \"\" for viewport/fullPage.",
-                },
-                "id": {
-                    "type": "string",
-                    "description": "Optional canonical AXTree id to crop; pass \"\" if not used.",
-                },
-                "fullPage": {
-                    "type": "boolean",
-                    "description": "Whether to capture full page. Prefer false/cropped screenshots.",
-                },
-                "mode": {
-                    "type": "string",
-                    "description": "action_outcome | validator_failure | overlay_check | captcha_check | layout_check",
-                },
-                "question": {
-                    "type": "string",
-                    "description": "Short visual question for the verifier.",
-                },
-                "expected": {
-                    "type": "object",
-                    "additionalProperties": True,
-                    "description": "Expected visible state, e.g. {\"target\":\"JobBuddy\",\"state\":\"product detail page\"}.",
-                },
-            },
-            "required": [
-                "pageId",
-                "selector",
-                "id",
-                "fullPage",
-                "mode",
-                "question",
-                "expected",
-            ],
-            "additionalProperties": False,
-        },
-        "final_answer": {
-            "type": "object",
-            "properties": {
-                "status": {
-                    "type": "string",
-                    "enum": [
-                        "done",
-                        "incomplete",
-                        "partial",
-                        "extraction_inconclusive",
-                    ],
-                    "description": (
-                        "done = task complete; partial = some trustworthy results but not all targets reached;"
-                        " extraction_inconclusive = extraction kept failing and no trustworthy result is available;"
-                        " incomplete = any other inability to proceed."
-                    ),
-                },
-                "answer": {
-                    "type": "string",
-                    "description": (
-                        "JSON string containing outcome, data, evidence,"
-                        " blockers, and next_steps. Large row sets must stay"
-                        " in record_extraction artifacts referenced by savedPath."
-                    ),
-                },
-                "reason": {
-                    "type": "string",
-                    "description": "Optional; brief justification (≤ 200 chars) for non-done statuses.",
-                },
-            },
-            "required": ["status", "answer"],
-            "additionalProperties": False,
-        },
-        "record_extraction": {
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "Short dataset name, e.g. \"trending-week-products\".",
-                },
-                "rows": {
-                    "type": "array",
-                    "items": {"type": "object", "additionalProperties": True},
-                    "description": (
-                        "Structured rows; every row must be a JSON object. Use exact expected_artifact"
-                        " field names. For sensitive fields include pageUrl, sourceTool,"
-                        " sourceSelectorOrAxId, and the canonical <field>EvidenceText"
-                        " key, e.g. rankEvidenceText. Legacy evidence/<field>Evidence"
-                        " aliases may validate but should not be preferred."
-                    ),
-                },
-                "schema": {
-                    "type": "object",
-                    "description": "Optional; documents the source/meaning of fields in `rows`. Not enforced.",
-                    "additionalProperties": True,
-                },
-                "description": {
-                    "type": "string",
-                    "description": "Optional; which page / selector this data was extracted from.",
-                },
-            },
-            "required": ["name", "rows"],
-            "additionalProperties": False,
-        },
-        "find_in_axtree": {
-            "type": "object",
-            "properties": {
-                "pageId": {
-                    "type": "string",
-                    "description": "Page id whose current DOM.getAXTree snapshot should be searched.",
-                },
-                "role": {
-                    "type": "string",
-                    "description": "Optional AX role filter, e.g. link, button, textbox. Pass \"\" for any role.",
-                },
-                "name": {
-                    "type": "string",
-                    "description": "Accessible name/text to locate. Pass \"\" to list by role only.",
-                },
-                "text": {
-                    "type": "string",
-                    "description": "Alias/fallback for name; pass \"\" unless name is empty.",
-                },
-                "match": {
-                    "type": "string",
-                    "enum": ["exact", "contains", "regex"],
-                    "description": "How to match name/text.",
-                },
-                "case_sensitive": {"type": "boolean"},
-                "interactive_only": {
-                    "type": "boolean",
-                    "description": "When true, only return AXTree lines marked interactable/focusable with #.",
-                },
-                "max_results": {"type": "integer", "minimum": 1, "maximum": 50},
-            },
-            "required": [
-                "pageId",
-                "role",
-                "name",
-                "text",
-                "match",
-                "case_sensitive",
-                "interactive_only",
-                "max_results",
-            ],
-            "additionalProperties": False,
-        },
-        "local_fs_search": {
-            "type": "object",
-            "properties": {
-                "pattern": {
-                    "type": "string",
-                    "description": "Regex grep; pass an empty string to list matches by glob / event_type only.",
-                },
-                "glob": {
-                    "type": "string",
-                    "description": "Glob relative to the current task worktree, e.g. observations/*.json or **/*.json.",
-                },
-                "event_type": {
-                    "type": ["string", "null"],
-                    "description": "JSONL-only: restrict the search to lines whose `event` matches this string; pass null when not needed.",
-                },
-                "max_results": {"type": "integer", "minimum": 1, "maximum": 100},
-                "max_bytes_per_hit": {"type": "integer", "minimum": 200, "maximum": 20000},
-                "max_total_bytes": {"type": "integer", "minimum": 1000, "maximum": 200000},
-            },
-            "required": [
-                "pattern",
-                "glob",
-                "event_type",
-                "max_results",
-                "max_bytes_per_hit",
-                "max_total_bytes",
-            ],
-            "additionalProperties": False,
-        },
-        "local_fs_read": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "line_offset": {"type": "integer", "minimum": 0},
-                "line_limit": {"type": "integer", "minimum": 1, "maximum": 5000},
-                "max_bytes": {"type": "integer", "minimum": 1000, "maximum": 200000},
-            },
-            "required": ["path", "line_offset", "line_limit", "max_bytes"],
-            "additionalProperties": False,
-        },
-        "local_fs_jsonpath": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "expr": {
-                    "type": "string",
-                    "description": "Supports $.a.b[0], [*], .*, ..field, ..*.",
-                },
-                "mode": {
-                    "type": "string",
-                    "enum": ["auto", "json", "jsonl"],
-                },
-                "max_nodes": {"type": "integer", "minimum": 1, "maximum": 500},
-                "max_bytes_per_node": {"type": "integer", "minimum": 100, "maximum": 50000},
-            },
-            "required": [
-                "path",
-                "expr",
-                "mode",
-                "max_nodes",
-                "max_bytes_per_node",
-            ],
-            "additionalProperties": False,
-        },
-    }
-
+from .composites.dismiss_overlay import (
+    DISMISS_OVERLAY_MAX_ATTEMPTS,
+    DISMISS_OVERLAY_MAX_DURATION_MS,
+    _dismiss_overlay,
+    _maybe_retry_original_action,
+    _try_backdrop_click,
+    _vl_overlay_arbiter,
+)
+from .composites.collect_items import (
+    COLLECT_ITEMS_DEFAULT_FIELDS,
+    COLLECT_ITEMS_HARVEST_LIMIT,
+    COLLECT_ITEMS_MAX_DURATION_MS,
+    COLLECT_ITEMS_MAX_ROUNDS,
+    COLLECT_ITEMS_MAX_WINDOWS,
+    COLLECT_ITEMS_SETTLE_MS,
+    COLLECT_ITEMS_STABILITY_THRESHOLD,
+    _collect_dedup_key,
+    _collect_interrupt_result,
+    _collect_items,
+    _collect_items_materialize,
+    _collect_overlay_recovery,
+    _collect_overlay_stop_reason,
+)
+from .composites.fill_field_verified import (
+    FILL_FIELD_STOPWORDS,
+    _axtree_node_name,
+    _fill_field_action,
+    _fill_field_keywords,
+    _fill_field_verified,
+)
 
 def build_browser_agent_tool_specs(capability_methods: Set[str]) -> List[JsonDict]:
     return BROWSER_TOOLS.tool_specs(capability_methods)

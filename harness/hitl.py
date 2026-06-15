@@ -82,6 +82,10 @@ _PAGE_LOADED_TYPES = frozenset(_normalize_notification_type(item) for item in {
     "page_loaded",
     "Page.loaded",
 })
+_PAGE_NAVIGATED_TYPES = frozenset(_normalize_notification_type(item) for item in {
+    "page_navigate",
+    "Page.navigate",
+})
 _CHALLENGE_URL_MARKERS = (
     "__cf_chl",
     "cf_chl",
@@ -131,7 +135,11 @@ def _notification_view(msg: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _notification_signal(msg: Dict[str, Any], page_id: str) -> Optional[str]:
+def _notification_signal(
+    msg: Dict[str, Any],
+    page_id: str,
+    pause_snapshot: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
     if not isinstance(msg, dict):
         return None
     view = _notification_view(msg)
@@ -159,6 +167,21 @@ def _notification_signal(msg: Dict[str, Any], page_id: str) -> Optional[str]:
         url = view.get("url")
         if isinstance(url, str) and url.strip() and not _is_challenge_url(url):
             return "page_settled"
+
+    if ntype in _PAGE_NAVIGATED_TYPES:
+        url = view.get("url")
+        if not isinstance(url, str) or not url.strip() or _is_challenge_url(url):
+            return None
+        paused_url = (
+            str(pause_snapshot.get("url") or "").strip()
+            if isinstance(pause_snapshot, dict)
+            else ""
+        )
+        if paused_url and url.strip() == paused_url:
+            return None
+        if not paused_url:
+            return None
+        return "page_settled"
 
     return None
 
@@ -621,7 +644,7 @@ async def wait_for_hitl_resume(
     strict_predicate = _make_resume_predicate_strict(page_id)
 
     def settlement_predicate(msg: Dict[str, Any]) -> bool:
-        return _notification_signal(msg, page_id) is not None
+        return _notification_signal(msg, page_id, pause_snapshot) is not None
 
     # Settlement triggers are only observed when a verifier can adjudicate
     # them; otherwise stay on the strict explicit-resume contract. The replay
@@ -644,7 +667,7 @@ async def wait_for_hitl_resume(
         if msg is None:
             return None
         return {
-            "signal": _notification_signal(msg, page_id),
+            "signal": _notification_signal(msg, page_id, pause_snapshot),
             "message": msg,
         }
 
@@ -778,8 +801,9 @@ async def wait_for_hitl_resume(
 
         # Settlement signals on the paused pageId. Never a resume by
         # themselves: Page.titleUpdated only caches the candidate title as
-        # evidence; only Page.loaded triggers adjudication (VL first, cached
-        # title as fallback), and only a verified pass leads to resolvePause.
+        # evidence; Page.loaded or a post-pause Page.navigate with a changed
+        # URL triggers adjudication (VL first, cached title as fallback), and
+        # only a verified pass leads to resolvePause.
         if challenge_verifier is None:
             continue
         view = _notification_view(evidence)
@@ -789,7 +813,7 @@ async def wait_for_hitl_resume(
             last_settled_title = event_title
         if event_url:
             last_settled_url = event_url
-        if str(view.get("type") or "") not in _PAGE_LOADED_TYPES:
+        if str(view.get("type") or "") not in (_PAGE_LOADED_TYPES | _PAGE_NAVIGATED_TYPES):
             if logger is not None:
                 logger.write("hitl.wait.settlement_check", {
                     "decision": "cached_evidence_only",

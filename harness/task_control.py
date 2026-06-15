@@ -1372,6 +1372,7 @@ def validate_worker_artifacts(
     result_artifacts = cumulative_sources if cumulative else (
         [selected.get("path")] if selected else []
     )
+    valid_extraction_artifacts = cumulative_sources if cumulative else extraction_artifacts
     result = {
         "status": status,
         "phase_id": contract.get("phase_id"),
@@ -1379,7 +1380,7 @@ def validate_worker_artifacts(
         "rowCount": len(rows),
         "artifacts": result_artifacts,
         "allExtractionArtifacts": all_extraction_artifacts,
-        "validExtractionArtifacts": extraction_artifacts,
+        "validExtractionArtifacts": valid_extraction_artifacts,
         "attemptExtractionArtifacts": extraction_attempt_artifacts,
         "priorExtractionArtifacts": prior_extraction_artifacts,
         "failures": failures,
@@ -2066,12 +2067,21 @@ def _normalize_validators(
         normalized.append({"type": "min_rows", "value": expected_artifact.get("min_rows")})
     if expected_artifact.get("max_rows") is not None:
         normalized.append({"type": "max_rows", "value": expected_artifact.get("max_rows")})
-    if expected_artifact.get("exact_rows") is not None:
+    has_exact_rows = expected_artifact.get("exact_rows") is not None
+    if has_exact_rows:
         normalized.append({"type": "exact_rows", "value": expected_artifact.get("exact_rows")})
     count_range = expected_artifact.get("count_range")
     if isinstance(count_range, list) and len(count_range) >= 2:
-        normalized.append({"type": "min_rows", "value": count_range[0]})
-        normalized.append({"type": "max_rows", "value": count_range[1]})
+        min_rows = _positive_int(count_range[0], default=0)
+        max_rows = _positive_int(count_range[1], default=0)
+        if not has_exact_rows:
+            if min_rows > 0 and min_rows == max_rows:
+                normalized.append({"type": "exact_rows", "value": min_rows})
+            else:
+                if min_rows > 0:
+                    normalized.append({"type": "min_rows", "value": min_rows})
+                if max_rows > 0:
+                    normalized.append({"type": "max_rows", "value": max_rows})
     fields = expected_artifact.get("required_fields")
     if not isinstance(fields, list) or not fields:
         fields = expected_artifact.get("fields")

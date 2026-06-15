@@ -15,6 +15,7 @@ from harness.constants import (
     RENDER_RECOVERY_METHODS,
     RENDER_RECOVERY_WINDOW_SECONDS,
 )
+from harness.tool_policy import mask_params
 from harness.utils import JsonDict, RunLogger, trim_large_strings
 
 
@@ -62,6 +63,8 @@ class RenderRecoveryRunner:
         self,
         method: str,
         params: JsonDict,
+        *,
+        redact_params: Optional[Set[str]] = None,
     ) -> Tuple[JsonDict, Optional[RenderRecoveryOutcome]]:
         return await call_with_render_recovery(
             browser=self.browser,
@@ -70,6 +73,7 @@ class RenderRecoveryRunner:
             capability_methods=self.capability_methods,
             method=method,
             params=params,
+            redact_params=redact_params,
         )
 
 
@@ -214,8 +218,14 @@ async def call_with_render_recovery(
     capability_methods: Set[str],
     method: str,
     params: JsonDict,
+    redact_params: Optional[Set[str]] = None,
 ) -> Tuple[JsonDict, Optional[RenderRecoveryOutcome]]:
     started = time.monotonic()
+    # The browser always gets the real params; everything we LOG or surface in
+    # the advisory uses the masked copy so a render-lost during a sensitive
+    # action (e.g. Input.type of a password) never persists the value. Recovery
+    # logic only reads pageId/anchor keys, which masking leaves intact.
+    safe_params = mask_params(params, redact_params)
 
     try:
         response = await browser.call(method, params)
@@ -235,7 +245,7 @@ async def call_with_render_recovery(
         trim_large_strings(
             {
                 "method": method,
-                "params": params,
+                "params": safe_params,
                 "pageId": page_id,
                 "reason": reason,
                 "response": response,
@@ -255,7 +265,9 @@ async def call_with_render_recovery(
             recent_recoveries=recent_recoveries,
             capability_methods=capability_methods,
             method=method,
-            params=params,
+            # recover_render_context only forwards params into recovery_attempt
+            # logging (original_params); the masked copy is correct there.
+            params=safe_params,
             page_id=page_id,
             original=latest_original,
             started=started,
@@ -268,9 +280,9 @@ async def call_with_render_recovery(
             recovery.elapsed_ms = int((time.monotonic() - started) * 1000)
             if recovery.recovered and recovery.page_id:
                 recent_recoveries[recovery.page_id] = time.monotonic()
-            log_render_recovery_result(logger, method, params, recovery)
+            log_render_recovery_result(logger, method, safe_params, recovery)
             return (
-                build_render_recovery_advisory(method, params, latest_original, recovery),
+                build_render_recovery_advisory(method, safe_params, latest_original, recovery),
                 recovery,
             )
 
@@ -288,7 +300,7 @@ async def call_with_render_recovery(
                 recovery.elapsed_ms = int((time.monotonic() - started) * 1000)
                 if recovery.page_id:
                     recent_recoveries[recovery.page_id] = time.monotonic()
-                log_render_recovery_result(logger, method, params, recovery)
+                log_render_recovery_result(logger, method, safe_params, recovery)
                 return retry_response, recovery
             latest_original = retry_response
 
@@ -301,8 +313,8 @@ async def call_with_render_recovery(
         recovery.elapsed_ms = int((time.monotonic() - started) * 1000)
         if recovery.recovered and recovery.page_id:
             recent_recoveries[recovery.page_id] = time.monotonic()
-        log_render_recovery_result(logger, method, params, recovery)
-        return build_render_recovery_advisory(method, params, latest_original, recovery), recovery
+        log_render_recovery_result(logger, method, safe_params, recovery)
+        return build_render_recovery_advisory(method, safe_params, latest_original, recovery), recovery
 
 
 async def recover_render_context(

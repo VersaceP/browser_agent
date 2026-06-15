@@ -1,0 +1,25 @@
+{
+  "method": "Page.reload",
+  "description": "Reloads the current page in the given pageId, equivalent to the browser reload button. Use as a recovery step when a page is stuck loading or in a degraded state before escalating to HITL.",
+  "params": {
+    "pageId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Page ID to reload.",
+      "required": true
+    },
+    "ignoreCache": {
+      "description": "When true, bypass the HTTP cache during reload (hard reload). Defaults to false.",
+      "type": "boolean",
+      "required": false
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why a reload is needed, e.g. \"page is stuck loading\" or \"attempting recovery before HITL escalation\"",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why a reload is needed, e.g. \"page is stuck loading\" or \"attempting recovery before HITL escalation\""
+}

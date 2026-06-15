@@ -86,14 +86,25 @@
       ],
       "site_entry_urls": [
         "https://theresanaiforthat.com/ai/gptkit/",
-        "https://theresanaiforthat.com/ai/flot-ai/"
+        "https://theresanaiforthat.com/ai/flot-ai/",
+        "https://theresanaiforthat.com/ai/iloveimg/",
+        "https://theresanaiforthat.com/ai/dub-ai/",
+        "https://theresanaiforthat.com/ai/agent4/",
+        "https://theresanaiforthat.com/ai/supertranslate/",
+        "https://theresanaiforthat.com/ai/agent4/#pros-and-cons",
+        "https://theresanaiforthat.com/ai/syncwell/",
+        "https://theresanaiforthat.com/ai/codekidz/",
+        "https://theresanaiforthat.com/ai/seopital/"
       ],
       "phase_keywords": [
         "phase_2_detail_pages",
         "For each product collected in phase 1 (ranks 25-35), visit its detail page and extract reviews, pros & cons, and Q&A details.",
         "detail_sections",
         "You are given an artifact containing product listing data (ranks 25-35) with detail URLs. For each product, navigate to its detailUrl, wait for the page to settle, and extract: (1) Reviews - all user reviews with reviewer name, rating, date, and review text; (2) Pros & Cons - pros list and cons list as shown on the page; (3) Q&A - all questions and answers with question text, answer text, and any metadata like dates or asker/answerer names. After collecting all detail data for all products, return the combined results. If a detail page does not have reviews/pros-cons/QA sections, note them as empty/absent with evidence.",
-        "theresanaiforthat.com"
+        "theresanaiforthat.com",
+        "phase_2_details",
+        "For each product from phase 1, navigate to its detail page and extract reviews, pros & cons, and Q&A content.",
+        "You will receive a list of 11 products from phase_1_discover_v2 (rank, productName, detailUrl). For each product:\n1. Navigate to its detailUrl. Use Page.create (or Page.navigate).\n2. Use Page.getState and DOM.getAXTree to understand the detail page layout.\n3. Locate and extract the following sections:\n   - Reviews: user reviews with reviewer name, rating, date, and review text\n   - Pros & Cons: the pros list and cons list  \n   - Q&A: questions and answers\n4. If sections are hidden behind tabs, accordions, or reveal controls, use Input.click to expand them.\n5. For each product, record: rank, productName, detailUrl, reviews (structured text of all reviews), pros (list/structured text), cons (list/structured text), qa (structured text of Q&A).\n6. Use record_extraction to persist results. Process all 11 products."
       ],
       "applies_when": [
         "A future phase targets the same site/domain and stage.",
@@ -108,14 +119,86 @@
         "DOM.getText",
         "Input.scroll",
         "Page.screenshot",
+        "record_extraction",
+        "Memory.save",
+        "Page.create",
+        "Fleet.status"
+      ],
+      "cautioned_tools": [],
+      "avoid_tools": [],
+      "procedure": [
+        "Start from the validated same-site entry URL when the task scope matches: https://theresanaiforthat.com/ai/book-of-art-history/",
+        "Prefer one browser page and Page.navigate/Page.getState between detail URLs instead of opening a fresh Page.create for every item.",
+        "Persist the handoff as record_extraction name 'product_details_25_35' with exact contract fields.",
+        "Include pageUrl, sourceTool, sourceSelectorOrAxId, and canonical <field>EvidenceText provenance for sensitive fields."
+      ],
+      "success_criteria": [
+        "record_extraction row keys match the worker contract exactly",
+        "validated artifacts satisfy the phase validators",
+        "source URLs and provenance are persisted for handoff"
+      ],
+      "failure_signatures": [
+        "same-domain task ignores the learned successful entry point",
+        "re-scrapes already validated rows instead of continuing from trusted artifacts",
+        "creates repeated fresh pages where same-tab navigation would reuse the working session"
+      ],
+      "stats": {
+        "success_count": 7,
+        "fail_count": 0
+      },
+      "first_seen_at": "2026-06-12T03:55:15Z",
+      "last_seen_at": "2026-06-15T06:02:58Z"
+    },
+    {
+      "id": "learned.toolify.ai.collection.78979e73a7",
+      "learned": true,
+      "task_types": [
+        "web_scrape"
+      ],
+      "stage": "collection",
+      "applies_to_stages": [
+        "collection"
+      ],
+      "fallback": false,
+      "cross_cutting": false,
+      "site_domains": [
+        "toolify.ai"
+      ],
+      "site_entry_urls": [
+        "https://toolify.ai/",
+        "https://www.toolify.ai/browser-extension/top-growth",
+        "https://www.toolify.ai/tool/similartube",
+        "https://www.toolify.ai/tool/etsy-ai-review-analysis-download",
+        "https://www.toolify.ai/tool/a-i-archives-share-claude-chatgpt-bard"
+      ],
+      "phase_keywords": [
+        "phase1_list",
+        "Navigate toolify.ai homepage → click 'browser extension' tag → click 'top growth' card → collect products #1-10: name, active users growth, growth rate, rating, and detail page URLs.",
+        "collection",
+        "1. Navigate to https://toolify.ai/ and get page state. 2. Locate and click the 'browser extension' tag/link on the homepage. 3. After navigation, locate and click the 'top growth' card/link. 4. On the resulting list page, collect products ranked #1 through #10. For each product, capture: product name, active users growth, growth rate, rating, and the URL/href for the product detail page. 5. Record all fields using record_extraction. For each product include rankEvidenceText (what on-page text indicates its rank position), and sourceSelectorOrAxId/pageUrl for provenance.",
+        "toolify.ai"
+      ],
+      "applies_when": [
+        "A future phase targets the same site/domain and stage.",
+        "The current task can reuse the validated entry points, page flow, or extraction shape from this successful attempt."
+      ],
+      "preferred_tools": [
+        "Fleet.create",
+        "Page.create",
+        "Page.navigate",
+        "Page.getState",
+        "Page.screenshot",
+        "DOM.getAXTree",
+        "Input.click",
+        "DOM.getAttribute",
         "record_extraction"
       ],
       "cautioned_tools": [],
       "avoid_tools": [],
       "procedure": [
-        "Start from the validated same-site entry URL when the task scope matches: https://theresanaiforthat.com/ai/gptkit/",
-        "Prefer one browser page and Page.navigate/Page.getState between detail URLs instead of opening a fresh Page.create for every item.",
-        "Persist the handoff as record_extraction name 'product_details_25_35' with exact contract fields.",
+        "Start from the validated same-site entry URL when the task scope matches: https://toolify.ai/",
+        "Use the previously validated listing/leaderboard surface before broad search or alternate pages.",
+        "Persist the handoff as record_extraction name 'top_growth_products' with exact contract fields.",
         "Include pageUrl, sourceTool, sourceSelectorOrAxId, and canonical <field>EvidenceText provenance for sensitive fields."
       ],
       "success_criteria": [
@@ -132,9 +215,267 @@
         "success_count": 1,
         "fail_count": 0
       },
-      "first_seen_at": "2026-06-12T03:55:15Z",
-      "last_seen_at": "2026-06-12T03:55:15Z"
+      "first_seen_at": "2026-06-15T03:52:11Z",
+      "last_seen_at": "2026-06-15T03:52:11Z"
+    },
+    {
+      "id": "learned.toolify.ai.detail_sections.f4fc61bdc9",
+      "learned": true,
+      "task_types": [
+        "web_scrape"
+      ],
+      "stage": "detail_sections",
+      "applies_to_stages": [
+        "detail_sections"
+      ],
+      "fallback": false,
+      "cross_cutting": false,
+      "site_domains": [
+        "toolify.ai"
+      ],
+      "site_entry_urls": [
+        "https://www.toolify.ai/tool/similartube",
+        "https://www.toolify.ai/tool/chatgpt-rewriter"
+      ],
+      "phase_keywords": [
+        "phase2_details",
+        "For each of the #1-10 products from phase1, visit the detail page and collect introduction text and updated time.",
+        "detail_sections",
+        "Starting from a fresh page, use the detail URLs from the phase1 artifact. Visit each product detail page one at a time. For each product: 1. Navigate to the detailUrl. 2. Locate the introduction/description section and collect its full text. 3. Locate the 'updated time' or 'last updated' field and collect its text. 4. Record using record_extraction with fields: rank, productName, introduction, updatedTime. Include evidence text and sourceSelectorOrAxId for both introduction and updatedTime fields. Process all 10 products.",
+        "toolify.ai"
+      ],
+      "applies_when": [
+        "A future phase targets the same site/domain and stage.",
+        "The current task can reuse the validated entry points, page flow, or extraction shape from this successful attempt."
+      ],
+      "preferred_tools": [
+        "Page.create",
+        "Page.navigate",
+        "Page.getState",
+        "DOM.getAXTree",
+        "DOM.getText",
+        "record_extraction",
+        "Page.switchTo"
+      ],
+      "cautioned_tools": [],
+      "avoid_tools": [],
+      "procedure": [
+        "Start from the validated same-site entry URL when the task scope matches: https://www.toolify.ai/tool/chatgpt-rewriter",
+        "Prefer one browser page and Page.navigate/Page.getState between detail URLs instead of opening a fresh Page.create for every item.",
+        "Persist the handoff as record_extraction name 'product_details' with exact contract fields.",
+        "Include pageUrl, sourceTool, sourceSelectorOrAxId, and canonical <field>EvidenceText provenance for sensitive fields."
+      ],
+      "success_criteria": [
+        "record_extraction row keys match the worker contract exactly",
+        "validated artifacts satisfy the phase validators",
+        "source URLs and provenance are persisted for handoff"
+      ],
+      "failure_signatures": [
+        "same-domain task ignores the learned successful entry point",
+        "re-scrapes already validated rows instead of continuing from trusted artifacts",
+        "creates repeated fresh pages where same-tab navigation would reuse the working session"
+      ],
+      "stats": {
+        "success_count": 2,
+        "fail_count": 0
+      },
+      "first_seen_at": "2026-06-15T03:56:20Z",
+      "last_seen_at": "2026-06-15T03:57:41Z"
+    },
+    {
+      "id": "learned.theresanaiforthat.com.collection.805f928735",
+      "learned": true,
+      "task_types": [
+        "web_scrape"
+      ],
+      "stage": "collection",
+      "applies_to_stages": [
+        "collection"
+      ],
+      "fallback": false,
+      "cross_cutting": false,
+      "site_domains": [
+        "theresanaiforthat.com"
+      ],
+      "site_entry_urls": [
+        "https://theresanaiforthat.com/trending/week/",
+        "https://theresanaiforthat.com/ai/iloveimg/",
+        "https://theresanaiforthat.com/ai/letterpal/",
+        "https://theresanaiforthat.com/ai/ecrett-music/",
+        "https://theresanaiforthat.com/ai/book-of-art-history/"
+      ],
+      "phase_keywords": [
+        "phase_1_discover_v2",
+        "Navigate to the trending/week page, identify product cards by DOM structure (not badge text), determine their positional rank by DOM order, and extract product name and detail URL for positions 25-35.",
+        "collection",
+        "1. Navigate to https://theresanaiforthat.com/trending/week/\n2. Use Page.getState and DOM.getAXTree to understand the product card structure.\n3. Identify how individual product cards are structured. Each card should have a product name (likely a heading or link) and a link to the detail page (href matching /ai/product-name/). Ignore comment links (/comment/ in URL).\n4. Products are ranked implicitly by their DOM/appearance order. The first product card is rank 1, second is rank 2, etc.\n5. Count product cards in DOM order. Scroll down progressively to materialize all cards through at least position 35.\n6. For product cards at positions 25 through 35 (inclusive), extract:\n   - rank: the positional number (25-35, based on DOM order of product cards)\n   - productName: the tool name from the card\n   - detailUrl: the href to the product detail page (must match /ai/product-name/ pattern, NOT /comment/)\n7. Use DOM.getAXTree to locate cards, DOM.getText for names, DOM.getAttribute for hrefs.\n8. Save all 11 rows with record_extraction fields: rank, productName, detailUrl.\n9. Mark rank provenance: include rankEvidenceText explaining 'Position N in DOM card order on trending/week page'.",
+        "theresanaiforthat.com"
+      ],
+      "applies_when": [
+        "A future phase targets the same site/domain and stage.",
+        "The current task can reuse the validated entry points, page flow, or extraction shape from this successful attempt."
+      ],
+      "preferred_tools": [
+        "Page.switchTo",
+        "Page.getState",
+        "DOM.getAXTree",
+        "DOM.getAttribute",
+        "record_extraction"
+      ],
+      "cautioned_tools": [],
+      "avoid_tools": [],
+      "procedure": [
+        "Start from the validated same-site entry URL when the task scope matches: https://theresanaiforthat.com/trending/week/",
+        "Use the previously validated listing/leaderboard surface before broad search or alternate pages.",
+        "Persist the handoff as record_extraction name 'trending_products_25_35' with exact contract fields.",
+        "Include pageUrl, sourceTool, sourceSelectorOrAxId, and canonical <field>EvidenceText provenance for sensitive fields."
+      ],
+      "success_criteria": [
+        "record_extraction row keys match the worker contract exactly",
+        "validated artifacts satisfy the phase validators",
+        "source URLs and provenance are persisted for handoff"
+      ],
+      "failure_signatures": [
+        "same-domain task ignores the learned successful entry point",
+        "re-scrapes already validated rows instead of continuing from trusted artifacts",
+        "creates repeated fresh pages where same-tab navigation would reuse the working session"
+      ],
+      "stats": {
+        "success_count": 1,
+        "fail_count": 0
+      },
+      "first_seen_at": "2026-06-15T05:43:46Z",
+      "last_seen_at": "2026-06-15T05:43:46Z"
+    },
+    {
+      "id": "learned.yue-accelerator.com.generic.300ea43113",
+      "learned": true,
+      "task_types": [
+        "form_fill"
+      ],
+      "stage": "generic",
+      "applies_to_stages": [
+        "generic"
+      ],
+      "fallback": false,
+      "cross_cutting": false,
+      "site_domains": [
+        "yue-accelerator.com"
+      ],
+      "site_entry_urls": [
+        "https://www.yue-accelerator.com/#/.",
+        "https://www.yue-accelerator.com/#/"
+      ],
+      "phase_keywords": [
+        "p1_explore",
+        "Navigate to the site, assess page state, identify login requirements, form location, and overall structure.",
+        "generic",
+        "Navigate to https://www.yue-accelerator.com/#/. Use Page.getState and DOM.getAXTree to understand the page. Identify: (1) Is a login prompt/modal visible? (2) What is the login method (email, phone, OAuth)? (3) Is there a form visible on the page or is it behind login? (4) What sections/fields does the form contain (especially 教育经历-本科 and 公司业务)? Report findings as structured observations. Do NOT attempt to fill anything yet.",
+        "yue-accelerator.com"
+      ],
+      "applies_when": [
+        "A future phase targets the same site/domain and stage.",
+        "The current task can reuse the validated entry points, page flow, or extraction shape from this successful attempt."
+      ],
+      "preferred_tools": [
+        "Fleet.create",
+        "Page.create",
+        "Page.getState",
+        "DOM.getAXTree",
+        "Input.click",
+        "DOM.getAttribute",
+        "Input.press",
+        "Page.screenshot",
+        "record_extraction"
+      ],
+      "cautioned_tools": [],
+      "avoid_tools": [],
+      "procedure": [
+        "Start from the validated same-site entry URL when the task scope matches: https://www.yue-accelerator.com/#/.",
+        "Reuse the previously validated same-site flow before exploring a new surface.",
+        "Persist the handoff as record_extraction name 'exploration_observations' with exact contract fields.",
+        "Include pageUrl, sourceTool, sourceSelectorOrAxId, and canonical <field>EvidenceText provenance for sensitive fields."
+      ],
+      "success_criteria": [
+        "record_extraction row keys match the worker contract exactly",
+        "validated artifacts satisfy the phase validators",
+        "source URLs and provenance are persisted for handoff"
+      ],
+      "failure_signatures": [
+        "same-domain task ignores the learned successful entry point",
+        "re-scrapes already validated rows instead of continuing from trusted artifacts",
+        "creates repeated fresh pages where same-tab navigation would reuse the working session"
+      ],
+      "stats": {
+        "success_count": 1,
+        "fail_count": 0
+      },
+      "first_seen_at": "2026-06-15T11:54:17Z",
+      "last_seen_at": "2026-06-15T11:54:17Z"
+    },
+    {
+      "id": "learned.yue-accelerator.com.generic.37de49c6e7",
+      "learned": true,
+      "task_types": [
+        "general"
+      ],
+      "stage": "generic",
+      "applies_to_stages": [
+        "generic"
+      ],
+      "fallback": false,
+      "cross_cutting": false,
+      "site_domains": [
+        "yue-accelerator.com"
+      ],
+      "site_entry_urls": [
+        "https://www.yue-accelerator.com/#/.",
+        "https://www.yue-accelerator.com/#/"
+      ],
+      "phase_keywords": [
+        "phase_1_probe",
+        "Navigate to the target site, probe the page to understand structure, identify login gate presence and type.",
+        "generic",
+        "Navigate to https://www.yue-accelerator.com/#/. Get the page state and examine the page structure. Determine: (1) Is there a login/auth gate? (2) What type of login is required (email/password, SSO, QR code, etc.)? (3) What is visible on the page before login? (4) After understanding the page, report the login gate type, the current URL, page title, and any visible login form fields/buttons. Do NOT attempt to log in or fill any credentials. Stop after probing.",
+        "yue-accelerator.com"
+      ],
+      "applies_when": [
+        "A future phase targets the same site/domain and stage.",
+        "The current task can reuse the validated entry points, page flow, or extraction shape from this successful attempt."
+      ],
+      "preferred_tools": [
+        "Fleet.create",
+        "Page.create",
+        "Page.getState",
+        "DOM.getAXTree",
+        "Page.screenshot",
+        "record_extraction"
+      ],
+      "cautioned_tools": [],
+      "avoid_tools": [],
+      "procedure": [
+        "Start from the validated same-site entry URL when the task scope matches: https://www.yue-accelerator.com/#/.",
+        "Reuse the previously validated same-site flow before exploring a new surface.",
+        "Persist the handoff as record_extraction name 'site_probe_result' with exact contract fields.",
+        "Include pageUrl, sourceTool, sourceSelectorOrAxId, and canonical <field>EvidenceText provenance for sensitive fields."
+      ],
+      "success_criteria": [
+        "record_extraction row keys match the worker contract exactly",
+        "validated artifacts satisfy the phase validators",
+        "source URLs and provenance are persisted for handoff"
+      ],
+      "failure_signatures": [
+        "same-domain task ignores the learned successful entry point",
+        "re-scrapes already validated rows instead of continuing from trusted artifacts",
+        "creates repeated fresh pages where same-tab navigation would reuse the working session"
+      ],
+      "stats": {
+        "success_count": 1,
+        "fail_count": 0
+      },
+      "first_seen_at": "2026-06-15T15:02:16Z",
+      "last_seen_at": "2026-06-15T15:02:16Z"
     }
   ],
-  "updated_at": "2026-06-12T03:55:15Z"
+  "updated_at": "2026-06-15T15:02:16Z"
 }

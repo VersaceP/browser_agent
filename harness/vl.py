@@ -30,6 +30,35 @@ def build_visual_verify_prompt(
     mode: str,
     question: str,
 ) -> str:
+    if mode == "overlay_classify":
+        return (
+            "An automated browser action was blocked by an overlay covering the"
+            " page (a modal, popup, cookie/consent banner, or newsletter dialog)."
+            " Locate the SAFE control that dismisses the overlay so automation can"
+            " continue: a close/X button, or 'Skip' / 'Not now' / 'Maybe later' /"
+            " 'No thanks' / 'Got it' / 'Continue without' (for a cookie/consent"
+            " banner, 'Reject all' or 'Accept all' is also safe).\n"
+            "SAFETY: Never pick a login, sign-up, subscribe, pay, purchase,"
+            " checkout, or 'continue with Google/Apple' control. If the ONLY way"
+            " past the overlay is such a consequential control, return"
+            " no_safe_dismiss.\n"
+            f"question: {question or '(none)'}\n"
+            f"expected: {json.dumps(expected or {}, ensure_ascii=False, default=str)}\n\n"
+            "Coordinates are NORMALIZED integers from 0 to 1000, origin at the"
+            " top-left corner: x = round(1000 * pixelX / imageWidth), y = round("
+            "1000 * pixelY / imageHeight). Point at the CENTER of the chosen"
+            " control.\n"
+            "Return exactly one JSON object with keys:\n"
+            "- verdict: one of dismiss_found, no_overlay, no_safe_dismiss, uncertain\n"
+            "- dismiss_point: object {x: number, y: number} normalized 0-1000"
+            " (omit or null unless verdict is dismiss_found)\n"
+            "- control_label: short visible text/label on the chosen control\n"
+            "- is_consequential: boolean, true if the control could log in, pay,"
+            " subscribe, or otherwise act on the user's behalf\n"
+            "- confidence: number from 0 to 1\n"
+            "- visible_evidence: short array of visible screenshot observations\n"
+            "- reason: one short sentence\n"
+        )
     if mode == "challenge_detection":
         return (
             "Decide whether this browser screenshot is blocked by an anti-bot,"
@@ -123,6 +152,8 @@ async def visual_verify_image(
         }
 
     verdict = str(parsed.get("verdict") or "uncertain").strip().lower()
+    if mode == "overlay_classify":
+        return _finalize_overlay_classify(parsed, usage)
     allowed_verdicts = (
         {"confirmed_challenge", "normal_loading", "unrelated_block", "uncertain"}
         if mode == "challenge_detection"
@@ -157,6 +188,54 @@ async def visual_verify_image(
         "confidence": confidence,
         "visible_evidence": [str(item)[:300] for item in evidence[:8]],
         "recommended_recovery": recovery,
+        "reason": str(parsed.get("reason") or "")[:500],
+        "usage": usage,
+    }
+
+
+def _finalize_overlay_classify(parsed: JsonDict, usage: JsonDict) -> JsonDict:
+    """Normalize an overlay_classify VL response. dismiss_point stays in the
+    model's NORMALIZED 0-1000 grounding space; the caller back-translates to CSS
+    coordinates and runs an independent elementFromPoint safety check before any
+    click."""
+    verdict = str(parsed.get("verdict") or "uncertain").strip().lower()
+    if verdict not in {"dismiss_found", "no_overlay", "no_safe_dismiss", "uncertain"}:
+        verdict = "uncertain"
+    try:
+        confidence = float(parsed.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(confidence, 1.0))
+
+    point: Optional[JsonDict] = None
+    raw_point = parsed.get("dismiss_point")
+    if isinstance(raw_point, dict):
+        try:
+            point = {"x": float(raw_point.get("x")), "y": float(raw_point.get("y"))}
+        except (TypeError, ValueError):
+            point = None
+    elif isinstance(raw_point, (list, tuple)) and len(raw_point) >= 2:
+        try:
+            point = {"x": float(raw_point[0]), "y": float(raw_point[1])}
+        except (TypeError, ValueError):
+            point = None
+    # A dismiss_found verdict without a usable point is downgraded: the caller
+    # has nothing safe to click.
+    if verdict == "dismiss_found" and point is None:
+        verdict = "uncertain"
+
+    evidence = parsed.get("visible_evidence")
+    if not isinstance(evidence, list):
+        evidence = []
+    return {
+        "status": "done",
+        "mode": "overlay_classify",
+        "verdict": verdict,
+        "confidence": confidence,
+        "dismiss_point": point,
+        "control_label": str(parsed.get("control_label") or "")[:200],
+        "is_consequential": bool(parsed.get("is_consequential", False)),
+        "visible_evidence": [str(item)[:300] for item in evidence[:8]],
         "reason": str(parsed.get("reason") or "")[:500],
         "usage": usage,
     }

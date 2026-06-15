@@ -453,6 +453,7 @@ def compact_messages_if_needed(
     tools: List[JsonDict],
     config: HarnessConfig,
     lifecycle: Optional[LifecycleManager] = None,
+    force_reason: Optional[str] = None,
 ) -> List[JsonDict]:
     if lifecycle is not None:
         payload = lifecycle.compact_before(
@@ -478,7 +479,7 @@ def compact_messages_if_needed(
         max(1, config.model_context_window_tokens)
         * max(0.1, min(config.context_compaction_threshold_ratio, 0.95))
     )
-    if estimated <= threshold:
+    if estimated <= threshold and not force_reason:
         return messages
 
     original_pairing_error = validate_tool_pairing(messages)
@@ -487,6 +488,20 @@ def compact_messages_if_needed(
     keep_head = max(0, config.context_compaction_keep_head_pairs)
     keep_tail = max(0, config.context_compaction_keep_tail_pairs)
     if len(groups) <= keep_head + keep_tail + 1:
+        if force_reason:
+            logger.write(
+                "context.compaction_skipped",
+                {
+                    "actor": actor,
+                    "step": step,
+                    "reason": "not_enough_message_groups",
+                    "forceReason": force_reason,
+                    "estimatedTokensBefore": estimated,
+                    "thresholdTokens": threshold,
+                    "messageCount": len(messages),
+                    "groupCount": len(groups),
+                },
+            )
         return messages
 
     compactions_dir = task_subdir(logger, "context_compactions")
@@ -561,6 +576,7 @@ def compact_messages_if_needed(
                 "reason": "no_pairing_safe_candidate",
                 "estimatedTokensBefore": estimated,
                 "thresholdTokens": threshold,
+                "forceReason": force_reason,
                 "messageCount": len(messages),
                 "originalPairingError": original_pairing_error,
                 "validationFailures": validation_failures[:10],
@@ -577,6 +593,7 @@ def compact_messages_if_needed(
         "actor": actor,
         "step": step,
         "estimatedTokensBefore": estimated,
+        "forceReason": force_reason,
         "strategy": strategy,
         "middleGroups": middle_groups,
     }
@@ -591,6 +608,8 @@ def compact_messages_if_needed(
         summary["originalSavedPath"] = str(path.resolve())
         summary["estimatedTokensBefore"] = estimated
         summary["thresholdTokens"] = threshold
+        if force_reason:
+            summary["forceReason"] = force_reason
         compacted_message = make_compaction_message(summary)
 
     new_messages = assemble_compacted_messages(
@@ -610,6 +629,7 @@ def compact_messages_if_needed(
                 "pairingError": final_pairing_error,
                 "estimatedTokensBefore": estimated,
                 "thresholdTokens": threshold,
+                "forceReason": force_reason,
                 "messageCount": len(messages),
                 "originalPairingError": original_pairing_error,
                 "savedPath": str(path.resolve()),
@@ -626,6 +646,8 @@ def compact_messages_if_needed(
             "keepHeadPairs": chosen_keep_head,
             "keepTailPairs": keep_tail,
             "estimatedTokensBefore": estimated,
+            "thresholdTokens": threshold,
+            "forceReason": force_reason,
             "messageCountBefore": len(messages),
             "messageCountAfter": len(new_messages),
             "savedPath": str(path.resolve()),

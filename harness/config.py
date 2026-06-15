@@ -82,6 +82,9 @@ class HarnessConfig:
     context_compaction_threshold_ratio: float = 0.85
     context_compaction_keep_head_pairs: int = 1
     context_compaction_keep_tail_pairs: int = 3
+    cache_pressure_uncached_input_threshold: int = 10000
+    cache_pressure_consecutive_steps: int = 2
+    cache_pressure_min_remaining_steps: int = 2
     log_browser_payloads: bool = True
     hitl_poll_interval_seconds: float = 2.0
     hitl_wait_timeout_seconds: float = 1200.0
@@ -91,6 +94,35 @@ class HarnessConfig:
     hitl_post_resume_confirm_max_rounds: int = 3
     progress_local_fs_without_extraction_limit: int = 5
     progress_no_artifact_limit: int = 8
+    # Browser-side stale-id rematch policy:
+    #   "off"            -> stale guard blocks every stale id (legacy behavior)
+    #   "composite_only" -> only harness composite tools may pass previously
+    #                       seen stale ids through to the browser rematch
+    #   "on"             -> model-initiated calls may pass them through too
+    browser_side_rematch: str = "composite_only"
+    # Auto-intercept policy for overlay occlusion (Phase 7.2). When a browser
+    # action is blocked by an overlay, how aggressively the harness handles it:
+    #   "off"     -> no hint, no auto-run (legacy: model sees the raw error)
+    #   "suggest" -> attach a dismiss_overlay runtimeStrategy hint only
+    #   "p0"      -> auto-run dismiss_overlay on P0 (errorClassification
+    #                occlusion_blocked); P1/P2/P3 stay suggest-only
+    #   "p0p1"    -> also auto-run on P1 (an AXTree layer reports
+    #                occlusionState=occluded); P2 (text soft-detect) / P3
+    #                (observation keywords) remain suggest-only because soft
+    #                text signals have false positives (a cookies article hits
+    #                "we use cookies") and auto-clicking them is unacceptable.
+    auto_intercept: str = "p0p1"
+    # DOM.getSemanticTree usage policy (Phase B). It stays forbidden on the MODEL
+    # tool surface always (3.65x heavier than AXTree, no href/name/aria, and a
+    # historical renderer-crash ban); this flag only governs HARNESS-INTERNAL use:
+    #   "off"      -> never used, even internally (current safe default)
+    #   "internal" -> harness may make a one-shot, render_recovery-wrapped call to
+    #                 derive a tiny structure digest (scroll containers via
+    #                 isScrollable, bounds) that never enters model context. The
+    #                 raw tree is digested and discarded; never per-iteration.
+    # NOTE: shadow-host mapping is NOT supported (getSemanticTree does not
+    # traverse shadow roots on this build — see abcp-panel-quirks #8).
+    semantic_tree: str = "off"
     vl: VLConfig = field(default_factory=VLConfig)
 
     @classmethod
@@ -154,6 +186,24 @@ class HarnessConfig:
                     cls.context_compaction_threshold_ratio,
                 )
             ),
+            cache_pressure_uncached_input_threshold=int(
+                data.get(
+                    "cache_pressure_uncached_input_threshold",
+                    cls.cache_pressure_uncached_input_threshold,
+                )
+            ),
+            cache_pressure_consecutive_steps=int(
+                data.get(
+                    "cache_pressure_consecutive_steps",
+                    cls.cache_pressure_consecutive_steps,
+                )
+            ),
+            cache_pressure_min_remaining_steps=int(
+                data.get(
+                    "cache_pressure_min_remaining_steps",
+                    cls.cache_pressure_min_remaining_steps,
+                )
+            ),
             context_compaction_keep_head_pairs=int(
                 data.get(
                     "context_compaction_keep_head_pairs",
@@ -213,6 +263,24 @@ class HarnessConfig:
                     "progress_no_artifact_limit",
                     cls.progress_no_artifact_limit,
                 )
+            ),
+            browser_side_rematch=(
+                str(data.get("browser_side_rematch", cls.browser_side_rematch))
+                if str(data.get("browser_side_rematch", cls.browser_side_rematch))
+                in {"off", "composite_only", "on"}
+                else cls.browser_side_rematch
+            ),
+            auto_intercept=(
+                str(data.get("auto_intercept", cls.auto_intercept))
+                if str(data.get("auto_intercept", cls.auto_intercept))
+                in {"off", "suggest", "p0", "p0p1"}
+                else cls.auto_intercept
+            ),
+            semantic_tree=(
+                str(data.get("semantic_tree", cls.semantic_tree))
+                if str(data.get("semantic_tree", cls.semantic_tree))
+                in {"off", "internal"}
+                else cls.semantic_tree
             ),
         )
 

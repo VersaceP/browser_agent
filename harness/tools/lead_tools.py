@@ -401,6 +401,12 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
     _merge_strategy_avoid_tools(worker_contract, strategies)
     base_task = str(tool_input.get("task") or phase.get("worker_task") or "")
     base_context = str(tool_input.get("context") or phase.get("context") or "")
+    auth_gate_guidance = _auth_gate_probe_guidance(phase, worker_contract)
+    collection_guidance = _collection_contract_guidance(phase, worker_contract)
+    if auth_gate_guidance:
+        base_context = f"{base_context}\n\n{auth_gate_guidance}".strip()
+    if collection_guidance:
+        base_context = f"{base_context}\n\n{collection_guidance}".strip()
     if strategy_guidance:
         base_context = f"{base_context}\n\n{strategy_guidance}".strip()
     return await agent.spawner.spawn_browser_agent(
@@ -440,6 +446,327 @@ def _merge_strategy_avoid_tools(worker_contract: JsonDict, strategies: List[Json
             seen.add(text)
     if forbidden:
         worker_contract["forbidden_methods"] = forbidden
+
+
+_AUTH_GATE_FIELD_NAMES = {
+    "auth_required",
+    "authentication_required",
+    "login_required",
+    "signin_required",
+    "sign_in_required",
+    "requires_login",
+    "requires_auth",
+    "auth_method",
+    "authentication_method",
+    "login_method",
+    "auth_surface",
+    "login_surface",
+    "auth_evidence",
+    "login_evidence",
+    "next_phase_requires_hitl",
+}
+
+_AUTH_GATE_MARKERS = (
+    "auth",
+    "authentication",
+    "authenticate",
+    "login",
+    "log in",
+    "logged in",
+    "sign in",
+    "signin",
+    "sso",
+    "oauth",
+    "credential",
+    "password",
+    "captcha",
+    "human verification",
+    "identity verification",
+    "phone verification",
+    "security verification",
+    "verification code",
+    "sms verification",
+    "2fa",
+    "mfa",
+    "paywall",
+    "subscribe",
+    "subscription",
+    "hitl",
+    "登录",
+    "登陆",
+    "认证",
+    "手机号",
+    "验证码",
+    "人机",
+    "扫码",
+    "微信",
+    "付费墙",
+)
+
+_AUTH_GATE_PROBE_MARKERS = (
+    "probe",
+    "explore",
+    "assess",
+    "identify",
+    "detect",
+    "discover",
+    "check auth",
+    "check authentication",
+    "check login",
+    "check sign-in",
+    "check signin",
+    "check gate",
+    "check paywall",
+    "inspect",
+    "understand",
+    "requirements",
+    "page state",
+    "visible",
+    "门禁",
+    "探测",
+    "探索",
+    "识别",
+    "判断",
+    "确认",
+    "可见",
+)
+
+_AUTH_GATE_EXECUTION_MARKERS = (
+    "handle login",
+    "handle auth",
+    "handle authentication",
+    "complete login",
+    "complete auth",
+    "complete authentication",
+    "perform login",
+    "perform auth",
+    "perform authentication",
+    "requestpause",
+    "request pause",
+    "request hitl",
+    "hitl.requestpause",
+    "after login",
+    "after authentication",
+    "post-login",
+    "post login",
+    "post-auth",
+    "post auth",
+    "verify login",
+    "verify auth",
+    "verify authentication",
+    "verify authenticated",
+    "verify by page.getstate",
+    "login verification",
+    "auth verification",
+    "authentication verification",
+    "login status",
+    "login_status",
+    "form accessible",
+    "form_accessible",
+    "完成登录",
+    "完成认证",
+    "处理登录",
+    "处理认证",
+    "请求 hitl",
+    "人工登录",
+    "登录后",
+    "认证后",
+    "验证登录",
+    "验证认证",
+)
+
+_POST_AUTH_TARGET_MARKERS = (
+    "form",
+    "field",
+    "section",
+    "fill",
+    "submit",
+    "row",
+    "item",
+    "detail",
+    "download",
+    "collect",
+    "extract",
+    "list",
+    "表单",
+    "字段",
+    "版块",
+    "部分",
+    "填写",
+    "提交",
+    "采集",
+    "下载",
+    "详情",
+)
+
+
+def _auth_gate_probe_guidance(phase: JsonDict, worker_contract: JsonDict) -> str:
+    """Inject pre-auth gate guardrails for auth-gated workflows.
+
+    The trigger is intentionally semantic rather than site-specific: it catches
+    phases whose contract asks the worker to explore/detect an auth gate before
+    the target content is available, while skipping phases whose job is to
+    actually request HITL/login or perform post-auth form/list work.
+    """
+    expected = (
+        worker_contract.get("expected_artifact")
+        if isinstance(worker_contract.get("expected_artifact"), dict)
+        else phase.get("expected_artifact")
+        if isinstance(phase.get("expected_artifact"), dict)
+        else {}
+    )
+    fields = _expected_field_names(expected)
+    normalized_fields = {
+        str(item or "").strip().lower()
+        for item in fields
+        if str(item or "").strip()
+    }
+    has_gate_fields = bool(normalized_fields & _AUTH_GATE_FIELD_NAMES)
+
+    validators = worker_contract.get("validators")
+    if not isinstance(validators, list):
+        validators = phase.get("validators")
+
+    parts = [
+        phase.get("id"),
+        phase.get("objective"),
+        phase.get("worker_task"),
+        phase.get("stage_hint"),
+        phase.get("stage_hint_reason"),
+        phase.get("context"),
+        worker_contract.get("task_type"),
+        worker_contract.get("objective"),
+        worker_contract.get("stage_hint"),
+        worker_contract.get("stage_hint_reason"),
+        *fields,
+    ]
+    for structured in (expected, validators):
+        if structured:
+            try:
+                parts.append(json.dumps(structured, ensure_ascii=False, default=str))
+            except TypeError:
+                parts.append(str(structured))
+    text = " ".join(str(item or "") for item in parts).lower()
+    if not any(marker in text for marker in _AUTH_GATE_MARKERS):
+        return ""
+
+    is_probe = has_gate_fields or any(
+        marker in text for marker in _AUTH_GATE_PROBE_MARKERS
+    )
+    if not is_probe:
+        return ""
+
+    if not has_gate_fields and any(
+        marker in text for marker in _AUTH_GATE_EXECUTION_MARKERS
+    ):
+        return ""
+
+    target_terms = [
+        marker
+        for marker in _POST_AUTH_TARGET_MARKERS
+        if marker in text
+    ][:8]
+    target_note = ""
+    if target_terms:
+        target_note = (
+            "- Treat target-content terms in this phase as post-auth scope if a"
+            f" gate is present: {target_terms!r}. Mark them behind_auth or"
+            " unknown; do not spend steps discovering them before auth.\n"
+        )
+
+    return (
+        "<auth_gate_probe_guidance>\n"
+        "- This is a pre-auth gate probe, not the protected target-content phase.\n"
+        "- Stop as soon as login/auth/SSO/OAuth/QR/phone verification/CAPTCHA/HITL/paywall is confirmed with Page.getState and DOM.getAXTree evidence.\n"
+        "- Report only gate facts: auth_required/login_required, auth_surface, auth_method/options/providers, current URL/title, evidence text/source, and whether the next phase needs HITL.\n"
+        "- Do not dismiss auth/paywall overlays, click provider/login/submit buttons, fill credentials, direct-navigate around the gate, or inspect post-auth form/list/detail/download fields.\n"
+        f"{target_note}"
+        "- If the protected target is not visible before auth, return it as behind_auth/unknown and hand control back to LeadAgent for a login/HITL phase.\n"
+        "</auth_gate_probe_guidance>"
+    )
+
+
+def _collection_contract_guidance(phase: JsonDict, worker_contract: JsonDict) -> str:
+    """Inject rank/window collection guardrails derived from the contract."""
+    stage = str(
+        worker_contract.get("stage_hint")
+        or phase.get("stage_hint")
+        or ""
+    ).strip()
+    if stage != "collection":
+        return ""
+    expected = (
+        worker_contract.get("expected_artifact")
+        if isinstance(worker_contract.get("expected_artifact"), dict)
+        else {}
+    )
+    fields = _expected_field_names(expected)
+    if not fields:
+        return ""
+    field_set = set(fields)
+    rank_like = {"rank", "position", "index"} & field_set
+    link_like = {"detailUrl", "url", "href", "productUrl"} & field_set
+    name_like = {"productName", "name", "title"} & field_set
+    if not (rank_like and link_like and name_like):
+        return ""
+    exact_rows = _exact_rows_from_contract(worker_contract)
+    exact_text = (
+        f"exactly {exact_rows} rows"
+        if exact_rows is not None
+        else "the requested row count"
+    )
+    return (
+        "<collection_contract_guidance>\n"
+        f"- The final record_extraction must satisfy fields {fields!r} and produce {exact_text}; do not treat a broad link harvest as final target data.\n"
+        "- Use collect_items for repeated list/card candidates when useful, but first verify the selector represents the product/card sequence, not all /ai/ links, featured links, nav links, or comment links.\n"
+        "- If collect_items returns many more rows than expected or recordExtraction.status=needs_fix, treat the selector as too broad or the row schema as wrong. Narrow the repeated card selector or transform/slice trusted DOM-order rows before final_answer.\n"
+        "- For rank/position tasks, derive rank from the verified DOM/visual order and persist canonical provenance fields such as rankEvidenceText, sourceTool, sourceSelectorOrAxId, and pageUrl.\n"
+        "</collection_contract_guidance>"
+    )
+
+
+def _expected_field_names(expected: JsonDict) -> List[str]:
+    raw_fields = expected.get("required_fields")
+    if not isinstance(raw_fields, list) or not raw_fields:
+        raw_fields = expected.get("fields")
+    if not isinstance(raw_fields, list):
+        return []
+    out: List[str] = []
+    seen = set()
+    for item in raw_fields:
+        value = (
+            item.get("name") or item.get("field") or item.get("key")
+            if isinstance(item, dict)
+            else item
+        )
+        text = str(value or "").strip()
+        if text and text not in seen:
+            out.append(text)
+            seen.add(text)
+    return out
+
+
+def _exact_rows_from_contract(worker_contract: JsonDict) -> Optional[int]:
+    expected = (
+        worker_contract.get("expected_artifact")
+        if isinstance(worker_contract.get("expected_artifact"), dict)
+        else {}
+    )
+    value = optional_int(expected.get("exact_rows"))
+    if value is not None and value > 0:
+        return value
+    validators = worker_contract.get("validators")
+    if not isinstance(validators, list):
+        return None
+    for validator in validators:
+        if not isinstance(validator, dict):
+            continue
+        if str(validator.get("type") or "") != "exact_rows":
+            continue
+        value = optional_int(validator.get("value"))
+        if value is not None and value > 0:
+            return value
+    return None
 
 
 @LEAD_TOOLS.register(

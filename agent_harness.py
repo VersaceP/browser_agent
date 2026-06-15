@@ -35,6 +35,7 @@ from harness.diagnostics import (
 from harness.local_fs import local_fs_jsonpath, local_fs_read, local_fs_search
 from harness.lifecycle import LifecycleContext, default_lifecycle_manager
 from harness.model_config import browser_agent_model_config, lead_agent_model_config
+from harness.observation.event_observer import BrowserEventObserver
 from harness.observation.loop_nudge import ActionLoopNudge
 from harness.offload import (
     offload_large_response_fields,
@@ -89,6 +90,8 @@ from harness.tool_policy import (
     ALWAYS_FORBIDDEN_ABCP_METHODS,
     HARNESS_TOOL_NAMES,
     filter_capability_methods_for_task_type,
+    sanitize_tool_calls_for_log,
+    sanitize_tool_input_for_log,
 )
 from harness.tools.browser_tools import (
     build_browser_agent_tool_specs,
@@ -157,6 +160,131 @@ def offload_tool_result_for_model(
     )
 
 
+def summarize_lead_tool_result_for_log(
+    *,
+    tool_call: JsonDict,
+    result: Any,
+    model_result: Any,
+    step: int,
+) -> JsonDict:
+    name = str(tool_call.get("name") or "tool")
+    tool_input = tool_call.get("input") if isinstance(tool_call.get("input"), dict) else {}
+    source = model_result if isinstance(model_result, dict) else result
+    summary: JsonDict = {
+        "step": step,
+        "tool": name,
+    }
+
+    if isinstance(tool_input, dict):
+        for key in ("path", "expr", "mode", "phase_id", "name"):
+            if tool_input.get(key) is not None:
+                summary[key] = tool_input.get(key)
+        if name == "wait_browser_agents":
+            worker_ids = tool_input.get("worker_ids")
+            if isinstance(worker_ids, list):
+                summary["workerIds"] = worker_ids[:10]
+            summary["waitMode"] = tool_input.get("mode") or "all"
+            if tool_input.get("timeout_seconds") is not None:
+                summary["timeoutSeconds"] = tool_input.get("timeout_seconds")
+
+    if not isinstance(source, dict):
+        summary["resultType"] = type(source).__name__
+        return summary
+
+    for key in (
+        "status",
+        "count",
+        "truncated",
+        "relativePath",
+        "path",
+        "expr",
+        "mode",
+        "maxBytesPerNode",
+        "_offloaded",
+        "savedPath",
+        "byteSize",
+        "originalBytes",
+        "query_with",
+        "phaseCount",
+        "currentPhase",
+        "error",
+        "next_instruction",
+    ):
+        if key in source:
+            summary[key] = source.get(key)
+
+    completed = source.get("completed")
+    if isinstance(completed, list):
+        summary["completedCount"] = len(completed)
+        summary["workerStatuses"] = [
+            {
+                "workerId": item.get("workerId"),
+                "status": item.get("status"),
+                "validatedStatus": item.get("validatedStatus"),
+                "phaseId": item.get("phaseId"),
+            }
+            for item in completed[:10]
+            if isinstance(item, dict)
+        ]
+    pending = source.get("pending")
+    if isinstance(pending, list):
+        summary["pendingCount"] = len(pending)
+    artifacts = source.get("artifacts")
+    if isinstance(artifacts, list):
+        summary["artifactCount"] = len(artifacts)
+    result_levels = source.get("resultLevels")
+    if isinstance(result_levels, dict):
+        l1 = result_levels.get("l1")
+        if isinstance(l1, dict):
+            summary["resultL1"] = {
+                key: l1.get(key)
+                for key in (
+                    "status",
+                    "statusCategory",
+                    "validatedStatus",
+                    "workerId",
+                    "phaseId",
+                    "artifactCount",
+                    "extractionArtifactCount",
+                    "errorCount",
+                )
+                if key in l1
+            }
+    return trim_large_strings(summary, 1000)
+
+
+def update_cache_pressure_state(
+    *,
+    current_streak: int,
+    usage_payload: JsonDict,
+    config: HarnessConfig,
+    step: int,
+    max_steps: int,
+) -> tuple[int, Optional[str]]:
+    threshold = int(
+        getattr(config, "cache_pressure_uncached_input_threshold", 10000) or 0
+    )
+    required = int(getattr(config, "cache_pressure_consecutive_steps", 2) or 0)
+    min_remaining = int(
+        getattr(config, "cache_pressure_min_remaining_steps", 2) or 0
+    )
+    if threshold <= 0 or required <= 0:
+        return 0, None
+    try:
+        uncached_input = int(usage_payload.get("uncached_input") or 0)
+    except (TypeError, ValueError):
+        uncached_input = 0
+    streak = current_streak + 1 if uncached_input > threshold else 0
+    remaining_steps = max_steps - step
+    if streak >= required and remaining_steps > min_remaining:
+        reason = (
+            "cache_pressure:"
+            f"uncached_input>{threshold} for {streak} consecutive step(s)"
+        )
+        return 0, reason
+    return streak, None
+
+
 class BrowserAgent:
     def __init__(
         self,
@@ -192,9 +320,20 @@ class BrowserAgent:
         self.axtree_ids: Set[str] = set()
         self.axtree_page_id = ""
         self.axtree_invalidated = True
+        # Monotonic serial bumped only when BrowserEventObserver applies a fresh
+        # full snapshot from DOM.axTreeUpdated. _invoke_browser_method samples it
+        # before runner.call so post-action pessimistic invalidation can detect a
+        # same-page event that landed mid-call and avoid clobbering it (race fix).
+        self.axtree_event_serial = 0
+        # Page of the most recently applied DOM.axTreeUpdated; suppression is
+        # gated on this matching the page held before the call (page scope).
+        self.axtree_event_page_id = ""
         self._render_recovery_recent: Dict[str, float] = {}
         self.render_recovery_runner = None
+        self.event_observer = BrowserEventObserver(self)
         self.recent_tool_signatures: List[str] = []
+        self._cache_pressure_streak = 0
+        self._forced_compaction_reason: Optional[str] = None
         self.static_context_block, self.static_context_hash = build_static_context_block(
             self.runtime.harness.context_file
         )
@@ -221,6 +360,10 @@ class BrowserAgent:
                 capability_methods=self.capability_methods,
                 recent_recoveries=self._render_recovery_recent,
             )
+            # Layer-0 event observer: DOM.axTreeUpdated (browser-side stale-id
+            # auto-rematch) refreshes our id snapshot without a manual
+            # DOM.getAXTree round-trip. Never enters the model context.
+            self.event_observer.attach(self.browser)
             dynamic_context = self._build_dynamic_context(bootstrap)
 
             messages = [
@@ -235,6 +378,8 @@ class BrowserAgent:
             ]
 
             for step in range(1, self.runtime.harness.max_steps + 1):
+                force_reason = self._forced_compaction_reason
+                self._forced_compaction_reason = None
                 messages = compact_messages_if_needed(
                     logger=self.logger,
                     actor="browser_agent",
@@ -244,6 +389,7 @@ class BrowserAgent:
                     tools=tools,
                     config=self.runtime.harness,
                     lifecycle=self.lifecycle,
+                    force_reason=force_reason,
                 )
                 self.logger.write("agent.step.start", {"step": step})
                 self.lifecycle.agent_before_step(
@@ -257,17 +403,12 @@ class BrowserAgent:
                         "toolCount": len(tools),
                     },
                 )
-                step_system_prompt = self._maybe_apply_step_cap_reminder(
-                    system_prompt=system_prompt,
-                    step=step,
-                    max_steps=self.runtime.harness.max_steps,
-                )
                 text, tool_calls, stop_reason, usage = await self.provider.generate_response(
-                    system_prompt=step_system_prompt,
+                    system_prompt=system_prompt,
                     messages=messages,
                     tools=tools,
                 )
-                self.logger.record_llm_usage(
+                usage_payload = self.logger.record_llm_usage(
                     source="browser_agent",
                     provider=self.runtime.model.provider,
                     model=self.runtime.model.model_id,
@@ -276,12 +417,20 @@ class BrowserAgent:
                     conversation_id=f"browser:{self.runtime.agent_id}",
                     context_hash=self.static_context_hash,
                 )
+                self._observe_cache_pressure(
+                    usage_payload,
+                    step=step,
+                    max_steps=self.runtime.harness.max_steps,
+                )
+                # Mask sensitive tool-call inputs (e.g. fill_field_verified text
+                # with mask=true) at the earliest log/trace boundary. The real
+                # input still drives execution; only persisted copies are masked.
                 self.logger.write(
                     "agent.model",
                     {
                         "step": step,
                         "text": text,
-                        "tool_calls": tool_calls,
+                        "tool_calls": sanitize_tool_calls_for_log(tool_calls),
                         "stop_reason": stop_reason,
                     },
                 )
@@ -292,7 +441,9 @@ class BrowserAgent:
                     "tool_calls": [
                         {
                             "name": item.get("name"),
-                            "input": item.get("input", {}),
+                            "input": sanitize_tool_input_for_log(
+                                item.get("name"), item.get("input", {})
+                            ),
                         }
                         for item in tool_calls
                     ],
@@ -404,6 +555,12 @@ class BrowserAgent:
                                 "</loop_nudge>"
                             ),
                         })
+                    reminder = self._step_cap_reminder_block(
+                        current_step=step,
+                        max_steps=self.runtime.harness.max_steps,
+                    )
+                    if reminder is not None:
+                        tool_results.append(reminder)
                 messages.append({"role": "user", "content": tool_results})
                 if should_finish:
                     break
@@ -467,6 +624,10 @@ class BrowserAgent:
                     return final_answer
             raise
         finally:
+            try:
+                self.event_observer.detach()
+            except Exception:
+                pass
             try:
                 write_context_snapshot(
                     self.logger,
@@ -698,7 +859,7 @@ L1. Contracts, Feedback, Memory
 
 L2. Perception And Evidence
 - DOM.getAXTree is the default perception tool for structure, labels, controls, state, and canonical ids. DOM.getText reads exact visible text for a known target. DOM.getAttribute reads href/src/id/aria-/data-/value and other attributes.
-- AXTree ids are epoch-bound physical anchors. Any Page.navigate, Page.recovered, Page.create/switch/close, Runtime.evaluate, Hitl transition, or Input.* action can invalidate them. After such a change, call Page.getState as needed, then DOM.getAXTree and derive fresh ids before targeting. For same-instance multi-page workflows, track each pageId with its URL/title/purpose, switch serially with Page.switchTo, and never assume a snapshot from one page remains valid after Page.create or Page.switchTo.
+- AXTree ids are epoch-bound physical anchors. Any Page.navigate, render recovery/recovered feedback, Page.create/switch/close, Runtime.evaluate, Hitl transition, or Input.* action can invalidate them. After such a change, call Page.getState as needed, then DOM.getAXTree and derive fresh ids before targeting. For same-instance multi-page workflows, track each pageId with its URL/title/purpose, switch serially with Page.switchTo, and never assume a snapshot from one page remains valid after Page.create or Page.switchTo.
 - Large DOM/text/attribute/tool results are offloaded under observations/. The model-visible stub includes `savedPath`, `outline`, `format`, and `query_with`; inspect savedPath with local_fs_search, local_fs_read, or local_fs_jsonpath before deriving params from offloaded evidence.
 - Screenshots produce a `savedPath` only. You cannot see the image from Page.screenshot output. Do not call Page.screenshot to read text, understand layout, identify selectors, or extract data. Use visual_verify only for bounded visual checks after visual uncertainty, overlays/CAPTCHA, canvas/image UI, layout mismatch, or DOM/visual disagreement.
 
@@ -788,23 +949,21 @@ L6. Termination
     def _trim_for_log(self, value: Any) -> Any:
         return trim_large_strings(value, max_chars=8000)
 
-    def _maybe_apply_step_cap_reminder(
-        self, *, system_prompt: str, step: int, max_steps: int,
-    ) -> str:
-        """When the worker is within 2 steps of its cap, prepend a transient
-        reminder so the next model turn can checkpoint cleanly via
-        final_answer(status="partial"|"incomplete"). The reminder is
-        appended only for this single LLM call (not stored in messages or
-        the persistent system prompt) so prompt caching remains hot for
-        the bulk of the run.
-        """
-        remaining = max_steps - step
+    def _step_cap_reminder_block(
+        self, *, current_step: int, max_steps: int,
+    ) -> Optional[JsonDict]:
+        """Append a transient reminder to the next user message, not system."""
+        next_step = current_step + 1
+        if next_step > max_steps:
+            return None
+        remaining = max_steps - next_step
         if remaining > 2:
-            return system_prompt
+            return None
         if remaining <= 0:
             remaining = 1  # we are at the last step
         reminder = (
-            "\n\n[HARNESS-CHECKPOINT-REMINDER]\n"
+            "[HARNESS-CHECKPOINT-REMINDER]\n"
+            "This reminder applies to the immediately following assistant turn only.\n"
             f"You have {remaining} step(s) left before this worker is hard-stopped.\n"
             "If the task is not finished, call final_answer immediately:\n"
             "  - status=\"partial\" if you have any usable evidence to hand off,\n"
@@ -819,9 +978,37 @@ L6. Termination
         )
         self.logger.write(
             "agent.step_cap.reminder",
-            {"step": step, "max_steps": max_steps, "remaining": remaining},
+            {
+                "step": next_step,
+                "max_steps": max_steps,
+                "remaining": remaining,
+                "injected_after_step": current_step,
+                "placement": "user_message_text_block",
+            },
         )
-        return system_prompt + reminder
+        return {"type": "text", "text": reminder}
+
+    def _observe_cache_pressure(
+        self, usage_payload: JsonDict, *, step: int, max_steps: int,
+    ) -> None:
+        self._cache_pressure_streak, reason = update_cache_pressure_state(
+            current_streak=self._cache_pressure_streak,
+            usage_payload=usage_payload,
+            config=self.runtime.harness,
+            step=step,
+            max_steps=max_steps,
+        )
+        if reason:
+            self._forced_compaction_reason = reason
+            self.logger.write(
+                "context.compaction_requested",
+                {
+                    "actor": "browser_agent",
+                    "step": step + 1,
+                    "reason": reason,
+                    "triggerStep": step,
+                },
+            )
 
     def _observe_tool_result(self, tool_call: JsonDict, result: Any) -> None:
         """Feed browser_call results into diagnostics for status classification."""
@@ -926,6 +1113,8 @@ class LeadAgent:
         )
         self.recent_tool_signatures: List[str] = []
         self._current_step: int = 0
+        self._cache_pressure_streak = 0
+        self._forced_compaction_reason: Optional[str] = None
 
     def refresh_strategy_bank(self) -> JsonDict:
         self.strategy_bank = load_strategy_bank(
@@ -1320,6 +1509,8 @@ class LeadAgent:
 
         try:
             for step in range(1, self.runtime.harness.lead_max_steps + 1):
+                force_reason = self._forced_compaction_reason
+                self._forced_compaction_reason = None
                 messages = compact_messages_if_needed(
                     logger=self.logger,
                     actor="lead_agent",
@@ -1329,6 +1520,7 @@ class LeadAgent:
                     tools=tools,
                     config=self.runtime.harness,
                     lifecycle=self.lifecycle,
+                    force_reason=force_reason,
                 )
                 remaining = self.runtime.harness.lead_max_steps - step
                 step_reason = (
@@ -1359,17 +1551,12 @@ class LeadAgent:
                         "toolCount": len(tools),
                     },
                 )
-                step_system_prompt = self._maybe_apply_step_cap_reminder(
-                    system_prompt=system_prompt,
-                    step=step,
-                    max_steps=self.runtime.harness.lead_max_steps,
-                )
                 text, tool_calls, stop_reason, usage = await self.provider.generate_response(
-                    system_prompt=step_system_prompt,
+                    system_prompt=system_prompt,
                     messages=messages,
                     tools=tools,
                 )
-                self.logger.record_llm_usage(
+                usage_payload = self.logger.record_llm_usage(
                     source="lead_agent",
                     provider=self.runtime.model.provider,
                     model=self.runtime.model.model_id,
@@ -1377,6 +1564,11 @@ class LeadAgent:
                     step=step,
                     conversation_id=f"lead:{self.runtime.agent_id}",
                     context_hash=self.static_context_hash,
+                )
+                self._observe_cache_pressure(
+                    usage_payload,
+                    step=step,
+                    max_steps=self.runtime.harness.lead_max_steps,
                 )
                 self.logger.write(
                     "lead.model",
@@ -1419,6 +1611,15 @@ class LeadAgent:
                         result=result,
                         step=step,
                     )
+                    self.logger.write(
+                        "lead.tool.result",
+                        summarize_lead_tool_result_for_log(
+                            tool_call=tool_call,
+                            result=result,
+                            model_result=model_result,
+                            step=step,
+                        ),
+                    )
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": tool_call["id"],
@@ -1437,6 +1638,13 @@ class LeadAgent:
                         should_finish = True
                         break
 
+                if not should_finish:
+                    reminder = self._step_cap_reminder_block(
+                        current_step=step,
+                        max_steps=self.runtime.harness.lead_max_steps,
+                    )
+                    if reminder is not None:
+                        tool_results.append(reminder)
                 messages.append({"role": "user", "content": tool_results})
                 if should_finish:
                     break
@@ -1509,16 +1717,20 @@ class LeadAgent:
         )
         return final_answer
 
-    def _maybe_apply_step_cap_reminder(
-        self, *, system_prompt: str, step: int, max_steps: int,
-    ) -> str:
-        remaining = max_steps - step
+    def _step_cap_reminder_block(
+        self, *, current_step: int, max_steps: int,
+    ) -> Optional[JsonDict]:
+        next_step = current_step + 1
+        if next_step > max_steps:
+            return None
+        remaining = max_steps - next_step
         if remaining > 2:
-            return system_prompt
+            return None
         if remaining <= 0:
             remaining = 1
         reminder = (
-            "\n\n[LEAD-CHECKPOINT-REMINDER]\n"
+            "[LEAD-CHECKPOINT-REMINDER]\n"
+            "This reminder applies to the immediately following assistant turn only.\n"
             f"You have {remaining} orchestration step(s) left. Do not start a"
             " new broad phase. If current evidence is enough, call final_answer;"
             " otherwise report the blocker, failed phase, and next concrete"
@@ -1526,9 +1738,37 @@ class LeadAgent:
         )
         self.logger.write(
             "lead.step_cap.reminder",
-            {"step": step, "max_steps": max_steps, "remaining": remaining},
+            {
+                "step": next_step,
+                "max_steps": max_steps,
+                "remaining": remaining,
+                "injected_after_step": current_step,
+                "placement": "user_message_text_block",
+            },
         )
-        return system_prompt + reminder
+        return {"type": "text", "text": reminder}
+
+    def _observe_cache_pressure(
+        self, usage_payload: JsonDict, *, step: int, max_steps: int,
+    ) -> None:
+        self._cache_pressure_streak, reason = update_cache_pressure_state(
+            current_streak=self._cache_pressure_streak,
+            usage_payload=usage_payload,
+            config=self.runtime.harness,
+            step=step,
+            max_steps=max_steps,
+        )
+        if reason:
+            self._forced_compaction_reason = reason
+            self.logger.write(
+                "context.compaction_requested",
+                {
+                    "actor": "lead_agent",
+                    "step": step + 1,
+                    "reason": reason,
+                    "triggerStep": step,
+                },
+            )
 
     def _build_system_prompt(self) -> str:
         strategy_bank_json = json.dumps(
@@ -1551,6 +1791,8 @@ Lead state flow:
    Valid stage_hint values: collection, detail_sections, attribute_links, form_interaction, computed_relationship, generic. Use generic only when the phase truly cannot be classified.
    Do not hand-author ABCP allow-lists. BrowserAgent access is governed by task_type policy plus explicit forbidden_methods. If a workflow crosses task types, split phases and replan with the correct task_type.
    BrowserAgent slots are expensive and pooled. Keep live slots within runtime_limits.max_browser_agent_instances. A normal new worker reuses only the slot connection and must start browser work from a fresh page. For related continuations only, inspect list_browser_agents slots and pass reuse_from_worker_id or preferred_slot_id so the spawner can expose that idle slot's existing fleet/page registry.
+   If the user asks for an explicit item count such as "#1-10", "top 10", "all 10", or "for each of the 10 rows", encode that count as expected_artifact.exact_rows or an exact_rows validator. Use required_fields for every user-requested output field, and make scalar fields field_nonempty unless the task explicitly allows blanks or missing values.
+   For any auth-gated workflow (login, SSO/OAuth, QR scan, phone verification, CAPTCHA/human verification, paywall, or subscription wall), split pre-auth gate probing from post-auth target work. The pre-auth phase should only answer whether a gate is present, the gate surface/method/options, current URL/title, and evidence; it must stop once a gate is confirmed and must not require post-auth target fields, form sections, list rows, downloads, or details. Put HITL/login verification in the next phase, then map/fill/collect protected target content only after authentication is verified.
 1. Spawn one BrowserAgent for the first pending phase. Give it a narrow worker_task, exact target fields, exact output format, explicit stop condition, and a `result_contract`.
 2. When spawning a BrowserAgent, copy expected_artifact.fields / required_fields verbatim and state that record_extraction row keys must use those exact names. For provenance-sensitive fields, state the literal keys from worker_contract.validators: pageUrl, sourceTool, sourceSelectorOrAxId, and canonical <field>EvidenceText such as rankEvidenceText. The validator accepts legacy evidence/<field>Evidence aliases only as compatibility fallback; prefer the canonical keys.
 3. Never turn an unverified assumption into a worker instruction. Dynamic params must be described as observable labels, roles, headings, hrefs, artifact paths, or current-page evidence. Do not pass hard-coded pageId, fleetId, AXTree ids, CSS selectors, ranks, or list indexes unless they came from cited recent evidence.

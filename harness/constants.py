@@ -44,7 +44,15 @@ OFFLOAD_METHODS = {
     "DOM.getAttribute",
 }
 OFFLOAD_FIELDS_AS_TEXT = {"lines"}
-OFFLOAD_FIELDS_AS_JSON = {"tree", "nodes", "ax", "text", "attributes", "value"}
+OFFLOAD_FIELDS_AS_JSON = {
+    "tree",
+    "nodes",
+    "ax",
+    "text",
+    "attributes",
+    "value",
+    "layers",
+}
 OFFLOAD_FIELDS = OFFLOAD_FIELDS_AS_TEXT | OFFLOAD_FIELDS_AS_JSON
 SCREENSHOT_METHODS = {"Page.screenshot", "DOM.getElementScreenshot"}
 GENERIC_TOOL_RESULT_KEEP_KEYS = (

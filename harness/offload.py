@@ -55,6 +55,88 @@ def outline_large_field(value: Any, max_bytes: int = GENERIC_TOOL_RESULT_KEEP_FI
     return outline_value(value)
 
 
+def compact_model_facing_tool_result(value: Any) -> Any:
+    """Drop low-value successful-result chatter before it reaches the model."""
+    if isinstance(value, dict):
+        compacted: JsonDict = {}
+        for key, item in value.items():
+            if key == "suspected_challenge" and _empty_challenge_summary(item):
+                continue
+            if key == "suggested_prompt" and not _keep_suggested_prompt(value):
+                continue
+            compacted[key] = compact_model_facing_tool_result(item)
+        return compacted
+    if isinstance(value, list):
+        return [compact_model_facing_tool_result(item) for item in value]
+    return value
+
+
+def _empty_challenge_summary(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    adjudication = str(value.get("adjudication") or "")
+    if adjudication and adjudication != "not_ready":
+        return False
+    signals = value.get("signals")
+    if isinstance(signals, list) and signals:
+        return False
+    try:
+        score = float(value.get("suspicionScore") or 0)
+    except (TypeError, ValueError):
+        score = 0.0
+    return score <= 0 and not bool(value.get("highConfidenceHit"))
+
+
+def _keep_suggested_prompt(container: JsonDict) -> bool:
+    for key in (
+        "error",
+        "errorClassification",
+        "warning",
+        "warnings",
+        "blocked",
+        "blocker",
+        "blockers",
+        "missingAnyOf",
+        "pausedState",
+        "autoHitl",
+        "challengeAdjudication",
+        "hitl_wait",
+    ):
+        value = container.get(key)
+        if value not in (None, "", [], {}):
+            return True
+    challenge = container.get("suspected_challenge")
+    if isinstance(challenge, dict) and not _empty_challenge_summary(challenge):
+        return True
+    status = str(container.get("status") or "").lower()
+    if status and status not in {
+        "ok",
+        "done",
+        "success",
+        "succeeded",
+        "running",
+        "loaded",
+        "ready",
+        "resumed",
+    }:
+        return True
+    observation = str(container.get("observation") or "").lower()
+    return any(
+        marker in observation
+        for marker in (
+            "error",
+            "failed",
+            "blocked",
+            "warning",
+            "paused",
+            "captcha",
+            "challenge",
+            "timeout",
+            "stale",
+        )
+    )
+
+
 def offload_large_tool_result(
     *,
     logger: RunLogger,
@@ -64,6 +146,7 @@ def offload_large_tool_result(
     prefix: str = "",
     threshold_bytes: int = DEFAULT_TOOL_RESULT_OFFLOAD_THRESHOLD_BYTES,
 ) -> Any:
+    result = compact_model_facing_tool_result(result)
     byte_size = json_size_bytes(result)
     if byte_size <= threshold_bytes:
         return result
@@ -109,6 +192,22 @@ def offload_large_tool_result(
         nested_offloaded = extract_offloaded_paths(result)
         if nested_offloaded:
             stub["nestedOffloadedFiles"] = nested_offloaded[:100]
+    try:
+        relative_path = str(path.resolve().relative_to(logger.task_dir.resolve()))
+    except ValueError:
+        relative_path = str(path.resolve())
+    logger.write(
+        "tool_result.offloaded",
+        {
+            "tool": tool_name,
+            "step": step,
+            "prefix": prefix,
+            "savedPath": str(path.resolve()),
+            "relativePath": relative_path,
+            "byteSize": byte_size,
+            "queryWith": "local_fs_jsonpath",
+        },
+    )
     return stub
 
 
@@ -167,7 +266,12 @@ def offload_large_response_fields(
         if blob is None:
             continue
         byte_size = json_size_bytes(blob)
-        if byte_size <= threshold_bytes:
+        field_threshold = (
+            min(threshold_bytes, GENERIC_TOOL_RESULT_KEEP_FIELD_BYTES)
+            if field == "layers"
+            else threshold_bytes
+        )
+        if byte_size <= field_threshold:
             continue
         if copied is None:
             copied = copy.deepcopy(response)
