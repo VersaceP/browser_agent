@@ -1,0 +1,4 @@
+interface:
+  display_name: "1688 to PDD Draft"
+  short_description: "Download 1688 items into PDD drafts"
+  default_prompt: "Use $1688-to-pdd-draft to download 1688 products and fill Pinduoduo product drafts without submitting."

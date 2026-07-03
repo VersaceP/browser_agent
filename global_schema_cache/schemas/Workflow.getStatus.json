@@ -1,0 +1,13 @@
+{
+  "method": "Workflow.getStatus",
+  "description": "Returns the in-memory status snapshot for one workflow run.",
+  "params": {
+    "runId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Workflow run ID returned by Workflow.execute or supplied by the caller.",
+      "required": true
+    }
+  },
+  "requiresPurpose": false
+}

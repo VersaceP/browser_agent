@@ -123,9 +123,36 @@ class HarnessConfig:
     cache_pressure_consecutive_steps: int = 2
     cache_pressure_min_remaining_steps: int = 2
     log_browser_payloads: bool = True
+    # Try a matching skill's frozen Workflow.execute fast path before the worker
+    # LLM loop (skill_registry.match → run_skill_workflow → success_contract →
+    # record_extraction). Fires only when a skill matches AND its required vars
+    # are derivable; otherwise falls through to the normal BrowserAgent loop.
+    skill_fast_path_enabled: bool = True
+    # Runtime-only operator override (NOT read from config.json): set per run from
+    # the terminal via `--skill <id>` or the interactive `/skill <id>` command,
+    # which main.run_cli writes here. When set, it forces that skill for every
+    # browser worker spawn, bypassing auto-match, LeadAgent selection, and decline;
+    # a phase whose required variables are not derivable falls back to the normal
+    # loop (fail-safe). Empty = off.
+    forced_skill_id: str = ""
+    # When the skill fast path falls back AND the BrowserAgent slow path then
+    # succeeds for a degraded (recently-failed) skill, distill the successful
+    # trace into a candidate workflow and run skill_heal (write candidate →
+    # canary → promote). Closes the rotted-skill self-healing loop; best-effort,
+    # gated, and canary-validated so a bad candidate never promotes.
+    skill_auto_heal_enabled: bool = True
+    # Open a SECOND ABCP connection (control channel) so the harness can issue
+    # control calls (Workflow.pause/resume, Hitl.*) WHILE the primary connection is
+    # blocked inside a skill's Workflow.execute — the single primary _call_lock makes
+    # in-band control impossible. When a challenge/pause is observed mid-execute, the
+    # control channel actively pauses → resolves (human/VL) → resumes the workflow,
+    # so it finishes its remaining steps instead of handing off. Default OFF:
+    # cross-connection runId/page reachability is panel-unverified; any control
+    # failure degrades to the observe-only hand-off (skill_pause). Flip on once the
+    # panel confirms cross-connection control works.
+    skill_workflow_active_control_enabled: bool = False
     hitl_poll_interval_seconds: float = 2.0
     hitl_wait_timeout_seconds: float = 1200.0
-    hitl_max_step_retries: int = 1
     hitl_no_repause_cooldown_seconds: float = 8.0
     hitl_post_resume_guard_seconds: float = 30.0
     hitl_post_resume_confirm_max_rounds: int = 3
@@ -248,6 +275,16 @@ class HarnessConfig:
             ),
             log_browser_payloads=bool(
                 data.get("log_browser_payloads", cls.log_browser_payloads)
+            ),
+            skill_auto_heal_enabled=bool(
+                data.get("skill_auto_heal_enabled", cls.skill_auto_heal_enabled)
+            ),
+            skill_workflow_active_control_enabled=bool(
+                data.get("skill_workflow_active_control_enabled",
+                         cls.skill_workflow_active_control_enabled)
+            ),
+            skill_fast_path_enabled=bool(
+                data.get("skill_fast_path_enabled", cls.skill_fast_path_enabled)
             ),
             hitl_poll_interval_seconds=float(
                 data.get(

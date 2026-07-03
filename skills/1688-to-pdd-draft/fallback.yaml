@@ -1,0 +1,36 @@
+success_contract:
+  capture_outputs_required:
+    - product_info.txt
+    - raw_product_data.json
+    - product_manifest.json
+    - pdd_upload/main_image_01.jpg
+  pdd_draft_result_required:
+    stoppedBeforeSkuPreviewAndSubmit: true
+  pdd_form_expected:
+    carousel_uploaded: true
+    title_filled: true
+    attributes_filled: true
+    sku_specs_filled: true
+    stock_and_prices_filled: true
+  forbidden_actions:
+    - SKU preview image-space upload
+    - 提交并上架
+
+takeover:
+  on_1688_blocked:
+    reobserve: [Page.getState, DOM.getAXTree]
+    action: request_hitl_if_login_or_challenge
+  on_pdd_login_required:
+    action: Hitl.requestPause
+    resume_with: Page.getState
+  on_contract_unmet:
+    inspect:
+      - product_manifest.json
+      - PDD page body text
+      - upload counts
+    continue_only_until: draft_filled_before_submit
+
+maintenance:
+  regenerate_manifest_when_mapping_changes: true
+  disable_after_consecutive_failures: 3
+  never_auto_submit: true

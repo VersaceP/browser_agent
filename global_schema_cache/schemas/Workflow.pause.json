@@ -1,0 +1,18 @@
+{
+  "method": "Workflow.pause",
+  "description": "Requests an active workflow run to pause at the next safe execution boundary.",
+  "params": {
+    "runId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Workflow run ID returned by Workflow.execute or supplied by the caller.",
+      "required": true
+    },
+    "reason": {
+      "description": "Optional reason recorded in Workflow.progress when the run reaches the paused state.",
+      "type": "string",
+      "required": false
+    }
+  },
+  "requiresPurpose": false
+}

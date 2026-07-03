@@ -427,6 +427,39 @@ def load_runtime_config(config_path: str) -> RuntimeConfig:
     )
 
 
+def _available_skill_ids() -> List[str]:
+    try:
+        from harness.skill.registry import SkillRegistry
+        return [s.skill_id for s in SkillRegistry.load().all()]
+    except Exception:
+        return []
+
+
+def _handle_skill_command(line: str, args: argparse.Namespace) -> str:
+    """Process a `/skill ...` line typed at the task prompt. Mutates args.skill
+    and returns any inline task text after the id (empty -> caller re-prompts)."""
+    tokens = line.split()
+    arg = tokens[1] if len(tokens) > 1 else ""
+    inline_task = " ".join(tokens[2:]).strip()
+    ids = _available_skill_ids()
+    if not arg or arg in ("list", "ls", "?"):
+        print("可用技能:", ", ".join(ids) or "(无)")
+        if args.skill:
+            print(f"当前已选: {args.skill}")
+        print("用法: /skill <id> 选取；/skill off 取消；/skill 列出")
+        return ""
+    if arg in ("off", "none", "clear", "-"):
+        args.skill = ""
+        print("已取消技能强制。")
+        return inline_task
+    if ids and arg not in ids:
+        print(f"未知技能 {arg!r}。可用: {', '.join(ids) or '(无)'}")
+        return ""
+    args.skill = arg
+    print(f"已选技能: {arg}（本次运行强制使用；变量无法派生的阶段会自动回落）")
+    return inline_task
+
+
 def read_task(args: argparse.Namespace) -> str:
     if args.task_option:
         return args.task_option
@@ -434,7 +467,14 @@ def read_task(args: argparse.Namespace) -> str:
         return args.task
     if not sys.stdin.isatty():
         return sys.stdin.read().strip()
-    return input("请输入浏览器任务: ").strip()
+    while True:
+        line = input("请输入浏览器任务（可先用 /skill <id> 指定技能，/skill 列出）: ").strip()
+        if line.startswith("/skill"):
+            inline_task = _handle_skill_command(line, args)
+            if inline_task:
+                return inline_task
+            continue
+        return line
 
 
 async def run_cli(args: argparse.Namespace) -> int:
@@ -453,13 +493,19 @@ async def run_cli(args: argparse.Namespace) -> int:
         print("没有收到任务。")
         return 2
 
+    # --skill / interactive /skill both land on args.skill; force it for this run
+    # without editing config. Unknown ids are validated + ignored downstream.
+    forced_skill = str(getattr(args, "skill", "") or "").strip()
+    if forced_skill:
+        runtime.harness.forced_skill_id = forced_skill
+        print(f"技能强制: {forced_skill}", flush=True)
+
     logger = RunLogger(
         runtime.harness.worktree_dir,
         on_event=ConsoleProgressReporter(),
     )
     _LAST_LOGGER = logger
     runtime.harness.runs_dir = str(logger.task_dir)
-    runtime.harness.artifacts_dir = str(logger.artifacts_dir)
     print(f"任务已创建: {logger.task_id}", flush=True)
     print(f"模式: {mode}", flush=True)
     print(f"任务目录: {logger.task_dir}", flush=True)
@@ -529,6 +575,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["lead", "single"],
         help="lead=多 agent 编排；single=旧版单 browser agent",
     )
+    parser.add_argument(
+        "--skill",
+        dest="skill",
+        default="",
+        help="强制本次运行使用的技能 id（等价于 harness.forced_skill_id，无需改 config）",
+    )
+    parser.add_argument(
+        "--list-skills",
+        action="store_true",
+        help="列出可用技能 id 后退出",
+    )
     return parser
 
 
@@ -537,6 +594,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "list_skills", False):
+        ids = _available_skill_ids()
+        print("可用技能:", ", ".join(ids) or "(无)")
+        return 0
     try:
         return asyncio.run(run_cli(args))
     except KeyboardInterrupt:

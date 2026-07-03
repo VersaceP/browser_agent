@@ -1,0 +1,32 @@
+# 结构化成功判据 + 接管策略（机器可判定）。字段说明见 skills/README.md §5。
+
+success_contract:
+  workflow_no_error: true                               # browser_call 返回无 error 标志
+  observation_prefix: "Workflow execution completed:"   # 成功 observation 前缀
+  variables_required: [targetText]                      # workflow 必须写入的 scalar 变量
+  # 持久化由 harness 在 workflow 返回后做；以下声明落盘后的期望：
+  persisted_rows_at_least: 1
+  fields_required: [__FILL__]
+  fields_nonempty: [__FILL__]
+  visual_checks: []          # VL contract_verify（Role B，变量契约过后判可见末态）。
+                             # 如 [{type: text_present, text: "提交成功"}, {type: challenge_gone}]。
+                             # 仅 VL 判 violated 才否决（uncertain/截图失败不否决=VL 是 L4 弱层）。
+
+takeover:
+  on_call_error:                                        # browser_call 带 error（非读引擎内部 .status）
+    read: ["results[-1].step", "results[-1].error", variables, failedStepPath]
+    reobserve: [Page.getState, DOM.getAXTree]
+    semantic_anchor: results[-1].step.purpose
+  on_contract_unmet:
+    from_step: len(results)
+    reason: postcondition_unmet
+
+hitl_boundary:
+  detect: [Hitl.resumed]      # workflow 侧唯一可 listen 的 HITL 事件（白名单见 README §3.3）
+  action: listen_then_pause   # 侦测到 → 触发 pauseController 暂停；绝不在 workflow 内 resolvePause
+
+maintenance:
+  max_revision_per_failure_class: 3       # 同类失败最多修补次数
+  disable_after_consecutive_failures: 3   # 连续失败 N 次自动禁用 skill
+  canary_ttl_hours: 24
+  auto_disable_on_challenge: false        # 遇挑战不自动禁用（环境因素非 skill 缺陷）

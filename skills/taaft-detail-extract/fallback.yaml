@@ -1,0 +1,37 @@
+# TAAFT 详情页抽取——结构化成功判据 + 接管策略。字段说明见 skills/README.md §5。
+
+success_contract:
+  workflow_no_error: true
+  observation_prefix: "Workflow execution completed:"
+  variables_required: []                 # 三个 *Text 用 any_nonempty 表达更准（见下）
+  variables_any_nonempty: [reviewsText, prosConsText, qaText]   # 至少一段非空
+  # 落盘字段重命名（harness 不再隐式剥 *Text；变量名 → 字段名）：
+  variable_to_field: { reviewsText: reviews, prosConsText: prosCons, qaText: qa }
+  # 落盘由 harness 在 workflow 返回后做（record_extraction 非 workflow step）：
+  persisted_rows_at_least: 1
+  fields_required: [rank, productName, detailUrl]
+  fields_nonempty: [rank, productName, detailUrl]
+  # ⚠️ harness field_provenance 校验：每个抽取字段需 <field>EvidenceText + sourceTool/sourceSelectorOrAxId
+  provenance_required: true
+
+takeover:
+  on_call_error:                          # Runtime.evaluate(onError:stop) 失败 → execute 抛异常
+    recover_via: Workflow.getStatus(runId)   # ⚠️ rich payload 不在异常里，必须二次调 getStatus（联机实测）
+    read: [status.failedStepPath, status.error, status.variables, "status.results[-1].step"]
+    reobserve: [Page.getState, DOM.getAXTree]
+    semantic_anchor: status.results[-1].step.purpose
+  on_contract_unmet:                      # 无 error 但三段 *Text 全空 → contract-unmet
+    from_step: len(results)
+    reason: heading_match_failed          # 页面结构变了 / 标题不叫 Reviews/Pros/Q&A
+    recover_with: [DOM.getAXTree, DOM.getText]   # 调整 JS heading 匹配，或退回 DOM 工具
+    then: self_heal_workflow_v2
+
+hitl_boundary:
+  detect: [Hitl.resumed]                  # workflow 侧唯一可 listen 的 HITL 事件
+  action: listen_then_pause               # 遇 Cloudflare → requestPause，等 Hitl.resumed，不在 workflow 内 resolvePause
+
+maintenance:
+  max_revision_per_failure_class: 3
+  disable_after_consecutive_failures: 3
+  canary_ttl_hours: 24
+  auto_disable_on_challenge: false        # Cloudflare 是环境因素，非 skill 缺陷

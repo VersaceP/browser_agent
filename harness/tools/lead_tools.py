@@ -100,6 +100,12 @@ def _spawn_browser_agent_schema(_: Any = None) -> JsonDict:
                     " The harness merges it with the"
                     " phase's expected_artifact, validators, allowed_methods,"
                     " forbidden_methods, max_surface_attempts, and stop_condition."
+                    " Optional: set skill_id (a known reusable skill) +"
+                    " skill_variables (its required inputs, e.g. detailUrl) to run"
+                    " that skill's fast path. If spawn_browser_agent returns"
+                    " skill_selection_required, read candidate skillMarkdown and"
+                    " retry with skill_id+skill_variables, or decline with"
+                    " skill_selection={\"use_skill\":false,\"reason\":\"...\"}."
                 ),
             },
         },
@@ -382,6 +388,46 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
         base_context = f"{base_context}\n\n{collection_guidance}".strip()
     if strategy_guidance:
         base_context = f"{base_context}\n\n{strategy_guidance}".strip()
+    # Skill selection is a LeadAgent decision gate. Soft recall returns candidate
+    # SKILL.md content first; the LeadAgent must retry with explicit skill_id or
+    # an explicit decline. The worker fast path then takes the explicit path.
+    try:
+        spawner = getattr(agent, "spawner", None)
+        runtime = getattr(spawner, "runtime", None)
+        harness_cfg = getattr(runtime, "harness", None)
+        registry = spawner._get_skill_registry() if spawner is not None and hasattr(spawner, "_get_skill_registry") else None
+        if registry is not None and getattr(harness_cfg, "skill_fast_path_enabled", True):
+            from harness.skill.contract import (
+                apply_forced_skill,
+                build_skill_selection_request,
+                enrich_worker_contract_with_skill,
+            )
+            # Operator override wins first: a configured forced_skill_id stamps
+            # skill_id (clearing any Lead decline), so selection is skipped and the
+            # worker runs that skill wherever its variables are derivable.
+            forced = apply_forced_skill(
+                worker_contract,
+                registry=registry,
+                forced_skill_id=str(getattr(harness_cfg, "forced_skill_id", "") or ""),
+                logger=agent.logger,
+            )
+            if not forced:
+                selection_request = build_skill_selection_request(
+                    worker_contract,
+                    registry=registry,
+                    phase=phase,
+                    task=base_task,
+                    context=base_context,
+                    logger=agent.logger,
+                )
+                if selection_request is not None:
+                    return selection_request
+            enrich_worker_contract_with_skill(
+                worker_contract, registry=registry, phase=phase,
+                task=base_task, context=base_context, logger=agent.logger,
+            )
+    except Exception:  # never break spawning
+        pass
     return await agent.spawner.spawn_browser_agent(
         task=base_task,
         context=base_context,

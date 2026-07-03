@@ -1,0 +1,4 @@
+interface:
+  display_name: "ABCP Browser Direct"
+  short_description: "Drive ABCP Browser directly from Codex"
+  default_prompt: "Use $abcp-browser-direct to operate ABCP Browser directly for this task."

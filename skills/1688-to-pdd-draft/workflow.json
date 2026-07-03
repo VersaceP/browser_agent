@@ -1,0 +1,53 @@
+{
+  "description": "Scripted ABCP Browser workflow for downloading 1688 products and filling Pinduoduo product-add drafts without SKU preview image-space upload or final submission.",
+  "type": "scripted-browser-workflow",
+  "variables": {
+    "keyword": "汉服女装",
+    "ranks": "6,7",
+    "pddPageId": "",
+    "categoryPath": ["服饰箱包", "女装/女士精品", "汉服", "汉服套装"],
+    "stock": 500,
+    "groupPrice": 59,
+    "singlePrice": 69,
+    "referencePrice": 89
+  },
+  "phases": [
+    {
+      "id": "capture_1688",
+      "command": "python3 skills/1688-to-pdd-draft/scripts/abcp_1688_capture.py --keyword \"$keyword\" --ranks \"$ranks\"",
+      "outputs": [
+        "Desktop/1688_<keyword>_第<rank>名/product_info.txt",
+        "Desktop/1688_<keyword>_第<rank>名/raw_product_data.json",
+        "Desktop/1688_<keyword>_第<rank>名/product_manifest.json",
+        "Desktop/1688_<keyword>_第<rank>名/pdd_upload/main_image_*.jpg"
+      ],
+      "stopOnError": true
+    },
+    {
+      "id": "pdd_login_and_category",
+      "manualOrScripted": true,
+      "commands": [
+        "python3 skills/1688-to-pdd-draft/scripts/abcp_pdd_publish.py login-phone --phone <phone>",
+        "python3 skills/1688-to-pdd-draft/scripts/abcp_pdd_publish.py select-category --page-id \"$pddPageId\""
+      ],
+      "notes": "Password entry is HITL. Reuse an already logged-in PDD tab when available."
+    },
+    {
+      "id": "fill_pdd_draft",
+      "command": "python3 skills/1688-to-pdd-draft/scripts/abcp_pdd_publish.py fill-draft --page-id \"$pddPageId\" --product-dir \"<product_dir>\"",
+      "postcondition": "Result has stoppedBeforeSkuPreviewAndSubmit=true.",
+      "forEach": "captured product directory",
+      "stopOnError": true
+    }
+  ],
+  "forbiddenPhases": [
+    "fix-preview",
+    "upload-image-space",
+    "direct-material-upload",
+    "retry-material-create",
+    "finish-current",
+    "publish-current",
+    "submit_product",
+    "提交并上架"
+  ]
+}

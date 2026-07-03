@@ -2,6 +2,12 @@
   "method": "Workflow.execute",
   "description": "Execute a sequence of steps (actions, conditions, loops, listeners, transforms) in a single workflow.",
   "params": {
+    "runId": {
+      "description": "Optional stable workflow run ID used for pause/resume/status and progress notifications.",
+      "type": "string",
+      "minLength": 1,
+      "required": false
+    },
     "description": {
       "description": "Optional summary of what the workflow is trying to accomplish.",
       "type": "string",

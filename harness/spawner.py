@@ -1168,6 +1168,102 @@ class BrowserAgentSpawner:
             if slot.client is not None:
                 await slot.client.close()
 
+    def _get_skill_registry(self):
+        """Lazy-load the skill registry once per spawner."""
+        registry = getattr(self, "_skill_registry", None)
+        if registry is None:
+            try:
+                from harness.skill.registry import SkillRegistry
+                registry = SkillRegistry.load()
+            except Exception as exc:  # registry load must never break spawning
+                self.logger.write("skill.registry.load_failed", {"error": str(exc)})
+                registry = False  # sentinel: tried and failed
+            self._skill_registry = registry
+        return registry or None
+
+    async def _try_skill_fast_path(
+        self,
+        harness: Any,
+        *,
+        worker_contract: JsonDict,
+        phase: JsonDict,
+        task: str,
+        context: str,
+        fleet_ids: List[str],
+    ) -> Optional[str]:
+        """Attempt a matching skill's fast path. Returns the worker answer if the
+        skill handled the task, else None (caller runs the normal LLM loop).
+        Any error falls back to the LLM loop — must never break the worker."""
+        if not getattr(self.runtime.harness, "skill_fast_path_enabled", True):
+            return None
+        registry = self._get_skill_registry()
+        if registry is None or not registry.all():
+            return None
+        try:
+            from harness.skill.dispatch import maybe_run_skill_fast_path
+            from harness.skill.health import default_health
+            from harness.tools.browser_tools import _record_extraction
+            outcome = await maybe_run_skill_fast_path(
+                harness,
+                registry=registry,
+                worker_contract=worker_contract,
+                phase=phase,
+                task=task,
+                context=context,
+                fleet_ids=fleet_ids,
+                record_extraction=_record_extraction,
+                health=default_health(),
+            )
+        except Exception as exc:  # any failure → normal loop
+            self.logger.write("skill.fast_path.error", {"error": str(exc)})
+            return None
+        if outcome and outcome.get("handled"):
+            return outcome.get("answer")
+        return None
+
+    async def _maybe_autoheal_skill(
+        self,
+        harness: Any,
+        *,
+        fast_path_handled: bool,
+        slow_path_succeeded: bool,
+        worker_contract: JsonDict,
+        phase: JsonDict,
+        task: str,
+        context: str,
+        fleet_ids: List[str],
+    ) -> None:
+        """Close the self-heal loop: if the fast path fell back but the slow path
+        succeeded for a degraded skill, distill the trace → candidate → canary →
+        promote. Best-effort; any error is swallowed (never affects the worker)."""
+        if fast_path_handled or not slow_path_succeeded:
+            return
+        if not getattr(self.runtime.harness, "skill_auto_heal_enabled", True):
+            return
+        registry = self._get_skill_registry()
+        if registry is None or not registry.all():
+            return
+        try:
+            from harness.skill.autoheal import maybe_autoheal_from_trace
+            from harness.skill.dispatch import resolve_skill_and_variables
+            from harness.skill.health import default_health
+
+            skill, canary_variables = resolve_skill_and_variables(
+                registry, worker_contract, phase=phase, task=task, context=context,
+            )
+            if skill is None:
+                return
+            await maybe_autoheal_from_trace(
+                harness,
+                skill=skill,
+                health=default_health(),
+                trace=getattr(harness, "trace", []) or [],
+                canary_variables=canary_variables,
+                fleet_id=next(iter(fleet_ids), "") if fleet_ids else "",
+            )
+        except Exception as exc:  # self-heal must never break the worker
+            self.logger.write("skill.autoheal.error", {"error": str(exc)})
+
     async def _run_browser_worker(
         self,
         slot: BrowserAgentSlot,
@@ -1219,6 +1315,17 @@ class BrowserAgentSpawner:
             effective_context = context or "(none)"
             if slot_context:
                 effective_context = f"{effective_context}\n\n{slot_context}".strip()
+            try:
+                from harness.skill.contract import selected_skill_context
+                skill_context = selected_skill_context(
+                    self._get_skill_registry(),
+                    worker_contract or {},
+                )
+            except Exception as exc:
+                self.logger.write("skill.context.error", {"error": str(exc)})
+                skill_context = ""
+            if skill_context:
+                effective_context = f"{effective_context}\n\n{skill_context}".strip()
             worker_task = (
                 f"BrowserAgent name: {name}\n"
                 f"Independent context:\n{effective_context}\n\n"
@@ -1232,7 +1339,19 @@ class BrowserAgentSpawner:
             harness.worker_contract = worker_contract or {}
             harness.preloaded_registration = registration
             harness.preloaded_capability_bundle = bundle
-            answer = await harness.run(worker_task)
+
+            skill_answer = await self._try_skill_fast_path(
+                harness,
+                worker_contract=worker_contract or {},
+                phase=phase or {},
+                task=task,
+                context=effective_context,
+                fleet_ids=sorted(slot.fleet_ids),
+            )
+            if skill_answer is not None:
+                answer = skill_answer
+            else:
+                answer = await harness.run(worker_task)
             trace_path = self._write_worker_trace(worker_id, harness.trace)
             trace_summary = self._summarize_worker_trace(harness.trace)
             challenge_tracker = getattr(harness, "challenge_tracker", None)
@@ -1274,6 +1393,19 @@ class BrowserAgentSpawner:
                 else "validation_failed"
                 if artifact_validation.get("status") == "failed"
                 else "not_validated"
+            )
+            # Self-heal loop: the fast path fell back (skill_answer is None) but the
+            # slow path produced a validated result — distill its trace into a
+            # candidate workflow and canary-promote it for the degraded skill.
+            await self._maybe_autoheal_skill(
+                harness,
+                fast_path_handled=skill_answer is not None,
+                slow_path_succeeded=validated_status == "validated_done",
+                worker_contract=worker_contract or {},
+                phase=phase or {},
+                task=task,
+                context=effective_context,
+                fleet_ids=sorted(slot.fleet_ids),
             )
             diagnostics = getattr(harness, "diagnostics", None)
             result = {

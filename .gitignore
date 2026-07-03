@@ -25,3 +25,9 @@ claude_code_scrape/
 .DS_Store
 *.py[cod]
 *$py.class
+node_modules/
+# skill runtime state (P5)
+skills/.skill_health.json
+skills/**/.heal_history.json
+# auto-distilled / archived candidate workflows (self-heal); live workflow.json is tracked
+skills/**/workflow.v*.json
