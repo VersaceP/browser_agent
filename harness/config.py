@@ -26,6 +26,31 @@ class VLConfig:
     api_key: Optional[str] = None
     max_checks_per_worker: int = 2
     default_timeout_seconds: float = 60.0
+    # captcha_solve (§13.4): bounded solve-plan retries before short-circuiting to
+    # HITL. Behavioral-risk / unknown challenges are NEVER retried (honest
+    # short-circuit in vl._finalize_captcha_solve); this only bounds the
+    # visual-self-consistent solve loop.
+    captcha_solve_max_retries: int = 2
+    # VL Role C (§13.4): auto-attempt a visual-self-consistent CAPTCHA via solve-plan
+    # (drag/click) before falling back to a human. Separate, default-OFF gate — this
+    # is the most consequential VL action (it acts on a challenge, with ToS/legal
+    # weight), so it must be opted into INDEPENDENTLY of vl.enabled / the other roles.
+    # When OFF (or vl.enabled OFF), a pause always resolves via the human path.
+    captcha_solve_enabled: bool = False
+    # VL Role A (§13.2): locate an AXTree-blind target visually, then PROMOTE the
+    # pixel back to a durable canonical id via bbox containment. Default OFF — a
+    # caller (slow-path recovery) opts in before invoking harness.vl.locate.
+    visual_locate_enabled: bool = False
+    # VL Role B (§13.3): after a skill's variable success_contract passes, judge the
+    # declared visual_checks (text_present / challenge_gone / ...) on a screenshot.
+    # Low-cost confirmation, default ON; only a definitive `violated` vetoes (VL is
+    # L4/weak — `uncertain` never overrides the passed variable contract).
+    contract_verify_enabled: bool = True
+    # VL Role D (§13.5): auto-trigger the global visual arbiter on a visually-related
+    # browser_call failure (after deterministic recovery), routing it to the right VL
+    # role and attaching a recovery recommendation (resolvedId / hitl / dismiss / ...)
+    # to the result. Default OFF — it costs a VL call per visual failure.
+    arbiter_enabled: bool = False
     extra_params: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -43,6 +68,21 @@ class VLConfig:
             ),
             default_timeout_seconds=float(
                 data.get("default_timeout_seconds", cls.default_timeout_seconds)
+            ),
+            captcha_solve_max_retries=int(
+                data.get("captcha_solve_max_retries", cls.captcha_solve_max_retries)
+            ),
+            captcha_solve_enabled=bool(
+                data.get("captcha_solve_enabled", cls.captcha_solve_enabled)
+            ),
+            visual_locate_enabled=bool(
+                data.get("visual_locate_enabled", cls.visual_locate_enabled)
+            ),
+            contract_verify_enabled=bool(
+                data.get("contract_verify_enabled", cls.contract_verify_enabled)
+            ),
+            arbiter_enabled=bool(
+                data.get("arbiter_enabled", cls.arbiter_enabled)
             ),
             extra_params=(
                 data.get("extra_params")

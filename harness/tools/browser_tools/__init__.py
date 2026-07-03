@@ -1823,6 +1823,23 @@ async def _visual_verify(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
         mode=mode,
         question=question,
     )
+    # VL Role A: promote a located pixel back to a durable canonical id (bbox→id),
+    # so the agent acts on a stable handle instead of raw coordinates. Gated by
+    # vl.visual_locate_enabled; best-effort (any failure leaves the raw point).
+    if (
+        mode == "visual_locate"
+        and isinstance(verdict, dict)
+        and verdict.get("verdict") == "located"
+        and verdict.get("point")
+        and bool(getattr(vl_config, "visual_locate_enabled", False))
+    ):
+        verdict = await _promote_visual_locate(
+            agent, page_id, image_path, verdict, step,
+            expected_text=" ".join(
+                part for part in (question, str(expected.get("target") or ""))
+                if part
+            ),
+        )
     vl_check_count = getattr(agent, "vl_check_count", 0)
     vl_force_check_count = getattr(agent, "vl_force_check_count", 0)
     result = {
@@ -1849,6 +1866,168 @@ async def _visual_verify(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
         },
     )
     return result
+
+
+def _arbiter_error_text(result: JsonDict) -> str:
+    """Pull a failure string from a browser_call result (else '')."""
+    if not isinstance(result, dict):
+        return ""
+    if result.get("error"):
+        return str(result["error"])
+    response = result.get("response")
+    if isinstance(response, dict):
+        if response.get("error"):
+            return str(response["error"])
+        obs = response.get("observation")
+        if isinstance(obs, str) and "fail" in obs.lower():
+            return obs
+    return ""
+
+
+def _arbiter_next_instruction(rec: JsonDict) -> str:
+    action = rec.get("action")
+    if action == "retry_by_id":
+        return (f"VL arbiter located the target and promoted it to durable id"
+                f" {rec.get('id')!r}. Retry the failed action targeting that id"
+                f" (a durable handle — not coordinates).")
+    if action == "hitl":
+        return (f"VL arbiter assessment: {rec.get('reason', 'needs human/challenge handling')}."
+                f" Take the HITL/challenge path instead of retrying blindly.")
+    if action == "dismiss":
+        label = rec.get("label")
+        return (f"VL arbiter found a safe dismiss control{(' (' + str(label) + ')') if label else ''}."
+                f" Dismiss the overlay, then retry the action.")
+    if action == "coordinate":
+        return ("VL arbiter located the target but no AXTree node covers it; if safe and"
+                " not consequential, use one coordinate action at cssPoint (never persist coordinates).")
+    if action == "reperceive":
+        return "VL arbiter suggests re-perceiving: refresh Page.getState + DOM.getAXTree before retrying."
+    return ""
+
+
+async def _maybe_vl_arbitrate(
+    agent: Any,
+    method: str,
+    params: JsonDict,
+    result: JsonDict,
+    step: int,
+) -> JsonDict:
+    """Role D auto-trigger: on a visually-related failure, route to the VL arbiter
+    and attach a recovery recommendation. Best-effort + gated (vl.arbiter_enabled);
+    bounded per worker by max_checks_per_worker. Never raises into the call path."""
+    if not isinstance(result, dict):
+        return result
+    vl_config = getattr(getattr(getattr(agent, "runtime", None), "harness", None), "vl", None)
+    if (vl_config is None or not getattr(vl_config, "enabled", False)
+            or not getattr(vl_config, "arbiter_enabled", False)):
+        return result
+    error_text = _arbiter_error_text(result)
+    if not error_text:
+        return result
+    classification = ""
+    cl = result.get("errorClassification")
+    if isinstance(cl, dict):
+        classification = str(cl.get("type") or "")
+    page_id = str((params or {}).get("pageId") or "")
+    browser = getattr(agent, "browser", None)
+    if not page_id or browser is None:
+        return result
+    # bound the number of arbiter VL calls per worker
+    max_checks = optional_int(getattr(vl_config, "max_checks_per_worker", 2), 2) or 2
+    if getattr(agent, "vl_arbiter_count", 0) >= max_checks:
+        return result
+    try:
+        from harness.vl.arbiter import arbitrate, is_visual_failure
+        if not is_visual_failure(classification, error_text):
+            return result
+        agent.vl_arbiter_count = getattr(agent, "vl_arbiter_count", 0) + 1
+        rec = await arbitrate(
+            browser, page_id, classification_type=classification, error_text=error_text,
+            target_description=str((params or {}).get("purpose") or ""),
+            vl_config=vl_config, logger=getattr(agent, "logger", None),
+        )
+    except Exception as exc:  # arbitration must never break the call path
+        logger = getattr(agent, "logger", None)
+        if logger is not None:
+            logger.write("vl.arbiter.error", {"method": method, "error": str(exc)})
+        return result
+    if not isinstance(rec, dict) or rec.get("action") in (None, "none"):
+        return result
+    out = {**result, "vlArbiter": rec}
+    instruction = _arbiter_next_instruction(rec)
+    if instruction:
+        out["next_instruction"] = instruction
+    return out
+
+
+async def _promote_visual_locate(
+    agent: Any,
+    page_id: str,
+    image_path: str,
+    verdict: JsonDict,
+    step: int,
+    *,
+    expected_text: str = "",
+) -> JsonDict:
+    """Reverse-look-up the VL `point` to a canonical AXTree id via bbox containment
+    (the AXTree bbox space == screenshot px space). Attaches `resolvedId` (durable)
+    or `cssPoint` (coords fallback for a genuine AXTree blind spot). Best-effort."""
+    try:
+        from harness.vl.locate import (
+            _screenshot_dims,
+            apply_promotion_guard,
+            promote_locate,
+        )
+
+        shot_w, shot_h = await _screenshot_dims(image_path)
+        ax = await _invoke_browser_method(
+            agent, "DOM.getAXTree",
+            {"pageId": page_id, "purpose": "promote the VL pixel to a canonical id"},
+            step,
+        )
+        lines = (_response_data(ax) or {}).get("lines") or []
+        dpr_resp = await _invoke_browser_method(
+            agent, "Runtime.evaluate",
+            {"pageId": page_id, "returnByValue": True,
+             "expression": "return {dpr: window.devicePixelRatio || 1};",
+             "purpose": "read devicePixelRatio to map screenshot px to CSS px"},
+            step,
+        )
+        dpr = float((_response_data(dpr_resp) or {}).get("dpr") or 1.0) or 1.0
+        promo = promote_locate(lines, verdict["point"], shot_w=shot_w, shot_h=shot_h, dpr=dpr)
+        promo = apply_promotion_guard(
+            promo, vl_label=verdict.get("control_label"),
+            expected_text=expected_text, dpr=dpr,
+            logger=getattr(agent, "logger", None),
+            page_id=page_id,
+        )
+        out = {**verdict, "promotion": promo}
+        if promo.get("resolved"):
+            out["resolvedId"] = promo.get("id")
+            out["resolvedLabel"] = promo.get("label")
+            out["next_instruction"] = (
+                f"VL located the target and it was promoted to durable id"
+                f" {promo.get('id')!r}. Act on that id (Input.click/DOM.getText with"
+                f" id), NOT raw coordinates."
+            )
+        elif promo.get("promotionGuard"):
+            out["cssPoint"] = promo.get("cssPoint")
+            out["next_instruction"] = (
+                "VL located the target but the bbox promotion failed a sanity"
+                f" check ({promo['promotionGuard'].get('reason')}) and was demoted."
+                " If safe and not consequential, use a single coordinate action at"
+                " cssPoint; coordinates must never be persisted into a skill."
+            )
+        else:
+            out["cssPoint"] = promo.get("cssPoint")
+            out["next_instruction"] = (
+                "VL located the target but no AXTree node covers it (blind spot)."
+                " If safe and not consequential, use a single coordinate action at"
+                " cssPoint; coordinates must never be persisted into a skill."
+            )
+        return out
+    except Exception as exc:  # promotion is best-effort; keep the raw verdict
+        return {**verdict, "promotion_error": str(exc)}
 
 
 def _screenshot_saved_path(result: JsonDict) -> Optional[str]:

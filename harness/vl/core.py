@@ -59,6 +59,88 @@ def build_visual_verify_prompt(
             "- visible_evidence: short array of visible screenshot observations\n"
             "- reason: one short sentence\n"
         )
+    if mode == "contract_verify":
+        return (
+            "Judge whether this browser screenshot SATISFIES the structured success"
+            " checks below. A browser action returning no error does NOT mean the"
+            " task succeeded — verify the visible end state.\n"
+            f"checks: {json.dumps((expected or {}).get('visual_checks') or expected or [], ensure_ascii=False, default=str)}\n"
+            f"context: {question or '(none)'}\n\n"
+            "Each check is one of:\n"
+            "  {type:'text_present', text:'...'}   — the text must be visibly present\n"
+            "  {type:'text_absent',  text:'...'}   — the text must NOT be present\n"
+            "  {type:'challenge_gone'}             — no CAPTCHA/verification/anti-bot visible\n"
+            "  {type:'element_visible', description:'...'}  — the described element is visible\n"
+            "  {type:'state', description:'...'}    — the page is in the described state\n"
+            "Be strict: if a required check is clearly not met, it is violated. If you"
+            " genuinely cannot tell from the screenshot, use uncertain (do NOT guess"
+            " 'satisfied').\n"
+            "Return exactly one JSON object with keys:\n"
+            "- verdict: one of satisfied, violated, uncertain\n"
+            "- failed_checks: array of the checks (or their text/description) NOT met\n"
+            "- visible_evidence: short array of visible screenshot observations\n"
+            "- confidence: number from 0 to 1\n"
+            "- reason: one short sentence\n"
+        )
+    if mode == "visual_locate":
+        return (
+            "Locate a specific target element in this browser screenshot so an"
+            " automation harness can act on it. The target may be a visual element"
+            " the accessibility tree can't reach (canvas drawing, text inside an"
+            " image, a purely visual control).\n"
+            f"target: {question or '(the element described in expected)'}\n"
+            f"expected: {json.dumps(expected or {}, ensure_ascii=False, default=str)}\n\n"
+            "Coordinates are NORMALIZED integers 0..1000, origin top-left:"
+            " x = round(1000 * pixelX / imageWidth), y = round(1000 * pixelY /"
+            " imageHeight). Point at the CENTER of the target.\n"
+            "SAFETY: set is_consequential=true if the target could log in, pay,"
+            " subscribe, submit, delete, or otherwise act on the user's behalf.\n"
+            "Return exactly one JSON object with keys:\n"
+            "- verdict: one of located, not_found, uncertain\n"
+            "- point: object {x: number, y: number} normalized 0-1000"
+            " (omit or null unless verdict is located)\n"
+            "- control_label: short visible text/label on the target\n"
+            "- is_consequential: boolean\n"
+            "- confidence: number from 0 to 1\n"
+            "- visible_evidence: short array of visible screenshot observations\n"
+            "- reason: one short sentence\n"
+        )
+    if mode == "captcha_solve":
+        return (
+            "This browser screenshot may be blocked by a CAPTCHA / anti-bot"
+            " challenge. Classify it and, ONLY for a purely visual puzzle, output"
+            " an ordered solve plan so the harness can drive it.\n"
+            "BE HONEST ABOUT SOLVABILITY (critical):\n"
+            "- visual_self_consistent: the answer is fully in the picture — slider"
+            " gap, pick-the-tiles grid, rotate-to-upright, click-the-target, read"
+            " the distorted text (OCR). These are solvable; give a solve_plan.\n"
+            "- behavioral_risk: reCAPTCHA v2/v3, hCaptcha, Cloudflare Turnstile —"
+            " these score mouse trajectory / timing / fingerprint / entropy, NOT a"
+            " visual answer. You CANNOT solve these. Set challenge_category="
+            "behavioral_risk, verdict=unsolvable, and solve_plan=[] (empty). Do not"
+            " guess a plan — wrong attempts escalate difficulty or trigger bans.\n"
+            "- unknown / not a challenge: set solve_plan=[] and the matching verdict.\n"
+            f"question: {question or '(none)'}\n"
+            f"expected: {json.dumps(expected or {}, ensure_ascii=False, default=str)}\n\n"
+            "Coordinates are NORMALIZED integers 0..1000, origin top-left:"
+            " x = round(1000 * pixelX / imageWidth), y = round(1000 * pixelY /"
+            " imageHeight). Point at element CENTERS.\n"
+            "Return exactly one JSON object with keys:\n"
+            "- verdict: one of solvable, unsolvable, not_a_challenge, uncertain\n"
+            "- challenge_type: one of slider, grid, rotate, click_target, text_ocr,"
+            " behavioral, hybrid, unknown\n"
+            "- challenge_category: one of visual_self_consistent, behavioral_risk, unknown\n"
+            "- solve_plan: array of steps (NON-EMPTY only for visual_self_consistent)."
+            " Each step is one of:\n"
+            "    slider:       {action:'drag', from:{x,y}, dx:number, dy:number}\n"
+            "    rotate:       {action:'drag_arc', from:{x,y}, to:{x,y}}\n"
+            "    grid:         {action:'click', at:{x,y}, label:string}\n"
+            "    click_target: {action:'click', at:{x,y}, label:string}\n"
+            "    text_ocr:     {action:'type', text:string, into:{x,y}}\n"
+            "- confidence: number from 0 to 1\n"
+            "- visible_evidence: short array of visible screenshot observations\n"
+            "- reason: one short sentence\n"
+        )
     if mode == "challenge_detection":
         return (
             "Decide whether this browser screenshot is blocked by an anti-bot,"
@@ -154,6 +236,12 @@ async def visual_verify_image(
     verdict = str(parsed.get("verdict") or "uncertain").strip().lower()
     if mode == "overlay_classify":
         return _finalize_overlay_classify(parsed, usage)
+    if mode == "captcha_solve":
+        return _finalize_captcha_solve(parsed, usage)
+    if mode == "visual_locate":
+        return _finalize_visual_locate(parsed, usage)
+    if mode == "contract_verify":
+        return _finalize_contract_verify(parsed, usage)
     allowed_verdicts = (
         {"confirmed_challenge", "normal_loading", "unrelated_block", "uncertain"}
         if mode == "challenge_detection"
@@ -239,6 +327,190 @@ def _finalize_overlay_classify(parsed: JsonDict, usage: JsonDict) -> JsonDict:
         "reason": str(parsed.get("reason") or "")[:500],
         "usage": usage,
     }
+
+
+_CAPTCHA_VERDICTS = {"solvable", "unsolvable", "not_a_challenge", "uncertain"}
+_CAPTCHA_TYPES = {"slider", "grid", "rotate", "click_target", "text_ocr",
+                  "behavioral", "hybrid", "unknown"}
+_CAPTCHA_CATEGORIES = {"visual_self_consistent", "behavioral_risk", "unknown"}
+_SOLVE_ACTIONS = {"drag", "drag_arc", "click", "type"}
+
+
+def _norm_point(raw: Any) -> Optional[JsonDict]:
+    """Coerce a {x,y} (or [x,y]) into a normalized 0-1000 point dict, else None."""
+    if isinstance(raw, dict):
+        try:
+            return {"x": float(raw.get("x")), "y": float(raw.get("y"))}
+        except (TypeError, ValueError):
+            return None
+    if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+        try:
+            return {"x": float(raw[0]), "y": float(raw[1])}
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _normalize_solve_step(step: Any) -> Optional[JsonDict]:
+    """Validate one SolveStep; coords stay NORMALIZED 0-1000 (caller maps to CSS).
+    Returns a clean step dict or None if malformed (dropped)."""
+    if not isinstance(step, dict):
+        return None
+    action = str(step.get("action") or "").strip().lower()
+    if action not in _SOLVE_ACTIONS:
+        return None
+    if action == "drag":  # slider: from + dx/dy offset
+        frm = _norm_point(step.get("from"))
+        if frm is None:
+            return None
+        try:
+            dx = float(step.get("dx", 0.0))
+            dy = float(step.get("dy", 0.0))
+        except (TypeError, ValueError):
+            return None
+        return {"action": "drag", "from": frm, "dx": dx, "dy": dy,
+                "label": str(step.get("label") or "")[:120]}
+    if action == "drag_arc":  # rotate: from -> to
+        frm, to = _norm_point(step.get("from")), _norm_point(step.get("to"))
+        if frm is None or to is None:
+            return None
+        return {"action": "drag_arc", "from": frm, "to": to,
+                "label": str(step.get("label") or "")[:120]}
+    if action == "click":  # grid / click_target
+        at = _norm_point(step.get("at"))
+        if at is None:
+            return None
+        return {"action": "click", "at": at, "label": str(step.get("label") or "")[:120]}
+    # type: text into a focus point
+    into = _norm_point(step.get("into"))
+    text = str(step.get("text") or "")
+    if into is None or not text:
+        return None
+    return {"action": "type", "into": into, "text": text[:200],
+            "label": str(step.get("label") or "")[:120]}
+
+
+def _finalize_contract_verify(parsed: JsonDict, usage: JsonDict) -> JsonDict:
+    """Normalize a contract_verify (VL judge) response. verdict ∈ satisfied/violated/
+    uncertain; failed_checks lists the unmet checks. The caller treats only a
+    definitive `violated` as a veto (VL is L4 — `uncertain` never overrides a passed
+    variable contract)."""
+    verdict = str(parsed.get("verdict") or "uncertain").strip().lower()
+    if verdict not in {"satisfied", "violated", "uncertain"}:
+        verdict = "uncertain"
+    try:
+        confidence = max(0.0, min(float(parsed.get("confidence", 0.0)), 1.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    failed = parsed.get("failed_checks")
+    if not isinstance(failed, list):
+        failed = []
+    evidence = parsed.get("visible_evidence")
+    if not isinstance(evidence, list):
+        evidence = []
+    return {
+        "status": "done",
+        "mode": "contract_verify",
+        "verdict": verdict,
+        "failed_checks": [str(c)[:200] for c in failed[:12]],
+        "confidence": confidence,
+        "visible_evidence": [str(item)[:300] for item in evidence[:8]],
+        "reason": str(parsed.get("reason") or "")[:500],
+        "usage": usage,
+    }
+
+
+def _finalize_visual_locate(parsed: JsonDict, usage: JsonDict) -> JsonDict:
+    """Normalize a visual_locate response. `point` stays NORMALIZED 0-1000; the
+    caller maps to screenshot px and runs bbox→id promotion + safety checks."""
+    verdict = str(parsed.get("verdict") or "uncertain").strip().lower()
+    if verdict not in {"located", "not_found", "uncertain"}:
+        verdict = "uncertain"
+    point = _norm_point(parsed.get("point"))
+    if verdict == "located" and point is None:
+        verdict = "uncertain"
+    try:
+        confidence = max(0.0, min(float(parsed.get("confidence", 0.0)), 1.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    evidence = parsed.get("visible_evidence")
+    if not isinstance(evidence, list):
+        evidence = []
+    return {
+        "status": "done",
+        "mode": "visual_locate",
+        "verdict": verdict,
+        "point": point,
+        "control_label": str(parsed.get("control_label") or "")[:200],
+        "is_consequential": bool(parsed.get("is_consequential", False)),
+        "confidence": confidence,
+        "visible_evidence": [str(item)[:300] for item in evidence[:8]],
+        "reason": str(parsed.get("reason") or "")[:500],
+        "usage": usage,
+    }
+
+
+def _finalize_captcha_solve(parsed: JsonDict, usage: JsonDict) -> JsonDict:
+    """Normalize a captcha_solve response. SAFETY-CRITICAL honest short-circuit:
+    a non-visual_self_consistent category (behavioral_risk / unknown) is forced to
+    verdict=unsolvable with an EMPTY solve_plan regardless of what the model said —
+    behavioral challenges score trajectory/timing/fingerprint, not a visual answer,
+    so attempting them escalates difficulty or triggers bans. solve_plan steps stay
+    in normalized 0-1000 space; the caller maps to CSS and runs elementFromPoint +
+    is_consequential safety checks before any Input."""
+    verdict = str(parsed.get("verdict") or "uncertain").strip().lower()
+    if verdict not in _CAPTCHA_VERDICTS:
+        verdict = "uncertain"
+    ctype = str(parsed.get("challenge_type") or "unknown").strip().lower()
+    if ctype not in _CAPTCHA_TYPES:
+        ctype = "unknown"
+    category = str(parsed.get("challenge_category") or "unknown").strip().lower()
+    if category not in _CAPTCHA_CATEGORIES:
+        category = "unknown"
+    try:
+        confidence = max(0.0, min(float(parsed.get("confidence", 0.0)), 1.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+
+    raw_plan = parsed.get("solve_plan")
+    solve_plan: list = []
+    if isinstance(raw_plan, list):
+        for step in raw_plan[:12]:
+            norm = _normalize_solve_step(step)
+            if norm is not None:
+                solve_plan.append(norm)
+
+    short_circuit_reason = None
+    # Honest hard-distinction: only visual_self_consistent puzzles are ever solved.
+    if category != "visual_self_consistent":
+        if solve_plan:
+            short_circuit_reason = f"category={category} is not visually solvable; plan discarded"
+        solve_plan = []
+        if verdict == "solvable":
+            verdict = "unsolvable"
+    # A 'solvable' verdict with nothing to do is not actionable.
+    elif verdict == "solvable" and not solve_plan:
+        verdict = "uncertain"
+        short_circuit_reason = "solvable but no usable solve_plan steps"
+
+    evidence = parsed.get("visible_evidence")
+    if not isinstance(evidence, list):
+        evidence = []
+    out = {
+        "status": "done",
+        "mode": "captcha_solve",
+        "verdict": verdict,
+        "challenge_type": ctype,
+        "challenge_category": category,
+        "solve_plan": solve_plan,
+        "confidence": confidence,
+        "visible_evidence": [str(item)[:300] for item in evidence[:8]],
+        "reason": str(parsed.get("reason") or "")[:500],
+        "usage": usage,
+    }
+    if short_circuit_reason:
+        out["short_circuit_reason"] = short_circuit_reason
+    return out
 
 
 async def _call_openai_compatible(

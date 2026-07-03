@@ -293,7 +293,7 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                 },
                 "mode": {
                     "type": "string",
-                    "description": "action_outcome | validator_failure | overlay_check | captcha_check | layout_check",
+                    "description": "action_outcome | validator_failure | overlay_check | captcha_check | layout_check | visual_locate (locate an AXTree-blind target by description; returns a durable resolvedId via bbox→id promotion — act on that id, not coordinates) | contract_verify (judge structured visual_checks in `expected.visual_checks`; returns satisfied/violated/uncertain + failed_checks)",
                 },
                 "question": {
                     "type": "string",
