@@ -540,6 +540,23 @@ class BrowserAgentSpawner:
         except Exception as exc:
             slot.sync_errors.append(f"Fleet.list: {str(exc)[:240]}")
 
+        # Self-heal: drop registry keys that are obviously not real ids. A
+        # leaked schema-dict repr (pre-as_id-guard bug, or any future leak) is
+        # str({...}) and starts with '{'; calling Page.list/Page.getState on it
+        # returns -32602 and just pollutes sync_errors. Real fleet/page ids are
+        # UUIDs and never start with '{'.
+        slot.fleet_ids = {
+            fid for fid in slot.fleet_ids
+            if isinstance(fid, str) and fid and not fid.startswith("{")
+        }
+        bogus_page_ids = [
+            pid for pid in list(slot.page_registry)
+            if not isinstance(pid, str) or pid.startswith("{")
+        ]
+        for pid in bogus_page_ids:
+            slot.page_registry.pop(pid, None)
+            slot.page_quarantine.pop(pid, None)
+
         for fleet_id in sorted(slot.fleet_ids)[:6]:
             try:
                 pages_response = await slot.client.call(
@@ -966,10 +983,19 @@ class BrowserAgentSpawner:
         slot: BrowserAgentSlot,
         value: Any,
     ) -> None:
+        def as_id(raw: Any) -> str:
+            # Real fleet/page ids are string scalars (UUIDs). A dict/list value
+            # here is a JSON-schema fragment echoed inside an attached
+            # methodSchema.params (e.g. {"pageId": {"type":"string","pattern":...}}
+            # from describeAction). str()-coercing it would poison page_registry
+            # / fleet_ids with a bogus key that later makes Page.getState /
+            # Page.list fail with -32602. Only accept real string ids.
+            return raw if isinstance(raw, str) and raw else ""
+
         def visit(item: Any) -> None:
             if isinstance(item, dict):
-                fleet_id = str(item.get("fleetId") or item.get("fleet_id") or "")
-                page_id = str(item.get("pageId") or item.get("page_id") or "")
+                fleet_id = as_id(item.get("fleetId") or item.get("fleet_id"))
+                page_id = as_id(item.get("pageId") or item.get("page_id"))
                 url = str(item.get("url") or item.get("currentUrl") or "")
                 title = str(item.get("title") or "")
                 status = str(item.get("status") or "")
@@ -992,7 +1018,13 @@ class BrowserAgentSpawner:
                         page["status"] = status
                     self._apply_page_quarantine(slot, page_id, page)
                     slot.page_registry[page_id] = page
-                for nested in item.values():
+                # methodSchema echoes describeAction param specs (dict values for
+                # pageId/fleetId/id/etc.); skip it so we never recurse into
+                # schema fragments. The as_id guard already neutralizes them, but
+                # this also avoids walking a large, meaningless schema subtree.
+                for key, nested in item.items():
+                    if key == "methodSchema":
+                        continue
                     visit(nested)
             elif isinstance(item, list):
                 for nested in item:
@@ -1943,7 +1975,49 @@ def _worker_feedback_classification(
     trace_classification = _classification_from_contract_violation(trace)
     if trace_classification is not None:
         return trace_classification
+    browser_call_classification = _classification_from_browser_call(trace)
+    if browser_call_classification is not None:
+        return browser_call_classification
     return _classification_from_final_answer(answer)
+
+
+def _classification_from_browser_call(
+    trace: List[JsonDict],
+) -> Optional[JsonDict]:
+    for item in reversed(trace or []):
+        if not isinstance(item, dict) or item.get("type") != "browser_call":
+            continue
+        result = item.get("result")
+        if not isinstance(result, dict):
+            continue
+        classification = result.get("classification")
+        if isinstance(classification, dict):
+            category = str(classification.get("category") or "").strip()
+            if category == "blocked_infrastructure":
+                recovered = dict(classification)
+                recovered.setdefault(
+                    "hint",
+                    "Browser infrastructure failed; rebuild page/fleet or reconnect the Browser Client before retrying.",
+                )
+                recovered["source"] = "browser_call.classification"
+                return recovered
+        error_classification = result.get("errorClassification")
+        if not isinstance(error_classification, dict):
+            continue
+        error_type = str(error_classification.get("type") or "").strip()
+        if error_type != "browser_unavailable_or_no_page":
+            continue
+        return {
+            "category": "blocked_infrastructure",
+            "type": error_type,
+            "method": result.get("method") or "Page.create",
+            "hint": (
+                "Page.create failed with -32005 and no usable existing page was"
+                " found; reconnect or rebuild the Browser Client before retrying."
+            ),
+            "source": "browser_call.errorClassification",
+        }
+    return None
 
 
 def _classification_from_contract_violation(
@@ -1988,13 +2062,21 @@ def _classification_from_final_answer(answer: str) -> Optional[JsonDict]:
         else:
             category = str(raw_classification or "").strip()
             classification = {"category": category}
-        if category != "blocked_cross_task_type_required":
+        if category not in {
+            "blocked_cross_task_type_required",
+            "blocked_infrastructure",
+        }:
             continue
         hint = (
             blocker.get("hint")
             or blocker.get("message")
             or blocker.get("reason")
-            or "LeadAgent should replan with a task_type that permits the required method."
+            or (
+                "Browser infrastructure failed; reconnect/rebuild the Browser"
+                " Client before retrying."
+                if category == "blocked_infrastructure"
+                else "LeadAgent should replan with a task_type that permits the required method."
+            )
         )
         classification.setdefault("hint", str(hint)[:500])
         if blocker.get("method"):

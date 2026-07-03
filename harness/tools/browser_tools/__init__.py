@@ -213,6 +213,15 @@ async def execute_browser_tool(agent: Any, tool_call: JsonDict, step: int) -> Tu
             agent.trace.append({"type": "loop_guard", "result": guard_result})
             return guard_result, should_stop
 
+    # browser_call carries the page_create terminal hard-stop in its second
+    # return value (page_create_should_stop). Its registered handler can only
+    # return a JsonDict, so dispatching through it would drop should_stop to a
+    # hard-coded False and let the worker keep hammering a dead browser. Route
+    # it straight to the capability executor here (after the loop guard) so the
+    # hard-stop propagates, mirroring the direct-capability-name path below.
+    if name == "browser_call":
+        return await _execute_browser_capability_tool(agent, name, tool_input, step)
+
     if action is None:
         if name in getattr(agent, "capability_methods", set()):
             return await _execute_browser_capability_tool(agent, name, tool_input, step)
@@ -270,7 +279,15 @@ async def _browser_call(ctx: ToolContext) -> JsonDict:
     description=(
         "Extract a repeated DOM collection into structured rows without hand-written JS."
         " Use this for lists, tables, cards, and link collections instead of parsing"
-        " large AXTree text. Internally wraps Runtime.evaluate in an explicit return IIFE."
+        " large AXTree text. PREFER this over eval_js_json whenever the extraction is"
+        " expressible as one selector + field specs — it adds matchedCount diagnostics"
+        " and record_name persistence for free."
+        " Internally wraps Runtime.evaluate in an explicit return IIFE."
+        " Field specs: text, href, src, imgAlt, ariaLabel, role, rect, ancestorText,"
+        " or attr:<name>. The src spec auto-resolves lazy images (falls back to"
+        " data-src/data-original/srcset and absolutizes the URL) so blank 1x1"
+        " placeholders are skipped; for images not yet in the DOM, scroll or use"
+        " collect_items first to mount them."
     ),
     input_schema=_browser_schema_for("extract_dom_records"),
     contract_check=True,
@@ -286,7 +303,10 @@ async def _browser_extract_dom_records(ctx: ToolContext) -> JsonDict:
         "Evaluate a JavaScript expression and force a JSON return through a"
         " harness wrapper. Last-resort fallback for structured data only"
         " when DOM.getAXTree + DOM.getText/DOM.getAttribute cannot express"
-        " the needed relationship. For statement bodies, pass an IIFE"
+        " the needed relationship. If the data is a flat repeated collection"
+        " reachable by ONE CSS selector, use extract_dom_records instead;"
+        " reserve this for cross-node/cross-section logic (heading-scoped"
+        " aggregation, computed relations). For statement bodies, pass an IIFE"
         " expression such as (() => { const rows = []; return rows; })()."
     ),
     input_schema=_browser_schema_for("eval_js_json"),
@@ -619,7 +639,9 @@ async def _execute_browser_capability_tool(
         agent.trace.append({"type": "screenshot_guard", "result": screenshot_guard})
         return screenshot_guard, False
 
-    target_param_guard = _check_target_param_requirements(method, params)
+    target_param_guard = _check_target_param_requirements(
+        method, params, getattr(agent, "method_schemas", {})
+    )
     if target_param_guard is not None:
         attach_error_classification(target_param_guard, method=method)
         attach_method_schema(target_param_guard, method, agent.method_schemas)
@@ -666,6 +688,7 @@ async def _execute_browser_capability_tool(
         )
     _ensure_hitl_request_reason(method, params, reason)
 
+    page_create_should_stop = False
     try:
         runner = getattr(agent, "render_recovery_runner", None)
         if runner is None:
@@ -711,10 +734,17 @@ async def _execute_browser_capability_tool(
         }
         attach_method_schema(result, method, agent.method_schemas)
 
+    if _is_page_create_32005_failure(method, result):
+        result, page_create_should_stop = await _recover_page_create_32005(
+            agent,
+            params,
+            result,
+        )
     attach_error_classification(result, method=method)
     result = _attach_navigation_check(result, method=method, params=params)
     result = _attach_runtime_strategy_hints(result, method=method)
-    result = await _maybe_auto_hitl_for_challenge(agent, method, params, result, step)
+    if not page_create_should_stop:
+        result = await _maybe_auto_hitl_for_challenge(agent, method, params, result, step)
     result = _attach_normalized_handles(result)
     # Record THIS call's AXTree snapshot first (precomputed_snapshot is the
     # pre-auto-intercept tree). Auto-intercept runs AFTER: its dismiss_overlay
@@ -736,7 +766,14 @@ async def _execute_browser_capability_tool(
     # this model path), so there is no recursion; its internal clicks/re-inspects
     # leave agent.axtree_* either invalidated or refreshed to the post-dismiss
     # tree — never a stale snapshot marked clean.
-    result = await _maybe_auto_intercept_overlay(agent, method, params, result, step)
+    if not page_create_should_stop:
+        result = await _maybe_auto_intercept_overlay(agent, method, params, result, step)
+    # VL Role D: if the call still failed with a visual/occlusion/challenge/locator
+    # error after deterministic recovery, auto-route it to the VL arbiter and attach
+    # a recovery recommendation (resolvedId / hitl / dismiss / reperceive). Gated by
+    # vl.arbiter_enabled; non-visual failures and disabled VL are no-ops.
+    if not page_create_should_stop:
+        result = await _maybe_vl_arbitrate(agent, method, params, result, step)
     agent.logger.write("browser.call.result", agent._trim_for_log(result))
     model_result = agent._clean_for_model(result)
     model_result = offload_large_tool_result(
@@ -754,7 +791,7 @@ async def _execute_browser_capability_tool(
         "params": params,
         "result": agent._clean_for_model(model_result),
     })
-    return model_result, False
+    return model_result, page_create_should_stop
 
 
 async def _invoke_browser_method(
@@ -839,6 +876,14 @@ async def _invoke_browser_method(
         result = {"method": method, "params": _shown_params(params), "error": str(exc)}
         attach_method_schema(result, method, agent.method_schemas)
 
+    if _is_page_create_32005_failure(method, result):
+        result, _page_create_should_stop = await _recover_page_create_32005(
+            agent,
+            params,
+            result,
+        )
+        if "params" in result:
+            result["params"] = _shown_params(params)
     attach_error_classification(result, method=method)
     result = _attach_navigation_check(result, method=method, params=params)
     result = _attach_runtime_strategy_hints(result, method=method)
@@ -935,11 +980,21 @@ async def _extract_dom_records(agent: Any, tool_input: JsonDict, step: int) -> J
 
     rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
     rows = [row for row in rows if isinstance(row, dict)]
+    matched_count = int(payload.get("matchedCount") or 0)
     result: JsonDict = {
         "status": "done",
         "selector": selector,
+        # matchedCount = selector hits BEFORE visibleOnly/limit filtering; rowCount
+        # = rows returned. Exposing both lets the model tell "selector wrong /
+        # content absent" (matchedCount 0) apart from "matched but filtered out"
+        # (matchedCount > 0, rowCount 0 -> usually not-yet-visible lazy content).
+        "matchedCount": matched_count,
         "rowCount": len(rows),
         "rows": rows,
+        # filteredCount = scanned nodes dropped by visibleOnly; truncated STRICTLY
+        # means the scan stopped early because `limit` was reached (filtered-out
+        # nodes never set it, so lazyHint and truncated can't contradict).
+        "filteredCount": int(payload.get("filteredCount") or 0),
         "truncated": bool(payload.get("truncated")),
         "next_step": (
             "If these rows are target data, call record_extraction now."
@@ -947,6 +1002,13 @@ async def _extract_dom_records(agent: Any, tool_input: JsonDict, step: int) -> J
             else "Rows were automatically persisted via record_extraction."
         ),
     }
+    if matched_count > 0 and not rows:
+        result["lazyHint"] = (
+            f"Selector matched {matched_count} node(s) but 0 rows passed the filter"
+            " (likely visibleOnly hiding not-yet-visible lazy content). Scroll the"
+            " section into view or use collect_items, then re-extract before"
+            " concluding the content is absent."
+        )
     if record_name:
         record_result = _record_extraction(
             agent,
@@ -1056,6 +1118,15 @@ async def _eval_js_json_tool(agent: Any, tool_input: JsonDict, step: int) -> Jso
     }
     if policy_warnings:
         result["policyWarnings"] = policy_warnings
+    # Advisory routing only (never blocks): a flat selector+map extraction is
+    # exactly what extract_dom_records expresses declaratively.
+    if _looks_like_flat_collection_js(expression):
+        result["routingHint"] = (
+            "This expression is a flat querySelectorAll+map extraction;"
+            " prefer extract_dom_records (selector + field specs) next time —"
+            " it adds matchedCount diagnostics, lazy-src resolution, and"
+            " record_name persistence."
+        )
     if record_name:
         if rows is None:
             return {
@@ -1086,6 +1157,30 @@ async def _eval_js_json_tool(agent: Any, tool_input: JsonDict, step: int) -> Jso
             "turns": 0,
         }
     return result
+
+
+_FLAT_COLLECTION_MAP_RE = re.compile(r"\.map\s*\(|forEach\s*\(")
+# Cross-node markers extract_dom_records cannot express — their presence means
+# the free-form JS is justified. Note: r"querySelector\s*\(" does NOT match
+# "querySelectorAll(" ("querySelector" is followed by "All", not "(").
+_CROSS_NODE_JS_RE = re.compile(
+    r"\bclosest\s*\(|\.parentElement\b|\.parentNode\b"
+    r"|\.next(?:Element)?Sibling\b|\.previous(?:Element)?Sibling\b"
+    r"|\.children\b|\.childNodes\b"
+    r"|\.(?:first|last)(?:Element)?Child\b"
+    r"|querySelector\s*\("
+)
+
+
+def _looks_like_flat_collection_js(expression: str) -> bool:
+    """True when the JS is a single querySelectorAll + map/forEach projection —
+    the shape extract_dom_records covers declaratively. Advisory only."""
+    expr = str(expression or "")
+    if expr.count("querySelectorAll") != 1:
+        return False
+    if not _FLAT_COLLECTION_MAP_RE.search(expr):
+        return False
+    return not _CROSS_NODE_JS_RE.search(expr)
 
 
 def _eval_js_policy_warnings(
@@ -1491,6 +1586,25 @@ def _result_has_auto_hitl(result: Any) -> bool:
     return isinstance(result, dict) and isinstance(result.get("autoHitl"), dict)
 
 
+def _auto_hitl_is_actionable(auto: Any) -> bool:
+    """True only when an autoHitl entry represents a REAL pause request — i.e.
+    `Hitl.requestPause` actually ran. A skipped / not-executed adjudication is a
+    no-op: the page was never paused, so a composite loop must NOT abort on it.
+
+    Post-97f105e the harness only writes result['autoHitl'] when it truly requests
+    HITL (skipped/cooldown/stale verdicts go to `suspected_challenge.adjudication`
+    instead), so in practice every autoHitl is actionable. This guard keeps
+    `_loop_interrupt_from_result` honest against a future short-circuit that could
+    attach a `tool_was_executed: False` / `status: "skipped*"` autoHitl."""
+    if not isinstance(auto, dict):
+        return False
+    if auto.get("tool_was_executed") is False:
+        return False
+    if str(auto.get("status") or "").lower().startswith("skipped"):
+        return False
+    return True
+
+
 def _navigate_hitl_result(page_id: str, attempt: int, result: JsonDict) -> JsonDict:
     wait = {}
     auto_hitl = result.get("autoHitl")
@@ -1631,8 +1745,8 @@ def _loop_interrupt_from_result(result: Any) -> Optional[JsonDict]:
     outcome is on THAT result."""
     if not isinstance(result, dict):
         return None
-    if _result_has_auto_hitl(result):
-        auto = result.get("autoHitl")
+    auto = result.get("autoHitl")
+    if isinstance(auto, dict) and _auto_hitl_is_actionable(auto):
         wait: JsonDict = {}
         response = auto.get("response") if isinstance(auto, dict) else None
         if isinstance(response, dict) and isinstance(response.get("hitl_wait"), dict):
@@ -2107,7 +2221,28 @@ def _build_extract_dom_records_expression(
       spec = String(spec || "text");
       if (spec === "text" || spec === "textContent") return norm(el.innerText || el.textContent || "");
       if (spec === "href") return el.href || (el.closest && el.closest("a[href]") ? el.closest("a[href]").href : "");
-      if (spec === "src") return el.src || "";
+      if (spec === "src") {{
+        // Site-agnostic lazy-image resolver: many sites (1688/taobao/amazon...)
+        // keep the real URL in data-src/srcset until the <img> scrolls into view
+        // and only set a 1x1/blank placeholder on .src. Fall back to the common
+        // lazy attributes when .src is empty or a placeholder, then absolutize.
+        const isPh = (u) => !u
+          || /^data:image\\/(gif|svg)/i.test(u)
+          || /(blank|placeholder|spacer|loading|transparent|grey|gray|1x1|s\\.gif)\\.(gif|png|svg|webp)/i.test(u);
+        let u = el.currentSrc || el.src || "";
+        if (isPh(u)) {{
+          u = el.getAttribute("data-src") || el.getAttribute("data-lazy-src")
+            || el.getAttribute("data-original") || el.getAttribute("data-ks-lazyload")
+            || el.getAttribute("data-url") || el.getAttribute("data-image") || u;
+        }}
+        if (isPh(u)) {{
+          const ss = el.getAttribute("srcset") || el.getAttribute("data-srcset") || "";
+          if (ss) {{ const first = ss.split(",")[0].trim().split(/\\s+/)[0]; if (first) u = first; }}
+        }}
+        try {{ if (u && !/^(https?:|data:|\\/\\/)/i.test(u)) u = new URL(u, location.href).href; }} catch (e) {{}}
+        if (/^\\/\\//.test(u)) u = location.protocol + u;
+        return u || "";
+      }}
       if (spec === "imgAlt") {{
         const img = el.matches && el.matches("img") ? el : el.querySelector && el.querySelector("img");
         return img ? norm(img.getAttribute("alt") || img.alt || "") : "";
@@ -2125,10 +2260,13 @@ def _build_extract_dom_records_expression(
     }};
     const rows = [];
     const nodes = Array.from(document.querySelectorAll(selector));
-    for (let domOrder = 0; domOrder < nodes.length && rows.length < limit; domOrder++) {{
+    let filteredCount = 0;
+    let stoppedByLimit = false;
+    for (let domOrder = 0; domOrder < nodes.length; domOrder++) {{
+      if (rows.length >= limit) {{ stoppedByLimit = true; break; }}
       const el = nodes[domOrder];
       const visible = isVisible(el);
-      if (visibleOnly && !visible) continue;
+      if (visibleOnly && !visible) {{ filteredCount++; continue; }}
       const row = {{ domOrder, visible }};
       for (const [name, spec] of Object.entries(fieldSpecs || {{}})) {{
         row[name] = read(el, spec);
@@ -2141,7 +2279,9 @@ def _build_extract_dom_records_expression(
       rows,
       rowCount: rows.length,
       matchedCount: nodes.length,
-      truncated: nodes.length > rows.length
+      filteredCount,
+      stoppedByLimit,
+      truncated: stoppedByLimit
     }});
   }} catch (err) {{
     return JSON.stringify({{
@@ -2401,6 +2541,267 @@ def _response_data(result: JsonDict) -> JsonDict:
         return {}
     data = response.get("data")
     return data if isinstance(data, dict) else {}
+
+
+def _raw_response_data(response: Any) -> JsonDict:
+    if not isinstance(response, dict):
+        return {}
+    data = response.get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def _page_create_error_text(result: Any) -> str:
+    parts: List[str] = []
+
+    def visit(value: Any, depth: int = 0) -> None:
+        if depth > 5:
+            return
+        if isinstance(value, str):
+            parts.append(value)
+        elif isinstance(value, (int, float, bool)):
+            parts.append(str(value))
+        elif isinstance(value, dict):
+            for key in ("error", "message", "code", "data", "observation"):
+                if key in value:
+                    visit(value.get(key), depth + 1)
+            response = value.get("response")
+            if isinstance(response, dict):
+                visit(response, depth + 1)
+        elif isinstance(value, list):
+            for item in value[:10]:
+                visit(item, depth + 1)
+
+    visit(result)
+    return " ".join(parts)
+
+
+def _is_page_create_32005_failure(method: str, result: Any) -> bool:
+    if method != "Page.create":
+        return False
+    text = _page_create_error_text(result).lower()
+    return "-32005" in text and "page.create" in text
+
+
+def _pages_from_value(value: Any) -> List[JsonDict]:
+    pages: List[JsonDict] = []
+
+    def visit(item: Any, inherited_fleet_id: str = "") -> None:
+        if isinstance(item, dict):
+            fleet_id = str(item.get("fleetId") or inherited_fleet_id or "")
+            page_id = item.get("pageId") or item.get("page_id")
+            if isinstance(page_id, str) and page_id.strip():
+                page = dict(item)
+                if fleet_id and not page.get("fleetId"):
+                    page["fleetId"] = fleet_id
+                pages.append(page)
+            for nested in item.values():
+                visit(nested, fleet_id)
+        elif isinstance(item, list):
+            for nested in item:
+                visit(nested, inherited_fleet_id)
+
+    visit(value)
+    dedup: Dict[str, JsonDict] = {}
+    for page in pages:
+        page_id = str(page.get("pageId") or page.get("page_id") or "").strip()
+        if page_id:
+            dedup[page_id] = page
+    return list(dedup.values())
+
+
+async def _page_create_probe_call(agent: Any, method: str, params: JsonDict) -> JsonDict:
+    try:
+        runner = getattr(agent, "render_recovery_runner", None)
+        if runner is not None:
+            response, _recovery = await runner.call(method, params)
+        else:
+            response = await agent.browser.call(method, params)
+        return {"ok": True, "method": method, "params": params, "response": response}
+    except Exception as exc:  # noqa: BLE001 - diagnostic probe must record all failures.
+        return {"ok": False, "method": method, "params": params, "error": str(exc)}
+
+
+def _page_state_is_usable(response: Any) -> bool:
+    if not isinstance(response, dict) or response.get("error"):
+        return False
+    data = _raw_response_data(response)
+    status = str(data.get("status") or "").strip().lower()
+    if status in {"closed", "crashed", "stale", "quarantined", "paused"}:
+        return False
+    hitl = data.get("hitl")
+    if isinstance(hitl, dict) and hitl.get("isPaused") is True:
+        return False
+    return True
+
+
+def _page_create_infrastructure_classification() -> JsonDict:
+    return {
+        "category": "blocked_infrastructure",
+        "type": "browser_unavailable_or_no_page",
+        "method": "Page.create",
+        "hint": (
+            "Page.create failed with -32005 and Fleet/Page probing found no"
+            " usable existing page. Reconnect or rebuild the Browser Client"
+            " before retrying this worker."
+        ),
+    }
+
+
+def _page_create_terminal_answer(
+    *,
+    original_error: str,
+    probe: JsonDict,
+) -> str:
+    classification = _page_create_infrastructure_classification()
+    payload = {
+        "outcome": "blocked",
+        "data": {},
+        "evidence": [
+            {
+                "method": "Page.create",
+                "error": original_error[:500],
+                "probeClassification": "browser_unavailable_or_no_page",
+                "checkedPageCount": len(probe.get("checkedPages") or []),
+            }
+        ],
+        "blockers": [
+            {
+                "classification": classification,
+                "message": classification["hint"],
+                "method": "Page.create",
+            }
+        ],
+        "next_steps": [
+            "Reconnect or restart the Browser Client/playground backend, then retry the worker.",
+            "If Fleet.list/Page.list shows reusable pages later, prefer reusing one instead of creating a new page.",
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+async def _recover_page_create_32005(
+    agent: Any,
+    params: JsonDict,
+    result: JsonDict,
+) -> Tuple[JsonDict, bool]:
+    original_error = _page_create_error_text(result)
+    probe: JsonDict = {
+        "trigger": "Page.create_-32005",
+        "originalError": original_error[:500],
+        "fleetList": None,
+        "pageLists": [],
+        "checkedPages": [],
+        "classification": "unknown",
+    }
+    page_candidates: List[JsonDict] = []
+
+    fleet_list = await _page_create_probe_call(agent, "Fleet.list", {})
+    probe["fleetList"] = fleet_list
+    page_candidates.extend(_pages_from_value(fleet_list.get("response")))
+    fleets = _raw_response_data(fleet_list.get("response")).get("fleets")
+    if isinstance(fleets, list):
+        for fleet in fleets:
+            if not isinstance(fleet, dict):
+                continue
+            fleet_id = str(fleet.get("fleetId") or "").strip()
+            if not fleet_id:
+                continue
+            listed = await _page_create_probe_call(
+                agent,
+                "Page.list",
+                {"fleetId": fleet_id},
+            )
+            probe["pageLists"].append(listed)
+            for page in _pages_from_value(listed.get("response")):
+                page.setdefault("fleetId", fleet_id)
+                page_candidates.append(page)
+
+    page_candidates.extend(_pages_from_value(getattr(agent, "preloaded_registration", None)))
+    deduped: Dict[str, JsonDict] = {}
+    for page in page_candidates:
+        page_id = str(page.get("pageId") or page.get("page_id") or "").strip()
+        if page_id:
+            deduped[page_id] = page
+
+    for page in list(deduped.values())[:5]:
+        page_id = str(page.get("pageId") or page.get("page_id") or "").strip()
+        if not page_id:
+            continue
+        state = await _page_create_probe_call(
+            agent,
+            "Page.getState",
+            {
+                "pageId": page_id,
+                "purpose": "verify existing page after Page.create -32005",
+            },
+        )
+        state_data = _raw_response_data(state.get("response"))
+        checked = {
+            "pageId": page_id,
+            "fleetId": str(page.get("fleetId") or state_data.get("fleetId") or ""),
+            "ok": bool(state.get("ok")) and _page_state_is_usable(state.get("response")),
+            "status": state_data.get("status"),
+            "title": state_data.get("title"),
+            "url": state_data.get("url"),
+            "error": state.get("error"),
+        }
+        probe["checkedPages"].append(checked)
+        if checked["ok"]:
+            probe["classification"] = "create_failed_but_existing_page_usable"
+            response = {
+                "observation": (
+                    "Page.create failed with -32005, but an existing usable"
+                    f" page was found and reused: pageId=\"{page_id}\""
+                    f" fleetId=\"{checked['fleetId']}\"."
+                ),
+                "data": {
+                    "pageId": page_id,
+                    "fleetId": checked["fleetId"],
+                    "reusedExistingPage": True,
+                    "pageCreateOriginalError": original_error[:500],
+                },
+            }
+            recovered = {
+                "method": "Page.create",
+                "params": params,
+                "response": response,
+                "pageCreateRecovery": probe,
+                "next_instruction": (
+                    "Continue with the reused pageId. Call Page.getState and"
+                    " DOM.getAXTree before targeting page elements."
+                ),
+            }
+            return recovered, False
+
+    probe["classification"] = "browser_unavailable_or_no_page"
+    classification = _page_create_infrastructure_classification()
+    terminal = {
+        "method": "Page.create",
+        "params": params,
+        "status": "incomplete",
+        "terminal": True,
+        "error": (
+            "Page.create failed with -32005 and no usable existing page was"
+            " found via Fleet.list/Page.list/Page.getState."
+        ),
+        "classification": classification,
+        "errorClassification": {
+            "type": "browser_unavailable_or_no_page",
+            "suggested_action": "abort_worker_reconnect_browser_then_retry",
+            "method": "Page.create",
+        },
+        "pageCreateRecovery": probe,
+        "answer": _page_create_terminal_answer(
+            original_error=original_error,
+            probe=probe,
+        ),
+        "next_instruction": (
+            "Stop this worker. The browser backend has no usable page after"
+            " Page.create -32005; LeadAgent should retry only after the Browser"
+            " Client/playground backend is connected or rebuilt."
+        ),
+    }
+    return terminal, True
 
 
 def _attach_navigation_check(result: JsonDict, *, method: str, params: JsonDict) -> JsonDict:
@@ -2753,7 +3154,66 @@ def _non_negative_numeric_param(params: JsonDict, key: str) -> bool:
     return False
 
 
-def _check_target_param_requirements(method: str, params: JsonDict) -> Optional[JsonDict]:
+def _check_id_param_format(
+    method: str,
+    params: JsonDict,
+    method_schemas: Optional[dict],
+) -> Optional[JsonDict]:
+    """Validate a supplied canonical element `id` against the describeAction
+    schema pattern. A truncated/fabricated id (e.g. "2:5367" where the schema
+    requires "^\\d+:\\d+:\\d+$") is caught here with an actionable error
+    instead of reaching the browser and returning a raw -32602 Invalid params.
+    Only fires when an `id` is actually supplied; a missing id is handled by the
+    selector/id presence check. Returns None when no pattern is available
+    (nothing to validate against) so this never over-rejects."""
+    if not isinstance(params, dict) or not isinstance(method_schemas, dict):
+        return None
+    raw_id = params.get("id")
+    if not isinstance(raw_id, str) or not raw_id.strip():
+        return None
+    schema = method_schemas.get(method)
+    if not isinstance(schema, dict):
+        return None
+    spec_params = schema.get("params")
+    if not isinstance(spec_params, dict):
+        return None
+    id_spec = spec_params.get("id")
+    if not isinstance(id_spec, dict):
+        return None
+    pattern = id_spec.get("pattern")
+    if not isinstance(pattern, str) or not pattern.strip():
+        return None
+    try:
+        matched = re.search(pattern, raw_id.strip()) is not None
+    except re.error:
+        return None
+    if matched:
+        return None
+    return {
+        "method": method,
+        "params": params,
+        "status": "invalid_params",
+        "error": (
+            f"{method} params.id is not a valid canonical element id"
+            f" (schema pattern: {pattern})."
+        ),
+        "tool_was_executed": False,
+        "invalidParam": "id",
+        "pattern": pattern,
+        "next_instruction": (
+            "Re-read the active page with DOM.getAXTree and copy a current"
+            " canonical id verbatim. Do not truncate ids, reuse stale ids from"
+            " a prior page/navigation, or fabricate one. The id must match the"
+            f" schema pattern: {pattern}."
+        ),
+    }
+
+
+def _check_target_param_requirements(
+    method: str,
+    params: JsonDict,
+    method_schemas: Optional[dict] = None,
+) -> Optional[JsonDict]:
     if not isinstance(params, dict):
         return None
     has_selector_or_id = _non_empty_param(params, "selector") or _non_empty_param(params, "id")
@@ -2793,6 +3253,11 @@ def _check_target_param_requirements(method: str, params: JsonDict) -> Optional[
                     " click."
                 ),
             }
+    # Canonical id format guard: catch a malformed id here (clear, actionable
+    # error) rather than letting it reach the browser as a -32602 Invalid params.
+    id_format_error = _check_id_param_format(method, params, method_schemas)
+    if id_format_error is not None:
+        return id_format_error
     return None
 
 

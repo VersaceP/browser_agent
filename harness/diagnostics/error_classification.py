@@ -28,6 +28,16 @@ def classify_browser_error(
     lower = text.lower()
     method_name = str(method or "")
 
+    if (
+        method_name == "Page.create"
+        and "-32005" in lower
+        and "page.create" in lower
+    ):
+        return {
+            "type": "page_create_failed",
+            "suggested_action": "probe_existing_pages_then_reuse_or_abort_worker",
+            "method": method_name,
+        }
     if _contains(lower, "err_page_paused", "paused for human intervention"):
         return {
             "type": "hitl_paused_state",
@@ -79,6 +89,8 @@ def classify_browser_error(
 
 def attach_error_classification(result: JsonDict, *, method: str = "") -> JsonDict:
     """Mutate and return result with `errorClassification` when an error exists."""
+    if isinstance(result.get("errorClassification"), dict):
+        return result
     message = _extract_error_message(result)
     if not message:
         return result
