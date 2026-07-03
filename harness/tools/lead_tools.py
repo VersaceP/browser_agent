@@ -11,7 +11,7 @@ from harness.extraction_artifacts import (
     validate_extraction_rows,
 )
 from harness.lifecycle import LifecycleContext, lifecycle_for
-from harness.local_fs import local_fs_jsonpath, local_fs_read, local_fs_search
+from harness.local_fs import local_fs_read, local_fs_search
 from harness.strategy_bank import render_strategy_guidance
 from harness.task_control import mark_phase_exhausted_if_needed
 from harness.tools.loop_guard import check_tool_call_loop
@@ -185,33 +185,6 @@ def _local_fs_read_schema(_: Any = None) -> JsonDict:
             "max_bytes": {"type": "integer", "minimum": 1000, "maximum": 200000},
         },
         "required": ["path", "line_offset", "line_limit", "max_bytes"],
-        "additionalProperties": False,
-    }
-
-
-def _local_fs_jsonpath_schema(_: Any = None) -> JsonDict:
-    return {
-        "type": "object",
-        "properties": {
-            "path": {"type": "string"},
-            "expr": {
-                "type": "string",
-                "description": "Supports $.a.b[0], [*], .*, ..field, ..*.",
-            },
-            "mode": {
-                "type": "string",
-                "enum": ["auto", "json", "jsonl"],
-            },
-            "max_nodes": {"type": "integer", "minimum": 1, "maximum": 500},
-            "max_bytes_per_node": {"type": "integer", "minimum": 100, "maximum": 50000},
-        },
-        "required": [
-            "path",
-            "expr",
-            "mode",
-            "max_nodes",
-            "max_bytes_per_node",
-        ],
         "additionalProperties": False,
     }
 
@@ -841,25 +814,6 @@ async def _lead_local_fs_read(ctx: ToolContext) -> JsonDict:
                 ctx.agent.runtime.harness.local_fs_max_read_bytes,
             ) or ctx.agent.runtime.harness.local_fs_max_read_bytes,
             ctx.agent.runtime.harness.local_fs_max_read_bytes,
-        ),
-    )
-
-
-@LEAD_TOOLS.register(
-    name="local_fs_jsonpath",
-    description="Read-only read of a JSON/JSONL file inside the current task worktree, with a JSONPath subset for node extraction.",
-    input_schema=_local_fs_jsonpath_schema,
-)
-async def _lead_local_fs_jsonpath(ctx: ToolContext) -> JsonDict:
-    tool_input = ctx.tool_input
-    return local_fs_jsonpath(
-        ctx.agent.logger,
-        path=str(tool_input.get("path") or ""),
-        expr=str(tool_input.get("expr") or "$"),
-        mode=str(tool_input.get("mode") or "auto"),
-        max_nodes=optional_int(tool_input.get("max_nodes"), 50) or 50,
-        max_bytes_per_node=(
-            optional_int(tool_input.get("max_bytes_per_node"), 1000) or 1000
         ),
     )
 

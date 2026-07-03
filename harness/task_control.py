@@ -24,6 +24,11 @@ from harness.constants import (
     WORKER_STATUS_PAGE_SETTLED_AFTER_HITL,
 )
 from harness.extraction_artifacts import field_name_from_spec, field_names_from_specs
+from harness.task_types import (
+    VALID_TASK_TYPES,
+    normalize_task_type,
+    task_type_choices_for_error,
+)
 from harness.utils import JsonDict, RunLogger, safe_path_component, trim_large_strings
 
 
@@ -43,20 +48,6 @@ VOLATILE_HANDLE_KEYS = {
     "nodeId",
     "selector",
     "sourceSelectorOrAxId",
-}
-
-TASK_TYPE_ALIASES = {
-    "browser_data_collection": "web_scrape",
-    "browser_action": "form_fill",
-}
-
-VALID_TASK_TYPES = {
-    "general",
-    "web_search",
-    "web_scrape",
-    "form_fill",
-    "download_file",
-    "browser_state_management",
 }
 
 VALID_STAGE_HINTS = {
@@ -144,24 +135,25 @@ def validate_task_plan(
     if not task_type:
         errors.append(
             "task_type is required; use an explicit value such as web_scrape,"
-            " form_fill, download_file, web_search, or general"
+            " form_filling, file_download, file_upload, web_search, or general"
         )
         task_type = "general"
-    elif task_type in TASK_TYPE_ALIASES:
-        canonical = TASK_TYPE_ALIASES[task_type]
-        warnings.append({
-            "type": "task_type_alias",
-            "input": task_type,
-            "canonical": canonical,
-            "message": (
-                f"task_type {task_type!r} is accepted as an alias; use"
-                f" canonical task_type {canonical!r} in future plans."
-            ),
-        })
-        task_type = canonical
-    elif task_type not in VALID_TASK_TYPES:
+    else:
+        canonical = normalize_task_type(task_type)
+        if canonical != task_type:
+            warnings.append({
+                "type": "task_type_alias",
+                "input": task_type,
+                "canonical": canonical,
+                "message": (
+                    f"task_type {task_type!r} is accepted as an alias; use"
+                    f" canonical task_type {canonical!r} in future plans."
+                ),
+            })
+            task_type = canonical
+    if task_type not in VALID_TASK_TYPES:
         errors.append(
-            f"task_type must be one of {sorted(VALID_TASK_TYPES | set(TASK_TYPE_ALIASES))}; got {task_type!r}"
+            f"task_type must be one of {task_type_choices_for_error()}; got {task_type!r}"
         )
 
     raw_phases = raw_plan.get("phases")
@@ -350,7 +342,7 @@ def phase_contract(
     payload: JsonDict = {
         "version": "v1",
         "phase_id": phase_id,
-        "task_type": str(
+        "task_type": normalize_task_type(
             contract.get("task_type")
             or phase.get("task_type")
             or default_task_type
@@ -384,6 +376,16 @@ def phase_contract(
             or "Record the required extraction artifact, then call final_answer."
         ),
     }
+    # Pass through skill-selection fields the LeadAgent set on the worker_contract.
+    # phase_contract otherwise rebuilds a fixed-field payload, which silently
+    # dropped these — so an explicit skill_id/skill_variables (select) or
+    # skill_selection={"use_skill": false} (decline) never reached the dispatch
+    # gate and spawn_browser_agent kept re-returning skill_selection_required
+    # (an unbreakable loop for the Lead). Preserve them verbatim when present.
+    for skill_key in ("skill_id", "skill_variables", "skill_selection", "domain"):
+        value = contract.get(skill_key)
+        if value is not None:
+            payload[skill_key] = value
     if validator_errors:
         payload["contract_warnings"] = validator_errors
     return payload
@@ -470,7 +472,6 @@ def initialize_task_state(
         "completed_items": list((preserve_from or {}).get("completed_items") or []),
         "pending_items": list((preserve_from or {}).get("pending_items") or []),
         "failed_items": list((preserve_from or {}).get("failed_items") or []),
-        "learned_strategies": list((preserve_from or {}).get("learned_strategies") or []),
         "banned_strategies": list((preserve_from or {}).get("banned_strategies") or []),
         "quality": dict((preserve_from or {}).get("quality") or {}),
     }
@@ -1413,6 +1414,14 @@ PLACEHOLDER_TEXT_PATTERNS = tuple(
         r"^\s*no comments? yet\s*$",
         r"^\s*coming soon\s*$",
         r"^\s*nothing (?:here|found)\s*$",
+        # Failure-as-data: a worker writing WHY it could not get the value (EN/zh)
+        # instead of the value itself. Anchored bare-absence values, plus
+        # iframe/main-DOM meta-commentary that never appears in real field data.
+        r"^\s*(?:n/?a|none|null|nil|unknown|unavailable|not (?:found|available|provided|specified|shown|displayed|captured|obtained|extracted))\s*\.?\s*$",
+        r"(?:located in|present in|inside|within)\s+(?:an?\s+)?iframe",
+        r"位于\s*iframe|iframe\s*(?:中|内|里)|嵌(?:套|入)在?\s*iframe",
+        r"主\s*dom\s*(?:未|中未|没有|不包含)|not (?:directly )?(?:in|present in|contained in) the (?:main )?dom",
+        r"^\s*(?:未(?:获取|提供|找到|明确|展示|提取|包含|显示|抓取|呈现)|无法(?:获取|提取|访问|抓取|读取)|暂无(?:数据|内容|信息)?|无(?:数据|内容|此信息|相关信息)|未知|不适用|页面(?:未|没有)(?:明确|直接|展示))",
     )
 )
 

@@ -7,7 +7,7 @@ actually passed (axtree_id, css selector, fake jQuery-style pseudo, or
 an "other_string" the model invented) and pair each call with its outcome.
 
 Also reports the find-chain cost: how often a targeted call was preceded
-by DOM.getAXTree / local_fs_search / local_fs_read / local_fs_jsonpath in
+by DOM.getAXTree / local_fs_search / local_fs_read in
 the prior few tool calls, and the median number of model steps spent
 between a DOM.getAXTree and the next call that consumed an element handle.
 
@@ -47,7 +47,7 @@ ELEMENT_TARGETED_METHODS = frozenset({
     "DOM.getAttribute",
 })
 INTERACTION_METHODS = frozenset({"Input.click", "Input.type", "Input.press"})
-FIND_TOOLS = frozenset({"local_fs_search", "local_fs_read", "local_fs_jsonpath"})
+FIND_TOOLS = frozenset({"local_fs_search", "local_fs_read"})
 AXTREE_METHODS = frozenset({"DOM.getAXTree", "DOM.getSemanticTree"})
 RENDER_RECOVERY_EVENT_TYPES = frozenset({"browser.call.recovery_result"})
 

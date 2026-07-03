@@ -22,8 +22,10 @@ from harness.utils import JsonDict
 
 
 AXTREE_ID_RE = re.compile(r"\b\d+:-?\d+:-?\d+\b")
+# Accepts both the legacy indent-based line format and the current
+# depth-prefixed one (`3 [3:426:426] link "TAAFT" # @10,0,106,94`).
 AXTREE_LINE_RE = re.compile(
-    r"^\s*\[(?P<id>\d+:-?\d+:-?\d+)\]\s+"
+    r"^(?:\d+\s+)?\s*\[(?P<id>\d+:-?\d+:-?\d+)\]\s+"
     r"(?P<role>[\w-]+)(?:\s+\"(?P<name>[^\"]*)\")?"
 )
 ACTIONABLE_ROLES = {

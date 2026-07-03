@@ -4,7 +4,7 @@
   "strategies": [
     {
       "id": "web_scrape.collection.repeated_dom",
-      "task_types": ["web_scrape", "browser_data_collection"],
+      "task_types": ["web_scrape"],
       "stage": "collection",
       "applies_to_stages": ["collection"],
       "fallback": false,
@@ -23,7 +23,7 @@
         "record_extraction"
       ],
       "cautioned_tools": ["extract_dom_records"],
-      "avoid_tools": ["Runtime.evaluate", "eval_js_json", "DOM.getSemanticTree"],
+      "avoid_tools": ["eval_js_json"],
       "procedure": [
         "Confirm page state, then use DOM.getAXTree to identify item boundaries, labels, controls, and stable anchors.",
         "Scroll only when more items must be materialized; refresh DOM.getAXTree after scrolls.",
@@ -47,7 +47,7 @@
     },
     {
       "id": "web_scrape.collection.attribute_links",
-      "task_types": ["web_scrape", "browser_data_collection"],
+      "task_types": ["web_scrape"],
       "stage": "attribute_links",
       "applies_to_stages": ["attribute_links", "collection"],
       "fallback": false,
@@ -64,7 +64,7 @@
         "record_extraction"
       ],
       "cautioned_tools": ["extract_dom_records"],
-      "avoid_tools": ["Runtime.evaluate", "eval_js_json", "DOM.getSemanticTree"],
+      "avoid_tools": ["eval_js_json"],
       "procedure": [
         "Use DOM.getAXTree to locate the item/control/anchor associated with each attribute.",
         "Use DOM.getAttribute for the target attribute value.",
@@ -88,7 +88,7 @@
     },
     {
       "id": "web_scrape.detail_sections.reveal_then_text",
-      "task_types": ["web_scrape", "browser_data_collection"],
+      "task_types": ["web_scrape"],
       "stage": "detail_sections",
       "applies_to_stages": ["detail_sections"],
       "fallback": false,
@@ -108,7 +108,7 @@
         "record_extraction"
       ],
       "cautioned_tools": ["visual_verify"],
-      "avoid_tools": ["Runtime.evaluate", "eval_js_json", "extract_dom_records", "DOM.getSemanticTree"],
+      "avoid_tools": ["eval_js_json", "extract_dom_records"],
       "procedure": [
         "Use DOM.getAXTree to locate headings, controls, tab labels, accordion buttons, show-more controls, anchor links, and section bodies.",
         "Reveal hidden or lazy content through Input.click or Input.scroll only when the AXTree shows an appropriate control or target.",
@@ -132,7 +132,7 @@
     },
     {
       "id": "web_scrape.computed_relationship.eval_js",
-      "task_types": ["web_scrape", "browser_data_collection"],
+      "task_types": ["web_scrape"],
       "stage": "computed_relationship",
       "applies_to_stages": ["computed_relationship"],
       "fallback": false,
@@ -150,7 +150,7 @@
         "record_extraction"
       ],
       "cautioned_tools": ["Runtime.evaluate"],
-      "avoid_tools": ["DOM.getSemanticTree", "unverified generated values"],
+      "avoid_tools": ["unverified generated values"],
       "procedure": [
         "State a valid reason_kind before eval_js_json: computed_geometry, cross_node_relationship, shadow_dom_traversal, cross_frame_aggregation, non_dom_state, or legacy_no_dom_equivalent.",
         "Keep JavaScript scoped to the computed relationship; do not use it for text or attributes native DOM tools can read.",
@@ -174,7 +174,7 @@
     },
     {
       "id": "browser_action.form_interaction.axtree_input",
-      "task_types": ["form_fill", "browser_action"],
+      "task_types": ["form_filling"],
       "stage": "form_interaction",
       "applies_to_stages": ["form_interaction"],
       "fallback": false,
@@ -194,7 +194,7 @@
         "record_extraction"
       ],
       "cautioned_tools": ["visual_verify"],
-      "avoid_tools": ["Runtime.evaluate", "eval_js_json", "DOM.getSemanticTree"],
+      "avoid_tools": ["eval_js_json"],
       "procedure": [
         "Locate controls and labels with DOM.getAXTree.",
         "Fill values with Input.type/Input.press and toggle/select with Input.click using AXTree ids or stable selectors.",
@@ -218,7 +218,7 @@
     },
     {
       "id": "browser_action.overlay.dismiss_ladder",
-      "task_types": ["general", "web_search", "web_scrape", "form_fill", "browser_action"],
+      "task_types": ["general", "web_search", "web_scrape", "form_filling"],
       "stage": "overlay_recovery",
       "applies_to_stages": [
         "collection",
@@ -256,7 +256,7 @@
         "eval_js_json"
       ],
       "cautioned_tools": ["visual_verify", "Runtime.evaluate"],
-      "avoid_tools": ["DOM.getSemanticTree", "repeating the same blocked click"],
+      "avoid_tools": ["repeating the same blocked click"],
       "procedure": [
         "Refresh DOM.getAXTree and identify the blocking overlay, modal, or dialog text before retrying the original action.",
         "If a close, dismiss, not-now, skip, or X control is visible in the current AXTree, click it with its canonical id.",
@@ -280,7 +280,7 @@
     },
     {
       "id": "browser_action.overlay.auth_persist_fleet",
-      "task_types": ["general", "web_search", "web_scrape", "form_fill", "browser_action"],
+      "task_types": ["general", "web_search", "web_scrape", "form_filling"],
       "stage": "overlay_recovery",
       "applies_to_stages": [
         "collection",
@@ -338,7 +338,7 @@
     },
     {
       "id": "hitl.guard.before_request_pause",
-      "task_types": ["general", "web_search", "web_scrape", "form_fill", "browser_action"],
+      "task_types": ["general", "web_search", "web_scrape", "form_filling"],
       "stage": "hitl_guard",
       "applies_to_stages": [
         "collection",

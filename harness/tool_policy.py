@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, FrozenSet, Iterable, Optional, Set
 
+from harness.task_types import normalize_task_type
+
 
 # Tool input fields that carry secrets when the call opts into masking
 # (mask=true). The browser still receives the real value; these are masked at
@@ -18,6 +20,24 @@ from typing import Any, Dict, FrozenSet, Iterable, Optional, Set
 SENSITIVE_TOOL_INPUT_FIELDS: Dict[str, FrozenSet[str]] = {
     "fill_field_verified": frozenset({"text"}),
 }
+
+# Harness composite tools hidden from the model tool surface for task types
+# where they have no legitimate use — pure schema-token/choice-noise savings.
+# Mirrors the ABCP-method task_type policy: hide only where we are confident
+# (fail-open for general/unknown and for form-capable task types).
+HARNESS_TOOLS_HIDDEN_BY_TASK_TYPE: Dict[str, FrozenSet[str]] = {
+    "web_scrape": frozenset({"fill_field_verified"}),
+    "web_search": frozenset({"fill_field_verified"}),
+    "file_download": frozenset({"fill_field_verified"}),
+    "browser_state_management": frozenset({"fill_field_verified"}),
+}
+
+
+def hidden_harness_tools_for_task_type(task_type: object) -> Set[str]:
+    return set(
+        HARNESS_TOOLS_HIDDEN_BY_TASK_TYPE.get(normalize_task_type(task_type))
+        or frozenset()
+    )
 
 
 def mask_token(value: Any) -> str:
@@ -67,7 +87,6 @@ HARNESS_DEFAULT_ALLOWED_TOOLS: FrozenSet[str] = frozenset({
     "record_extraction",
     "local_fs_search",
     "local_fs_read",
-    "local_fs_jsonpath",
     "find_in_axtree",
     "extract_dom_records",
     "eval_js_json",
@@ -83,8 +102,16 @@ HARNESS_TOOL_NAMES: FrozenSet[str] = frozenset({
     *HARNESS_DEFAULT_ALLOWED_TOOLS,
 })
 
+# DOM.getSemanticTree is NO LONGER globally forbidden: crash-boundary probes on
+# current ABCP builds did not reproduce the historical renderer crash, and the
+# model needs it as a diagnostic when AXTree is insufficient (tag hierarchy,
+# complete local bounds, selector debugging). It is heavy (~3.65x AXTree) so its
+# results are offloaded (constants.OFFLOAD_METHODS) and the model prompt limits
+# it to local diagnostics. Keeping it out of this set also lets it appear in
+# worker_contract.forbidden_methods without tripping the unknown-method check
+# (it is now a known capability method). HARNESS-INTERNAL auto-digest use stays
+# separately gated by HarnessConfig.semantic_tree.
 ALWAYS_FORBIDDEN_ABCP_METHODS: FrozenSet[str] = frozenset({
-    "DOM.getSemanticTree",
     "Hitl.getTaskSummary",
     "Hitl.resumeEvent",
     "Memory.delete",
@@ -93,31 +120,44 @@ ALWAYS_FORBIDDEN_ABCP_METHODS: FrozenSet[str] = frozenset({
 TASK_TYPE_DISABLED_DOMAINS = {
     "web_search": frozenset({"Bookmark", "Download", "File", "History", "Memory"}),
     "web_scrape": frozenset({"Bookmark", "Download", "File", "History", "Memory"}),
-    "form_fill": frozenset({"Bookmark", "Download", "History"}),
-    "download_file": frozenset({"Bookmark", "History", "Memory"}),
+    "form_filling": frozenset({"Bookmark", "Download", "File", "History", "Memory"}),
+    "file_download": frozenset({"Bookmark", "File", "History", "Memory"}),
+    "file_upload": frozenset({"Bookmark", "Download", "File", "History", "Memory"}),
+    "browser_state_management": frozenset({"Bookmark", "Download", "File", "History", "Memory"}),
 }
 
 TASK_TYPE_ALLOWED_EXCEPTIONS = {
     "web_search": frozenset({"Memory.get", "Memory.save"}),
     "web_scrape": frozenset({"Memory.get", "Memory.save"}),
-    "form_fill": frozenset({"File.handleChooser", "Memory.get", "Memory.save"}),
-    "download_file": frozenset({"Memory.get", "Memory.save"}),
-}
-
-TASK_TYPE_ALIASES = {
-    "browser_data_collection": "web_scrape",
-    "browser_action": "form_fill",
+    "form_filling": frozenset({"File.handleChooser", "Memory.get", "Memory.save"}),
+    "file_download": frozenset({"File.download", "Memory.get", "Memory.save"}),
+    "file_upload": frozenset({"File.handleChooser", "Memory.get", "Memory.save"}),
+    "browser_state_management": frozenset({
+        "Bookmark.add",
+        "Bookmark.createFolder",
+        "Bookmark.deleteFolder",
+        "Bookmark.edit",
+        "Bookmark.isBookmarked",
+        "Bookmark.list",
+        "Bookmark.listFolders",
+        "Bookmark.moveToFolder",
+        "Bookmark.remove",
+        "Bookmark.renameFolder",
+        "Bookmark.search",
+        "History.deleteByOrigin",
+        "History.deleteItem",
+        "History.list",
+        "History.search",
+        "Memory.get",
+        "Memory.list",
+        "Memory.save",
+    }),
 }
 
 
 def method_domain(method: str) -> str:
     text = str(method or "").strip()
     return text.split(".", 1)[0] if "." in text else ""
-
-
-def normalize_task_type(task_type: object) -> str:
-    normalized = str(task_type or "general").strip() or "general"
-    return TASK_TYPE_ALIASES.get(normalized, normalized)
 
 
 def disabled_reason_for_method(method: str, task_type: object) -> str:

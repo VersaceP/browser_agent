@@ -1,10 +1,12 @@
 """
 harness.observation.semantic_index - Phase B: harness-internal SemanticTree use.
 
-DOM.getSemanticTree stays FORBIDDEN on the model tool surface and is NEVER exposed
-to the LLM. Gated by HarnessConfig.semantic_tree == "internal", the harness may
-make a one-shot, render_recovery-wrapped call to derive a tiny DIGEST that never
-enters model context. The raw tree is always digested and discarded.
+This module is the HARNESS-INTERNAL auto-digest path, independent of the model
+tool surface (the model may now call DOM.getSemanticTree directly as a limited
+diagnostic — see tool_policy). Gated by HarnessConfig.semantic_tree == "internal",
+the harness may make a one-shot, render_recovery-wrapped call to derive a tiny
+DIGEST that never enters model context. The raw tree is always digested and
+discarded.
 
 NOT used for (DISPROVEN on this build — abcp-panel-quirks #8/#9): scroll-container
 discovery (isScrollable only flags #document) and shadow-host mapping (shadow not

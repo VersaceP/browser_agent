@@ -32,7 +32,7 @@ from harness.diagnostics import (
     classify_terminal_status,
     status_category,
 )
-from harness.local_fs import local_fs_jsonpath, local_fs_read, local_fs_search
+from harness.local_fs import local_fs_read, local_fs_search
 from harness.lifecycle import LifecycleContext, default_lifecycle_manager
 from harness.model_config import browser_agent_model_config, lead_agent_model_config
 from harness.observation.event_observer import BrowserEventObserver
@@ -352,7 +352,10 @@ class BrowserAgent:
         try:
             bootstrap = await self._bootstrap_browser(task)
             system_prompt = self._build_system_prompt()
-            tools = build_browser_agent_tool_specs(self._visible_capability_methods())
+            tools = build_browser_agent_tool_specs(
+                self._visible_capability_methods(),
+                task_type=self._contract_task_type(),
+            )
             dispatch_tool = build_browser_tool_dispatcher(self)
             self.render_recovery_runner = build_render_recovery_runner(
                 browser=self.browser,
@@ -858,9 +861,9 @@ L1. Contracts, Feedback, Memory
 - Reusable authenticated fleet memory uses this exact JSON contract: {auth_fleet_json}. Treat it as a verified session index only, never as a credential store.
 
 L2. Perception And Evidence
-- DOM.getAXTree is the default perception tool for structure, labels, controls, state, and canonical ids. DOM.getText reads exact visible text for a known target. DOM.getAttribute reads href/src/id/aria-/data-/value and other attributes.
+- DOM.getAXTree is the default perception tool for structure, labels, controls, state, and canonical ids. DOM.getText reads exact visible text for a known target. DOM.getAttribute reads href/src/id/aria-/data-/value and other attributes. Canonical element ids are three-segment frameId:axNodeId:domNodeId (e.g. 2:5367:5367); copy them verbatim from the latest AXTree and never truncate to two segments.
 - AXTree ids are epoch-bound physical anchors. Any Page.navigate, render recovery/recovered feedback, Page.create/switch/close, Runtime.evaluate, Hitl transition, or Input.* action can invalidate them. After such a change, call Page.getState as needed, then DOM.getAXTree and derive fresh ids before targeting. For same-instance multi-page workflows, track each pageId with its URL/title/purpose, switch serially with Page.switchTo, and never assume a snapshot from one page remains valid after Page.create or Page.switchTo.
-- Large DOM/text/attribute/tool results are offloaded under observations/. The model-visible stub includes `savedPath`, `outline`, `format`, and `query_with`; inspect savedPath with local_fs_search, local_fs_read, or local_fs_jsonpath before deriving params from offloaded evidence.
+- Large DOM/text/attribute/tool results are offloaded under observations/. The model-visible stub includes `savedPath`, `outline`, `format`, and `query_with`; inspect savedPath with local_fs_search or local_fs_read before deriving params from offloaded evidence.
 - Screenshots produce a `savedPath` only. You cannot see the image from Page.screenshot output. Do not call Page.screenshot to read text, understand layout, identify selectors, or extract data. Use visual_verify only for bounded visual checks after visual uncertainty, overlays/CAPTCHA, canvas/image UI, layout mismatch, or DOM/visual disagreement.
 
 L3. Lifecycle And HITL
@@ -875,11 +878,12 @@ L4. Actions, Verification, Data
 - Verify every state-changing action with the cheapest reliable signal: ActionFeedback, Page.getState for navigation/lifecycle, refreshed DOM.getAXTree, DOM.getText, or DOM.getAttribute(value).
 - Use extract_dom_records for uniform lists/cards/tables. Use eval_js_json only when DOM primitives cannot express the relationship; give a valid reason_kind and cross-check at least one target field with DOM evidence before record_extraction.
 - Any reusable data handed to LeadAgent must go through record_extraction. Row keys must match expected_artifact fields exactly. Critical fields need sourceTool, sourceSelectorOrAxId, pageUrl, and canonical <field>EvidenceText evidence fields such as rankEvidenceText where applicable.
-- Reject empty, guessed, order-only, placeholder, sample, or template values. If the page truly shows absence/placeholder content, set `placeholderDetected: true` so validation can classify it.
+- Reject empty, guessed, order-only, placeholder, sample, or template values. If the page truly shows absence/placeholder content, set `placeholderDetected: true` so validation can classify it. Never write a failure narrative (e.g. "未获取", "未明确展示", "located in an iframe", "not in the main DOM", "N/A") into a data field — that is a placeholder and validation rejects it; either obtain the real value or report a blocker.
+- A selector returning 0 rows is NOT proof the content is absent. Tabbed/sectioned detail pages (e.g. 包装信息 / 商品详情 / Reviews / Specs) only render their content after the tab/section is activated, and many images are lazy-loaded (real URL in data-src/srcset, revealed on scroll). Before concluding absence: click the relevant tab/heading, refresh Page.getState + DOM.getAXTree, scroll the section into view, then re-extract (extract_dom_records src auto-resolves lazy images). Content inside an iframe surfaces through frame-aware canonical ids (DOM.getAXTree / DOM.getSemanticTree emit frameId:axNodeId:domNodeId across frames) — try targeting those ids; there is no frame-switch action (Page.switchTo changes tabs/pages, not frames), so if the frame's content cannot be reached with the available DOM tools, report a blocker instead of assuming absence. Only report absence after these steps.
 
 L5. Recovery
 - Do not repeat an identical failed call. Read the failure ActionFeedback and suggested_prompt, call Page.getState if lifecycle may be stale, refresh DOM.getAXTree if the target may be stale/hidden/disabled, then retry only with changed params.
-- Do not call DOM.getSemanticTree; current ABCP builds have reproduced renderer crashes after it. Prefer DOM.getAXTree and focused DOM.getText/DOM.getAttribute.
+- Use DOM.getSemanticTree only for local diagnostics when AXTree is insufficient and you need tag hierarchy, complete local bounds, Shadow DOM, or selector debugging. It is heavy and offloaded; prefer DOM.getAXTree + focused DOM.getText/DOM.getAttribute for routine perception. DOM.getAXTree / DOM.getSemanticTree return canonical ids: frameId:axNodeId:domNodeId.
 - local_fs_* inspects offloaded evidence; it is not live page state. If repeated local_fs searches return the same evidence, pivot to fresh DOM/Page/Input perception or finalize with a blocker.
 - If a needed method is blocked by task_type policy, final_answer with status="incomplete" and include {{"classification":"blocked_cross_task_type_required","method":"...","task_type":"...","reason":"..."}} for LeadAgent replan.
 
@@ -889,14 +893,16 @@ L6. Termination
 - final_answer.answer must be JSON shaped like {{"outcome":"done|partial|blocked|failed","data":{{}},"evidence":[],"blockers":[],"next_steps":[]}}. Put large rows in record_extraction artifacts and reference their savedPath, not inline data.
 """ + self.static_context_block
 
-    def _visible_capability_methods(self) -> Set[str]:
-        task_type = None
+    def _contract_task_type(self) -> str:
         contract = getattr(self, "worker_contract", None)
         if isinstance(contract, dict):
-            task_type = contract.get("task_type")
+            return str(contract.get("task_type") or "") or "general"
+        return "general"
+
+    def _visible_capability_methods(self) -> Set[str]:
         return filter_capability_methods_for_task_type(
             self.capability_methods,
-            task_type or "general",
+            self._contract_task_type(),
         )
 
     def _capture_artifacts(self, method: str, response: Any) -> Any:
@@ -1115,6 +1121,11 @@ class LeadAgent:
         self._current_step: int = 0
         self._cache_pressure_streak = 0
         self._forced_compaction_reason: Optional[str] = None
+        # Set True when THIS run's schema bootstrap could not (re)build the cache
+        # (no browser, empty capabilities, lock timeout, exception). A stale local
+        # cache may still exist on disk, but it cannot be trusted for the strict
+        # unknown-method check this run, so plan validation degrades to skip it.
+        self._schema_bootstrap_degraded: bool = False
 
     def refresh_strategy_bank(self) -> JsonDict:
         self.strategy_bank = load_strategy_bank(
@@ -1215,6 +1226,13 @@ class LeadAgent:
         ])
 
     def _schema_cache_status(self) -> tuple[SchemaCacheStatus, Set[str]]:
+        # If this run's bootstrap failed (no browser/empty caps/lock timeout/
+        # exception), a stale on-disk cache is not authoritative — it may predate
+        # a policy change (e.g. un-banning DOM.getSemanticTree) and would wrongly
+        # reject now-valid methods. Degrade so plan validation skips the strict
+        # unknown-method check, matching the bootstrap fallback log.
+        if self._schema_bootstrap_degraded:
+            return SchemaCacheStatus.NOT_LOADED, set()
         cache_dir = global_schema_cache_dir(self.runtime.harness.worktree_dir)
         cached_hash = read_cached_capability_hash(cache_dir)
         global_methods = read_schema_methods_from_dirs([
@@ -1227,6 +1245,9 @@ class LeadAgent:
         return SchemaCacheStatus.NOT_LOADED, set()
 
     async def _bootstrap_schema_cache(self) -> None:
+        # Assume healthy; any degraded exit below flips this so _schema_cache_status
+        # degrades plan validation instead of trusting a possibly-stale cache.
+        self._schema_bootstrap_degraded = False
         cache_dir = global_schema_cache_dir(self.runtime.harness.worktree_dir)
         schemas_dir = global_schemas_dir(self.runtime.harness.worktree_dir)
         tmp_schemas_dir = cache_dir / f"schemas.tmp.{os.getpid()}.{uuid.uuid4().hex}"
@@ -1267,8 +1288,12 @@ class LeadAgent:
                             "fallback": "validate_task_plan will skip unknown-method check",
                         },
                     )
+                    self._schema_bootstrap_degraded = True
                     return
-                digest = capability_hash(capabilities)
+                digest = capability_hash(
+                    capabilities,
+                    policy_fingerprint=_BLOCKED_CAPABILITIES,
+                )
                 cached_digest = read_cached_capability_hash(cache_dir)
                 cached_methods = read_schema_methods_from_dirs([schemas_dir])
                 if cached_digest == digest and cached_methods:
@@ -1304,6 +1329,7 @@ class LeadAgent:
                                 "fallback": "validate_task_plan will skip unknown-method check",
                             },
                         )
+                        self._schema_bootstrap_degraded = True
                         return
 
                     cached_digest = read_cached_capability_hash(cache_dir)
@@ -1337,6 +1363,7 @@ class LeadAgent:
                                 "fallback": "validate_task_plan will skip unknown-method check",
                             },
                         )
+                        self._schema_bootstrap_degraded = True
                         return
                     if schemas_dir.exists():
                         shutil.rmtree(schemas_dir, ignore_errors=True)
@@ -1358,6 +1385,7 @@ class LeadAgent:
                     )
         except Exception as exc:
             shutil.rmtree(tmp_schemas_dir, ignore_errors=True)
+            self._schema_bootstrap_degraded = True
             self.logger.write(
                 "schema.bootstrap.failed",
                 {
@@ -1482,9 +1510,6 @@ class LeadAgent:
                     self.runtime.harness.max_browser_agent_instances
                 ),
                 "max_browser_agents": self.runtime.harness.max_browser_agents,
-                "default_worker_concurrency": (
-                    self.runtime.harness.default_worker_concurrency
-                ),
                 "lead_max_steps": self.runtime.harness.lead_max_steps,
                 "worker_max_steps": self.runtime.harness.worker_max_steps,
             },
@@ -1860,7 +1885,6 @@ __all__ = [
     "compact_messages_if_needed",
     "exception_payload",
     "lead_agent_model_config",
-    "local_fs_jsonpath",
     "local_fs_read",
     "local_fs_search",
     "make_browser_event_logger",

@@ -17,8 +17,13 @@ def _response_data(result: JsonDict) -> JsonDict:
 AXTREE_ID_RE = re.compile(r"^\d+:-?\d+:-?\d+$")
 AXTREE_ID_TOKEN_RE = re.compile(r"\[(\d+:-?\d+:-?\d+)\]")
 AXTREE_ID_ANYWHERE_RE = re.compile(r"\b\d+:-?\d+:-?\d+\b")
+# Two live line formats: legacy indent-based (`  [30:553:553] link "TAAFT" #`)
+# and the current depth-prefixed one (`3 [3:426:426] link "TAAFT" # @10,0,106,94`)
+# where the leading integer is the node's depth in the ORIGINAL (unfiltered) AX
+# tree — folding noise nodes keeps original depth values, so gaps like 0→3 are
+# normal and consecutive depths are NOT contiguous.
 AXTREE_LINE_RE = re.compile(
-    r"^(?P<indent>\s*)\[(?P<id>\d+:-?\d+:-?\d+)\]\s+"
+    r"^(?:(?P<depth>\d+)\s+)?(?P<indent>\s*)\[(?P<id>\d+:-?\d+:-?\d+)\]\s+"
     r"(?P<role>[^\s\"]+)(?:\s+\"(?P<name>.*?)\")?(?P<rest>.*)$"
 )
 
@@ -105,6 +110,7 @@ def _axtree_nodes_from_lines(lines: List[str]) -> List[JsonDict]:
             continue
         rest = str(match.group("rest") or "")
         name = str(match.group("name") or "")
+        depth_prefix = match.group("depth")
         nodes.append({
             "id": match.group("id"),
             "role": match.group("role"),
@@ -112,7 +118,11 @@ def _axtree_nodes_from_lines(lines: List[str]) -> List[JsonDict]:
             "interactive": "#" in rest,
             "line": line,
             "lineNumber": index,
-            "depth": len(str(match.group("indent") or "")) // 2,
+            "depth": (
+                int(depth_prefix)
+                if depth_prefix is not None
+                else len(str(match.group("indent") or "")) // 2
+            ),
         })
     return nodes
 

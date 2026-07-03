@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 from harness.utils import JsonDict
 
 
-LOCAL_FS_TOOLS = {"local_fs_search", "local_fs_read", "local_fs_jsonpath"}
+LOCAL_FS_TOOLS = {"local_fs_search", "local_fs_read"}
 ARTIFACT_PROGRESS_TOOLS = {
     "record_extraction",
     "extract_dom_records",
@@ -20,7 +20,6 @@ ARTIFACT_PROGRESS_TOOLS = {
     "navigate_verified",
     "local_fs_search",
     "local_fs_read",
-    "local_fs_jsonpath",
     "System.describeAction",
     "System.describeEvent",
     "System.getCapabilities",
@@ -187,9 +186,11 @@ class ProgressAccountant:
                 "tool_was_executed": False,
                 "next_instruction": (
                     "Local file searches have not produced any record_extraction"
-                    " artifact. Return to browser extraction, call record_extraction"
-                    " with verified rows, or finalize with a blocker. Do not reuse"
-                    " stale AXTree ids or selectors from old offload files."
+                    " artifact. Return to browser extraction: call DOM.getAXTree"
+                    " for a fresh snapshot (this re-enables local file reads),"
+                    " call record_extraction with verified rows, or finalize with"
+                    " a blocker. Do not reuse stale AXTree ids or selectors from"
+                    " old offload files."
                 ),
             }
             self.interventions.append(intervention)
@@ -250,6 +251,16 @@ class ProgressAccountant:
             self.pending_intervention = None
             return
         self.turns_since_artifact_progress += 1
+        if tool_name == "DOM.getAXTree" and _tool_result_success(result):
+            # A fresh AXTree snapshot (and its offload file) makes follow-up
+            # local file reads legitimate perception work again. Without this
+            # reset the counter is sticky until record_extraction, which
+            # deadlocks offloaded pages: the model can fetch the tree but can
+            # never read the offload file it points to.
+            self.local_fs_without_extraction = 0
+            self.repeated_local_result_count = 0
+            self.last_local_result_signature = None
+            self.pending_intervention = None
         if tool_name in LOCAL_FS_TOOLS and artifact_count == 0:
             self.local_fs_without_extraction += 1
             self.local_fs_streak += 1

@@ -32,7 +32,6 @@ from harness.task_control import (
     repeated_phase_attempt_guard,
     validate_worker_artifacts,
 )
-from harness.strategy_bank import record_learned_strategy
 from harness.strategy_telemetry import append_strategy_attempt
 from harness.tool_policy import ALWAYS_FORBIDDEN_ABCP_METHODS
 from harness.templates import get_path
@@ -1416,15 +1415,6 @@ class BrowserAgentSpawner:
             worker_contract=worker_contract or {},
             result=result,
         )
-        learned_strategy = record_learned_strategy(
-            self.runtime.harness.strategy_bank_path,
-            worker_contract=worker_contract or {},
-            result=result,
-            phase=phase or {},
-            logger=self.logger,
-        )
-        if learned_strategy:
-            result["learnedStrategy"] = learned_strategy
         if slot.status == "running":
             self._mark_slot_idle(slot, worker_id=worker_id, result=result)
         self.logger.write("spawner.browser.result", trim_large_strings(result, 8000))

@@ -436,7 +436,7 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                 },
                 "event_type": {
                     "type": ["string", "null"],
-                    "description": "JSONL-only: restrict the search to lines whose `event` matches this string; pass null when not needed.",
+                    "description": "Only for .jsonl files: restrict the search to lines whose `type` matches this string. Pass null when not needed (searching .txt offloads, listing files, plain grep). The strings \"null\"/\"none\" are treated as null.",
                 },
                 "max_results": {"type": "integer", "minimum": 1, "maximum": 100},
                 "max_bytes_per_hit": {"type": "integer", "minimum": 200, "maximum": 20000},
@@ -461,30 +461,6 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                 "max_bytes": {"type": "integer", "minimum": 1000, "maximum": 200000},
             },
             "required": ["path", "line_offset", "line_limit", "max_bytes"],
-            "additionalProperties": False,
-        },
-        "local_fs_jsonpath": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "expr": {
-                    "type": "string",
-                    "description": "Supports $.a.b[0], [*], .*, ..field, ..*.",
-                },
-                "mode": {
-                    "type": "string",
-                    "enum": ["auto", "json", "jsonl"],
-                },
-                "max_nodes": {"type": "integer", "minimum": 1, "maximum": 500},
-                "max_bytes_per_node": {"type": "integer", "minimum": 100, "maximum": 50000},
-            },
-            "required": [
-                "path",
-                "expr",
-                "mode",
-                "max_nodes",
-                "max_bytes_per_node",
-            ],
             "additionalProperties": False,
         },
     }

@@ -137,10 +137,8 @@ Common harness options:
     "worker_max_steps": 30,
     "max_browser_agent_instances": 3,
     "max_browser_agents": 3,
-    "default_worker_concurrency": 3,
     "hitl_poll_interval_seconds": 2,
     "hitl_wait_timeout_seconds": 600,
-    "hitl_max_step_retries": 1,
     "worktree_dir": "worktree",
     "context_file": null
   }
@@ -152,10 +150,8 @@ Common harness options:
 - `worker_max_steps`: maximum BrowserAgent rounds.
 - `max_browser_agent_instances`: maximum live BrowserAgent slots kept in the reusable pool. Idle slots keep their ABCP connection and page registry. Normal new workers reuse only the connection and start from a fresh page; explicit continuations can reuse prior page candidates.
 - `max_browser_agents`: maximum concurrently running browser workers. Effective browser-slot concurrency is still bounded by `max_browser_agent_instances`.
-- `default_worker_concurrency`: default concurrency for batch browser/plan tools.
 - `hitl_poll_interval_seconds`: polling interval after `Hitl.requestPause`.
 - `hitl_wait_timeout_seconds`: maximum wait time for human intervention.
-- `hitl_max_step_retries`: retries for the current ABCP step after HITL resumes.
 - `worktree_dir`: root directory for run logs and artifacts.
 - `context_file`: optional static prompt context file. Keep it stable during a task, or it can reduce prompt-cache reuse.
 

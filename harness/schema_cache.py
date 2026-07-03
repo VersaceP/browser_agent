@@ -48,14 +48,28 @@ def capability_hash_path(cache_dir: Path) -> Path:
     return cache_dir / CAPABILITY_HASH_FILE
 
 
-def capability_hash(capabilities: Any) -> str:
+def capability_hash(capabilities: Any, *, policy_fingerprint: Any = None) -> str:
     caps = capabilities if isinstance(capabilities, list) else []
     normalized = sorted(
         [item for item in caps if isinstance(item, dict)],
         key=lambda item: str(item.get("method") or ""),
     )
+    # policy_fingerprint folds the harness-side method policy (e.g. the
+    # blocked-methods set) into the digest so that un-banning/re-banning a method
+    # changes the cache key even though the raw System.getCapabilities response is
+    # unchanged. Without it, a cache built while a method was blocked would never
+    # describe that method after it is un-banned -> Lead plan validation reports
+    # "unknown method". Omitted (None) keeps the legacy capability-only hash.
+    payload: Any = normalized
+    if policy_fingerprint is not None:
+        fingerprint = (
+            sorted(str(item) for item in policy_fingerprint)
+            if isinstance(policy_fingerprint, (set, frozenset, list, tuple))
+            else str(policy_fingerprint)
+        )
+        payload = {"capabilities": normalized, "policy": fingerprint}
     encoded = json.dumps(
-        normalized,
+        payload,
         ensure_ascii=False,
         sort_keys=True,
         default=str,

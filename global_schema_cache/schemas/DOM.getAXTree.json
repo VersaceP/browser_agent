@@ -1,20 +1,32 @@
 {
   "method": "DOM.getAXTree",
-  "description": "Retrieves a noise-reduced accessibility tree as the default page perception entry for locating interactive targets and canonical ids; do not use it when you specifically need raw DOM tag hierarchy or attributes.",
+  "description": "Retrieves a compact page map with structure, actionable targets, canonical ids, and compact layout hints; use it as the default page exploration entry before DOM reads or Input actions.",
   "params": {
     "pageId": {
       "type": "string",
       "format": "uuid",
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Page ID whose accessibility tree should be returned.",
+      "description": "Page ID whose compact page map should be returned.",
       "required": true
+    },
+    "id": {
+      "description": "Canonical element ID used to scope the AX tree to a specific subtree.",
+      "type": "string",
+      "pattern": "^\\d+:\\d+:\\d+$",
+      "required": false
+    },
+    "selector": {
+      "description": "CSS selector used to scope the AX tree to the first matching element in the main frame.",
+      "type": "string",
+      "minLength": 1,
+      "required": false
     },
     "purpose": {
       "type": "string",
-      "description": "Describe why you need accessibility semantics, e.g., locating a clickable target, checking enabled/checked state, or refreshing canonical element ids",
+      "description": "Describe why you need the current page map, e.g., understanding page structure, locating an actionable target, checking enabled/checked/layout state, or refreshing canonical element ids",
       "required": true
     }
   },
   "requiresPurpose": true,
-  "purposeHint": "Describe why you need accessibility semantics, e.g., locating a clickable target, checking enabled/checked state, or refreshing canonical element ids"
+  "purposeHint": "Describe why you need the current page map, e.g., understanding page structure, locating an actionable target, checking enabled/checked/layout state, or refreshing canonical element ids"
 }

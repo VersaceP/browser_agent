@@ -29,7 +29,7 @@ from harness.extraction_artifacts import (
 )
 from harness.hitl import wait_for_hitl_resume
 from harness.lifecycle import LifecycleContext, lifecycle_for
-from harness.local_fs import local_fs_jsonpath, local_fs_read, local_fs_search
+from harness.local_fs import local_fs_read, local_fs_search
 from harness.observation.overlay_actions import (
     compute_backdrop_point,
     backdrop_point_is_safe,
@@ -55,7 +55,11 @@ from harness.offload import offload_large_tool_result
 from harness.progress import extraction_artifact_count
 from harness.render_recovery import build_render_recovery_runner
 from harness.task_control import phase_prior_artifact_paths, validate_worker_artifacts
-from harness.tool_policy import disabled_reason_for_method, mask_params
+from harness.tool_policy import (
+    disabled_reason_for_method,
+    hidden_harness_tools_for_task_type,
+    mask_params,
+)
 from harness.tools.loop_guard import check_tool_call_loop
 from harness.tools.parsers import (
     attach_method_schema,
@@ -524,28 +528,6 @@ async def _browser_local_fs_read(ctx: ToolContext) -> JsonDict:
                 ctx.agent.runtime.harness.local_fs_max_read_bytes,
             ) or ctx.agent.runtime.harness.local_fs_max_read_bytes,
             ctx.agent.runtime.harness.local_fs_max_read_bytes,
-        ),
-    )
-
-
-@BROWSER_TOOLS.register(
-    name="local_fs_jsonpath",
-    description="Read-only read of a JSON/JSONL file inside the current task worktree, with a JSONPath subset for node extraction.",
-    input_schema=_browser_schema_for("local_fs_jsonpath"),
-    contract_check=True,
-    progress_check=True,
-    trace_type="local_fs_jsonpath",
-)
-async def _browser_local_fs_jsonpath(ctx: ToolContext) -> JsonDict:
-    tool_input = ctx.tool_input
-    return local_fs_jsonpath(
-        ctx.agent.logger,
-        path=str(tool_input.get("path") or ""),
-        expr=str(tool_input.get("expr") or "$"),
-        mode=str(tool_input.get("mode") or "auto"),
-        max_nodes=optional_int(tool_input.get("max_nodes"), 50) or 50,
-        max_bytes_per_node=(
-            optional_int(tool_input.get("max_bytes_per_node"), 1000) or 1000
         ),
     )
 
@@ -3958,5 +3940,13 @@ from .composites.fill_field_verified import (
     _fill_field_verified,
 )
 
-def build_browser_agent_tool_specs(capability_methods: Set[str]) -> List[JsonDict]:
-    return BROWSER_TOOLS.tool_specs(capability_methods)
+def build_browser_agent_tool_specs(
+    capability_methods: Set[str],
+    task_type: Any = "general",
+) -> List[JsonDict]:
+    hidden = hidden_harness_tools_for_task_type(task_type)
+    return [
+        spec
+        for spec in BROWSER_TOOLS.tool_specs(capability_methods)
+        if spec.get("name") not in hidden
+    ]

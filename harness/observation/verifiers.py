@@ -476,11 +476,31 @@ COLLECT_ROWS_JS = r"""
     return { error: 'invalid selector: ' + String(err && err.message || err) };
   }
   const norm = (v, max = 600) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim().slice(0, max);
+  // Site-agnostic lazy-image resolver (kept in sync with extract_dom_records):
+  // many sites keep the real URL in data-src/srcset until the <img> scrolls
+  // into view and only put a 1x1/blank placeholder on .src.
+  const isPh = (u) => !u
+    || /^data:image\/(gif|svg)/i.test(u)
+    || /(blank|placeholder|spacer|loading|transparent|grey|gray|1x1|s\.gif)\.(gif|png|svg|webp)/i.test(u);
+  const absll = (u) => { try { if (u && !/^(https?:|data:|\/\/)/i.test(u)) u = new URL(u, location.href).href; } catch (e) {} return /^\/\//.test(u) ? location.protocol + u : u; };
+  const imgSrc = (img) => {
+    if (!img) return '';
+    let u = img.currentSrc || img.getAttribute('src') || '';
+    if (isPh(u)) u = img.getAttribute('data-src') || img.getAttribute('data-lazy-src')
+      || img.getAttribute('data-original') || img.getAttribute('data-ks-lazyload')
+      || img.getAttribute('data-url') || img.getAttribute('data-image') || u;
+    if (isPh(u)) { const ss = img.getAttribute('srcset') || img.getAttribute('data-srcset') || ''; if (ss) { const first = ss.split(',')[0].trim().split(/\s+/)[0]; if (first) u = first; } }
+    return absll(u) || '';
+  };
   const read = (el, spec) => {
     spec = String(spec || 'text');
     if (spec === 'text' || spec === 'textContent') return norm(el.innerText || el.textContent || '');
     if (spec === 'href') return el.href || (el.querySelector && el.querySelector('a[href]') ? el.querySelector('a[href]').href : '') || (el.closest && el.closest('a[href]') ? el.closest('a[href]').href : '');
-    if (spec === 'src') return el.src || (el.querySelector && el.querySelector('img[src]') ? el.querySelector('img[src]').src : '') || '';
+    if (spec === 'src') {
+      const img = (el.matches && el.matches('img')) ? el : (el.querySelector && el.querySelector('img'));
+      if (img) return imgSrc(img);
+      return absll(el.currentSrc || (el.getAttribute && el.getAttribute('src')) || '') || '';
+    }
     if (spec === 'imgAlt') { const img = (el.matches && el.matches('img')) ? el : (el.querySelector && el.querySelector('img')); return img ? norm(img.getAttribute('alt') || img.alt || '') : ''; }
     if (spec.startsWith('attr:')) return norm(el.getAttribute(spec.slice(5)) || '');
     return norm(el.innerText || el.textContent || '');

@@ -105,9 +105,14 @@ Input action.
 ## Semantic Perception
 
 Use `DOM.getAXTree` as the primary perception tool. It exposes text, roles,
-states, controls, and canonical element ids. Do not call `DOM.getSemanticTree`;
-the harness disables it because current ABCP builds have reproduced renderer
-crashes after that call.
+states, controls, and canonical element ids. Use `DOM.getSemanticTree` only for
+local diagnostics when AXTree is insufficient and you need tag hierarchy,
+complete local bounds, Shadow DOM, or selector debugging; it is heavy (~3.65x
+AXTree) and its results are offloaded, so prefer AXTree + focused
+`DOM.getText`/`DOM.getAttribute` for routine perception. Both
+`DOM.getAXTree` and `DOM.getSemanticTree` return canonical ids of the form
+`frameId:axNodeId:domNodeId` (three segments) — copy them verbatim and never
+truncate to two segments.
 
 Selector priority: canonical AXTree id > semantic attributes (`aria-label`,
 `name`) > stable CSS selector. Avoid dynamic hash classes.
@@ -169,8 +174,8 @@ Do not use JavaScript for ordinary visible text or attributes that
 
 Large DOM, text, attribute, screenshot, and tool results are auto-offloaded
 under the task worktree. In-context payloads keep `savedPath`, `outline`,
-`format`, and `query_with`. Follow `query_with` with `local_fs_search`,
-`local_fs_read`, or `local_fs_jsonpath` to inspect offloaded evidence.
+`format`, and `query_with`. Follow `query_with` with `local_fs_search` or
+`local_fs_read` to inspect offloaded evidence.
 
 ## HITL and Visual Checks
 

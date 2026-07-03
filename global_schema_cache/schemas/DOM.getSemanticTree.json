@@ -1,0 +1,47 @@
+{
+  "method": "DOM.getSemanticTree",
+  "description": "Retrieves a local native semantic DOM tree for diagnostics such as tag hierarchy, bounds, Shadow DOM, and selector debugging; use DOM.getAXTree as the default page map first.",
+  "params": {
+    "pageId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Page ID whose DOM structure should be inspected.",
+      "required": true
+    },
+    "id": {
+      "description": "Canonical element ID to inspect from DOM.getAXTree.",
+      "type": "string",
+      "pattern": "^\\d+:\\d+:\\d+$",
+      "required": false
+    },
+    "selector": {
+      "description": "CSS selector used to anchor the semantic tree lookup to the first matching element.",
+      "type": "string",
+      "minLength": 1,
+      "required": false
+    },
+    "elementId": {
+      "description": "Raw DOM element ID to anchor the semantic tree lookup.",
+      "type": "string",
+      "required": false
+    },
+    "includeShadowDom": {
+      "description": "Include Shadow DOM content in the returned tree when true.",
+      "type": "boolean",
+      "required": false
+    },
+    "filterNoise": {
+      "description": "Filter low-signal nodes from the returned tree when true.",
+      "type": "boolean",
+      "required": false
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why raw local DOM structure is needed, e.g., diagnosing a selector, inspecting Shadow DOM, bounds, or nested layout after DOM.getAXTree was insufficient",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why raw local DOM structure is needed, e.g., diagnosing a selector, inspecting Shadow DOM, bounds, or nested layout after DOM.getAXTree was insufficient"
+}

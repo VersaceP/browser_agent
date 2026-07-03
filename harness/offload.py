@@ -46,7 +46,7 @@ def write_offloaded_blob(path: Path, field: str, blob: Any) -> Tuple[str, str, A
         json.dumps(blob, ensure_ascii=False, indent=2, default=str),
         encoding="utf-8",
     )
-    return "json_tree", "local_fs_jsonpath", outline_value(blob)
+    return "json_tree", "local_fs_read", outline_value(blob)
 
 
 def outline_large_field(value: Any, max_bytes: int = GENERIC_TOOL_RESULT_KEEP_FIELD_BYTES) -> Any:
@@ -172,7 +172,7 @@ def offload_large_tool_result(
         "_offloaded": True,
         "savedPath": str(path.resolve()),
         "format": "json_response",
-        "query_with": "local_fs_jsonpath",
+        "query_with": "local_fs_read",
         "originalBytes": byte_size,
         "byteSize": byte_size,
         "outline": outline_value(result),
@@ -205,7 +205,7 @@ def offload_large_tool_result(
             "savedPath": str(path.resolve()),
             "relativePath": relative_path,
             "byteSize": byte_size,
-            "queryWith": "local_fs_jsonpath",
+            "queryWith": "local_fs_read",
         },
     )
     return stub
@@ -249,7 +249,7 @@ def offload_large_response_fields(
             "_offloaded": True,
             "savedPath": str(path.resolve()),
             "format": "json_tree",
-            "query_with": "local_fs_jsonpath",
+            "query_with": "local_fs_read",
             "originalBytes": byte_size,
             "byteSize": byte_size,
             "nodeCount": count_json_nodes(data),

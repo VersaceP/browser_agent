@@ -200,14 +200,6 @@ class ConsoleProgressReporter:
         return f"{name} -> {method} ({'; '.join(details)})"
 
     def _format_harness_tool_call(self, name: str, raw_input: Dict[str, Any]) -> str:
-        if name == "local_fs_jsonpath":
-            details = [
-                f"file={self._short_path(raw_input.get('path'))}",
-                f"expr={self._short_text(raw_input.get('expr') or '$', 70)}",
-            ]
-            if raw_input.get("max_nodes") is not None:
-                details.append(f"nodes={raw_input.get('max_nodes')}")
-            return f"{name} ({'; '.join(details)})"
         if name == "local_fs_read":
             return (
                 f"{name} (file={self._short_path(raw_input.get('path'))}; "

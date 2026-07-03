@@ -137,10 +137,8 @@ Anthropic 示例：
     "worker_max_steps": 30,
     "max_browser_agent_instances": 3,
     "max_browser_agents": 3,
-    "default_worker_concurrency": 3,
     "hitl_poll_interval_seconds": 2,
     "hitl_wait_timeout_seconds": 600,
-    "hitl_max_step_retries": 1,
     "worktree_dir": "worktree",
     "context_file": null
   }
@@ -152,10 +150,8 @@ Anthropic 示例：
 - `worker_max_steps`: BrowserAgent 最大执行轮数。
 - `max_browser_agent_instances`: 可复用池里最多保留的长期存活 BrowserAgent slot 数。idle slot 会保留 ABCP 连接和页面 registry。普通新 worker 只复用连接并从新页面开始；显式 continuation 才会复用旧页面候选。
 - `max_browser_agents`: 同时运行的 browser worker 上限；实际 browser slot 并发仍受 `max_browser_agent_instances` 限制。
-- `default_worker_concurrency`: batch browser/plan 工具的默认并发数。
 - `hitl_poll_interval_seconds`: `Hitl.requestPause` 后轮询恢复状态的间隔。
 - `hitl_wait_timeout_seconds`: 等待人工介入的最长时间。
-- `hitl_max_step_retries`: HITL 恢复后重试当前 ABCP step 的次数。
 - `worktree_dir`: 运行日志和 artifacts 的根目录。
 - `context_file`: 可选静态 prompt 上下文文件。任务期间应保持稳定，否则会降低 prompt cache 复用率。
 

@@ -60,10 +60,8 @@ class HarnessConfig:
     worker_max_steps: int = 40
     max_browser_agent_instances: int = 3
     max_browser_agents: int = 3
-    default_worker_concurrency: int = 3
     worktree_dir: str = "worktree"
     runs_dir: str = "runs"
-    artifacts_dir: str = "artifacts"
     context_file: Optional[str] = None
     strategy_bank_path: str = "strategy_bank/strategy_bank.json"
     memory_context: str = (
@@ -71,7 +69,6 @@ class HarnessConfig:
         "Trust the cached System.describeAction schemas (global_schema_cache/schemas/<Method>.json) "
         "as the source of truth for parameters; descriptions live in System.getCapabilities."
     )
-    screenshot_max_base64_chars: int = 0
     max_observation_chars: int = 24000
     offload_threshold_bytes: int = DEFAULT_OFFLOAD_THRESHOLD_BYTES
     tool_result_offload_threshold_bytes: int = (
@@ -112,9 +109,12 @@ class HarnessConfig:
     #                text signals have false positives (a cookies article hits
     #                "we use cookies") and auto-clicking them is unacceptable.
     auto_intercept: str = "p0p1"
-    # DOM.getSemanticTree usage policy (Phase B). It stays forbidden on the MODEL
-    # tool surface always (3.65x heavier than AXTree, no href/name/aria, and a
-    # historical renderer-crash ban); this flag only governs HARNESS-INTERNAL use:
+    # DOM.getSemanticTree usage policy (Phase B). The MODEL may now call it
+    # directly as a diagnostic (un-banned in tool_policy; the model prompt limits
+    # it to local diagnostics when AXTree is insufficient). It is still 3.65x
+    # heavier than AXTree with no href/name/aria, so its results are offloaded.
+    # This flag is independent of the model surface and only governs the
+    # HARNESS-INTERNAL auto-digest path:
     #   "off"      -> never used, even internally (current safe default)
     #   "internal" -> harness may make a one-shot, render_recovery-wrapped call to
     #                 derive a tiny structure digest (scroll containers via
@@ -141,24 +141,14 @@ class HarnessConfig:
             max_browser_agents=int(
                 data.get("max_browser_agents", cls.max_browser_agents)
             ),
-            default_worker_concurrency=int(
-                data.get(
-                    "default_worker_concurrency",
-                    cls.default_worker_concurrency,
-                )
-            ),
             worktree_dir=data.get("worktree_dir", cls.worktree_dir),
             runs_dir=data.get("runs_dir", cls.runs_dir),
-            artifacts_dir=data.get("artifacts_dir", cls.artifacts_dir),
             context_file=data.get("context_file"),
             strategy_bank_path=data.get(
                 "strategy_bank_path",
                 cls.strategy_bank_path,
             ),
             memory_context=data.get("memory_context", cls.memory_context),
-            screenshot_max_base64_chars=int(
-                data.get("screenshot_max_base64_chars", cls.screenshot_max_base64_chars)
-            ),
             max_observation_chars=int(
                 data.get("max_observation_chars", cls.max_observation_chars)
             ),
@@ -230,9 +220,6 @@ class HarnessConfig:
                     "hitl_wait_timeout_seconds",
                     cls.hitl_wait_timeout_seconds,
                 )
-            ),
-            hitl_max_step_retries=int(
-                data.get("hitl_max_step_retries", cls.hitl_max_step_retries)
             ),
             hitl_no_repause_cooldown_seconds=float(
                 data.get(
