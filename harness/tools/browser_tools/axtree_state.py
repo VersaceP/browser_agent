@@ -1,7 +1,7 @@
 """AXTree cache, stale-id guard, and browser-side rematch bookkeeping."""
 
 import re
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from harness.utils import JsonDict
 
@@ -26,6 +26,32 @@ AXTREE_LINE_RE = re.compile(
     r"^(?:(?P<depth>\d+)\s+)?(?P<indent>\s*)\[(?P<id>\d+:-?\d+:-?\d+)\]\s+"
     r"(?P<role>[^\s\"]+)(?:\s+\"(?P<name>.*?)\")?(?P<rest>.*)$"
 )
+
+# Compact layout tokens the panel appends after the accessible name, before the
+# `#` actionable marker / `@x,y,w,h` viewport rect (px space pending live probe;
+# see abcp-panel-quirks #11). Whitelisted so unknown future tokens are ignored;
+# `zN` encodes stacking order.
+AXTREE_KNOWN_FLAGS = frozenset({"hidden", "off", "blocked", "scroll", "sticky", "clip"})
+AXTREE_Z_FLAG_RE = re.compile(r"^z-?\d+$")
+AXTREE_RECT_RE = re.compile(r"@(-?\d+),(-?\d+),(\d+),(\d+)")
+
+
+def _axtree_flags_and_rect(rest: str) -> Tuple[List[str], Optional[JsonDict]]:
+    """Parse layout flags and the viewport rect out of a line's tail (the text
+    after the quoted accessible name). Legacy lines without flags/rect yield
+    ([], None)."""
+    match = AXTREE_RECT_RE.search(rest)
+    rect: Optional[JsonDict] = None
+    if match:
+        x, y, w, h = (int(group) for group in match.groups())
+        rect = {"x": x, "y": y, "w": w, "h": h}
+    head = rest[: match.start()] if match else rest
+    flags = [
+        token
+        for token in head.replace("#", " ").split()
+        if token in AXTREE_KNOWN_FLAGS or AXTREE_Z_FLAG_RE.match(token)
+    ]
+    return flags, rect
 
 AXTREE_INVALIDATING_METHODS = {
     "Page.create",
@@ -111,11 +137,14 @@ def _axtree_nodes_from_lines(lines: List[str]) -> List[JsonDict]:
         rest = str(match.group("rest") or "")
         name = str(match.group("name") or "")
         depth_prefix = match.group("depth")
+        flags, rect = _axtree_flags_and_rect(rest)
         nodes.append({
             "id": match.group("id"),
             "role": match.group("role"),
             "name": name,
             "interactive": "#" in rest,
+            "flags": flags,
+            "rect": rect,
             "line": line,
             "lineNumber": index,
             "depth": (

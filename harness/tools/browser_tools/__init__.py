@@ -8,6 +8,7 @@ import copy
 import re
 import sys
 import time
+import uuid
 from functools import lru_cache
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
@@ -173,6 +174,7 @@ def build_browser_tool_dispatcher(agent: Any) -> BrowserToolDispatcher:
             effective_call,
             result,
         )
+        result = await _maybe_reality_check(agent, effective_call, result, step)
         return result, should_stop
 
     return dispatch
@@ -191,9 +193,18 @@ async def execute_browser_tool(agent: Any, tool_call: JsonDict, step: int) -> Tu
 
     if action is not None and action.terminal:
         result = await action.handler(ctx)
-        return result, True
+        # A terminal handler may soft-reject its call (tool_was_executed False)
+        # to bounce it back to the model with guidance instead of terminating —
+        # e.g. final_answer declaring target_absent without any visual reality
+        # check on record. The rejection carries next_instruction; the loop
+        # continues so the model can comply and re-finalize.
+        should_stop = not (
+            isinstance(result, dict)
+            and result.get("tool_was_executed") is False
+        )
+        return result, should_stop
 
-    progress_gate = _check_extraction_progress_gate(agent, name)
+    progress_gate = _call_extraction_progress_gate(agent, name, tool_input)
     if progress_gate is not None:
         agent.trace.append({"type": "progress_gate", "result": progress_gate})
         return progress_gate, False
@@ -240,7 +251,7 @@ async def execute_browser_tool(agent: Any, tool_call: JsonDict, step: int) -> Tu
             return contract_result, False
 
     if action.progress_check:
-        progress_result = _check_progress_before(agent, name)
+        progress_result = _check_progress_before(agent, name, tool_input, step)
         if progress_result is not None:
             agent.trace.append({"type": "progress_intervention", "result": progress_result})
             return progress_result, False
@@ -272,6 +283,233 @@ async def _browser_call(ctx: ToolContext) -> JsonDict:
         ctx.step,
     )
     return result
+
+
+@BROWSER_TOOLS.register(
+    name="execute_selected_skill",
+    description=(
+        "Execute the currently selected workflow skill's frozen recipe without"
+        " copying, reading, or reconstructing workflow.json steps. Accepts one"
+        " variables object or multiple rows; batch rows run strictly serially"
+        " on the supplied warm page. This tool only runs the selected recipe and"
+        " returns structured rows; persist accepted data with record_extraction."
+    ),
+    input_schema=_browser_schema_for("execute_selected_skill"),
+    contract_check=True,
+)
+async def _browser_execute_selected_skill(ctx: ToolContext) -> JsonDict:
+    from harness.skill.contract import skill_selection_declined
+    from harness.skill.dispatch import (
+        _align_row_fields_to_expected,
+        _expected_fields_of,
+        _provenance_evidence_requirements,
+        _run_with_transient_retry,
+        build_extraction_row,
+        page_binding_mismatch,
+        required_filled,
+    )
+    from harness.skill.pause import classify_run_for_hitl
+    from harness.skill.registry import SkillRegistry
+    from harness.skill.workflow import check_success_contract
+
+    agent = ctx.agent
+    contract = getattr(agent, "worker_contract", None)
+    contract = contract if isinstance(contract, dict) else {}
+    repair_manifest = contract.get("_repair_manifest")
+    if (
+        isinstance(repair_manifest, dict)
+        and not str(repair_manifest.get("disabledReason") or "").strip()
+    ):
+        return {
+            "status": "rejected",
+            "error": (
+                "A field-level repair manifest is active. Preserve its trusted"
+                " baseline and patch only the listed fields; do not re-run the"
+                " full selected workflow."
+            ),
+            "tool_was_executed": False,
+        }
+    if bool(getattr(agent, "_selected_skill_workflow_attempted", False)):
+        return {
+            "status": "rejected",
+            "error": (
+                "The selected frozen workflow already ran in this worker."
+                " Follow the existing failure/partial handoff and re-observe"
+                " only the unresolved target instead of replaying the recipe."
+            ),
+            "tool_was_executed": False,
+        }
+    if skill_selection_declined(contract):
+        return {
+            "status": "rejected",
+            "error": "The worker contract explicitly declined skill execution.",
+            "tool_was_executed": False,
+        }
+    skill_id = str(contract.get("skill_id") or "").strip()
+    if not skill_id:
+        selection = contract.get("skill_selection")
+        if isinstance(selection, dict) and selection.get("use_skill") is not False:
+            skill_id = str(selection.get("skill_id") or "").strip()
+    registry = SkillRegistry.load()
+    skill = registry.get(skill_id) if skill_id else None
+    if skill is None or not skill.has_workflow:
+        return {
+            "status": "rejected",
+            "error": "No selected workflow skill is available for this worker.",
+            "tool_was_executed": False,
+        }
+
+    single = ctx.tool_input.get("variables")
+    single = single if isinstance(single, dict) else {}
+    batch = ctx.tool_input.get("rows")
+    batch = [row for row in batch if isinstance(row, dict)] if isinstance(batch, list) else []
+    if single and batch:
+        return {
+            "status": "invalid_input",
+            "error": "Provide variables or rows, not both.",
+            "tool_was_executed": False,
+        }
+    page_id = str(ctx.tool_input.get("pageId") or "").strip()
+    fleet_id = str(ctx.tool_input.get("fleetId") or "").strip()
+    if not page_id:
+        return {
+            "status": "invalid_input",
+            "error": "pageId must be a live page handle from Page.getState/Page.list.",
+            "tool_was_executed": False,
+        }
+
+    evidence_fields = set(
+        _provenance_evidence_requirements(contract.get("validators")).values()
+    )
+    passthrough = {
+        str(value)
+        for value in (skill.row_contract.get("passthrough_variables") or [])
+        if str(value).strip()
+    }
+    allowed = set(skill.variable_template) | passthrough | evidence_fields
+    base_input = contract.get("skill_variables")
+    base_input = base_input if isinstance(base_input, dict) else {}
+    inputs = batch if batch else [single]
+    effective_inputs: List[JsonDict] = []
+    for row in inputs:
+        effective = dict(base_input)
+        effective.update(row)
+        unknown = sorted(str(key) for key in effective if str(key) not in allowed)
+        if unknown:
+            return {
+                "status": "invalid_input",
+                "error": "Input contains fields outside the selected skill row contract.",
+                "unknownFields": unknown,
+                "allowedFields": sorted(allowed),
+                "tool_was_executed": False,
+            }
+        effective_inputs.append(effective)
+
+    output_rows: List[JsonDict] = []
+    runs: List[JsonDict] = []
+    for index, row_input in enumerate(effective_inputs):
+        variables = {
+            key: row_input.get(key, default)
+            for key, default in skill.variable_template.items()
+        }
+        if not required_filled(skill, variables):
+            result = {
+                "status": "partial" if output_rows else "invalid_input",
+                "skill": skill.skill_id,
+                "completedRows": len(output_rows),
+                "failedRow": index,
+                "error": "A workflow-referenced variable is empty.",
+                "rows": output_rows,
+                "tool_was_executed": bool(output_rows),
+            }
+            return result
+        run_id = f"skill-tool-{skill.skill_id}-{uuid.uuid4().hex[:8]}"
+        run_result, observed_signal = await _run_with_transient_retry(
+            agent,
+            skill,
+            run_id=run_id,
+            page_id=page_id,
+            fleet_id=fleet_id,
+            variables=variables,
+            event_prefix="skill.selected_workflow",
+        )
+        hitl = classify_run_for_hitl(run_result, observed_signal)
+        verdict = check_success_contract(skill, run_result)
+        mismatch = page_binding_mismatch(skill, run_result, variables)
+        run_summary: JsonDict = {
+            "index": index,
+            "runId": run_id,
+            "succeeded": bool(run_result.get("succeeded")),
+            "failedChecks": verdict.get("failed_checks") or [],
+        }
+        if hitl is not None:
+            run_summary["hitl"] = hitl
+        if mismatch is not None:
+            run_summary["pageBinding"] = mismatch
+        runs.append(run_summary)
+        if (
+            not run_result.get("succeeded")
+            or not verdict.get("ok")
+            or hitl is not None
+            or mismatch is not None
+        ):
+            result = {
+                "status": "partial" if output_rows else "workflow_failed",
+                "skill": skill.skill_id,
+                "completedRows": len(output_rows),
+                "failedRow": index,
+                "rows": output_rows,
+                "runs": runs,
+                "next_instruction": (
+                    "Use the returned completed rows as observed data. Re-observe"
+                    " only the failed row/fields, then persist one final artifact."
+                ),
+            }
+            _record_selected_skill_tool_trace(agent, result)
+            return result
+        built = build_extraction_row(
+            skill,
+            run_result,
+            input_variables=dict(row_input),
+        )
+        output_rows.append(_align_row_fields_to_expected(
+            built, _expected_fields_of(contract),
+        ))
+
+    result = {
+        "status": "done",
+        "skill": skill.skill_id,
+        "completedRows": len(output_rows),
+        "rows": output_rows,
+        "runs": runs,
+        "next_instruction": (
+            "Review the structured rows against the worker contract, add any"
+            " evidence the frozen workflow cannot produce, then call"
+            " record_extraction. Do not re-run the same workflow manually."
+        ),
+    }
+    _record_selected_skill_tool_trace(agent, result)
+    return result
+
+
+def _record_selected_skill_tool_trace(agent: Any, result: JsonDict) -> None:
+    summary = {
+        "skill": result.get("skill"),
+        "status": result.get("status"),
+        "completedRows": result.get("completedRows"),
+        "failedRow": result.get("failedRow"),
+        "runIds": [
+            run.get("runId")
+            for run in (result.get("runs") or [])
+            if isinstance(run, dict)
+        ],
+    }
+    logger = getattr(agent, "logger", None)
+    if logger is not None and hasattr(logger, "write"):
+        logger.write("skill.selected_workflow.executed", summary)
+    trace = getattr(agent, "trace", None)
+    if isinstance(trace, list):
+        trace.append({"type": "execute_selected_skill", "result": summary})
 
 
 @BROWSER_TOOLS.register(
@@ -445,6 +683,16 @@ async def _browser_visual_verify(ctx: ToolContext) -> JsonDict:
 )
 async def _browser_final_answer(ctx: ToolContext) -> JsonDict:
     answer = str(ctx.tool_input.get("answer", "")).strip()
+    rejection = _final_answer_reality_check_rejection(ctx.agent, answer)
+    if rejection is not None:
+        ctx.agent.logger.write("final_answer.reality_check_rejected", {
+            "status": ctx.tool_input.get("status"),
+        })
+        ctx.agent.trace.append({
+            "type": "final_answer_rejected",
+            "result": rejection,
+        })
+        return rejection
     result = {
         "status": ctx.tool_input.get("status", "done"),
         "answer": answer,
@@ -474,7 +722,7 @@ async def _browser_final_answer(ctx: ToolContext) -> JsonDict:
 )
 async def _browser_record_extraction(ctx: ToolContext) -> JsonDict:
     result = _record_extraction(ctx.agent, ctx.tool_input)
-    if result.get("status") == "done":
+    if _record_extraction_persisted(result):
         ctx.agent.pending_unrecorded_extraction = None
     return result
 
@@ -485,7 +733,11 @@ async def _browser_record_extraction(ctx: ToolContext) -> JsonDict:
         "Search the current DOM.getAXTree snapshot by role/name/text and return"
         " complete canonical AXTree ids with line context. Use this instead of"
         " grepping offloaded AXTree text when locating an element in a large"
-        " accessibility tree. It is read-only and requires a fresh current"
+        " accessibility tree. Matches include layout `flags`"
+        " (hidden/off/blocked/scroll/sticky/clip/zN) and the `rect` viewport"
+        " box when the line carries them — avoid hidden/blocked targets; use"
+        " `rect` for spatial reasoning only, not for deriving click coordinates"
+        " (act on the id). It is read-only and requires a fresh current"
         " DOM.getAXTree snapshot."
     ),
     input_schema=_browser_schema_for("find_in_axtree"),
@@ -597,7 +849,7 @@ async def _execute_browser_capability_tool(
         attach_method_schema(result, method, agent.method_schemas)
         agent.logger.write("browser.call.params_error", result)
         _observe_progress_after(agent, method or "browser_call.params_error", result)
-        progress_result = _check_progress_before(agent, method or "browser_call")
+        progress_result = _check_progress_before(agent, method or "browser_call", None, step)
         if progress_result is not None:
             agent.trace.append({"type": "progress_intervention", "result": progress_result})
             return progress_result, False
@@ -613,7 +865,7 @@ async def _execute_browser_capability_tool(
         attach_method_schema(result, method, agent.method_schemas)
         agent.logger.write("browser.call.rejected", result)
         _observe_progress_after(agent, method or "browser_call_rejected", result)
-        progress_result = _check_progress_before(agent, method or "browser_call")
+        progress_result = _check_progress_before(agent, method or "browser_call", None, step)
         if progress_result is not None:
             agent.trace.append({"type": "progress_intervention", "result": progress_result})
             return progress_result, False
@@ -626,12 +878,23 @@ async def _execute_browser_capability_tool(
         attach_method_schema(contract_result, method, agent.method_schemas)
         agent.logger.write("browser.call.contract_violation", contract_result)
         _observe_progress_after(agent, method or "browser_call.contract_violation", contract_result)
-        progress_result = _check_progress_before(agent, method or "browser_call")
+        progress_result = _check_progress_before(agent, method or "browser_call", None, step)
         if progress_result is not None:
             agent.trace.append({"type": "progress_intervention", "result": progress_result})
             return progress_result, False
         agent.trace.append({"type": "contract_violation", "result": contract_result})
         return contract_result, False
+
+    memory_scope_guard = _check_cross_task_memory_scope(agent, method, params)
+    if memory_scope_guard is not None:
+        agent.logger.write(
+            "browser.call.cross_task_memory_rejected", memory_scope_guard
+        )
+        agent.trace.append({
+            "type": "cross_task_memory_guard",
+            "result": memory_scope_guard,
+        })
+        return memory_scope_guard, False
 
     screenshot_guard = _check_screenshot_misuse(method, params, reason)
     if screenshot_guard is not None:
@@ -647,7 +910,7 @@ async def _execute_browser_capability_tool(
         attach_method_schema(target_param_guard, method, agent.method_schemas)
         agent.logger.write("browser.call.params_error", target_param_guard)
         _observe_progress_after(agent, method or "browser_call.params_error", target_param_guard)
-        progress_result = _check_progress_before(agent, method or "browser_call")
+        progress_result = _check_progress_before(agent, method or "browser_call", None, step)
         if progress_result is not None:
             agent.trace.append({"type": "progress_intervention", "result": progress_result})
             return progress_result, False
@@ -667,7 +930,7 @@ async def _execute_browser_capability_tool(
         agent.trace.append({"type": "stale_axtree_target", "result": stale_target})
         return stale_target, False
 
-    progress_result = _check_progress_before(agent, method)
+    progress_result = _check_progress_before(agent, method, None, step)
     if progress_result is not None:
         agent.trace.append({"type": "progress_intervention", "result": progress_result})
         return progress_result, False
@@ -1024,7 +1287,7 @@ async def _extract_dom_records(agent: Any, tool_input: JsonDict, step: int) -> J
             },
         )
         result["recordExtraction"] = record_result
-        if record_result.get("status") == "done":
+        if _record_extraction_persisted(record_result):
             agent.pending_unrecorded_extraction = None
     elif rows:
         agent.pending_unrecorded_extraction = {
@@ -1147,7 +1410,7 @@ async def _eval_js_json_tool(agent: Any, tool_input: JsonDict, step: int) -> Jso
             },
         )
         result["recordExtraction"] = record_result
-        if record_result.get("status") == "done":
+        if _record_extraction_persisted(record_result):
             agent.pending_unrecorded_extraction = None
     elif rows:
         agent.pending_unrecorded_extraction = {
@@ -1304,7 +1567,7 @@ def _find_in_axtree(agent: Any, tool_input: JsonDict) -> JsonDict:
             start = max(0, line_number - 2)
             end = min(len(lines), line_number + 1)
             context = "\n".join(lines[start:end])
-        matches.append({
+        entry: JsonDict = {
             "id": node_id,
             "role": node.get("role") or "",
             "name": name,
@@ -1312,7 +1575,14 @@ def _find_in_axtree(agent: Any, tool_input: JsonDict) -> JsonDict:
             "lineNumber": line_number or None,
             "line": raw_line,
             "context": context,
-        })
+        }
+        node_flags = node.get("flags") or []
+        if node_flags:
+            entry["flags"] = list(node_flags)
+        node_rect = node.get("rect")
+        if isinstance(node_rect, dict):
+            entry["rect"] = node_rect
+        matches.append(entry)
         if len(matches) >= max_results:
             break
 
@@ -1851,6 +2121,298 @@ def _log_dismiss_overlay(
         )
 
 
+def _repair_identity_text(value: Any) -> str:
+    return str(value).strip() if value is not None else ""
+
+
+def _repair_visual_target_signature(identity: Any, field: Any) -> str:
+    identity_field = (
+        str(identity.get("field") or "").strip()
+        if isinstance(identity, dict) else ""
+    )
+    identity_value = (
+        _repair_identity_text(identity.get("value"))
+        if isinstance(identity, dict) else ""
+    )
+    return json.dumps(
+        [identity_field, identity_value, str(field or "").strip()],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _normalized_repair_page(url: Any) -> Tuple[str, str]:
+    """Normalize a repair evidence URL to its stable host/path destination."""
+    raw = str(url or "").strip()
+    try:
+        parsed = urlparse(raw)
+    except ValueError:
+        return "", raw.rstrip("/")
+    host = parsed.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = (parsed.path or "/").rstrip("/") or "/"
+    return host, path
+
+
+def _repair_page_binding(raw: Any) -> Optional[JsonDict]:
+    if not isinstance(raw, dict):
+        return None
+    field = str(raw.get("field") or "").strip()
+    url = str(raw.get("url") or "").strip()
+    host, _ = _normalized_repair_page(url)
+    if not field or not host:
+        return None
+    return {"field": field, "url": url}
+
+
+def _validated_repair_visual_targets(
+    agent: Any,
+    raw_targets: Any,
+) -> Tuple[List[JsonDict], Optional[JsonDict]]:
+    if raw_targets in (None, []):
+        return [], None
+    if not isinstance(raw_targets, list):
+        return [], {
+            "status": "rejected",
+            "error": "visual_verify.repair_targets must be an array",
+            "tool_was_executed": False,
+        }
+    contract = getattr(agent, "worker_contract", None)
+    manifest = (
+        contract.get("_repair_manifest") if isinstance(contract, dict) else None
+    )
+    repairs = manifest.get("repairs") if isinstance(manifest, dict) else None
+    if not isinstance(repairs, list) or not repairs:
+        return [], {
+            "status": "rejected",
+            "error": "repair_targets require an active repair manifest",
+            "tool_was_executed": False,
+        }
+    allowed: Dict[Tuple[str, str], Set[str]] = {}
+    identity_values: Dict[Tuple[str, str], Any] = {}
+    page_bindings: Dict[Tuple[str, str], JsonDict] = {}
+    for item in repairs:
+        identity = item.get("identity") if isinstance(item, dict) else None
+        identity_field = (
+            str(identity.get("field") or "").strip()
+            if isinstance(identity, dict) else ""
+        )
+        identity_value = (
+            _repair_identity_text(identity.get("value"))
+            if isinstance(identity, dict) else ""
+        )
+        fields = item.get("fields") if isinstance(item, dict) else None
+        if identity_field and identity_value and isinstance(fields, list):
+            key = (identity_field, identity_value)
+            allowed[key] = {
+                str(field).strip() for field in fields if str(field).strip()
+            }
+            identity_values[key] = identity.get("value")
+            page_binding = _repair_page_binding(item.get("pageBinding"))
+            if page_binding is not None:
+                page_bindings[key] = page_binding
+
+    normalized: List[JsonDict] = []
+    seen_signatures: Set[str] = set()
+    for index, raw_target in enumerate(raw_targets):
+        identity = raw_target.get("identity") if isinstance(raw_target, dict) else None
+        identity_field = (
+            str(identity.get("field") or "").strip()
+            if isinstance(identity, dict) else ""
+        )
+        identity_value = (
+            _repair_identity_text(identity.get("value"))
+            if isinstance(identity, dict) else ""
+        )
+        fields = raw_target.get("fields") if isinstance(raw_target, dict) else None
+        target_fields = sorted({
+            str(field).strip() for field in fields if str(field).strip()
+        }) if isinstance(fields, list) else []
+        key = (identity_field, identity_value)
+        if (
+            key not in allowed
+            or not target_fields
+            or any(field not in allowed[key] for field in target_fields)
+        ):
+            return [], {
+                "status": "rejected",
+                "error": (
+                    f"visual_verify.repair_targets[{index}] must match one"
+                    " manifest identity and its repair fields"
+                ),
+                "tool_was_executed": False,
+            }
+        fresh_fields = []
+        for field in target_fields:
+            signature = _repair_visual_target_signature(identity, field)
+            if signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+            fresh_fields.append(field)
+        if fresh_fields:
+            target = {
+                "identity": {
+                    "field": identity_field,
+                    "value": identity_values[key],
+                },
+                "fields": fresh_fields,
+            }
+            if key in page_bindings:
+                target["pageBinding"] = dict(page_bindings[key])
+            normalized.append(target)
+    return normalized, None
+
+
+async def _verify_repair_visual_page(
+    agent: Any,
+    page_id: str,
+    targets: List[JsonDict],
+    step: int,
+) -> Tuple[JsonDict, Optional[JsonDict]]:
+    target_bindings = [
+        _repair_page_binding(target.get("pageBinding")) for target in targets
+    ]
+    bindings = [binding for binding in target_bindings if binding is not None]
+    if not bindings:
+        return {"status": "unavailable"}, None
+    if len(bindings) != len(targets):
+        return {"status": "mixed_bindings"}, {
+            "status": "rejected",
+            "error": (
+                "repair_targets mix page-bound and unbound rows; verify them"
+                " in separate visual_verify calls"
+            ),
+            "tool_was_executed": False,
+        }
+
+    destinations = {
+        _normalized_repair_page(binding["url"]) for binding in bindings
+    }
+    if len(destinations) != 1:
+        return {"status": "conflicting_targets"}, {
+            "status": "rejected",
+            "error": (
+                "repair_targets resolve to different pages; verify each page"
+                " in a separate visual_verify call"
+            ),
+            "tool_was_executed": False,
+        }
+
+    expected_urls = sorted({binding["url"] for binding in bindings})
+    state = await _invoke_browser_method(
+        agent,
+        "Page.getState",
+        {
+            "pageId": page_id,
+            "purpose": "Bind repair absence evidence to its expected baseline page",
+        },
+        step,
+    )
+    data = _response_data(state)
+    current_url = str(data.get("url") or data.get("currentUrl") or "").strip()
+    binding_result = {
+        "status": "unverified",
+        "expectedUrls": expected_urls,
+        "currentUrl": current_url,
+    }
+    if not current_url:
+        return binding_result, {
+            "status": "repair_visual_page_unverified",
+            "error": "Page.getState did not return a URL for repair evidence",
+            "expectedPageUrls": expected_urls,
+            "tool_was_executed": True,
+            "next_instruction": (
+                "Re-establish the target page and retry visual_verify; repair"
+                " absence evidence cannot be attached without a current URL."
+            ),
+        }
+    if _normalized_repair_page(current_url) not in destinations:
+        binding_result["status"] = "mismatch"
+        return binding_result, {
+            "status": "repair_visual_wrong_page",
+            "error": "visual repair evidence was requested on the wrong page",
+            "expectedPageUrls": expected_urls,
+            "currentUrl": current_url,
+            "tool_was_executed": True,
+            "next_instruction": (
+                "Navigate or switch to the manifest-bound target page, confirm"
+                " it with Page.getState, then retry visual_verify."
+            ),
+        }
+    binding_result["status"] = "matched"
+    return binding_result, None
+
+
+def _record_repair_visual_evidence(
+    agent: Any,
+    targets: List[JsonDict],
+    result: JsonDict,
+    *,
+    question: str,
+) -> List[JsonDict]:
+    if (
+        not targets
+        or str(result.get("status") or "") != "done"
+        or str(result.get("verdict") or "").strip().lower() != "absent"
+    ):
+        return []
+    has_page_binding = any(
+        _repair_page_binding(target.get("pageBinding")) is not None
+        for target in targets
+    )
+    page_binding = result.get("repairPageBinding")
+    if has_page_binding and (
+        not isinstance(page_binding, dict)
+        or page_binding.get("status") != "matched"
+    ):
+        return []
+    contract = getattr(agent, "worker_contract", None)
+    manifest = (
+        contract.get("_repair_manifest") if isinstance(contract, dict) else None
+    )
+    if not isinstance(manifest, dict):
+        return []
+    satisfied = manifest.get("visualEvidenceSatisfied")
+    if not isinstance(satisfied, dict):
+        satisfied = {}
+        manifest["visualEvidenceSatisfied"] = satisfied
+    recorded: List[JsonDict] = []
+    for target in targets:
+        identity = target.get("identity")
+        for field in target.get("fields") or []:
+            signature = _repair_visual_target_signature(identity, field)
+            evidence = {
+                "identity": dict(identity) if isinstance(identity, dict) else {},
+                "field": str(field),
+                "signature": signature,
+                "screenshotPath": str(result.get("screenshotPath") or ""),
+                "verdict": "absent",
+                "question": question[:500],
+            }
+            if isinstance(page_binding, dict):
+                evidence["pageBinding"] = dict(page_binding)
+            satisfied[signature] = evidence
+            recorded.append(evidence)
+    if recorded:
+        pending = manifest.get("visualEvidencePending")
+        recorded_signatures = {item["signature"] for item in recorded}
+        if isinstance(pending, list):
+            remaining = [
+                item for item in pending
+                if isinstance(item, dict)
+                and str(item.get("signature") or "") not in recorded_signatures
+            ]
+            if remaining:
+                manifest["visualEvidencePending"] = remaining
+            else:
+                manifest.pop("visualEvidencePending", None)
+        agent.logger.write("repair.visual_evidence_satisfied", {
+            "targets": recorded,
+        })
+    return recorded
+
+
 async def _visual_verify(agent: Any, tool_input: JsonDict, step: int) -> JsonDict:
     vl_config = getattr(agent.runtime.harness, "vl", None)
     if vl_config is None or not getattr(vl_config, "enabled", False):
@@ -1863,7 +2425,23 @@ async def _visual_verify(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
         2,
     )
     max_checks = max(0, raw_max_checks if raw_max_checks is not None else 2)
-    force_check = bool(tool_input.get("_force", False))
+    page_id = str(tool_input.get("pageId") or "").strip()
+    if not page_id:
+        return {"status": "failed", "error": "pageId is required"}
+    selector = str(tool_input.get("selector") or "").strip()
+    element_id = str(tool_input.get("id") or "").strip()
+    requested_mode = str(tool_input.get("mode") or "action_outcome").strip()
+    mode = requested_mode
+    question = str(tool_input.get("question") or "").strip()
+    repair_targets, repair_target_error = _validated_repair_visual_targets(
+        agent, tool_input.get("repair_targets"),
+    )
+    if repair_target_error is not None:
+        return repair_target_error
+    # Target-bound repair evidence is a machine-enforced completion gate, so an
+    # earlier overlay/layout check must not exhaust its budget. It uses the
+    # separate forced counter and remains bounded by the worker's step limit.
+    force_check = bool(tool_input.get("_force", False)) or bool(repair_targets)
     if not force_check and getattr(agent, "vl_check_count", 0) >= max_checks:
         return {
             "status": "rejected",
@@ -1874,18 +2452,35 @@ async def _visual_verify(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
                 " finalize with the blocker."
             ),
         }
-
-    page_id = str(tool_input.get("pageId") or "").strip()
-    if not page_id:
-        return {"status": "failed", "error": "pageId is required"}
-    selector = str(tool_input.get("selector") or "").strip()
-    element_id = str(tool_input.get("id") or "").strip()
-    mode = str(tool_input.get("mode") or "action_outcome").strip()
-    question = str(tool_input.get("question") or "").strip()
+    if repair_targets:
+        mode = "repair_absence"
+        question = (
+            f"{question}\nRepair evidence targets: "
+            f"{json.dumps(repair_targets, ensure_ascii=False, default=str)}. "
+            "Determine whether the expected content for these exact fields is"
+            " absent on the current page."
+        ).strip()
     expected = tool_input.get("expected")
     if not isinstance(expected, dict):
         expected = {}
+    elif repair_targets:
+        expected = dict(expected)
+    if repair_targets:
+        expected["repair_targets"] = repair_targets
     full_page = bool(tool_input.get("fullPage", False))
+
+    repair_page_binding: JsonDict = {"status": "not_applicable"}
+    if repair_targets:
+        repair_page_binding, page_binding_error = await _verify_repair_visual_page(
+            agent, page_id, repair_targets, step,
+        )
+        if page_binding_error is not None:
+            agent.logger.write("repair.visual_page_rejected", {
+                **page_binding_error,
+                "pageId": page_id,
+                "repairTargets": repair_targets,
+            })
+            return page_binding_error
 
     screenshot_params: JsonDict = {
         "pageId": page_id,
@@ -1905,6 +2500,10 @@ async def _visual_verify(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
     if stale_target is not None:
         return stale_target
 
+    screenshot_scope = (
+        "element" if (selector or element_id)
+        else ("fullpage" if full_page else "viewport")
+    )
     before_artifacts = set(str(path) for path in getattr(agent, "artifacts", []))
     screenshot = await _invoke_browser_method(
         agent,
@@ -1919,6 +2518,41 @@ async def _visual_verify(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
             if str(path) not in before_artifacts
         ]
         image_path = after_artifacts[-1] if after_artifacts else ""
+    if not image_path and (selector or element_id):
+        # skillsGuide §5: if element capture fails, do not repeat it — resync
+        # once with Page.getState, then fall back to a viewport screenshot. The
+        # verdict consumer sees screenshotScope so it knows the crop widened.
+        await _invoke_browser_method(
+            agent,
+            "Page.getState",
+            {
+                "pageId": page_id,
+                "purpose": "Resync page state after element screenshot failed before viewport fallback",
+            },
+            step,
+        )
+        fallback_params: JsonDict = {
+            "pageId": page_id,
+            "fullPage": False,
+            "options": {"format": "base64"},
+            "purpose": "Viewport fallback after element screenshot failure",
+        }
+        before_artifacts = set(str(path) for path in getattr(agent, "artifacts", []))
+        screenshot = await _invoke_browser_method(
+            agent,
+            "Page.screenshot",
+            fallback_params,
+            step,
+        )
+        image_path = _screenshot_saved_path(screenshot)
+        if not image_path:
+            after_artifacts = [
+                str(path) for path in getattr(agent, "artifacts", [])
+                if str(path) not in before_artifacts
+            ]
+            image_path = after_artifacts[-1] if after_artifacts else ""
+        if image_path:
+            screenshot_scope = "viewport_fallback"
     if not image_path:
         return {
             "status": "failed",
@@ -1960,6 +2594,7 @@ async def _visual_verify(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
         **verdict,
         "mode": mode,
         "screenshotPath": image_path,
+        "screenshotScope": screenshot_scope,
         "selector": selector or None,
         "id": element_id or None,
         "vlCheckCount": vl_check_count,
@@ -1971,6 +2606,43 @@ async def _visual_verify(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
             " do not use it as final structured extraction."
         ),
     }
+    if repair_targets:
+        result["repairPageBinding"] = repair_page_binding
+        if requested_mode != mode:
+            result["requestedMode"] = requested_mode
+    repair_evidence = _record_repair_visual_evidence(
+        agent,
+        repair_targets,
+        result,
+        question=question,
+    )
+    if repair_targets:
+        result["repairTargets"] = repair_targets
+    if repair_evidence:
+        result["repairEvidenceSatisfied"] = repair_evidence
+    elif repair_targets and result.get("status") == "done":
+        verdict_name = str(result.get("verdict") or "uncertain")
+        if verdict_name == "present":
+            result["status"] = "repair_visual_contradiction"
+            result["next_instruction"] = (
+                "The visual check found the target content present. Do not mark"
+                " it confirmed_absent; extract the visible value and submit a"
+                " non-empty repair patch instead."
+            )
+            event_type = "repair.visual_evidence_contradicted"
+        else:
+            result["status"] = "repair_visual_inconclusive"
+            result["next_instruction"] = (
+                "The screenshot did not prove absence. Reframe or expand the"
+                " relevant page region and retry, or leave the repair unresolved."
+            )
+            event_type = "repair.visual_evidence_inconclusive"
+        agent.logger.write(event_type, {
+            "pageId": page_id,
+            "verdict": verdict_name,
+            "repairTargets": repair_targets,
+            "screenshotPath": image_path,
+        })
     agent.logger.write(
         "vl.visual_verify",
         {
@@ -2072,6 +2744,228 @@ async def _maybe_vl_arbitrate(
     if instruction:
         out["next_instruction"] = instruction
     return out
+
+
+async def _maybe_reality_check(
+    agent: Any,
+    tool_call: JsonDict,
+    result: JsonDict,
+    step: int,
+) -> JsonDict:
+    """Layer-2 visual reality check: after a target-shortfall streak (tools
+    keep yielding nothing OR yielding rows that never satisfy the phase
+    contract — mis-attributed rows look productive while missing the target),
+    auto-run a full-page screenshot + VL against a claim synthesized from the
+    worker contract, persist the observation through record_extraction (so
+    its savedPath is ledger-valid evidence for target_absent claims), and
+    attach the verdict to the tool result. Task-type agnostic — the trigger
+    is the streak, not any validator kind. Best-effort + gated; never raises
+    into the path."""
+    if not isinstance(result, dict):
+        return result
+    vl_config = getattr(
+        getattr(getattr(agent, "runtime", None), "harness", None), "vl", None
+    )
+    if (
+        vl_config is None
+        or not getattr(vl_config, "enabled", False)
+        or not getattr(vl_config, "reality_check_enabled", True)
+    ):
+        return result
+    try:
+        from harness.vl.reality_check import (
+            build_reality_check_row,
+            classify_target_yield,
+            synthesize_claim,
+        )
+        name = str(tool_call.get("name") or "")
+        tool_input = tool_call.get("input") or {}
+        if not isinstance(tool_input, dict):
+            tool_input = {}
+        yield_state = classify_target_yield(name, result)
+        if yield_state is None:
+            return result
+        if yield_state is False:
+            agent.target_shortfall_streak = 0
+            return result
+        agent.target_shortfall_streak = (
+            getattr(agent, "target_shortfall_streak", 0) + 1
+        )
+        threshold = max(
+            1,
+            optional_int(
+                getattr(vl_config, "reality_check_shortfall_threshold", 3), 3
+            ) or 3,
+        )
+        if agent.target_shortfall_streak < threshold:
+            return result
+        if getattr(agent, "reality_check_count", 0) >= 1:
+            return result
+        page_id = str(tool_input.get("pageId") or "").strip()
+        if not page_id:
+            return result
+        claim = synthesize_claim(getattr(agent, "worker_contract", None))
+        # Full-page capture: a viewport shot can only prove "not on this
+        # screen", not "not on this page" (virtualized lists still render
+        # only materialized content, but the coverage is strictly wider).
+        verdict = await _visual_verify(
+            agent,
+            {
+                "pageId": page_id,
+                "mode": "page_state",
+                "question": claim,
+                "fullPage": True,
+                "_force": True,
+            },
+            step,
+        )
+        if not isinstance(verdict, dict) or verdict.get("status") in {
+            "disabled",
+            "failed",
+            "rejected",
+        }:
+            # Do NOT consume the per-worker budget on a failed capture —
+            # the streak stays armed so a later shortfall can retry.
+            return result
+        row = build_reality_check_row(
+            claim=claim,
+            verdict=verdict,
+            trigger_tool=name,
+            shortfall_streak=agent.target_shortfall_streak,
+            page_id=page_id,
+        )
+        record = _record_extraction(agent, {
+            "name": "vl_reality_check",
+            "rows": [row],
+            "schema": {"source": "vl_reality_check"},
+            "description": (
+                "Automatic visual reality check triggered by a"
+                " target-shortfall perception streak"
+            ),
+        })
+        # The check ran: consume the budget either way. Re-arming on a
+        # persist failure would burn an unbounded _force VL call per further
+        # shortfall while the worker never sees the verdict.
+        agent.reality_check_count = getattr(agent, "reality_check_count", 0) + 1
+        if not str(record.get("savedPath") or "").strip():
+            # VL succeeded but the evidence did not persist: hand the verdict
+            # to the worker anyway (the observation is still real) and tell
+            # it to persist its own copy — the layer-3 pass and the B3 gate
+            # need a ledger entry to verify.
+            agent.target_shortfall_streak = 0
+            logger = getattr(agent, "logger", None)
+            if logger is not None and hasattr(logger, "write"):
+                logger.write("vl.reality_check.persist_failed", {
+                    "triggerTool": name,
+                    "recordStatus": str(record.get("status") or ""),
+                })
+            out = {**result, "realityCheck": {
+                "verdict": row["verdict"],
+                "observation": row["observation"],
+                "screenshotPath": row["screenshotPath"],
+                "targetShortfallStreak": row["targetShortfallStreak"],
+                "evidencePersisted": False,
+            }}
+            out["next_instruction"] = (
+                "A visual reality check ran but its evidence artifact failed"
+                " to persist. The observation above is still valid: persist"
+                " it yourself via record_extraction and cite that savedPath"
+                " in evidenceArtifacts before declaring"
+                " target_absent/instruction_infeasible."
+            )
+            return out
+        reality: JsonDict = {
+            "verdict": row["verdict"],
+            "observation": row["observation"],
+            "screenshotPath": row["screenshotPath"],
+            "targetShortfallStreak": row["targetShortfallStreak"],
+            "evidenceSavedPath": str(record.get("savedPath") or ""),
+        }
+        logger = getattr(agent, "logger", None)
+        if logger is not None and hasattr(logger, "write"):
+            logger.write("vl.reality_check", {**reality, "triggerTool": name})
+        agent.target_shortfall_streak = 0
+        out = {**result, "realityCheck": reality}
+        out["next_instruction"] = (
+            "A visual reality check ran because perception kept falling short"
+            " of the task target. Compare its observation against the task"
+            " expectation: if it confirms the target content does not exist"
+            " on this page, declare target_absent/instruction_infeasible"
+            f" citing {reality['evidenceSavedPath'] or 'the reality-check artifact'}"
+            " in evidenceArtifacts; if it shows the content elsewhere on the"
+            " page, adjust your perception (scroll/selector) accordingly."
+        )
+        return out
+    except Exception as exc:  # reality check must never break the call path
+        logger = getattr(agent, "logger", None)
+        if logger is not None and hasattr(logger, "write"):
+            logger.write("vl.reality_check.error", {"error": str(exc)[:300]})
+        return result
+
+
+def _final_answer_reality_check_rejection(
+    agent: Any,
+    answer: str,
+) -> Optional[JsonDict]:
+    """Layer-3 gate: a final_answer that declares target_absent /
+    instruction_infeasible with NO visual reality check on record is bounced
+    back once, telling the worker to verify visually and cite the persisted
+    observation. One bounce only — the spawner-side evidence gate remains the
+    last line of defense, so a second attempt always goes through."""
+    vl_config = getattr(
+        getattr(getattr(agent, "runtime", None), "harness", None), "vl", None
+    )
+    if (
+        vl_config is None
+        or not getattr(vl_config, "enabled", False)
+        or not getattr(vl_config, "reality_check_enabled", True)
+    ):
+        return None
+    if getattr(agent, "final_answer_reality_nudged", False):
+        return None
+    try:
+        from harness.vl.reality_check import (
+            cites_ledger_evidence,
+            semantic_terminal_claimed,
+        )
+        if not semantic_terminal_claimed(answer):
+            return None
+        # "Any VL check happened" is too weak a pass — an overlay/CAPTCHA
+        # check says nothing about the target's absence. Accept only:
+        # (a) the layer-2 auto reality check ran (its target-specific
+        #     observation was handed back to the worker), or
+        # (b) the worker did its own visual check AND cites ledger-backed
+        #     evidence in the answer (so the B3 gate can verify it).
+        if getattr(agent, "reality_check_count", 0) > 0:
+            return None
+        vl_checks = (
+            (getattr(agent, "vl_check_count", 0) or 0)
+            + (getattr(agent, "vl_force_check_count", 0) or 0)
+        )
+        if vl_checks > 0:
+            ledger = [
+                *list(getattr(agent, "artifacts", []) or []),
+                *list(getattr(agent, "extraction_attempt_artifacts", []) or []),
+            ]
+            if cites_ledger_evidence(answer, ledger):
+                return None
+    except Exception:
+        return None
+    agent.final_answer_reality_nudged = True
+    return {
+        "status": "rejected_needs_reality_check",
+        "tool_was_executed": False,
+        "next_instruction": (
+            "You are declaring the target absent/infeasible, but no visual"
+            " reality check ran this session — DOM probing alone is not"
+            " sufficient evidence of absence. Scroll to the relevant region,"
+            " call visual_verify with a claim describing the expected content,"
+            " persist the observation via record_extraction, cite its"
+            " savedPath in evidenceArtifacts, then call final_answer again."
+            " If visual verification is impossible (e.g. page dead), re-issue"
+            " this final_answer unchanged and it will be accepted."
+        ),
+    }
 
 
 async def _promote_visual_locate(
@@ -3958,8 +4852,73 @@ async def _request_hitl_for_challenge(
     finally:
         agent.challenge_adjudicating = False
 
-def _check_extraction_progress_gate(agent: Any, next_tool: str) -> Optional[JsonDict]:
+PROGRESS_GATE_MAX_BLOCKS = 2
+PROGRESS_GATE_RECOVERY_TOOLS = frozenset({
+    "find_in_axtree",
+    "local_fs_read",
+    "local_fs_search",
+    "visual_verify",
+    "DOM.getAXTree",
+    "DOM.getSemanticTree",
+    "DOM.getText",
+    "DOM.getAttribute",
+    "Input.scroll",
+    "Input.press",
+    "Memory.get",
+    "Memory.save",
+    "Page.create",
+    "Page.getState",
+    "Page.list",
+    "Page.screenshot",
+    "System.describeAction",
+    "System.describeEvent",
+    "System.getCapabilities",
+})
+
+
+def _record_extraction_persisted(result: JsonDict) -> bool:
+    return bool(isinstance(result, dict) and str(result.get("savedPath") or "").strip())
+
+
+def _gate_subject_tool(next_tool: str, tool_input: JsonDict) -> str:
+    if str(next_tool or "") == "browser_call":
+        method = str(tool_input.get("method") or "").strip()
+        if method:
+            return method
+    return str(next_tool or "").strip()
+
+
+def _call_extraction_progress_gate(
+    agent: Any,
+    next_tool: str,
+    tool_input: JsonDict,
+) -> Optional[JsonDict]:
+    try:
+        return _check_extraction_progress_gate(agent, next_tool, tool_input)
+    except TypeError as exc:
+        # Some tests/plugins monkeypatch the internal gate using the old
+        # two-argument signature. Keep that compatibility while the real helper
+        # accepts tool_input so browser_call can be classified by method.
+        if "positional" not in str(exc) and "argument" not in str(exc):
+            raise
+        return _check_extraction_progress_gate(agent, next_tool)
+
+
+def _check_extraction_progress_gate(
+    agent: Any,
+    next_tool: str,
+    tool_input: Optional[JsonDict] = None,
+) -> Optional[JsonDict]:
     if next_tool == "record_extraction":
+        return None
+    subject_tool = _gate_subject_tool(next_tool, tool_input or {})
+    if subject_tool in PROGRESS_GATE_RECOVERY_TOOLS:
+        pending = getattr(agent, "pending_unrecorded_extraction", None)
+        if isinstance(pending, dict):
+            pending["recoveryBypassCount"] = (
+                optional_int(pending.get("recoveryBypassCount"), 0) or 0
+            ) + 1
+            agent.pending_unrecorded_extraction = pending
         return None
     pending = getattr(agent, "pending_unrecorded_extraction", None)
     if not isinstance(pending, dict):
@@ -3969,17 +4928,94 @@ def _check_extraction_progress_gate(agent: Any, next_tool: str) -> Optional[Json
         pending["turns"] = turns + 1
         agent.pending_unrecorded_extraction = pending
         return None
+    gate_blocks = optional_int(pending.get("gateBlocks"), 0) or 0
+    if gate_blocks >= PROGRESS_GATE_MAX_BLOCKS:
+        downgraded = {
+            "status": "progress_gate_downgraded",
+            "reason": "unrecorded_structured_rows_gate_limit",
+            "rowCount": pending.get("rowCount"),
+            "source": pending.get("source"),
+            "tool": subject_tool,
+            "gateBlocks": gate_blocks,
+            "tool_was_executed": True,
+            "next_instruction": (
+                "The unrecorded-rows gate reached its bounded limit and was"
+                " downgraded so recovery tools can continue. Persist trustworthy"
+                " rows when possible; otherwise gather evidence and finalize with"
+                " a blocker or target_absent/instruction_infeasible classification."
+            ),
+        }
+        agent.pending_unrecorded_extraction = None
+        if hasattr(agent, "trace") and isinstance(agent.trace, list):
+            agent.trace.append({"type": "progress_gate_downgraded", "result": downgraded})
+        logger = getattr(agent, "logger", None)
+        if logger is not None and hasattr(logger, "write"):
+            logger.write("progress_gate.downgraded", downgraded)
+        return None
+    pending["gateBlocks"] = gate_blocks + 1
+    agent.pending_unrecorded_extraction = pending
     return {
         "status": "progress_gate",
         "reason": "unrecorded_structured_rows",
         "rowCount": pending.get("rowCount"),
         "source": pending.get("source"),
+        "tool": subject_tool,
+        "gateBlocks": pending.get("gateBlocks"),
         "tool_was_executed": False,
         "next_instruction": (
             "You already extracted structured rows but did not persist them."
             " Call record_extraction now if the rows are relevant, rerun"
-            " extract_dom_records with record_name set, or call final_answer"
-            " with a blocker if they are not trustworthy."
+            " extract_dom_records with record_name set, use recovery tools such"
+            " as DOM.getAXTree/DOM.getText/DOM.getAttribute/Input.scroll to"
+            " gather missing evidence, or call final_answer with a blocker if"
+            " they are not trustworthy."
+        ),
+    }
+
+
+def _check_cross_task_memory_scope(
+    agent: Any,
+    method: str,
+    params: JsonDict,
+) -> Optional[JsonDict]:
+    """Block Memory.get/save against another task's scope.
+
+    Task-scope memories carry a previous task's objective/steps; reading
+    them contaminates the current worker's premise (2cb616: "scroll to
+    rank 50, extract 11 rows" restored as established knowledge), and
+    writing them corrupts the other task's record. Registration already
+    strips foreign entries; this guard closes the direct-query path.
+    Non-task scopes (auth fleet, fleet ids) are untouched.
+    """
+    if method not in {"Memory.get", "Memory.save"}:
+        return None
+    scope = str((params or {}).get("scope") or "").strip()
+    if not scope:
+        return None
+    parts = scope.split(":")
+    if len(parts) < 3 or parts[-1] != "task":
+        return None
+    scope_task_id = parts[-2]
+    # Only gate scopes whose middle segment looks like a harness task id
+    # (long hex) — custom scopes keep working.
+    if not re.fullmatch(r"[0-9a-f]{16,}", scope_task_id):
+        return None
+    task_dir = getattr(getattr(agent, "logger", None), "task_dir", None)
+    current_task_id = str(getattr(task_dir, "name", "") or "")
+    if not current_task_id or scope_task_id == current_task_id:
+        return None
+    return {
+        "status": "rejected",
+        "method": method,
+        "error": (
+            f"{method} targets another task's memory scope: {scope}"
+        ),
+        "tool_was_executed": False,
+        "next_instruction": (
+            "Memory from other tasks is historical context, not instructions"
+            " for the current task. Use your own task scope"
+            f" (…:{current_task_id}:task) and derive the objective from the"
+            " user_task and worker contract only."
         ),
     }
 
@@ -4064,7 +5100,29 @@ def _method_pattern_matches(pattern: str, method: str) -> bool:
     return False
 
 
-def _check_progress_before(agent: Any, tool_name: str) -> Optional[JsonDict]:
+def _is_own_artifact_read(agent: Any, tool_name: str, path_hint: Any) -> bool:
+    """True only for local_fs_read of a file THIS RUN persisted via
+    record_extraction (exact path match against the attempt ledger). Reading
+    one's own needs_fix artifact to figure out what to fix is analysis of the
+    ledger, not offload spinning — task 9d5655d3 got gated mid-self-diagnosis."""
+    if tool_name != "local_fs_read":
+        return False
+    path = str(path_hint or "")
+    if not path or "/artifacts/extractions/" not in path:
+        return False
+    attempts = {
+        str(item)
+        for item in (getattr(agent, "extraction_attempt_artifacts", None) or [])
+    }
+    return path in attempts
+
+
+def _check_progress_before(
+    agent: Any,
+    tool_name: str,
+    tool_input: Optional[JsonDict] = None,
+    step: Optional[int] = None,
+) -> Optional[JsonDict]:
     progress = getattr(agent, "progress", None)
     if progress is None:
         return None
@@ -4093,8 +5151,34 @@ def _check_progress_before(agent: Any, tool_name: str) -> Optional[JsonDict]:
         local_fs_limit=limit,
         no_artifact_limit=no_artifact_limit,
         requires_artifact=requires_artifact,
+        own_artifact_read=_is_own_artifact_read(
+            agent, tool_name, (tool_input or {}).get("path"),
+        ),
+        step=step,
     )
     if result is not None:
+        # Saves that carried schemaWarnings were persisted but deliberately NOT
+        # credited to the artifact ledger ("trust the ledger, not the claim").
+        # Surface them on the intervention so neither the model nor a human
+        # reading the log mistakes "uncredited save" for "never extracted
+        # anything" — task 9d5655d3's diagnosis stalled on that ambiguity.
+        attempted = [
+            str(path)
+            for path in (getattr(agent, "extraction_attempt_artifacts", None) or [])
+        ]
+        credited = {
+            str(path) for path in (getattr(agent, "artifacts", None) or [])
+        }
+        uncredited = [path for path in attempted if path not in credited]
+        if uncredited:
+            result["uncreditedArtifacts"] = {
+                "count": len(uncredited),
+                "paths": uncredited[-3:],
+                "note": (
+                    "saved with schema warnings, so not counted as extraction"
+                    " progress; fix the row keys/values and re-record"
+                ),
+            }
         agent.logger.write("progress.intervention", result)
     return result
 
@@ -4103,11 +5187,26 @@ def _observe_progress_after(agent: Any, tool_name: str, result: Optional[JsonDic
     progress = getattr(agent, "progress", None)
     if progress is None:
         return
+    result_path = (
+        result.get("path") if isinstance(result, dict) else None
+    )
     progress.after_tool(
         tool_name=tool_name,
         artifact_count=extraction_artifact_count(getattr(agent, "artifacts", [])),
         result=result,
+        own_artifact_read=_is_own_artifact_read(agent, tool_name, result_path),
     )
+    repair_merge = (
+        result.get("repairMerge") if isinstance(result, dict) else None
+    )
+    applied_repairs = (
+        repair_merge.get("applied")
+        if isinstance(repair_merge, dict) else None
+    )
+    if applied_repairs and hasattr(progress, "notify_repair_progress"):
+        repair_progress = progress.notify_repair_progress(applied_repairs)
+        if repair_progress.get("newFieldCount"):
+            agent.logger.write("progress.repair_advanced", repair_progress)
     if (
         tool_name == "navigate_verified"
         and isinstance(result, dict)
@@ -4141,6 +5240,28 @@ def _record_extraction(agent: Any, tool_input: JsonDict) -> JsonDict:
         return error
     rows = rows or []
 
+    rows, repair_merge, repair_error = _merge_repair_patch_rows(
+        agent,
+        artifact_name=raw_name,
+        patch_rows=rows,
+        repair_resolutions=tool_input.get("repair_resolutions"),
+    )
+    if repair_error is not None:
+        repair_error.setdefault(
+            "next_instruction",
+            (
+                "This worker is in field-repair mode. Submit only manifest target"
+                " rows, each with the exact identity field/value shown in the"
+                " handoff plus at least one requested repair field; do not resend"
+                " trusted rows or fields."
+            ),
+        )
+        return repair_error
+    if repair_merge:
+        description = description or (
+            "Field-level slow-path repair merged into trusted fast-path baseline"
+        )
+
     schema_warnings = [
         *_record_extraction_schema_warnings(agent, rows),
         *_record_extraction_content_warnings(rows),
@@ -4161,6 +5282,20 @@ def _record_extraction(agent: Any, tool_input: JsonDict) -> JsonDict:
         saved_path = str(result.get("savedPath") or "")
         if saved_path and saved_path not in attempts:
             attempts.append(saved_path)
+    if repair_merge:
+        result["repairMerge"] = repair_merge
+        contract = getattr(agent, "worker_contract", None)
+        manifest = (
+            contract.get("_repair_manifest")
+            if isinstance(contract, dict)
+            and isinstance(contract.get("_repair_manifest"), dict)
+            else None
+        )
+        if manifest is not None and result.get("savedPath"):
+            # Subsequent patch saves build on the latest merged rows, so a
+            # worker can repair several targets serially without resending old
+            # patches or copying the full baseline through the LLM context.
+            manifest["workingArtifact"] = str(result["savedPath"])
     validation = _validate_recorded_extraction(agent, str(result.get("savedPath") or ""))
     if validation:
         result["artifactValidation"] = trim_large_strings(validation, 3000)
@@ -4191,7 +5326,519 @@ def _record_extraction(agent: Any, tool_input: JsonDict) -> JsonDict:
                     " the canonical <field>EvidenceText keys (e.g. rankEvidenceText)"
                     " before final_answer."
                 )
+    repair_resolutions = (
+        repair_merge.get("resolutions")
+        if isinstance(repair_merge, dict)
+        and isinstance(repair_merge.get("resolutions"), list)
+        else []
+    )
+    if repair_resolutions:
+        contract = getattr(agent, "worker_contract", None)
+        manifest = (
+            contract.get("_repair_manifest")
+            if isinstance(contract, dict) else None
+        )
+        satisfied = (
+            manifest.get("visualEvidenceSatisfied")
+            if isinstance(manifest, dict) else None
+        )
+        satisfied_signatures = (
+            set(satisfied) if isinstance(satisfied, dict) else set()
+        )
+        pending_by_signature = {
+            str(item.get("signature")): dict(item)
+            for item in (
+                manifest.get("visualEvidencePending")
+                if isinstance(manifest, dict)
+                and isinstance(manifest.get("visualEvidencePending"), list)
+                else []
+            )
+            if isinstance(item, dict) and str(item.get("signature") or "")
+        }
+        visual_checks_enabled = _repair_visual_checks_enabled(agent)
+        for item in repair_resolutions:
+            identity = item.get("identity") if isinstance(item, dict) else None
+            field = item.get("field") if isinstance(item, dict) else None
+            signature = _repair_visual_target_signature(identity, field)
+            outcome = str(item.get("outcome") or "") if isinstance(item, dict) else ""
+            if outcome == "confirmed_absent" and visual_checks_enabled:
+                if signature not in satisfied_signatures:
+                    pending_by_signature[signature] = {**item, "signature": signature}
+                continue
+            pending_by_signature.pop(signature, None)
+            # Evidence for a prior absence claim must not automatically satisfy
+            # a later claim after the field was observed or supplied with a value.
+            if isinstance(satisfied, dict):
+                satisfied.pop(signature, None)
+                satisfied_signatures.discard(signature)
+        unresolved_absent = list(pending_by_signature.values())
+        if isinstance(manifest, dict):
+            if unresolved_absent:
+                manifest["visualEvidencePending"] = unresolved_absent
+            else:
+                manifest.pop("visualEvidencePending", None)
+        if unresolved_absent:
+            pending = {
+                str(item) for item in (result.get("validationPending") or [])
+                if str(item).strip()
+            }
+            pending.add("absence_visual_evidence")
+            result["validationPending"] = sorted(pending)
+            result["repairEvidencePending"] = unresolved_absent
+            visual_instruction = (
+                "Repair values marked confirmed_absent are merged, but target-"
+                "bound visual evidence is still pending. Keep/reuse the relevant"
+                " live page and call visual_verify with repair_targets matching"
+                " the listed identity/field targets before final_answer;"
+                " Page.screenshot and unrelated visual checks do not count. Cite"
+                " this merged savedPath plus the visual evidence in final_answer."
+                " Do not re-submit or re-scrape already merged fields."
+            )
+            prior_instruction = str(result.get("next_instruction") or "").strip()
+            result["next_instruction"] = (
+                f"{prior_instruction} {visual_instruction}".strip()
+            )
     return result
+
+
+def _merge_repair_patch_rows(
+    agent: Any,
+    *,
+    artifact_name: str,
+    patch_rows: List[JsonDict],
+    repair_resolutions: Any = None,
+) -> Tuple[List[JsonDict], JsonDict, Optional[JsonDict]]:
+    """Merge model-supplied patch rows into an internal fast-path baseline.
+
+    The manifest is injected by the spawner, never accepted from the model.
+    Only named repair fields and their evidence metadata may change; every
+    other baseline field is preserved byte-for-byte.
+    """
+    contract = getattr(agent, "worker_contract", None)
+    manifest = (
+        contract.get("_repair_manifest")
+        if isinstance(contract, dict)
+        and isinstance(contract.get("_repair_manifest"), dict)
+        else None
+    )
+    if manifest is None or str(manifest.get("artifactName") or "") != artifact_name:
+        return patch_rows, {}, None
+    if manifest.get("disabledReason"):
+        # A previous structural failure deliberately abandoned merge mode. The
+        # worker may now record one complete replacement artifact normally.
+        return patch_rows, {}, None
+
+    def fallback(reason: str, detail: str) -> Tuple[List[JsonDict], JsonDict, JsonDict]:
+        """Disable an unusable internal manifest so the next save can recover."""
+        manifest["disabledReason"] = reason
+        abandoned_visual = manifest.pop("visualEvidencePending", None)
+        if isinstance(abandoned_visual, list) and abandoned_visual:
+            manifest["visualEvidenceAbandoned"] = [
+                dict(item) for item in abandoned_visual if isinstance(item, dict)
+            ]
+        payload = {
+            "artifactName": artifact_name,
+            "reason": reason,
+            "detail": detail[:500],
+            "baselineArtifact": str(manifest.get("baselineArtifact") or ""),
+        }
+        logger = getattr(agent, "logger", None)
+        if logger is not None and hasattr(logger, "write"):
+            logger.write("skill.fast_path.repair_fallback", payload)
+            if isinstance(abandoned_visual, list) and abandoned_visual:
+                logger.write("repair.visual_evidence_abandoned", {
+                    "reason": reason,
+                    "targets": manifest.get("visualEvidenceAbandoned") or [],
+                })
+        return patch_rows, {}, {
+            "status": "repair_fallback_required",
+            "error": detail,
+            "tool_was_executed": False,
+            "next_instruction": (
+                "The trusted repair baseline is unavailable or inconsistent, so"
+                " field-patch mode has been disabled. Re-record ONE COMPLETE"
+                " artifact under the expected name with every expected row and"
+                " field; the normal phase validators will check it."
+            ),
+        }
+
+    if str(manifest.get("version") or "") != "repair_manifest.v1":
+        return fallback(
+            "invalid_manifest_version",
+            "invalid internal repair manifest version",
+        )
+
+    raw_path = str(
+        manifest.get("workingArtifact") or manifest.get("baselineArtifact") or ""
+    ).strip()
+    try:
+        path = Path(raw_path).expanduser().resolve()
+        root = (agent.logger.task_dir / "artifacts" / "extractions").resolve()
+    except Exception:
+        return fallback("invalid_baseline_path", "repair baseline path is invalid")
+    if not raw_path or (path != root and root not in path.parents):
+        return fallback(
+            "baseline_outside_task",
+            "repair baseline must be an extraction artifact in this task",
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return fallback(
+            "baseline_unreadable",
+            f"repair baseline could not be read: {str(exc)[:300]}",
+        )
+    raw_baseline_rows = payload.get("rows") if isinstance(payload, dict) else None
+    if not isinstance(raw_baseline_rows, list) or not all(
+        isinstance(row, dict) for row in raw_baseline_rows
+    ):
+        return fallback(
+            "baseline_rows_invalid",
+            "repair baseline has no valid rows array",
+        )
+    baseline_rows = [dict(row) for row in raw_baseline_rows]
+    expected_count = manifest.get("rowCount")
+    if isinstance(expected_count, int) and len(baseline_rows) != expected_count:
+        return fallback(
+            "baseline_row_count_changed",
+            "repair baseline row count changed unexpectedly",
+        )
+
+    repairs = manifest.get("repairs")
+    if not isinstance(repairs, list) or not repairs:
+        return fallback("manifest_targets_missing", "repair manifest has no targets")
+
+    targets: Dict[Tuple[str, str], JsonDict] = {}
+    for item in repairs:
+        identity = item.get("identity") if isinstance(item, dict) else None
+        field = str(identity.get("field") or "") if isinstance(identity, dict) else ""
+        value = identity.get("value") if isinstance(identity, dict) else None
+        fields = item.get("fields") if isinstance(item, dict) else None
+        if not field or not isinstance(fields, list) or not fields:
+            return fallback(
+                "manifest_target_invalid",
+                "repair manifest contains an invalid target",
+            )
+        key = (field, str(value).strip() if value is not None else "")
+        row_indexes = [
+            index for index, row in enumerate(baseline_rows)
+            if (
+                str(row.get(field)).strip()
+                if row.get(field) is not None else ""
+            ) == key[1]
+        ]
+        if not key[1] or len(row_indexes) != 1 or key in targets:
+            return fallback(
+                "baseline_identity_mismatch",
+                "repair target identity is not unique in the baseline",
+            )
+        targets[key] = {
+            "rowIndex": row_indexes[0],
+            "fields": {str(name) for name in fields if str(name).strip()},
+        }
+
+    resolutions: Dict[Tuple[Tuple[str, str], str], JsonDict] = {}
+    if repair_resolutions is not None:
+        if not isinstance(repair_resolutions, list):
+            return patch_rows, {}, {
+                "status": "rejected",
+                "error": "repair_resolutions must be an array in repair mode",
+            }
+        for index, raw_resolution in enumerate(repair_resolutions):
+            if not isinstance(raw_resolution, dict):
+                return patch_rows, {}, {
+                    "status": "rejected",
+                    "error": f"repair_resolutions[{index}] must be an object",
+                }
+            identity = raw_resolution.get("identity")
+            identity_field = (
+                str(identity.get("field") or "").strip()
+                if isinstance(identity, dict) else ""
+            )
+            identity_value = (
+                str(identity.get("value")).strip()
+                if isinstance(identity, dict) and identity.get("value") is not None
+                else ""
+            )
+            field = str(raw_resolution.get("field") or "").strip()
+            outcome = str(raw_resolution.get("outcome") or "").strip()
+            identity_key = (identity_field, identity_value)
+            target = targets.get(identity_key)
+            if (
+                target is None
+                or not field
+                or field not in target["fields"]
+            ):
+                return patch_rows, {}, {
+                    "status": "rejected",
+                    "error": (
+                        f"repair_resolutions[{index}] does not identify one"
+                        " manifest target field"
+                    ),
+                }
+            if outcome not in {
+                "value_found", "observed_empty", "confirmed_absent", "unresolved",
+            }:
+                return patch_rows, {}, {
+                    "status": "rejected",
+                    "error": f"repair_resolutions[{index}].outcome is invalid",
+                }
+            resolution_key = (identity_key, field)
+            if resolution_key in resolutions:
+                return patch_rows, {}, {
+                    "status": "rejected",
+                    "error": "duplicate repair resolution for one target field",
+                }
+            resolutions[resolution_key] = {
+                "outcome": outcome,
+                "evidenceArtifacts": [
+                    str(path).strip()
+                    for path in (raw_resolution.get("evidenceArtifacts") or [])
+                    if str(path).strip()
+                ] if isinstance(raw_resolution.get("evidenceArtifacts"), list) else [],
+                "note": str(raw_resolution.get("note") or "").strip()[:500],
+            }
+
+    applied: List[JsonDict] = []
+    ignored_fields: List[JsonDict] = []
+    resolution_results: List[JsonDict] = []
+    confirmed_absent: List[JsonDict] = []
+    seen_targets: set[Tuple[str, str]] = set()
+    shared_metadata = {"pageUrl", "sourceTool", "sourceSelectorOrAxId"}
+    for patch_index, patch in enumerate(patch_rows):
+        matching = [
+            (key, target) for key, target in targets.items()
+            if (
+                str(patch.get(key[0])).strip()
+                if patch.get(key[0]) is not None else ""
+            ) == key[1]
+        ]
+        if len(matching) != 1:
+            return patch_rows, {}, {
+                "status": "rejected",
+                "error": (
+                    f"repair patch row {patch_index} must contain exactly one"
+                    " manifest identity field/value"
+                ),
+            }
+        key, target = matching[0]
+        if key in seen_targets:
+            return patch_rows, {}, {
+                "status": "rejected",
+                "error": "duplicate repair patch row for one target",
+            }
+        seen_targets.add(key)
+        repair_fields = target["fields"]
+        provided = sorted(field for field in repair_fields if field in patch)
+        if not provided:
+            return patch_rows, {}, {
+                "status": "rejected",
+                "error": (
+                    f"repair patch row {patch_index} contains none of its"
+                    f" requested fields: {sorted(repair_fields)}"
+                ),
+            }
+
+        for field in provided:
+            value_is_empty = _repair_value_is_empty(patch.get(field))
+            resolution = resolutions.get((key, field))
+            if value_is_empty and resolution is None:
+                return patch_rows, {}, {
+                    "status": "rejected",
+                    "error": (
+                        f"empty repair field {field!r} requires a matching"
+                        " repair_resolutions entry with outcome observed_empty"
+                        " or confirmed_absent"
+                    ),
+                }
+            if resolution is None:
+                outcome = "value_found"
+                resolution = {"outcome": outcome, "evidenceArtifacts": [], "note": ""}
+            else:
+                outcome = str(resolution.get("outcome") or "")
+            if outcome == "unresolved":
+                return patch_rows, {}, {
+                    "status": "rejected",
+                    "error": (
+                        f"repair field {field!r} is unresolved and cannot be"
+                        " persisted as a completed patch"
+                    ),
+                }
+            if value_is_empty and outcome == "value_found":
+                return patch_rows, {}, {
+                    "status": "rejected",
+                    "error": f"empty repair field {field!r} cannot be value_found",
+                }
+            if not value_is_empty and outcome in {"observed_empty", "confirmed_absent"}:
+                return patch_rows, {}, {
+                    "status": "rejected",
+                    "error": (
+                        f"non-empty repair field {field!r} conflicts with"
+                        f" outcome {outcome}"
+                    ),
+                }
+            if (
+                outcome in {"observed_empty", "confirmed_absent"}
+                and _repair_field_requires_nonempty(agent, field)
+            ):
+                return patch_rows, {}, {
+                    "status": "repair_contract_conflict",
+                    "error": (
+                        f"repair field {field!r} is constrained by field_nonempty"
+                        f" and cannot resolve as {outcome}"
+                    ),
+                    "field": field,
+                    "validator": "field_nonempty",
+                    "outcome": outcome,
+                    "tool_was_executed": False,
+                    "next_instruction": (
+                        "This is a deterministic contract conflict, not an"
+                        " extraction retry. Do not submit the same empty patch"
+                        " again; report the blocker so LeadAgent can revise the"
+                        " contract or accept a partial result."
+                    ),
+                }
+            if (
+                outcome in {"observed_empty", "confirmed_absent"}
+                and not _repair_resolution_has_source_evidence(
+                    agent, patch, field, resolution,
+                )
+            ):
+                return patch_rows, {}, {
+                    "status": "rejected",
+                    "error": (
+                        f"empty repair field {field!r} requires source evidence"
+                        f" for outcome {outcome}"
+                    ),
+                }
+            resolution_result = {
+                "identity": {"field": key[0], "value": patch.get(key[0])},
+                "field": field,
+                "outcome": outcome,
+            }
+            resolution_results.append(resolution_result)
+            if outcome == "confirmed_absent":
+                confirmed_absent.append(resolution_result)
+
+        destination = baseline_rows[target["rowIndex"]]
+        allowed_evidence = {
+            evidence_name
+            for field in repair_fields
+            for evidence_name in (f"{field}EvidenceText", f"{field}Evidence")
+        }
+        allowed = repair_fields | allowed_evidence | shared_metadata | {key[0]}
+        ignored = sorted(str(field) for field in patch.keys() if field not in allowed)
+        if ignored:
+            ignored_fields.append({"patchRow": patch_index, "fields": ignored})
+        for field in allowed:
+            if field in patch and field != key[0]:
+                destination[field] = patch[field]
+        applied.append({
+            "patchRow": patch_index,
+            "baselineRow": target["rowIndex"],
+            "identity": {"field": key[0], "value": patch.get(key[0])},
+            "fields": provided,
+        })
+
+    if not applied:
+        return patch_rows, {}, {
+            "status": "rejected",
+            "error": "repair patch did not update any manifest field",
+        }
+    info: JsonDict = {
+        "baselineArtifact": str(manifest.get("baselineArtifact") or raw_path),
+        "workingArtifact": raw_path,
+        "applied": applied,
+        "preservedRowCount": len(baseline_rows),
+    }
+    if ignored_fields:
+        info["ignoredFields"] = ignored_fields
+    if resolution_results:
+        info["resolutions"] = resolution_results
+    if confirmed_absent:
+        info["confirmedAbsent"] = confirmed_absent
+    return baseline_rows, info, None
+
+
+def _repair_value_is_empty(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, tuple, dict, set)):
+        return len(value) == 0
+    return False
+
+
+def _repair_field_requires_nonempty(agent: Any, field: str) -> bool:
+    contract = getattr(agent, "worker_contract", None)
+    if not isinstance(contract, dict):
+        return False
+    validators = contract.get("validators")
+    for validator in validators if isinstance(validators, list) else []:
+        if not isinstance(validator, dict):
+            continue
+        if str(validator.get("type") or "") != "field_nonempty":
+            continue
+        fields = validator.get("fields")
+        if isinstance(fields, list) and field in {str(item) for item in fields}:
+            return True
+        if str(validator.get("field") or "").strip() == field:
+            return True
+    expected = contract.get("expected_artifact")
+    specs = expected.get("fields") if isinstance(expected, dict) else None
+    for spec in specs if isinstance(specs, list) else []:
+        if not isinstance(spec, dict):
+            continue
+        name = str(spec.get("name") or spec.get("field") or spec.get("key") or "")
+        if name != field:
+            continue
+        if spec.get("allow_empty") is True or spec.get("optional_empty") is True:
+            return False
+        return bool(spec.get("nonempty") or spec.get("required_nonempty"))
+    return False
+
+
+def _repair_resolution_has_source_evidence(
+    agent: Any,
+    patch: JsonDict,
+    field: str,
+    resolution: JsonDict,
+) -> bool:
+    if any(
+        str(patch.get(name) or "").strip()
+        for name in (f"{field}EvidenceText", f"{field}Evidence")
+    ):
+        return True
+    source_tool = str(patch.get("sourceTool") or "").strip()
+    source_locator = str(
+        patch.get("sourceSelectorOrAxId") or patch.get("pageUrl") or ""
+    ).strip()
+    if source_tool and source_locator:
+        return True
+    ledger = {
+        str(path).strip()
+        for path in [
+            *list(getattr(agent, "artifacts", []) or []),
+            *list(getattr(agent, "extraction_attempt_artifacts", []) or []),
+        ]
+        if str(path).strip()
+    }
+    return any(
+        str(path).strip() in ledger
+        for path in (resolution.get("evidenceArtifacts") or [])
+    )
+
+
+def _repair_visual_checks_enabled(agent: Any) -> bool:
+    vl_config = getattr(
+        getattr(getattr(agent, "runtime", None), "harness", None), "vl", None,
+    )
+    return bool(
+        vl_config is not None
+        and getattr(vl_config, "enabled", False)
+        and getattr(vl_config, "reality_check_enabled", True)
+    )
 
 
 def _is_advisory_record_failure(failure: JsonDict) -> bool:

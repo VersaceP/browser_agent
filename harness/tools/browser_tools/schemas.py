@@ -44,6 +44,39 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
             "required": ["method", "params", "reason"],
             "additionalProperties": False,
         },
+        "execute_selected_skill": {
+            "type": "object",
+            "properties": {
+                "pageId": {
+                    "type": "string",
+                    "description": "Live pageId for the selected skill's frozen workflow.",
+                },
+                "fleetId": {
+                    "type": "string",
+                    "description": "Live fleetId for the page; pass \"\" only when unavailable.",
+                },
+                "variables": {
+                    "type": "object",
+                    "description": (
+                        "One workflow input row. Use this OR rows; pass {} when using rows."
+                    ),
+                    "additionalProperties": True,
+                },
+                "rows": {
+                    "type": "array",
+                    "description": (
+                        "Multiple workflow input rows executed strictly serially on the warm tab."
+                        " Use this OR variables; pass [] when using variables."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": True,
+                    },
+                },
+            },
+            "required": ["pageId", "fleetId", "variables", "rows"],
+            "additionalProperties": False,
+        },
         "extract_dom_records": {
             "type": "object",
             "properties": {
@@ -293,7 +326,7 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                 },
                 "mode": {
                     "type": "string",
-                    "description": "action_outcome | validator_failure | overlay_check | captcha_check | layout_check | visual_locate (locate an AXTree-blind target by description; returns a durable resolvedId via bbox→id promotion — act on that id, not coordinates) | contract_verify (judge structured visual_checks in `expected.visual_checks`; returns satisfied/violated/uncertain + failed_checks)",
+                    "description": "action_outcome | validator_failure | overlay_check | captcha_check | layout_check | visual_locate (locate an AXTree-blind target by description; returns a durable resolvedId via bbox→id promotion — act on that id, not coordinates) | contract_verify (judge structured visual_checks in `expected.visual_checks`; returns satisfied/violated/uncertain + failed_checks). Calls with repair_targets automatically use the internal repair_absence mode and return absent/present/uncertain.",
                 },
                 "question": {
                     "type": "string",
@@ -303,6 +336,39 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                     "type": "object",
                     "additionalProperties": True,
                     "description": "Expected visible state, e.g. {\"target\":\"JobBuddy\",\"state\":\"product detail page\"}.",
+                },
+                "repair_targets": {
+                    "type": "array",
+                    "description": (
+                        "Optional field-repair evidence binding. Use only when"
+                        " the harness supplied a repair manifest and this visual"
+                        " check verifies confirmed_absent fields. Each identity"
+                        " and field must exactly match that manifest; unrelated"
+                        " overlay/CAPTCHA/layout checks do not satisfy repair"
+                        " evidence. The harness binds the check to the baseline"
+                        " row URL when available, and only an absent verdict"
+                        " satisfies it. Pass [] for ordinary visual verification."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "identity": {
+                                "type": "object",
+                                "properties": {
+                                    "field": {"type": "string"},
+                                    "value": {},
+                                },
+                                "required": ["field", "value"],
+                                "additionalProperties": False,
+                            },
+                            "fields": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "required": ["identity", "fields"],
+                        "additionalProperties": False,
+                    },
                 },
             },
             "required": [
@@ -376,6 +442,51 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                     "type": "string",
                     "description": "Optional; which page / selector this data was extracted from.",
                 },
+                "repair_resolutions": {
+                    "type": "array",
+                    "description": (
+                        "Field-level outcomes used only when the harness supplied a"
+                        " repair manifest. Non-empty repaired values default to"
+                        " value_found. Every empty repaired value must declare"
+                        " observed_empty (the source explicitly exposes a legal"
+                        " empty value) or confirmed_absent (the expected browser"
+                        " content does not exist). confirmed_absent may require"
+                        " visual_verify before final_answer; Page.screenshot alone"
+                        " is not visual verification. This metadata is not written"
+                        " into the user artifact."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "identity": {
+                                "type": "object",
+                                "properties": {
+                                    "field": {"type": "string"},
+                                    "value": {},
+                                },
+                                "required": ["field", "value"],
+                                "additionalProperties": False,
+                            },
+                            "field": {"type": "string"},
+                            "outcome": {
+                                "type": "string",
+                                "enum": [
+                                    "value_found",
+                                    "observed_empty",
+                                    "confirmed_absent",
+                                    "unresolved",
+                                ],
+                            },
+                            "evidenceArtifacts": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "note": {"type": "string"},
+                        },
+                        "required": ["identity", "field", "outcome"],
+                        "additionalProperties": False,
+                    },
+                },
             },
             "required": ["name", "rows"],
             "additionalProperties": False,
@@ -407,7 +518,7 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                 "case_sensitive": {"type": "boolean"},
                 "interactive_only": {
                     "type": "boolean",
-                    "description": "When true, only return AXTree lines marked interactable/focusable with #.",
+                    "description": "When true, only return AXTree lines marked with # (preferred actionable targets).",
                 },
                 "max_results": {"type": "integer", "minimum": 1, "maximum": 50},
             },

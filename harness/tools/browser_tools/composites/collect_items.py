@@ -49,6 +49,10 @@ def _record_extraction(*args: Any, **kwargs: Any) -> JsonDict:
     return _bt()._record_extraction(*args, **kwargs)
 
 
+def _record_extraction_persisted(result: JsonDict) -> bool:
+    return _bt()._record_extraction_persisted(result)
+
+
 async def discover_selector_candidates(*args: Any, **kwargs: Any) -> List[JsonDict]:
     return await _bt().discover_selector_candidates(*args, **kwargs)
 
@@ -622,7 +626,7 @@ async def _collect_items(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
                 contract_warning["selectorCandidates"] = candidates[:5]
             result["contractWarning"] = contract_warning
             result["next_step"] = contract_warning["next_instruction"]
-        if record_result.get("status") == "done":
+        if _record_extraction_persisted(record_result):
             agent.pending_unrecorded_extraction = None
     elif collected:
         agent.pending_unrecorded_extraction = {
