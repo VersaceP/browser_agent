@@ -1,0 +1,20 @@
+{
+  "method": "Emulation.setFingerprint",
+  "description": "Applies the stable offline fingerprint profile for the entire fleet.",
+  "params": {
+    "fleetId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Fleet ID whose stable fingerprint profile should apply to all current pages.",
+      "required": true
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why the fleet needs its stable fingerprint profile applied before navigation or inspection",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why the fleet needs its stable fingerprint profile applied before navigation or inspection"
+}
