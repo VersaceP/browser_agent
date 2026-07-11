@@ -55,6 +55,9 @@ def outline_large_field(value: Any, max_bytes: int = GENERIC_TOOL_RESULT_KEEP_FI
     return outline_value(value)
 
 
+SUGGESTED_PROMPT_SUCCESS_MAX_CHARS = 200
+
+
 def compact_model_facing_tool_result(value: Any) -> Any:
     """Drop low-value successful-result chatter before it reaches the model."""
     if isinstance(value, dict):
@@ -63,6 +66,12 @@ def compact_model_facing_tool_result(value: Any) -> Any:
             if key == "suspected_challenge" and _empty_challenge_summary(item):
                 continue
             if key == "suggested_prompt" and not _keep_suggested_prompt(value):
+                # The skillsGuide says to read suggested_prompt on success too,
+                # so keep it — but truncated: it is platform advice, not harness
+                # truth, and full-length success chatter is token noise.
+                trimmed = _trim_success_suggested_prompt(item)
+                if trimmed:
+                    compacted[key] = trimmed
                 continue
             compacted[key] = compact_model_facing_tool_result(item)
         return compacted
@@ -85,6 +94,13 @@ def _empty_challenge_summary(value: Any) -> bool:
     except (TypeError, ValueError):
         score = 0.0
     return score <= 0 and not bool(value.get("highConfidenceHit"))
+
+
+def _trim_success_suggested_prompt(item: Any) -> str:
+    text = str(item or "").strip()
+    if len(text) <= SUGGESTED_PROMPT_SUCCESS_MAX_CHARS:
+        return text
+    return text[: SUGGESTED_PROMPT_SUCCESS_MAX_CHARS - 1].rstrip() + "…"
 
 
 def _keep_suggested_prompt(container: JsonDict) -> bool:

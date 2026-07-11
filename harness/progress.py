@@ -7,7 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from harness.utils import JsonDict
 
@@ -100,6 +100,37 @@ class ProgressAccountant:
     infra_error_streak: int = 0
     last_infra_error: Optional[JsonDict] = None
     infra_diagnostic_bypass_count: int = 0
+    last_blocked_reason: Optional[str] = None
+    last_blocked_step: Optional[int] = None
+    repair_progress_signatures: Set[str] = field(default_factory=set)
+
+    def _emit_intervention(
+        self, intervention: JsonDict, step: Optional[int] = None,
+    ) -> JsonDict:
+        """Record + return an intervention, deduplicating within one parallel
+        batch: a SAME-STEP consecutive block with the same reason (two parallel
+        calls in one step each hitting the same gate) keeps the accounting but
+        collapses the repeated instruction text — task 9d5655d3 step 29
+        injected the same directive twice. Cross-step blocks are never
+        deduplicated (each model turn deserves the full instruction), and a
+        caller that does not pass step opts out entirely."""
+        reason = str(intervention.get("reason") or "")
+        if (
+            reason
+            and reason == self.last_blocked_reason
+            and step is not None
+            and step == self.last_blocked_step
+        ):
+            intervention["duplicate_of_previous"] = True
+            intervention["next_instruction"] = (
+                "Duplicate of the previous intervention in this same step"
+                " (parallel tool call blocked by the same rule); follow that"
+                " instruction."
+            )
+        self.last_blocked_reason = reason
+        self.last_blocked_step = step
+        self.interventions.append(intervention)
+        return intervention
 
     def before_tool(
         self,
@@ -109,6 +140,8 @@ class ProgressAccountant:
         local_fs_limit: int,
         no_artifact_limit: int,
         requires_artifact: bool,
+        own_artifact_read: bool = False,
+        step: Optional[int] = None,
     ) -> Optional[JsonDict]:
         self.extraction_artifact_count = max(
             self.extraction_artifact_count,
@@ -134,8 +167,7 @@ class ProgressAccountant:
                     " DOM/response feedback, or finalize with the blocker."
                 ),
             }
-            self.interventions.append(intervention)
-            return intervention
+            return self._emit_intervention(intervention, step)
         if (
             requires_artifact
             and artifact_count == 0
@@ -165,14 +197,20 @@ class ProgressAccountant:
                     " or finalize with the blocker."
                 ),
             }
-            self.interventions.append(intervention)
-            return intervention
+            return self._emit_intervention(intervention, step)
+        if tool_name in LOCAL_FS_TOOLS and own_artifact_read:
+            # Reading an artifact THIS RUN persisted (e.g. analyzing why its
+            # own save came back needs_fix) is ledger analysis, not offload
+            # spinning — exempt from the local_fs gates. Kept narrow: the
+            # caller verifies an exact match against this run's own extraction
+            # attempt paths, so the "trust the ledger" guard semantics from
+            # the 07-08 deadlock fixes stay intact for everything else.
+            return None
         if tool_name in LOCAL_FS_TOOLS and self.pending_intervention:
             intervention = dict(self.pending_intervention)
             intervention["tool_was_executed"] = False
-            self.interventions.append(intervention)
             self.pending_intervention = None
-            return intervention
+            return self._emit_intervention(intervention, step)
         if (
             tool_name in LOCAL_FS_TOOLS
             and artifact_count == 0
@@ -193,8 +231,7 @@ class ProgressAccountant:
                     " old offload files."
                 ),
             }
-            self.interventions.append(intervention)
-            return intervention
+            return self._emit_intervention(intervention, step)
         if (
             tool_name in LOCAL_FS_TOOLS
             and artifact_count == 0
@@ -213,8 +250,7 @@ class ProgressAccountant:
                     " finalize with a blocker."
                 ),
             }
-            self.interventions.append(intervention)
-            return intervention
+            return self._emit_intervention(intervention, step)
         return None
 
     def after_tool(
@@ -223,8 +259,13 @@ class ProgressAccountant:
         tool_name: str,
         artifact_count: int,
         result: Optional[JsonDict] = None,
+        own_artifact_read: bool = False,
     ) -> None:
         self.tool_calls += 1
+        # An executed tool separates intervention batches: the next block is a
+        # fresh intervention, not a duplicate of the previous one.
+        self.last_blocked_reason = None
+        self.last_blocked_step = None
         self.distinct_tools[tool_name] = self.distinct_tools.get(tool_name, 0) + 1
         infra_error = _infra_error_summary(result)
         if infra_error:
@@ -261,6 +302,10 @@ class ProgressAccountant:
             self.repeated_local_result_count = 0
             self.last_local_result_signature = None
             self.pending_intervention = None
+        if tool_name in LOCAL_FS_TOOLS and own_artifact_read:
+            # Neutral: reading this run's own persisted artifacts neither
+            # feeds nor resets the offload-spinning counters.
+            return
         if tool_name in LOCAL_FS_TOOLS and artifact_count == 0:
             self.local_fs_without_extraction += 1
             self.local_fs_streak += 1
@@ -306,6 +351,65 @@ class ProgressAccountant:
             "toolCalls": self.tool_calls,
         }
 
+    def notify_repair_progress(self, applied: Any) -> JsonDict:
+        """Credit new manifest-authorized fields without crediting the artifact.
+
+        A partial merge may still be needs_fix because another target remains.
+        Identity+field signatures reset the stall counter for real repair work,
+        while replaying the same patch cannot buy another reset.
+        """
+        new_items: List[JsonDict] = []
+        for item in applied if isinstance(applied, list) else []:
+            if not isinstance(item, dict):
+                continue
+            identity = item.get("identity")
+            identity_field = (
+                str(identity.get("field") or "").strip()
+                if isinstance(identity, dict) else ""
+            )
+            identity_value = (
+                str(identity.get("value")).strip()
+                if isinstance(identity, dict) and identity.get("value") is not None
+                else ""
+            )
+            fields = sorted({
+                str(repair_field).strip()
+                for repair_field in (item.get("fields") or [])
+                if str(repair_field).strip()
+            }) if isinstance(item.get("fields"), list) else []
+            if not identity_field or not identity_value or not fields:
+                continue
+            fresh_fields: List[str] = []
+            for repair_field in fields:
+                signature = "\x1f".join(
+                    (identity_field, identity_value, repair_field)
+                )
+                if signature in self.repair_progress_signatures:
+                    continue
+                self.repair_progress_signatures.add(signature)
+                fresh_fields.append(repair_field)
+            if fresh_fields:
+                new_items.append({
+                    "identity": {
+                        "field": identity_field,
+                        "value": identity.get("value"),
+                    },
+                    "fields": fresh_fields,
+                })
+        if new_items:
+            self.turns_since_artifact_progress = 0
+            self.local_fs_without_extraction = 0
+            self.local_fs_streak = 0
+            self.repeated_local_result_count = 0
+            self.pending_intervention = None
+        return {
+            "status": "repair_progress" if new_items else "repair_progress_duplicate",
+            "newRepairs": new_items,
+            "newFieldCount": sum(len(item["fields"]) for item in new_items),
+            "repairProgressFieldCount": len(self.repair_progress_signatures),
+            "turnsSinceArtifactProgress": self.turns_since_artifact_progress,
+        }
+
     def to_log_payload(self) -> JsonDict:
         return {
             "toolCalls": self.tool_calls,
@@ -317,6 +421,7 @@ class ProgressAccountant:
             "infraErrorStreak": self.infra_error_streak,
             "lastInfraError": self.last_infra_error,
             "infraDiagnosticBypassCount": self.infra_diagnostic_bypass_count,
+            "repairProgressFieldCount": len(self.repair_progress_signatures),
             "distinctTools": dict(sorted(self.distinct_tools.items())),
             "interventionCount": len(self.interventions),
         }

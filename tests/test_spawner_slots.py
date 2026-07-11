@@ -2,10 +2,20 @@ import asyncio
 import json
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 from abcp_client import ABCPClientConfig
 from harness.config import HarnessConfig, RuntimeConfig
-from harness.spawner import BrowserAgentSlot, BrowserAgentSpawner
+from harness.spawner import (
+    BrowserAgentSlot,
+    BrowserAgentSpawner,
+    _effective_worker_status,
+    _finalize_skill_execution_metadata,
+    _prompt_worker_contract,
+    _skill_execution_metadata,
+    _unresolved_repair_visual_evidence,
+)
+from harness.task_control import initialize_task_state, load_task_state
 from harness.utils import RunLogger
 from llm.config import ModelConfig
 
@@ -33,6 +43,117 @@ def _slot_context_payload(context: str) -> dict:
 
 
 class BrowserAgentSlotTests(unittest.TestCase):
+    def test_prompt_contract_redacts_only_top_level_internal_fields(self) -> None:
+        internal = {
+            "skill_id": "collection",
+            "_skill_route_source": "suite_routed",
+            "_repair_manifest": {"_nested_state": "kept-with-parent"},
+            "expected_artifact": {"fields": ["rank"]},
+        }
+        exposed = _prompt_worker_contract(internal)
+        self.assertEqual(exposed, {
+            "skill_id": "collection",
+            "expected_artifact": {"fields": ["rank"]},
+        })
+        self.assertIn("_skill_route_source", internal)  # source contract untouched
+
+    def test_fast_path_terminal_status_is_done_not_constructor_running(self) -> None:
+        self.assertEqual(_effective_worker_status("running", "skill answer"), "done")
+        self.assertEqual(_effective_worker_status("incomplete", None), "incomplete")
+
+    def test_execution_metadata_distinguishes_fast_repair_and_slow(self) -> None:
+        self.assertEqual(
+            _skill_execution_metadata({"handled": True, "completedRows": 4}),
+            {"executionMode": "skill_fast_path", "fastPathRows": 4, "repairRows": 0},
+        )
+        repair = _skill_execution_metadata({
+            "handled": False,
+            "completedRows": 4,
+            "repair_manifest": {"repairs": [{}, {}]},
+        })
+        self.assertEqual(repair["executionMode"], "skill_repair")
+        self.assertEqual(repair["fastPathRows"], 4)
+        self.assertEqual(repair["repairRows"], 2)
+        self.assertEqual(
+            _skill_execution_metadata(None)["executionMode"],
+            "browser_slow_path",
+        )
+
+    def test_repair_visual_pending_is_machine_enforced_at_spawner_boundary(self) -> None:
+        harness = SimpleNamespace(
+            worker_contract={
+                "_repair_manifest": {
+                    "visualEvidencePending": [
+                        {
+                            "identity": {"field": "url", "value": "https://example.com/a"},
+                            "field": "availability",
+                            "outcome": "confirmed_absent",
+                            "signature": "sig-a",
+                        },
+                        {
+                            "identity": {"field": "url", "value": "https://example.com/b"},
+                            "field": "availability",
+                            "outcome": "confirmed_absent",
+                            "signature": "sig-b",
+                        },
+                    ],
+                },
+            },
+            reality_check_count=0,
+            vl_check_count=0,
+            vl_force_check_count=0,
+        )
+        self.assertEqual(len(_unresolved_repair_visual_evidence(harness)), 2)
+        harness.vl_check_count = 99
+        # Unrelated/overlay VL counters no longer satisfy target evidence.
+        self.assertEqual(len(_unresolved_repair_visual_evidence(harness)), 2)
+        harness.worker_contract["_repair_manifest"]["visualEvidenceSatisfied"] = {
+            "sig-a": {"screenshotPath": "/tmp/a.png"},
+        }
+        unresolved = _unresolved_repair_visual_evidence(harness)
+        self.assertEqual(len(unresolved), 1)
+        self.assertEqual(unresolved[0]["signature"], "sig-b")
+
+    def test_repair_fallback_reports_actual_full_slow_path(self) -> None:
+        metadata = {
+            "executionMode": "skill_repair",
+            "fastPathRows": 3,
+            "repairRows": 1,
+        }
+        harness = SimpleNamespace(worker_contract={
+            "_repair_manifest": {
+                "disabledReason": "baseline_unreadable",
+                "visualEvidencePending": [{
+                    "identity": {"field": "url", "value": "https://example.com/a"},
+                    "field": "availability",
+                    "signature": "stale-a",
+                }],
+            },
+        })
+
+        result = _finalize_skill_execution_metadata(metadata, harness)
+
+        self.assertEqual(result["executionMode"], "browser_slow_path")
+        self.assertTrue(result["skillRepairFallback"])
+        self.assertEqual(result["repairFallbackReason"], "baseline_unreadable")
+        self.assertEqual(result["fastPathRows"], 3)
+        self.assertEqual(_unresolved_repair_visual_evidence(harness), [])
+
+    def test_selected_workflow_tool_is_reported_without_claiming_zero_llm(self) -> None:
+        harness = SimpleNamespace(
+            worker_contract={},
+            trace=[
+                {"type": "model"},
+                {"type": "execute_selected_skill", "result": {"completedRows": 2}},
+            ],
+        )
+        result = _finalize_skill_execution_metadata(
+            _skill_execution_metadata(None), harness,
+        )
+        self.assertEqual(result["executionMode"], "browser_slow_path")
+        self.assertTrue(result["skillAssistedSlowPath"])
+        self.assertEqual(result["selectedSkillWorkflowCalls"], 1)
+
     def test_fresh_page_context_hides_previous_page_details(self) -> None:
         spawner = _make_spawner(self)
         slot = BrowserAgentSlot(slot_id="slot-001", agent_id="agent-slot-001")
@@ -140,6 +261,51 @@ class BrowserAgentSlotTests(unittest.TestCase):
         self.assertEqual(result["error"], "Reached the max_browser_agents limit")
         self.assertIn("max_browser_agents", result["limit_semantics"])
         self.assertIn("max_browser_agent_instances", result["limit_semantics"])
+
+    def test_spawn_reserves_phase_during_slot_acquire_and_cancels_on_rejection(self) -> None:
+        spawner = _make_spawner(self)
+        plan = {
+            "version": "v1",
+            "goal": "Collect one row",
+            "task_type": "web_scrape",
+            "phases": [{
+                "id": "p1",
+                "type": "browser_worker",
+                "objective": "Collect one row",
+                "worker_task": "Collect one row.",
+                "stage_hint": "collection",
+                "stage_hint_reason": "Collect a single structured row from the page.",
+                "expected_artifact": {"name": "rows", "exact_rows": 1},
+                "validators": [],
+                "validators_normalized": True,
+                "worker_contract": {},
+                "max_attempts": 3,
+            }],
+        }
+        initialize_task_state(spawner.logger, plan)
+        seen_status = {}
+
+        async def fake_acquire(**kwargs):
+            state = load_task_state(spawner.logger)
+            seen_status["status"] = state["phases"]["p1"]["status"]
+            seen_status["attempts"] = len(state["phases"]["p1"]["attempts"])
+            return {"status": "rejected", "error": "no slot"}
+
+        spawner._acquire_slot = fake_acquire  # type: ignore[method-assign]
+
+        result = asyncio.run(spawner.spawn_browser_agent(
+            task="Collect one row.",
+            phase_id="p1",
+            worker_contract={},
+            phase=plan["phases"][0],
+            task_plan=plan,
+        ))
+
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(seen_status, {"status": "running", "attempts": 1})
+        state = load_task_state(spawner.logger)
+        self.assertEqual(state["phases"]["p1"]["status"], "pending")
+        self.assertEqual(state["phases"]["p1"]["attempts"], [])
 
     def test_live_slot_cap_rejects_when_no_idle_slot_available(self) -> None:
         spawner = _make_spawner(self)

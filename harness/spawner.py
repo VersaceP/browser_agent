@@ -4,6 +4,7 @@ harness.spawner - Worker BrowserAgent spawning and lifecycle management.
 
 import asyncio
 import json
+import os
 import re
 import time
 from dataclasses import dataclass, field, replace
@@ -13,6 +14,7 @@ from urllib.parse import urlparse
 from abcp_client import ABCPClient, ABCPTransportError
 from harness.constants import (
     WORKER_STATUS_CANCELLED,
+    WORKER_STATUS_DONE,
     WORKER_STATUS_FAILED,
 )
 from harness.diagnostics import status_category
@@ -24,11 +26,13 @@ from harness.schema_cache import global_schemas_dir
 from harness.schema_loader import CapabilityBundle, load_capability_bundle
 from harness.task_control import (
     build_attempt_digest,
+    cancel_phase_running_reservation,
     classification_for_worker_status,
     contract_hash_for_phase,
     mark_phase_result,
     mark_phase_running,
     phase_prior_artifact_paths,
+    phase_start_rejection,
     repeated_phase_attempt_guard,
     validate_worker_artifacts,
 )
@@ -52,6 +56,120 @@ from llm import LLMFactory
 
 
 BrowserAgentFactory = Callable[[Any, ABCPClient, RuntimeConfig, RunLogger], Any]
+
+
+def _prompt_worker_contract(worker_contract: Any) -> JsonDict:
+    """Return the contract view exposed to the worker LLM.
+
+    Top-level underscore-prefixed fields are harness-private provenance/state.
+    Keep them on ``harness.worker_contract`` while excluding them from prompt
+    text so implementation details cannot influence the worker's decisions.
+    """
+    if not isinstance(worker_contract, dict):
+        return {}
+    return {
+        key: value for key, value in worker_contract.items()
+        if not str(key).startswith("_")
+    }
+
+
+def _skill_execution_metadata(skill_outcome: Any) -> JsonDict:
+    if not isinstance(skill_outcome, dict):
+        return {
+            "executionMode": "browser_slow_path",
+            "fastPathRows": 0,
+            "repairRows": 0,
+        }
+    completed_rows = optional_int(skill_outcome.get("completedRows"), 0) or 0
+    if skill_outcome.get("handled"):
+        mode = "skill_fast_path"
+        repair_rows = 0
+    elif isinstance(skill_outcome.get("repair_manifest"), dict):
+        mode = "skill_repair"
+        repairs = skill_outcome["repair_manifest"].get("repairs")
+        repair_rows = len(repairs) if isinstance(repairs, list) else 0
+    else:
+        mode = "browser_slow_path"
+        repair_rows = 0
+    return {
+        "executionMode": mode,
+        "fastPathRows": max(0, completed_rows),
+        "repairRows": repair_rows,
+    }
+
+
+def _effective_worker_status(current_status: str, skill_answer: Any) -> str:
+    # A handled fast path deliberately skips BrowserAgent.run(), whose terminal
+    # transition normally changes the constructor default from running -> done.
+    # Validation remains a separate dimension in validatedStatus.
+    return WORKER_STATUS_DONE if skill_answer is not None else current_status
+
+
+def _finalize_skill_execution_metadata(
+    metadata: JsonDict,
+    harness: Any,
+) -> JsonDict:
+    """Repair mode can disable itself during record_extraction when its trusted
+    baseline becomes unreadable/inconsistent. Re-derive telemetry after the LLM
+    run so reports describe the actual full slow-path replacement, while keeping
+    fastPathRows as useful history.
+    """
+    out = dict(metadata)
+    contract = getattr(harness, "worker_contract", None)
+    manifest = (
+        contract.get("_repair_manifest") if isinstance(contract, dict) else None
+    )
+    disabled_reason = (
+        str(manifest.get("disabledReason") or "").strip()
+        if isinstance(manifest, dict) else ""
+    )
+    if disabled_reason:
+        out["executionMode"] = "browser_slow_path"
+        out["skillRepairFallback"] = True
+        out["repairFallbackReason"] = disabled_reason
+    trace = getattr(harness, "trace", None)
+    selected_workflow_calls = sum(
+        1
+        for item in (trace if isinstance(trace, list) else [])
+        if isinstance(item, dict) and item.get("type") == "execute_selected_skill"
+    )
+    if selected_workflow_calls:
+        # Keep executionMode honest: the BrowserAgent LLM still orchestrated
+        # this path, so it is not the zero-LLM fast path. This companion field
+        # proves the frozen registry recipe ran instead of being reconstructed.
+        out["selectedSkillWorkflowCalls"] = selected_workflow_calls
+        out["skillAssistedSlowPath"] = True
+    return out
+
+
+def _unresolved_repair_visual_evidence(harness: Any) -> List[JsonDict]:
+    contract = getattr(harness, "worker_contract", None)
+    manifest = (
+        contract.get("_repair_manifest") if isinstance(contract, dict) else None
+    )
+    if isinstance(manifest, dict) and manifest.get("disabledReason"):
+        # Full slow-path replacement abandoned the baseline repair contract;
+        # visual obligations tied to that baseline no longer govern completion.
+        return []
+    pending = (
+        manifest.get("visualEvidencePending")
+        if isinstance(manifest, dict) else None
+    )
+    if not isinstance(pending, list) or not pending:
+        return []
+    satisfied = (
+        manifest.get("visualEvidenceSatisfied")
+        if isinstance(manifest, dict) else None
+    )
+    satisfied_signatures = set(satisfied) if isinstance(satisfied, dict) else set()
+    return [
+        dict(item) for item in pending
+        if isinstance(item, dict)
+        and (
+            not str(item.get("signature") or "")
+            or str(item.get("signature")) not in satisfied_signatures
+        )
+    ]
 
 
 @dataclass
@@ -127,10 +245,20 @@ class BrowserAgentSpawner:
         phase_id: Optional[str] = None,
         worker_contract: Optional[JsonDict] = None,
         phase: Optional[JsonDict] = None,
+        task_plan: Optional[JsonDict] = None,
         preferred_slot_id: Optional[str] = None,
         reuse_from_worker_id: Optional[str] = None,
     ) -> JsonDict:
         effective_contract = worker_contract or {}
+        start_rejection = phase_start_rejection(
+            task_plan,
+            self.logger,
+            phase_id=phase_id,
+            worker_contract=effective_contract,
+        )
+        if start_rejection is not None:
+            self.logger.write("spawner.browser.start_rejected", start_rejection)
+            return start_rejection
         current_contract_hash = contract_hash_for_phase(
             phase,
             effective_contract,
@@ -148,6 +276,12 @@ class BrowserAgentSpawner:
 
         worker_id = self._next_id("browser")
         agent_name = name or worker_id
+        mark_phase_running(
+            self.logger,
+            phase_id=phase_id,
+            worker_id=worker_id,
+            worker_name=agent_name,
+        )
         try:
             slot = await self._acquire_slot(
                 worker_id=worker_id,
@@ -161,6 +295,11 @@ class BrowserAgentSpawner:
                 reuse_from_worker_id=reuse_from_worker_id,
             )
         except Exception as exc:
+            cancel_phase_running_reservation(
+                self.logger,
+                phase_id=phase_id,
+                worker_id=worker_id,
+            )
             result = {
                 "status": "failed",
                 "error": str(exc),
@@ -170,6 +309,11 @@ class BrowserAgentSpawner:
             self.logger.write("spawner.slot.acquire_failed", result)
             return result
         if isinstance(slot, dict):
+            cancel_phase_running_reservation(
+                self.logger,
+                phase_id=phase_id,
+                worker_id=worker_id,
+            )
             return slot
 
         expose_reusable_pages = bool(
@@ -190,12 +334,6 @@ class BrowserAgentSpawner:
                 worker_contract=effective_contract,
                 phase=phase or {},
             )
-        )
-        mark_phase_running(
-            self.logger,
-            phase_id=phase_id,
-            worker_id=worker_id,
-            worker_name=agent_name,
         )
         self._handles[worker_id] = BrowserAgentHandle(
             worker_id=worker_id,
@@ -1222,9 +1360,12 @@ class BrowserAgentSpawner:
         task: str,
         context: str,
         fleet_ids: List[str],
-    ) -> Optional[str]:
-        """Attempt a matching skill's fast path. Returns the worker answer if the
-        skill handled the task, else None (caller runs the normal LLM loop).
+    ) -> Optional[JsonDict]:
+        """Attempt a matching skill's fast path. Returns the dispatch outcome:
+        {"handled": True, "answer": ...} when the skill completed the task,
+        {"handled": False, "handoff_note": ...} when a batch run stopped mid-way
+        (completed rows persisted; the note tells the slow path what remains),
+        or None (caller runs the normal LLM loop with the original task).
         Any error falls back to the LLM loop — must never break the worker."""
         if not getattr(self.runtime.harness, "skill_fast_path_enabled", True):
             return None
@@ -1249,9 +1390,7 @@ class BrowserAgentSpawner:
         except Exception as exc:  # any failure → normal loop
             self.logger.write("skill.fast_path.error", {"error": str(exc)})
             return None
-        if outcome and outcome.get("handled"):
-            return outcome.get("answer")
-        return None
+        return outcome
 
     async def _maybe_autoheal_skill(
         self,
@@ -1272,6 +1411,21 @@ class BrowserAgentSpawner:
             return
         if not getattr(self.runtime.harness, "skill_auto_heal_enabled", True):
             return
+        try:
+            # 07-07: a directly forced skill takes health OUT of the loop —
+            # dispatch stopped recording, and health-driven autoheal must not
+            # fire either. A suite route is different: its four-dimensional
+            # phase match is exact, so it remains eligible for health/autoheal.
+            from harness.skill.contract import is_suite_routed
+            from harness.skill.dispatch import _is_explicit_selection
+            suite_routed = is_suite_routed(worker_contract or {})
+            # An exact suite route is health-managed and may autoheal after a
+            # degraded workflow falls back successfully. A direct force remains
+            # outside both health accounting and health-driven autoheal.
+            if not suite_routed and _is_explicit_selection(worker_contract or {}):
+                return
+        except Exception:  # pragma: no cover - guard must never break the worker
+            return
         registry = self._get_skill_registry()
         if registry is None or not registry.all():
             return
@@ -1282,6 +1436,7 @@ class BrowserAgentSpawner:
 
             skill, canary_variables = resolve_skill_and_variables(
                 registry, worker_contract, phase=phase, task=task, context=context,
+                mode=str(getattr(self.runtime.harness, "skill_selection_mode", "manual") or "manual"),
             )
             if skill is None:
                 return
@@ -1295,6 +1450,35 @@ class BrowserAgentSpawner:
             )
         except Exception as exc:  # self-heal must never break the worker
             self.logger.write("skill.autoheal.error", {"error": str(exc)})
+
+    def _record_guidance_signal(
+        self,
+        *,
+        worker_contract: JsonDict,
+        fast_path_handled: bool,
+        validated_ok: bool,
+        steps: int,
+        answer: str,
+    ) -> None:
+        """Guidance（hints）层的防腐弱信号：结局 + 步数 + answer 里的
+        guidance_stale 上报 → skills/.guidance_health.json（独立软通道，只标
+        needs_review 供人工复审，永不禁用）。record_guidance_outcome 只接受
+        suite_routed；直接强制单个 guidance 不记。Best-effort，绝不影响结果。"""
+        if not getattr(self.runtime.harness, "skill_guidance_signal_enabled", True):
+            return
+        try:
+            from harness.skill.guidance import record_guidance_outcome
+            record_guidance_outcome(
+                self._get_skill_registry(),
+                worker_contract,
+                validated_ok=validated_ok,
+                fast_path_handled=fast_path_handled,
+                steps=steps,
+                answer=answer,
+                logger=self.logger,
+            )
+        except Exception as exc:  # weak signal must never break the worker
+            self.logger.write("skill.guidance.signal_error", {"error": str(exc)})
 
     async def _run_browser_worker(
         self,
@@ -1358,11 +1542,12 @@ class BrowserAgentSpawner:
                 skill_context = ""
             if skill_context:
                 effective_context = f"{effective_context}\n\n{skill_context}".strip()
+            prompt_worker_contract = _prompt_worker_contract(worker_contract)
             worker_task = (
                 f"BrowserAgent name: {name}\n"
                 f"Independent context:\n{effective_context}\n\n"
                 f"<worker_contract>\n"
-                f"{json.dumps(worker_contract or {}, ensure_ascii=False, indent=2, default=str)}\n"
+                f"{json.dumps(prompt_worker_contract, ensure_ascii=False, indent=2, default=str)}\n"
                 f"</worker_contract>\n\n"
                 f"Result contract:\n{result_contract or 'Return a structured JSON string containing outcome, data, evidence, next_steps.'}\n\n"
                 f"Assigned task:\n{task}"
@@ -1372,7 +1557,7 @@ class BrowserAgentSpawner:
             harness.preloaded_registration = registration
             harness.preloaded_capability_bundle = bundle
 
-            skill_answer = await self._try_skill_fast_path(
+            skill_outcome = await self._try_skill_fast_path(
                 harness,
                 worker_contract=worker_contract or {},
                 phase=phase or {},
@@ -1380,10 +1565,36 @@ class BrowserAgentSpawner:
                 context=effective_context,
                 fleet_ids=sorted(slot.fleet_ids),
             )
+            skill_answer = (
+                skill_outcome.get("answer")
+                if skill_outcome and skill_outcome.get("handled")
+                else None
+            )
+            execution_metadata = _skill_execution_metadata(skill_outcome)
             if skill_answer is not None:
                 answer = skill_answer
+                harness.final_status = _effective_worker_status(
+                    harness.final_status, skill_answer,
+                )
             else:
+                # A batch fast path that stopped mid-way hands its progress to the
+                # slow path: completed rows are already persisted, the note says
+                # which rows remain and how to merge into ONE final artifact.
+                handoff_note = str((skill_outcome or {}).get("handoff_note") or "")
+                if handoff_note:
+                    repair_manifest = (skill_outcome or {}).get("repair_manifest")
+                    if isinstance(repair_manifest, dict):
+                        harness.worker_contract = {
+                            **(harness.worker_contract or {}),
+                            "_repair_manifest": dict(repair_manifest),
+                        }
+                    worker_task = (
+                        f"{worker_task}\n\nSKILL FAST-PATH BATCH HANDOFF:\n{handoff_note}"
+                    )
                 answer = await harness.run(worker_task)
+            execution_metadata = _finalize_skill_execution_metadata(
+                execution_metadata, harness,
+            )
             trace_path = self._write_worker_trace(worker_id, harness.trace)
             trace_summary = self._summarize_worker_trace(harness.trace)
             challenge_tracker = getattr(harness, "challenge_tracker", None)
@@ -1407,6 +1618,21 @@ class BrowserAgentSpawner:
                 ),
                 task_dir=self.logger.task_dir,
             )
+            unresolved_visual = _unresolved_repair_visual_evidence(harness)
+            if unresolved_visual:
+                artifact_validation["status"] = "failed"
+                failures = artifact_validation.get("failures")
+                if not isinstance(failures, list):
+                    failures = []
+                    artifact_validation["failures"] = failures
+                failures.append({
+                    "type": "repair_absence_visual_evidence",
+                    "message": (
+                        "repair marked fields confirmed_absent but completed no"
+                        " visual_verify before worker termination"
+                    ),
+                    "pending": unresolved_visual,
+                })
             terminal_classification = classification_for_worker_status(
                 harness.final_status
             )
@@ -1416,9 +1642,28 @@ class BrowserAgentSpawner:
                 feedback_classification = _worker_feedback_classification(
                     harness.trace,
                     answer,
+                    persisted_artifacts=[
+                        *list(getattr(harness, "artifacts", []) or []),
+                        *list(
+                            getattr(harness, "extraction_attempt_artifacts", [])
+                            or []
+                        ),
+                    ],
                 )
                 if feedback_classification is not None:
                     artifact_validation["classification"] = feedback_classification
+                    if feedback_classification.get("evidenceGate"):
+                        self.logger.write("semantic_terminal.evidence_gate", {
+                            "workerId": worker_id,
+                            "phaseId": phase_id,
+                            "claimedCategory": feedback_classification.get(
+                                "claimedCategory"
+                            ),
+                            "category": feedback_classification.get("category"),
+                            "evidenceGate": feedback_classification.get(
+                                "evidenceGate"
+                            ),
+                        })
             validated_status = (
                 "validated_done"
                 if artifact_validation.get("status") == "done"
@@ -1439,11 +1684,19 @@ class BrowserAgentSpawner:
                 context=effective_context,
                 fleet_ids=sorted(slot.fleet_ids),
             )
+            self._record_guidance_signal(
+                worker_contract=worker_contract or {},
+                fast_path_handled=skill_answer is not None,
+                validated_ok=validated_status == "validated_done",
+                steps=int(trace_summary.get("toolCalls") or 0),
+                answer=str(answer or ""),
+            )
             diagnostics = getattr(harness, "diagnostics", None)
             result = {
                 "status": harness.final_status,
                 "statusCategory": status_category(harness.final_status),
                 "validatedStatus": validated_status,
+                **execution_metadata,
                 "workerId": worker_id,
                 "agentId": slot.agent_id,
                 "slotId": slot.slot_id,
@@ -1573,6 +1826,8 @@ class BrowserAgentSpawner:
             validation=result.get("artifactValidation"),
             result_status=phase_result_status,
             attempt_digest=attempt_digest,
+            phase=phase,
+            worker_contract=worker_contract,
         )
         append_strategy_attempt(
             logger=self.logger,
@@ -1964,6 +2219,7 @@ def _state_response_indicates_paused(value: Any) -> bool:
 def _worker_feedback_classification(
     trace: List[JsonDict],
     answer: str,
+    persisted_artifacts: Optional[List[str]] = None,
 ) -> Optional[JsonDict]:
     """Recover route-relevant classifications from worker feedback.
 
@@ -1978,7 +2234,10 @@ def _worker_feedback_classification(
     browser_call_classification = _classification_from_browser_call(trace)
     if browser_call_classification is not None:
         return browser_call_classification
-    return _classification_from_final_answer(answer)
+    return _classification_from_final_answer(
+        answer,
+        persisted_artifacts=persisted_artifacts,
+    )
 
 
 def _classification_from_browser_call(
@@ -2042,7 +2301,76 @@ def _classification_from_contract_violation(
     return None
 
 
-def _classification_from_final_answer(answer: str) -> Optional[JsonDict]:
+# Evidence gate (A + B3) for semantic-terminal blockers. A: the blocker must
+# carry reason text. B3: evidenceArtifacts must name at least one savedPath
+# the harness itself recorded via record_extraction this run — we trust the
+# harness ledger, never the filesystem or the model's claim, so a fabricated
+# path can not mint a terminal verdict. Failure costs are asymmetric: a false
+# terminal silently blocks dependents and tells the user their instruction is
+# wrong, while a false downgrade just spends another attempt — so the gate
+# fails closed toward "not terminal".
+_SEMANTIC_TERMINAL_MIN_REASON_CHARS = 40
+
+
+def _blocker_evidence_paths(
+    blocker: JsonDict,
+    classification: JsonDict,
+) -> List[str]:
+    raw = blocker.get("evidenceArtifacts")
+    if not isinstance(raw, list):
+        raw = classification.get("evidenceArtifacts")
+    if not isinstance(raw, list):
+        return []
+    return [str(item).strip() for item in raw if str(item).strip()]
+
+
+def _semantic_terminal_evidence_failure(
+    category: str,
+    blocker: JsonDict,
+    classification: JsonDict,
+    persisted_artifacts: Optional[List[str]],
+) -> Optional[str]:
+    """Return None when the semantic-terminal claim may go terminal, else a
+    short human-readable reason why it must be downgraded to retryable."""
+    reason_text = str(
+        blocker.get("reason")
+        or classification.get("reason")
+        or blocker.get("message")
+        or blocker.get("detail")
+        or ""
+    ).strip()
+    if not reason_text:
+        return "blocker carries no reason text"
+    evidence_paths = _blocker_evidence_paths(blocker, classification)
+    ledger = {
+        os.path.normpath(str(path).strip())
+        for path in (persisted_artifacts or [])
+        if str(path).strip()
+    }
+    if any(os.path.normpath(path) in ledger for path in evidence_paths):
+        return None
+    if category == "instruction_infeasible":
+        # Infeasibility often has nothing extractable to persist (the site
+        # lacks the requested concept entirely), so a substantive reason is
+        # acceptable evidence on its own.
+        if len(reason_text) >= _SEMANTIC_TERMINAL_MIN_REASON_CHARS:
+            return None
+        return (
+            "no evidenceArtifacts entry matches a record_extraction savedPath"
+            " from this run, and the reason text is too thin to stand alone"
+        )
+    if not evidence_paths:
+        return "no evidenceArtifacts listed"
+    return (
+        "no evidenceArtifacts entry matches a record_extraction savedPath"
+        " from this run"
+    )
+
+
+def _classification_from_final_answer(
+    answer: str,
+    persisted_artifacts: Optional[List[str]] = None,
+) -> Optional[JsonDict]:
     try:
         payload = json.loads(str(answer or ""))
     except (TypeError, json.JSONDecodeError):
@@ -2060,13 +2388,45 @@ def _classification_from_final_answer(answer: str) -> Optional[JsonDict]:
             category = str(raw_classification.get("category") or "").strip()
             classification = dict(raw_classification)
         else:
-            category = str(raw_classification or "").strip()
+            # Models phrase the blocker several ways; accept a top-level
+            # "category" key too so a semantic-terminal report is not
+            # silently dropped back into the retry loop.
+            category = str(
+                raw_classification
+                or blocker.get("category")
+                or blocker.get("type")
+                or ""
+            ).strip()
             classification = {"category": category}
         if category not in {
             "blocked_cross_task_type_required",
             "blocked_infrastructure",
+            "target_absent",
+            "instruction_infeasible",
         }:
             continue
+        if category in {"target_absent", "instruction_infeasible"}:
+            gate_failure = _semantic_terminal_evidence_failure(
+                category,
+                blocker,
+                classification,
+                persisted_artifacts,
+            )
+            if gate_failure is not None:
+                # Downgrade, never drop silently: keep the claim visible so
+                # the Lead/next worker can persist evidence and re-declare,
+                # but do not let it mint a terminal phase status.
+                classification["category"] = f"{category}_unverified"
+                classification["claimedCategory"] = category
+                classification["evidenceGate"] = gate_failure
+                classification.setdefault("hint", (
+                    f"Worker claimed {category} but the evidence gate failed:"
+                    f" {gate_failure}. Persist the observed evidence via"
+                    " record_extraction and re-declare with its savedPath in"
+                    " evidenceArtifacts, or keep working the phase."
+                )[:500])
+                classification["source"] = "final_answer.blockers"
+                return classification
         hint = (
             blocker.get("hint")
             or blocker.get("message")
@@ -2075,7 +2435,12 @@ def _classification_from_final_answer(answer: str) -> Optional[JsonDict]:
                 "Browser infrastructure failed; reconnect/rebuild the Browser"
                 " Client before retrying."
                 if category == "blocked_infrastructure"
-                else "LeadAgent should replan with a task_type that permits the required method."
+                else (
+                    "LeadAgent should stop retrying the same target and ask the"
+                    " user to revise the range/source."
+                    if category in {"target_absent", "instruction_infeasible"}
+                    else "LeadAgent should replan with a task_type that permits the required method."
+                )
             )
         )
         classification.setdefault("hint", str(hint)[:500])

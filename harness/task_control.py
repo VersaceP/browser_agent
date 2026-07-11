@@ -35,6 +35,39 @@ from harness.utils import JsonDict, RunLogger, safe_path_component, trim_large_s
 TASK_PLAN_FILE = "task_plan.json"
 TASK_STATE_FILE = "task_state.json"
 REPEAT_GUARD_REJECTION_LOCK_THRESHOLD = 3
+SEMANTIC_TERMINAL_CLASSIFICATIONS = frozenset({
+    "target_absent",
+    "instruction_infeasible",
+})
+TERMINAL_PHASE_STATUSES = frozenset({
+    "validated_done",
+    "phase_failed",
+    "blocked_by_challenge",
+    "hitl_required",
+    "hitl_timeout",
+    "page_settled_after_hitl",
+    "stale_pause_deadlock",
+    "target_absent",
+    "instruction_infeasible",
+    "blocked_by_dependency",
+})
+BLOCKING_DEPENDENCY_STATUSES = TERMINAL_PHASE_STATUSES - {"validated_done"}
+# Statuses a replan resets to a clean slate. phase_failed is the Lead's
+# explicit retry-via-replan path. blocked_by_dependency is DERIVED state:
+# every blocking dependency status is itself terminal, so the only way the
+# dependency recovers is a replan — preserving the stale marker across that
+# replan would deadlock the dependent phase forever (next_pending_phase
+# skips terminal statuses and never re-derives them). Reset it and let the
+# new plan re-derive blocking from the (possibly fixed) dependency.
+REPLAN_RESET_STATUSES = frozenset({"phase_failed", "blocked_by_dependency"})
+# Cross-replan failure budget for one OBJECTIVE (see objective_fingerprint):
+# per-phase max_attempts is escapable by replanning under a fresh phase id
+# (attempts reset with the new id — the 2cb616 v1→v2→v3 loop), so failures
+# are also accumulated per objective fingerprint, which survives replans.
+# The budget counts ATTEMPTS, not phase ids: after 6 same-objective failures
+# no new phase id gets more budget (how many ids that spans depends on when
+# the Lead replans).
+OBJECTIVE_MAX_ATTEMPTS = 6
 
 AXTREE_ID_ANYWHERE_RE = re.compile(r"\b\d+:-?\d+:-?\d+\b")
 VOLATILE_HANDLE_KEYS = {
@@ -105,9 +138,57 @@ VALIDATOR_TYPES = {
     "field_provenance",
 }
 
+# High-frequency intuitive names models emit before learning the canonical
+# enum (task 9d5655d3 burned two plan rejections on exactly these guesses).
+# Normalized with a visible warning receipt (validator_type_alias) — never
+# silently: the emit_task_plan schema enum is the primary fix, this is the
+# fallback for gateway models that ignore input_schema.
+VALIDATOR_TYPE_ALIASES = {
+    "url_format": "url_pattern",
+    "rank_range": "range",
+    "value_range": "range",
+    "no_duplicates": "unique",
+    "unique_fields": "unique",
+}
+
 
 def utc_now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+
+def _validated_task_type(
+    raw: Any,
+    *,
+    errors: List[str],
+    warnings: List[JsonDict],
+    where: str,
+) -> str:
+    """Alias-normalize + membership-check ONE task_type field ('' when absent).
+    Unknown values must error everywhere the field is accepted: the policy
+    layer looks task_type up (TASK_TYPE_DISABLED_DOMAINS.get) and an unknown
+    value silently disables NOTHING — a typo would grant a worker every method
+    domain (review P2: worker_contract.task_type was never checked)."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    canonical = normalize_task_type(text)
+    if canonical != text:
+        warnings.append({
+            "type": "task_type_alias",
+            "field": where,
+            "input": text,
+            "canonical": canonical,
+            "message": (
+                f"{where}: {text!r} is accepted as an alias; use canonical"
+                f" task_type {canonical!r} in future plans."
+            ),
+        })
+        text = canonical
+    if text not in VALID_TASK_TYPES:
+        errors.append(
+            f"{where} must be one of {task_type_choices_for_error()}; got {text!r}"
+        )
+    return text
 
 
 def validate_task_plan(
@@ -116,11 +197,16 @@ def validate_task_plan(
     known_abcp_methods: Optional[AbstractSet[str]] = None,
     known_harness_tools: Optional[AbstractSet[str]] = None,
 ) -> Tuple[Optional[JsonDict], List[str]]:
-    """Validate and normalize the v1 linear task plan.
+    """Validate and normalize the v1 task plan.
 
-    v1 intentionally supports a linear phase list only. `depends_on` and
-    `fanout_from` may be present for forward compatibility, but execution does
-    not schedule DAG fan-out yet.
+    Scheduling is a dependency gate, not a scheduler: `depends_on` OMITTED ⇒
+    the phase implicitly depends on all prior phases in plan order (strict
+    serial, the conservative default); `depends_on=[]` ⇒ explicitly
+    independent; `depends_on=[ids]` ⇒ exactly those. Phases whose dependencies
+    are all validated_done can be spawned concurrently by the Lead. A phase
+    whose dependency ended in a blocking terminal status is marked
+    blocked_by_dependency instead of being spawned. `fanout_from` remains
+    forward-compat only.
     """
     errors: List[str] = []
     if not isinstance(raw_plan, dict):
@@ -139,21 +225,8 @@ def validate_task_plan(
         )
         task_type = "general"
     else:
-        canonical = normalize_task_type(task_type)
-        if canonical != task_type:
-            warnings.append({
-                "type": "task_type_alias",
-                "input": task_type,
-                "canonical": canonical,
-                "message": (
-                    f"task_type {task_type!r} is accepted as an alias; use"
-                    f" canonical task_type {canonical!r} in future plans."
-                ),
-            })
-            task_type = canonical
-    if task_type not in VALID_TASK_TYPES:
-        errors.append(
-            f"task_type must be one of {task_type_choices_for_error()}; got {task_type!r}"
+        task_type = _validated_task_type(
+            task_type, errors=errors, warnings=warnings, where="task_type",
         )
 
     raw_phases = raw_plan.get("phases")
@@ -211,11 +284,19 @@ def validate_task_plan(
         if validators is not None and not isinstance(validators, list):
             errors.append(f"phase {phase_id}: validators must be an array")
             validators = []
-        validators = _normalize_validators(
+        expected_artifact = _normalize_expected_artifact_contract(
             expected_artifact if isinstance(expected_artifact, dict) else {},
             validators,
             errors,
+            warnings,
             phase_id=phase_id,
+        )
+        validators = _normalize_validators(
+            expected_artifact,
+            validators,
+            errors,
+            phase_id=phase_id,
+            warnings=warnings,
         )
 
         worker_contract = raw_phase.get("worker_contract")
@@ -229,18 +310,41 @@ def validate_task_plan(
                 phase_id=phase_id,
                 known_abcp_methods=known_abcp_methods,
                 known_harness_tools=known_harness_tools,
+                warnings=warnings,
             )
+            if worker_contract.get("task_type") is not None:
+                worker_contract["task_type"] = _validated_task_type(
+                    worker_contract.get("task_type"),
+                    errors=errors,
+                    warnings=warnings,
+                    where=f"phase {phase_id}: worker_contract.task_type",
+                )
+
+        # phase_contract consumes phase.task_type (contract > phase > plan),
+        # but normalization used to drop it silently — a per-phase override
+        # the model emitted at the sanctioned granularity simply vanished
+        # (review P2). Preserve it, validated.
+        phase_task_type = _validated_task_type(
+            raw_phase.get("task_type"),
+            errors=errors,
+            warnings=warnings,
+            where=f"phase {phase_id}: task_type",
+        )
 
         phases.append({
             "id": phase_id,
             "type": phase_type,
+            "task_type": phase_task_type or None,
             "objective": objective,
             "worker_task": worker_task,
             "stage_hint": stage_hint,
             "stage_hint_reason": stage_hint_reason,
             "context": str(raw_phase.get("context") or ""),
             "max_steps": raw_phase.get("max_steps"),
-            "depends_on": raw_phase.get("depends_on") or [],
+            # None (omitted) and [] (explicitly independent) mean DIFFERENT
+            # schedules — `or []` used to collapse both into [], erasing the
+            # planner's only syntax for parallel phases (task 2ed5a466).
+            "depends_on": _normalized_depends_on(raw_phase.get("depends_on")),
             "fanout_from": raw_phase.get("fanout_from"),
             "join": raw_phase.get("join"),
             "expected_artifact": expected_artifact,
@@ -249,6 +353,22 @@ def validate_task_plan(
             "worker_contract": worker_contract or {},
             "max_attempts": _positive_int(raw_phase.get("max_attempts"), default=3),
         })
+
+    # depends_on must reference declared phase ids: an unknown id resolves to
+    # dependency_not_ready (non-blocking) at schedule time, so the phase would
+    # be skipped forever with no signal — reject the plan instead.
+    for phase in phases:
+        phase_id = str(phase.get("id"))
+        for dep_id in _phase_dependency_ids(phase) or []:
+            if dep_id == phase_id:
+                errors.append(
+                    f"phase {phase_id}: depends_on must not reference itself"
+                )
+            elif dep_id not in seen_ids:
+                errors.append(
+                    f"phase {phase_id}: depends_on references unknown phase"
+                    f" id {dep_id!r}"
+                )
 
     normalized = {
         "version": "v1",
@@ -270,7 +390,15 @@ def _validate_worker_contract_methods(
     phase_id: str,
     known_abcp_methods: Optional[AbstractSet[str]],
     known_harness_tools: Optional[AbstractSet[str]],
+    warnings: Optional[List[JsonDict]] = None,
 ) -> None:
+    """allowed_methods (allow-list): an unknown name is a probable typo that
+    would silently forbid the method the planner MEANT to allow — fail loud.
+    forbidden_methods (deny-list): forbidding a method that does not exist is
+    a no-op — rejecting the whole plan over it cost task 2ed5a466 a full plan
+    round-trip on 'Download.save' (×4 phases). Unknown deny entries are
+    DROPPED with a warning receipt instead; task_type policy already disables
+    whole method domains worker-side, so the deny-list is only ever an extra."""
     harness_tools = known_harness_tools or set()
     for key in ("allowed_methods", "forbidden_methods"):
         raw_methods = worker_contract.get(key)
@@ -279,24 +407,71 @@ def _validate_worker_contract_methods(
         if not isinstance(raw_methods, list):
             errors.append(f"phase {phase_id}: worker_contract.{key} must be an array")
             continue
+        tolerant = key == "forbidden_methods"
+        kept: List[Any] = []
+
+        def _unknown(method: str) -> None:
+            if tolerant:
+                if warnings is not None:
+                    warnings.append({
+                        "type": "unknown_forbidden_method_dropped",
+                        "phase": phase_id,
+                        "method": method,
+                        "note": (
+                            "Not a known method, so it forbids nothing —"
+                            " dropped. task_type policy already disables whole"
+                            " method domains worker-side; use canonical names"
+                            " or Domain.* wildcards for extra restrictions."
+                        ),
+                    })
+                return
+            errors.append(
+                f"phase {phase_id}: unknown method in worker_contract.{key}: {method!r}"
+            )
+
         for raw_method in raw_methods:
             method = str(raw_method or "").strip()
             if not method:
                 continue
-            if "*" in method:
-                continue
-            if method in harness_tools:
+            if "*" in method or method in harness_tools:
+                kept.append(method)
                 continue
             if known_abcp_methods is not None:
                 if method not in known_abcp_methods:
-                    errors.append(
-                        f"phase {phase_id}: unknown method in worker_contract.{key}: {method!r}"
-                    )
+                    _unknown(method)
+                    continue
+                kept.append(method)
                 continue
             if "." not in method:
-                errors.append(
-                    f"phase {phase_id}: unknown harness tool in worker_contract.{key}: {method!r}"
-                )
+                if tolerant:
+                    _unknown(method)
+                else:
+                    errors.append(
+                        f"phase {phase_id}: unknown harness tool in worker_contract.{key}: {method!r}"
+                    )
+                continue
+            # Dotted method with no schema cache to check against: keep it.
+            kept.append(method)
+        if tolerant:
+            worker_contract[key] = kept
+
+
+def _first_valid_task_type(*candidates: Any) -> str:
+    """First candidate that normalizes to a KNOWN task_type ('general' when
+    none does). The policy layer is a dict lookup that fail-opens on unknown
+    values — an unknown task_type disables NOTHING — so garbage at a
+    higher-precedence level must fall through to the validated level below
+    it instead of reaching the policy (review: a spawn override typo
+    'scraping' re-enabled Download.* on a web_scrape phase; phase_contract
+    has no error channel, so it degrades instead of rejecting — the spawn
+    tool boundary rejects loud)."""
+    for candidate in candidates:
+        if candidate is None or str(candidate).strip() == "":
+            continue
+        canonical = normalize_task_type(candidate)
+        if canonical in VALID_TASK_TYPES:
+            return canonical
+    return "general"
 
 
 def phase_contract(
@@ -342,11 +517,10 @@ def phase_contract(
     payload: JsonDict = {
         "version": "v1",
         "phase_id": phase_id,
-        "task_type": normalize_task_type(
-            contract.get("task_type")
-            or phase.get("task_type")
-            or default_task_type
-            or "general"
+        "task_type": _first_valid_task_type(
+            contract.get("task_type"),
+            phase.get("task_type"),
+            default_task_type,
         ),
         "stage_hint": str(contract.get("stage_hint") or phase.get("stage_hint") or "generic"),
         "stage_hint_reason": str(
@@ -355,6 +529,12 @@ def phase_contract(
             or ""
         ),
         "objective": str(contract.get("objective") or phase.get("objective") or ""),
+        # Passed through for downstream consumers that need the concrete task
+        # phrasing (e.g. the VL reality check synthesizes its claim from the
+        # contract and falls back to worker_task when objective is generic).
+        "worker_task": str(
+            contract.get("worker_task") or phase.get("worker_task") or ""
+        ),
         "input_artifacts": contract.get("input_artifacts") or [],
         "expected_artifact": expected_artifact,
         "validators": validators,
@@ -382,7 +562,7 @@ def phase_contract(
     # skill_selection={"use_skill": false} (decline) never reached the dispatch
     # gate and spawn_browser_agent kept re-returning skill_selection_required
     # (an unbreakable loop for the Lead). Preserve them verbatim when present.
-    for skill_key in ("skill_id", "skill_variables", "skill_selection", "domain"):
+    for skill_key in ("skill_id", "skill_variables", "skill_rows", "skill_selection", "domain"):
         value = contract.get(skill_key)
         if value is not None:
             payload[skill_key] = value
@@ -416,6 +596,10 @@ def initialize_task_state(
             "at": utc_now_iso(),
             "reason": replan_reason,
             "preserved_phases": [],
+            # Historic key name; holds every REPLAN_RESET_STATUSES reset
+            # (phase_failed AND blocked_by_dependency — see each entry's
+            # previousStatus). Kept as-is so old and new replan entries in
+            # the same task_state stay grep-able under one key.
             "reset_phase_failed": [],
             "new_phases": [],
             "removed_phases": sorted(
@@ -431,7 +615,7 @@ def initialize_task_state(
         previous = previous_phases.get(phase_id)
         if isinstance(previous, dict):
             previous_status = str(previous.get("status") or "")
-            if previous_status == "phase_failed":
+            if previous_status in REPLAN_RESET_STATUSES:
                 phases_state[phase_id] = _empty_phase_state()
                 if replan_audit is not None:
                     replan_audit["reset_phase_failed"].append({
@@ -474,6 +658,11 @@ def initialize_task_state(
         "failed_items": list((preserve_from or {}).get("failed_items") or []),
         "banned_strategies": list((preserve_from or {}).get("banned_strategies") or []),
         "quality": dict((preserve_from or {}).get("quality") or {}),
+        # Survives replans BY DESIGN: this is the whole point of the
+        # objective-level budget — a fresh phase id must not reset it.
+        "objective_attempts": dict(
+            (preserve_from or {}).get("objective_attempts") or {}
+        ),
     }
     if preserve_from is not None:
         state["replans"] = list((preserve_from or {}).get("replans") or [])
@@ -527,7 +716,7 @@ def _first_active_phase_id(plan: JsonDict, phases_state: JsonDict) -> Optional[s
             if isinstance(phases_state.get(phase_id), dict)
             else None
         )
-        if status not in {"validated_done", "phase_failed"}:
+        if status not in TERMINAL_PHASE_STATUSES:
             return phase_id
     return _first_phase_id(plan)
 
@@ -587,6 +776,156 @@ def contract_hash_for_phase(
         separators=(",", ":"),
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+_SOURCE_URL_RE = re.compile(r"https?://[^\s\"'<>\)\]]+")
+
+
+def _normalized_source_urls(*texts: Any) -> List[str]:
+    """Normalized source identities mentioned by a phase (host+path, scheme/
+    www/query/trailing-slash and trailing sentence punctuation stripped).
+    Bounded and sorted for stability.
+
+    Caveat (by design): URLs are regex-extracted from natural-language
+    worker_task/objective text, so this dimension is only as stable as the
+    Lead's phrasing — it is an AUXILIARY discriminator (so "same range,
+    different source" unlocks the budget). The primary objective key remains
+    the numeric validators + artifact name."""
+    urls: Set[str] = set()
+    for text in texts:
+        for raw in _SOURCE_URL_RE.findall(str(text or "")):
+            # Regex capture over prose swallows sentence punctuation:
+            # "... from https://x/trending/week/." must not mint a fresh
+            # fingerprint via that trailing dot.
+            parsed = urlparse(raw.rstrip(".,;:!?)"))
+            host = str(parsed.netloc or "").lower()
+            if host.startswith("www."):
+                host = host[4:]
+            if not host:
+                continue
+            path = str(parsed.path or "").rstrip("/")
+            urls.add(f"{host}{path}")
+    return sorted(urls)[:3]
+
+
+def _fingerprint_num(value: Any) -> Any:
+    """Numeric normalization so 40 and "40" fingerprint identically."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return int(number) if number == int(number) else number
+
+
+def objective_fingerprint(
+    phase: Optional[JsonDict],
+    worker_contract: Optional[JsonDict] = None,
+) -> str:
+    """Cross-replan identity of WHAT a phase is trying to obtain.
+
+    Phase ids and artifact names drift across replans (2cb616:
+    collect_trending_40_50 → _v2 → _v3, trending_week_40_50 →
+    trending_week_products_40_50) while the actual objective — "rows with
+    rank 40-50, exactly 11 of them, from theresanaiforthat.com/trending/week"
+    — stays identical. The key combines the normalized source URLs with the
+    numeric validator features (range bounds, expected row counts); the
+    normalized artifact name is the fallback when a phase carries no numeric
+    target. Changing any of these means genuinely changing the objective
+    (different source, different range, different artifact), which is
+    exactly when the accumulated budget should reset.
+
+    When the Lead spawns with a worker_contract override, THAT is what the
+    worker actually runs — its expected_artifact/validators/texts take
+    precedence over the raw phase (same merge semantics as phase_contract),
+    so the gate and the execution stay in sync.
+    Returns "" (no fingerprint, never gated) when nothing usable exists.
+    """
+    if not isinstance(phase, dict):
+        return ""
+    contract = worker_contract if isinstance(worker_contract, dict) else {}
+    expected = dict(
+        phase.get("expected_artifact")
+        if isinstance(phase.get("expected_artifact"), dict) else {}
+    )
+    contract_expected = contract.get("expected_artifact")
+    if isinstance(contract_expected, dict):
+        expected.update(contract_expected)
+    validators = (
+        contract.get("validators")
+        if isinstance(contract.get("validators"), list)
+        else phase.get("validators")
+    )
+    sources = _normalized_source_urls(
+        contract.get("worker_task") or phase.get("worker_task"),
+        contract.get("objective") or phase.get("objective"),
+    )
+    ranges: List[List[Any]] = []
+    counts: List[List[Any]] = []
+    for validator in validators if isinstance(validators, list) else []:
+        if not isinstance(validator, dict):
+            continue
+        vtype = str(validator.get("type") or "")
+        if vtype == "range":
+            ranges.append([
+                str(validator.get("field") or ""),
+                _fingerprint_num(validator.get("min")),
+                _fingerprint_num(validator.get("max")),
+            ])
+        elif vtype in {"exact_rows", "min_rows"}:
+            for key in ("value", "count", "exact", "min"):
+                value = validator.get(key)
+                if value is None:
+                    continue
+                # Same tolerance as _run_validator's _positive_int: a
+                # string "11" validates identically to 11, so it must
+                # fingerprint identically too.
+                normalized = _fingerprint_num(value)
+                if isinstance(normalized, (int, float)) and normalized:
+                    counts.append([vtype, int(normalized)])
+                    break
+    name = str(expected.get("name") or "").strip().lower()
+    name = re.sub(r"[_-]v\d+$", "", name)
+    name = re.sub(r"[^a-z0-9]+", "_", name).strip("_")
+    ranges.sort()
+    counts.sort()
+    if ranges:
+        features: List[Any] = ["ranges", sources, ranges, counts]
+    elif counts and name:
+        # Counts alone are too weak (two detail phases may both expect 4
+        # rows); anchor them with the name.
+        features = ["named_counts", sources, name, counts]
+    elif name:
+        features = ["name", sources, name]
+    else:
+        return ""
+    blob = json.dumps(features, sort_keys=True, default=str)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
+
+
+def _record_objective_attempt(
+    state: JsonDict,
+    phase: Optional[JsonDict],
+    phase_id: str,
+    *,
+    succeeded: bool,
+    worker_contract: Optional[JsonDict] = None,
+) -> None:
+    fingerprint = objective_fingerprint(phase, worker_contract)
+    if not fingerprint:
+        return
+    attempts = state.setdefault("objective_attempts", {})
+    if succeeded:
+        attempts.pop(fingerprint, None)
+        return
+    entry = attempts.get(fingerprint)
+    if not isinstance(entry, dict):
+        entry = {"count": 0, "phaseIds": []}
+        attempts[fingerprint] = entry
+    entry["count"] = int(entry.get("count") or 0) + 1
+    phase_ids = entry.setdefault("phaseIds", [])
+    if phase_id not in phase_ids:
+        phase_ids.append(phase_id)
+    entry["updated_at"] = utc_now_iso()
 
 
 def build_attempt_digest(
@@ -982,6 +1321,33 @@ def mark_phase_running(
     write_task_state(logger, state)
 
 
+def cancel_phase_running_reservation(
+    logger: RunLogger,
+    *,
+    phase_id: Optional[str],
+    worker_id: str,
+) -> None:
+    if not phase_id:
+        return
+    state = load_task_state(logger)
+    phase_state = _phase_state(state, phase_id)
+    if phase_state is None:
+        return
+    attempts = phase_state.get("attempts")
+    if isinstance(attempts, list):
+        phase_state["attempts"] = [
+            item for item in attempts
+            if not (
+                isinstance(item, dict)
+                and str(item.get("workerId") or "") == str(worker_id)
+                and str(item.get("status") or "") == "running"
+            )
+        ]
+    if str(phase_state.get("status") or "") == "running":
+        phase_state["status"] = "pending"
+    write_task_state(logger, state)
+
+
 def mark_phase_result(
     logger: RunLogger,
     *,
@@ -990,6 +1356,8 @@ def mark_phase_result(
     validation: Optional[JsonDict],
     result_status: str,
     attempt_digest: Optional[JsonDict] = None,
+    phase: Optional[JsonDict] = None,
+    worker_contract: Optional[JsonDict] = None,
 ) -> None:
     if not phase_id:
         return
@@ -1046,13 +1414,46 @@ def mark_phase_result(
         phase_state["last_failure"] = None
         phase_state["last_failure_classification"] = None
         _append_unique(state.setdefault("artifacts", []), artifacts)
+        _record_objective_attempt(
+            state, phase, str(phase_id),
+            succeeded=True, worker_contract=worker_contract,
+        )
     else:
+        classification = (
+            validation.get("classification")
+            if isinstance(validation, dict)
+            and isinstance(validation.get("classification"), dict)
+            else {}
+        )
+        semantic_category = str(classification.get("category") or "").strip()
+        if semantic_category in SEMANTIC_TERMINAL_CLASSIFICATIONS:
+            phase_state["status"] = semantic_category
+            phase_state[f"{semantic_category}_at"] = utc_now_iso()
+            phase_state["last_failure_classification"] = classification
+            phase_state["last_failure"] = [{
+                "type": semantic_category,
+                "classification": classification,
+                "message": (
+                    classification.get("hint")
+                    or f"Worker classified the phase as {semantic_category}."
+                ),
+            }]
+            write_task_state(logger, state)
+            return
         phase_state["status"] = "validation_failed" if validation else result_status
         phase_state["last_failure"] = (
             validation.get("failures") if isinstance(validation, dict) else None
         )
         phase_state["last_failure_classification"] = (
             validation.get("classification") if isinstance(validation, dict) else None
+        )
+        # Objective-level failure accounting survives replans (per-phase
+        # attempts do not: a fresh phase id resets them). Challenge/HITL and
+        # semantic-terminal outcomes returned earlier and are deliberately
+        # not counted — they are not evidence the objective is unreachable.
+        _record_objective_attempt(
+            state, phase, str(phase_id),
+            succeeded=False, worker_contract=worker_contract,
         )
 
     write_task_state(logger, state)
@@ -1100,6 +1501,251 @@ def phase_prior_artifact_paths(
     ]
 
 
+def _normalized_depends_on(raw: Any) -> Optional[List[str]]:
+    """Plan-normalization twin of _phase_dependency_ids: keep None (omitted →
+    implicit serial) distinct from [] (explicitly independent); coerce a bare
+    string to a one-element list; anything malformed degrades to None."""
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, str):
+        return [raw.strip()] if raw.strip() else []
+    if isinstance(raw, list):
+        return [str(item).strip() for item in raw if str(item).strip()]
+    return None
+
+
+def _phase_dependency_ids(phase: JsonDict) -> Optional[List[str]]:
+    """None ⇒ depends_on OMITTED (conservative implicit: all prior phases in
+    plan order). [] ⇒ EXPLICITLY independent — startable immediately, in
+    parallel with anything. Task 2ed5a466: the old falsy check collapsed [] into
+    the implicit-serial default, leaving the planner no syntax at all to declare
+    independence, and three logically-parallel detail phases ran serially."""
+    raw = phase.get("depends_on")
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, str):
+        values: List[Any] = [raw]
+    elif isinstance(raw, list):
+        values = raw
+    else:
+        return None  # malformed → conservative implicit ordering
+    return [
+        str(item).strip()
+        for item in values
+        if str(item).strip()
+    ]
+
+
+def _dependency_blocker(
+    phase: JsonDict,
+    phases: JsonDict,
+    implicit_prior_phase_ids: List[str],
+) -> Optional[JsonDict]:
+    dependency_ids = _phase_dependency_ids(phase)
+    if dependency_ids is None:
+        dependency_ids = implicit_prior_phase_ids
+    for dep_id in dependency_ids:
+        dep_state = phases.get(dep_id)
+        dep_status = (
+            str(dep_state.get("status") or "")
+            if isinstance(dep_state, dict)
+            else ""
+        )
+        if dep_status == "validated_done":
+            continue
+        if dep_status in BLOCKING_DEPENDENCY_STATUSES:
+            return {
+                "type": "dependency_failed",
+                "dependencyPhaseId": dep_id,
+                "dependencyStatus": dep_status,
+                "blocking": True,
+                "message": (
+                    f"Dependency phase {dep_id} ended with status"
+                    f" {dep_status}; this phase cannot run without a revised"
+                    " plan or replacement input artifact."
+                ),
+            }
+        return {
+            "type": "dependency_not_ready",
+            "dependencyPhaseId": dep_id,
+            "dependencyStatus": dep_status or "pending",
+            "blocking": False,
+            "message": (
+                f"Dependency phase {dep_id} is not validated yet; wait for it"
+                " before spawning this phase."
+            ),
+        }
+    return None
+
+
+def _mark_phase_blocked_by_dependency(
+    phases: JsonDict,
+    phase_id: str,
+    blocker: JsonDict,
+) -> None:
+    phase_state = phases.get(phase_id)
+    if not isinstance(phase_state, dict):
+        return
+    phase_state["status"] = "blocked_by_dependency"
+    phase_state["last_failure"] = [blocker]
+    phase_state["last_failure_classification"] = {
+        "category": "blocked_by_dependency",
+        "dependencyPhaseId": blocker.get("dependencyPhaseId"),
+        "dependencyStatus": blocker.get("dependencyStatus"),
+        "hint": blocker.get("message"),
+    }
+
+
+def phase_start_rejection(
+    plan: Optional[JsonDict],
+    logger: RunLogger,
+    *,
+    phase_id: Optional[str],
+    worker_contract: Optional[JsonDict] = None,
+) -> Optional[JsonDict]:
+    if not plan or not phase_id:
+        return None
+    state = load_task_state(logger)
+    phases = state.get("phases") if isinstance(state.get("phases"), dict) else {}
+    plan_phases = plan.get("phases") if isinstance(plan.get("phases"), list) else []
+    prior_ids: List[str] = []
+    target_phase: Optional[JsonDict] = None
+    for phase in plan_phases:
+        if not isinstance(phase, dict):
+            continue
+        current_id = str(phase.get("id") or "")
+        if current_id == str(phase_id):
+            target_phase = phase
+            break
+        prior_ids.append(current_id)
+    if target_phase is None:
+        return None
+    phase_state = phases.get(str(phase_id))
+    status = (
+        str(phase_state.get("status") or "")
+        if isinstance(phase_state, dict)
+        else ""
+    )
+    if status in TERMINAL_PHASE_STATUSES:
+        return {
+            "status": "phase_not_startable",
+            "phaseId": str(phase_id),
+            "phaseStatus": status,
+            "tool_was_executed": False,
+            "next_instruction": (
+                "Do not spawn this phase. Emit a revised task_plan with a new"
+                " phase id/objective or final_answer with the blocker."
+            ),
+        }
+    if status == "running":
+        return {
+            "status": "phase_already_running",
+            "phaseId": str(phase_id),
+            "tool_was_executed": False,
+            "next_instruction": (
+                "A worker is already running for this phase. Wait for it instead"
+                " of spawning another copy."
+            ),
+        }
+    attempts = phase_state.get("attempts") if isinstance(phase_state, dict) else []
+    attempts_count = len(attempts) if isinstance(attempts, list) else 0
+    max_attempts = _positive_int(target_phase.get("max_attempts"), default=3)
+    if attempts_count >= max_attempts and status in {
+        "validation_failed",
+        "failed",
+        "cancelled",
+        "unknown",
+    }:
+        return {
+            "status": "phase_exhausted",
+            "phaseId": str(phase_id),
+            "attempts": attempts_count,
+            "max_attempts": max_attempts,
+            "tool_was_executed": False,
+            "next_instruction": (
+                "This phase has reached max_attempts. Replan with a changed"
+                " contract/objective or stop with final_answer."
+            ),
+        }
+    fingerprint = objective_fingerprint(target_phase, worker_contract)
+    if fingerprint:
+        objective_attempts = (
+            state.get("objective_attempts")
+            if isinstance(state.get("objective_attempts"), dict)
+            else {}
+        )
+        entry = objective_attempts.get(fingerprint)
+        objective_count = (
+            int(entry.get("count") or 0) if isinstance(entry, dict) else 0
+        )
+        if objective_count >= OBJECTIVE_MAX_ATTEMPTS:
+            return {
+                "status": "objective_exhausted",
+                "phaseId": str(phase_id),
+                "objectiveFingerprint": fingerprint,
+                "objectiveAttempts": objective_count,
+                "objectiveMaxAttempts": OBJECTIVE_MAX_ATTEMPTS,
+                "priorPhaseIds": (
+                    list(entry.get("phaseIds") or [])
+                    if isinstance(entry, dict) else []
+                ),
+                "tool_was_executed": False,
+                "next_instruction": (
+                    "This OBJECTIVE (same target range/row count/artifact,"
+                    " regardless of phase id) has already failed"
+                    f" {objective_count} times across replans. Re-issuing it"
+                    " under a fresh phase id is not allowed. Either genuinely"
+                    " change the target (different source URL, different"
+                    " range, different artifact), or final_answer reporting"
+                    " target_absent/instruction_infeasible with the collected"
+                    " evidence so the user can revise the instruction."
+                ),
+            }
+    blocker = _dependency_blocker(target_phase, phases, prior_ids)
+    if blocker is not None:
+        if blocker.get("blocking"):
+            _mark_phase_blocked_by_dependency(phases, str(phase_id), blocker)
+            state["current_phase"] = _first_active_phase_id(plan, phases)
+            write_task_state(logger, state)
+            logger.write("task_phase.blocked_by_dependency", {
+                "phaseId": str(phase_id),
+                **blocker,
+            })
+        # Two very different situations share this branch: a dependency that
+        # FAILED terminally (replan territory) vs one that simply has not
+        # finished yet (wait territory). Now that the rejection payload
+        # reaches the Lead verbatim, the wrong instruction would upgrade a
+        # blind retry into a wrong replan — say the right thing per case.
+        if blocker.get("blocking"):
+            next_instruction = (
+                "Do not spawn this phase: its dependency ended in a terminal"
+                " failure and will not recover on its own. Emit a revised"
+                " task_plan that fixes or replaces the dependency phase —"
+                " a replan resets blocked_by_dependency and re-derives it"
+                " from the new plan — or final_answer with the blocker."
+            )
+        else:
+            next_instruction = (
+                f"Dependency phase {blocker.get('dependencyPhaseId')} is"
+                f" {blocker.get('dependencyStatus') or 'pending'}, not failed."
+                " Do NOT replan and do not re-spawn in a loop: wait for it"
+                " (wait_browser_agents if it is running), then spawn this"
+                " phase once the dependency is validated_done."
+            )
+        return {
+            "status": (
+                "blocked_by_dependency"
+                if blocker.get("blocking")
+                else "dependency_not_ready"
+            ),
+            "phaseId": str(phase_id),
+            "tool_was_executed": False,
+            **blocker,
+            "next_instruction": next_instruction,
+        }
+    return None
+
+
 def mark_phase_exhausted_if_needed(
     plan: Optional[JsonDict],
     logger: RunLogger,
@@ -1120,15 +1766,7 @@ def mark_phase_exhausted_if_needed(
         if not isinstance(phase_state, dict):
             continue
         status = str(phase_state.get("status") or "")
-        if status in {
-            "validated_done",
-            "phase_failed",
-            "blocked_by_challenge",
-            "hitl_required",
-            "hitl_timeout",
-            "page_settled_after_hitl",
-            "stale_pause_deadlock",
-        }:
+        if status in TERMINAL_PHASE_STATUSES:
             continue
         attempts = phase_state.get("attempts") if isinstance(phase_state, dict) else []
         attempts_count = len(attempts) if isinstance(attempts, list) else 0
@@ -1175,6 +1813,8 @@ def next_pending_phase(plan: Optional[JsonDict], logger: RunLogger) -> Optional[
     phases: JsonDict = raw_phases_state if isinstance(raw_phases_state, dict) else {}
     raw_plan_phases = plan.get("phases")
     plan_phases = raw_plan_phases if isinstance(raw_plan_phases, list) else []
+    prior_ids: List[str] = []
+    state_changed = False
     for phase in plan_phases:
         if not isinstance(phase, dict):
             continue
@@ -1182,15 +1822,22 @@ def next_pending_phase(plan: Optional[JsonDict], logger: RunLogger) -> Optional[
         raw_phase_state = phases.get(phase_id)
         phase_state: JsonDict = raw_phase_state if isinstance(raw_phase_state, dict) else {}
         status = phase_state.get("status")
-        if status in {
-            "validated_done",
-            "phase_failed",
-            "blocked_by_challenge",
-            "hitl_required",
-            "hitl_timeout",
-            "page_settled_after_hitl",
-            "stale_pause_deadlock",
-        }:
+        if status in TERMINAL_PHASE_STATUSES:
+            prior_ids.append(phase_id)
+            continue
+        if status == "running":
+            prior_ids.append(phase_id)
+            continue
+        blocker = _dependency_blocker(phase, phases, prior_ids)
+        if blocker is not None:
+            if blocker.get("blocking"):
+                _mark_phase_blocked_by_dependency(phases, phase_id, blocker)
+                logger.write("task_phase.blocked_by_dependency", {
+                    "phaseId": phase_id,
+                    **blocker,
+                })
+                state_changed = True
+            prior_ids.append(phase_id)
             continue
         attempts = phase_state.get("attempts") if isinstance(phase_state, dict) else []
         attempts_count = len(attempts) if isinstance(attempts, list) else 0
@@ -1201,9 +1848,17 @@ def next_pending_phase(plan: Optional[JsonDict], logger: RunLogger) -> Optional[
             "cancelled",
             "unknown",
         }:
+            prior_ids.append(phase_id)
             continue
         if status not in {"validated_done"}:
+            if state_changed:
+                state["current_phase"] = phase_id
+                write_task_state(logger, state)
             return phase
+        prior_ids.append(phase_id)
+    if state_changed:
+        state["current_phase"] = _first_active_phase_id(plan, phases)
+        write_task_state(logger, state)
     return None
 
 
@@ -1305,48 +1960,67 @@ def validate_worker_artifacts(
             "availableArtifacts": all_extraction_artifacts,
         })
 
-    selected = (
-        candidates[0]
-        if candidates
-        else attempt_candidates[0]
-        if attempt_candidates
-        else loaded[0]
-        if loaded
-        else loaded_attempts[0]
-        if loaded_attempts
-        else prior_candidates[0]
-        if prior_candidates
-        else loaded_prior[0]
-        if loaded_prior
-        else None
-    )
-    rows: List[JsonDict] = []
-    if selected:
-        payload = selected.get("payload") or {}
-        schema_warnings = payload.get("schemaWarnings")
-        if isinstance(schema_warnings, list) and schema_warnings:
-            failures.append({
-                "type": "schema",
-                "message": "selected record_extraction artifact has schemaWarnings",
-                "path": selected.get("path"),
-                "schemaWarnings": schema_warnings[:5],
-            })
-        raw_rows = payload.get("rows")
-        if isinstance(raw_rows, list):
-            rows = [row for row in raw_rows if isinstance(row, dict)]
-        else:
-            failures.append({
-                "type": "schema",
-                "message": "selected artifact has no rows array",
-                "path": selected.get("path"),
-            })
+    # Same-name artifact selection (fa86c5f6 fix): within the first non-empty
+    # tier, order candidates best-first (no schemaWarnings > more rows >
+    # recorded later) and pick the FIRST one that passes every validator; if
+    # none passes, keep the heuristic-best and report ITS failures. The old
+    # first-recorded pick validated a schema-flagged batch dump into a bogus
+    # validation_failed while a clean complete artifact sat right next to it.
+    def _order_best_first(items: List[JsonDict]) -> List[JsonDict]:
+        def sort_key(pair):
+            idx, item = pair
+            payload = item.get("payload") or {}
+            schema_warnings = payload.get("schemaWarnings")
+            has_warnings = 1 if isinstance(schema_warnings, list) and schema_warnings else 0
+            rows_list = payload.get("rows")
+            n_rows = len(rows_list) if isinstance(rows_list, list) else 0
+            return (has_warnings, -n_rows, -idx)
+        return [item for _, item in sorted(enumerate(items), key=sort_key)]
 
-    for validator in validators:
-        failures.extend(_run_validator(validator, rows))
+    def _evaluate_candidate(
+        item: Optional[JsonDict],
+    ) -> Tuple[List[JsonDict], List[JsonDict]]:
+        cand_failures: List[JsonDict] = []
+        cand_rows: List[JsonDict] = []
+        if item:
+            payload = item.get("payload") or {}
+            schema_warnings = payload.get("schemaWarnings")
+            if isinstance(schema_warnings, list) and schema_warnings:
+                cand_failures.append({
+                    "type": "schema",
+                    "message": "selected record_extraction artifact has schemaWarnings",
+                    "path": item.get("path"),
+                    "schemaWarnings": schema_warnings[:5],
+                })
+            raw_rows = payload.get("rows")
+            if isinstance(raw_rows, list):
+                cand_rows = [row for row in raw_rows if isinstance(row, dict)]
+            else:
+                cand_failures.append({
+                    "type": "schema",
+                    "message": "selected artifact has no rows array",
+                    "path": item.get("path"),
+                })
+        for validator in validators:
+            cand_failures.extend(_run_validator(validator, cand_rows))
+        cand_failures.extend(_detect_placeholder_rows(cand_rows))
+        cand_failures.extend(_detect_stub_rows(cand_rows, expected))
+        return cand_failures, cand_rows
 
-    placeholder_failures = _detect_placeholder_rows(rows)
-    failures.extend(placeholder_failures)
-    failures.extend(_detect_stub_rows(rows, expected))
+    if expected_name:
+        tier = candidates or attempt_candidates or prior_candidates
+    else:
+        tier = loaded or loaded_attempts or loaded_prior
+    ordered = _order_best_first(tier)
+    selected = ordered[0] if ordered else None
+    selected_failures, rows = _evaluate_candidate(selected)
+    if selected_failures:
+        for item in ordered[1:]:
+            alt_failures, alt_rows = _evaluate_candidate(item)
+            if not alt_failures:
+                selected, selected_failures, rows = item, alt_failures, alt_rows
+                break
+    failures.extend(selected_failures)
     warnings = _detect_near_stub_rows(rows, expected)
 
     cumulative = False
@@ -1373,7 +2047,9 @@ def validate_worker_artifacts(
     result_artifacts = cumulative_sources if cumulative else (
         [selected.get("path")] if selected else []
     )
-    valid_extraction_artifacts = cumulative_sources if cumulative else extraction_artifacts
+    valid_extraction_artifacts = cumulative_sources if cumulative else (
+        [selected.get("path")] if selected and not failures else []
+    )
     result = {
         "status": status,
         "phase_id": contract.get("phase_id"),
@@ -1714,7 +2390,11 @@ def _run_validator(validator: JsonDict, rows: List[JsonDict]) -> List[JsonDict]:
             elif validator_type == "max_rows":
                 raw_value = validator.get("max")
             else:
-                raw_value = validator.get("count") or validator.get("exact")
+                raw_value = (
+                    validator.get("count")
+                    or validator.get("exact")
+                    or validator.get("rows")
+                )
         value = _positive_int(raw_value, default=0)
         count = len(rows)
         ok = (
@@ -1731,17 +2411,37 @@ def _run_validator(validator: JsonDict, rows: List[JsonDict]) -> List[JsonDict]:
         return failures
 
     if validator_type == "unique":
-        field = str(validator.get("field") or "").strip()
+        # Plan-author validators are copied through normalization verbatim
+        # and commonly use "fields": [...] (plural). Reading only "field"
+        # made every row key "" — a bogus all-duplicates needs_fix.
+        unique_fields: List[str] = []
+        single = str(validator.get("field") or "").strip()
+        if single:
+            unique_fields = [single]
+        else:
+            raw_fields = validator.get("fields")
+            if isinstance(raw_fields, list):
+                unique_fields = [
+                    str(item).strip() for item in raw_fields if str(item).strip()
+                ]
+        if not unique_fields:
+            return failures
         seen: Dict[str, int] = {}
         duplicates: List[JsonDict] = []
         for index, row in enumerate(rows):
-            value = str(row.get(field) or "")
+            value = "\x1f".join(
+                str(row.get(name) or "") for name in unique_fields
+            )
             if value in seen:
                 duplicates.append({"row": index, "firstRow": seen[value], "value": value})
             else:
                 seen[value] = index
         if duplicates:
-            failures.append({"type": validator_type, "field": field, "duplicates": duplicates[:20]})
+            failures.append({
+                "type": validator_type,
+                "field": ", ".join(unique_fields),
+                "duplicates": duplicates[:20],
+            })
         return failures
 
     if validator_type == "url_pattern":
@@ -2064,12 +2764,203 @@ def _float_value(value: Any, default: float) -> float:
         return default
 
 
+def _row_count_validator_value(validator: JsonDict) -> Optional[int]:
+    validator_type = str(validator.get("type") or "").strip()
+    raw_value = validator.get("value")
+    if raw_value is None:
+        if validator_type == "min_rows":
+            raw_value = validator.get("min")
+        elif validator_type == "max_rows":
+            raw_value = validator.get("max")
+        elif validator_type == "exact_rows":
+            for key in ("count", "exact", "rows"):
+                if validator.get(key) is not None:
+                    raw_value = validator.get(key)
+                    break
+    value = _positive_int(raw_value, default=0)
+    return value if value > 0 else None
+
+
+def _normalize_expected_artifact_contract(
+    expected_artifact: JsonDict,
+    validators: List[Any],
+    errors: List[str],
+    warnings: List[JsonDict],
+    *,
+    phase_id: str,
+) -> JsonDict:
+    """Recover one canonical expected-artifact shape from equivalent inputs.
+
+    Gateway models sometimes put a field list under an empty JSON key (task
+    51496108) even though the same list is correctly present in a
+    required_fields validator. The empty key has no semantics: drop it with a
+    receipt, then backfill only from an unambiguous contract source.
+    """
+    expected = dict(expected_artifact)
+    blank_values = []
+    for key in list(expected):
+        if str(key).strip():
+            continue
+        blank_values.append(expected.pop(key))
+        warnings.append({
+            "type": "empty_expected_artifact_key_dropped",
+            "phase": phase_id,
+            "message": (
+                "expected_artifact contained an empty property name; it has no"
+                " contract meaning and was dropped"
+            ),
+        })
+
+    field_names = field_names_from_specs(expected.get("fields") or [])
+    if not field_names:
+        field_names = field_names_from_specs(expected.get("required_fields") or [])
+    explicit_required: List[str] = []
+    seen_required = set()
+    explicit_exact_values: Set[int] = set()
+    for validator in validators if isinstance(validators, list) else []:
+        if not isinstance(validator, dict):
+            continue
+        validator_type = str(validator.get("type") or "").strip()
+        validator_type = VALIDATOR_TYPE_ALIASES.get(validator_type, validator_type)
+        if validator_type == "required_fields":
+            for field in field_names_from_specs(validator.get("fields") or []):
+                if field not in seen_required:
+                    explicit_required.append(field)
+                    seen_required.add(field)
+        elif validator_type == "exact_rows":
+            value = _row_count_validator_value({**validator, "type": validator_type})
+            if value is not None:
+                explicit_exact_values.add(value)
+
+    if not field_names and explicit_required:
+        expected["fields"] = explicit_required
+        field_names = list(explicit_required)
+        warnings.append({
+            "type": "expected_artifact_fields_backfilled",
+            "phase": phase_id,
+            "source": "required_fields",
+            "fields": explicit_required,
+        })
+    if blank_values and not field_names and any(value not in (None, "", [], {}) for value in blank_values):
+        errors.append(
+            f"phase {phase_id}: expected_artifact empty-key value could not be"
+            " recovered from fields/required_fields"
+        )
+
+    if expected.get("exact_rows") is None:
+        if len(explicit_exact_values) == 1:
+            expected["exact_rows"] = next(iter(explicit_exact_values))
+            warnings.append({
+                "type": "expected_artifact_exact_rows_backfilled",
+                "phase": phase_id,
+                "source": "exact_rows validator",
+                "value": expected["exact_rows"],
+            })
+        elif len(explicit_exact_values) > 1:
+            errors.append(
+                f"phase {phase_id}: conflicting exact_rows validators:"
+                f" {sorted(explicit_exact_values)}"
+            )
+    return expected
+
+
+def _canonical_validator_params(validator: JsonDict) -> JsonDict:
+    normalized = dict(validator)
+    validator_type = str(normalized.get("type") or "").strip()
+    if validator_type in {"min_rows", "max_rows", "exact_rows"}:
+        value = _row_count_validator_value(normalized)
+        if value is not None:
+            normalized["value"] = value
+        for alias in ("count", "exact", "rows", "min", "max"):
+            normalized.pop(alias, None)
+    if validator_type in {"required_fields", "field_nonempty", "unique"}:
+        fields = field_names_from_specs(normalized.get("fields") or [])
+        single = str(normalized.get("field") or "").strip()
+        if single and single not in fields:
+            fields.append(single)
+        if fields:
+            normalized["fields"] = fields
+            normalized.pop("field", None)
+    return normalized
+
+
+def _validator_semantic_signature(validator: JsonDict) -> str:
+    validator_type = str(validator.get("type") or "")
+    if validator_type in {"min_rows", "max_rows", "exact_rows"}:
+        payload: Any = [validator_type, _row_count_validator_value(validator)]
+    elif validator_type in {"required_fields", "field_nonempty", "unique"}:
+        payload = [
+            validator_type,
+            sorted(set(field_names_from_specs(validator.get("fields") or []))),
+        ]
+    elif validator_type == "set_equals":
+        payload = [
+            validator_type,
+            str(validator.get("field") or ""),
+            sorted({str(value) for value in (validator.get("values") or [])}),
+        ]
+    else:
+        payload = validator
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _dedupe_and_check_validators(
+    validators: List[JsonDict],
+    errors: List[str],
+    *,
+    phase_id: str,
+    warnings: Optional[List[JsonDict]],
+) -> List[JsonDict]:
+    invalid_row_constraints = [
+        str(validator.get("type") or "")
+        for validator in validators
+        if str(validator.get("type") or "") in {
+            "min_rows", "max_rows", "exact_rows",
+        }
+        and _row_count_validator_value(validator) is None
+    ]
+    for validator_type in invalid_row_constraints:
+        errors.append(
+            f"phase {phase_id}: {validator_type} requires a positive integer value"
+        )
+    exact_values = {
+        value for value in (
+            _row_count_validator_value(validator)
+            for validator in validators
+            if str(validator.get("type") or "") == "exact_rows"
+        )
+        if value is not None
+    }
+    if len(exact_values) > 1:
+        errors.append(
+            f"phase {phase_id}: conflicting exact_rows constraints:"
+            f" {sorted(exact_values)}"
+        )
+
+    out: List[JsonDict] = []
+    seen = set()
+    for validator in validators:
+        signature = _validator_semantic_signature(validator)
+        if signature in seen:
+            if warnings is not None:
+                warnings.append({
+                    "type": "duplicate_validator_dropped",
+                    "phase": phase_id,
+                    "validatorType": str(validator.get("type") or ""),
+                })
+            continue
+        seen.add(signature)
+        out.append(validator)
+    return out
+
+
 def _normalize_validators(
     expected_artifact: JsonDict,
     validators: List[Any],
     errors: List[str],
     *,
     phase_id: str,
+    warnings: Optional[List[JsonDict]] = None,
 ) -> List[JsonDict]:
     normalized: List[JsonDict] = []
     if expected_artifact.get("min_rows") is not None:
@@ -2114,17 +3005,39 @@ def _normalize_validators(
             errors.append(f"phase {phase_id}: validators[{index}] must be an object")
             continue
         validator_type = str(validator.get("type") or "").strip()
+        canonical_type = VALIDATOR_TYPE_ALIASES.get(validator_type, validator_type)
+        if canonical_type != validator_type:
+            if warnings is not None:
+                warnings.append({
+                    "type": "validator_type_alias",
+                    "phase": phase_id,
+                    "index": index,
+                    "input": validator_type,
+                    "canonical": canonical_type,
+                    "message": (
+                        f"validator type {validator_type!r} normalized to"
+                        f" {canonical_type!r}; emit the canonical name next time"
+                    ),
+                })
+            validator_type = canonical_type
         if validator_type not in VALIDATOR_TYPES:
             errors.append(
                 f"phase {phase_id}: validators[{index}].type must be one of {sorted(VALIDATOR_TYPES)}"
             )
         normalized_validator = dict(validator)
+        normalized_validator["type"] = validator_type
         if validator_type == "field_provenance":
             normalized_validator["fields"] = _normalize_provenance_validator_fields(
                 normalized_validator
             )
-        normalized.append(normalized_validator)
-    return normalized
+        normalized.append(_canonical_validator_params(normalized_validator))
+    normalized = [_canonical_validator_params(item) for item in normalized]
+    return _dedupe_and_check_validators(
+        normalized,
+        errors,
+        phase_id=phase_id,
+        warnings=warnings,
+    )
 
 
 def _nonempty_fields_from_expected(expected_artifact: JsonDict, fields: Any) -> List[str]:

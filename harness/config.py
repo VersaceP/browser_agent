@@ -14,6 +14,11 @@ from harness.constants import (
 from llm.config import ModelConfig
 
 
+def _normalize_selection_mode(value: Any) -> str:
+    mode = str(value or "").strip().lower()
+    return mode if mode in ("manual", "auto") else "manual"
+
+
 JsonDict = Dict[str, Any]
 
 
@@ -51,6 +56,17 @@ class VLConfig:
     # role and attaching a recovery recommendation (resolvedId / hitl / dismiss / ...)
     # to the result. Default OFF — it costs a VL call per visual failure.
     arbiter_enabled: bool = False
+    # Visual reality check: when perception keeps falling short of the task
+    # target (a target-shortfall streak — 0 rows/matches, OR rows persisted
+    # that never satisfy the phase contract; raw non-zero yield does NOT
+    # reset the streak because mis-attributed rows look productive while
+    # still missing the target), auto-run a full-page screenshot + VL against
+    # a claim synthesized from the worker contract, persist the observation,
+    # and attach it to the tool result. Task-type agnostic: the trigger is
+    # the streak, not any validator kind. Default ON but still gated behind
+    # vl.enabled (the master switch).
+    reality_check_enabled: bool = True
+    reality_check_shortfall_threshold: int = 3
     extra_params: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -83,6 +99,19 @@ class VLConfig:
             ),
             arbiter_enabled=bool(
                 data.get("arbiter_enabled", cls.arbiter_enabled)
+            ),
+            reality_check_enabled=bool(
+                data.get("reality_check_enabled", cls.reality_check_enabled)
+            ),
+            reality_check_shortfall_threshold=int(
+                data.get(
+                    "reality_check_shortfall_threshold",
+                    # Accept the short-lived original key name too.
+                    data.get(
+                        "reality_check_zero_yield_threshold",
+                        cls.reality_check_shortfall_threshold,
+                    ),
+                )
             ),
             extra_params=(
                 data.get("extra_params")
@@ -122,12 +151,21 @@ class HarnessConfig:
     cache_pressure_uncached_input_threshold: int = 10000
     cache_pressure_consecutive_steps: int = 2
     cache_pressure_min_remaining_steps: int = 2
+    lead_model_timeout_step_retries: int = 1
     log_browser_payloads: bool = True
     # Try a matching skill's frozen Workflow.execute fast path before the worker
     # LLM loop (skill_registry.match → run_skill_workflow → success_contract →
     # record_extraction). Fires only when a skill matches AND its required vars
     # are derivable; otherwise falls through to the normal BrowserAgent loop.
     skill_fast_path_enabled: bool = True
+    # How a skill gets selected for a run. "manual" (default, 2026-07-06 user
+    # decision): ONLY an explicit user choice (`--skill <id>` / `/skill <id>` →
+    # forced_skill_id, or an explicit worker_contract.skill_id) engages a skill —
+    # registry auto-match, the LeadAgent skill_selection_required gate, and
+    # enrich auto-stamping are all disabled, so an uncalibrated draft can never
+    # steal execution. "auto": restore the pre-07-06 behavior (deterministic
+    # unique match + Lead selection gate).
+    skill_selection_mode: str = "manual"
     # Runtime-only operator override (NOT read from config.json): set per run from
     # the terminal via `--skill <id>` or the interactive `/skill <id>` command,
     # which main.run_cli writes here. When set, it forces that skill for every
@@ -141,6 +179,11 @@ class HarnessConfig:
     # canary → promote). Closes the rotted-skill self-healing loop; best-effort,
     # gated, and canary-validated so a bad candidate never promotes.
     skill_auto_heal_enabled: bool = True
+    # Guidance (hints) 层的防腐弱信号：worker 结束后把「结局 + 步数 + agent 上报
+    # 的 guidance_stale」记进 skills/.guidance_health.json（独立软通道——显式
+    # 选择绕过 .skill_health.json，07-07 语义保持）。只标 needs_review 供人工
+    # 复审（/skill-create --recheck），永不禁用/否决。纯被动记账，默认开。
+    skill_guidance_signal_enabled: bool = True
     # Open a SECOND ABCP connection (control channel) so the harness can issue
     # control calls (Workflow.pause/resume, Hitl.*) WHILE the primary connection is
     # blocked inside a skill's Workflow.execute — the single primary _call_lock makes
@@ -261,6 +304,12 @@ class HarnessConfig:
                     cls.cache_pressure_min_remaining_steps,
                 )
             ),
+            lead_model_timeout_step_retries=int(
+                data.get(
+                    "lead_model_timeout_step_retries",
+                    cls.lead_model_timeout_step_retries,
+                )
+            ),
             context_compaction_keep_head_pairs=int(
                 data.get(
                     "context_compaction_keep_head_pairs",
@@ -285,6 +334,9 @@ class HarnessConfig:
             ),
             skill_fast_path_enabled=bool(
                 data.get("skill_fast_path_enabled", cls.skill_fast_path_enabled)
+            ),
+            skill_selection_mode=_normalize_selection_mode(
+                data.get("skill_selection_mode", cls.skill_selection_mode)
             ),
             hitl_poll_interval_seconds=float(
                 data.get(
