@@ -75,9 +75,10 @@ Normally prefer `Page.create({"url": target_url})` over a separate `Fleet.create
 - Every proxied/state-changing action must include a concrete `purpose` in `params`.
 - Do not use placeholder purposes such as `click`, `type`, `continue`, or `do task`.
 - Events are not actions. Do not call `Page.loaded`, `Hitl.resumed`, or other event names as methods.
-- Prefer target order: live AXTree canonical id, stable semantic attribute, stable CSS selector, coordinates as last resort.
-- Do not use screenshots to read ordinary text or form values. Use screenshots only for canvas, graphical state, CAPTCHA, layout overlap, or human-audit proof.
-- Use `Runtime.evaluate` only when DOM/attribute tools cannot access the required data or relationship.
+- Prefer target order: live AXTree canonical id, stable semantic attribute, stable CSS selector, coordinates as last resort. Avoid dynamic hash classes.
+- Read AXTree lines as `depth [id] role "label" flags # @x,y,w,h`: `#` marks a preferred actionable target, `@x,y,w,h` is a viewport rect (use it for spatial reasoning only — relative position, overlap, on/off-screen — not for deriving click coordinates; act through the canonical id or a selector), and flags such as `hidden`, `off`, `blocked`, `scroll`, `sticky`, `clip`, or `zN` describe compact layout state. Prefer `#` targets without `hidden`/`blocked`.
+- Do not use screenshots to read ordinary text or form values. Use screenshots only for canvas, graphical state, CAPTCHA, layout overlap, or human-audit proof. For visual checks, crop to the element when it can be located (confirm the current `Page.screenshot` element-targeting parameter via `System.describeAction`, then pass `pageId` and a stable selector; omit `options.path` for automatic saving). If element capture fails, do not repeat it; call `Page.getState`, then fall back to a viewport screenshot only if needed.
+- Use `Runtime.evaluate` only when DOM/attribute tools cannot access the required data or relationship. Never use it to bypass permissions, casually mutate page state, or replace form interactions.
 
 ## Page And Event Loop
 
@@ -88,7 +89,7 @@ After navigation, page recovery, popup/page identity changes, dialog closure, fi
 3. Refresh `DOM.getAXTree`.
 4. Select new live ids before input.
 
-Subscribe to notifications or use `wait_for_notification` when waiting for lifecycle events. A typical event notification arrives as `System.notification` with `params.type == "event"` and `params.data.event`.
+Subscribe to notifications or use `wait_for_notification` when waiting for lifecycle events. A typical event notification arrives as `System.notification` with `params.type == "event"` and `params.data.event`. Discover events with `System.listEvents`; for unfamiliar events call `System.describeEvent({"event": ...})` for meaning, severity, payload, and recommended response.
 
 Before critical clicks, submits, deletes, downloads, or credential entry, call `Page.getState` once to rule out loading, crash, HITL, dialogs, file choosers, or page switches.
 

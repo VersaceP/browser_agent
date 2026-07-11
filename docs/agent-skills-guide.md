@@ -114,6 +114,16 @@ AXTree) and its results are offloaded, so prefer AXTree + focused
 `frameId:axNodeId:domNodeId` (three segments) — copy them verbatim and never
 truncate to two segments.
 
+Read AXTree lines as `depth [id] role "label" flags # @x,y,w,h`: `#` marks a
+preferred actionable target, `@x,y,w,h` is the element's viewport rect (absent
+on unpositioned nodes), and flags such as `hidden`, `off`, `blocked`, `scroll`,
+`sticky`, `clip`, or `zN` describe compact layout state. Use `rect` for spatial
+reasoning only (relative position, overlap, on/off-screen), not for deriving
+click coordinates — act through the canonical id or a selector. Prefer `#`
+targets without `hidden`/`blocked`; treat `blocked` as occlusion (dismiss the
+blocker first) and `scroll` as a scrollable container. (The pixel space of
+`@x,y,w,h` is a pending live probe — see the maintainer note below.)
+
 Selector priority: canonical AXTree id > semantic attributes (`aria-label`,
 `name`) > stable CSS selector. Avoid dynamic hash classes.
 
@@ -168,7 +178,9 @@ legacy cases with no DOM equivalent. Provide a valid reason kind, a concrete
 explanation, and a DOM cross-check plan.
 
 Do not use JavaScript for ordinary visible text or attributes that
-`DOM.getText`/`DOM.getAttribute` can read.
+`DOM.getText`/`DOM.getAttribute` can read. Never use it to bypass permissions,
+casually mutate page state, or replace form interactions — form entry goes
+through Input-level tools.
 
 ## Offload
 
@@ -189,7 +201,11 @@ into task context and update `Memory` if constraints or milestones changed.
 
 Use screenshots and `visual_verify` for visual ambiguity: CAPTCHA, overlays,
 canvas/image-heavy UI, layout mismatch, or DOM/visual disagreement. Do not use
-VL for bulk data extraction or DOM-readable text.
+VL for bulk data extraction or DOM-readable text. When the element can be
+located, crop strictly to the component (selector or canonical id,
+`fullPage=false`) instead of viewport/fullpage capture; if element capture
+fails, do not repeat it — resync with `Page.getState` and fall back to a
+viewport screenshot only if still needed.
 
 ## Recovery
 
@@ -203,3 +219,21 @@ After an action failure:
 5. If auto-scroll reports out-of-bounds or invisibility, query and scroll the
    nearest scrollable parent container.
 6. If repeated attempts fail, change strategy or finalize with a blocker.
+
+## Maintainer Note: Pending Live Probes (2026-07-07)
+
+The upstream skillsGuide update documents richer AXTree lines
+(`flags # @x,y,w,h`). Items that need a live panel probe before stronger
+automation is built on them:
+
+1. **bbox coordinate space** — the new guide says `@x,y,w,h` is CSS pixels; the
+   2026-06-27 probe found the bbox space equal to the `Page.screenshot` pixel
+   space (2560×1600 on a DPR-2 machine). If the panel switched to CSS px while
+   screenshots stay physical px, `harness/vl/locate.py` bbox→id promotion needs
+   a DPR conversion. Probe: compare one element's AXTree bbox,
+   `getBoundingClientRect`, and screenshot dimensions.
+2. **Per-flag semantics** — `off`/`clip`/`zN` meanings are undocumented; pin
+   them down before find_in_axtree filtering or auto_intercept uses them.
+3. **getSemanticTree shadow-root traversal** — the new guide lists Shadow DOM
+   as a valid use, but the 2026-06 probe found `includeShadowDOM` had no
+   effect (abcp-panel-quirks #8). Retest on the current build.
