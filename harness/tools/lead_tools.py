@@ -13,7 +13,12 @@ from harness.extraction_artifacts import (
 from harness.lifecycle import LifecycleContext, lifecycle_for
 from harness.local_fs import local_fs_read, local_fs_search
 from harness.strategy_bank import render_strategy_guidance
-from harness.task_control import mark_phase_exhausted_if_needed
+from harness.task_control import VALIDATOR_TYPES, mark_phase_exhausted_if_needed
+from harness.task_types import (
+    VALID_TASK_TYPES,
+    normalize_task_type,
+    task_type_choices_for_error,
+)
 from harness.tools.loop_guard import check_tool_call_loop
 from harness.tools.registry import ToolContext, ToolRegistry
 from harness.utils import JsonDict, optional_int
@@ -28,19 +33,191 @@ def _nullable(type_name: str) -> JsonDict:
     return {"type": [type_name, "null"]}
 
 
+def _validator_item_schema() -> JsonDict:
+    """Typed schema for one plan validator.
+
+    The type enum is generated from VALIDATOR_TYPES (single source of truth)
+    so the model sees the exact canonical names UP FRONT — task 9d5655d3
+    burned two plan rejections learning them from error messages because the
+    old schema was an opaque `additionalProperties: true` object.
+    """
+    return {
+        "type": "object",
+        "properties": {
+            "type": {
+                "type": "string",
+                "enum": sorted(VALIDATOR_TYPES),
+            },
+            "field": {
+                "type": "string",
+                "description": "Target field for single-field validators (range/url_pattern/field_pattern).",
+            },
+            "fields": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Target fields for required_fields/field_nonempty/unique.",
+            },
+            "count": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Row count for exact_rows (aliases value/exact accepted).",
+            },
+            "value": {"type": "integer", "minimum": 1},
+            "min": {"type": "number"},
+            "max": {"type": "number"},
+            "pattern": {
+                "type": "string",
+                "description": "Regex for url_pattern/field_pattern.",
+            },
+            "values": {
+                "type": "array",
+                "items": {},
+                "description": (
+                    "Exact allowed value set for set_equals; use this for"
+                    " non-contiguous targets such as ranks [38, 40]."
+                ),
+            },
+        },
+        "required": ["type"],
+        "additionalProperties": True,
+    }
+
+
+def _expected_artifact_schema() -> JsonDict:
+    # `type: [...]` is already used by this tool surface (_nullable). Avoid
+    # introducing oneOf here: several Anthropic-compatible gateways implement
+    # only a conservative JSON-schema subset even though native providers accept
+    # oneOf. Runtime normalization still validates object field specs fully.
+    field_items: JsonDict = {
+        "type": ["string", "object"],
+        "description": (
+            "A field name string, or an object field spec using name/field/key"
+            " plus optional type/allow_empty/nonempty metadata."
+        ),
+    }
+    field_list: JsonDict = {"type": "array", "items": field_items}
+    return {
+        "type": "object",
+        "description": (
+            "Structured output contract. Declare name, fields and row-count"
+            " constraints here; equivalent explicit validators are accepted"
+            " but normalized/deduplicated by the harness."
+        ),
+        "properties": {
+            "name": {"type": "string"},
+            "fields": field_list,
+            "required_fields": field_list,
+            "exact_rows": {"type": "integer", "minimum": 1},
+            "min_rows": {"type": "integer", "minimum": 1},
+            "max_rows": {"type": "integer", "minimum": 1},
+            "count_range": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "minItems": 2,
+                "maxItems": 2,
+            },
+            "nonempty_fields": field_list,
+            "field_nonempty": field_list,
+            "provenance_required": field_list,
+        },
+        "propertyNames": {"minLength": 1},
+        "additionalProperties": True,
+    }
+
+
 def _emit_task_plan_schema(_: Any = None) -> JsonDict:
     return {
         "type": "object",
         "properties": {
             "plan": {
                 "type": "object",
-                "additionalProperties": True,
                 "description": (
-                    "Plan object with goal, task_type, and a linear phases array."
+                    "Plan object with goal, task_type, and a phases array."
                     " Each phase needs id, type='browser_worker', objective,"
                     " worker_task, stage_hint, stage_hint_reason,"
                     " expected_artifact, validators, and max_attempts."
+                    " Scheduling: depends_on OMITTED = the phase implicitly"
+                    " depends on ALL phases listed before it (strict serial"
+                    " order); depends_on=[] = independent, startable"
+                    " immediately; depends_on=[ids] = exactly those phases"
+                    " must be validated_done first. Phases whose dependencies"
+                    " are satisfied can be spawned in parallel."
                 ),
+                "properties": {
+                    "goal": {"type": "string"},
+                    "task_type": {
+                        "type": "string",
+                        # Canonical names only — legacy aliases are accepted at
+                        # runtime with a warning receipt, same policy as the
+                        # validator type enum.
+                        "enum": sorted(VALID_TASK_TYPES),
+                    },
+                    "phases": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "type": {"type": "string"},
+                                "task_type": {
+                                    "type": "string",
+                                    "enum": sorted(VALID_TASK_TYPES),
+                                    "description": (
+                                        "Optional per-phase override of the"
+                                        " plan task_type (e.g. one"
+                                        " file_download phase inside a"
+                                        " web_scrape plan). Omit to inherit"
+                                        " the plan task_type."
+                                    ),
+                                },
+                                "objective": {"type": "string"},
+                                "worker_task": {"type": "string"},
+                                "stage_hint": {"type": "string"},
+                                "stage_hint_reason": {"type": "string"},
+                                "expected_artifact": {
+                                    **_expected_artifact_schema(),
+                                },
+                                "depends_on": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": (
+                                        "Phase ids that must be validated_done"
+                                        " before this phase can start. OMIT for"
+                                        " strict serial order (implicitly"
+                                        " depends on all prior phases); [] for"
+                                        " an independent phase; list only the"
+                                        " true data dependencies (e.g. every"
+                                        " detail phase depends only on the"
+                                        " collection phase) so independent"
+                                        " phases can run in parallel."
+                                    ),
+                                },
+                                "validators": {
+                                    "type": "array",
+                                    "description": (
+                                        "MUST be an array of typed objects"
+                                        " (never a dict keyed by validator"
+                                        " name)."
+                                    ),
+                                    "items": _validator_item_schema(),
+                                },
+                                "max_attempts": {"type": "integer"},
+                            },
+                            "required": [
+                                "id",
+                                "objective",
+                                "worker_task",
+                                "stage_hint",
+                                "stage_hint_reason",
+                                "expected_artifact",
+                                "validators",
+                            ],
+                            "additionalProperties": True,
+                        },
+                    },
+                },
+                "required": ["goal", "task_type", "phases"],
+                "additionalProperties": True,
             },
         },
         "required": ["plan"],
@@ -95,6 +272,17 @@ def _spawn_browser_agent_schema(_: Any = None) -> JsonDict:
             "worker_contract": {
                 "type": "object",
                 "additionalProperties": True,
+                "properties": {
+                    "task_type": {
+                        "type": "string",
+                        "enum": sorted(VALID_TASK_TYPES),
+                        "description": (
+                            "Optional task_type override for this worker;"
+                            " method access follows its policy. Omit to use"
+                            " the phase/plan task_type."
+                        ),
+                    },
+                },
                 "description": (
                     "Contract override; pass {} when the phase contract is enough."
                     " The harness merges it with the"
@@ -338,10 +526,51 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
         }
     exhausted = mark_phase_exhausted_if_needed(agent.task_plan, agent.logger)
     phase_id = tool_input.get("phase_id")
-    phase = agent.resolve_phase_for_spawn(
-        str(phase_id) if isinstance(phase_id, str) and phase_id.strip() else None
+    # The override contract must reach the pre-check: a spawn that genuinely
+    # changes the objective via worker_contract would otherwise be rejected
+    # against the raw phase's exhausted fingerprint before ever reaching the
+    # spawner (which already receives the effective contract).
+    raw_contract = tool_input.get("worker_contract")
+    # Runtime twin of the plan-time task_type check: execute_lead_tool does no
+    # local JSON-schema validation, so the spawn schema's enum only constrains
+    # a well-behaved provider — a gateway that ignores schemas (the recurring
+    # failure class here) can still send anything. tool_policy fail-opens on
+    # unknown task_type (dict lookup → no disabled domains), so an unchecked
+    # override typo like 'scraping' would re-enable Download/File on a
+    # web_scrape phase. Reject loud before the contract is built.
+    if isinstance(raw_contract, dict):
+        raw_task_type = str(raw_contract.get("task_type") or "").strip()
+        if raw_task_type:
+            canonical_task_type = normalize_task_type(raw_task_type)
+            if canonical_task_type not in VALID_TASK_TYPES:
+                return {
+                    "status": "invalid_worker_contract",
+                    "error": (
+                        "worker_contract.task_type must be one of"
+                        f" {task_type_choices_for_error()}; got {raw_task_type!r}"
+                    ),
+                    "tool_was_executed": False,
+                    "next_instruction": (
+                        "Retry spawn_browser_agent with a canonical task_type,"
+                        " or omit worker_contract.task_type to inherit the"
+                        " phase/plan task_type. Never invent task_type names:"
+                        " an unknown value would bypass method policy."
+                    ),
+                }
+            raw_contract["task_type"] = canonical_task_type
+    phase, rejection = agent.resolve_phase_for_spawn_with_rejection(
+        str(phase_id) if isinstance(phase_id, str) and phase_id.strip() else None,
+        worker_contract=raw_contract if isinstance(raw_contract, dict) else None,
     )
     if phase is None:
+        # Pass the structured rejection through verbatim: it carries the real
+        # status (dependency_not_ready / blocked_by_dependency /
+        # phase_already_running / objective_exhausted / ...) plus a
+        # next_instruction. Task 2ed5a466 collapsed these into a generic
+        # "phase not found" and the Lead blind-retried a dependency-gated
+        # phase twice.
+        if rejection is not None:
+            return rejection
         exhausted_match = _matching_exhaustion(exhausted, phase_id)
         if exhausted_match is not None:
             return {
@@ -361,7 +590,6 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
             "status": "failed",
             "error": f"phase not found or no pending phase: {phase_id}",
         }
-    raw_contract = tool_input.get("worker_contract")
     worker_contract = agent.build_worker_contract(
         phase,
         raw_contract if isinstance(raw_contract, dict) else None,
@@ -402,16 +630,24 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
                 build_skill_selection_request,
                 enrich_worker_contract_with_skill,
             )
+            from harness.skill.guidance import default_guidance_health
+            from harness.skill.health import default_health
             # Operator override wins first: a configured forced_skill_id stamps
             # skill_id (clearing any Lead decline), so selection is skipped and the
             # worker runs that skill wherever its variables are derivable.
+            selection_mode = str(getattr(harness_cfg, "skill_selection_mode", "manual") or "manual")
             forced = apply_forced_skill(
                 worker_contract,
                 registry=registry,
                 forced_skill_id=str(getattr(harness_cfg, "forced_skill_id", "") or ""),
+                phase=phase,
                 logger=agent.logger,
+                workflow_health=default_health(),
+                guidance_health=default_guidance_health(),
             )
             if not forced:
+                # manual mode: the Lead is never interrupted with a selection
+                # request — only the user's /skill choice engages a skill.
                 selection_request = build_skill_selection_request(
                     worker_contract,
                     registry=registry,
@@ -419,12 +655,14 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
                     task=base_task,
                     context=base_context,
                     logger=agent.logger,
+                    mode=selection_mode,
                 )
                 if selection_request is not None:
                     return selection_request
             enrich_worker_contract_with_skill(
                 worker_contract, registry=registry, phase=phase,
                 task=base_task, context=base_context, logger=agent.logger,
+                mode=selection_mode,
             )
     except Exception:  # never break spawning
         pass
@@ -437,6 +675,7 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
         phase_id=str(phase.get("id") or ""),
         worker_contract=worker_contract,
         phase=phase,
+        task_plan=getattr(agent, "task_plan", None),
         preferred_slot_id=tool_input.get("preferred_slot_id"),
         reuse_from_worker_id=tool_input.get("reuse_from_worker_id"),
     )
