@@ -2,7 +2,6 @@
 llm.anthropic_provider - Anthropic messages API adapter.
 """
 
-import asyncio
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,7 +12,6 @@ except ImportError:
 
 from llm.base import BaseLLMProvider
 from llm.cache_control import (
-    LLM_API_TIMEOUT,
     _build_cache_diagnostics,
     _emit_cache_log,
     _is_cache_control_rejection,
@@ -21,6 +19,44 @@ from llm.cache_control import (
     _with_cache_control_diagnostics,
 )
 from llm.config import ModelConfig
+
+
+def _degenerate_response_problem(response: Any) -> Optional[Dict[str, Any]]:
+    """Detect a gateway-degenerate messages.create response, else None.
+
+    Degenerate = NO payload block (no tool_use, no non-empty text, no
+    thinking) AND anomalous usage (missing, or output_tokens==0). A
+    well-formed "model chose to say nothing" keeps a real usage meter; a
+    truncated/aborted gateway response does not. Responses with payload are
+    never flagged here even when usage is missing — content wins, and the
+    getattr defaults below keep parsing alive.
+    """
+    content = getattr(response, "content", None) or []
+    has_payload = False
+    for block in content:
+        block_type = getattr(block, "type", "")
+        if block_type == "tool_use":
+            has_payload = True
+            break
+        if block_type == "text" and (getattr(block, "text", "") or "").strip():
+            has_payload = True
+            break
+        if block_type in ("thinking", "redacted_thinking"):
+            has_payload = True
+            break
+    if has_payload:
+        return None
+    usage = getattr(response, "usage", None)
+    output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+    if usage is not None and output_tokens > 0:
+        return None
+    return {
+        "provider": "anthropic",
+        "content_blocks": len(content),
+        "usage_missing": usage is None,
+        "output_tokens": output_tokens,
+        "stop_reason": getattr(response, "stop_reason", None),
+    }
 
 
 class AnthropicProvider(BaseLLMProvider):
@@ -147,25 +183,22 @@ class AnthropicProvider(BaseLLMProvider):
             else False if prior_reject_fallback else None,
             fallback=prior_reject_fallback,
         )
-        timeout_retries = 0
+        timeout_attempts: List[Dict[str, Any]] = []
 
         async def request_with_timeout(request_kwargs: Dict[str, Any]):
-            nonlocal timeout_retries
-            try:
-                return await asyncio.wait_for(
-                    self.client.messages.create(**request_kwargs),
-                    timeout=LLM_API_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                timeout_retries += 1
+            response, attempts = await self._request_with_timeout_retries(
+                lambda: self.client.messages.create(**request_kwargs),
+                provider="anthropic",
+                operation="messages.create",
+                response_validator=_degenerate_response_problem,
+            )
+            if attempts:
+                timeout_attempts.extend(attempts)
                 _emit_cache_log(
-                    "[Anthropic] messages.create timed out; retrying once"
+                    "[Anthropic] messages.create recovered after "
+                    f"{len(attempts)} timeout/degenerate attempt(s)"
                 )
-                await asyncio.sleep(1.0)
-                return await asyncio.wait_for(
-                    self.client.messages.create(**request_kwargs),
-                    timeout=LLM_API_TIMEOUT,
-                )
+            return response
 
         try:
             response = await request_with_timeout(kwargs)
@@ -188,11 +221,13 @@ class AnthropicProvider(BaseLLMProvider):
             self._cache_control_disabled_after_reject = True
 
         # 缓存命中观测(设置环境变量 LLM_CACHE_DEBUG=1 打开)
-        usage = response.usage
+        # usage 可能为 None(部分网关的截断/异常响应不带 usage)——全部走
+        # getattr 默认值,不能直接点属性,否则 AttributeError 直接打死 worker。
+        usage = getattr(response, "usage", None)
         cache_read = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
         cache_creation = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
-        uncached_input = int(usage.input_tokens or 0)  # 已扣除 cache 部分
-        output_tokens = int(usage.output_tokens or 0)
+        uncached_input = int(getattr(usage, "input_tokens", 0) or 0)  # 已扣除 cache 部分
+        output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
         cache_meta = cache_diagnostics.get("cache_control", {})
         _emit_cache_log(
             f"[Anthropic Cache] new={uncached_input} "
@@ -206,7 +241,7 @@ class AnthropicProvider(BaseLLMProvider):
         tool_calls = []
         assistant_prefix_blocks: List[Dict[str, Any]] = []
 
-        for block in response.content:
+        for block in (response.content or []):
             if block.type == "text":
                 response_text += block.text
             elif block.type == "tool_use":
@@ -237,7 +272,18 @@ class AnthropicProvider(BaseLLMProvider):
             "uncached_input": uncached_input,
             "output": output_tokens,
             "cache_diagnostics": cache_diagnostics,
-            "timeout_retries": timeout_retries,
+            "timeout_retries": sum(
+                1 for item in timeout_attempts
+                if item.get("reason") != "degenerate_response"
+            ),
+            "degenerate_retries": sum(
+                1 for item in timeout_attempts
+                if item.get("reason") == "degenerate_response"
+            ),
+            "timeout_attempts": timeout_attempts,
+            "timeout_seconds": self._llm_timeout_seconds(),
+            "timeout_max_retries": self._llm_timeout_max_retries(),
+            "timeout_retry_interval_seconds": self._llm_timeout_retry_interval_seconds(),
             "_assistant_prefix_blocks": assistant_prefix_blocks,
         }
 

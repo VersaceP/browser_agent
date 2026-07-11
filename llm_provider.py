@@ -9,14 +9,13 @@ from llm import (
     ModelConfig,
     OpenAIProvider,
 )
-from llm.cache_control import CacheControlDecision, LLM_API_TIMEOUT
+from llm.cache_control import CacheControlDecision
 
 
 __all__ = [
     "AnthropicProvider",
     "BaseLLMProvider",
     "CacheControlDecision",
-    "LLM_API_TIMEOUT",
     "LLMFactory",
     "ModelConfig",
     "OpenAIProvider",

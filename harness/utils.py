@@ -73,6 +73,7 @@ class UsageBucket:
     uncached_input: int = 0
     output: int = 0
     timeout_retries: int = 0
+    degenerate_retries: int = 0
 
     def add(
         self,
@@ -81,6 +82,7 @@ class UsageBucket:
         uncached_input: int,
         output: int,
         timeout_retries: int = 0,
+        degenerate_retries: int = 0,
     ) -> None:
         self.calls += 1
         self.cache_read += cache_read
@@ -88,6 +90,7 @@ class UsageBucket:
         self.uncached_input += uncached_input
         self.output += output
         self.timeout_retries += timeout_retries
+        self.degenerate_retries += degenerate_retries
 
     def summary(self) -> JsonDict:
         return {
@@ -97,6 +100,7 @@ class UsageBucket:
             "uncached_input": self.uncached_input,
             "output": self.output,
             "timeout_retries": self.timeout_retries,
+            "degenerate_retries": self.degenerate_retries,
             "cache_read_rate": _cache_rate(
                 self.cache_read,
                 self.cache_creation,
@@ -132,6 +136,7 @@ class UsageAggregator:
         uncached_input = _usage_int(usage, "uncached_input")
         output = _usage_int(usage, "output")
         timeout_retries = _usage_int(usage, "timeout_retries")
+        degenerate_retries = _usage_int(usage, "degenerate_retries")
 
         self.total.add(
             cache_read,
@@ -139,6 +144,7 @@ class UsageAggregator:
             uncached_input,
             output,
             timeout_retries,
+            degenerate_retries,
         )
         bucket = self.by_source.setdefault(source, UsageBucket())
         bucket.add(
@@ -147,6 +153,7 @@ class UsageAggregator:
             uncached_input,
             output,
             timeout_retries,
+            degenerate_retries,
         )
         if context_hash:
             self.context_hashes.add(context_hash)
@@ -195,6 +202,7 @@ class UsageAggregator:
             "uncached_input": uncached_input,
             "output": output,
             "timeout_retries": timeout_retries,
+            "degenerate_retries": degenerate_retries,
             "cache_read_rate": _cache_rate(
                 cache_read,
                 cache_creation,
@@ -273,6 +281,14 @@ class RunLogger:
         )
         if step is not None:
             payload["step"] = step
+        for key in (
+            "timeout_attempts",
+            "timeout_seconds",
+            "timeout_max_retries",
+            "timeout_retry_interval_seconds",
+        ):
+            if key in usage:
+                payload[key] = usage[key]
         self.write("llm.usage", payload)
         return payload
 

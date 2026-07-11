@@ -2,10 +2,9 @@
 llm.openai_provider - OpenAI and OpenAI-compatible chat adapter.
 """
 
-import asyncio
 import json
 import os
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from openai import AsyncOpenAI
@@ -14,7 +13,6 @@ except ImportError:
 
 from llm.base import BaseLLMProvider
 from llm.cache_control import (
-    LLM_API_TIMEOUT,
     _build_cache_diagnostics,
     _emit_cache_log,
     _is_cache_control_rejection,
@@ -22,6 +20,41 @@ from llm.cache_control import (
     _with_cache_control_diagnostics,
 )
 from llm.config import ModelConfig
+
+
+def _degenerate_response_problem(response: Any) -> Optional[Dict[str, Any]]:
+    """Detect a structurally degenerate chat.completions response, else None.
+
+    Only structural gateway failures count: no choices, a None message, or a
+    missing usage meter. A well-formed response whose message happens to have
+    empty content but carries real usage is the model's business, not ours —
+    the agent-level streak guard owns that case.
+    """
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        return {"provider": "openai", "reason": "no_choices"}
+    message = getattr(choices[0], "message", None)
+    if message is None:
+        return {
+            "provider": "openai",
+            "reason": "no_message",
+            "finish_reason": getattr(choices[0], "finish_reason", None),
+        }
+    if getattr(response, "usage", None) is None:
+        # Payload wins (same policy as the Anthropic detector): a message
+        # carrying real content or tool_calls is the model's answer even when
+        # the gateway omitted the usage meter — retrying it would throw away a
+        # good response. Only "no usage AND no payload" is degenerate.
+        has_payload = bool(
+            str(getattr(message, "content", "") or "").strip()
+        ) or bool(getattr(message, "tool_calls", None))
+        if not has_payload:
+            return {
+                "provider": "openai",
+                "reason": "usage_missing",
+                "finish_reason": getattr(choices[0], "finish_reason", None),
+            }
+    return None
 
 
 class OpenAIProvider(BaseLLMProvider):
@@ -271,6 +304,10 @@ class OpenAIProvider(BaseLLMProvider):
                 "max_tokens",
                 "temperature",
                 "tool_choice",
+                "llm_api_timeout_seconds",
+                "llm_timeout_max_retries",
+                "llm_timeout_backoff_seconds",
+                "llm_timeout_retry_interval_seconds",
             }
             for key, value in self.config.extra_params.items():
                 if key not in reserved_extra_keys:
@@ -304,12 +341,26 @@ class OpenAIProvider(BaseLLMProvider):
             fallback=prior_reject_fallback,
         )
 
+        timeout_attempts: List[Dict[str, Any]] = []
+
+        async def request_with_timeout(request_params: Dict[str, Any]):
+            response, attempts = await self._request_with_timeout_retries(
+                lambda: self.client.chat.completions.create(**request_params),
+                provider="openai",
+                operation="chat.completions.create",
+                response_validator=_degenerate_response_problem,
+            )
+            if attempts:
+                timeout_attempts.extend(attempts)
+                _emit_cache_log(
+                    "[OpenAI] chat.completions.create recovered after "
+                    f"{len(attempts)} timeout/degenerate attempt(s)"
+                )
+            return response
+
         # 调用 OpenAI API（带超时保护）
         try:
-            response = await asyncio.wait_for(
-                self.client.chat.completions.create(**request_params),
-                timeout=LLM_API_TIMEOUT,
-            )
+            response = await request_with_timeout(request_params)
         except Exception as exc:
             if not effective_cache_enabled or not _is_cache_control_rejection(exc):
                 raise
@@ -325,21 +376,20 @@ class OpenAIProvider(BaseLLMProvider):
             _emit_cache_log(
                 "[OpenAI Cache] cache_control rejected; retrying without markers"
             )
-            response = await asyncio.wait_for(
-                self.client.chat.completions.create(**fallback_params),
-                timeout=LLM_API_TIMEOUT,
-            )
+            response = await request_with_timeout(fallback_params)
             self._cache_control_disabled_after_reject = True
 
         # 缓存命中观测(OpenAI 自动缓存,只能从 prompt_tokens_details.cached_tokens 反查)
-        usage = response.usage
+        # usage 可能为 None(带 payload 的响应缺 usage 时检测器放行)——全部走
+        # getattr 默认值,不能直接点属性。
+        usage = getattr(response, "usage", None)
         details = getattr(usage, "prompt_tokens_details", None)
         cache_read = int(getattr(details, "cached_tokens", 0) or 0) if details else 0
         # OpenAI 不区分 creation vs read,首次调用就直接计入 prompt_tokens
         # 这里把"未走缓存的 input"算成 prompt - cached
-        prompt_tokens = int(usage.prompt_tokens or 0)
+        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
         uncached_input = max(prompt_tokens - cache_read, 0)
-        output_tokens = int(usage.completion_tokens or 0)
+        output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
         cache_meta = cache_diagnostics.get("cache_control", {})
         _emit_cache_log(
             f"[OpenAI Cache] prompt={prompt_tokens} read={cache_read} "
@@ -386,4 +436,16 @@ class OpenAIProvider(BaseLLMProvider):
             "uncached_input": uncached_input,
             "output": output_tokens,
             "cache_diagnostics": cache_diagnostics,
+            "timeout_retries": sum(
+                1 for item in timeout_attempts
+                if item.get("reason") != "degenerate_response"
+            ),
+            "degenerate_retries": sum(
+                1 for item in timeout_attempts
+                if item.get("reason") == "degenerate_response"
+            ),
+            "timeout_attempts": timeout_attempts,
+            "timeout_seconds": self._llm_timeout_seconds(),
+            "timeout_max_retries": self._llm_timeout_max_retries(),
+            "timeout_retry_interval_seconds": self._llm_timeout_retry_interval_seconds(),
         }

@@ -1,8 +1,11 @@
 {
   "provider": "anthropic",
   "model_id": "kimi-2.6",
-  "api_key": "sk-kimi-Du2NGogKdNeI9ZkBrctGLT7fdAaVGDlbx74ptVyRjzzW1ocBUGepeFhW0I3zZSsS",
+  "api_key": "YOUR_KIMI_API_KEY",
   "base_url": "https://api.kimi.com/coding/",
+  "llm_api_timeout_seconds": 240,
+  "llm_timeout_max_retries": 2,
+  "llm_timeout_retry_interval_seconds": 30,
   "extra_params": {
     "temperature": 0.5,
     "max_tokens": 4096,
@@ -15,7 +18,9 @@
     "base_url": "https://your-qwen-compatible-endpoint.example/v1",
     "api_key": "",
     "max_checks_per_worker": 5,
-    "default_timeout_seconds": 60
+    "default_timeout_seconds": 60,
+    "reality_check_enabled": true,
+    "reality_check_shortfall_threshold": 3
   },
   "browser": {
     "agent_id": "abcp-agent",
@@ -40,6 +45,7 @@
     "offload_threshold_bytes": 8000,
     "tool_result_offload_threshold_bytes": 50000,
     "local_fs_max_read_bytes": 20000,
+    "lead_model_timeout_step_retries": 1,
     "hitl_no_repause_cooldown_seconds": 8.0,
     "hitl_post_resume_guard_seconds": 30.0,
     "hitl_post_resume_confirm_max_rounds": 3,

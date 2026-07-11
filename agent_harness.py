@@ -8,12 +8,13 @@ main.py and tests.
 
 import asyncio
 import json
+import re
 import shutil
 import os
 import uuid
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from abcp_client import ABCPClient, ABCPClientConfig, ABCPTransportError
 from harness.auth_fleet import AUTH_FLEET_MEMORY_SCOPE, auth_fleet_memory_guidance
@@ -25,6 +26,7 @@ from harness.constants import (
     MODEL_ALLOWED_SOFT_STATUSES,
     WORKER_STATUS_CONTEXT_LIMIT,
     WORKER_STATUS_DONE,
+    WORKER_STATUS_INCOMPLETE,
     WORKER_STATUS_RUNNING,
 )
 from harness.diagnostics import (
@@ -77,18 +79,22 @@ from harness.strategy_bank import (
     select_strategies_for_phase,
 )
 from harness.task_control import (
+    VALIDATOR_TYPES,
     find_phase,
     initialize_task_state,
     load_task_state,
     mark_phase_exhausted_if_needed,
     next_pending_phase,
     phase_contract,
+    phase_start_rejection,
     validate_task_plan,
     write_task_plan,
 )
+from harness.task_types import normalize_task_type
 from harness.tool_policy import (
     ALWAYS_FORBIDDEN_ABCP_METHODS,
     HARNESS_TOOL_NAMES,
+    TASK_TYPE_DISABLED_DOMAINS,
     filter_capability_methods_for_task_type,
     sanitize_tool_calls_for_log,
     sanitize_tool_input_for_log,
@@ -111,7 +117,24 @@ from harness.utils import (
     trim_large_strings,
     write_context_snapshot,
 )
-from llm import BaseLLMProvider, LLMFactory, ModelConfig
+from llm import (
+    BaseLLMProvider,
+    LLMEmptyResponseError,
+    LLMFactory,
+    LLMRequestTimeoutError,
+    ModelConfig,
+)
+
+
+# Consecutive degenerate model responses (max_tokens truncation OR empty
+# end_turn, no tool call emitted) tolerated before the agent is terminated as
+# incomplete. Raising max_tokens is not an option: several models/gateways
+# hard-cap output tokens and reject larger values, and thinking tokens count
+# against the same budget. Empty end_turn responses are gateway/provider
+# incidents surfaced by the provider-level degenerate detection (task
+# 9d5655d3: the lead accepted one as a self-reported completion and died
+# silently at step 10/50 mislabeled as step_cap).
+TRUNCATION_STREAK_LIMIT = 3
 
 
 # ABCP capability methods we strip from the BrowserAgent tool surface because
@@ -380,6 +403,7 @@ class BrowserAgent:
                 }
             ]
 
+            truncation_streak = 0
             for step in range(1, self.runtime.harness.max_steps + 1):
                 force_reason = self._forced_compaction_reason
                 self._forced_compaction_reason = None
@@ -406,11 +430,29 @@ class BrowserAgent:
                         "toolCount": len(tools),
                     },
                 )
-                text, tool_calls, stop_reason, usage = await self.provider.generate_response(
-                    system_prompt=system_prompt,
-                    messages=messages,
-                    tools=tools,
-                )
+                try:
+                    text, tool_calls, stop_reason, usage = await self.provider.generate_response(
+                        system_prompt=system_prompt,
+                        messages=messages,
+                        tools=tools,
+                    )
+                except LLMEmptyResponseError as exc:
+                    # Mirror the lead: a degenerate response that survived the
+                    # provider's own retries surfaces as an empty turn for the
+                    # streak guard below — crashing the worker here would burn
+                    # the whole phase attempt on a gateway hiccup.
+                    self.logger.write("agent.model_degenerate_response", {
+                        "step": step,
+                        "provider": exc.provider,
+                        "model": exc.model,
+                        "operation": exc.operation,
+                        "problem": exc.problem,
+                        "providerMaxRetries": exc.max_retries,
+                        "attempts": exc.attempts,
+                    })
+                    text, tool_calls, stop_reason, usage = (
+                        "", [], "degenerate_response", {},
+                    )
                 usage_payload = self.logger.record_llm_usage(
                     source="browser_agent",
                     provider=self.runtime.model.provider,
@@ -453,6 +495,84 @@ class BrowserAgent:
                 })
 
                 if not tool_calls:
+                    # A no-tool turn is an incident (not a self-reported
+                    # completion) in two shapes: cut off by the output-token
+                    # limit, or entirely empty (degenerate gateway response
+                    # that survived provider-level retries, or a model
+                    # emitting a bare end_turn). Without this guard the empty
+                    # turn was classified done with an empty answer, bypassing
+                    # the step-cap fallback AND the final_answer blocker
+                    # channel. Retry with recovery guidance; only a streak
+                    # terminates the worker, as incomplete.
+                    incident = (
+                        "truncated" if stop_reason == "max_tokens"
+                        else "empty" if not text.strip()
+                        else ""
+                    )
+                    if incident:
+                        truncation_streak += 1
+                        self.logger.write("agent.truncated_response", {
+                            "step": step,
+                            "streak": truncation_streak,
+                            "limit": TRUNCATION_STREAK_LIMIT,
+                            "kind": incident,
+                            "stop_reason": stop_reason,
+                            "text_chars": len(text or ""),
+                        })
+                        if truncation_streak < TRUNCATION_STREAK_LIMIT:
+                            placeholder = (
+                                "[response truncated by output-token limit]"
+                                if incident == "truncated"
+                                else "[empty model response discarded]"
+                            )
+                            messages.append({"role": "assistant", "content": [{
+                                "type": "text",
+                                "text": text.strip() or placeholder,
+                            }]})
+                            incident_detail = (
+                                "hit the output-token limit before emitting"
+                                " any tool call"
+                                if incident == "truncated"
+                                else "was empty (no text and no tool call)"
+                            )
+                            messages.append({"role": "user", "content": [{
+                                "type": "text",
+                                "text": (
+                                    "<truncation_recovery>Your previous response"
+                                    f" {incident_detail} and was discarded. Do not"
+                                    " restate prior reasoning or dump large data"
+                                    " inline. Respond with minimal text and"
+                                    " exactly one tool call now — the next"
+                                    " concrete action, or final_answer with your"
+                                    " best current status and blockers."
+                                    "</truncation_recovery>"
+                                ),
+                            }]})
+                            continue
+                        model_reported_status = WORKER_STATUS_INCOMPLETE
+                        blocker_type = (
+                            "llm_output_truncation"
+                            if incident == "truncated"
+                            else "llm_empty_response"
+                        )
+                        blocker_detail = (
+                            "hit the output-token limit"
+                            if incident == "truncated"
+                            else "were empty"
+                        )
+                        final_answer = json.dumps({
+                            "blockers": [{
+                                "type": blocker_type,
+                                "detail": (
+                                    f"{truncation_streak} consecutive model"
+                                    f" responses {blocker_detail}"
+                                    " without emitting a tool call; the harness"
+                                    " terminated the worker."
+                                ),
+                            }],
+                        }, ensure_ascii=False)
+                        should_finish = True
+                        break
                     final_answer = text.strip()
                     # Treat a text-only assistant turn as a self-reported done;
                     # the classifier below may still override if a hard signal
@@ -460,6 +580,7 @@ class BrowserAgent:
                     model_reported_status = WORKER_STATUS_DONE
                     should_finish = True
                     break
+                truncation_streak = 0
 
                 assistant_content: List[JsonDict] = []
                 prefix_blocks = usage.get("_assistant_prefix_blocks") if isinstance(usage, dict) else None
@@ -789,17 +910,41 @@ class BrowserAgent:
         memories = data.get("memories")
         if not isinstance(memories, list):
             return cleaned
-        allowed_scopes = {current_task_scope, AUTH_FLEET_MEMORY_SCOPE}
+        # BLOCKLIST, mirroring _check_cross_task_memory_scope: remove ONLY
+        # entries scoped to ANOTHER harness task (…:<hex16+ task id>:task).
+        # Fleet/auth/custom scopes pass through — registration may carry
+        # them legitimately. Foreign-task entries are removed ENTIRELY
+        # (2cb616 premise contamination: a previous task's "scroll to rank
+        # 50, extract 11 rows" memory was restored into the new worker as
+        # established knowledge; blanking the context but keeping the scope
+        # name was not enough — a visible scope invites Memory.get, which
+        # returns the full stale payload).
+        current_parts = str(current_task_scope or "").split(":")
+        current_task_id = current_parts[-2] if len(current_parts) >= 3 else ""
+        kept: List[JsonDict] = []
+        removed = 0
         for item in memories:
-            if not isinstance(item, dict):
+            scope = str(item.get("scope") or "") if isinstance(item, dict) else ""
+            parts = scope.split(":")
+            foreign_task = bool(
+                len(parts) >= 3
+                and parts[-1] == "task"
+                and re.fullmatch(r"[0-9a-f]{16,}", parts[-2] or "")
+                and parts[-2] != current_task_id
+            )
+            if foreign_task:
+                removed += 1
                 continue
-            scope = str(item.get("scope") or "")
-            if scope in allowed_scopes:
-                continue
-            if "context" in item:
-                item["context"] = ""
-            item["ignored"] = True
-            item["ignoreReason"] = "task memory scope does not match current worker task"
+            kept.append(item)
+        data["memories"] = kept
+        if removed:
+            data["removedForeignTaskMemories"] = {
+                "count": removed,
+                "reason": (
+                    "memories from other tasks are historical context, not"
+                    " instructions; removed to prevent premise contamination"
+                ),
+            }
         return cleaned
 
     def _build_dynamic_context(self, bootstrap: JsonDict) -> str:
@@ -858,34 +1003,42 @@ L1. Contracts, Feedback, Memory
 - For methods with `requiresPurpose`, the harness fills `purpose` from browser_call.reason or schema `purposeHint`; still provide a specific reason.
 - Never fabricate fleetId, pageId, canonical ids, selectors, URLs, credentials, or extracted values. They must come from response.data, worker input, current DOM/Page evidence, Memory.get task context, or record_extraction artifacts.
 - Memory.save/Memory.get are for task context, constraints, milestones, and recovery notes only. They are not browser state and must not store plaintext passwords, tokens, private keys, or page data.
+- Memory restored from OTHER tasks is historical context, never instructions for the current task: a previous task's objective, ranges, step lists, or selectors may be wrong or stale, and the harness strips such entries from registration. Do not query other tasks' memory scopes; derive the current objective only from the user_task and worker contract.
 - Reusable authenticated fleet memory uses this exact JSON contract: {auth_fleet_json}. Treat it as a verified session index only, never as a credential store.
 
 L2. Perception And Evidence
 - DOM.getAXTree is the default perception tool for structure, labels, controls, state, and canonical ids. DOM.getText reads exact visible text for a known target. DOM.getAttribute reads href/src/id/aria-/data-/value and other attributes. Canonical element ids are three-segment frameId:axNodeId:domNodeId (e.g. 2:5367:5367); copy them verbatim from the latest AXTree and never truncate to two segments.
+- Read AXTree lines as `depth [id] role "label" flags # @x,y,w,h`. `#` marks a preferred actionable target; `@x,y,w,h` is the element's viewport rect (absent on unpositioned nodes) — use it for spatial reasoning (relative position, overlap, on/off-screen), not for deriving click coordinates; act through the canonical id or a selector, never coordinates read off the rect. Layout flags such as `hidden`, `off`, `blocked`, `scroll` (scrollable container), `sticky`, `clip`, `zN` (stacking order) may appear before the `#`/`@` markers, and can be present on non-actionable lines too. Prefer `#` targets whose line shows no `hidden`/`blocked` flag; treat `blocked` as occlusion (dismiss the blocker first) and `scroll` as the container to scroll in nested-scroll flows.
 - AXTree ids are epoch-bound physical anchors. Any Page.navigate, render recovery/recovered feedback, Page.create/switch/close, Runtime.evaluate, Hitl transition, or Input.* action can invalidate them. After such a change, call Page.getState as needed, then DOM.getAXTree and derive fresh ids before targeting. For same-instance multi-page workflows, track each pageId with its URL/title/purpose, switch serially with Page.switchTo, and never assume a snapshot from one page remains valid after Page.create or Page.switchTo.
 - Large DOM/text/attribute/tool results are offloaded under observations/. The model-visible stub includes `savedPath`, `outline`, `format`, and `query_with`; inspect savedPath with local_fs_search or local_fs_read before deriving params from offloaded evidence.
-- Screenshots produce a `savedPath` only. You cannot see the image from Page.screenshot output. Do not call Page.screenshot to read text, understand layout, identify selectors, or extract data. Use visual_verify only for bounded visual checks after visual uncertainty, overlays/CAPTCHA, canvas/image UI, layout mismatch, or DOM/visual disagreement.
+- Screenshots produce a `savedPath` only. You cannot see the image from Page.screenshot output. Do not call Page.screenshot to read text, understand layout, identify selectors, or extract data. Use visual_verify only for bounded visual checks after visual uncertainty, overlays/CAPTCHA, canvas/image UI, layout mismatch, or DOM/visual disagreement. When the element can be located, prefer a cropped element check (visual_verify with selector or canonical id, fullPage=false) over viewport/fullpage capture.
 
 L3. Lifecycle And HITL
-- Page.* handles lifecycle/navigation/dialogs/screenshots/page state. Event names such as Page.loaded, Page.dialogOpened, or Hitl.resumeEvent are not actions.
+- Page.* handles lifecycle/navigation/dialogs/screenshots/page state. Event names such as Page.loaded, Page.dialogOpened, or Hitl.resumed are not actions.
 - After navigation/loading/download/state changes, wait for live feedback/events when provided; if uncertain, call Page.getState once to resync, then DOM.getAXTree.
+- On page identity events (Page.open, Page.close, Page.switchTo, Page.popupRequested), refresh handles with Page.list or Page.getState and stop using closed or stale pageIds. After Page.dialogClosed or File.chooserClosed, call Page.getState before continuing. On Page.loadFailed, inspect the failure details before retrying; after Page.crashed, discard stale targets and resync or recreate the page.
 - A BrowserAgent may manage multiple tabs/pages inside its own instance. Use Page.create for additional pages and Page.switchTo/Page.list to select the active page. Control pages serially, not concurrently, and refresh Page/DOM perception after every switch before acting.
 - After a successful Hitl.requestPause, the harness owns wait, resolve, visual recovery checks, and terminal confirmation. Do not call any Hitl.* method again. Continue only when `hitl_wait.status="resumed"`; on `timeout`, `page_settled_after_hitl`, `stale_pause_deadlock`, `still_challenge_after_hitl`, or `browser_error_after_hitl`, call final_answer with a blocker.
 - Before critical or destructive actions, call Page.getState once if there is any doubt about loading, crash, HITL, dialog, file chooser, page identity, or viewport shift.
 
 L4. Actions, Verification, Data
-- Prefer Input.* for focus, scrolling, stabilization, and occlusion-aware interactions. Use canonical ids from the latest AXTree when possible; stable semantic selectors are fallback; raw coordinates are last resort.
+- Prefer Input.* for focus, scrolling, stabilization, and occlusion-aware interactions. Use canonical ids from the latest AXTree when possible; stable semantic selectors are fallback (avoid dynamic hash classes); raw coordinates are last resort. Do not add manual scroll or wait steps before standard Input.* interactions — they already handle focus, scrolling, and stabilization; manually scroll only nested scrollable containers or lazy-loading flows.
 - Verify every state-changing action with the cheapest reliable signal: ActionFeedback, Page.getState for navigation/lifecycle, refreshed DOM.getAXTree, DOM.getText, or DOM.getAttribute(value).
-- Use extract_dom_records for uniform lists/cards/tables. Use eval_js_json only when DOM primitives cannot express the relationship; give a valid reason_kind and cross-check at least one target field with DOM evidence before record_extraction.
+- Use extract_dom_records for uniform lists/cards/tables. Use eval_js_json only when DOM primitives cannot express the relationship; give a valid reason_kind and cross-check at least one target field with DOM evidence before record_extraction. Never use eval_js_json or Runtime.evaluate to bypass permissions, casually mutate page state, or replace form interactions — form entry goes through Input.*/fill_field_verified.
+- When <selected_skill> names a workflow skill and the zero-LLM fast path did not finish, call execute_selected_skill with live page/fleet handles plus variables or rows. The harness executes the selected frozen recipe; never search for workflow.json, reconstruct its steps from markdown, or copy them into browser_call.
 - Any reusable data handed to LeadAgent must go through record_extraction. Row keys must match expected_artifact fields exactly. Critical fields need sourceTool, sourceSelectorOrAxId, pageUrl, and canonical <field>EvidenceText evidence fields such as rankEvidenceText where applicable.
 - Reject empty, guessed, order-only, placeholder, sample, or template values. If the page truly shows absence/placeholder content, set `placeholderDetected: true` so validation can classify it. Never write a failure narrative (e.g. "未获取", "未明确展示", "located in an iframe", "not in the main DOM", "N/A") into a data field — that is a placeholder and validation rejects it; either obtain the real value or report a blocker.
 - A selector returning 0 rows is NOT proof the content is absent. Tabbed/sectioned detail pages (e.g. 包装信息 / 商品详情 / Reviews / Specs) only render their content after the tab/section is activated, and many images are lazy-loaded (real URL in data-src/srcset, revealed on scroll). Before concluding absence: click the relevant tab/heading, refresh Page.getState + DOM.getAXTree, scroll the section into view, then re-extract (extract_dom_records src auto-resolves lazy images). Content inside an iframe surfaces through frame-aware canonical ids (DOM.getAXTree / DOM.getSemanticTree emit frameId:axNodeId:domNodeId across frames) — try targeting those ids; there is no frame-switch action (Page.switchTo changes tabs/pages, not frames), so if the frame's content cannot be reached with the available DOM tools, report a blocker instead of assuming absence. Only report absence after these steps.
 
 L5. Recovery
 - Do not repeat an identical failed call. Read the failure ActionFeedback and suggested_prompt, call Page.getState if lifecycle may be stale, refresh DOM.getAXTree if the target may be stale/hidden/disabled, then retry only with changed params.
+- If auto-scroll reports out-of-bounds or the target stays invisible, locate the nearest scrollable parent container (the AXTree `scroll` flag marks scrollable containers) and scroll that container, not the window.
 - Use DOM.getSemanticTree only for local diagnostics when AXTree is insufficient and you need tag hierarchy, complete local bounds, Shadow DOM, or selector debugging. It is heavy and offloaded; prefer DOM.getAXTree + focused DOM.getText/DOM.getAttribute for routine perception. DOM.getAXTree / DOM.getSemanticTree return canonical ids: frameId:axNodeId:domNodeId.
 - local_fs_* inspects offloaded evidence; it is not live page state. If repeated local_fs searches return the same evidence, pivot to fresh DOM/Page/Input perception or finalize with a blocker.
+- Visual reality check before giving up: whenever your DOM evidence contradicts the task's expectation — an expected row/rank/field/section/value is missing, a collection returns 0 rows repeatedly, or scrolling/searching keeps finding nothing — scroll to the relevant region, call Page.screenshot, then visual_verify with a claim describing what you expected to see (e.g. "a product card ranked #40 or higher exists on this page"). Use the VL observation to confirm or refute your DOM conclusion, persist the observation via record_extraction, and cite that savedPath in evidenceArtifacts when declaring target_absent/instruction_infeasible or any blocker. Never conclude something is absent from DOM probing alone.
 - If a needed method is blocked by task_type policy, final_answer with status="incomplete" and include {{"classification":"blocked_cross_task_type_required","method":"...","task_type":"...","reason":"..."}} for LeadAgent replan.
+- If the requested target/range is proven absent after live recovery steps (for example exhaustive scroll reaches only #35 while #40-#50 were requested), final_answer with status="incomplete" and include a blocker exactly like {{"classification":"target_absent","reason":"page renders ranks #1-#35 only","highestRankReached":35,"attempts":3,"terminalCondition":"exhausted_scroll","evidenceArtifacts":["<artifact path>"]}} — the "classification" key must be present with that literal value. evidenceArtifacts must list savedPath values returned by your record_extraction calls in this run: the harness verifies them against its own ledger and downgrades unverified claims back to a retryable failure, so persist the observed evidence (for example the ranks you did see) BEFORE declaring target_absent. Do not fabricate rows to satisfy exact_rows.
+- If the instruction itself can never succeed on this source regardless of page state (contradictory requirements, a field/range this site does not define, a concept the source lacks), final_answer with status="incomplete" and include a blocker exactly like {{"classification":"instruction_infeasible","reason":"...","evidenceArtifacts":["<artifact path>"]}}. Use target_absent when this page could have held the target but demonstrably does not; use instruction_infeasible when no page of this source could satisfy the request.
 
 L6. Termination
 - Track remaining step budget. Near the cap, stop probing and call final_answer.
@@ -1190,6 +1343,60 @@ class LeadAgent:
             self.logger.write("task_plan.rejected", result)
             return result
 
+        preserve_from = load_task_state(self.logger) if replan_reason else None
+        if preserve_from is not None:
+            phases_state = (
+                preserve_from.get("phases")
+                if isinstance(preserve_from.get("phases"), dict)
+                else {}
+            )
+            running = sorted(
+                str(phase_id) for phase_id, phase_state in phases_state.items()
+                if isinstance(phase_state, dict)
+                and str(phase_state.get("status") or "") == "running"
+            )
+            if running:
+                result = {
+                    "status": "failed",
+                    "error": "replan rejected while BrowserAgent phases are running",
+                    "runningPhases": running,
+                    "next_instruction": (
+                        "Do not replace task_state while workers are live; their"
+                        " results would be validated against a moving plan. Call"
+                        " wait_browser_agents, then emit one complete replan that"
+                        " contains all known remediation phases."
+                    ),
+                }
+                self.logger.write("task_plan.rejected", result)
+                return result
+
+            plan_phases = (
+                plan.get("phases") if isinstance(plan.get("phases"), list) else []
+            )
+            if len(plan_phases) > 1:
+                implicit = [
+                    str(phase.get("id") or "")
+                    for phase in plan_phases if isinstance(phase, dict)
+                    and phase.get("depends_on") is None
+                ]
+                if implicit:
+                    result = {
+                        "status": "failed",
+                        "error": (
+                            "multi-phase replan requires explicit depends_on for"
+                            " every phase"
+                        ),
+                        "phasesMissingDependsOn": implicit,
+                        "next_instruction": (
+                            "Re-emit the complete replan. Use depends_on=[] for"
+                            " independent remediation phases, or list their exact"
+                            " data dependencies, so the harness cannot silently"
+                            " serialize them by plan order."
+                        ),
+                    }
+                    self.logger.write("task_plan.rejected", result)
+                    return result
+
         plan_path = write_task_plan(self.logger, plan)
         plan_warnings = (
             plan.get("warnings") if isinstance(plan.get("warnings"), list) else []
@@ -1198,7 +1405,6 @@ class LeadAgent:
             self.logger.write("task_plan.accepted_with_warnings", {
                 "warnings": plan_warnings,
             })
-        preserve_from = load_task_state(self.logger) if replan_reason else None
         state = initialize_task_state(
             self.logger,
             plan,
@@ -1216,6 +1422,27 @@ class LeadAgent:
                 " that later become phase_failed."
             ),
         }
+        # Echo what task_type policy ALREADY enforces worker-side, instead of
+        # duplicating it into the plan: the model sees the coverage and stops
+        # hand-authoring deny-lists of guessed method names (task 2ed5a466:
+        # 'Download.save' ×4 phases rejected a whole plan).
+        try:
+            normalized_task_type = normalize_task_type(plan.get("task_type"))
+            disabled_domains = TASK_TYPE_DISABLED_DOMAINS.get(normalized_task_type)
+            if disabled_domains:
+                result["methodPolicy"] = {
+                    "task_type": normalized_task_type,
+                    "disabledMethodDomains": sorted(disabled_domains),
+                    "note": (
+                        "These method domains are already disabled worker-side"
+                        " by task_type policy — no forbidden_methods needed for"
+                        " them. forbidden_methods is only for EXTRA"
+                        " restrictions; unknown names in it are dropped with a"
+                        " warning."
+                    ),
+                }
+        except Exception:  # receipt enrichment must never block acceptance
+            pass
         if plan_warnings:
             result["warnings"] = plan_warnings
         return result
@@ -1394,24 +1621,48 @@ class LeadAgent:
                 },
             )
 
-    def resolve_phase_for_spawn(self, phase_id: Optional[str]) -> Optional[JsonDict]:
+    def resolve_phase_for_spawn_with_rejection(
+        self,
+        phase_id: Optional[str],
+        worker_contract: Optional[JsonDict] = None,
+    ) -> "Tuple[Optional[JsonDict], Optional[JsonDict]]":
+        """(phase, rejection). The rejection is phase_start_rejection's
+        structured payload (dependency_not_ready / blocked_by_dependency /
+        phase_already_running / objective_exhausted / ...) when the phase
+        exists but cannot start NOW. Task 2ed5a466: collapsing every rejection
+        into a generic "phase not found or no pending phase" left the Lead
+        blind-retrying a dependency-gated phase — the reason and its
+        next_instruction must reach the model."""
         if self.task_plan is None:
-            return None
+            return None, None
         mark_phase_exhausted_if_needed(self.task_plan, self.logger)
         if phase_id:
             phase = find_phase(self.task_plan, phase_id)
             if phase is None:
-                return None
-            state = load_task_state(self.logger)
-            phase_state = (
-                state.get("phases", {}).get(str(phase.get("id") or ""))
-                if isinstance(state.get("phases"), dict)
-                else None
+                return None, None
+            rejection = phase_start_rejection(
+                self.task_plan,
+                self.logger,
+                phase_id=str(phase.get("id") or ""),
+                # The (raw) override is what the worker will actually run;
+                # without it a spawn that genuinely changes the objective
+                # would be pre-rejected against the raw phase's fingerprint.
+                worker_contract=worker_contract,
             )
-            if isinstance(phase_state, dict) and phase_state.get("status") == "phase_failed":
-                return None
-            return phase
-        return next_pending_phase(self.task_plan, self.logger)
+            if rejection is not None:
+                return None, rejection
+            return phase, None
+        return next_pending_phase(self.task_plan, self.logger), None
+
+    def resolve_phase_for_spawn(
+        self,
+        phase_id: Optional[str],
+        worker_contract: Optional[JsonDict] = None,
+    ) -> Optional[JsonDict]:
+        phase, _rejection = self.resolve_phase_for_spawn_with_rejection(
+            phase_id, worker_contract=worker_contract,
+        )
+        return phase
 
     def build_worker_contract(
         self,
@@ -1531,8 +1782,23 @@ class LeadAgent:
         tools = build_lead_agent_tool_specs()
         dispatch_tool = build_lead_tool_dispatcher(self)
         system_prompt = self._build_system_prompt()
+        try:
+            lead_timeout_step_retries = max(
+                0,
+                int(
+                    getattr(
+                        self.runtime.harness,
+                        "lead_model_timeout_step_retries",
+                        1,
+                    )
+                    or 0
+                ),
+            )
+        except (TypeError, ValueError):
+            lead_timeout_step_retries = 1
 
         try:
+            empty_response_streak = 0
             for step in range(1, self.runtime.harness.lead_max_steps + 1):
                 force_reason = self._forced_compaction_reason
                 self._forced_compaction_reason = None
@@ -1576,11 +1842,92 @@ class LeadAgent:
                         "toolCount": len(tools),
                     },
                 )
-                text, tool_calls, stop_reason, usage = await self.provider.generate_response(
-                    system_prompt=system_prompt,
-                    messages=messages,
-                    tools=tools,
-                )
+                model_attempt = 0
+                while True:
+                    model_attempt += 1
+                    try:
+                        text, tool_calls, stop_reason, usage = await self.provider.generate_response(
+                            system_prompt=system_prompt,
+                            messages=messages,
+                            tools=tools,
+                        )
+                        break
+                    except LLMEmptyResponseError as exc:
+                        # The provider already burned its own retry budget on
+                        # degenerate responses; give the step a fresh provider
+                        # call before surfacing. Never raise: an unhandled
+                        # degenerate response must end as an explicit
+                        # empty_model_response final, not a crashed run.
+                        will_retry = model_attempt <= lead_timeout_step_retries
+                        self.logger.write(
+                            "lead.model_degenerate_response",
+                            {
+                                "step": step,
+                                "attempt": model_attempt,
+                                "maxStepRetries": lead_timeout_step_retries,
+                                "willRetry": will_retry,
+                                "provider": exc.provider,
+                                "model": exc.model,
+                                "operation": exc.operation,
+                                "problem": exc.problem,
+                                "providerMaxRetries": exc.max_retries,
+                                "attempts": exc.attempts,
+                                "messageCount": len(messages),
+                            },
+                        )
+                        if will_retry:
+                            continue
+                        # Surface as an empty turn; the streak guard below owns
+                        # recovery and, eventually, the incomplete final.
+                        text, tool_calls, stop_reason, usage = (
+                            "", [], "degenerate_response", {},
+                        )
+                        break
+                    except LLMRequestTimeoutError as exc:
+                        will_retry = model_attempt <= lead_timeout_step_retries
+                        self.logger.write(
+                            "lead.model_timeout",
+                            {
+                                "step": step,
+                                "attempt": model_attempt,
+                                "maxStepRetries": lead_timeout_step_retries,
+                                "willRetry": will_retry,
+                                "errorType": type(exc).__name__,
+                                "error": str(exc),
+                                "provider": exc.provider,
+                                "model": exc.model,
+                                "operation": exc.operation,
+                                "timeoutSeconds": exc.timeout_seconds,
+                                "providerMaxRetries": exc.max_retries,
+                                "timeoutAttempts": exc.attempts,
+                                "messageCount": len(messages),
+                                "toolCount": len(tools),
+                            },
+                        )
+                        if not will_retry:
+                            raise
+                        reason = "llm_timeout_step_retry"
+                        self.logger.write(
+                            "context.compaction_requested",
+                            {
+                                "actor": "lead_agent",
+                                "step": step,
+                                "reason": reason,
+                                "triggerStep": step,
+                                "triggerAttempt": model_attempt,
+                            },
+                        )
+                        messages = compact_messages_if_needed(
+                            logger=self.logger,
+                            actor="lead_agent",
+                            step=step,
+                            system_prompt=system_prompt,
+                            messages=messages,
+                            tools=tools,
+                            config=self.runtime.harness,
+                            lifecycle=self.lifecycle,
+                            force_reason=reason,
+                        )
                 usage_payload = self.logger.record_llm_usage(
                     source="lead_agent",
                     provider=self.runtime.model.provider,
@@ -1606,10 +1953,89 @@ class LeadAgent:
                 )
 
                 if not tool_calls:
+                    # A no-tool lead turn with real text is a self-reported
+                    # final answer. A no-tool turn that is empty or truncated
+                    # is an incident: task 9d5655d3's lead accepted a
+                    # degenerate empty end_turn as "done" at step 10/50,
+                    # silently orphaning a pending phase. Retry with recovery
+                    # guidance (listing pending phases); only a streak
+                    # terminates, explicitly labeled — never as step_cap.
+                    incident = (
+                        "truncated" if stop_reason == "max_tokens"
+                        else "empty" if not text.strip()
+                        else ""
+                    )
+                    if incident:
+                        empty_response_streak += 1
+                        pending_ids = self._pending_phase_ids()
+                        self.logger.write("lead.empty_model_response", {
+                            "step": step,
+                            "streak": empty_response_streak,
+                            "limit": TRUNCATION_STREAK_LIMIT,
+                            "kind": incident,
+                            "stop_reason": stop_reason,
+                            "text_chars": len(text or ""),
+                            "pendingPhases": pending_ids,
+                        })
+                        if empty_response_streak < TRUNCATION_STREAK_LIMIT:
+                            placeholder = (
+                                "[response truncated by output-token limit]"
+                                if incident == "truncated"
+                                else "[empty model response discarded]"
+                            )
+                            messages.append({"role": "assistant", "content": [{
+                                "type": "text",
+                                "text": text.strip() or placeholder,
+                            }]})
+                            incident_detail = (
+                                "hit the output-token limit before emitting"
+                                " any tool call"
+                                if incident == "truncated"
+                                else "was empty (no text and no tool call)"
+                            )
+                            if pending_ids:
+                                next_action = (
+                                    " The task plan still has pending phase(s): "
+                                    + ", ".join(pending_ids)
+                                    + ". Either call spawn_browser_agent for the"
+                                    " next pending phase, or call final_answer"
+                                    " explaining why you are stopping early."
+                                )
+                            else:
+                                next_action = (
+                                    " If the task is complete, call final_answer"
+                                    " with the final result now."
+                                )
+                            messages.append({"role": "user", "content": [{
+                                "type": "text",
+                                "text": (
+                                    "<empty_response_recovery>Your previous"
+                                    f" response {incident_detail} and was"
+                                    " discarded. Respond with minimal text and"
+                                    f" exactly one tool call now.{next_action}"
+                                    "</empty_response_recovery>"
+                                ),
+                            }]})
+                            continue
+                        final_trigger = "empty_model_response"
+                        final_answer = (
+                            f"LeadAgent terminated after {empty_response_streak}"
+                            " consecutive empty/truncated model responses"
+                            + (
+                                "; pending phases not executed: "
+                                + ", ".join(pending_ids)
+                                if pending_ids
+                                else ""
+                            )
+                            + f". See run log: {self.logger.path}"
+                        )
+                        should_finish = True
+                        break
                     final_answer = text.strip()
                     final_trigger = "model_text"
                     should_finish = True
                     break
+                empty_response_streak = 0
 
                 assistant_content: List[JsonDict] = []
                 prefix_blocks = usage.get("_assistant_prefix_blocks") if isinstance(usage, dict) else None
@@ -1673,6 +2099,28 @@ class LeadAgent:
                 messages.append({"role": "user", "content": tool_results})
                 if should_finish:
                     break
+            # Normalize BEFORE the finally-snapshot so lead.final and the
+            # context snapshot carry the same trigger. step_cap is reserved
+            # for genuinely exhausting lead_max_steps — task 9d5655d3's empty
+            # response at step 10/50 was mislabeled step_cap by the old
+            # unconditional fallback, which sent the investigation down the
+            # wrong path.
+            if not final_answer:
+                if step >= self.runtime.harness.lead_max_steps:
+                    final_trigger = "step_cap"
+                    final_answer = (
+                        "LeadAgent reached the maximum orchestration step count"
+                        " without an explicit completion. "
+                        f"See run log: {self.logger.path}"
+                    )
+                else:
+                    final_trigger = final_trigger or "no_completion"
+                    final_answer = (
+                        f"LeadAgent stopped at step {step}/"
+                        f"{self.runtime.harness.lead_max_steps} without an"
+                        f" explicit completion (trigger: {final_trigger})."
+                        f" See run log: {self.logger.path}"
+                    )
             completed = True
         except asyncio.CancelledError as exc:
             self.logger.write(
@@ -1688,12 +2136,10 @@ class LeadAgent:
             raise
         finally:
             try:
+                # Normal completion normalized final_answer/final_trigger above;
+                # on exception paths final_answer may legitimately be empty and
+                # the snapshot records it as-is (completed=False tells the story).
                 snapshot_final_answer = final_answer
-                if not snapshot_final_answer and completed:
-                    snapshot_final_answer = (
-                        "LeadAgent reached the maximum orchestration step count without an explicit completion. "
-                        f"See run log: {self.logger.path}"
-                    )
                 write_context_snapshot(
                     self.logger,
                     actor="lead_agent",
@@ -1726,11 +2172,12 @@ class LeadAgent:
                 )
 
         if not final_answer:
+            # Defensive only: normal completion always normalizes above.
             final_answer = (
-                "LeadAgent reached the maximum orchestration step count without an explicit completion. "
+                "LeadAgent finished without an explicit completion. "
                 f"See run log: {self.logger.path}"
             )
-            final_trigger = "step_cap"
+            final_trigger = final_trigger or "no_completion"
         self.logger.write(
             "lead.final",
             {
@@ -1741,6 +2188,32 @@ class LeadAgent:
             },
         )
         return final_answer
+
+    def _pending_phase_ids(self) -> List[str]:
+        """Phase ids not yet completed, for empty-response recovery prompts.
+
+        Best-effort: a missing/unreadable task_state must never break the
+        recovery path — it only makes the prompt less specific.
+        """
+        if self.task_plan is None:
+            return []
+        try:
+            state = load_task_state(self.logger)
+        except Exception:
+            return []
+        phases = state.get("phases") if isinstance(state, dict) else None
+        if not isinstance(phases, dict):
+            return []
+        pending: List[str] = []
+        for phase_id, phase_state in phases.items():
+            status = (
+                str(phase_state.get("status") or "")
+                if isinstance(phase_state, dict)
+                else ""
+            )
+            if status in {"pending", "running"}:
+                pending.append(str(phase_id))
+        return pending
 
     def _step_cap_reminder_block(
         self, *, current_step: int, max_steps: int,
@@ -1802,6 +2275,14 @@ class LeadAgent:
             indent=2,
             default=str,
         )
+        known_skills_block = ""
+        try:
+            from harness.skill.contract import build_known_skills_digest
+            from harness.skill.registry import SkillRegistry
+
+            known_skills_block = build_known_skills_digest(SkillRegistry.load())
+        except Exception:  # skills digest must never break prompt construction
+            known_skills_block = ""
         return """You are the ABCP LeadAgent, responsible for decomposing the user task, spawning BrowserAgent phases, validating artifacts, and returning the final result.
 
 You cannot drive the browser directly. Use Lead tools only. Express complex browser work as BrowserAgent phases and validate their artifacts before returning the final result.
@@ -1811,21 +2292,29 @@ Strategy bank entries are procedural defaults, not permissions and not hard scri
 """ + strategy_bank_json + """
 </strategy_bank>
 
+""" + known_skills_block + """
+
 Lead state flow:
-0. First call `emit_task_plan` with a v1 linear phase plan. The plan must include task_type. Each phase needs objective, worker_task, stage_hint, stage_hint_reason, expected_artifact, validators, worker_contract, and max_attempts. Use max_attempts=3 by default unless the task is trivial or unsafe to retry.
+0. First call `emit_task_plan` with a v1 phase plan. The plan must include task_type. Each phase needs objective, worker_task, stage_hint, stage_hint_reason, expected_artifact, validators, worker_contract, and max_attempts. Use max_attempts=3 by default unless the task is trivial or unsafe to retry.
+   Phase scheduling is driven by depends_on: OMITTING it means the phase implicitly depends on ALL phases listed before it (strict serial order); depends_on=[] declares an independent phase; depends_on=["p1"] lists the exact data dependencies. Declare only true data dependencies — e.g. every detail phase depends only on the collection phase, not on its sibling detail phases — so independent phases can run in parallel. A spawn whose dependencies are not yet validated_done is rejected with dependency_not_ready; wait for the dependency instead of retrying. A replan is a COMPLETE replacement: first wait for all live workers, then include every currently known remediation phase in the same emit_task_plan call. Multi-phase replans must set depends_on explicitly on every phase; use [] for independent repairs so they remain parallel.
+   validators is an ARRAY of typed objects (never a dict keyed by validator name). Valid validator types (exact enum): """ + ", ".join(sorted(VALIDATOR_TYPES)) + """. Common shapes: {"type":"exact_rows","count":11}, {"type":"range","field":"rank","min":40,"max":50}, {"type":"set_equals","field":"rank","values":[39,41]} for an exact NON-CONTIGUOUS target set, {"type":"unique","fields":["detailUrl"]}, {"type":"url_pattern","field":"detailUrl","pattern":"^https://..."}, {"type":"required_fields","fields":[...]}, {"type":"field_nonempty","fields":[...]}. A range includes every value between min/max and cannot express {38,40}; use set_equals or attach explicit skill_rows for such remediation. Do not invent type names (url_format/rank_range/no_duplicates are wrong).
+   Plan at skill granularity: <known_skills> lists reusable skills, each tagged with a `kind`. kind="workflow": a frozen Workflow.execute recipe that runs the phase with ZERO worker LLM steps (fast path) — for these you may attach worker_contract.skill_rows (multi-row) or skill_variables (single-row). kind="guidance": a hints-only skill that has NO fast path and produces NO artifact by itself — it only injects page knowledge (selectors, negative knowledge, filtering rules) into the worker's context; the worker still performs the task and record_extraction itself, so plan its phase exactly as a normal browser phase (full expected_artifact + validators) and do NOT attach skill_rows/skill_variables to it. Skill use is a USER decision (skill_selection_mode=manual, the default): you must NOT pick a skill on your own; a skill engages only when the operator forced one (--skill / /skill, which may name a single skill or a suite whose members route per phase by stage_hint/fields). When a workflow skill IS forced, shape the plan for it: use the skill's declared field names verbatim in expected_artifact (never invent synonyms like productUrl for its detailUrl), set worker_contract.skill_id, and for a multi-row phase either omit skill_rows when a validated upstream artifact exactly covers the validator-selected slice (the harness auto-builds them), or attach worker_contract.skill_rows=[one dict per row using the skill's row_variables]. Explicit rows are accepted for enrichment only after an exact validated identity-set match; never copy rows from a prose summary when an artifact exists. The fast path iterates rows on one warm tab. A single-row phase uses worker_contract.skill_variables instead.
    Valid stage_hint values: collection, detail_sections, attribute_links, form_interaction, computed_relationship, generic. Use generic only when the phase truly cannot be classified.
-   Do not hand-author ABCP allow-lists. BrowserAgent access is governed by task_type policy plus explicit forbidden_methods. If a workflow crosses task types, split phases and replan with the correct task_type. Canonical task_type values include web_search, web_scrape, file_download, file_upload, form_filling, browser_state_management, and general. web_scrape/web_search intentionally disable Download and File methods, so a worker cannot save or upload files there. For file/image/PDF/export saving, use a dedicated task_type="file_download" phase: first discover and validate the resolved URL in web_scrape/web_search, then pass that URL/path plan to file_download, where File.download and Download.* are available. For native upload controls, use task_type="file_upload", where File.handleChooser is available after the worker opens the page and triggers the chooser. For ordinary data entry, submission, login, settings changes, or forms that may include an upload control, use task_type="form_filling"; it has DOM/Input plus File.handleChooser, but not File.download or Download.*. Use task_type="browser_state_management" only for targeted Bookmark/History/Memory state work; it does not expose File.download, File.handleChooser, Download.*, Bookmark.clearAll, or History.clearAll. Legacy aliases download_file, form_fill, browser_action, and browser_data_collection are accepted but should not be emitted in new plans.
+   Do not hand-author ABCP method lists. BrowserAgent method access is governed by task_type policy, which already disables whole method domains worker-side — a web_scrape worker cannot call Download/File/Bookmark/History methods no matter what the plan says, so you normally need NO forbidden_methods at all (the acceptance receipt echoes the policy-disabled domains). Add forbidden_methods only for an EXTRA restriction beyond policy, using canonical method names or Domain.* wildcards; never guess method names — unknown names in forbidden_methods are dropped with a warning, and unknown names in allowed_methods reject the plan. If a workflow crosses task types, split phases and replan with the correct task_type. Canonical task_type values include web_search, web_scrape, file_download, file_upload, form_filling, browser_state_management, and general. web_scrape/web_search intentionally disable Download and File methods, so a worker cannot save or upload files there. For file/image/PDF/export saving, use a dedicated task_type="file_download" phase: first discover and validate the resolved URL in web_scrape/web_search, then pass that URL/path plan to file_download, where File.download and Download.* are available. For native upload controls, use task_type="file_upload", where File.handleChooser is available after the worker opens the page and triggers the chooser. For ordinary data entry, submission, login, settings changes, or forms that may include an upload control, use task_type="form_filling"; it has DOM/Input plus File.handleChooser, but not File.download or Download.*. Use task_type="browser_state_management" only for targeted Bookmark/History/Memory state work; it does not expose File.download, File.handleChooser, Download.*, Bookmark.clearAll, or History.clearAll. Legacy aliases download_file, form_fill, browser_action, and browser_data_collection are accepted but should not be emitted in new plans.
    BrowserAgent slots are expensive and pooled. Keep live slots within runtime_limits.max_browser_agent_instances. A normal new worker reuses only the slot connection and must start browser work from a fresh page. For related continuations only, inspect list_browser_agents slots and pass reuse_from_worker_id or preferred_slot_id so the spawner can expose that idle slot's existing fleet/page registry.
    If the user asks for an explicit item count such as "#1-10", "top 10", "all 10", or "for each of the 10 rows", encode that count as expected_artifact.exact_rows or an exact_rows validator. Use required_fields for every user-requested output field, and make scalar fields field_nonempty unless the task explicitly allows blanks or missing values.
    For any auth-gated workflow (login, SSO/OAuth, QR scan, phone verification, CAPTCHA/human verification, paywall, or subscription wall), split pre-auth gate probing from post-auth target work. The pre-auth phase should only answer whether a gate is present, the gate surface/method/options, current URL/title, and evidence; it must stop once a gate is confirmed and must not require post-auth target fields, form sections, list rows, downloads, or details. Put HITL/login verification in the next phase, then map/fill/collect protected target content only after authentication is verified.
-1. Spawn one BrowserAgent for the first pending phase. Give it a narrow worker_task, exact target fields, exact output format, explicit stop condition, and a `result_contract`.
+1. Spawn a BrowserAgent per startable phase: a phase is startable when every depends_on phase (or, with depends_on omitted, every prior phase) is validated_done. Independent phases MAY be spawned in parallel in one turn (respect runtime_limits.max_browser_agent_instances), then collected with wait_browser_agents. Give each worker a narrow worker_task, exact target fields, exact output format, explicit stop condition, and a `result_contract`. If a spawn returns dependency_not_ready, the dependency is still running — wait for it; do not re-spawn in a loop.
 2. When spawning a BrowserAgent, copy expected_artifact.fields / required_fields verbatim and state that record_extraction row keys must use those exact names. For provenance-sensitive fields, state the literal keys from worker_contract.validators: pageUrl, sourceTool, sourceSelectorOrAxId, and canonical <field>EvidenceText such as rankEvidenceText. The validator accepts legacy evidence/<field>Evidence aliases only as compatibility fallback; prefer the canonical keys.
 3. Never turn an unverified assumption into a worker instruction. Dynamic params must be described as observable labels, roles, headings, hrefs, artifact paths, or current-page evidence. Do not pass hard-coded pageId, fleetId, AXTree ids, CSS selectors, ranks, or list indexes unless they came from cited recent evidence.
-3a. If spawn_browser_agent returns status="skill_selection_required", read the candidate skillMarkdown before deciding. To use a skill, retry spawn_browser_agent with worker_contract.skill_id and row/page-specific skill_variables. To decline all candidates, retry with worker_contract.skill_selection={"use_skill": false, "reason": "...", "considered_skill_ids": [...]}. An empty/blank skill_id is NOT a decline and will re-request selection — you must send the skill_selection.use_skill=false object to proceed without a skill. Do not switch stage_hint to generic just to dodge selection; that does not bypass it and still needs a valid >=40 char stage_hint_reason. Do not force a single-detail skill over a batch phase; split/replan per row or explicitly decline.
+3a. (auto selection mode only; never happens under the default manual mode) If spawn_browser_agent returns status="skill_selection_required", read the candidate skillMarkdown before deciding. To use a skill, retry spawn_browser_agent with worker_contract.skill_id and row/page-specific skill_variables — or, for a batch phase, worker_contract.skill_rows=[one dict per row]; the fast path runs the frozen workflow once per row on one warm tab with zero LLM steps, so PREFER skill_rows over declining a matching single-detail skill for a batch. To decline all candidates, retry with worker_contract.skill_selection={"use_skill": false, "reason": "...", "considered_skill_ids": [...]}. An empty/blank skill_id is NOT a decline and will re-request selection — you must send the skill_selection.use_skill=false object to proceed without a skill. Do not switch stage_hint to generic just to dodge selection; that does not bypass it and still needs a valid >=40 char stage_hint_reason. Never run a single-detail skill once over a whole batch; accept with skill_rows, split per row, or explicitly decline.
 4. After each BrowserAgent result, route from `resultLevels.l1` and `statusCategory`; use `resultLevels.l2` for data/evidence/blockers. `traceSummary`, `tracePath`, artifact paths, and offload paths are detail surfaces only; inspect them with local_fs_search/local_fs_read when needed, not by pasting large traces into context.
+   Describe a worker as "zero-LLM fast path" only when executionMode="skill_fast_path" and traceSummary.steps=0. executionMode="skill_repair" means a workflow produced a trusted baseline but a BrowserAgent LLM repaired localized fields; do not report that as zero-LLM.
 5. If artifact validation fails with schema_mismatch but the rows are trustworthy, use lead_save_artifact to reshape from trusted extraction artifacts. Do not re-scrape only to rename fields.
 6. A phase with validatedStatus="validation_failed" or task_state status="validation_failed" is not complete. Do not describe it as done/completed/successful, mark it DONE/SKIP, or build later phases as if it were validated unless you first use lead_save_artifact to create a replacement artifact that passes validation.
 7. If validation reports data_placeholder, data_wrong_value, missing rank/range evidence, or the worker only found off-target rows, replan with a narrower BrowserAgent task or report partial/blocker. Do not accept placeholder artifacts as progress.
+7a. If resultLevels.l1.failureClassification is target_absent or instruction_infeasible, do not retry the same phase or advance dependent phases. Stop with final_answer or emit a substantially revised task_plan with a different target/source and new phase id.
+7b. A new phase id does NOT grant a new budget for the same objective: failures accumulate per objective fingerprint (target range/row count/artifact) across replans, and spawn_browser_agent returns objective_exhausted once that budget is spent. At that point either genuinely change the target (different source URL, range, or artifact) or final_answer with the collected evidence — re-phrasing the same objective under a fresh id will be rejected.
 8. If a phase is returned as phase_failed or phase_exhausted, do not retry that phase id directly. Either final_answer with the blocker or emit a revised task_plan with replan_reason that changes stage_hint, contract, decomposition, or strategy.
 9. If spawn_browser_agent returns phase_classification_repeated, do not call spawn_browser_agent again for the same phase/contract. Emit a revised task_plan with replan_reason that changes objective, worker_task, worker_contract, expected_artifact, validators, or task_type; otherwise final_answer with the blocker. If it returns phase_locked_must_finalize, call final_answer unless you can immediately emit a substantially revised task_plan.
 10. If resultLevels.l2.blockers contains stall_replan_recommended, the worker saw repeated within-attempt stall signals. Do not re-spawn the same phase with the same worker_task. Either emit a revised task_plan that changes the phase procedure, preferred tools, expected_artifact, validators, stage_hint, or worker_contract; or final_answer with the blocker, citing signalCount, loopNudgeCount, and progressInterventionCount as evidence. This is advisory, not an automatic failure, but ignoring it wastes another worker attempt.
