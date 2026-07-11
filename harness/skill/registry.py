@@ -6,6 +6,12 @@ fallback.yaml (success contract + takeover). This module does the deterministic
 pre-filter (§5.2) and manual lookup (§5.1) — no LLM. The actual run is in
 harness.skill.workflow.
 
+workflow.json is OPTIONAL (07-07 guidance layer): a directory with only
+SKILL.md loads as a *hints-only* (guidance) skill — no fast path, its value is
+the SKILL.md hints section injected into the slow-path worker context (see
+harness.skill.guidance). A present-but-malformed workflow.json still rejects
+the whole skill (fail loud, not silently hints-only).
+
 Match dims (SKILL.md frontmatter vs task descriptor):
   domain      exact or wildcard (*.example.com) vs the task's target host
   task_type   exact
@@ -30,9 +36,38 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import yaml
 
+from harness.skill.structured_output import validate_structured_output_workflow
 from harness.task_types import normalize_task_type
 
 SKILLS_DIR_DEFAULT = Path(__file__).resolve().parent.parent.parent / "skills"
+
+# Per-skill generation report written by /skill-create (provenance, quality
+# verdict, human-readable failures, next actions). Runtime state — gitignored
+# like .skill_health.json. Readers: CLI markers, selected_skill_context (so the
+# slow-path LLM knows a blocked draft's gaps), --recheck/--retry.
+CREATE_REPORT_FILENAME = ".create_report.json"
+
+ROW_CONTRACT_VARIABLE_TYPES = {
+    "scalar",
+    "string",
+    "integer",
+    "number",
+    "boolean",
+    "uri",
+}
+
+
+def load_create_report(directory: Any) -> Dict[str, Any]:
+    if not directory:
+        return {}
+    try:
+        path = Path(directory) / CREATE_REPORT_FILENAME
+        if not path.is_file():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 def _parse_frontmatter(md_text: str) -> Dict[str, Any]:
@@ -52,6 +87,120 @@ def _parse_frontmatter(md_text: str) -> Dict[str, Any]:
     except yaml.YAMLError:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _truthy_flag(value: Any) -> bool:
+    """Frontmatter flags arrive as bool from YAML or as strings from hand edits."""
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"true", "yes", "1", "on"}
+
+
+def validate_row_contract(
+    raw: Any,
+    workflow: Optional[Dict[str, Any]] = None,
+    success_contract: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, List[str]]:
+    """Validate the declarative contract used for batch row joins.
+
+    The contract deliberately describes roles, not site-specific field names.
+    A missing contract remains valid for legacy/single-run skills; a present but
+    malformed contract is rejected so runtime enrichment never guesses.
+    """
+    if raw is None:
+        return True, []
+    if not isinstance(raw, dict):
+        return False, ["row_contract must be an object"]
+    failures: List[str] = []
+    if raw.get("version") != 1:
+        failures.append("row_contract.version must be 1")
+
+    def _names(key: str, *, required: bool = False) -> List[str]:
+        value = raw.get(key)
+        if not isinstance(value, list):
+            if required or value is not None:
+                failures.append(f"row_contract.{key} must be an array")
+            return []
+        names = [str(item).strip() for item in value]
+        if any(not name for name in names):
+            failures.append(f"row_contract.{key} cannot contain blank names")
+        names = [name for name in names if name]
+        if len(names) != len(set(names)):
+            failures.append(f"row_contract.{key} cannot contain duplicates")
+        if required and not names:
+            failures.append(f"row_contract.{key} must not be empty")
+        return names
+
+    identities = _names("identity_variables", required=True)
+    passthrough = _names("passthrough_variables", required=True)
+    produced = _names("produced_fields", required=True)
+    template = set((workflow or {}).get("variables") or {})
+    unknown_identity = sorted(set(identities) - template)
+    unknown_passthrough = sorted(set(passthrough) - template)
+    if unknown_identity:
+        failures.append(
+            "row_contract.identity_variables are not workflow variables: "
+            + ", ".join(unknown_identity)
+        )
+    if unknown_passthrough:
+        failures.append(
+            "row_contract.passthrough_variables are not workflow variables: "
+            + ", ".join(unknown_passthrough)
+        )
+    if not set(identities).issubset(set(passthrough)):
+        failures.append(
+            "row_contract.identity_variables must also be passthrough_variables"
+        )
+
+    field_map = (success_contract or {}).get("variable_to_field")
+    field_map = field_map if isinstance(field_map, dict) else {}
+
+    def _extract_variables(steps: Any) -> Set[str]:
+        values: Set[str] = set()
+        for step in steps if isinstance(steps, list) else []:
+            if not isinstance(step, dict):
+                continue
+            extract = step.get("extract")
+            if isinstance(extract, dict):
+                values.update(str(name) for name in extract)
+            for branch in ("then", "else", "body"):
+                values.update(_extract_variables(step.get(branch)))
+        return values
+
+    actual_produced = {
+        str(field_map.get(variable) or variable)
+        for variable in _extract_variables((workflow or {}).get("steps"))
+    }
+    undeclared_outputs = sorted(set(produced) - actual_produced)
+    if undeclared_outputs:
+        failures.append(
+            "row_contract.produced_fields are not workflow extract outputs: "
+            + ", ".join(undeclared_outputs)
+        )
+
+    variable_types = raw.get("variable_types")
+    if not isinstance(variable_types, dict):
+        failures.append("row_contract.variable_types must be an object")
+    else:
+        for name, kind in variable_types.items():
+            variable = str(name).strip()
+            normalized_kind = str(kind).strip().lower()
+            if variable not in template:
+                failures.append(
+                    f"row_contract.variable_types names unknown variable: {variable}"
+                )
+            if normalized_kind not in ROW_CONTRACT_VARIABLE_TYPES:
+                failures.append(
+                    f"row_contract.variable_types.{variable} must be one of "
+                    + ", ".join(sorted(ROW_CONTRACT_VARIABLE_TYPES))
+                )
+        missing_types = sorted(set(passthrough) - set(variable_types))
+        if missing_types:
+            failures.append(
+                "row_contract.variable_types missing passthrough variables: "
+                + ", ".join(missing_types)
+            )
+    return not failures, failures
 
 
 def _domain_matches(skill_domain: str, task_domain: str) -> bool:
@@ -112,6 +261,55 @@ class Skill:
     def success_contract(self) -> Dict[str, Any]:
         return dict(self.fallback.get("success_contract") or {})
 
+    @property
+    def row_contract(self) -> Dict[str, Any]:
+        return dict(self.fallback.get("row_contract") or {})
+
+    @property
+    def structured_output(self) -> Dict[str, Any]:
+        """Optional multi-row JSON-string output from ordinary Workflow.execute."""
+        raw = self.workflow.get("structured_output")
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    @property
+    def has_workflow(self) -> bool:
+        """本 skill 是否带 workflow（快路径）层。"""
+        return bool(self.workflow.get("steps"))
+
+    @property
+    def is_hints_only(self) -> bool:
+        """guidance skill：没有冻结 workflow，慢路径就是执行路径（快路径直接
+        跳过、不碰引擎、不记任何账——见 harness.skill.guidance 模块说明）。"""
+        return not self.has_workflow
+
+    @property
+    def hints(self) -> str:
+        """SKILL.md 的 `## 页面知识（hints）` 小节（无则空串）。"""
+        from harness.skill.guidance import extract_hints_section
+        return extract_hints_section(self.skill_md)
+
+    @property
+    def suite(self) -> str:
+        """技能组名（frontmatter `suite:`，无则空串）。suite 是"选择别名"：
+        `/skill <suite名>` 展开成所有 suite 成员，各 phase 按四维路由到成员
+        （见 SkillRegistry.expand_selection）。"""
+        return str(self.frontmatter.get("suite") or "").strip()
+
+    @property
+    def is_draft(self) -> bool:
+        """/skill-create scaffolds carry `draft: true` until calibrated. Drafts
+        are excluded from auto matching (match/candidates/soft_candidates) but
+        stay reachable via explicit get() — /skill <id> is an informed choice
+        (the CLI list marks them [draft])."""
+        return _truthy_flag(self.frontmatter.get("draft"))
+
+    @property
+    def is_tested(self) -> bool:
+        """`tested` absent means the skill predates the live-trial gate — treat
+        as tested; only an explicit falsy value marks it untried."""
+        value = self.frontmatter.get("tested")
+        return True if value is None else _truthy_flag(value)
+
     def matches(
         self,
         *,
@@ -130,7 +328,11 @@ class Skill:
             return False
         if self.stage_hint and stage_hint and self.stage_hint != stage_hint:
             return False
-        if self.fields and fields is not None and not self.fields.issubset(fields):
+        # Canonicalized comparison: productUrl vs detailUrl must not split a
+        # match (07-05 incident); unknown tokens stay distinct (conservative).
+        if self.fields and fields is not None and not canonical_fields(self.fields).issubset(
+            canonical_fields(fields)
+        ):
             return False
         return True
 
@@ -159,16 +361,30 @@ class SkillRegistry:
     def _load_one(directory: Path) -> Optional[Skill]:
         skill_md = directory / "SKILL.md"
         workflow_json = directory / "workflow.json"
-        if not skill_md.is_file() or not workflow_json.is_file():
+        if not skill_md.is_file():
             return None
         skill_md_text = skill_md.read_text(encoding="utf-8")
         frontmatter = _parse_frontmatter(skill_md_text)
-        try:
-            workflow = json.loads(workflow_json.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(workflow, dict) or not isinstance(workflow.get("steps"), list):
-            return None
+        # workflow.json 可缺席（hints-only guidance skill）；但存在即必须合法——
+        # 坏 JSON 不能静默降级成 guidance，否则 workflow skill 的损坏被吞掉。
+        workflow: Dict[str, Any] = {}
+        if workflow_json.is_file():
+            try:
+                workflow = json.loads(workflow_json.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                return None
+            if not isinstance(workflow, dict) or not isinstance(workflow.get("steps"), list):
+                return None
+            structured_ok, structured_failures = validate_structured_output_workflow(
+                workflow.get("structured_output"), workflow,
+            )
+            if not structured_ok:
+                print(
+                    f"[skill_registry] WARNING: {workflow_json} has invalid "
+                    f"structured_output ({'; '.join(structured_failures)}); skill rejected",
+                    file=sys.stderr,
+                )
+                return None
         fallback: Dict[str, Any] = {}
         fb = directory / "fallback.yaml"
         if fb.is_file():
@@ -182,6 +398,19 @@ class SkillRegistry:
                 print(f"[skill_registry] WARNING: {fb} is malformed YAML "
                       f"(success_contract gating disabled): {exc}", file=sys.stderr)
                 fallback = {}
+        row_contract = fallback.get("row_contract") if fallback else None
+        row_contract_ok, row_contract_failures = validate_row_contract(
+            row_contract,
+            workflow,
+            fallback.get("success_contract") if isinstance(fallback, dict) else None,
+        )
+        if not row_contract_ok:
+            print(
+                f"[skill_registry] WARNING: {fb} has an invalid row_contract "
+                f"({'; '.join(row_contract_failures)}); skill rejected",
+                file=sys.stderr,
+            )
+            return None
         skill_id = str(frontmatter.get("name") or directory.name)
         return Skill(skill_id=skill_id, directory=directory,
                      frontmatter=frontmatter, workflow=workflow,
@@ -194,6 +423,31 @@ class SkillRegistry:
         """Manual selection (§5.1 /skill <id>)."""
         return self._by_id.get(skill_id)
 
+    def suite_members(self, suite: str) -> List[Skill]:
+        """一个技能组的所有成员（frontmatter suite 匹配），skill_id 升序稳定。"""
+        s = str(suite or "").strip()
+        if not s:
+            return []
+        return sorted((sk for sk in self._skills if sk.suite == s),
+                      key=lambda sk: sk.skill_id)
+
+    def expand_selection(self, name: str) -> List[str]:
+        """把用户 `/skill <name>` 的 name 展开成 skill_id 列表。
+
+        name 是某个 skill_id → 返回 [name]（单选，语义不变）；name 是一个
+        suite 名（有成员且不与任何 skill_id 冲突）→ 返回该组全部成员 id。
+        既是 skill_id 又是 suite 名时，skill_id 优先（显式点名的 id 最具体）。
+        无匹配 → 返回 [name]（交给下游 get() 报未知，保持既有错误路径）。"""
+        n = str(name or "").strip()
+        if not n:
+            return []
+        if n in self._by_id:
+            return [n]
+        members = self.suite_members(n)
+        if members:
+            return [sk.skill_id for sk in members]
+        return [n]
+
     def candidates(
         self,
         *,
@@ -201,11 +455,13 @@ class SkillRegistry:
         task_type: str = "",
         stage_hint: str = "",
         fields: Optional[Set[str]] = None,
+        include_drafts: bool = False,
     ) -> List[Skill]:
         return [
             s for s in self._skills
-            if s.matches(domain=domain, task_type=task_type,
-                         stage_hint=stage_hint, fields=fields)
+            if (include_drafts or not s.is_draft)
+            and s.matches(domain=domain, task_type=task_type,
+                          stage_hint=stage_hint, fields=fields)
         ]
 
     def soft_candidates(
@@ -217,15 +473,20 @@ class SkillRegistry:
         fields: Optional[Set[str]] = None,
         text: str = "",
         limit: int = 5,
+        include_drafts: bool = False,
     ) -> List[Tuple[Skill, int, List[str]]]:
         """Soft-recall skill candidates for LLM selection.
 
         This intentionally does not hard-filter on keywords. Every dimension only
         contributes score/reasons; the LeadAgent decides by reading SKILL.md and
         the executor later performs deterministic safety/variable checks.
+        Drafts are excluded by default: an uncalibrated scaffold must not be
+        offered to the Lead as if it were a proven recipe.
         """
         hits: List[Tuple[Skill, int, List[str]]] = []
         for skill in self._skills:
+            if skill.is_draft and not include_drafts:
+                continue
             score, reasons = _soft_skill_score(
                 skill,
                 domain=domain,
@@ -250,7 +511,8 @@ class SkillRegistry:
         """Deterministic pre-filter (§5.2): return the unique hit, else None.
 
         Multiple candidates → None here (caller does a single LLM disambiguation
-        over self.candidates(...)); no silent guessing.
+        over self.candidates(...)); no silent guessing. Drafts never auto-match
+        (candidates() excludes them); explicit get() is the only draft entry.
         """
         hits = self.candidates(domain=domain, task_type=task_type,
                                stage_hint=stage_hint, fields=fields)
@@ -262,8 +524,8 @@ _TOKEN_RE = re.compile(r"[a-z0-9]+")
 FIELD_ALIASES: Dict[str, Set[str]] = {
     "name": {"productname", "product", "tool", "toolname", "app", "appname"},
     "productname": {"name", "product", "tool", "toolname", "app", "appname"},
-    "detailurl": {"url", "href", "link", "detail", "detailpage", "targeturl"},
-    "url": {"detailurl", "href", "link", "detailpage", "targeturl"},
+    "detailurl": {"url", "href", "link", "detail", "detailpage", "targeturl", "producturl"},
+    "url": {"detailurl", "href", "link", "detailpage", "targeturl", "producturl"},
     "proscons": {"pros", "cons", "advantages", "disadvantages"},
     "pros": {"proscons", "advantages"},
     "cons": {"proscons", "disadvantages"},
@@ -274,6 +536,42 @@ FIELD_ALIASES: Dict[str, Set[str]] = {
 
 def _norm_token(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+# ONE canonicalization for the whole skill machinery. The 07-05 duplicate-skill
+# incident came from call sites comparing fields differently (literal subset in
+# one place, alias-expanded overlap in another), so productUrl vs detailUrl
+# split the registry into two competing skills for the same page anatomy.
+# Groups are deliberately conservative: only high-confidence synonyms merge;
+# an unknown token canonicalizes to itself (fails toward "not equal", which
+# escalates to a human/Lead instead of silently merging distinct fields).
+# NOTE: pageUrl is deliberately NOT in the detailurl group — in extraction rows
+# it is provenance ("observed on this page"), not the row's target URL.
+_CANONICAL_FIELD_GROUPS: Dict[str, Set[str]] = {
+    "detailurl": {"url", "href", "link", "detailpage", "targeturl", "producturl", "itemurl"},
+    "productname": {"name", "product", "toolname", "appname"},
+    "proscons": {"pros", "cons", "prosandcons", "advantages", "disadvantages"},
+    "qa": {"faq", "questions", "answers", "qanda", "questionsandanswers"},
+    "reviews": {"review", "ratings", "comments", "testimonials"},
+    "rank": {"ranking", "position"},
+}
+
+_CANONICAL_BY_ALIAS: Dict[str, str] = {}
+for _canon, _aliases in _CANONICAL_FIELD_GROUPS.items():
+    _CANONICAL_BY_ALIAS[_canon] = _canon
+    for _alias in _aliases:
+        _CANONICAL_BY_ALIAS[_alias] = _canon
+
+
+def canonical_field(value: Any) -> str:
+    """Normalize a field name to its canonical representative
+    (productUrl/detailUrl/href → detailurl; faq → qa; unknown → itself)."""
+    norm = _norm_token(value)
+    return _CANONICAL_BY_ALIAS.get(norm, norm)
+
+
+def canonical_fields(values: Any) -> Set[str]:
+    return {canonical_field(v) for v in (values or []) if _norm_token(v)}
 
 
 def _tokenize(value: Any) -> Set[str]:
@@ -298,7 +596,8 @@ def _expanded_field_tokens(fields: Set[str]) -> Set[str]:
 GENERIC_OUTPUT_FIELD_TOKENS: Set[str] = {
     "rank", "name", "productname", "product", "tool", "toolname", "app",
     "appname", "title", "url", "detailurl", "detail", "detailpage", "href",
-    "link", "targeturl", "index", "position", "id", "row", "item",
+    "link", "targeturl", "producturl", "itemurl", "index", "position", "id",
+    "row", "item",
 }
 
 
@@ -401,8 +700,9 @@ def _self_check() -> int:
     skills = reg.all()
     print(f"loaded {len(skills)} skill(s) from {SKILLS_DIR_DEFAULT}")
     for s in skills:
+        layer = "hints-only" if s.is_hints_only else f"steps={len(s.steps)}"
         print(f"  - {s.skill_id}: domain={s.domain!r} task_type={s.task_type!r} "
-              f"stage_hint={s.stage_hint!r} fields={sorted(s.fields)} steps={len(s.steps)}")
+              f"stage_hint={s.stage_hint!r} fields={sorted(s.fields)} {layer}")
     # demonstrate a deterministic match against a TAAFT-like task descriptor
     hit = reg.match(domain="theresanaiforthat.com", task_type="web_scrape",
                     stage_hint="detail_sections",

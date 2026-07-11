@@ -49,7 +49,16 @@ _PAUSE_ONSET_TYPES = frozenset(_normalize_notification_type(item) for item in {
 
 def _title_is_challenge(title: Any) -> bool:
     text = str(title or "").lower()
-    return bool(text and any(marker in text for marker in _CHALLENGE_STATE_MARKERS))
+    # Cloudflare's interstitial title often uses these generic strings without
+    # the word "cloudflare" or "captcha". Keep this aligned with the frozen
+    # title-only boundary used by taaft-detail-extract.
+    title_markers = (
+        *_CHALLENGE_STATE_MARKERS,
+        "just a moment",
+        "checking your browser",
+        "attention required",
+    )
+    return bool(text and any(marker in text for marker in title_markers))
 
 
 def hitl_onset_signal(msg: Dict[str, Any], page_id: str) -> Optional[Dict[str, Any]]:

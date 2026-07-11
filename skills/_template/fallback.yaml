@@ -1,5 +1,12 @@
 # 结构化成功判据 + 接管策略（机器可判定）。字段说明见 skills/README.md §5。
 
+row_contract:
+  version: 1
+  identity_variables: [targetUrl]       # 每行稳定身份；必须是 workflow variables
+  passthrough_variables: [targetUrl]    # 运行输入中需原样进入落盘行的字段
+  produced_fields: [targetText]         # workflow extract 经 variable_to_field 映射后的字段
+  variable_types: { targetUrl: uri }    # scalar|string|integer|number|boolean|uri
+
 success_contract:
   workflow_no_error: true                               # browser_call 返回无 error 标志
   observation_prefix: "Workflow execution completed:"   # 成功 observation 前缀

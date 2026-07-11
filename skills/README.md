@@ -9,10 +9,17 @@
 
 ## 0. 一个 skill 是什么
 
-一个可复用的任务胶囊 = **一份冻结的 `Workflow.execute` 步骤序列（快路径）+ 成功判据 + workflow 走不下去时交给 BrowserAgent 的兜底契约（慢路径）**。
+一个可复用的任务胶囊，有**两个可各自缺席的层**（07-07 定案，"层不是类"）：
 
-- 命中 → 注入运行期参数 → `browser_call(Workflow.execute, …)` 跑确定性步骤，happy-path 不动页面级 LLM。
-- 失败/暂停 → 把失败步 + 累积 variables 交 BrowserAgent 接管。
+| 层 | 载体 | 作用 |
+|----|------|------|
+| **workflow**（快路径） | workflow.json + fallback.yaml | 冻结的 `Workflow.execute` 步骤序列 + 成功判据 + 兜底契约；happy-path 零页面级 LLM |
+| **hints**（guidance，慢路径捷径） | SKILL.md 的 `## 页面知识（hints）` 小节 | 建议性页面知识（选择器/负知识/遮罩/步数基线），注进 worker 上下文省去重复探索（见 §8） |
+
+- workflow 命中 → 注入运行期参数 → `browser_call(Workflow.execute, …)` 跑确定性步骤。
+- workflow 失败/暂停 → 把失败步 + 累积 variables 交 BrowserAgent 接管。
+- **没有 workflow.json 的目录 = hints-only（guidance）skill**：快路径直接跳过，worker 带着 hints 自己干（p1 型探索任务的正确形态）。
+- p2-p5 型确定性抽取：workflow 为主，hints 可补接管知识；同一 skill 可双层兼有。
 
 ---
 
@@ -56,8 +63,11 @@ allow_auto_captcha: false          # 是否允许 VL 自动解 CAPTCHA（默认 
 ## 运行指令
 1. 取运行期 pageId / fleetId（来自最近 Page.getState / Page.list）。
 2. 取运行期 variables（每个占位 var 的实际值）。
-3. 调 `browser_call(Workflow.execute, { runId, pageId, fleetId, variables, steps:<读 workflow.json>, errorConfig:<读 workflow.json> })`。
-4. **持久化在 workflow 之外**：workflow 返回后读 `result.variables`，由 harness/agent 调 `record_extraction` 落盘（见 §4 持久化铁律）。
+3. 调 harness `execute_selected_skill({pageId, fleetId, variables, rows:[]})`；runner
+   从 registry 读取当前所选 skill 的冻结 recipe。慢路径不得把 workflow steps 复制进
+   prompt/browser_call，也不得从 SKILL.md 散文重建它。
+4. **持久化在 workflow 之外**：runner 返回后检查结构化行，由 harness/agent 调
+   `record_extraction` 落盘（见 §4 持久化铁律）。
 5. 按 fallback.yaml 的 success_contract 判定。
 
 ## 成功判据（见 fallback.yaml success_contract 的人读版）
@@ -161,7 +171,9 @@ DOM.axTreeUpdated
 3. `transform` step 的 `output`——写入该变量名。
 4. 引擎 autoExtract（如从 AXTree 自动抽 exampleId）+ `pageId`/`fleetId` 自动注入每个 action step 的 params。
 
-**所有变量值都是 scalar（string|number|boolean）**（`types/index.ts:68`）。结构化/多行数据进不了 variables——见 §4。
+**所有变量值都是 scalar（string|number|boolean）**（`types/index.ts:68`）。数组/对象不能直接成为
+variable，但可以由冻结 workflow `JSON.stringify` 成一个 string variable，再由 harness 按声明式
+`structured_output` 契约解码——见 §4。
 
 **`Runtime.evaluate` 契约（联机实测）**：`expression` 当**函数体**跑、**必须 `return`**（裸表达式如 `1+1`/`({a:1})` 返回 null）。一发返回一个 JSON 对象，配 `extract: {reviewsText:"reviews", ...}` 把多个字段拆进 scalar 变量——是"内容全在 DOM、CSS/AXTree 取不到单容器"时的拼装首选。`Runtime.evaluate` 已从 strategy_bank `avoid_tools` 解禁（仍 cautioned，勿滥用于 DOM 工具能干的活）。
 
@@ -181,15 +193,48 @@ DOM.axTreeUpdated
 | 数据形态 | 通道 |
 |---------|------|
 | **定 schema 的单行**（如一个详情页的 reviews/pros/cons/qa） | workflow 用 `extract`/`transform` 把每个字段写进 **scalar variables** → workflow 返回 → **harness/agent 读 `result.variables` 拼行 → 调 `record_extraction` 落盘** |
-| **多行 / 结构化** | workflow 内 `Memory.save`（ABCP 原生 action）逐行存，或走 title/base64 侧信道（`Runtime.evaluate`，见记忆 `abcp-side-channel-pattern`）→ harness 读回 → 逐行 `record_extraction` |
+| **多行 / 结构化** | 普通 `Workflow.execute` 在末步把 `{rows:[...]}` `JSON.stringify` 到一个 scalar variable；`workflow.json.structured_output` 声明变量名、字段、rank 规则和 phase window → harness 解码、验证并一次性 `record_extraction` |
 
 > 一句话：**workflow 负责“拿到值”，harness 负责“落盘”**。workflow.json 的最后一步**不是** record_extraction，而是把字段读进 variables 的那一步。
+
+标准多行声明示例（仍是普通 workflow，不是新的 skill 类型或 execution mode）：
+
+```jsonc
+{
+  "variables": {"targetUrl": "", "minRank": 1, "maxRank": 10, "expectedRows": 10},
+  "structured_output": {
+    "version": 1,
+    "transport": "json_variable",
+    "variable": "structuredRowsJson",
+    "fields": ["rank", "productName", "productUrl"],
+    "rank": {"field": "rank", "source": "dom_order", "base": 1},
+    "window": {"source": "phase_validator", "field": "rank", "inclusive": true},
+    "runtime_variables": {
+      "target_url": "targetUrl",
+      "rank_min": "minRank",
+      "rank_max": "maxRank",
+      "expected_rows": "expectedRows"
+    }
+  }
+}
+```
+
+`structured_output.variable` 必须由 workflow step 的 `extract` 真实产出；JSON 必须是数组或
+`{"rows": [...]}`。registry、静态复检、live recheck 和 dispatch 都 fail-closed 校验该声明。
+rank window 与精确行数来自当前 phase validators，不能把来源任务的一次历史范围写死成路由逻辑。
 
 ---
 
 ## 5. fallback.yaml（结构化成功判据 + 接管策略）
 
 ```yaml
+row_contract:                                           # workflow skill 的批量行角色声明（v1）
+  version: 1
+  identity_variables: [targetUrl]                       # 稳定行身份；必须属于 workflow variables
+  passthrough_variables: [targetUrl, productName]       # 输入中需原样进入落盘行的变量
+  produced_fields: [reviews, price]                     # workflow extract 映射后的输出字段
+  variable_types: { targetUrl: uri, productName: string }
+
 success_contract:
   workflow_no_error: true                               # browser_call 返回无 error 标志
   observation_prefix: "Workflow execution completed:"   # 成功 observation 前缀
@@ -220,6 +265,28 @@ maintenance:
   canary_ttl_hours: 24
   auto_disable_on_challenge: false        # 遇挑战不自动禁用（环境因素非 skill 缺陷）
 ```
+
+### 5.1 row_contract（批量输入的机器契约）
+
+`row_contract` 只声明字段的**角色和比较类型**，不声明任何站点规则。它是
+`skill_rows` 与上游 validated artifact 做确定性连接的唯一依据：
+
+- `identity_variables`：一行的稳定身份，必须非空、必须同时属于
+  `passthrough_variables`，且每项都是 `workflow.json.variables` 中的变量。
+- `passthrough_variables`：由上游/任务输入提供并应保留到落盘行的变量；harness
+  只补空缺值，绝不覆盖 Lead 明确给出的非空值。
+- `produced_fields`：冻结 workflow 自己产出的字段（应用
+  `success_contract.variable_to_field` 后的名字），用于区分输入与输出责任。
+- `variable_types`：每个 passthrough 变量的比较语义，合法值为
+  `scalar|string|integer|number|boolean|uri`。`scalar` 会把数值与等价数字字符串
+  归一比较，避免 `39` 与 `"39"` 制造假冲突。
+
+`/skill-create` 会从冻结 workflow、期望 artifact 和 validated 样例行生成并校验
+该声明。带变量化 `Page.navigate` 的 workflow 若无法声明稳定 identity 或
+produced fields，质量门必须失败；运行时对旧 skill 仍向后兼容，但不会替它猜测
+显式 `skill_rows` 的身份或透传字段。候选源只取 validated artifacts，先当前
+phase 作用域、后跨 replan 总账；任何集合不一致、重复 identity、字段冲突或多源
+歧义都 fail closed。
 
 ---
 
@@ -255,3 +322,26 @@ maintenance:
 - [ ] `Workflow.execute` 传了稳定 `runId`（失败时靠 `Workflow.getStatus(runId)` 取详情，§6）。
 - [ ] errorConfig.onError 关键步为 `stop`（让失败触发接管）。
 - [ ] fallback.yaml 的 success_contract 不依赖引擎内部 status。
+
+---
+
+## 8. hints（guidance）层——慢路径捷径
+
+**是什么**：SKILL.md 里一个固定标题的小节（`## 页面知识（hints）`，标题匹配"页面知识"或"hints"开头的 H2），存放建议性页面知识：元素在哪（选择器）、优先用什么工具、网站怎么观察、**负知识**（哪些路走不通——如 `/comment/` 链接是噪音）、遮罩关法、滚动/停止判据、步数基线。**quirk 密度，一行一条，只结构化机器要用的部分**（frontmatter 匹配维度 + 一条锚点探针），其余保持散文——别造第二个 workflow DSL。
+
+**怎么生效**：仅显式选择（`/skill <id>`）时，`selected_skill_context`（harness/skill/contract.py）把 hints 连同**探针协议**注进 worker 上下文：
+
+1. hints 是**待验证假设不是事实**；
+2. 采信前先验证锚点探针（hints 首条选择器）在当前页命中；
+3. 探针失败/页面矛盾 → **整段弃用**转自由探索，并在最终 answer 里写 `guidance_stale: <原因>`；
+4. 绝不硬凑证据迁就过期 hint——validators 才是契约。
+
+hints-only skill 定向注入该小节（正文其余部分不占 6000 字预算）；workflow skill 整份注入不变（兜底契约仍是慢路径菜谱）。
+
+**形态**：
+- **hints-only**：目录只有 SKILL.md（刻意无 workflow.json）。快路径直接跳过（`skill.fast_path.hints_only`），不碰引擎、不记 .skill_health.json，autoheal 也不会给它蒸 workflow。适合 p1 型探索任务（lazy-load 滚动、动态停止条件）。
+- **双层**：workflow skill 的 SKILL.md 补同名小节即可（`/skill-create --guidance <任务目录> <已有skill-id>` 自动蒸馏叠加）。
+
+**防腐（独立软通道，不碰 .skill_health.json）**：worker 结束后 harness 把「结局 + 工具调用数 + answer 里的 `guidance_stale` 上报」记进 `skills/.guidance_health.json`（gitignored 运行态）。agent 报 stale 一次、或连续失败 ≥2 次 → `needs_review`（CLI 列表标 `[hints待复审]`）。**只标记、永不禁用**——显式选择绕过 health 的 07-07 语义不变。人工闭环：复核/重蒸馏后 `/skill-create --recheck <id>` 清标记。
+
+**生成**：`/skill-create --guidance <任务目录或trace.jsonl> [skill-id] [--phase <phaseId>]`——知识蒸馏器读**完整 trace（含失败调用）**，与步骤蒸馏器目标相反：挑工具调用最多的 validated trace（探索越多知识越全），产出选择器清单/负知识/遮罩/滚动/步数基线。skill-id 已存在 → 写进其 SKILL.md（status=hints_updated）；否则新建 hints-only（status=created）。同域去重与 workflow 蒸馏共用同一裁决（optimize=叠 hints / new / quit）。

@@ -132,35 +132,77 @@ def check_persisted_contract(
     artifact: Optional[Dict[str, Any]] = None,
     *,
     row_count: int = 1,
+    expected_rows: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Persistence-side success_contract (the half check_success_contract documents
     it does NOT cover): the built row must satisfy persisted_rows_at_least /
     fields_required / fields_nonempty, and record_extraction's artifact validation
-    must not have flagged needs_fix. Returns {"ok": bool, "failed_checks": [...]}.
-    Empty contract ⇒ ok.
+    must not have flagged needs_fix OR left anything validationPending. Returns
+    {"ok": bool, "failed_checks": [...]}. Empty contract ⇒ ok.
 
-    NOTE on provenance: record_extraction treats field_provenance (and min_rows) as
-    *advisory*, not blocking (_is_advisory_record_failure), so a missing
-    `<field>EvidenceText` surfaces as validationPending — NOT status=needs_fix — and
-    therefore does NOT veto the fast path here. Only a blocking failure (schema /
-    required_fields) flips needs_fix. So a skill whose contract names a sensitive
-    field (e.g. TAAFT `rank`) still completes the fast path; the missing evidence
-    column is an advisory enrichment, not a gate."""
+    NOTE on provenance/advisory: record_extraction classifies field_provenance
+    (and row-count shortfalls) as *advisory* — validationPending, not
+    status=needs_fix — because an ITERATING worker fixes those by enriching rows
+    on a LATER save. The fast path has no later save: this check is its terminal
+    verdict, so anything still pending here is blocking FOR IT. Task 2ed5a466 p3
+    proved the alternative: rows missing rankEvidenceText self-approved here,
+    then the same validator (blocking at phase level) failed the attempt — three
+    times. Advisory is a property of the consumer's ability to continue, not of
+    the validator."""
     contract = skill.success_contract
     row = row or {}
     failed: List[str] = []
 
+    # fields comparison is CANONICAL (productUrl≡detailUrl): fast-path persistence
+    # aligns row keys to the PLAN's field names (dispatch._align_row_fields_to_
+    # expected), so the skill's own contract naming may legitimately differ from
+    # the row's literal keys by a synonym — that must not read as "missing".
+    from harness.skill.registry import canonical_field
+
+    def _row_value(field: str):
+        if field in row:
+            return True, row.get(field)
+        canon = canonical_field(field)
+        for key, value in row.items():
+            if canonical_field(key) == canon:
+                return True, value
+        return False, None
+
     min_rows = contract.get("persisted_rows_at_least")
     if isinstance(min_rows, int) and row_count < min_rows:
         failed.append(f"persisted_rows_at_least:{min_rows}(got {row_count})")
+    # PHASE row-count gate: the skill's own persisted_rows_at_least (typically 1)
+    # knows nothing about the phase's exact_rows/min_rows, and record_extraction
+    # treats an under-count as ADVISORY (a worker mid-collection keeps going).
+    # Without this check a single-run fast path on a 5-row phase could satisfy
+    # its own contract with 1 row, self-approve, skip the slow path, and burn a
+    # whole phase attempt at spawner-level validation instead (the exact trap
+    # the 9d5655d3 review flagged against merge-only repair).
+    if isinstance(expected_rows, int) and expected_rows > 0 and row_count < expected_rows:
+        failed.append(f"phase_rows:{expected_rows}(got {row_count})")
     for field in contract.get("fields_required") or []:
-        if field not in row:
+        present, _ = _row_value(str(field))
+        if not present:
             failed.append(f"fields_required:{field}")
     for field in contract.get("fields_nonempty") or []:
-        val = row.get(field)
+        _, val = _row_value(str(field))
         if val is None or (isinstance(val, str) and not val.strip()):
             failed.append(f"fields_nonempty:{field}")
-    if isinstance(artifact, dict) and artifact.get("status") == "needs_fix":
-        failed.append("artifact_validation:needs_fix")
+    if isinstance(artifact, dict):
+        if artifact.get("status") == "needs_fix":
+            failed.append("artifact_validation:needs_fix")
+        # Terminal-consumer rule: validationPending lists validator types the
+        # record path deferred for a later, enriched save. The fast path never
+        # saves again, so a pending validator here is a failed one at phase
+        # validation — read the already-computed verdict instead of re-running
+        # validators (a second executor is how the two judgements drifted apart
+        # in the first place).
+        pending = artifact.get("validationPending")
+        if isinstance(pending, list):
+            pending_types = sorted({str(p) for p in pending if str(p).strip()})
+            if pending_types:
+                failed.append(
+                    "artifact_validation_pending:" + ",".join(pending_types)
+                )
 
     return {"ok": not failed, "failed_checks": failed}

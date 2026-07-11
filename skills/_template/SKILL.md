@@ -16,16 +16,15 @@ allow_auto_captcha: false
 ## 运行指令
 1. 取运行期 pageId / fleetId（来自最近 Page.getState / Page.list）。
 2. 取运行期 variables：本次任务每个占位变量的实际值（见 workflow.json 的 `variables`）。
-3. 调用：
+3. 调用当前所选 skill 的受控 runner（不要读取/复制 workflow steps）：
    ```
-   browser_call(Workflow.execute, {
-     runId, pageId, fleetId,
-     variables: { ...workflow.json.variables, ...<本次实际值> },
-     steps: <读 workflow.json.steps>,
-     errorConfig: <读 workflow.json.errorConfig>
+   execute_selected_skill({
+     pageId, fleetId,
+     variables: { ...<本次实际值> },
+     rows: []
    })
    ```
-4. **持久化在 workflow 之外**：workflow 返回后读 `result.variables`，拼成一行，调 harness `record_extraction` 落盘。
+4. **持久化在 workflow 之外**：runner 返回后检查结构化行，调 harness `record_extraction` 落盘。
    （workflow.json 的最后一步只负责把字段读进 variables，不调 record_extraction——见 skills/README.md §4。）
 5. 按 fallback.yaml 的 `success_contract` 判定成功；不成立或带 error → 走兜底契约。
 

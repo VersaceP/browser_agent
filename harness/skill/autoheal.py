@@ -93,6 +93,11 @@ async def maybe_autoheal_from_trace(
     report ({"promoted": bool, ...}) or None when nothing was attempted."""
     if skill is None or skill.directory is None:
         return None
+    if getattr(skill, "is_hints_only", False):
+        # guidance skill 没有 workflow 可修；蒸一个出来会静默改变它的性质
+        # （hints 按设计保持建议性）。想升格成 workflow 走 /skill-create。
+        _log(agent, "skill.autoheal.skipped", {"skill": skill.skill_id, "reason": "hints_only"})
+        return None
     if not is_degraded(skill, health):
         _log(agent, "skill.autoheal.skipped", {"skill": skill.skill_id, "reason": "not_degraded"})
         return None
