@@ -1,5 +1,5 @@
 {
-  "description": "Extract Reviews / Pros & Cons / Q&A text from a theresanaiforthat.com product detail page. Content is all in the DOM (tabs are anchors), so one Runtime.evaluate reads all three sections (reviews scoped to comment bodies) into scalar variables. Persistence (record_extraction) is a harness post-step.",
+  "description": "Extract Reviews / Pros & Cons / Q&A text from a theresanaiforthat.com product detail page using native DOM reads. TAAFT detail pages keep all three sections in stable containers (#rw_cont / #pros-and-cons / #faq) present in the DOM without tab clicks, so three DOM.getText reads replace the v1 Runtime.evaluate heading-heuristic script (live-proven across 11 products, task 5d69c57d p2-p5, 2026-07-04). Persistence (record_extraction) is a harness post-step.",
   "variables": {
     "rank": "",
     "productName": "",
@@ -27,14 +27,14 @@
     {
       "action": "Runtime.evaluate",
       "params": {
-        "expression": "function chl(){var t=(document.title||'').toLowerCase();var u=(location.href||'').toLowerCase();var m=['just a moment','verify you are human','checking your browser','attention required','cloudflare','cf-chl','__cf_chl','challenge-platform'];var hit=m.some(function(s){return t.indexOf(s)>=0||u.indexOf(s)>=0;});return {challenge:hit?'yes':''};}return chl();",
+        "expression": "function chl(){var t=(document.title||'').toLowerCase();var m=['just a moment','verify you are human','checking your browser','attention required'];var hit=m.some(function(s){return t.indexOf(s)>=0;});return {challenge:hit?'yes':''};}return chl();",
         "returnByValue": true
       },
       "extract": {
         "challengeFlag": "challenge"
       },
       "onError": "continue",
-      "purpose": "Detect a Cloudflare/CAPTCHA challenge by title/url markers (challengeFlag='yes' only when challenged; empty on the happy path)"
+      "purpose": "Detect a Cloudflare/CAPTCHA challenge by TITLE markers only (challengeFlag='yes' only when challenged). URL markers are deliberately absent: after auto-clearance the URL can retain a residual __cf_chl_rt_tk param while the page is already the real product page (live-observed 2026-07-04), so a URL check would false-positive into a 20-minute Hitl.resumed wait. Deliberately kept as Runtime.evaluate: this is the challenge BOUNDARY (control flow), not content extraction, and make_challenge_poller mirrors this exact JS on the second connection."
     },
     {
       "type": "if",
@@ -58,21 +58,50 @@
         "key": "Escape"
       },
       "onError": "continue",
-      "purpose": "Dismiss the auth/signup overlay if present (harmless when absent)"
+      "purpose": "Dismiss the auth/signup overlay if present (harmless when absent; live-used by p2/p4 workers before section reads)"
     },
     {
-      "action": "Runtime.evaluate",
+      "action": "Page.getState",
+      "params": {},
+      "extract": {
+        "pageUrl": "url",
+        "pageTitle": "title"
+      },
+      "onError": "continue",
+      "purpose": "Bind the extraction to THIS row's page: the harness compares pageUrl against the navigated detailUrl and rejects the row on mismatch. Without this, a soft-failed navigate (onError:continue) in a same-tab batch would silently read the PREVIOUS row's sections. Native Page.getState — no JS."
+    },
+    {
+      "action": "DOM.getText",
       "params": {
-        "expression": "function bh(t){var hs=[].slice.call(document.querySelectorAll('h1,h2,h3,h4,[role=heading]'));return hs.find(function(h){return h.textContent.trim().toLowerCase().indexOf(t.toLowerCase())===0;});}function box(h){if(!h)return null;var el=h;for(var i=0;i<5&&el.parentElement;i++){el=el.parentElement;if((el.innerText||'').length>600)return el;}return el;}function bt(h){var b=box(h);return b?(b.innerText||''):'';}function reviews(){var b=box(bh('Reviews'));if(!b)return '';var cs=[].slice.call(b.querySelectorAll('.comment_content, .comment_body'));if(cs.length){return cs.map(function(e){return (e.innerText||'').trim();}).filter(Boolean).join('\\n---\\n');}var c=b.cloneNode(true);var rc=c.querySelector('.ratings_chart_outer');if(rc)rc.remove();return (c.innerText||'').trim();}return {reviews:reviews().slice(0,2500),pros:bt(bh('Pros')).slice(0,2000),qa:bt(bh('Q&A')).slice(0,2000)};",
-        "returnByValue": true
+        "selector": "#rw_cont"
       },
       "extract": {
-        "reviewsText": "reviews",
-        "prosConsText": "pros",
-        "qaText": "qa"
+        "reviewsText": "textContent"
       },
-      "onError": "stop",
-      "purpose": "Read Reviews (scoped to comment bodies) / Pros&Cons / Q&A via a return-body script that locates each section by heading"
+      "onError": "continue",
+      "purpose": "Read the Reviews container #rw_cont via native DOM.getText (works off-viewport; returns full comment bodies — fixes the v1 reviews-body TODO). onError:continue — the section is genuinely absent on some products (-32005; e.g. rank 37 in task 5d69c57d) and absence must not kill the run."
+    },
+    {
+      "action": "DOM.getText",
+      "params": {
+        "selector": "#pros-and-cons"
+      },
+      "extract": {
+        "prosConsText": "textContent"
+      },
+      "onError": "continue",
+      "purpose": "Read the Pros & Cons container #pros-and-cons via native DOM.getText. onError:continue — section may be genuinely absent; the variables_any_nonempty contract gates overall success."
+    },
+    {
+      "action": "DOM.getText",
+      "params": {
+        "selector": "#faq"
+      },
+      "extract": {
+        "qaText": "textContent"
+      },
+      "onError": "continue",
+      "purpose": "Read the Q&A container #faq via native DOM.getText. onError:continue — section may be genuinely absent; the variables_any_nonempty contract gates overall success."
     }
   ]
 }

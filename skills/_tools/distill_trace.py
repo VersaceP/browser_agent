@@ -162,7 +162,9 @@ def distill(events: list[dict]) -> tuple[list[dict], list[str], list[str], dict]
                                     "id": f"$vars.{slug}Id" if label != "__TODO_LOCATE__" else "__TODO_LOCATE__"},
                          "purpose": purpose}
                 if method == "DOM.getText":
-                    inner["extract"] = {f"{slug}Text": "text"}
+                    # extract path is "textContent": internalRpc unwraps the call's
+                    # data, whose text field is textContent (live-verified 2026-07-04)
+                    inner["extract"] = {f"{slug}Text": "textContent"}
                     inner["onError"] = "continue"
                     persist.append(f"{slug}Text")
                 elif method == "DOM.getAttribute":
@@ -179,9 +181,10 @@ def distill(events: list[dict]) -> tuple[list[dict], list[str], list[str], dict]
             else:  # selector-based or other locator — keep as-is, flag for durability
                 step = {"action": method, "params": params, "purpose": purpose}
                 if method == "DOM.getText":
-                    step["extract"] = {"selText": "text"}
+                    slug = slugify(label_from_purpose(purpose) or str(params.get("selector") or "sel"))
+                    step["extract"] = {f"{slug}Text": "textContent"}
                     step["onError"] = "continue"
-                    persist.append("selText")
+                    persist.append(f"{slug}Text")
                     notes.append(f"selector-based {method} kept as-is; verify CSS selector durability: {params.get('selector')!r}")
                 steps.append(step)
             continue

@@ -1,30 +1,45 @@
 # TAAFT 详情页抽取——结构化成功判据 + 接管策略。字段说明见 skills/README.md §5。
 
+row_contract:
+  version: 1
+  identity_variables: [detailUrl]
+  passthrough_variables: [rank, productName, detailUrl]
+  produced_fields: [reviews, prosCons, qa]
+  variable_types:
+    rank: scalar
+    productName: string
+    detailUrl: uri
+
 success_contract:
   workflow_no_error: true
   observation_prefix: "Workflow execution completed:"
   variables_required: []                 # 三个 *Text 用 any_nonempty 表达更准（见下）
   variables_any_nonempty: [reviewsText, prosConsText, qaText]   # 至少一段非空
   # 落盘字段重命名（harness 不再隐式剥 *Text；变量名 → 字段名）：
-  variable_to_field: { reviewsText: reviews, prosConsText: prosCons, qaText: qa }
+  # ⚠️ 键必须是本 workflow 自己的 extract 变量名（reviewsText/prosConsText/qaText）。
+  # 07-06 曾被误改成生成版 skill 的变量名（rwContText/...）→ 三字段映射全失效、快路径恒自我否决。
+  variable_to_field: { reviewsText: reviews, prosConsText: prosCons, qaText: qa, detailUrl: productUrl }
   # 落盘由 harness 在 workflow 返回后做（record_extraction 非 workflow step）：
   persisted_rows_at_least: 1
-  fields_required: [rank, productName, detailUrl]
-  fields_nonempty: [rank, productName, detailUrl]
+  # 只要求"行身份"字段——内容字段（reviews/prosCons/qa）不进 required：
+  # 部分产品真实缺段（如 rank 37 无 prosCons/qa），由上面 variables_any_nonempty
+  # 裁决"至少一段非空"；把内容字段设为 required 会让缺段产品恒契约失败回落。
+  fields_required: [rank, productName, productUrl]
+  fields_nonempty: [rank, productName, productUrl]
   # ⚠️ harness field_provenance 校验：每个抽取字段需 <field>EvidenceText + sourceTool/sourceSelectorOrAxId
   provenance_required: true
 
 takeover:
-  on_call_error:                          # Runtime.evaluate(onError:stop) 失败 → execute 抛异常
+  on_call_error:                          # v2: 内容三步 onError:continue 不触发；此路= navigate/引擎级失败 → execute 抛异常
     recover_via: Workflow.getStatus(runId)   # ⚠️ rich payload 不在异常里，必须二次调 getStatus（联机实测）
     read: [status.failedStepPath, status.error, status.variables, "status.results[-1].step"]
     reobserve: [Page.getState, DOM.getAXTree]
     semantic_anchor: status.results[-1].step.purpose
   on_contract_unmet:                      # 无 error 但三段 *Text 全空 → contract-unmet
     from_step: len(results)
-    reason: heading_match_failed          # 页面结构变了 / 标题不叫 Reviews/Pros/Q&A
-    recover_with: [DOM.getAXTree, DOM.getText]   # 调整 JS heading 匹配，或退回 DOM 工具
-    then: self_heal_workflow_v2
+    reason: section_containers_missing    # 页面改版 / #rw_cont、#pros-and-cons、#faq 容器 id 变了
+    recover_with: [DOM.getAXTree, DOM.getText]   # AXTree 重发现 section 容器（v1 heading 启发式 JS 为备选），getText 复抽
+    then: self_heal_workflow_v3
 
 hitl_boundary:
   detect: [Hitl.resumed]                  # workflow 侧唯一可 listen 的 HITL 事件
