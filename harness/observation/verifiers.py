@@ -1,7 +1,7 @@
 """
 harness.observation.verifiers - Read-only semantic oracles for micro-loops.
 
-Design contract (docs/micro-loop-implementation-plan.md Phase 1):
+Design contract (micro-loop oracle phase 1):
 - Oracle JS comes only from the fixed templates below; the model never writes
   or sees it. Bindings are JSON-encoded before substitution.
 - Oracles run through the harness read_only_eval channel, which skips the

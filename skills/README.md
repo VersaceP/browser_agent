@@ -1,9 +1,6 @@
 # Skills — 可复用任务胶囊约定（P1 contract）
 
-> 配套设计文档：[`docs/skill-agentic-workflow-hybrid-plan.md`](../docs/skill-agentic-workflow-hybrid-plan.md)（canonical）
-> 本文是该方案 **P1（skill 约定）** 的落地物：定义 `skills/<slug>/` 的目录形态、三份文件的字段 schema、以及兜底契约模板。所有字段均经 ABCP 源码核实（`abcp browser/packages/{workflow,actions}/src/`）。
->
-> 凡“怎么填”看本文，凡“为什么这么设计”看 canonical 文档。
+> 本文定义 `skills/<slug>/` 的目录形态、三份文件的字段 schema、以及兜底契约模板。所有字段均经 ABCP 源码核实（`abcp browser/packages/{workflow,actions}/src/`）。
 
 ---
 
