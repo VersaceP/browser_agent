@@ -1,0 +1,32 @@
+# Standard Workflow.execute structured-output contract.
+
+success_contract:
+  workflow_no_error: true
+  observation_prefix: "Workflow execution completed:"
+  variables_required: [structuredRowsJson, collectionCandidateCount, pageUrl, pageStatus]
+  variables_any_nonempty: [structuredRowsJson]
+  persisted_rows_at_least: 1
+  fields_required: [rank, productName, productUrl]
+  fields_nonempty: [rank, productName, productUrl]
+
+takeover:
+  on_call_error:
+    recover_via: Workflow.getStatus(runId)
+    read: [status.failedStepPath, status.error, status.variables, "status.results[-1].step"]
+    reobserve: [Page.getState, DOM.getAXTree]
+    semantic_anchor: status.results[-1].step.purpose
+  on_contract_unmet:
+    from_step: len(results)
+    reason: postcondition_unmet
+    recover_with: [Page.getState, DOM.getAXTree]
+    then: self_heal_workflow_v2
+
+hitl_boundary:
+  detect: [Hitl.resumed]
+  action: listen_then_pause
+
+maintenance:
+  max_revision_per_failure_class: 3
+  disable_after_consecutive_failures: 3
+  canary_ttl_hours: 24
+  auto_disable_on_challenge: false

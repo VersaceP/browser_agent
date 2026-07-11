@@ -1,0 +1,146 @@
+{
+  "description": "Collect ranked weekly products through a standard Workflow.execute structured JSON output.",
+  "variables": {
+    "targetUrl": "https://theresanaiforthat.com/trending/week/",
+    "minRank": 41,
+    "maxRank": 50,
+    "expectedRows": 10
+  },
+  "errorConfig": {
+    "onError": "stop",
+    "maxRetries": 1
+  },
+  "structured_output": {
+    "version": 1,
+    "transport": "json_variable",
+    "variable": "structuredRowsJson",
+    "fields": [
+      "rank",
+      "productName",
+      "productUrl"
+    ],
+    "rank": {
+      "field": "rank",
+      "source": "dom_order",
+      "base": 1
+    },
+    "window": {
+      "source": "phase_validator",
+      "field": "rank",
+      "inclusive": true
+    },
+    "runtime_variables": {
+      "target_url": "targetUrl",
+      "rank_min": "minRank",
+      "rank_max": "maxRank",
+      "expected_rows": "expectedRows"
+    },
+    "source_selector": "a.ai_link filtered to unique query-free /ai/<slug>/ URLs"
+  },
+  "steps": [
+    {
+      "action": "Page.navigate",
+      "params": {
+        "url": "$vars.targetUrl"
+      },
+      "onError": "continue",
+      "purpose": "Start navigation to the ranked collection page; heavy pages may time out at the call boundary, so Page.loaded settles below."
+    },
+    {
+      "type": "listen",
+      "event": "Page.loaded",
+      "timeout": 15000,
+      "onTimeout": "continue"
+    },
+    {
+      "action": "Input.press",
+      "params": {
+        "key": "Escape"
+      },
+      "onError": "continue",
+      "purpose": "Dismiss the observed non-auth overlay without submitting anything."
+    },
+    {
+      "action": "Page.getState",
+      "extract": {
+        "pageUrl": "url",
+        "pageTitle": "title",
+        "pageStatus": "status"
+      },
+      "purpose": "Bind structured collection output to the actual page."
+    },
+    {
+      "action": "Runtime.evaluate",
+      "params": {
+        "expression": "window.__abcpSkillCollection={seen:{},rows:[]};return {ready:'yes'};",
+        "returnByValue": true
+      },
+      "extract": {
+        "collectionInitReady": "ready"
+      },
+      "purpose": "Initialize the page-local unique collection accumulator."
+    },
+    {
+      "action": "Runtime.evaluate",
+      "params": {
+        "expression": "const selector=\"a.ai_link\";\nconst expectedHost=\"theresanaiforthat.com\";\nconst pattern=\"^https://theresanaiforthat\\\\.com/ai/\";\nconst state=window.__abcpSkillCollection||{seen:{},rows:[]};\nfor (const anchor of Array.from(document.querySelectorAll(selector))) {\n  let u; try { u=new URL(anchor.href||anchor.getAttribute('href')||'', location.href); } catch (_) { continue; }\n  if (expectedHost && u.hostname.replace(/^www\\./,'') !== expectedHost.replace(/^www\\./,'')) continue;\n  if (pattern) { try { if (!(new RegExp(pattern)).test(u.href)) continue; } catch (_) { continue; } }\n  if (u.search || u.hash) continue;\n  if (!/^\\/ai\\/[^/]+\\/?$/.test(u.pathname)) continue;\n  const productUrl=u.origin+u.pathname;\n  const productName=String(anchor.textContent||'').replace(/\\s+/g,' ').trim();\n  if (!productName || state.seen[productUrl]) continue;\n  state.seen[productUrl]=true; state.rows.push({productName,productUrl});\n}\nwindow.__abcpSkillCollection=state;\nreturn {candidateCount:state.rows.length};",
+        "returnByValue": true
+      },
+      "extract": {
+        "collectionCandidateCount": "candidateCount"
+      },
+      "purpose": "Harvest currently materialized clean product links in DOM order."
+    },
+    {
+      "type": "loop",
+      "maxIterations": 25,
+      "condition": {
+        "path": "$vars.collectionCandidateCount",
+        "operator": "lt",
+        "value": "$vars.maxRank"
+      },
+      "body": [
+        {
+          "action": "Input.scroll",
+          "params": {
+            "direction": "down",
+            "amount": 1200
+          },
+          "purpose": "Materialize more ranked collection items."
+        },
+        {
+          "action": "Runtime.evaluate",
+          "params": {
+            "expression": "const selector=\"a.ai_link\";\nconst expectedHost=\"theresanaiforthat.com\";\nconst pattern=\"^https://theresanaiforthat\\\\.com/ai/\";\nconst state=window.__abcpSkillCollection||{seen:{},rows:[]};\nfor (const anchor of Array.from(document.querySelectorAll(selector))) {\n  let u; try { u=new URL(anchor.href||anchor.getAttribute('href')||'', location.href); } catch (_) { continue; }\n  if (expectedHost && u.hostname.replace(/^www\\./,'') !== expectedHost.replace(/^www\\./,'')) continue;\n  if (pattern) { try { if (!(new RegExp(pattern)).test(u.href)) continue; } catch (_) { continue; } }\n  if (u.search || u.hash) continue;\n  if (!/^\\/ai\\/[^/]+\\/?$/.test(u.pathname)) continue;\n  const productUrl=u.origin+u.pathname;\n  const productName=String(anchor.textContent||'').replace(/\\s+/g,' ').trim();\n  if (!productName || state.seen[productUrl]) continue;\n  state.seen[productUrl]=true; state.rows.push({productName,productUrl});\n}\nwindow.__abcpSkillCollection=state;\nreturn {candidateCount:state.rows.length};",
+            "returnByValue": true
+          },
+          "extract": {
+            "collectionCandidateCount": "candidateCount"
+          },
+          "purpose": "Merge newly materialized clean product links into the accumulator."
+        }
+      ]
+    },
+    {
+      "action": "Runtime.evaluate",
+      "params": {
+        "expression": "const state=window.__abcpSkillCollection||{rows:[]};\nreturn {structuredRowsJson:JSON.stringify({rows:state.rows}),candidateCount:state.rows.length};",
+        "returnByValue": true
+      },
+      "extract": {
+        "structuredRowsJson": "structuredRowsJson",
+        "collectionCandidateCount": "candidateCount"
+      },
+      "purpose": "Serialize accumulated candidates into a scalar JSON workflow variable."
+    },
+    {
+      "action": "Page.getState",
+      "extract": {
+        "pageUrl": "url",
+        "pageTitle": "title",
+        "pageStatus": "status"
+      },
+      "purpose": "Reconfirm page identity after producing structured output."
+    }
+  ]
+}
