@@ -30,6 +30,27 @@ def build_visual_verify_prompt(
     mode: str,
     question: str,
 ) -> str:
+    if mode == "repair_absence":
+        return (
+            "Determine whether the screenshot shows that the exact repair-target"
+            " fields below are ABSENT from their expected page. This is a"
+            " fail-closed browser repair check, not a request to extract or"
+            " summarize page content.\n"
+            f"repair_targets: {json.dumps((expected or {}).get('repair_targets') or [], ensure_ascii=False, default=str)}\n"
+            f"context: {question or '(none)'}\n\n"
+            "Return absent only when the screenshot gives sufficient coverage of"
+            " the relevant page region and the expected field content is not"
+            " present. Return present when that content or section is visibly"
+            " present, even if its value is incomplete. Return uncertain when the"
+            " target region is off-screen, collapsed, obscured, still loading, or"
+            " otherwise cannot be judged. Do not infer absence from a missing"
+            " screenshot crop.\n"
+            "Return exactly one JSON object with keys:\n"
+            "- verdict: one of absent, present, uncertain\n"
+            "- confidence: number from 0 to 1\n"
+            "- visible_evidence: short array of visible screenshot observations\n"
+            "- reason: one short sentence\n"
+        )
     if mode == "overlay_classify":
         return (
             "An automated browser action was blocked by an overlay covering the"
@@ -242,6 +263,8 @@ async def visual_verify_image(
         return _finalize_visual_locate(parsed, usage)
     if mode == "contract_verify":
         return _finalize_contract_verify(parsed, usage)
+    if mode == "repair_absence":
+        return _finalize_repair_absence(parsed, usage)
     allowed_verdicts = (
         {"confirmed_challenge", "normal_loading", "unrelated_block", "uncertain"}
         if mode == "challenge_detection"
@@ -276,6 +299,29 @@ async def visual_verify_image(
         "confidence": confidence,
         "visible_evidence": [str(item)[:300] for item in evidence[:8]],
         "recommended_recovery": recovery,
+        "reason": str(parsed.get("reason") or "")[:500],
+        "usage": usage,
+    }
+
+
+def _finalize_repair_absence(parsed: JsonDict, usage: JsonDict) -> JsonDict:
+    """Normalize the dedicated, fail-closed repair absence verdict."""
+    verdict = str(parsed.get("verdict") or "uncertain").strip().lower()
+    if verdict not in {"absent", "present", "uncertain"}:
+        verdict = "uncertain"
+    try:
+        confidence = max(0.0, min(float(parsed.get("confidence", 0.0)), 1.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    evidence = parsed.get("visible_evidence")
+    if not isinstance(evidence, list):
+        evidence = []
+    return {
+        "status": "done",
+        "mode": "repair_absence",
+        "verdict": verdict,
+        "confidence": confidence,
+        "visible_evidence": [str(item)[:300] for item in evidence[:8]],
         "reason": str(parsed.get("reason") or "")[:500],
         "usage": usage,
     }

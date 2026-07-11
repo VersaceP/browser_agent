@@ -14,5 +14,6 @@ from harness.vl.core import (  # noqa: F401  (underscore names are not covered b
     _finalize_captcha_solve,
     _finalize_contract_verify,
     _finalize_overlay_classify,
+    _finalize_repair_absence,
     _finalize_visual_locate,
 )
