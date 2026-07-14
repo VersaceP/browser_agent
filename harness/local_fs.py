@@ -6,7 +6,7 @@ import json
 import re
 from typing import List, Optional
 
-from harness.constants import DEFAULT_LOCAL_FS_READ_BYTES
+from runtime_config import DEFAULT_LOCAL_FS_READ_BYTES
 from harness.utils import (
     JsonDict,
     RunLogger,

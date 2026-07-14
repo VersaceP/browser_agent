@@ -19,7 +19,7 @@ from harness.constants import (
 )
 from harness.diagnostics import status_category
 from harness.render_recovery import extract_page_id_from_values
-from harness.config import RuntimeConfig
+from runtime_config import RuntimeConfig
 from harness.lifecycle import LifecycleContext, default_lifecycle_manager
 from harness.model_config import browser_agent_model_config
 from harness.schema_cache import global_schemas_dir

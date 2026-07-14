@@ -13,7 +13,7 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
-from harness.config import VLConfig
+from runtime_config import VLConfig
 from harness.utils import JsonDict
 
 

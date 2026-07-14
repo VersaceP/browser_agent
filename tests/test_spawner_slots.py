@@ -4,8 +4,9 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
-from abcp_client import ABCPClientConfig
-from harness.config import HarnessConfig, RuntimeConfig
+from runtime_config import ABCPClientConfig
+from runtime_config import HarnessConfig, RuntimeConfig
+
 from harness.spawner import (
     BrowserAgentSlot,
     BrowserAgentSpawner,
@@ -17,7 +18,8 @@ from harness.spawner import (
 )
 from harness.task_control import initialize_task_state, load_task_state
 from harness.utils import RunLogger
-from llm.config import ModelConfig
+from runtime_config import ModelConfig
+
 
 
 def _make_spawner(testcase: unittest.TestCase) -> BrowserAgentSpawner:

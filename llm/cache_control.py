@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from llm.config import ModelConfig
+from runtime_config import ModelConfig
 _MARKER_POSITION_INDEX_RE = re.compile(r"\.(messages|content)\[\d+\]")
 _CACHE_CONTROL_MODES = {"auto", "on", "off"}
 _OPENAI_CACHE_CONTROL_BASE_URL_HINTS = (

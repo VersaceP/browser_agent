@@ -18,7 +18,7 @@ from llm.cache_control import (
     _resolve_cache_control_decision,
     _with_cache_control_diagnostics,
 )
-from llm.config import ModelConfig
+from runtime_config import ModelConfig
 
 
 def _degenerate_response_problem(response: Any) -> Optional[Dict[str, Any]]:

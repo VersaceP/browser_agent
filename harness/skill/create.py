@@ -1218,7 +1218,8 @@ async def trial_workflow_live(
     own_client = False
     if client is None:
         try:
-            from abcp_client import ABCPClient, ABCPClientConfig
+            from abcp_client import ABCPClient
+            from runtime_config import ABCPClientConfig
             client = ABCPClient(ws_config or ABCPClientConfig())
             await client.connect()
             own_client = True
@@ -1457,7 +1458,8 @@ async def recheck_skill_live(
     own_client = False
     if client is None:
         try:
-            from abcp_client import ABCPClient, ABCPClientConfig
+            from abcp_client import ABCPClient
+            from runtime_config import ABCPClientConfig
             client = ABCPClient(ws_config or ABCPClientConfig())
             await client.connect()
             own_client = True

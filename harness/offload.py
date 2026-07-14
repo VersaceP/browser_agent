@@ -10,9 +10,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
-from harness.constants import (
+from runtime_config import (
     DEFAULT_OFFLOAD_THRESHOLD_BYTES,
     DEFAULT_TOOL_RESULT_OFFLOAD_THRESHOLD_BYTES,
+)
+from harness.constants import (
     GENERIC_TOOL_RESULT_KEEP_FIELD_BYTES,
     GENERIC_TOOL_RESULT_KEEP_KEYS,
     GENERIC_TOOL_RESULT_RESPONSE_KEEP_KEYS,

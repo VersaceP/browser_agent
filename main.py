@@ -17,19 +17,17 @@ try:
 except ImportError:
     pass
 
-from abcp_client import ABCPClient, ABCPClientConfig
+from abcp_client import ABCPClient
 from agent_harness import (
     BrowserAgent,
-    HarnessConfig,
     LeadAgent,
-    RuntimeConfig,
-    VLConfig,
     browser_agent_model_config,
     exception_payload,
     lead_agent_model_config,
 )
 from harness.utils import RunLogger, make_browser_event_logger
-from llm import LLMFactory, ModelConfig
+from llm import LLMFactory
+from runtime_config import RuntimeConfig, load_runtime_config
 
 
 _LAST_LOGGER: Optional[RunLogger] = None
@@ -405,29 +403,6 @@ class ConsoleProgressReporter:
             f"[ToolResult] {tool} 结果已 offload: {size} bytes -> "
             f"{self._short_path(payload.get('relativePath') or payload.get('savedPath'))}"
         )
-
-
-def load_runtime_config(config_path: str) -> RuntimeConfig:
-    path = Path(config_path)
-    raw = {}
-    if path.exists():
-        raw = json.loads(path.read_text(encoding="utf-8"))
-
-    model = ModelConfig.load_from_file(config_path)
-    browser_raw = raw.get("browser", {})
-    harness_raw = raw.get("harness", {})
-
-    harness = HarnessConfig.from_dict(harness_raw)
-    # VL is configured only at the top level of config.json:
-    # {"vl": {"enabled": true, "provider": "openai", ...}}
-    harness.vl = VLConfig.from_dict(raw.get("vl", {}))
-
-    return RuntimeConfig(
-        agent_id=browser_raw.get("agent_id") or raw.get("agent_id", "abcp-agent"),
-        model=model,
-        browser=ABCPClientConfig.from_dict(browser_raw),
-        harness=harness,
-    )
 
 
 def _available_skill_ids() -> List[str]:

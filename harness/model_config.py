@@ -4,7 +4,7 @@ harness.model_config - Model config helpers for harness-controlled agents.
 
 from dataclasses import replace
 
-from llm.config import ModelConfig
+from runtime_config import ModelConfig
 
 
 def browser_agent_model_config(model: ModelConfig) -> ModelConfig:

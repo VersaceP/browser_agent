@@ -18,7 +18,8 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT))
 
-from abcp_client import ABCPClient, ABCPClientConfig  # noqa: E402
+from abcp_client import ABCPClient  # noqa: E402
+from runtime_config import ABCPClientConfig  # noqa: E402
 
 
 JsonDict = Dict[str, Any]

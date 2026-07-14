@@ -16,10 +16,10 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from abcp_client import ABCPClient, ABCPClientConfig, ABCPTransportError
+from abcp_client import ABCPClient, ABCPTransportError
 from harness.auth_fleet import AUTH_FLEET_MEMORY_SCOPE, auth_fleet_memory_guidance
 from harness.compaction import compact_messages_if_needed, validate_tool_pairing
-from harness.config import HarnessConfig, RuntimeConfig, VLConfig
+from runtime_config import ABCPClientConfig, HarnessConfig, ModelConfig, RuntimeConfig, VLConfig
 from harness.challenge_detector import ChallengeTracker
 from harness.constants import (
     CONTEXT_LIMIT_ERROR_MARKERS,
@@ -122,7 +122,6 @@ from llm import (
     LLMEmptyResponseError,
     LLMFactory,
     LLMRequestTimeoutError,
-    ModelConfig,
 )
 
 

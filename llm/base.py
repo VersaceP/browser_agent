@@ -7,7 +7,7 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from llm.config import ModelConfig
+from runtime_config import ModelConfig
 
 
 class LLMRequestTimeoutError(asyncio.TimeoutError):

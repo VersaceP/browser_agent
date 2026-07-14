@@ -4,7 +4,7 @@ llm.factory - LLM provider factory.
 
 from llm.anthropic_provider import AnthropicProvider
 from llm.base import BaseLLMProvider
-from llm.config import ModelConfig
+from runtime_config import ModelConfig
 from llm.openai_provider import OpenAIProvider
 
 

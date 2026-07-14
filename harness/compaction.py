@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
-from harness.config import HarnessConfig
+from runtime_config import HarnessConfig
 from harness.lifecycle import LifecycleContext, LifecycleManager
 from harness.utils import (
     JsonDict,

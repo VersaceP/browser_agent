@@ -12,15 +12,16 @@ still sees it) and multi-subscriber dispatch.
 import asyncio
 import inspect
 import json
-import os
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import websockets
+
+from runtime_config import ABCPClientConfig
 
 
 JsonDict = Dict[str, Any]
@@ -178,48 +179,6 @@ def _connect_supports_proxy_arg() -> bool:
 def _is_local_ws_url(ws_url: str) -> bool:
     host = urlparse(ws_url).hostname
     return host in {"localhost", "127.0.0.1", "::1"}
-
-
-@dataclass
-class ABCPClientConfig:
-    ws_url: str = "ws://localhost:9300/ws"
-    jwt_token: Optional[str] = None
-    jwt_token_env: Optional[str] = None
-    request_shape: str = "flat"
-    connect_timeout_seconds: float = 15
-    call_timeout_seconds: float = 60
-    ping_interval_seconds: Optional[float] = 20
-    max_message_size_bytes: Optional[int] = 16 * 1024 * 1024
-
-    @classmethod
-    def from_dict(cls, data: JsonDict) -> "ABCPClientConfig":
-        token = data.get("jwt_token")
-        token_env = data.get("jwt_token_env")
-        if not token and token_env:
-            token = os.environ.get(token_env)
-        max_message_size = data.get(
-            "max_message_size_bytes",
-            cls.max_message_size_bytes,
-        )
-
-        return cls(
-            ws_url=data.get("ws_url", cls.ws_url),
-            jwt_token=token,
-            jwt_token_env=token_env,
-            request_shape=data.get("request_shape", cls.request_shape),
-            connect_timeout_seconds=float(
-                data.get("connect_timeout_seconds", cls.connect_timeout_seconds)
-            ),
-            call_timeout_seconds=float(
-                data.get("call_timeout_seconds", cls.call_timeout_seconds)
-            ),
-            ping_interval_seconds=data.get(
-                "ping_interval_seconds", cls.ping_interval_seconds
-            ),
-            max_message_size_bytes=(
-                None if max_message_size is None else int(max_message_size)
-            ),
-        )
 
 
 class ABCPClient:

@@ -1,17 +1,72 @@
 """
-harness.config - Runtime and harness configuration for ABCP agents.
+runtime_config.py - 全项目统一配置表（single source of truth）。
+
+config.json 的四张配置表全部定义在这一个文件里：
+
+    顶层             -> ModelConfig       （LLM 连接：provider/model_id/api_key/超时重试/extra_params）
+    "vl": {...}      -> VLConfig          （视觉模型连接 + 各 VL 角色开关）
+    "browser": {...} -> ABCPClientConfig  （ABCP WebSocket 连接）
+    "harness": {...} -> HarnessConfig     （编排/步数预算/offload/HITL/skill 等运行时行为）
+
+历史位置 llm/config.py、abcp_client.py、harness/config.py 仍从这里 re-export，
+旧 import 路径全部兼容。load_runtime_config() 是唯一装载入口；装载时对
+config.json 里不认识的字段打印告警，不再静默吞掉写了也不生效的键。
+
+本模块只依赖标准库（不 import 项目内任何模块），避免循环依赖。
 """
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+import json
+import os
+import sys
+from dataclasses import dataclass, field, fields
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-from abcp_client import ABCPClientConfig
-from harness.constants import (
-    DEFAULT_LOCAL_FS_READ_BYTES,
-    DEFAULT_OFFLOAD_THRESHOLD_BYTES,
-    DEFAULT_TOOL_RESULT_OFFLOAD_THRESHOLD_BYTES,
-)
-from llm.config import ModelConfig
+
+JsonDict = Dict[str, Any]
+
+
+# ---------------------------------------------------------------------------
+# 共享默认值（harness/constants.py 从这里 re-export）
+# ---------------------------------------------------------------------------
+
+DEFAULT_OFFLOAD_THRESHOLD_BYTES = 8000
+DEFAULT_TOOL_RESULT_OFFLOAD_THRESHOLD_BYTES = 50000
+DEFAULT_LOCAL_FS_READ_BYTES = 20000
+
+DEFAULT_LLM_API_TIMEOUT_SECONDS = 180.0
+DEFAULT_LLM_TIMEOUT_MAX_RETRIES = 1
+DEFAULT_LLM_TIMEOUT_BACKOFF_SECONDS = 1.0
+
+
+# ---------------------------------------------------------------------------
+# 数值解析 helpers
+# ---------------------------------------------------------------------------
+
+def _float_config(value: Any, default: float, *, minimum: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, parsed)
+
+
+def _optional_float_config(value: Any, *, minimum: float = 0.0) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return max(minimum, parsed)
+
+
+def _int_config(value: Any, default: int, *, minimum: int = 0, maximum: int = 10) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(maximum, parsed))
 
 
 def _normalize_selection_mode(value: Any) -> str:
@@ -19,8 +74,134 @@ def _normalize_selection_mode(value: Any) -> str:
     return mode if mode in ("manual", "auto") else "manual"
 
 
-JsonDict = Dict[str, Any]
+# ---------------------------------------------------------------------------
+# 顶层：ModelConfig（LLM 连接）
+# ---------------------------------------------------------------------------
 
+@dataclass
+class ModelConfig:
+    """模型配置 — 定义 LLM 的连接参数"""
+    provider: str = "anthropic"
+    model_id: str = "claude-sonnet-4-20250514"
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+    extra_params: Dict[str, Any] = field(default_factory=dict)
+    llm_api_timeout_seconds: float = DEFAULT_LLM_API_TIMEOUT_SECONDS
+    llm_timeout_max_retries: int = DEFAULT_LLM_TIMEOUT_MAX_RETRIES
+    llm_timeout_backoff_seconds: float = DEFAULT_LLM_TIMEOUT_BACKOFF_SECONDS
+    llm_timeout_retry_interval_seconds: Optional[float] = None
+
+    @classmethod
+    def load_from_file(cls, filepath: str) -> "ModelConfig":
+        """从 JSON 配置文件加载配置，敏感字段通过环境变量名间接获取"""
+        if not os.path.exists(filepath):
+            return cls()
+
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        extra_params = (
+            data.get("extra_params")
+            if isinstance(data.get("extra_params"), dict)
+            else {}
+        )
+
+        def model_value(key: str, default: Any) -> Any:
+            return data.get(key, extra_params.get(key, default))
+
+        return cls(
+            provider=data.get("provider", "anthropic"),
+            model_id=data.get("model_id", "claude-sonnet-4-20250514"),
+            api_key=data.get("api_key") or cls._env(data.get("api_key_env")),
+            base_url=data.get("base_url") or cls._env(data.get("base_url_env")),
+            extra_params=extra_params,
+            llm_api_timeout_seconds=_float_config(
+                model_value(
+                    "llm_api_timeout_seconds",
+                    DEFAULT_LLM_API_TIMEOUT_SECONDS,
+                ),
+                DEFAULT_LLM_API_TIMEOUT_SECONDS,
+                minimum=1.0,
+            ),
+            llm_timeout_max_retries=_int_config(
+                model_value(
+                    "llm_timeout_max_retries",
+                    DEFAULT_LLM_TIMEOUT_MAX_RETRIES,
+                ),
+                DEFAULT_LLM_TIMEOUT_MAX_RETRIES,
+                minimum=0,
+                maximum=10,
+            ),
+            llm_timeout_backoff_seconds=_float_config(
+                model_value(
+                    "llm_timeout_backoff_seconds",
+                    DEFAULT_LLM_TIMEOUT_BACKOFF_SECONDS,
+                ),
+                DEFAULT_LLM_TIMEOUT_BACKOFF_SECONDS,
+                minimum=0.0,
+            ),
+            llm_timeout_retry_interval_seconds=_optional_float_config(
+                model_value("llm_timeout_retry_interval_seconds", None),
+                minimum=0.0,
+            ),
+        )
+
+    @staticmethod
+    def _env(key: Optional[str]) -> Optional[str]:
+        """从系统环境变量中读取指定 key 的值"""
+        if not key:
+            return None
+        return os.environ.get(key)
+
+
+# ---------------------------------------------------------------------------
+# "browser" 段：ABCPClientConfig（ABCP WebSocket 连接）
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ABCPClientConfig:
+    ws_url: str = "ws://localhost:9300/ws"
+    jwt_token: Optional[str] = None
+    jwt_token_env: Optional[str] = None
+    request_shape: str = "flat"
+    connect_timeout_seconds: float = 15
+    call_timeout_seconds: float = 60
+    ping_interval_seconds: Optional[float] = 20
+    max_message_size_bytes: Optional[int] = 16 * 1024 * 1024
+
+    @classmethod
+    def from_dict(cls, data: JsonDict) -> "ABCPClientConfig":
+        token = data.get("jwt_token")
+        token_env = data.get("jwt_token_env")
+        if not token and token_env:
+            token = os.environ.get(token_env)
+        max_message_size = data.get(
+            "max_message_size_bytes",
+            cls.max_message_size_bytes,
+        )
+
+        return cls(
+            ws_url=data.get("ws_url", cls.ws_url),
+            jwt_token=token,
+            jwt_token_env=token_env,
+            request_shape=data.get("request_shape", cls.request_shape),
+            connect_timeout_seconds=float(
+                data.get("connect_timeout_seconds", cls.connect_timeout_seconds)
+            ),
+            call_timeout_seconds=float(
+                data.get("call_timeout_seconds", cls.call_timeout_seconds)
+            ),
+            ping_interval_seconds=data.get(
+                "ping_interval_seconds", cls.ping_interval_seconds
+            ),
+            max_message_size_bytes=(
+                None if max_message_size is None else int(max_message_size)
+            ),
+        )
+
+
+# ---------------------------------------------------------------------------
+# "vl" 段：VLConfig（视觉模型 + 各 VL 角色开关）
+# ---------------------------------------------------------------------------
 
 @dataclass
 class VLConfig:
@@ -120,6 +301,10 @@ class VLConfig:
             ),
         )
 
+
+# ---------------------------------------------------------------------------
+# "harness" 段：HarnessConfig（编排与运行时行为）
+# ---------------------------------------------------------------------------
 
 @dataclass
 class HarnessConfig:
@@ -328,6 +513,12 @@ class HarnessConfig:
             skill_auto_heal_enabled=bool(
                 data.get("skill_auto_heal_enabled", cls.skill_auto_heal_enabled)
             ),
+            skill_guidance_signal_enabled=bool(
+                data.get(
+                    "skill_guidance_signal_enabled",
+                    cls.skill_guidance_signal_enabled,
+                )
+            ),
             skill_workflow_active_control_enabled=bool(
                 data.get("skill_workflow_active_control_enabled",
                          cls.skill_workflow_active_control_enabled)
@@ -407,3 +598,90 @@ class RuntimeConfig:
     model: ModelConfig
     browser: ABCPClientConfig
     harness: HarnessConfig
+
+
+# ---------------------------------------------------------------------------
+# 未知字段审计 + 装载入口
+# ---------------------------------------------------------------------------
+
+# 顶层除 ModelConfig 字段外还认识的键（env 间接键 + 三个子段 + 顶层 agent_id 兜底）。
+_TOP_LEVEL_EXTRA_KEYS = {
+    "api_key_env",
+    "base_url_env",
+    "agent_id",
+    "vl",
+    "browser",
+    "harness",
+}
+# browser 段里 agent_id 由 load_runtime_config 直接读取（不属于 ABCPClientConfig）。
+_BROWSER_EXTRA_KEYS = {"agent_id"}
+# vl 段接受的历史别名（VLConfig.from_dict 里兼容读取）。
+_VL_ALIAS_KEYS = {"reality_check_zero_yield_threshold"}
+
+
+def _field_names(cls: type) -> set:
+    return {f.name for f in fields(cls)}
+
+
+def audit_config_keys(raw: JsonDict) -> List[str]:
+    """比对 config 各段的键与配置表字段，返回人话告警（每项一行，空列表=干净）。"""
+    if not isinstance(raw, dict):
+        return []
+    warnings: List[str] = []
+
+    def check(section_name: str, section: Any, known: set) -> None:
+        if not isinstance(section, dict):
+            return
+        unknown = sorted(k for k in section if k not in known)
+        if unknown:
+            prefix = f"{section_name}." if section_name else ""
+            names = "、".join(prefix + k for k in unknown)
+            warnings.append(f"有不认识的字段（写了也不会生效，已忽略）: {names}")
+
+    check("", raw, _field_names(ModelConfig) | _TOP_LEVEL_EXTRA_KEYS)
+    check(
+        "browser",
+        raw.get("browser"),
+        _field_names(ABCPClientConfig) | _BROWSER_EXTRA_KEYS,
+    )
+    # runtime-only 字段不算“不认识”，下面单独给更准确的专属提示。
+    check("harness", raw.get("harness"), _field_names(HarnessConfig))
+    check("vl", raw.get("vl"), _field_names(VLConfig) | _VL_ALIAS_KEYS)
+
+    harness_raw = raw.get("harness")
+    if isinstance(harness_raw, dict):
+        if "forced_skill_id" in harness_raw:
+            warnings.append(
+                "harness.forced_skill_id 只在运行时通过 --skill / /skill 设置，"
+                "写在 config 里不生效"
+            )
+        if "vl" in harness_raw:
+            warnings.append("vl 配置要放在 config 顶层，放在 harness.vl 里不生效")
+    return warnings
+
+
+def load_runtime_config(config_path: str, *, warn: bool = True) -> RuntimeConfig:
+    path = Path(config_path)
+    raw: JsonDict = {}
+    if path.exists():
+        raw = json.loads(path.read_text(encoding="utf-8"))
+
+    if warn:
+        for line in audit_config_keys(raw):
+            print(f"[config] {path.name} {line}", file=sys.stderr)
+
+    model = ModelConfig.load_from_file(config_path)
+    browser_raw = raw.get("browser", {})
+    harness_raw = raw.get("harness", {})
+
+    harness = HarnessConfig.from_dict(harness_raw)
+    # VL is configured only at the top level of config.json:
+    # {"vl": {"enabled": true, "provider": "openai", ...}}
+    harness.vl = VLConfig.from_dict(raw.get("vl", {}))
+
+    return RuntimeConfig(
+        agent_id=browser_raw.get("agent_id") or raw.get("agent_id", "abcp-agent"),
+        model=model,
+        browser=ABCPClientConfig.from_dict(browser_raw),
+        harness=harness,
+    )

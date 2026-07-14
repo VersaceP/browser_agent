@@ -2,10 +2,6 @@
 harness.constants - Shared constants for ABCP agent harness modules.
 """
 
-DEFAULT_OFFLOAD_THRESHOLD_BYTES = 8000
-DEFAULT_TOOL_RESULT_OFFLOAD_THRESHOLD_BYTES = 50000
-DEFAULT_LOCAL_FS_READ_BYTES = 20000
-
 CHALLENGE_KEYWORDS = (
     "captcha",
     "cloudflare",
