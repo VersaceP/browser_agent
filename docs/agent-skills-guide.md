@@ -191,6 +191,17 @@ under the task worktree. In-context payloads keep `savedPath`, `outline`,
 
 ## HITL and Visual Checks
 
+Treat login walls, QR/SMS/2FA prompts, CAPTCHAs, and human-verification
+challenges as runtime interrupts of the worker that encounters them, not as a
+reason to end that worker and spawn a separate auth-probe or HITL worker. A
+generic sign-in header is not decisive. When `Page.getState` plus
+`DOM.getAXTree` show an authentication/verification surface, concrete auth
+controls or methods, and protected content that is blocked or inaccessible,
+call `Hitl.requestPause` immediately. Do not add repeated offload reads, a
+gate-only artifact, screenshots, or visual verification unless the DOM evidence
+is ambiguous, contradictory, or primarily graphical. After resume, synchronize
+state, refresh the AXTree, verify access, and continue the original worker task.
+
 After `Hitl.requestPause` succeeds, the harness owns wait/resolve/confirmation.
 Do not call `Hitl.*` again. Continue only after `hitl_wait.status == "resumed"`;
 for `timeout`, `stale_pause_deadlock`, `still_challenge_after_hitl`,

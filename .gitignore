@@ -9,6 +9,7 @@ ENV/
 .venv/
 worktree/
 tests/
+tests/*
 reports/
 dist/
 artifacts/
@@ -26,12 +27,8 @@ claude_code_scrape/
 *.py[cod]
 *$py.class
 node_modules/
-# skill runtime state (P5)
 skills/.skill_health.json
-# guidance(hints) 层防腐弱信号（运行态，同 .skill_health.json）
 skills/.guidance_health.json
 skills/**/.heal_history.json
-# auto-distilled / archived candidate workflows (self-heal); live workflow.json is tracked
 skills/**/workflow.v*.json
-# per-skill generation report from /skill-create (runtime state, like .skill_health.json)
 skills/**/.create_report.json

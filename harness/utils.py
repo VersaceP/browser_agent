@@ -18,6 +18,128 @@ EventSink = Callable[[str, JsonDict], None]
 LLM_HIDDEN_FIELDS: Set[str] = set()
 
 
+_ENGLISH_SEMANTIC_NEGATION_RE = re.compile(
+    r"(?:"
+    r"\b(?:do|does|did|must|should|shall|will|would|can|could)\s+not\b"
+    r"|\b(?:don't|doesn't|didn't|mustn't|shouldn't|shan't|won't|"
+    r"wouldn't|can't|cannot|couldn't)\b"
+    r"|\bnever\b|\bwithout\b|\bno\s+need\s+to\b"
+    r")"
+    r"(?:[\s,:()\[\]{}\"'`-]+[a-z0-9_.]+){0,6}"
+    r"[\s,:()\[\]{}\"'`.-]*$",
+    re.IGNORECASE,
+)
+_CJK_SEMANTIC_NEGATION_RE = re.compile(
+    r"(?:不要|不得|禁止|无需|不需要|不可|切勿)"
+    r"[^。！？!?;；\n]{0,24}$"
+)
+_PARENTHETICAL_SEMANTIC_NEGATION_RE = re.compile(
+    r"(?:"
+    r"\b(?:do|does|did|must|should|shall|will|would|can|could)\s+not\b"
+    r"|\b(?:don't|doesn't|didn't|mustn't|shouldn't|shan't|won't|"
+    r"wouldn't|can't|cannot|couldn't)\b"
+    r"|\bnever\b|不要|不得|禁止|无需|不需要|不可|切勿"
+    r")\s*[,，][^,，!?;。！？；\n]{1,64}[,，][^,，]*$",
+    re.IGNORECASE,
+)
+_CONDITIONAL_SEMANTIC_LEAD_RE = re.compile(
+    r"\b(?:if|when|unless|while|once|provided|assuming)\b"
+    r"|(?:如果|若|当|除非|倘若|假如)",
+    re.IGNORECASE,
+)
+
+
+def semantic_marker_spans(text: str, marker: str) -> List[Tuple[int, int]]:
+    """Return token-safe spans for a semantic marker.
+
+    Latin markers use alphanumeric boundaries so ``auth`` does not match
+    ``author``. CJK markers retain substring semantics because they are not
+    whitespace-delimited.
+    """
+    haystack = str(text or "").lower()
+    needle = str(marker or "").lower()
+    if not needle:
+        return []
+    if re.fullmatch(r"[a-z0-9 ._-]+", needle):
+        pattern = re.escape(needle).replace(r"\ ", r"\s+")
+        return [
+            match.span()
+            for match in re.finditer(
+                rf"(?<![a-z0-9]){pattern}(?![a-z0-9])",
+                haystack,
+            )
+        ]
+    spans: List[Tuple[int, int]] = []
+    offset = 0
+    while True:
+        start = haystack.find(needle, offset)
+        if start < 0:
+            return spans
+        end = start + len(needle)
+        spans.append((start, end))
+        offset = end
+
+
+def contains_semantic_marker(text: str, marker: str) -> bool:
+    """Return whether ``marker`` occurs with token-safe semantics."""
+    return bool(semantic_marker_spans(text, marker))
+
+
+def _has_direct_parenthetical_negation(sentence_prefix: str) -> bool:
+    """Distinguish a direct prohibition from a negated conditional branch."""
+    match = _PARENTHETICAL_SEMANTIC_NEGATION_RE.search(sentence_prefix)
+    if match is None:
+        return False
+    previous_comma = max(
+        sentence_prefix.rfind(",", 0, match.start()),
+        sentence_prefix.rfind("，", 0, match.start()),
+    )
+    negation_lead = sentence_prefix[previous_comma + 1:match.start()]
+    return _CONDITIONAL_SEMANTIC_LEAD_RE.search(negation_lead) is None
+
+
+def contains_affirmative_semantic_marker(text: str, marker: str) -> bool:
+    """Return whether at least one marker occurrence is not locally negated.
+
+    This is intentionally local rather than a general natural-language
+    negation engine. It protects imperative phase contracts such as
+    ``do NOT call Hitl.requestPause`` / ``不要调用 Hitl.requestPause`` while
+    still treating a later affirmative occurrence in the same text as an
+    execution instruction.
+    """
+    source = str(text or "")
+    for start, _end in semantic_marker_spans(source, marker):
+        prefix = source[max(0, start - 96):start]
+        # Negation is clause-local. A prohibited occurrence in a previous
+        # sentence must not suppress a later affirmative instruction.
+        # A dot is a sentence boundary when followed by whitespace, an
+        # uppercase Latin character, or CJK text.
+        # The trailing dot in the prefix of the shorter ``requestpause``
+        # alias is the method separator from ``Hitl.requestPause`` and must
+        # retain the preceding negation context.
+        sentence_prefix = re.split(
+            r"[!?;。！？；\n]|\.(?=\s|[A-Z\u3400-\u9fff])",
+            prefix,
+        )[-1]
+        # A comma normally separates the negated condition/action from the
+        # later affirmative instruction ("cannot proceed, request HITL").
+        # Preserve an immediately parenthesized prohibition such as
+        # "Do not, under any circumstances, call HITL", except when the
+        # negation belongs to a conditional branch ("If you cannot, stop,
+        # otherwise call HITL").
+        clause_prefix = (
+            sentence_prefix
+            if _has_direct_parenthetical_negation(sentence_prefix)
+            else re.split(r"[,，]", sentence_prefix)[-1]
+        )
+        if _ENGLISH_SEMANTIC_NEGATION_RE.search(clause_prefix):
+            continue
+        if _CJK_SEMANTIC_NEGATION_RE.search(clause_prefix):
+            continue
+        return True
+    return False
+
+
 def _resolve_context_file(context_file: Optional[str]) -> Optional[Path]:
     if not context_file:
         return None

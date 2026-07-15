@@ -361,8 +361,11 @@
       "procedure": [
         "Before requesting HITL for ordinary overlays, first verify page state and run the overlay dismiss ladder when it is safe.",
         "Use Hitl.requestPause only for CAPTCHA, hard auth walls, sensitive approval, manual review, or overlays that cannot be safely dismissed.",
+        "Treat an unpredicted login, QR/SMS/2FA prompt, CAPTCHA, or human-verification gate as a runtime interrupt of the current worker; do not finalize solely to hand it to a new auth or HITL worker.",
+        "A generic sign-in header alone is insufficient. Once Page.getState plus DOM.getAXTree show an authentication or verification surface, concrete auth controls or methods, and protected content that is blocked or inaccessible, call Hitl.requestPause immediately.",
+        "After decisive DOM evidence, do not reread the same offloaded AXTree, record a gate-only artifact, take screenshots, or call visual_verify unless the evidence is ambiguous, contradictory, or primarily graphical.",
         "After Hitl.requestPause succeeds, the harness owns wait, resolve, and confirmation; do not call Hitl.resolvePause yourself.",
-        "Continue only when hitl_wait.status is resumed; otherwise finalize with a blocker."
+        "Continue the original worker contract only when hitl_wait.status is resumed, after Page.getState and a fresh DOM.getAXTree verify that the protected target is usable; otherwise finalize with a blocker."
       ],
       "success_criteria": [
         "HITL is reserved for genuine user action requirements",

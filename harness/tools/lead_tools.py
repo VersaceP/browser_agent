@@ -21,7 +21,12 @@ from harness.task_types import (
 )
 from harness.tools.loop_guard import check_tool_call_loop
 from harness.tools.registry import ToolContext, ToolRegistry
-from harness.utils import JsonDict, optional_int
+from harness.utils import (
+    JsonDict,
+    contains_affirmative_semantic_marker,
+    contains_semantic_marker,
+    optional_int,
+)
 
 
 LeadToolDispatcher = Callable[[JsonDict], Awaitable[Tuple[JsonDict, bool]]]
@@ -859,12 +864,13 @@ _POST_AUTH_TARGET_MARKERS = (
 
 
 def _auth_gate_probe_guidance(phase: JsonDict, worker_contract: JsonDict) -> str:
-    """Inject pre-auth gate guardrails for auth-gated workflows.
+    """Inject guardrails only for an explicitly diagnostic gate probe.
 
     The trigger is intentionally semantic rather than site-specific: it catches
-    phases whose contract asks the worker to explore/detect an auth gate before
-    the target content is available, while skipping phases whose job is to
-    actually request HITL/login or perform post-auth form/list work.
+    phases whose final deliverable is gate diagnosis, while skipping business
+    phases and phases whose job explicitly includes requesting HITL/login.
+    Unpredicted gates in ordinary work are handled by the BrowserAgent's global
+    runtime-auth interrupt SOP, not by ending this worker and spawning another.
     """
     expected = (
         worker_contract.get("expected_artifact")
@@ -904,25 +910,30 @@ def _auth_gate_probe_guidance(phase: JsonDict, worker_contract: JsonDict) -> str
                 parts.append(json.dumps(structured, ensure_ascii=False, default=str))
             except TypeError:
                 parts.append(str(structured))
-    text = " ".join(str(item or "") for item in parts).lower()
-    if not any(marker in text for marker in _AUTH_GATE_MARKERS):
+    text = " ".join(str(item or "") for item in parts)
+    if not any(
+        contains_semantic_marker(text, marker)
+        for marker in _AUTH_GATE_MARKERS
+    ):
         return ""
 
     is_probe = has_gate_fields or any(
-        marker in text for marker in _AUTH_GATE_PROBE_MARKERS
+        contains_semantic_marker(text, marker)
+        for marker in _AUTH_GATE_PROBE_MARKERS
     )
     if not is_probe:
         return ""
 
-    if not has_gate_fields and any(
-        marker in text for marker in _AUTH_GATE_EXECUTION_MARKERS
+    if any(
+        contains_affirmative_semantic_marker(text, marker)
+        for marker in _AUTH_GATE_EXECUTION_MARKERS
     ):
         return ""
 
     target_terms = [
         marker
         for marker in _POST_AUTH_TARGET_MARKERS
-        if marker in text
+        if contains_semantic_marker(text, marker)
     ][:8]
     target_note = ""
     if target_terms:
@@ -934,12 +945,12 @@ def _auth_gate_probe_guidance(phase: JsonDict, worker_contract: JsonDict) -> str
 
     return (
         "<auth_gate_probe_guidance>\n"
-        "- This is a pre-auth gate probe, not the protected target-content phase.\n"
+        "- The phase contract explicitly makes gate diagnosis the final deliverable; this is the narrow probe-only exception to the runtime-auth interrupt rule.\n"
         "- Stop as soon as login/auth/SSO/OAuth/QR/phone verification/CAPTCHA/HITL/paywall is confirmed with Page.getState and DOM.getAXTree evidence.\n"
         "- Report only gate facts: auth_required/login_required, auth_surface, auth_method/options/providers, current URL/title, evidence text/source, and whether the next phase needs HITL.\n"
-        "- Do not dismiss auth/paywall overlays, click provider/login/submit buttons, fill credentials, direct-navigate around the gate, or inspect post-auth form/list/detail/download fields.\n"
+        "- Because the user asked only for diagnosis, do not call Hitl.requestPause, dismiss auth/paywall overlays, click provider/login/submit buttons, fill credentials, direct-navigate around the gate, or inspect post-auth form/list/detail/download fields.\n"
         f"{target_note}"
-        "- If the protected target is not visible before auth, return it as behind_auth/unknown and hand control back to LeadAgent for a login/HITL phase.\n"
+        "- If the protected target is not visible before auth, return it as behind_auth/unknown and finish this diagnostic contract; do not assume or request a follow-up login/HITL phase.\n"
         "</auth_gate_probe_guidance>"
     )
 

@@ -29,7 +29,14 @@ from harness.task_types import (
     normalize_task_type,
     task_type_choices_for_error,
 )
-from harness.utils import JsonDict, RunLogger, safe_path_component, trim_large_strings
+from harness.utils import (
+    JsonDict,
+    RunLogger,
+    contains_affirmative_semantic_marker,
+    contains_semantic_marker,
+    safe_path_component,
+    trim_large_strings,
+)
 
 
 TASK_PLAN_FILE = "task_plan.json"
@@ -150,6 +157,112 @@ VALIDATOR_TYPE_ALIASES = {
     "no_duplicates": "unique",
     "unique_fields": "unique",
 }
+
+# Authentication walls and human-verification challenges are runtime
+# interrupts for the worker that encounters them.  A plan may still contain a
+# standalone diagnostic probe when that is the user's actual goal, but it must
+# not serialize that probe into a second worker whose only job is to request
+# HITL on the same gate.
+_AUTH_PLAN_MARKERS = (
+    "auth", "authentication", "login", "log in", "sign in", "signin",
+    "sso", "oauth", "password", "captcha", "human verification",
+    "verification code", "2fa", "mfa", "hitl", "登录", "登陆", "认证",
+    "验证码", "扫码", "人机",
+)
+_AUTH_PROBE_MARKERS = (
+    "probe", "detect", "identify", "assess", "check gate", "check login",
+    "gate type", "gate evidence", "auth required", "login required",
+    "门禁", "探测", "识别", "判断", "确认是否",
+)
+_AUTH_TRANSITION_MARKERS = (
+    "hitl.requestpause", "requestpause", "request hitl", "request pause",
+    "complete login", "complete authentication", "handle login",
+    "perform login", "after login", "post-login", "verify login",
+    "login status", "login_status", "人工登录", "请求 hitl", "完成登录",
+    "处理登录", "登录后", "验证登录",
+)
+_AUTH_PROBE_FIELD_MARKERS = frozenset({
+    "gatetype", "gateevidence", "authrequired", "authenticationrequired",
+    "loginrequired", "requireslogin", "requiresauth", "authsurface",
+    "loginsurface", "authevidence", "loginevidence",
+    "nextphaserequireshitl",
+})
+
+
+def _normalized_semantic_token(value: Any) -> str:
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", str(value or "").lower())
+
+
+def _auth_phase_kind(phase: JsonDict) -> str:
+    """Classify only explicit auth-planning phases.
+
+    Returns ``probe``, ``transition``, or ``""``.  Ordinary business phases
+    intentionally classify as empty even though they may encounter an
+    unpredictable login wall at runtime.
+    """
+    expected = phase.get("expected_artifact")
+    expected = expected if isinstance(expected, dict) else {}
+    fields = field_names_from_specs(expected.get("fields") or [])
+    required = field_names_from_specs(expected.get("required_fields") or [])
+    normalized_fields = {
+        _normalized_semantic_token(field) for field in [*fields, *required]
+    }
+    parts = [
+        phase.get("id"),
+        phase.get("objective"),
+        phase.get("worker_task"),
+        phase.get("stage_hint_reason"),
+        phase.get("context"),
+        *fields,
+        *required,
+    ]
+    text = " ".join(str(item or "") for item in parts)
+    if not any(
+        contains_semantic_marker(text, marker) for marker in _AUTH_PLAN_MARKERS
+    ):
+        return ""
+    if any(
+        contains_affirmative_semantic_marker(text, marker)
+        for marker in _AUTH_TRANSITION_MARKERS
+    ):
+        return "transition"
+    if normalized_fields & _AUTH_PROBE_FIELD_MARKERS:
+        return "probe"
+    if any(
+        contains_semantic_marker(text, marker) for marker in _AUTH_PROBE_MARKERS
+    ):
+        return "probe"
+    return ""
+
+
+def _reject_serial_auth_handoff(phases: List[JsonDict], errors: List[str]) -> None:
+    """Reject the concrete probe-worker -> HITL-worker waste pattern.
+
+    The guard is deliberately narrow: phases must be adjacent, the first must
+    be an explicit auth diagnostic, and the second must serialize on it either
+    implicitly or through depends_on.  A lone diagnostic probe remains valid.
+    """
+    for probe, transition in zip(phases, phases[1:]):
+        if _auth_phase_kind(probe) != "probe":
+            continue
+        if _auth_phase_kind(transition) != "transition":
+            continue
+        dependencies = _phase_dependency_ids(transition)
+        serialized_on_probe = (
+            dependencies is None
+            or str(probe.get("id") or "") in dependencies
+        )
+        if not serialized_on_probe:
+            continue
+        errors.append(
+            "auth phase split is not allowed: diagnostic phase"
+            f" {probe.get('id')!r} is followed by HITL/login phase"
+            f" {transition.get('id')!r}. Authentication and human verification"
+            " are runtime interrupts: merge detection, Hitl.requestPause, and"
+            " post-resume verification into the worker performing the protected"
+            " task. Keep a probe-only phase only when gate diagnosis itself is"
+            " the final user objective."
+        )
 
 
 def utc_now_iso() -> str:
@@ -369,6 +482,8 @@ def validate_task_plan(
                     f"phase {phase_id}: depends_on references unknown phase"
                     f" id {dep_id!r}"
                 )
+
+    _reject_serial_auth_handoff(phases, errors)
 
     normalized = {
         "version": "v1",
