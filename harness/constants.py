@@ -51,6 +51,46 @@ OFFLOAD_FIELDS_AS_JSON = {
 }
 OFFLOAD_FIELDS = OFFLOAD_FIELDS_AS_TEXT | OFFLOAD_FIELDS_AS_JSON
 SCREENSHOT_METHODS = {"Page.screenshot", "DOM.getElementScreenshot"}
+
+# Fleet-routing outcomes that can reach LeadAgent. Keep the guidance text and
+# this catalog together so tests can mechanically reject undocumented additions.
+LEAD_FLEET_ROUTING_DECISION_CODES = (
+    "session_fleet_lost",
+    "fleet_assignment_lost",
+    "fleet_auth_gated",
+    "fleet_auth_resolver_required",
+    "fleet_reperception_required",
+    "session_transport_unavailable",
+    "session_manual_reset_required",
+    "session_slot_busy",
+    "fleet_owner_unavailable",
+    "reuse_fleet_lost",
+    "reuse_session_conflict",
+    "session_isolation_conflict",
+    "fleet_routing_conflict",
+    "session_binding_conflict",
+    "fleet_session_conflict",
+    "released_fleet_conflict",
+)
+
+LEAD_FLEET_ROUTING_DECISION_GUIDANCE = """- session_fleet_lost: the named fleet disappeared from the owner inventory and is effectively terminal until explicit reset/re-authentication. Mark the auth session stale and follow the auth-interrupt/login recovery flow; never retry or silently rebind the same session_key.
+- fleet_assignment_lost: stop the worker and request a fresh coordinator assignment; do not retry calls against the lost fleetId.
+- fleet_auth_gated: another worker is resolving login/CAPTCHA for the shared fleet. Wait; do not create another fleet or continue account actions.
+  - reasonKind=fleet_auth_resolver_required: the gate is closed but currently has no resolver. Spawn or continue exactly one worker on the same fleet/session to refresh Page.getState and DOM.getAXTree, then explicitly call Hitl.requestPause to claim resolution. Do not create another fleet and do not wait without assigning a resolver.
+- fleet_reperception_required: shared auth state changed. The worker must call Page.getState and DOM.getAXTree before any further action.
+
+Fleet routing rejection table for spawn_browser_agent:
+- session_transport_unavailable: the original owner socket could not be restored; retry later without changing the session/fleet binding.
+- session_manual_reset_required: repeated owner-socket recovery failed. Stop retrying. A host/operator must restore the transport or explicitly reset the exact fleet/generation; the Lead must never release or silently rebind it.
+- session_slot_busy: when multi-worker fleet reuse is disabled, wait for the worker using that named session; never route the session to another fleet.
+- fleet_owner_unavailable: wait for the owner slot to reconnect; do not replace the task/session fleet.
+- reuse_fleet_lost: drop reuse_from_worker_id and request a fresh coordinator assignment.
+- reuse_session_conflict: keep the source worker's session_key, or start a fresh named session without inheriting that worker.
+- session_isolation_conflict: start a fresh fleet whose needs_isolated_session contract matches the request.
+- fleet_routing_conflict: session_key, preferred_slot_id, and reuse_from_worker_id disagree; remove the conflicting selectors instead of retrying them unchanged.
+- session_binding_conflict / fleet_session_conflict / released_fleet_conflict: fail closed and follow next_instruction; these protect an existing or released cookie jar from reassignment.
+"""
+
 GENERIC_TOOL_RESULT_KEEP_KEYS = (
     "method",
     "status",
@@ -136,12 +176,16 @@ WORKER_STATUS_UNKNOWN = "unknown"
 WORKER_STATUS_FAILED = "failed"
 WORKER_STATUS_CANCELLED = "cancelled"
 WORKER_STATUS_RUNNING = "running"
+WORKER_STATUS_SESSION_FLEET_LOST = "session_fleet_lost"
+WORKER_STATUS_FLEET_ASSIGNMENT_LOST = "fleet_assignment_lost"
 
 # Classifier priority (higher index = lower priority). The classifier walks this
 # list and returns the first hard signal that matches. Soft (model-reported)
 # status is only honored when no hard signal is present.
 WORKER_STATUS_HARD_PRIORITY = (
     WORKER_STATUS_CONTEXT_LIMIT,
+    WORKER_STATUS_SESSION_FLEET_LOST,
+    WORKER_STATUS_FLEET_ASSIGNMENT_LOST,
     WORKER_STATUS_STALE_PAUSE_DEADLOCK,
     WORKER_STATUS_PAGE_SETTLED_AFTER_HITL,
     WORKER_STATUS_HITL_WAITING,
@@ -178,6 +222,8 @@ WORKER_STATUS_CATEGORIES = {
     WORKER_STATUS_CANCELLED: WORKER_STATUS_CATEGORY_FATAL,
     WORKER_STATUS_UNKNOWN: WORKER_STATUS_CATEGORY_UNKNOWN,
     WORKER_STATUS_RUNNING: WORKER_STATUS_CATEGORY_UNKNOWN,
+    WORKER_STATUS_SESSION_FLEET_LOST: WORKER_STATUS_CATEGORY_NEEDS_HUMAN,
+    WORKER_STATUS_FLEET_ASSIGNMENT_LOST: WORKER_STATUS_CATEGORY_RECOVERABLE,
 }
 
 # Soft statuses the model is allowed to self-report via final_answer.

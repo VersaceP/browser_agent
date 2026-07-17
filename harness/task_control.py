@@ -24,6 +24,8 @@ from harness.constants import (
     WORKER_STATUS_PAGE_SETTLED_AFTER_HITL,
 )
 from harness.extraction_artifacts import field_name_from_spec, field_names_from_specs
+from harness.auth_fleet import normalize_auth_verification_contract
+from harness.fleet_coordinator import normalize_page_policy, normalize_reuse_scope
 from harness.task_types import (
     VALID_TASK_TYPES,
     normalize_task_type,
@@ -57,6 +59,15 @@ TERMINAL_PHASE_STATUSES = frozenset({
     "target_absent",
     "instruction_infeasible",
     "blocked_by_dependency",
+    "session_fleet_lost",
+})
+RECOVERABLE_ROUTING_PHASE_STATUSES = frozenset({"fleet_assignment_lost"})
+RETRYABLE_PHASE_FAILURE_STATUSES = frozenset({
+    "validation_failed",
+    "failed",
+    "cancelled",
+    "unknown",
+    *RECOVERABLE_ROUTING_PHASE_STATUSES,
 })
 BLOCKING_DEPENDENCY_STATUSES = TERMINAL_PHASE_STATUSES - {"validated_done"}
 # Statuses a replan resets to a clean slate. phase_failed is the Lead's
@@ -432,6 +443,59 @@ def validate_task_plan(
                     warnings=warnings,
                     where=f"phase {phase_id}: worker_contract.task_type",
                 )
+            if (
+                "needs_isolated_session" in worker_contract
+                and not isinstance(worker_contract.get("needs_isolated_session"), bool)
+            ):
+                errors.append(
+                    f"phase {phase_id}: worker_contract.needs_isolated_session"
+                    " must be a boolean"
+                )
+            raw_reuse_scope = worker_contract.get("reuse_scope")
+            try:
+                normalized_reuse_scope = normalize_reuse_scope(
+                    str(raw_reuse_scope or "")
+                )
+                if raw_reuse_scope is not None:
+                    if str(raw_reuse_scope).strip():
+                        worker_contract["reuse_scope"] = normalized_reuse_scope
+                    else:
+                        # Empty means unspecified. Do not freeze it to
+                        # connection here: spawn-time explicit continuation
+                        # selectors must still be able to default to page.
+                        worker_contract.pop("reuse_scope", None)
+            except ValueError as exc:
+                errors.append(f"phase {phase_id}: worker_contract.{exc}")
+                normalized_reuse_scope = "connection"
+            raw_page_policy = worker_contract.get("page_policy")
+            try:
+                normalized_page_policy = normalize_page_policy(
+                    str(raw_page_policy or ""),
+                    reuse_scope=normalized_reuse_scope,
+                )
+                if raw_page_policy is not None:
+                    if str(raw_page_policy).strip():
+                        worker_contract["page_policy"] = normalized_page_policy
+                    else:
+                        worker_contract.pop("page_policy", None)
+            except ValueError as exc:
+                errors.append(f"phase {phase_id}: worker_contract.{exc}")
+            if (
+                "session_key" in worker_contract
+                and not isinstance(worker_contract.get("session_key"), str)
+            ):
+                errors.append(
+                    f"phase {phase_id}: worker_contract.session_key must be a string"
+                )
+            if "auth_verification" in worker_contract:
+                try:
+                    worker_contract["auth_verification"] = (
+                        normalize_auth_verification_contract(
+                            worker_contract.get("auth_verification")
+                        )
+                    )
+                except ValueError as exc:
+                    errors.append(f"phase {phase_id}: worker_contract.{exc}")
 
         # phase_contract consumes phase.task_type (contract > phase > plan),
         # but normalization used to drop it silently — a per-phase override
@@ -677,7 +741,10 @@ def phase_contract(
     # skill_selection={"use_skill": false} (decline) never reached the dispatch
     # gate and spawn_browser_agent kept re-returning skill_selection_required
     # (an unbreakable loop for the Lead). Preserve them verbatim when present.
-    for skill_key in ("skill_id", "skill_variables", "skill_rows", "skill_selection", "domain"):
+    for skill_key in (
+        "skill_id", "skill_variables", "skill_rows", "skill_selection", "domain",
+        "needs_isolated_session", "reuse_scope", "session_key", "page_policy",
+    ):
         value = contract.get(skill_key)
         if value is not None:
             payload[skill_key] = value
@@ -1500,21 +1567,65 @@ def mark_phase_result(
             4000,
         )
 
+    if result_status in RECOVERABLE_ROUTING_PHASE_STATUSES:
+        phase_state["status"] = result_status
+        phase_state["last_failure"] = [{
+            "type": "recoverable_routing_failure",
+            "status": result_status,
+            "message": (
+                "The worker's unnamed fleet assignment was lost. Retry this"
+                " phase with a fresh coordinator assignment; retries remain"
+                " bounded by the phase max_attempts budget."
+            ),
+        }]
+        phase_state["last_failure_classification"] = (
+            validation.get("classification")
+            if isinstance(validation, dict)
+            and isinstance(validation.get("classification"), dict)
+            else None
+        )
+        # This is an orchestration/inventory failure, not evidence that the
+        # objective itself is infeasible. Preserve the reason and phase retry
+        # budget, but do not consume the cross-replan objective budget.
+        write_task_state(logger, state)
+        return
+
+    if result_status == "cancelled":
+        phase_state["status"] = result_status
+        phase_state["last_failure"] = [{
+            "type": "worker_cancelled",
+            "status": result_status,
+            "message": (
+                "The worker was cancelled. A retry remains bounded by the"
+                " phase max_attempts budget, but cancellation is not evidence"
+                " that the objective itself is infeasible."
+            ),
+        }]
+        phase_state["last_failure_classification"] = (
+            validation.get("classification")
+            if isinstance(validation, dict)
+            and isinstance(validation.get("classification"), dict)
+            else None
+        )
+        write_task_state(logger, state)
+        return
+
     if result_status in {
         "blocked_by_challenge",
         "hitl_required",
         "hitl_timeout",
         "page_settled_after_hitl",
         "stale_pause_deadlock",
+        "session_fleet_lost",
     }:
         phase_state["status"] = result_status
         phase_state["last_failure"] = [{
             "type": "challenge_blocker",
             "status": result_status,
             "message": (
-                "Worker reported a challenge/HITL blocker or stale pause"
-                " deadlock; do not retry this phase with the same browser"
-                " strategy without user action or a deliberate pivot."
+                "Worker reported a challenge/HITL/session blocker; do not"
+                " retry the same browser/session binding without user action"
+                " or a deliberate auth recovery pivot."
             ),
         }]
         write_task_state(logger, state)
@@ -1765,12 +1876,10 @@ def phase_start_rejection(
     attempts = phase_state.get("attempts") if isinstance(phase_state, dict) else []
     attempts_count = len(attempts) if isinstance(attempts, list) else 0
     max_attempts = _positive_int(target_phase.get("max_attempts"), default=3)
-    if attempts_count >= max_attempts and status in {
-        "validation_failed",
-        "failed",
-        "cancelled",
-        "unknown",
-    }:
+    if (
+        attempts_count >= max_attempts
+        and status in RETRYABLE_PHASE_FAILURE_STATUSES
+    ):
         return {
             "status": "phase_exhausted",
             "phaseId": str(phase_id),
@@ -1886,12 +1995,10 @@ def mark_phase_exhausted_if_needed(
         attempts = phase_state.get("attempts") if isinstance(phase_state, dict) else []
         attempts_count = len(attempts) if isinstance(attempts, list) else 0
         max_attempts = _positive_int(phase.get("max_attempts"), default=3)
-        if attempts_count < max_attempts or status not in {
-            "validation_failed",
-            "failed",
-            "cancelled",
-            "unknown",
-        }:
+        if (
+            attempts_count < max_attempts
+            or status not in RETRYABLE_PHASE_FAILURE_STATUSES
+        ):
             continue
         classification = phase_state.get("last_failure_classification")
         if not isinstance(classification, dict) and isinstance(attempts, list) and attempts:
@@ -1957,12 +2064,10 @@ def next_pending_phase(plan: Optional[JsonDict], logger: RunLogger) -> Optional[
         attempts = phase_state.get("attempts") if isinstance(phase_state, dict) else []
         attempts_count = len(attempts) if isinstance(attempts, list) else 0
         max_attempts = _positive_int(phase.get("max_attempts"), default=3)
-        if attempts_count >= max_attempts and status in {
-            "validation_failed",
-            "failed",
-            "cancelled",
-            "unknown",
-        }:
+        if (
+            attempts_count >= max_attempts
+            and status in RETRYABLE_PHASE_FAILURE_STATUSES
+        ):
             prior_ids.append(phase_id)
             continue
         if status not in {"validated_done"}:

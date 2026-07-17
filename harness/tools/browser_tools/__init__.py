@@ -244,6 +244,22 @@ async def execute_browser_tool(agent: Any, tool_call: JsonDict, step: int) -> Tu
         agent.trace.append({"type": "tool_error", "result": result})
         return result, False
 
+    fleet_guard, _fleet_receipt = _apply_fleet_binding(
+        agent, name, tool_input
+    )
+    routing_guard = fleet_guard or _check_page_binding(
+        agent, name, tool_input
+    )
+    if routing_guard is not None:
+        agent.logger.write("browser.tool.routing_rejected", routing_guard)
+        agent.trace.append({
+            "type": "page_binding_guard",
+            "method": name,
+            "params": tool_input,
+            "result": routing_guard,
+        })
+        return routing_guard, False
+
     if action.contract_check:
         contract_result = _check_worker_contract(agent, name)
         if contract_result is not None:
@@ -804,6 +820,456 @@ async def _browser_local_fs_read(ctx: ToolContext) -> JsonDict:
     )
 
 
+def _apply_fleet_binding(
+    agent: Any,
+    method: str,
+    params: JsonDict,
+) -> Tuple[Optional[JsonDict], JsonDict]:
+    """Enforce the coordinator-issued fleet binding on model-initiated calls.
+
+    Internal harness plumbing does not pass through this function.  This makes
+    Fleet.create coordinator-owned while still allowing the fast path and other
+    deterministic harness code to use its explicit assignment.
+    """
+
+    if not _fleet_reuse_enabled(agent):
+        return None, {}
+
+    assigned_fleet_id = str(
+        getattr(agent, "assigned_fleet_id", "") or ""
+    ).strip()
+    allowed = {
+        str(item).strip()
+        for item in (getattr(agent, "allowed_fleet_ids", set()) or set())
+        if str(item).strip()
+    }
+    if assigned_fleet_id:
+        allowed.add(assigned_fleet_id)
+    assignment_reason = str(
+        getattr(agent, "fleet_assignment_reason", "") or ""
+    ).strip()
+
+    receipt = {
+        "assignedFleetId": assigned_fleet_id,
+        "assignmentReason": assignment_reason,
+        "fleetInjected": False,
+    }
+    if method == "Fleet.create":
+        return {
+            "status": "fleet_create_coordinator_owned",
+            "error": (
+                "Fleet.create is coordinator-owned while fleet reuse is enabled;"
+                " the worker must create pages inside its assigned fleet."
+            ),
+            "assignedFleetId": assigned_fleet_id,
+            "assignmentReason": assignment_reason,
+            "tool_was_executed": False,
+            "next_instruction": (
+                "Call Page.create with the assignedFleetId. If true session"
+                " isolation is required, declare needs_isolated_session before"
+                " spawning the worker."
+            ),
+        }, receipt
+    if method == "Fleet.close":
+        return {
+            "status": "fleet_close_coordinator_owned",
+            "error": (
+                "Fleet.close is disabled for workers while fleet reuse is"
+                " enabled because close clears ownership and makes the fleet"
+                " claimable by another agent that knows its fleetId."
+            ),
+            "assignedFleetId": assigned_fleet_id,
+            "assignmentReason": assignment_reason,
+            "tool_was_executed": False,
+            "next_instruction": (
+                "Close task pages with Page.close when appropriate. Fleet"
+                " ownership transfer and retention are Dispatcher lifecycle"
+                " responsibilities."
+            ),
+        }, receipt
+
+    requested_fleet_id = str(params.get("fleetId") or "").strip()
+    if requested_fleet_id:
+        if not assigned_fleet_id:
+            return {
+                "status": "fleet_assignment_required",
+                "error": "No coordinator fleet assignment is attached to this worker.",
+                "requestedFleetId": requested_fleet_id,
+                "tool_was_executed": False,
+            }, receipt
+        if requested_fleet_id not in allowed:
+            return {
+                "status": "fleet_binding_violation",
+                "error": (
+                    f"fleetId {requested_fleet_id!r} is outside this worker's"
+                    " coordinator-issued binding."
+                ),
+                "assignedFleetId": assigned_fleet_id,
+                "allowedFleetIds": sorted(allowed),
+                "tool_was_executed": False,
+                "next_instruction": (
+                    "Use assignedFleetId from slot_context; never fabricate or"
+                    " substitute fleet identifiers."
+                ),
+            }, receipt
+    elif method in {"Page.create", "Page.list"}:
+        if not assigned_fleet_id:
+            return {
+                "status": "fleet_assignment_required",
+                "error": (
+                    f"{method} requires a coordinator-issued fleetId;"
+                    " fleetless Dispatcher selection is intentionally disabled."
+                ),
+                "tool_was_executed": False,
+            }, receipt
+        params["fleetId"] = assigned_fleet_id
+        receipt["fleetInjected"] = True
+
+    if method not in {"Page.create", "Page.list"} and not method.startswith("Fleet."):
+        return None, {}
+    return None, receipt
+
+
+def _fleet_reuse_enabled(agent: Any) -> bool:
+    runtime = getattr(agent, "runtime", None)
+    harness_config = getattr(runtime, "harness", None)
+    if harness_config is None or not hasattr(harness_config, "fleet_reuse_enabled"):
+        # Compatibility for direct helper users and lightweight test doubles.
+        # Real RuntimeConfig always carries the explicit flag (default: true).
+        return False
+    return bool(getattr(harness_config, "fleet_reuse_enabled", True))
+
+
+def _check_page_binding(
+    agent: Any,
+    method: str,
+    params: JsonDict,
+) -> Optional[JsonDict]:
+    """Reject model-visible page handles outside the worker delegation."""
+
+    if not _fleet_reuse_enabled(agent) or not isinstance(params, dict):
+        return None
+    if method == "Page.list" and not bool(
+        getattr(agent, "page_reuse_allowed", False)
+    ):
+        return {
+            "status": "page_reuse_not_allowed",
+            "error": (
+                "Page.list is unavailable for this fresh-page assignment;"
+                " prior worker pages are intentionally hidden."
+            ),
+            "assignedFleetId": str(
+                getattr(agent, "assigned_fleet_id", "") or ""
+            ),
+            "tool_was_executed": False,
+            "next_instruction": (
+                "Create a fresh page with Page.create. Existing pages are"
+                " available only to an explicit reuse_scope=page continuation."
+            ),
+        }
+    page_id = str(params.get("pageId") or "").strip()
+    if not page_id:
+        return None
+    allowed_pages = {
+        str(item).strip()
+        for item in (getattr(agent, "allowed_page_ids", set()) or set())
+        if str(item).strip()
+    }
+    page_fleets = getattr(agent, "page_fleet_ids", None)
+    page_fleets = page_fleets if isinstance(page_fleets, dict) else {}
+    allowed_fleets = {
+        str(item).strip()
+        for item in (getattr(agent, "allowed_fleet_ids", set()) or set())
+        if str(item).strip()
+    }
+    assigned_fleet = str(getattr(agent, "assigned_fleet_id", "") or "").strip()
+    if assigned_fleet:
+        allowed_fleets.add(assigned_fleet)
+    page_fleet = str(page_fleets.get(page_id) or "").strip()
+    if page_id not in allowed_pages or (
+        page_fleet and page_fleet not in allowed_fleets
+    ):
+        return {
+            "status": "page_binding_violation",
+            "error": (
+                f"pageId {page_id!r} is outside this worker's"
+                " coordinator-issued page delegation."
+            ),
+            "pageId": page_id,
+            "pageFleetId": page_fleet,
+            "assignedFleetId": assigned_fleet,
+            "tool_was_executed": False,
+            "next_instruction": (
+                "Use a pageId returned by this worker's Page.create, or an"
+                " existing page explicitly supplied by reuse_scope=page."
+            ),
+        }
+    return None
+
+
+def _observe_page_binding_after(
+    agent: Any,
+    method: str,
+    params: JsonDict,
+    result: JsonDict,
+) -> None:
+    """Register only pages proven to belong to the assigned fleet."""
+
+    if not _fleet_reuse_enabled(agent) or not isinstance(result, dict):
+        return
+    response = result.get("response")
+    if result.get("error") or (
+        isinstance(response, dict) and response.get("error")
+    ):
+        return
+    allowed_pages = getattr(agent, "allowed_page_ids", None)
+    if not isinstance(allowed_pages, set):
+        allowed_pages = set()
+        agent.allowed_page_ids = allowed_pages
+    page_fleets = getattr(agent, "page_fleet_ids", None)
+    if not isinstance(page_fleets, dict):
+        page_fleets = {}
+        agent.page_fleet_ids = page_fleets
+    allowed_fleets = {
+        str(item).strip()
+        for item in (getattr(agent, "allowed_fleet_ids", set()) or set())
+        if str(item).strip()
+    }
+    assigned_fleet = str(getattr(agent, "assigned_fleet_id", "") or "").strip()
+    if assigned_fleet:
+        allowed_fleets.add(assigned_fleet)
+
+    if method in {"Page.create", "Page.list"}:
+        inherited_fleet = str(params.get("fleetId") or assigned_fleet).strip()
+        for page in _pages_from_value(result):
+            page_id = str(page.get("pageId") or page.get("page_id") or "").strip()
+            fleet_id = str(
+                page.get("fleetId") or page.get("fleet_id") or inherited_fleet
+            ).strip()
+            if method == "Page.list" and page_id not in allowed_pages:
+                continue
+            if page_id and fleet_id in allowed_fleets:
+                allowed_pages.add(page_id)
+                page_fleets[page_id] = fleet_id
+    elif method == "Page.close":
+        page_id = str(params.get("pageId") or "").strip()
+        if page_id:
+            allowed_pages.discard(page_id)
+            page_fleets.pop(page_id, None)
+
+
+def _filter_page_list_response(
+    agent: Any,
+    response: Any,
+) -> Tuple[Any, JsonDict]:
+    """Expose Page.list as a view of already delegated pages only.
+
+    Page.create is the only model-visible operation that may add a new page
+    handle dynamically. An explicit continuation may use Page.list to refresh
+    its delegated pages, but must not discover or adopt other pages in the same
+    fleet. Filtering happens before result offload so hidden handles cannot leak
+    through an offloaded raw response.
+    """
+
+    if not _fleet_reuse_enabled(agent):
+        return response, {}
+    allowed_pages = {
+        str(item).strip()
+        for item in (getattr(agent, "allowed_page_ids", set()) or set())
+        if str(item).strip()
+    }
+    hidden_count = 0
+    visible_count = 0
+
+    def filtered(value: Any) -> Any:
+        nonlocal hidden_count, visible_count
+        if isinstance(value, list):
+            is_page_list = any(
+                isinstance(item, dict)
+                and bool(str(item.get("pageId") or item.get("page_id") or "").strip())
+                for item in value
+            )
+            if is_page_list:
+                kept: List[Any] = []
+                for item in value:
+                    if not isinstance(item, dict):
+                        continue
+                    page_id = str(
+                        item.get("pageId") or item.get("page_id") or ""
+                    ).strip()
+                    if page_id in allowed_pages:
+                        visible_count += 1
+                        kept.append(filtered(item))
+                    else:
+                        hidden_count += 1
+                return kept
+            return [filtered(item) for item in value]
+        if isinstance(value, dict):
+            return {key: filtered(item) for key, item in value.items()}
+        return value
+
+    sanitized = filtered(copy.deepcopy(response))
+    return sanitized, {
+        "pageListFiltered": True,
+        "visiblePageCount": visible_count,
+        "hiddenPageCount": hidden_count,
+    }
+
+
+async def _fleet_auth_barrier_before_call(
+    agent: Any,
+    method: str,
+    params: JsonDict,
+) -> Optional[JsonDict]:
+    barrier = getattr(agent, "fleet_auth_barrier", None)
+    fleet_id = str(getattr(agent, "assigned_fleet_id", "") or "").strip()
+    worker_id = str(getattr(agent, "worker_id", "") or "").strip()
+    if barrier is None or not fleet_id or not worker_id:
+        return None
+    receipt = await barrier.before_call(
+        fleet_id,
+        worker_id,
+        seen_generation=int(
+            getattr(agent, "fleet_barrier_generation", 0) or 0
+        ),
+    )
+    if not receipt.get("allowed"):
+        if receipt.get("resolverRequired") and method in {
+            "Page.getState",
+            "DOM.getAXTree",
+            "Hitl.requestPause",
+        }:
+            # An ownerless but still-closed gate permits read-only diagnosis.
+            # Hitl.requestPause proceeds to the explicit atomic claim below;
+            # no arbitrary business call may become resolver implicitly.
+            return None
+        return receipt
+    if receipt.get("generationChanged"):
+        generation = int(receipt.get("generation") or 0)
+        # Latch one target generation. ``seen_generation`` intentionally stays
+        # unchanged until both observations complete, so before_call will keep
+        # reporting generationChanged in the meantime.  Resetting the flags on
+        # every such call makes Page.getState and DOM.getAXTree erase each
+        # other's progress forever.
+        if (
+            not getattr(agent, "fleet_reperception_pending", False)
+            or int(
+                getattr(agent, "fleet_reperception_generation", -1) or -1
+            )
+            != generation
+        ):
+            agent.fleet_reperception_generation = generation
+            agent.fleet_reperception_pending = True
+            agent.fleet_reperception_state_seen = False
+            agent.fleet_reperception_tree_seen = False
+            agent.axtree_invalidated = True
+    if not getattr(agent, "fleet_reperception_pending", False):
+        return None
+    if method not in {"Page.getState", "DOM.getAXTree"}:
+        return {
+            "status": "fleet_reperception_required",
+            "reasonKind": "fleet_reperception_required",
+            "fleetId": fleet_id,
+            "generation": receipt.get("generation"),
+            "tool_was_executed": False,
+            "retryable": True,
+            "next_instruction": (
+                "The shared authentication state changed. Call Page.getState"
+                " and then DOM.getAXTree for this page before any other action."
+            ),
+        }
+    return None
+
+
+def _fleet_auth_barrier_after_call(
+    agent: Any,
+    method: str,
+    result: JsonDict,
+) -> None:
+    if not getattr(agent, "fleet_reperception_pending", False):
+        return
+    if _invoke_result_failed(result):
+        return
+    if method == "Page.getState":
+        agent.fleet_reperception_state_seen = True
+    elif method == "DOM.getAXTree":
+        agent.fleet_reperception_tree_seen = True
+    if not (
+        getattr(agent, "fleet_reperception_state_seen", False)
+        and getattr(agent, "fleet_reperception_tree_seen", False)
+    ):
+        return
+    generation = int(
+        getattr(agent, "fleet_reperception_generation", 0) or 0
+    )
+    agent.fleet_barrier_generation = generation
+    agent.fleet_reperception_pending = False
+
+
+async def _claim_fleet_auth_barrier_for_hitl(
+    agent: Any,
+    method: str,
+    params: JsonDict,
+) -> Optional[JsonDict]:
+    """Atomically select the one worker allowed to enter manual HITL."""
+
+    if method != "Hitl.requestPause":
+        return None
+    barrier = getattr(agent, "fleet_auth_barrier", None)
+    fleet_id = str(getattr(agent, "assigned_fleet_id", "") or "").strip()
+    worker_id = str(getattr(agent, "worker_id", "") or "").strip()
+    if barrier is None or not fleet_id or not worker_id:
+        return None
+    claim = await barrier.claim(
+        fleet_id,
+        worker_id,
+        str(params.get("reason") or params.get("purpose") or "manual HITL"),
+    )
+    if claim.get("claimed"):
+        return None
+    return {
+        "status": "fleet_auth_gated",
+        "reasonKind": "fleet_auth_gated",
+        "fleetId": fleet_id,
+        "resolverWorkerId": claim.get("resolverWorkerId"),
+        "generation": claim.get("generation"),
+        "tool_was_executed": False,
+        "retryable": True,
+        "next_instruction": (
+            "Another worker owns authentication recovery for this fleet. "
+            "Do not request HITL or act on the shared cookie jar until it finishes."
+        ),
+    }
+
+
+async def _relinquish_fleet_auth_resolver_after_failed_pause(
+    agent: Any,
+    method: str,
+    *,
+    pause_succeeded: bool,
+) -> JsonDict:
+    if method != "Hitl.requestPause" or pause_succeeded:
+        return {}
+    barrier = getattr(agent, "fleet_auth_barrier", None)
+    fleet_id = str(getattr(agent, "assigned_fleet_id", "") or "").strip()
+    worker_id = str(getattr(agent, "worker_id", "") or "").strip()
+    if barrier is None or not fleet_id or not worker_id:
+        return {}
+    receipt = await barrier.relinquish(
+        fleet_id,
+        worker_id,
+        reason="Hitl.requestPause failed before the human wait began",
+    )
+    if receipt.get("relinquished"):
+        logger = getattr(agent, "logger", None)
+        if logger is not None:
+            logger.write(
+                "auth_fleet.resolver_relinquished",
+                {"fleetId": fleet_id, "workerId": worker_id, **receipt},
+            )
+    return receipt
+
+
 async def _execute_browser_capability_tool(
     agent: Any,
     tool_name: str,
@@ -896,6 +1362,47 @@ async def _execute_browser_capability_tool(
         })
         return memory_scope_guard, False
 
+    fleet_binding_guard, fleet_binding_receipt = _apply_fleet_binding(
+        agent, method, params
+    )
+    if fleet_binding_guard is not None:
+        attach_error_classification(fleet_binding_guard, method=method)
+        attach_method_schema(fleet_binding_guard, method, agent.method_schemas)
+        agent.logger.write("browser.call.fleet_binding_rejected", fleet_binding_guard)
+        agent.trace.append({
+            "type": "fleet_binding_guard",
+            "method": method,
+            "params": params,
+            "result": fleet_binding_guard,
+        })
+        return fleet_binding_guard, False
+
+    page_binding_guard = _check_page_binding(agent, method, params)
+    if page_binding_guard is not None:
+        attach_error_classification(page_binding_guard, method=method)
+        attach_method_schema(page_binding_guard, method, agent.method_schemas)
+        agent.logger.write("browser.call.page_binding_rejected", page_binding_guard)
+        agent.trace.append({
+            "type": "page_binding_guard",
+            "method": method,
+            "params": params,
+            "result": page_binding_guard,
+        })
+        return page_binding_guard, False
+
+    auth_barrier_guard = await _fleet_auth_barrier_before_call(
+        agent, method, params
+    )
+    if auth_barrier_guard is not None:
+        agent.logger.write("browser.call.fleet_auth_gated", auth_barrier_guard)
+        agent.trace.append({
+            "type": "fleet_auth_gate",
+            "method": method,
+            "params": params,
+            "result": auth_barrier_guard,
+        })
+        return auth_barrier_guard, False
+
     screenshot_guard = _check_screenshot_misuse(method, params, reason)
     if screenshot_guard is not None:
         agent.logger.write("browser.call.screenshot_rejected", screenshot_guard)
@@ -950,8 +1457,21 @@ async def _execute_browser_capability_tool(
             },
         )
     _ensure_hitl_request_reason(method, params, reason)
+    hitl_claim_guard = await _claim_fleet_auth_barrier_for_hitl(
+        agent, method, params
+    )
+    if hitl_claim_guard is not None:
+        agent.logger.write("browser.call.fleet_auth_gated", hitl_claim_guard)
+        agent.trace.append({
+            "type": "fleet_auth_gate",
+            "method": method,
+            "params": params,
+            "result": hitl_claim_guard,
+        })
+        return hitl_claim_guard, False
 
     page_create_should_stop = False
+    hitl_pause_succeeded = False
     try:
         runner = getattr(agent, "render_recovery_runner", None)
         if runner is None:
@@ -976,10 +1496,18 @@ async def _execute_browser_capability_tool(
             )
         response, _recovery = await runner.call(method, params)
         response = agent._capture_artifacts(method, response)
+        page_list_receipt: JsonDict = {}
+        if method == "Page.list":
+            response, page_list_receipt = _filter_page_list_response(
+                agent, response
+            )
         axtree_snapshot = _precompute_axtree_snapshot(method, params, response)
         response = agent._offload_response(method, params, response, step)
 
-        if method == "Hitl.requestPause" and _hitl_pause_succeeded(response):
+        hitl_pause_succeeded = (
+            method == "Hitl.requestPause" and _hitl_pause_succeeded(response)
+        )
+        if hitl_pause_succeeded:
             response = await _enrich_pause_with_wait(agent, params, response, step)
 
         result = {
@@ -987,6 +1515,8 @@ async def _execute_browser_capability_tool(
             "params": params,
             "response": response,
         }
+        if page_list_receipt:
+            result.update(page_list_receipt)
         if isinstance(response, dict) and response.get("error"):
             attach_method_schema(result, method, agent.method_schemas)
     except ABCPTransportError as exc:
@@ -997,13 +1527,33 @@ async def _execute_browser_capability_tool(
         }
         attach_method_schema(result, method, agent.method_schemas)
 
-    if _is_page_create_32005_failure(method, result):
+    relinquished = await _relinquish_fleet_auth_resolver_after_failed_pause(
+        agent,
+        method,
+        pause_succeeded=hitl_pause_succeeded,
+    )
+    if relinquished:
+        result["fleetAuthBarrier"] = relinquished
+
+    lost_fleet_result = _assigned_fleet_lost_result(
+        agent, method, params, result
+    )
+    if lost_fleet_result is not None:
+        result = lost_fleet_result
+        page_create_should_stop = True
+    elif _is_page_create_32005_failure(method, result):
         result, page_create_should_stop = await _recover_page_create_32005(
             agent,
             params,
             result,
         )
+    _observe_page_binding_after(agent, method, params, result)
+    if fleet_binding_receipt and (
+        method in {"Page.create", "Page.list"} or method.startswith("Fleet.")
+    ):
+        result.update(fleet_binding_receipt)
     attach_error_classification(result, method=method)
+    _fleet_auth_barrier_after_call(agent, method, result)
     result = _attach_navigation_check(result, method=method, params=params)
     result = _attach_runtime_strategy_hints(result, method=method)
     if not page_create_should_stop:
@@ -1096,8 +1646,19 @@ async def _invoke_browser_method(
                 logger.write("browser.call.stale_axtree_target", stale_target)
             agent.trace.append({"type": "stale_axtree_target", "result": stale_target})
             return stale_target
+    auth_barrier_guard = await _fleet_auth_barrier_before_call(
+        agent, method, params
+    )
+    if auth_barrier_guard is not None:
+        return auth_barrier_guard
+    _ensure_hitl_request_reason(method, params, str(params.get("purpose") or ""))
+    hitl_claim_guard = await _claim_fleet_auth_barrier_for_hitl(
+        agent, method, params
+    )
+    if hitl_claim_guard is not None:
+        return hitl_claim_guard
+    hitl_pause_succeeded = False
     try:
-        _ensure_hitl_request_reason(method, params, str(params.get("purpose") or ""))
         runner = getattr(agent, "render_recovery_runner", None)
         if runner is None:
             runner = build_render_recovery_runner(
@@ -1126,7 +1687,10 @@ async def _invoke_browser_method(
         response = agent._capture_artifacts(method, response)
         axtree_snapshot = _precompute_axtree_snapshot(method, params, response)
         response = agent._offload_response(method, params, response, step)
-        if method == "Hitl.requestPause" and _hitl_pause_succeeded(response):
+        hitl_pause_succeeded = (
+            method == "Hitl.requestPause" and _hitl_pause_succeeded(response)
+        )
+        if hitl_pause_succeeded:
             response = await _enrich_pause_with_wait(agent, params, response, step)
         result = {
             "method": method,
@@ -1139,6 +1703,14 @@ async def _invoke_browser_method(
         result = {"method": method, "params": _shown_params(params), "error": str(exc)}
         attach_method_schema(result, method, agent.method_schemas)
 
+    relinquished = await _relinquish_fleet_auth_resolver_after_failed_pause(
+        agent,
+        method,
+        pause_succeeded=hitl_pause_succeeded,
+    )
+    if relinquished:
+        result["fleetAuthBarrier"] = relinquished
+
     if _is_page_create_32005_failure(method, result):
         result, _page_create_should_stop = await _recover_page_create_32005(
             agent,
@@ -1148,6 +1720,7 @@ async def _invoke_browser_method(
         if "params" in result:
             result["params"] = _shown_params(params)
     attach_error_classification(result, method=method)
+    _fleet_auth_barrier_after_call(agent, method, result)
     result = _attach_navigation_check(result, method=method, params=params)
     result = _attach_runtime_strategy_hints(result, method=method)
     if not internal:
@@ -3476,6 +4049,123 @@ def _is_page_create_32005_failure(method: str, result: Any) -> bool:
     return "-32005" in text and "page.create" in text
 
 
+FLEET_LOSS_ERROR_CODES = frozenset({
+    "FLEET_ARCHIVED",
+    "FLEET_NOT_AVAILABLE",
+    "FLEET_OWNERSHIP_MISMATCH",
+    "FLEET_OWNER_MISMATCH",
+})
+
+
+def _fleet_loss_signal(result: Any) -> str:
+    """Prefer Dispatcher structured codes, retaining one compatibility fallback."""
+
+    signals: Set[str] = set()
+
+    def visit(value: Any, depth: int = 0) -> None:
+        if depth > 6:
+            return
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if key in {"code", "errorCode", "reasonCode", "reasonKind"}:
+                    if isinstance(nested, str):
+                        signals.add(nested.strip().upper())
+                if key != "methodSchema":
+                    visit(nested, depth + 1)
+        elif isinstance(value, list):
+            for nested in value[:20]:
+                visit(nested, depth + 1)
+
+    visit(result)
+    structured = sorted(signals.intersection(FLEET_LOSS_ERROR_CODES))
+    if structured:
+        return structured[0]
+    lowered = _page_create_error_text(result).lower()
+    if any(marker in lowered for marker in (
+        "is archived",
+        "has been archived",
+        "fleet archived",
+        "owned by another agent",
+        "not available for this agent",
+    )):
+        return "LEGACY_ERROR_TEXT"
+    return ""
+
+
+def _assigned_fleet_lost_result(
+    agent: Any,
+    method: str,
+    params: JsonDict,
+    result: JsonDict,
+) -> Optional[JsonDict]:
+    if not _fleet_reuse_enabled(agent):
+        return None
+    if method != "Page.create":
+        return None
+    error_text = _page_create_error_text(result)
+    loss_signal = _fleet_loss_signal(result)
+    if not loss_signal:
+        return None
+    session_key = str(getattr(agent, "fleet_session_key", "") or "").strip()
+    fleet_id = str(
+        params.get("fleetId") or getattr(agent, "assigned_fleet_id", "") or ""
+    ).strip()
+    status = "session_fleet_lost" if session_key else "fleet_assignment_lost"
+    next_instruction = (
+        "Treat this authenticated session as stale and follow the"
+        " auth-interrupt/login recovery flow; do not retry the same binding."
+        if session_key
+        else "Stop this worker and request a fresh coordinator assignment."
+    )
+    lost_handler = getattr(agent, "auth_session_lost_handler", None)
+    if session_key and callable(lost_handler):
+        try:
+            lost_handler({
+                "sessionKey": session_key,
+                "fleetId": fleet_id,
+                "sessionGeneration": int(
+                    getattr(agent, "fleet_session_generation", 0) or 0
+                ),
+                "reason": error_text[:500],
+            })
+        except Exception as exc:  # recovery bookkeeping must not mask evidence
+            logger = getattr(agent, "logger", None)
+            if logger is not None:
+                logger.write(
+                    "auth_fleet.lost_handler_failed",
+                    {"sessionKey": session_key, "error": str(exc)[:300]},
+                )
+    answer = {
+        "outcome": "blocked",
+        "data": {},
+        "evidence": [{
+            "method": method,
+            "fleetId": fleet_id,
+            "error": error_text[:500],
+        }],
+        "blockers": [{
+            "classification": status,
+            "message": next_instruction,
+        }],
+        "next_steps": [next_instruction],
+    }
+    return {
+        **result,
+        "status": status,
+        "terminal": True,
+        "sessionKey": session_key,
+        "assignedFleetId": fleet_id,
+        "fleetLossSignal": loss_signal,
+        "errorClassification": {
+            "type": status,
+            "suggested_action": "auth_interrupt" if session_key else "respawn_worker",
+            "method": method,
+        },
+        "answer": json.dumps(answer, ensure_ascii=False),
+        "next_instruction": next_instruction,
+    }
+
+
 def _pages_from_value(value: Any) -> List[JsonDict]:
     pages: List[JsonDict] = []
 
@@ -3488,7 +4178,9 @@ def _pages_from_value(value: Any) -> List[JsonDict]:
                 if fleet_id and not page.get("fleetId"):
                     page["fleetId"] = fleet_id
                 pages.append(page)
-            for nested in item.values():
+            for key, nested in item.items():
+                if key == "methodSchema":
+                    continue
                 visit(nested, fleet_id)
         elif isinstance(item, list):
             for nested in item:
@@ -3579,6 +4271,11 @@ async def _recover_page_create_32005(
     result: JsonDict,
 ) -> Tuple[JsonDict, bool]:
     original_error = _page_create_error_text(result)
+    assigned_fleet_id = str(
+        params.get("fleetId")
+        or getattr(agent, "assigned_fleet_id", "")
+        or ""
+    ).strip()
     probe: JsonDict = {
         "trigger": "Page.create_-32005",
         "originalError": original_error[:500],
@@ -3588,33 +4285,66 @@ async def _recover_page_create_32005(
         "classification": "unknown",
     }
     page_candidates: List[JsonDict] = []
-
-    fleet_list = await _page_create_probe_call(agent, "Fleet.list", {})
-    probe["fleetList"] = fleet_list
-    page_candidates.extend(_pages_from_value(fleet_list.get("response")))
-    fleets = _raw_response_data(fleet_list.get("response")).get("fleets")
-    if isinstance(fleets, list):
-        for fleet in fleets:
-            if not isinstance(fleet, dict):
+    if _fleet_reuse_enabled(agent):
+        # A coordinator-managed fresh worker must never turn a create failure
+        # into implicit adoption of another worker's page.  Explicit page
+        # continuations already carry their delegated handles, so probe only
+        # those handles and do not expose global Fleet/Page inventory.
+        page_fleets = getattr(agent, "page_fleet_ids", None)
+        page_fleets = page_fleets if isinstance(page_fleets, dict) else {}
+        for page_id in sorted(getattr(agent, "allowed_page_ids", set()) or set()):
+            page_id = str(page_id or "").strip()
+            if not page_id:
                 continue
-            fleet_id = str(fleet.get("fleetId") or "").strip()
-            if not fleet_id:
+            candidate_fleet_id = str(page_fleets.get(page_id) or "").strip()
+            if not candidate_fleet_id or (
+                assigned_fleet_id
+                and candidate_fleet_id != assigned_fleet_id
+            ):
                 continue
-            listed = await _page_create_probe_call(
-                agent,
-                "Page.list",
-                {"fleetId": fleet_id},
-            )
-            probe["pageLists"].append(listed)
-            for page in _pages_from_value(listed.get("response")):
-                page.setdefault("fleetId", fleet_id)
-                page_candidates.append(page)
+            page_candidates.append({
+                "pageId": page_id,
+                "fleetId": candidate_fleet_id,
+            })
+        probe["fleetList"] = {
+            "skipped": True,
+            "reason": "coordinator_page_delegation_only",
+        }
+    else:
+        fleet_list = await _page_create_probe_call(agent, "Fleet.list", {})
+        probe["fleetList"] = fleet_list
+        page_candidates.extend(_pages_from_value(fleet_list.get("response")))
+        fleets = _raw_response_data(fleet_list.get("response")).get("fleets")
+        if isinstance(fleets, list):
+            for fleet in fleets:
+                if not isinstance(fleet, dict):
+                    continue
+                fleet_id = str(fleet.get("fleetId") or "").strip()
+                if not fleet_id or (
+                    assigned_fleet_id and fleet_id != assigned_fleet_id
+                ):
+                    continue
+                listed = await _page_create_probe_call(
+                    agent,
+                    "Page.list",
+                    {"fleetId": fleet_id},
+                )
+                probe["pageLists"].append(listed)
+                for page in _pages_from_value(listed.get("response")):
+                    page.setdefault("fleetId", fleet_id)
+                    page_candidates.append(page)
 
-    page_candidates.extend(_pages_from_value(getattr(agent, "preloaded_registration", None)))
+        page_candidates.extend(
+            _pages_from_value(getattr(agent, "preloaded_registration", None))
+        )
     deduped: Dict[str, JsonDict] = {}
     for page in page_candidates:
         page_id = str(page.get("pageId") or page.get("page_id") or "").strip()
-        if page_id:
+        fleet_id = str(page.get("fleetId") or "").strip()
+        if (
+            page_id
+            and (not assigned_fleet_id or fleet_id == assigned_fleet_id)
+        ):
             deduped[page_id] = page
 
     for page in list(deduped.values())[:5]:
@@ -3630,10 +4360,14 @@ async def _recover_page_create_32005(
             },
         )
         state_data = _raw_response_data(state.get("response"))
+        candidate_fleet_id = str(page.get("fleetId") or "")
         checked = {
             "pageId": page_id,
-            "fleetId": str(page.get("fleetId") or state_data.get("fleetId") or ""),
-            "ok": bool(state.get("ok")) and _page_state_is_usable(state.get("response")),
+            "fleetId": candidate_fleet_id,
+            "ok": (
+                bool(state.get("ok"))
+                and _page_state_is_usable(state.get("response"))
+            ),
             "status": state_data.get("status"),
             "title": state_data.get("title"),
             "url": state_data.get("url"),
@@ -4654,7 +5388,10 @@ async def _post_hitl_raw_browser_call(
     method: str,
     params: JsonDict,
     step: int,
+    *,
+    capture_axtree_text: bool = False,
 ) -> JsonDict:
+    private_axtree_text = ""
     try:
         _ensure_hitl_request_reason(method, params, str(params.get("purpose") or ""))
         runner = getattr(agent, "render_recovery_runner", None)
@@ -4668,6 +5405,8 @@ async def _post_hitl_raw_browser_call(
             agent.render_recovery_runner = runner
         response, _recovery = await runner.call(method, params)
         response = agent._capture_artifacts(method, response)
+        if capture_axtree_text and method == "DOM.getAXTree":
+            private_axtree_text = "\n".join(_axtree_lines_from_value(response))
         response = agent._offload_response(method, params, response, step)
         result = {"method": method, "params": params, "response": response}
     except ABCPTransportError as exc:
@@ -4692,6 +5431,10 @@ async def _post_hitl_raw_browser_call(
     if logger is not None and hasattr(logger, "write"):
         trim_for_log = getattr(agent, "_trim_for_log", lambda value: value)
         logger.write("hitl.post_resume.raw_call", trim_for_log(result))
+    if private_axtree_text:
+        # Ephemeral proof input for AuthFleetLedger. Attach only after logging;
+        # callers must not persist or expose the raw accessibility text.
+        result["_authAXTreeText"] = private_axtree_text
     return result
 
 
@@ -4811,6 +5554,21 @@ async def _request_hitl_for_challenge(
     reason: str,
     trigger_result: Optional[JsonDict] = None,
 ) -> JsonDict:
+    barrier = getattr(agent, "fleet_auth_barrier", None)
+    fleet_id = str(getattr(agent, "assigned_fleet_id", "") or "").strip()
+    worker_id = str(getattr(agent, "worker_id", "") or "").strip()
+    barrier_claim: JsonDict = {}
+    if barrier is not None and fleet_id and worker_id:
+        barrier_claim = await barrier.claim(fleet_id, worker_id, reason)
+        if not barrier_claim.get("claimed"):
+            return {
+                "status": "fleet_auth_gated",
+                "reasonKind": "fleet_auth_gated",
+                "fleetId": fleet_id,
+                "resolverWorkerId": barrier_claim.get("resolverWorkerId"),
+                "tool_was_executed": False,
+                "retryable": True,
+            }
     # Capture the pre-pause surface here so every auto-HITL path (VL-confirmed,
     # VL-disabled high-confidence, future callers) records the snapshot that the
     # verified-settlement title gate compares against.
@@ -4832,6 +5590,7 @@ async def _request_hitl_for_challenge(
             "triggerMethod": trigger_method,
             "reason": reason,
             "pauseSnapshot": snapshot,
+            "authBarrier": barrier_claim or None,
         },
     )
     agent.challenge_adjudicating = True
@@ -6108,6 +6867,113 @@ def _hitl_pause_snapshot(agent: Any, page_id: str) -> Optional[JsonDict]:
     return snapshot if isinstance(snapshot, dict) else None
 
 
+async def _verify_and_open_fleet_auth_barrier(
+    agent: Any,
+    page_id: str,
+    step: int,
+) -> JsonDict:
+    barrier = getattr(agent, "fleet_auth_barrier", None)
+    fleet_id = str(getattr(agent, "assigned_fleet_id", "") or "").strip()
+    worker_id = str(getattr(agent, "worker_id", "") or "").strip()
+    if barrier is None or not fleet_id or not worker_id:
+        return {"enabled": False}
+    state = await _post_hitl_raw_browser_call(
+        agent,
+        "Page.getState",
+        {
+            "pageId": page_id,
+            "purpose": "Verify shared fleet state before opening the authentication barrier.",
+        },
+        step,
+    )
+    tree = await _post_hitl_raw_browser_call(
+        agent,
+        "DOM.getAXTree",
+        {
+            "pageId": page_id,
+            "purpose": "Refresh page perception before opening the shared authentication barrier.",
+        },
+        step,
+        capture_axtree_text=True,
+    )
+    if _invoke_result_failed(state) or _invoke_result_failed(tree):
+        return {
+            "enabled": True,
+            "opened": False,
+            "reason": "clearance_perception_failed",
+        }
+    state_data = _response_data(state)
+    hitl = state_data.get("hitl") if isinstance(state_data.get("hitl"), dict) else {}
+    if hitl.get("isPaused") is True:
+        return {
+            "enabled": True,
+            "opened": False,
+            "reason": "page_still_paused",
+        }
+    resolved = await barrier.resolve(fleet_id, worker_id)
+    if resolved.get("resolved"):
+        agent.fleet_reperception_pending = True
+        agent.fleet_reperception_state_seen = True
+        agent.fleet_reperception_tree_seen = True
+        agent.fleet_barrier_generation = int(resolved.get("generation") or 0)
+        agent.fleet_reperception_pending = False
+    callback = getattr(agent, "auth_session_verified_handler", None)
+    ledger_receipt: JsonDict = {}
+    if resolved.get("resolved") and callable(callback):
+        try:
+            contract = getattr(agent, "worker_contract", None)
+            verification_contract = (
+                contract.get("auth_verification")
+                if isinstance(contract, dict)
+                else None
+            )
+            value = callback(
+                {
+                    "fleetId": fleet_id,
+                    "pageId": page_id,
+                    "url": state_data.get("url"),
+                    "title": state_data.get("title"),
+                    "sessionKey": getattr(agent, "fleet_session_key", ""),
+                    "verificationContract": verification_contract,
+                    # The ledger uses this only for an in-memory marker match;
+                    # the raw tree is never persisted or included in receipts.
+                    "axTreeText": str(
+                        tree.get("_authAXTreeText")
+                        or "\n".join(_axtree_lines_from_value(tree))
+                    ),
+                    "evidence": {
+                        "pageStateObserved": True,
+                        "axTreeObserved": True,
+                        "hitlPaused": False,
+                    },
+                }
+            )
+            if hasattr(value, "__await__"):
+                value = await value
+            if isinstance(value, dict):
+                ledger_receipt = value
+        except Exception as exc:
+            # Clearing a live fleet barrier and persisting a durable reuse
+            # claim are separate operations.  A ledger conflict/write failure
+            # must be visible, but must not crash the resolver or strand peers.
+            ledger_receipt = {
+                "recorded": False,
+                "reason": "auth_ledger_handler_failed",
+                "errorType": type(exc).__name__,
+                "error": str(exc)[:300],
+            }
+            logger = getattr(agent, "logger", None)
+            if logger is not None:
+                logger.write("auth_fleet.ledger_handler_failed", ledger_receipt)
+    return {
+        "enabled": True,
+        "opened": bool(resolved.get("resolved")),
+        "generation": resolved.get("generation"),
+        "ledger": ledger_receipt or None,
+        "reason": resolved.get("reason"),
+    }
+
+
 async def _enrich_pause_with_wait(
     agent: Any,
     params: JsonDict,
@@ -6138,6 +7004,13 @@ async def _enrich_pause_with_wait(
             agent,
             str(page_id),
             wait_result,
+            step,
+        )
+    if wait_result.get("status") == "resumed":
+        wait_result = dict(wait_result)
+        wait_result["fleetAuthBarrier"] = await _verify_and_open_fleet_auth_barrier(
+            agent,
+            str(page_id),
             step,
         )
     enriched = dict(response)

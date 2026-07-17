@@ -17,15 +17,12 @@ try:
 except ImportError:
     pass
 
-from abcp_client import ABCPClient
 from agent_harness import (
-    BrowserAgent,
     LeadAgent,
-    browser_agent_model_config,
     exception_payload,
     lead_agent_model_config,
 )
-from harness.utils import RunLogger, make_browser_event_logger
+from harness.utils import RunLogger
 from llm import LLMFactory
 from runtime_config import RuntimeConfig, load_runtime_config
 
@@ -1133,8 +1130,6 @@ async def run_cli(args: argparse.Namespace) -> int:
     if args.max_steps:
         runtime.harness.max_steps = args.max_steps
         runtime.harness.worker_max_steps = args.max_steps
-    mode = args.mode or runtime.harness.mode
-
     task = read_task(args)
     if not task:
         print("没有收到任务。")
@@ -1170,46 +1165,28 @@ async def run_cli(args: argparse.Namespace) -> int:
     _LAST_LOGGER = logger
     runtime.harness.runs_dir = str(logger.task_dir)
     print(f"任务已创建: {logger.task_id}", flush=True)
-    print(f"模式: {mode}", flush=True)
+    print("模式: lead", flush=True)
     print(f"任务目录: {logger.task_dir}", flush=True)
     print(f"运行日志: {logger.path}", flush=True)
     print("开始执行，关键进度会在这里显示。", flush=True)
 
-    artifacts: List[str] = []
     try:
-        if mode == "single":
-            provider = LLMFactory.create_provider(
-                browser_agent_model_config(runtime.model)
-            )
-            event_logger = make_browser_event_logger(
-                logger,
-                runtime.harness.log_browser_payloads,
-            )
-            async with ABCPClient(runtime.browser, on_event=event_logger) as browser:
-                harness = BrowserAgent(provider, browser, runtime, logger)
-                answer = await harness.run(task)
-                artifacts = harness.artifacts
-        elif mode == "lead":
-            provider = LLMFactory.create_provider(
-                lead_agent_model_config(runtime.model)
-            )
-            harness = LeadAgent(provider, runtime, logger)
-            answer = await harness.run(task)
-        else:
-            print(f"未知 mode: {mode}")
-            logger.write("run.error", {"error": f"未知 mode: {mode}"})
-            return 2
+        provider = LLMFactory.create_provider(
+            lead_agent_model_config(runtime.model)
+        )
+        harness = LeadAgent(provider, runtime, logger)
+        answer = await harness.run(task)
     except asyncio.CancelledError as exc:
         _CANCELLED_LOGGED = True
         logger.write(
             "run.cancelled",
-            exception_payload(exc, mode=mode, task=task),
+            exception_payload(exc, mode="lead", task=task),
         )
         raise
     except Exception as exc:
         logger.write(
             "run.error",
-            exception_payload(exc, mode=mode, task=task),
+            exception_payload(exc, mode="lead", task=task),
         )
         raise
     finally:
@@ -1219,10 +1196,6 @@ async def run_cli(args: argparse.Namespace) -> int:
     print(f"\n任务ID: {logger.task_id}")
     print(f"\n任务目录: {logger.task_dir}")
     print(f"\n运行日志: {logger.path}")
-    if artifacts:
-        print("Artifacts:")
-        for artifact in artifacts:
-            print(f"- {artifact}")
     return 0
 
 
@@ -1233,11 +1206,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default="config.json", help="配置文件路径")
     parser.add_argument("--agent-id", help="覆盖 config.json 中的 browser.agent_id")
     parser.add_argument("--max-steps", type=int, help="覆盖最大 agent 编排步数")
-    parser.add_argument(
-        "--mode",
-        choices=["lead", "single"],
-        help="lead=多 agent 编排；single=旧版单 browser agent",
-    )
     parser.add_argument(
         "--skill",
         dest="skill",

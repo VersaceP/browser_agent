@@ -132,11 +132,18 @@ Anthropic 示例：
 ```json
 {
   "harness": {
-    "mode": "lead",
     "lead_max_steps": 20,
     "worker_max_steps": 30,
     "max_browser_agent_instances": 3,
     "max_browser_agents": 3,
+    "fleet_reuse_enabled": true,
+    "same_fleet_multiworker_enabled": false,
+    "fleet_auth_barrier_enabled": true,
+    "fleet_auth_barrier_wait_seconds": 120,
+    "auth_fleet_ledger_path": ".auth_fleet_ledger.json",
+    "fleet_slot_reconnect_attempts": 2,
+    "fleet_slot_reconnect_backoff_seconds": 0.25,
+    "fleet_slot_manual_reset_after_failures": 3,
     "hitl_poll_interval_seconds": 2,
     "hitl_wait_timeout_seconds": 600,
     "worktree_dir": "worktree",
@@ -145,11 +152,17 @@ Anthropic 示例：
 }
 ```
 
-- `mode`: `lead` 使用多 agent 编排；`single` 直接运行单个 BrowserAgent。
 - `lead_max_steps`: LeadAgent 最大决策轮数。
 - `worker_max_steps`: BrowserAgent 最大执行轮数。
 - `max_browser_agent_instances`: 可复用池里最多保留的长期存活 BrowserAgent slot 数。idle slot 会保留 ABCP 连接和页面 registry。普通新 worker 只复用连接并从新页面开始；显式 continuation 才会复用旧页面候选。
 - `max_browser_agents`: 同时运行的 browser worker 上限；实际 browser slot 并发仍受 `max_browser_agent_instances` 限制。
+- `fleet_reuse_enabled`: 由协调器为 worker 确定性分配 fleet，并将无 fleetId 的 `Page.create` 收敛到该分配。具名/隔离 fleet 不会进入通用复用池。
+- `same_fleet_multiworker_enabled`: 多 slot 共享 task/session fleet 的灰度开关，默认 `false`；启用后各 worker 使用独立 page，owner 连接保持不变，通知由 harness 中继，同 page 调用串行化。
+- `fleet_auth_barrier_enabled`: 登录/验证码按 fleet 全域加门，非 resolver 有界等待且超时不放行。等待时间由 `fleet_auth_barrier_wait_seconds` 控制。
+- `auth_fleet_ledger_path`: 持久化的非敏感已验证会话索引；重启回收的 fleet 在账本对账前不会进入通用复用池。
+- `fleet_slot_reconnect_attempts`: 具名会话 slot 每轮使用原 `agentId` 进行的有界重连次数；transport 故障本身不等于 fleet 已丢失。
+- `fleet_slot_reconnect_backoff_seconds`: 重连间隔的基础时间；不会重放失败的浏览器写操作。
+- `fleet_slot_manual_reset_after_failures`: 连续恢复失败轮次达到该值后返回 `session_manual_reset_required`；只有 host/operator 能使用回执中的 fleet id 和 generation 显式重置。
 - `hitl_poll_interval_seconds`: `Hitl.requestPause` 后轮询恢复状态的间隔。
 - `hitl_wait_timeout_seconds`: 等待人工介入的最长时间。
 - `worktree_dir`: 运行日志和 artifacts 的根目录。
@@ -157,16 +170,10 @@ Anthropic 示例：
 
 ## 运行任务
 
-默认多 agent 模式：
+通过 LeadAgent 编排器运行任务：
 
 ```bash
 python main.py --task "打开 https://example.com 并总结页面。"
-```
-
-单 BrowserAgent 模式：
-
-```bash
-python main.py --mode single --task "打开 https://example.com 并总结页面。"
 ```
 
 从 stdin 读取任务：

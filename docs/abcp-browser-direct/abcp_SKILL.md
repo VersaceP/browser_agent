@@ -67,7 +67,11 @@ asyncio.run(main())
 6. Call `Page.getState` before DOM reads or physical input.
 7. Use `DOM.getAXTree` as the default perception tool, then target actions with live canonical ids where possible.
 
-Normally prefer `Page.create({"url": target_url})` over a separate `Fleet.create`; current ABCP can auto-select or create a fleet when `fleetId` is omitted.
+When reuse or login state matters, pass an observed `fleetId` explicitly to
+`Page.create`. Omitting it delegates selection to the Dispatcher, whose
+origin-based selection policy does not guarantee the intended reusable fleet
+and may create another one. Use fleetless `Page.create` only when any selected
+or newly created fleet is acceptable.
 
 ## Action Rules
 

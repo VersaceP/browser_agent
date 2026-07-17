@@ -50,10 +50,12 @@ selectors from this guide or from old traces.
 
 Use this source order:
 
-- Handles come from the previous action's `response.data`, for example
-  `Fleet.create -> fleetId -> Page.create`, then
-  `Page.create -> pageId -> Page/DOM/Input` calls. The ABCP demo uses this
-  pattern throughout `abcp browser/packages/demo/src/scenarios/basic/index.ts`.
+- In the harness, `fleetId` comes from `<slot_context>.assignedFleetId`; pass it
+  explicitly to `Page.create`, then derive `pageId` from that response for
+  Page/DOM/Input calls. The browser-tool boundary injects the same assignment
+  when `Page.create` omits it and rejects a different or fabricated fleet id.
+  Direct ABCP clients must derive handles from live responses and must not
+  assume that fleetless `Page.create` selects the intended reusable fleet.
 - Data-tool handles follow the same rule: `Bookmark.createFolder -> folderId`,
   `Bookmark.add/list -> bookmarkId`, and `Download.list -> downloadId`, as shown
   in `abcp browser/packages/demo/src/scenarios/data/index.ts`.

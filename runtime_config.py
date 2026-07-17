@@ -308,12 +308,29 @@ class VLConfig:
 
 @dataclass
 class HarnessConfig:
-    mode: str = "lead"
     max_steps: int = 40
     lead_max_steps: int = 40
     worker_max_steps: int = 40
     max_browser_agent_instances: int = 3
     max_browser_agents: int = 3
+    # Deterministic fleet routing.  When enabled, the spawner assigns every
+    # BrowserAgent a Dispatcher-observed fleet before browser work begins and
+    # the browser-tool boundary injects that fleetId into fleetless Page.create
+    # calls.  Unknown/cross-assignment fleet ids fail closed instead of letting
+    # the Dispatcher silently create or adopt a fleet.
+    fleet_reuse_enabled: bool = True
+    # Allow different BrowserAgent slots in one task to use distinct pages in
+    # the same coordinator-owned fleet. The owner socket remains connected and
+    # its notifications are relayed in-process to delegated workers.
+    same_fleet_multiworker_enabled: bool = False
+    fleet_auth_barrier_enabled: bool = True
+    fleet_auth_barrier_wait_seconds: float = 120.0
+    auth_fleet_ledger_path: str = ".auth_fleet_ledger.json"
+    # A transport failure quarantines the slot, then reconnects with the same
+    # agentId before the coordinator is allowed to tombstone its session fleets.
+    fleet_slot_reconnect_attempts: int = 2
+    fleet_slot_reconnect_backoff_seconds: float = 0.25
+    fleet_slot_manual_reset_after_failures: int = 3
     worktree_dir: str = "worktree"
     runs_dir: str = "runs"
     context_file: Optional[str] = None
@@ -423,7 +440,6 @@ class HarnessConfig:
     @classmethod
     def from_dict(cls, data: JsonDict) -> "HarnessConfig":
         return cls(
-            mode=data.get("mode", cls.mode),
             max_steps=int(data.get("max_steps", cls.max_steps)),
             lead_max_steps=int(data.get("lead_max_steps", cls.lead_max_steps)),
             worker_max_steps=int(data.get("worker_max_steps", cls.worker_max_steps)),
@@ -435,6 +451,57 @@ class HarnessConfig:
             ),
             max_browser_agents=int(
                 data.get("max_browser_agents", cls.max_browser_agents)
+            ),
+            fleet_reuse_enabled=bool(
+                data.get("fleet_reuse_enabled", cls.fleet_reuse_enabled)
+            ),
+            same_fleet_multiworker_enabled=bool(
+                data.get(
+                    "same_fleet_multiworker_enabled",
+                    cls.same_fleet_multiworker_enabled,
+                )
+            ),
+            fleet_auth_barrier_enabled=bool(
+                data.get(
+                    "fleet_auth_barrier_enabled",
+                    cls.fleet_auth_barrier_enabled,
+                )
+            ),
+            fleet_auth_barrier_wait_seconds=max(
+                0.01,
+                float(
+                    data.get(
+                        "fleet_auth_barrier_wait_seconds",
+                        cls.fleet_auth_barrier_wait_seconds,
+                    )
+                ),
+            ),
+            auth_fleet_ledger_path=str(
+                data.get(
+                    "auth_fleet_ledger_path",
+                    cls.auth_fleet_ledger_path,
+                )
+            ),
+            fleet_slot_reconnect_attempts=max(
+                1,
+                int(data.get(
+                    "fleet_slot_reconnect_attempts",
+                    cls.fleet_slot_reconnect_attempts,
+                )),
+            ),
+            fleet_slot_reconnect_backoff_seconds=max(
+                0.0,
+                float(data.get(
+                    "fleet_slot_reconnect_backoff_seconds",
+                    cls.fleet_slot_reconnect_backoff_seconds,
+                )),
+            ),
+            fleet_slot_manual_reset_after_failures=max(
+                1,
+                int(data.get(
+                    "fleet_slot_manual_reset_after_failures",
+                    cls.fleet_slot_manual_reset_after_failures,
+                )),
             ),
             worktree_dir=data.get("worktree_dir", cls.worktree_dir),
             runs_dir=data.get("runs_dir", cls.runs_dir),

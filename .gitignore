@@ -3,6 +3,7 @@ __pycache__/
 .pycache*
 abcp browser/
 abcp/
+abcp-platform/
 venv/
 env/
 ENV/

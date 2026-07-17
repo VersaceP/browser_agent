@@ -132,11 +132,18 @@ Common harness options:
 ```json
 {
   "harness": {
-    "mode": "lead",
     "lead_max_steps": 20,
     "worker_max_steps": 30,
     "max_browser_agent_instances": 3,
     "max_browser_agents": 3,
+    "fleet_reuse_enabled": true,
+    "same_fleet_multiworker_enabled": false,
+    "fleet_auth_barrier_enabled": true,
+    "fleet_auth_barrier_wait_seconds": 120,
+    "auth_fleet_ledger_path": ".auth_fleet_ledger.json",
+    "fleet_slot_reconnect_attempts": 2,
+    "fleet_slot_reconnect_backoff_seconds": 0.25,
+    "fleet_slot_manual_reset_after_failures": 3,
     "hitl_poll_interval_seconds": 2,
     "hitl_wait_timeout_seconds": 600,
     "worktree_dir": "worktree",
@@ -145,11 +152,17 @@ Common harness options:
 }
 ```
 
-- `mode`: `lead` uses the multi-agent planner; `single` runs one BrowserAgent directly.
 - `lead_max_steps`: maximum LeadAgent decision rounds.
 - `worker_max_steps`: maximum BrowserAgent rounds.
-- `max_browser_agent_instances`: maximum live BrowserAgent slots kept in the reusable pool. Idle slots keep their ABCP connection and page registry. Normal new workers reuse only the connection and start from a fresh page; explicit continuations can reuse prior page candidates.
+- `max_browser_agent_instances`: maximum live BrowserAgent slots kept in the reusable pool. Idle slots keep their ABCP connection and page registry.
 - `max_browser_agents`: maximum concurrently running browser workers. Effective browser-slot concurrency is still bounded by `max_browser_agent_instances`.
+- `fleet_reuse_enabled`: deterministically assign each worker a fleet and force `Page.create` into it. Generic work may reuse an eligible slot fleet; a new `session_key` or isolated worker gets a fresh fleet, and named/isolated fleets never become the generic slot default. Lost named sessions fail with `session_fleet_lost` instead of silently rebinding. Model-initiated `Fleet.create`/`Fleet.close` and out-of-assignment fleet ids fail closed; explicit page continuations may receive prior page candidates.
+- `same_fleet_multiworker_enabled`: opt-in canary for sharing one task/session fleet across parallel slots while keeping separate pages. It defaults to `false`; when enabled, the owner socket remains authoritative, notifications are relayed to delegates, and equal-page calls are serialized.
+- `fleet_auth_barrier_enabled`: make login/CAPTCHA resolution fleet-wide and fail closed for non-resolver workers. `fleet_auth_barrier_wait_seconds` controls the bounded wait.
+- `auth_fleet_ledger_path`: persistent, non-secret verified session index, relative to `worktree_dir` unless absolute. Reclaimed fleets are quarantined until ledger reconciliation restores their restrictions.
+- `fleet_slot_reconnect_attempts`: bounded same-`agentId` reconnect attempts per recovery cycle. Transport loss never proves that the fleet is lost.
+- `fleet_slot_reconnect_backoff_seconds`: base delay between those reconnect attempts. Failed browser mutations are never replayed.
+- `fleet_slot_manual_reset_after_failures`: recovery cycles before spawn returns `session_manual_reset_required`. The binding remains fail-closed until a host/operator explicitly resets it with the reported fleet id and generation.
 - `hitl_poll_interval_seconds`: polling interval after `Hitl.requestPause`.
 - `hitl_wait_timeout_seconds`: maximum wait time for human intervention.
 - `worktree_dir`: root directory for run logs and artifacts.
@@ -157,16 +170,10 @@ Common harness options:
 
 ## Running Tasks
 
-Default multi-agent mode:
+Run a task through the LeadAgent orchestrator:
 
 ```bash
 python main.py --task "Open https://example.com and summarize the page."
-```
-
-Single BrowserAgent mode:
-
-```bash
-python main.py --mode single --task "Open https://example.com and summarize the page."
 ```
 
 Read the task from stdin:

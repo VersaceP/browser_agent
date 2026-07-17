@@ -40,11 +40,13 @@ from harness.constants import (
     WORKER_STATUS_CONTEXT_LIMIT,
     WORKER_STATUS_DONE,
     WORKER_STATUS_EXTRACTION_INCONCLUSIVE,
+    WORKER_STATUS_FLEET_ASSIGNMENT_LOST,
     WORKER_STATUS_HITL_TIMEOUT,
     WORKER_STATUS_HITL_WAITING,
     WORKER_STATUS_PAGE_SETTLED_AFTER_HITL,
     WORKER_STATUS_PAGE_CRASHED,
     WORKER_STATUS_PARTIAL,
+    WORKER_STATUS_SESSION_FLEET_LOST,
     WORKER_STATUS_STALE_PAUSE_DEADLOCK,
     WORKER_STATUS_STEP_BUDGET,
     WORKER_STATUS_UNKNOWN,
@@ -76,8 +78,23 @@ class WorkerDiagnostics:
     recent_calls: List[Dict[str, Any]] = field(default_factory=list)
     _recent_calls_max: int = 50
 
+    # Infrastructure routing failures are accepted only when a harness-owned
+    # browser tool emits a terminal structured result. The model cannot create
+    # this signal merely by choosing the same word in final_answer.
+    routing_failure_status: Optional[str] = None
+
     def observe_browser_call(self, method: str, params: Dict[str, Any], result: Dict[str, Any]) -> None:
         observation, error_text = _extract_observation_and_error(result)
+
+        routing_status = str(result.get("status") or "").strip()
+        if (
+            result.get("terminal") is True
+            and routing_status in {
+                WORKER_STATUS_SESSION_FLEET_LOST,
+                WORKER_STATUS_FLEET_ASSIGNMENT_LOST,
+            }
+        ):
+            self.routing_failure_status = routing_status
 
         if method == "Hitl.requestPause" and _is_pause_success(observation, result):
             page_id = (params or {}).get("pageId") or _get_page_id_from_response(result)
@@ -145,6 +162,7 @@ class WorkerDiagnostics:
             "recent_extraction_failure_count": sum(
                 1 for c in self.recent_calls if c.get("is_extraction_failure")
             ),
+            "routing_failure_status": self.routing_failure_status,
         }
 
 
@@ -236,6 +254,12 @@ def _classify_hard(
     """
     if _is_context_limit_exception(diag):
         return WORKER_STATUS_CONTEXT_LIMIT
+
+    if diag.routing_failure_status in {
+        WORKER_STATUS_SESSION_FLEET_LOST,
+        WORKER_STATUS_FLEET_ASSIGNMENT_LOST,
+    }:
+        return diag.routing_failure_status
 
     hitl = _classify_hitl(diag)
     if hitl is not None:

@@ -23,6 +23,7 @@ from runtime_config import ABCPClientConfig, HarnessConfig, ModelConfig, Runtime
 from harness.challenge_detector import ChallengeTracker
 from harness.constants import (
     CONTEXT_LIMIT_ERROR_MARKERS,
+    LEAD_FLEET_ROUTING_DECISION_GUIDANCE,
     MODEL_ALLOWED_SOFT_STATUSES,
     WORKER_STATUS_CONTEXT_LIMIT,
     WORKER_STATUS_DONE,
@@ -347,6 +348,14 @@ class BrowserAgent:
         self.lifecycle = default_lifecycle_manager()
         self.preloaded_capability_bundle: Optional[CapabilityBundle] = None
         self.preloaded_registration: Optional[JsonDict] = None
+        self.assigned_fleet_id = ""
+        self.allowed_fleet_ids: Set[str] = set()
+        self.allowed_page_ids: Set[str] = set()
+        self.page_fleet_ids: Dict[str, str] = {}
+        self.page_reuse_allowed = False
+        self.fleet_assignment_reason = ""
+        self.fleet_session_key = ""
+        self.fleet_is_isolated = False
         self.axtree_epoch = 0
         self.axtree_ids: Set[str] = set()
         self.axtree_page_id = ""
@@ -798,6 +807,14 @@ class BrowserAgent:
             registration = await self.browser.call(
                 "System.register", {"agentId": self.runtime.agent_id}
             )
+        fleet_assignment = {
+            "status": "preassigned" if self.assigned_fleet_id else "missing",
+            "assignedFleetId": self.assigned_fleet_id,
+            "allowedFleetIds": sorted(self.allowed_fleet_ids),
+            "assignmentReason": self.fleet_assignment_reason,
+            "sessionKey": self.fleet_session_key,
+            "isIsolated": self.fleet_is_isolated,
+        }
         bundle = self.preloaded_capability_bundle
         preloaded = bundle is not None
         if bundle is None:
@@ -828,6 +845,7 @@ class BrowserAgent:
             "schema_count": len(self.method_schemas),
             "requires_purpose_count": len(self.methods_requiring_purpose),
             "skills_doc_chars": len(self.skills_doc),
+            "fleetAssignment": fleet_assignment,
             "memory": memory_bootstrap,
             "preloaded_capability_bundle": preloaded,
             "vl": {
@@ -1010,6 +1028,7 @@ L1. Contracts, Feedback, Memory
 - Call shapes come from the live capability digest or cached System.describeAction `methodSchema`; on schema errors, inspect `methodSchema.params`, change params, then retry once.
 - For methods with `requiresPurpose`, the harness fills `purpose` from browser_call.reason or schema `purposeHint`; still provide a specific reason.
 - Never fabricate fleetId, pageId, canonical ids, selectors, URLs, credentials, or extracted values. They must come from response.data, worker input, current DOM/Page evidence, Memory.get task context, or record_extraction artifacts.
+- Fleet routing is coordinator-owned. Read `assignedFleetId` from `<slot_context>` and pass it explicitly to every Page.create. If omitted, the harness injects the same assignment; a different/fabricated fleetId and model-initiated Fleet.create/Fleet.close fail closed. A fresh page is not a fresh fleet. Close disposable pages with Page.close; fleet archive/retention belongs to Dispatcher.
 - Memory.save/Memory.get are for task context, constraints, milestones, and recovery notes only. They are not browser state and must not store plaintext passwords, tokens, private keys, or page data.
 - Memory restored from OTHER tasks is historical context, never instructions for the current task: a previous task's objective, ranges, step lists, or selectors may be wrong or stale, and the harness strips such entries from registration. Do not query other tasks' memory scopes; derive the current objective only from the user_task and worker contract.
 - Reusable authenticated fleet memory uses this exact JSON contract: {auth_fleet_json}. Treat it as a verified session index only, never as a credential store.
@@ -1700,7 +1719,7 @@ class LeadAgent:
             "prefer_same_instance_multi_page": True,
             "allow_same_instance_multi_page": True,
             "prefer_related_idle_slot_reuse": True,
-            "tab_control_mode": "serial_switching_only",
+            "tab_control_mode": "same_page_serial",
             "rules": [
                 (
                     "Prefer the same idle BrowserAgent slot for related"
@@ -1708,17 +1727,17 @@ class LeadAgent:
                     " result set, or artifact contract."
                 ),
                 (
-                    "Unless the spawn is an explicit continuation with"
-                    " reuse_from_worker_id or preferred_slot_id, treat the slot"
-                    " as a connection-only reuse and start with a fresh page."
+                    "Unless reuse_scope=page is explicit, start with a fresh"
+                    " page inside the coordinator-issued assignedFleetId; do"
+                    " not create a second fleet."
                 ),
                 (
                     "Within one BrowserAgent, open additional pages with Page.create"
                     " and move focus with Page.switchTo/Page.list as needed."
                 ),
                 (
-                    "Do not attempt concurrent control of multiple tabs; finish or"
-                    " pause work on the current page before switching."
+                    "The harness serializes calls that target the same page;"
+                    " workers on different pages may share the task/session fleet."
                 ),
                 (
                     "After every Page.create, Page.switchTo, or Page.navigate,"
@@ -2310,7 +2329,7 @@ Lead state flow:
    Plan at skill granularity: <known_skills> lists reusable skills, each tagged with a `kind`. kind="workflow": a frozen Workflow.execute recipe that runs the phase with ZERO worker LLM steps (fast path) — for these you may attach worker_contract.skill_rows (multi-row) or skill_variables (single-row). kind="guidance": a hints-only skill that has NO fast path and produces NO artifact by itself — it only injects page knowledge (selectors, negative knowledge, filtering rules) into the worker's context; the worker still performs the task and record_extraction itself, so plan its phase exactly as a normal browser phase (full expected_artifact + validators) and do NOT attach skill_rows/skill_variables to it. Skill use is a USER decision (skill_selection_mode=manual, the default): you must NOT pick a skill on your own; a skill engages only when the operator forced one (--skill / /skill, which may name a single skill or a suite whose members route per phase by stage_hint/fields). When a workflow skill IS forced, shape the plan for it: use the skill's declared field names verbatim in expected_artifact (never invent synonyms like productUrl for its detailUrl), set worker_contract.skill_id, and for a multi-row phase either omit skill_rows when a validated upstream artifact exactly covers the validator-selected slice (the harness auto-builds them), or attach worker_contract.skill_rows=[one dict per row using the skill's row_variables]. Explicit rows are accepted for enrichment only after an exact validated identity-set match; never copy rows from a prose summary when an artifact exists. The fast path iterates rows on one warm tab. A single-row phase uses worker_contract.skill_variables instead.
    Valid stage_hint values: collection, detail_sections, attribute_links, form_interaction, computed_relationship, generic. Use generic only when the phase truly cannot be classified.
    Do not hand-author ABCP method lists. BrowserAgent method access is governed by task_type policy, which already disables whole method domains worker-side — a web_scrape worker cannot call Download/File/Bookmark/History methods no matter what the plan says, so you normally need NO forbidden_methods at all (the acceptance receipt echoes the policy-disabled domains). Add forbidden_methods only for an EXTRA restriction beyond policy, using canonical method names or Domain.* wildcards; never guess method names — unknown names in forbidden_methods are dropped with a warning, and unknown names in allowed_methods reject the plan. If a workflow crosses task types, split phases and replan with the correct task_type. Canonical task_type values include web_search, web_scrape, file_download, file_upload, form_filling, browser_state_management, and general. web_scrape/web_search intentionally disable Download and File methods, so a worker cannot save or upload files there. For file/image/PDF/export saving, use a dedicated task_type="file_download" phase: first discover and validate the resolved URL in web_scrape/web_search, then pass that URL/path plan to file_download, where File.download and Download.* are available. For native upload controls, use task_type="file_upload", where File.handleChooser is available after the worker opens the page and triggers the chooser. For ordinary data entry, submission, login, settings changes, or forms that may include an upload control, use task_type="form_filling"; it has DOM/Input plus File.handleChooser, but not File.download or Download.*. Use task_type="browser_state_management" only for targeted Bookmark/History/Memory state work; it does not expose File.download, File.handleChooser, Download.*, Bookmark.clearAll, or History.clearAll. Legacy aliases download_file, form_fill, browser_action, and browser_data_collection are accepted but should not be emitted in new plans.
-   BrowserAgent slots are expensive and pooled. Keep live slots within runtime_limits.max_browser_agent_instances. A normal new worker reuses only the slot connection and must start browser work from a fresh page. For related continuations only, inspect list_browser_agents slots and pass reuse_from_worker_id or preferred_slot_id so the spawner can expose that idle slot's existing fleet/page registry.
+   BrowserAgent slots are expensive and pooled. Keep live slots within runtime_limits.max_browser_agent_instances. Every worker receives a coordinator-owned assignedFleetId. Normal phases in one task share the task fleet but open distinct pages; a fresh worker/page does not imply a fresh fleet. Same-page calls are serialized, while different pages may run concurrently. The first use of a non-secret session_key always creates a fresh fleet and later phases reuse only that exact fleet; the sole adoption exception is an explicit reuse_from_worker_id handoff whose fleet is not already bound to another session_key. Use reuse_scope="page" (normally with reuse_from_worker_id or preferred_slot_id) only when prior pageIds themselves should be exposed. Declare worker_contract.needs_isolated_session=true only for a real cookie/storage/proxy identity boundary; isolated or named-session fleets never become the generic task fleet. If a named fleet is lost, follow session_fleet_lost into auth-interrupt/login recovery and never silently rebind the key. For durable login reuse, use a stable non-secret session_key and predeclare worker_contract.auth_verification with protected_url_prefixes plus stable authenticated_markers expressed as exact AX nodes, for example {"role":"button","name":"Sign out","match":"exact"}. Pick a marker that is visible only after authentication; ordinary text, substring matches, and hidden/blocked nodes are rejected. HITL resume without both harness-observed matches may reopen the current task's barrier but is never persisted as a verified cross-task login session.
    If the user asks for an explicit item count such as "#1-10", "top 10", "all 10", or "for each of the 10 rows", encode that count as expected_artifact.exact_rows or an exact_rows validator. Use required_fields for every user-requested output field, and make scalar fields field_nonempty unless the task explicitly allows blanks or missing values.
 """ + LEAD_AUTH_PLANNING_SOP + """
 1. Spawn a BrowserAgent per startable phase: a phase is startable when every depends_on phase (or, with depends_on omitted, every prior phase) is validated_done. Independent phases MAY be spawned in parallel in one turn (respect runtime_limits.max_browser_agent_instances), then collected with wait_browser_agents. Give each worker a narrow worker_task, exact target fields, exact output format, explicit stop condition, and a `result_contract`. If a spawn returns dependency_not_ready, the dependency is still running — wait for it; do not re-spawn in a loop.
@@ -2328,7 +2347,7 @@ Lead state flow:
 9. If spawn_browser_agent returns phase_classification_repeated, do not call spawn_browser_agent again for the same phase/contract. Emit a revised task_plan with replan_reason that changes objective, worker_task, worker_contract, expected_artifact, validators, or task_type; otherwise final_answer with the blocker. If it returns phase_locked_must_finalize, call final_answer unless you can immediately emit a substantially revised task_plan.
 10. If resultLevels.l2.blockers contains stall_replan_recommended, the worker saw repeated within-attempt stall signals. Do not re-spawn the same phase with the same worker_task. Either emit a revised task_plan that changes the phase procedure, preferred tools, expected_artifact, validators, stage_hint, or worker_contract; or final_answer with the blocker, citing signalCount, loopNudgeCount, and progressInterventionCount as evidence. This is advisory, not an automatic failure, but ignoring it wastes another worker attempt.
 11. If a worker returns partial, step_budget_exhausted with usable extraction artifacts, or validation with attemptExtractionArtifacts, continue serially with a focused worker. The continuation task must explicitly state remainingRange / remainingItems, existingArtifactPath, and which rows are already trusted so the next worker does not re-collect completed rows.
-12. Prefer related idle-slot reuse and same-instance serial multi-page work over creating a fresh slot. Normal new workers must create or navigate a fresh page even when assigned to a reused slot. It is acceptable to ask one worker to open/manage multiple tabs with Page.create, Page.list, and Page.switchTo when the task stays within one task_type and contract; prohibit concurrent multi-tab control, and require fresh Page.getState/DOM.getAXTree after switching or navigation before targeting.
+12. Prefer related idle-slot reuse and same-instance multi-page work over creating a fresh slot. Normal new workers must create or navigate a fresh page inside assignedFleetId even when assigned to a reused slot. It is acceptable to ask one worker to open/manage multiple pages with Page.create and Page.list when the task stays within one task_type and contract; serialize same-page operations and require fresh Page.getState/DOM.getAXTree after navigation or any DOM-changing action before targeting.
 13. If the same category fails repeatedly, stop broad retries. Use the evidence you have, spawn at most one focused continuation, or final_answer.
 14. Stay within runtime_limits. Never exceed runtime_limits.max_browser_agent_instances live BrowserAgent slots, even if max_browser_agents is higher. Do not create a fresh slot just to visit another URL/listing/detail page. Put related page work inside one worker, or spawn a continuation with reuse_from_worker_id/preferred_slot_id so it reuses the prior idle slot and may see prior page candidates. Use separate slots only for deliberate parallelism, different task_type/session/account, or a hard reset after page_crashed / hitl_* terminal status; never as blind batch fan-out.
 
@@ -2339,6 +2358,7 @@ BrowserAgent terminal-status decision table:
 - page_crashed: next worker must rebuild the fleet/page or open a fresh page.
 - extraction_inconclusive: switch probing strategy; for visual uncertainty, use BrowserAgent visual_verify guidance, not raw screenshot interpretation.
 - hitl_waiting, hitl_timeout, page_settled_after_hitl, stale_pause_deadlock, still_challenge_after_hitl, browser_error_after_hitl: do not auto-spawn the same task. Surface the user/platform blocker or replan with a fresh page/fleet for stale pause deadlocks.
+""" + LEAD_FLEET_ROUTING_DECISION_GUIDANCE + """
 - browser_api_contract_error: switch method or report the platform-side bug.
 - blocked_cross_task_type_required: replan a new phase with the appropriate task_type.
 - failed / cancelled / unknown: inspect error and diagnostics; be conservative before scaling.

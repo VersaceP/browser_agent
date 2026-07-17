@@ -74,8 +74,11 @@ async def canary_validate(
         return {"ok": False, "reason": "structurally_invalid"}
     if not page_id:
         if not fleet_id:
-            fl = await browser.call("Fleet.create", {})
-            fleet_id = ((fl or {}).get("data") or {}).get("fleetId") or ""
+            return {
+                "ok": False,
+                "reason": "fleet_assignment_required",
+                "tool_was_executed": False,
+            }
         pg = await browser.call("Page.create", {"fleetId": fleet_id, "url": "about:blank"})
         page_id = ((pg or {}).get("data") or {}).get("pageId") or ""
     candidate = _candidate_skill(skill, new_workflow)

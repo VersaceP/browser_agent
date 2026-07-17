@@ -2004,12 +2004,32 @@ async def _run_skill_with_optional_control(
 
 
 async def _ensure_page(agent: Any, fleet_ids: Optional[Sequence[str]]) -> tuple[str, str]:
-    fleet_id = next(iter(fleet_ids), "") if fleet_ids else ""
+    fleet_id = str(getattr(agent, "assigned_fleet_id", "") or "").strip()
     if not fleet_id:
+        fleet_id = next(iter(fleet_ids), "") if fleet_ids else ""
+    if not fleet_id:
+        harness_config = getattr(getattr(agent, "runtime", None), "harness", None)
+        if bool(getattr(harness_config, "fleet_reuse_enabled", False)):
+            raise RuntimeError(
+                "fleet_assignment_required: fast path refuses fleetless Page.create"
+            )
+        # Legacy-only fallback for deployments that explicitly disable the new
+        # coordinator.  Reuse-enabled workers are assigned before dispatch.
         fl = await agent.browser.call("Fleet.create", {})
         fleet_id = ((fl or {}).get("data") or {}).get("fleetId") or ""
     pg = await agent.browser.call("Page.create", {"fleetId": fleet_id, "url": "about:blank"})
     page_id = ((pg or {}).get("data") or {}).get("pageId") or ""
+    if page_id:
+        allowed_pages = getattr(agent, "allowed_page_ids", None)
+        if not isinstance(allowed_pages, set):
+            allowed_pages = set()
+            agent.allowed_page_ids = allowed_pages
+        allowed_pages.add(str(page_id))
+        page_fleets = getattr(agent, "page_fleet_ids", None)
+        if not isinstance(page_fleets, dict):
+            page_fleets = {}
+            agent.page_fleet_ids = page_fleets
+        page_fleets[str(page_id)] = str(fleet_id)
     return page_id, fleet_id
 
 
@@ -2038,10 +2058,6 @@ async def maybe_run_skill_fast_path(
     if skill is None:
         return None
 
-    # Guidance（hints-only）skill：没有 workflow 可跑——价值是 selected_skill_context
-    # 注进 worker 上下文的 hints，小节慢路径本身就是执行路径。不碰引擎、不记
-    # health（防腐走 harness.skill.guidance 的独立软通道）。放在 batch/变量
-    # 派生之前：skill_rows 对 guidance skill 同样无意义。
     if getattr(skill, "is_hints_only", False):
         _log(agent, "skill.fast_path.hints_only", {
             "skill": skill.skill_id,

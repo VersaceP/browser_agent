@@ -27,6 +27,14 @@
     "max_steps": 50,
     "lead_max_steps": 50,
     "worker_max_steps": 50,
+    "fleet_reuse_enabled": true,
+    "same_fleet_multiworker_enabled": false,
+    "fleet_auth_barrier_enabled": true,
+    "fleet_auth_barrier_wait_seconds": 120,
+    "auth_fleet_ledger_path": ".auth_fleet_ledger.json",
+    "fleet_slot_reconnect_attempts": 2,
+    "fleet_slot_reconnect_backoff_seconds": 0.25,
+    "fleet_slot_manual_reset_after_failures": 3,
     "memory_context": "ABCP agent harness: 使用浏览器原子能力完成用户任务；方法语义和参数以 System.getCapabilities 的 description 与 paramsSchema 为准。",
     "semantic_tree": "internal"
   }

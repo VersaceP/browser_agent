@@ -10,6 +10,7 @@ from harness.extraction_artifacts import (
     save_extraction_artifact,
     validate_extraction_rows,
 )
+from harness.fleet_coordinator import VALID_PAGE_POLICIES, VALID_REUSE_SCOPES
 from harness.lifecycle import LifecycleContext, lifecycle_for
 from harness.local_fs import local_fs_read, local_fs_search
 from harness.strategy_bank import render_strategy_guidance
@@ -36,6 +37,49 @@ LEAD_TOOLS = ToolRegistry("lead_agent")
 
 def _nullable(type_name: str) -> JsonDict:
     return {"type": [type_name, "null"]}
+
+
+def _auth_verification_schema() -> JsonDict:
+    return {
+        "type": "object",
+        "description": (
+            "Optional pre-HITL proof contract for durable session reuse. Both"
+            " the protected URL and an authenticated UI marker must match;"
+            " without this contract HITL may clear the current barrier but the"
+            " fleet is not persisted as a verified login session."
+        ),
+        "properties": {
+            "protected_url_prefixes": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string"},
+            },
+            "authenticated_markers": {
+                "type": "array",
+                "minItems": 1,
+                "description": (
+                    "Stable visible AX nodes that prove authentication. Match"
+                    " is exact; ordinary page text and hidden/blocked nodes do"
+                    " not count."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "role": {
+                            "type": "string",
+                            "pattern": "^[A-Za-z][A-Za-z0-9_-]*$",
+                        },
+                        "name": {"type": "string", "minLength": 3},
+                        "match": {"type": "string", "enum": ["exact"]},
+                    },
+                    "required": ["role", "name"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["protected_url_prefixes", "authenticated_markers"],
+        "additionalProperties": False,
+    }
 
 
 def _validator_item_schema() -> JsonDict:
@@ -206,6 +250,23 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                     ),
                                     "items": _validator_item_schema(),
                                 },
+                                "worker_contract": {
+                                    "type": "object",
+                                    "properties": {
+                                        "reuse_scope": {
+                                            "type": "string",
+                                            "enum": sorted(VALID_REUSE_SCOPES),
+                                        },
+                                        "session_key": {"type": "string"},
+                                        "page_policy": {
+                                            "type": "string",
+                                            "enum": sorted(VALID_PAGE_POLICIES),
+                                        },
+                                        "needs_isolated_session": {"type": "boolean"},
+                                        "auth_verification": _auth_verification_schema(),
+                                    },
+                                    "additionalProperties": True,
+                                },
                                 "max_attempts": {"type": "integer"},
                             },
                             "required": [
@@ -274,6 +335,33 @@ def _spawn_browser_agent_schema(_: Any = None) -> JsonDict:
                     " reusable page candidates from that slot to be exposed."
                 ),
             },
+            "reuse_scope": {
+                "type": ["string", "null"],
+                "enum": [*sorted(VALID_REUSE_SCOPES), None],
+                "description": (
+                    "Fleet/page reuse boundary. Omit or use connection for a"
+                    " fresh page in the slot's assigned fleet; fleet keeps the"
+                    " same fleet/session with a fresh page; page explicitly"
+                    " exposes prior pages for a related continuation."
+                ),
+            },
+            "session_key": {
+                **_nullable("string"),
+                "description": (
+                    "Stable harness session-affinity key for related phases."
+                    " First use creates a fresh fleet; later uses bind only to"
+                    " that exact fleet and fail terminally if it is lost. It is"
+                    " not an account credential and must not contain secrets."
+                ),
+            },
+            "page_policy": {
+                "type": ["string", "null"],
+                "enum": [*sorted(VALID_PAGE_POLICIES), None],
+                "description": (
+                    "Use new for a fresh page in assignedFleetId. existing is"
+                    " valid only with reuse_scope=page."
+                ),
+            },
             "worker_contract": {
                 "type": "object",
                 "additionalProperties": True,
@@ -287,6 +375,16 @@ def _spawn_browser_agent_schema(_: Any = None) -> JsonDict:
                             " the phase/plan task_type."
                         ),
                     },
+                    "needs_isolated_session": {
+                        "type": "boolean",
+                        "description": (
+                            "Request coordinator creation of a distinct fleet"
+                            " because cookies/storage/proxy identity must not be"
+                            " shared with the slot default. The resulting fleet"
+                            " never becomes the generic slot default."
+                        ),
+                    },
+                    "auth_verification": _auth_verification_schema(),
                 },
                 "description": (
                     "Contract override; pass {} when the phase contract is enough."
@@ -506,10 +604,12 @@ async def _lead_emit_task_plan(ctx: ToolContext) -> JsonDict:
     name="spawn_browser_agent",
     description=(
         "Asynchronously run a BrowserAgent worker in a pooled browser slot."
-        " Normal workers reuse only the slot connection and must start from a"
-        " fresh page. For related continuation work, pass reuse_from_worker_id"
-        " or preferred_slot_id when you know which prior slot/page set should"
-        " continue."
+        " The coordinator assigns a fleet before execution; normal workers"
+        " start a fresh page in that fleet. Use reuse_scope/session_key for"
+        " cookie/session affinity (a new key starts a fresh fleet), and"
+        " reuse_scope=page plus"
+        " reuse_from_worker_id or preferred_slot_id only when prior pages must"
+        " be exposed."
         " Keep BrowserAgent slots scarce; when related work only needs additional"
         " pages/tabs, put that into one worker as serial Page.create and"
         " Page.switchTo work instead of fan-out."
@@ -683,6 +783,9 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
         task_plan=getattr(agent, "task_plan", None),
         preferred_slot_id=tool_input.get("preferred_slot_id"),
         reuse_from_worker_id=tool_input.get("reuse_from_worker_id"),
+        reuse_scope=tool_input.get("reuse_scope"),
+        session_key=tool_input.get("session_key"),
+        page_policy=tool_input.get("page_policy"),
     )
 
 
