@@ -51,6 +51,7 @@ from harness.task_control import (
     mark_phase_result,
     mark_phase_running,
     phase_prior_artifact_paths,
+    phase_pacing_remaining_seconds,
     phase_start_rejection,
     repeated_phase_attempt_guard,
     validate_worker_artifacts,
@@ -371,6 +372,39 @@ class BrowserAgentSpawner:
         if start_rejection is not None:
             self.logger.write("spawner.browser.start_rejected", start_rejection)
             return start_rejection
+        phase_wait = phase_pacing_remaining_seconds(
+            task_plan,
+            self.logger,
+            phase_id=phase_id,
+            worker_contract=effective_contract,
+        )
+        if phase_wait > 0.0:
+            wait_payload = {
+                "phaseId": phase_id,
+                "requestedIntervalSeconds": (
+                    (effective_contract.get("pacing") or {}).get(
+                        "phase_interval_seconds", 0.0
+                    )
+                    if isinstance(effective_contract.get("pacing"), dict)
+                    else 0.0
+                ),
+                "actualWaitSeconds": phase_wait,
+                "slotReserved": False,
+            }
+            self.logger.write("pacing.phase.wait_started", wait_payload)
+            await asyncio.sleep(phase_wait)
+            self.logger.write("pacing.phase.wait_completed", wait_payload)
+            # Another spawn may have claimed or completed this phase while this
+            # coroutine was waiting; re-run the gate before reserving a slot.
+            start_rejection = phase_start_rejection(
+                task_plan,
+                self.logger,
+                phase_id=phase_id,
+                worker_contract=effective_contract,
+            )
+            if start_rejection is not None:
+                self.logger.write("spawner.browser.start_rejected", start_rejection)
+                return start_rejection
         current_contract_hash = contract_hash_for_phase(
             phase,
             effective_contract,
@@ -2834,6 +2868,7 @@ class BrowserAgentSpawner:
                     phase_id=phase_id,
                     exclude_worker_id=worker_id,
                 ),
+                file_evidence=getattr(harness, "file_action_evidence", []),
                 task_dir=self.logger.task_dir,
             )
             unresolved_visual = _unresolved_repair_visual_evidence(harness)

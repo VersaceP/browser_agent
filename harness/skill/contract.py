@@ -8,10 +8,10 @@ fast paths fall through to the BrowserAgent slow path.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from harness.extraction_artifacts import field_names_from_specs
+from harness.pacing import parse_utc_timestamp
 
 
 # Minimum soft-recall score required to interrupt the Lead with a selection
@@ -47,16 +47,12 @@ def _health_entry(provider: Any, skill_id: str) -> Dict[str, Any]:
 
 
 def _updated_timestamp(value: Any) -> float:
-    text = str(value or "").strip()
-    if not text:
+    parsed = parse_utc_timestamp(value)
+    if parsed is None:
         return float("-inf")
     try:
-        normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
-        parsed = datetime.fromisoformat(normalized)
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.timestamp()
-    except (TypeError, ValueError, OverflowError):
+    except (OverflowError, OSError):
         return float("-inf")
 
 

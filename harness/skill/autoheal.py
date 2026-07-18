@@ -19,28 +19,15 @@ on the in-memory trace, which has the same event schema as the JSONL it normally
 """
 from __future__ import annotations
 
-import importlib.util
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from harness.skill.distiller import load_distiller
 from harness.skill.heal import self_heal
 from harness.skill.registry import Skill
+from harness.workflow_policy import harden_navigation_lifecycle
 
-_DISTILLER_PATH = Path(__file__).resolve().parent.parent.parent / "skills" / "_tools" / "distill_trace.py"
-_distiller = None
-
-
-def _load_distiller():
-    """Import the standalone distiller module by path (skills/_tools isn't a package)."""
-    global _distiller
-    if _distiller is None:
-        spec = importlib.util.spec_from_file_location("_skill_distiller", _DISTILLER_PATH)
-        if spec is None or spec.loader is None:
-            raise ImportError(f"cannot load distiller from {_DISTILLER_PATH}")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        _distiller = module
-    return _distiller
+# Backward-compatible name used by skill/create.py and existing tests.
+_load_distiller = load_distiller
 
 
 def distill_trace_to_workflow(
@@ -54,6 +41,7 @@ def distill_trace_to_workflow(
     steps, _notes, _persist, variables = distiller.distill(list(trace or []))
     if not steps:
         return None
+    steps = harden_navigation_lifecycle(steps)
     # Prefer the live skill's variable template (preserves passthrough vars like
     # rank/productName); fall back to what the distiller inferred.
     template = dict(base_skill.variable_template) or (variables or {"detailUrl": ""})

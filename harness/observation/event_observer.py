@@ -73,6 +73,14 @@ class BrowserEventObserver:
                 return
             name = str(event.get("event") or "")
             self.event_counts[name] = self.event_counts.get(name, 0) + 1
+            tracker = getattr(self.agent, "page_lifecycle", None)
+            lifecycle_state = None
+            if tracker is not None:
+                lifecycle_state = tracker.observe_event(name, event.get("payload"))
+            if name in {"Page.navigate", "Page.recovered", "Page.crashed"}:
+                self._mark_invalidated(f"lifecycle_event:{name}")
+            if lifecycle_state is not None:
+                self._log("page.lifecycle.event", tracker.receipt(lifecycle_state.page_id))
             if name == "DOM.axTreeUpdated":
                 self._handle_axtree_updated(event.get("payload"))
         except Exception as exc:  # noqa: BLE001 - never break the reader

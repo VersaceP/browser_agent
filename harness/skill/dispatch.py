@@ -21,6 +21,7 @@ import uuid
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from harness.pacing import wait_between_rows
 from harness.skill.pause import HitlOnsetMonitor, classify_run_for_hitl
 from harness.skill.registry import Skill, SkillRegistry, canonical_field
 from harness.skill.structured_output import structured_output_rows
@@ -1561,6 +1562,13 @@ async def _run_batch_fast_path(
             "rowIndex": index, "runId": run_id,
             "rowFields": sorted(built_rows[-1].keys()),
         })
+        await wait_between_rows(
+            agent,
+            worker_contract,
+            completed_index=index,
+            total_rows=len(rows),
+            source="skill_fast_path",
+        )
 
     artifact: Dict[str, Any] = {}
     if record_extraction is not None:
@@ -1979,12 +1987,18 @@ async def _run_skill_with_optional_control(
                 # leg. The poll mirrors the skill's own challengeFlag JS on the 2nd
                 # connection (None when the skill declares no challenge boundary).
                 poll_challenge_fn = make_challenge_poller(skill)
+                audited_runner = functools.partial(
+                    run_skill_workflow,
+                    capability_methods=getattr(agent, "capability_methods", set()),
+                    method_schemas=getattr(agent, "method_schemas", {}),
+                )
                 try:
                     run_result = await run_workflow_with_control(
                         primary=agent.browser, control=control, skill=skill,
                         run_id=run_id, page_id=page_id, fleet_id=fleet_id,
                         variables=variables, on_pause=resolver,
                         poll_challenge_fn=poll_challenge_fn, logger=logger,
+                        primary_runner=audited_runner,
                     )
                     return run_result, None
                 finally:
@@ -1997,6 +2011,8 @@ async def _run_skill_with_optional_control(
         run_result = await run_skill_workflow(
             agent.browser, skill, run_id=run_id,
             page_id=page_id, fleet_id=fleet_id, variables=variables,
+            capability_methods=getattr(agent, "capability_methods", set()),
+            method_schemas=getattr(agent, "method_schemas", {}),
         )
     finally:
         observed_signal = monitor.stop()

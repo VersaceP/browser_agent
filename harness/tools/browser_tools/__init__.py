@@ -43,6 +43,8 @@ from harness.observation.overlay_actions import (
 )
 from harness.observation.overlay_detector import detect_overlay_from_result
 from harness.observation.semantic_index import discover_selector_candidates
+from harness.observation.page_lifecycle import PageLifecycleTracker
+from harness.observation.event_observer import unwrap_notification
 from harness.observation.verifiers import (
     build_read_only_oracle,
     collect_rows,
@@ -54,7 +56,9 @@ from harness.observation.verifiers import (
 )
 from harness.offload import offload_large_tool_result
 from harness.progress import extraction_artifact_count
+from harness.pacing import wait_between_rows
 from harness.render_recovery import build_render_recovery_runner
+from harness.runtime_evaluation import RuntimeEvaluationService
 from harness.task_control import phase_prior_artifact_paths, validate_worker_artifacts
 from harness.tool_policy import (
     disabled_reason_for_method,
@@ -88,6 +92,7 @@ from .axtree_state import (
     _record_axtree_history,
 )
 from harness.vl import visual_verify_image
+from harness.workflow_policy import validate_workflow_params
 
 
 
@@ -106,6 +111,175 @@ SCREENSHOT_ALLOWED_PURPOSE_RE = re.compile(
     r")\b",
     re.I,
 )
+
+
+def _prepare_runtime_evaluation(
+    agent: Any,
+    params: JsonDict,
+    policy: Optional[JsonDict],
+    *,
+    origin: str,
+) -> Tuple[Optional[Any], Optional[JsonDict]]:
+    """Single policy boundary shared by model and harness Runtime callers."""
+    return RuntimeEvaluationService(
+        getattr(agent, "method_schemas", {})
+    ).prepare(params, policy, origin=origin)
+
+
+def _lifecycle_page_id(agent: Any, params: Any) -> str:
+    if isinstance(params, dict) and params.get("pageId"):
+        return str(params.get("pageId") or "").strip()
+    return str(getattr(agent, "axtree_page_id", "") or "").strip()
+
+
+async def _page_lifecycle_guard_before(
+    agent: Any,
+    method: str,
+    params: JsonDict,
+) -> Optional[JsonDict]:
+    """Event-driven pre-call gate.
+
+    DOM probes wait for settlement.  A missed event triggers exactly one
+    Page.getState call.  Re-perception obligations are then exposed as explicit
+    guards so the model cannot continue with stale DOM handles.
+    """
+    tracker = getattr(agent, "page_lifecycle", None)
+    if not isinstance(tracker, PageLifecycleTracker):
+        return None
+    page_id = _lifecycle_page_id(agent, params)
+    state = tracker.state(page_id)
+    if state is None:
+        return None
+
+    is_dom_probe = method.startswith("DOM.")
+    if is_dom_probe and state.status == "loading":
+        raw_timeout = getattr(
+            agent.runtime.harness, "page_settlement_timeout_seconds", 15.0
+        )
+        try:
+            timeout = max(0.0, float(raw_timeout))
+        except (TypeError, ValueError):
+            timeout = 15.0
+        settled = await tracker.wait_for_settlement(page_id, timeout)
+        agent.logger.write("page.lifecycle.settlement_wait", {
+            "pageId": page_id,
+            "timeoutSeconds": timeout,
+            "outcome": settled,
+        })
+        if settled == "timeout":
+            runner = getattr(agent, "render_recovery_runner", None)
+            if runner is None:
+                runner = build_render_recovery_runner(
+                    browser=agent.browser,
+                    logger=agent.logger,
+                    capability_methods=agent.capability_methods,
+                    recent_recoveries=agent._render_recovery_recent,
+                )
+                agent.render_recovery_runner = runner
+            try:
+                response, _recovery = await runner.call("Page.getState", {
+                    "pageId": page_id,
+                    "purpose": "One-shot resynchronization after settlement event timeout",
+                })
+                tracker.observe_state_response(page_id, response)
+                agent.logger.write("page.lifecycle.timeout_resync", {
+                    **tracker.receipt(page_id),
+                    "performed": True,
+                })
+            except Exception as exc:  # the original DOM call remains blocked
+                return {
+                    "status": "page_settlement_unknown",
+                    "tool_was_executed": False,
+                    "pageLifecycle": tracker.receipt(page_id),
+                    "error": str(exc),
+                    "next_instruction": (
+                        "The Page.loaded settlement event timed out and the one-shot"
+                        " Page.getState resynchronization failed. Do not poll; inspect"
+                        " the failure or recover the page."
+                    ),
+                }
+            state = tracker.state(page_id)
+
+    state = tracker.state(page_id)
+    if state is None:
+        return None
+    if state.status == "loading" and is_dom_probe:
+        return {
+            "status": "page_still_loading",
+            "tool_was_executed": False,
+            "pageLifecycle": tracker.receipt(page_id),
+            "next_instruction": (
+                "DOM probes remain paused. Wait for a lifecycle event; do not poll"
+                " Page.getState."
+            ),
+        }
+    lifecycle_recovery_methods = {"Page.getState", "Page.navigate", "Page.close"}
+    # Download controls are mutually composable (pause -> resume/cancel). They
+    # may dirty page state for later DOM work, but must not deadlock each other
+    # behind that deferred resynchronization obligation.
+    is_file_control = method == "File.download" or method.startswith("Download.")
+    if (
+        state.requires_state_resync
+        and method not in lifecycle_recovery_methods
+        and not is_file_control
+    ):
+        return {
+            "status": "page_state_resync_required",
+            "tool_was_executed": False,
+            "pageLifecycle": tracker.receipt(page_id),
+            "next_instruction": (
+                "Call Page.getState once before continuing after navigation,"
+                " recovery, dialog/chooser close, or a download state change."
+            ),
+        }
+    if (
+        state.requires_ax_refresh
+        and method not in {*lifecycle_recovery_methods, "DOM.getAXTree"}
+        and not is_file_control
+    ):
+        return {
+            "status": "page_axtree_refresh_required",
+            "tool_was_executed": False,
+            "pageLifecycle": tracker.receipt(page_id),
+            "next_instruction": (
+                "Call DOM.getAXTree before continuing; navigation/recovery"
+                " invalidated all prior DOM targets."
+            ),
+        }
+    return None
+
+
+def _page_lifecycle_before_action(agent: Any, method: str, params: JsonDict) -> None:
+    tracker = getattr(agent, "page_lifecycle", None)
+    if isinstance(tracker, PageLifecycleTracker):
+        tracker.before_action(method, _lifecycle_page_id(agent, params))
+
+
+def _page_lifecycle_after_action(
+    agent: Any,
+    method: str,
+    params: JsonDict,
+    response: Any,
+) -> None:
+    tracker = getattr(agent, "page_lifecycle", None)
+    if not isinstance(tracker, PageLifecycleTracker):
+        return
+    page_id = _lifecycle_page_id(agent, params)
+    if method == "Page.getState":
+        tracker.observe_state_response(page_id, response)
+    elif method == "DOM.getAXTree" and not _invoke_result_failed({"response": response}):
+        tracker.observe_ax_refresh(page_id)
+    if (
+        method in {
+            "Page.navigate", "Page.getState", "DOM.getAXTree",
+            "File.download", "File.handleChooser", "Workflow.execute",
+        }
+        or method.startswith("Download.")
+    ):
+        agent.logger.write("page.lifecycle.after_action", {
+            "method": method,
+            **tracker.receipt(page_id),
+        })
 
 BrowserToolDispatcher = Callable[
     [JsonDict, int],
@@ -491,6 +665,13 @@ async def _browser_execute_selected_skill(ctx: ToolContext) -> JsonDict:
         output_rows.append(_align_row_fields_to_expected(
             built, _expected_fields_of(contract),
         ))
+        await wait_between_rows(
+            agent,
+            contract,
+            completed_index=index,
+            total_rows=len(effective_inputs),
+            source="execute_selected_skill",
+        )
 
     result = {
         "status": "done",
@@ -505,6 +686,47 @@ async def _browser_execute_selected_skill(ctx: ToolContext) -> JsonDict:
         ),
     }
     _record_selected_skill_tool_trace(agent, result)
+    return result
+
+
+@BROWSER_TOOLS.register(
+    name="execute_browser_workflow",
+    description=(
+        "Execute a temporary browser-only ABCP workflow after recursive harness"
+        " validation. Use it only when the complete action sequence and simple"
+        " data dependencies are known in advance. It cannot call harness-local"
+        " tools or Runtime.evaluate, and navigation must be followed by"
+        " Page.loaded, Page.getState, and DOM.getAXTree."
+    ),
+    input_schema=_browser_schema_for("execute_browser_workflow"),
+    contract_check=True,
+)
+async def _browser_execute_browser_workflow(ctx: ToolContext) -> JsonDict:
+    params = {
+        "description": str(ctx.tool_input.get("description") or "Temporary browser workflow"),
+        "variables": dict(ctx.tool_input.get("variables") or {}),
+        "steps": list(ctx.tool_input.get("steps") or []),
+        "timeout": int(ctx.tool_input.get("timeout") or 600000),
+        "stepTimeout": int(ctx.tool_input.get("stepTimeout") or 30000),
+    }
+    page_id = str(ctx.tool_input.get("pageId") or "").strip()
+    fleet_id = str(ctx.tool_input.get("fleetId") or "").strip()
+    if page_id:
+        params["pageId"] = page_id
+    if fleet_id:
+        params["fleetId"] = fleet_id
+    if isinstance(ctx.tool_input.get("errorConfig"), dict):
+        params["errorConfig"] = dict(ctx.tool_input.get("errorConfig") or {})
+    result, _should_stop = await _execute_browser_capability_tool(
+        ctx.agent,
+        "browser_call",
+        {
+            "method": "Workflow.execute",
+            "params": params,
+            "reason": params["description"],
+        },
+        ctx.step,
+    )
     return result
 
 
@@ -699,6 +921,16 @@ async def _browser_visual_verify(ctx: ToolContext) -> JsonDict:
 )
 async def _browser_final_answer(ctx: ToolContext) -> JsonDict:
     answer = str(ctx.tool_input.get("answer", "")).strip()
+    pending_rejection = _pending_ephemeral_final_rejection(
+        ctx.agent, str(ctx.tool_input.get("status") or "done")
+    )
+    if pending_rejection is not None:
+        ctx.agent.logger.write("final_answer.ephemeral_rows_rejected", pending_rejection)
+        ctx.agent.trace.append({
+            "type": "final_answer_rejected",
+            "result": pending_rejection,
+        })
+        return pending_rejection
     rejection = _final_answer_reality_check_rejection(ctx.agent, answer)
     if rejection is not None:
         ctx.agent.logger.write("final_answer.reality_check_rejected", {
@@ -740,7 +972,310 @@ async def _browser_record_extraction(ctx: ToolContext) -> JsonDict:
     result = _record_extraction(ctx.agent, ctx.tool_input)
     if _record_extraction_persisted(result):
         ctx.agent.pending_unrecorded_extraction = None
+        _consume_pending_ephemeral_rows(ctx.agent, ctx.tool_input.get("rows"))
+        result = await _maybe_run_ephemeral_batch_after_first_row(
+            ctx.agent, ctx.tool_input, result, step=ctx.step
+        )
     return result
+
+
+def _consume_pending_ephemeral_rows(agent: Any, observed_rows: Any) -> None:
+    pending = getattr(agent, "pending_ephemeral_rows", None)
+    if not isinstance(pending, dict):
+        return
+    planned = [
+        dict(row) for row in (pending.get("rows") or [])
+        if isinstance(row, dict)
+    ]
+    observed = [
+        dict(row) for row in (observed_rows or [])
+        if isinstance(row, dict)
+    ] if isinstance(observed_rows, list) else []
+    if not observed:
+        return
+    from harness.skill.ephemeral import canonical_page_target
+
+    preferred = str(pending.get("bindingVariable") or "")
+    completed_urls = {
+        canonical_page_target(row, preferred_field=preferred)
+        for row in observed
+    }
+    completed_urls.discard("")
+    if not completed_urls:
+        return
+    remaining = [
+        row for row in planned
+        if canonical_page_target(row, preferred_field=preferred) not in completed_urls
+    ]
+    if remaining:
+        pending["rows"] = remaining
+        agent.pending_ephemeral_rows = pending
+    else:
+        agent.pending_ephemeral_rows = None
+
+
+def _pending_ephemeral_final_rejection(
+    agent: Any,
+    final_status: str,
+) -> Optional[JsonDict]:
+    from harness.skill.ephemeral import pending_ephemeral_final_rejection
+
+    return pending_ephemeral_final_rejection(agent, final_status)
+
+
+def _attach_ephemeral_fallback(
+    agent: Any,
+    record_result: JsonDict,
+    report: JsonDict,
+    *,
+    remaining_rows: List[JsonDict],
+    binding_variable: str,
+    reason: str,
+) -> JsonDict:
+    remaining = [dict(row) for row in remaining_rows if isinstance(row, dict)]
+    if remaining:
+        agent.pending_ephemeral_rows = {
+            "rows": remaining,
+            "bindingVariable": binding_variable or None,
+            "reason": reason,
+        }
+    fallback = dict(report.get("fallback") or {})
+    fallback.update({
+        "reason": reason,
+        "remainingRowCount": len(remaining),
+        "remainingRows": remaining,
+    })
+    report["fallback"] = fallback
+    record_result["ephemeralWorkflow"] = report
+    record_result["requiresModelReplan"] = bool(remaining)
+    if remaining:
+        record_result["next_instruction"] = (
+            "Ephemeral workflow reuse stopped. Continue every fallback.remainingRows"
+            " item through the ordinary browser slow path, then call"
+            " record_extraction with a combined dataset. Do not finalize done"
+            " while pending rows remain."
+        )
+    return record_result
+
+
+def _persist_ephemeral_partial(
+    agent: Any,
+    record_input: JsonDict,
+    rows: List[JsonDict],
+    *,
+    reason: str,
+) -> Optional[JsonDict]:
+    if len(rows) <= 1:
+        return None
+    return _record_extraction(agent, {
+        "name": str(record_input.get("name") or "ephemeral_batch"),
+        "rows": rows,
+        "schema": {"source": "ephemeral_workflow_partial", "reason": reason},
+        "description": (
+            "Rows preserved before temporary workflow fallback; ordinary slow"
+            " path must complete and re-record the combined dataset."
+        ),
+    })
+
+
+async def _maybe_run_ephemeral_batch_after_first_row(
+    agent: Any,
+    record_input: JsonDict,
+    record_result: JsonDict,
+    *,
+    step: int,
+) -> JsonDict:
+    if bool(getattr(agent, "_ephemeral_workflow_attempted", False)):
+        return record_result
+    if not bool(getattr(agent.runtime.harness, "ephemeral_workflow_enabled", False)):
+        return record_result
+    contract = getattr(agent, "worker_contract", None)
+    contract = contract if isinstance(contract, dict) else {}
+    batch_rows = contract.get("batch_rows")
+    batch_rows = [dict(row) for row in batch_rows if isinstance(row, dict)] if isinstance(batch_rows, list) else []
+    observed_rows = record_input.get("rows")
+    observed_rows = [dict(row) for row in observed_rows if isinstance(row, dict)] if isinstance(observed_rows, list) else []
+    # One validated probe row + at least two remaining rows is the minimum at
+    # which compilation/canary can save work. Multi-row artifacts are already a
+    # batch result and must not trigger this path.
+    if len(observed_rows) != 1 or len(batch_rows) < 3:
+        return record_result
+    expected = contract.get("expected_artifact")
+    expected_fields = (
+        [str(field) for field in expected.get("fields") or [] if str(field)]
+        if isinstance(expected, dict) else []
+    )
+    if any(observed_rows[0].get(field) in (None, "") for field in expected_fields):
+        return record_result
+    page_id = str(getattr(agent, "axtree_page_id", "") or "").strip()
+    if not page_id:
+        return record_result
+
+    agent._ephemeral_workflow_attempted = True
+    from harness.skill.ephemeral import (
+        canonical_page_target,
+        compile_ephemeral_workflow,
+        execute_ephemeral_rows,
+    )
+    workflow, compile_report = compile_ephemeral_workflow(
+        list(getattr(agent, "trace", []) or []),
+        capability_methods=getattr(agent, "capability_methods", set()),
+        task_type=str(contract.get("task_type") or "general"),
+    )
+    if workflow is None:
+        report = {**compile_report, "executionStatus": "fallback_required"}
+        return _attach_ephemeral_fallback(
+            agent,
+            record_result,
+            report,
+            remaining_rows=batch_rows[1:],
+            binding_variable="",
+            reason=str(compile_report.get("reason") or "workflow_not_compilable"),
+        )
+    binding_variable = str(workflow.get("pageBindingVariable") or "").strip()
+    first_url = canonical_page_target(
+        observed_rows[0], preferred_field=binding_variable
+    )
+    planned_first_url = canonical_page_target(
+        batch_rows[0], preferred_field=binding_variable
+    )
+    if not first_url or not planned_first_url or first_url != planned_first_url:
+        report = {
+            **compile_report,
+            "executionStatus": "fallback_required",
+            "reason": "first_row_page_binding_unknown_or_mismatch",
+            "bindingVariable": binding_variable or None,
+        }
+        return _attach_ephemeral_fallback(
+            agent,
+            record_result,
+            report,
+            remaining_rows=batch_rows[1:],
+            binding_variable=binding_variable,
+            reason="first_row_page_binding_unknown_or_mismatch",
+        )
+
+    async def execute_workflow(params: JsonDict) -> JsonDict:
+        result = await _invoke_browser_method(
+            agent,
+            "Workflow.execute",
+            params,
+            step,
+            count_progress=False,
+        )
+        if not _invoke_result_failed(result):
+            # Workflow inner calls still emit lifecycle notifications, but are
+            # opaque to the outer dispatcher. The compiler/policy guarantees
+            # Page.getState + DOM.getAXTree after navigation, so reconcile the
+            # tracker from the workflow's final extracted state instead of
+            # forcing two redundant RPCs per row.
+            tracker = getattr(agent, "page_lifecycle", None)
+            if isinstance(tracker, PageLifecycleTracker):
+                variables = _response_data(result).get("variables")
+                variables = variables if isinstance(variables, dict) else {}
+                tracker.observe_state_response(page_id, {
+                    "data": {"status": variables.get("pageStatus") or "idle"}
+                })
+                tracker.observe_ax_refresh(page_id)
+        return result
+
+    batch_result = await execute_ephemeral_rows(
+        agent,
+        workflow,
+        batch_rows[1:],
+        worker_contract=contract,
+        page_id=page_id,
+        fleet_id=str(getattr(agent, "assigned_fleet_id", "") or ""),
+        execute_workflow=execute_workflow,
+    )
+    if batch_result.get("workflowAttempted"):
+        record_result["browserStateMayHaveChanged"] = True
+    report = {
+        **compile_report,
+        "executionStatus": batch_result.get("status"),
+        "canaryPassed": bool(batch_result.get("canaryPassed")),
+        "completedRows": batch_result.get("completedRows", 0),
+        "runs": batch_result.get("runs") or [],
+        "persistedToRegistry": False,
+    }
+    if batch_result.get("status") != "done":
+        completed_count = int(batch_result.get("completedRows") or 0)
+        preserved_rows = [
+            observed_rows[0],
+            *list(batch_result.get("rows") or []),
+        ]
+        partial_artifact = _persist_ephemeral_partial(
+            agent,
+            record_input,
+            preserved_rows,
+            reason=str(batch_result.get("reason") or batch_result.get("status") or "partial"),
+        )
+        if partial_artifact is not None:
+            report["partialArtifact"] = partial_artifact
+        report["fallback"] = {
+            "reason": batch_result.get("reason"),
+            "nextRowOffset": 1 + completed_count,
+        }
+        return _attach_ephemeral_fallback(
+            agent,
+            record_result,
+            report,
+            remaining_rows=batch_rows[1 + completed_count:],
+            binding_variable=binding_variable,
+            reason=str(batch_result.get("reason") or batch_result.get("status") or "partial"),
+        )
+
+    combined_rows = [observed_rows[0], *list(batch_result.get("rows") or [])]
+    missing = [
+        {"row": index, "field": field}
+        for index, row in enumerate(combined_rows)
+        for field in expected_fields
+        if not isinstance(row, dict) or row.get(field) in (None, "")
+    ]
+    if missing:
+        report["executionStatus"] = "partial"
+        partial_artifact = _persist_ephemeral_partial(
+            agent,
+            record_input,
+            combined_rows,
+            reason="compiled_rows_missing_expected_fields",
+        )
+        if partial_artifact is not None:
+            report["partialArtifact"] = partial_artifact
+        report["fallback"] = {
+            "reason": "compiled_rows_missing_expected_fields",
+            "missing": missing[:20],
+        }
+        missing_indexes = sorted({int(item["row"]) for item in missing})
+        return _attach_ephemeral_fallback(
+            agent,
+            record_result,
+            report,
+            remaining_rows=[
+                batch_rows[index]
+                for index in missing_indexes
+                if 0 <= index < len(batch_rows)
+            ],
+            binding_variable=binding_variable,
+            reason="compiled_rows_missing_expected_fields",
+        )
+    merged_artifact = _record_extraction(agent, {
+        "name": str(record_input.get("name") or "ephemeral_batch"),
+        "rows": combined_rows,
+        "schema": {
+            "source": "ephemeral_workflow",
+            "canary": "second_row",
+        },
+        "description": (
+            str(record_input.get("description") or "")
+            or "First row observed by LLM; remaining rows ran through a canary-gated ephemeral workflow."
+        ),
+    })
+    report["mergedArtifact"] = merged_artifact
+    report["totalRows"] = len(combined_rows)
+    agent.pending_ephemeral_rows = None
+    record_result["ephemeralWorkflow"] = report
+    return record_result
 
 
 @BROWSER_TOOLS.register(
@@ -1305,6 +1840,13 @@ async def _execute_browser_capability_tool(
         agent.trace.append({"type": "tool_error", "result": result})
         return result, False
 
+    runtime_policy = (
+        tool_input.get("runtime_policy")
+        if isinstance(tool_input, dict) else None
+    )
+    runtime_receipt: JsonDict = {}
+    runtime_json_expression = ""
+
     if params_error:
         result = {
             "method": method,
@@ -1337,6 +1879,47 @@ async def _execute_browser_capability_tool(
             return progress_result, False
         agent.trace.append({"type": "browser_call_rejected", "result": result})
         return result, False
+
+    if method == "Runtime.evaluate":
+        prepared, policy_error = _prepare_runtime_evaluation(
+            agent,
+            params,
+            runtime_policy,
+            origin="model_browser_call" if tool_name == "browser_call" else "model_direct_capability",
+        )
+        if policy_error is not None:
+            attach_method_schema(policy_error, method, agent.method_schemas)
+            agent.logger.write("runtime.evaluate.rejected", policy_error)
+            agent.trace.append({"type": "runtime_policy_rejected", "result": policy_error})
+            return policy_error, False
+        params = dict(prepared.params)
+        runtime_receipt = dict(prepared.receipt)
+        if runtime_receipt.get("resultMode") == "json":
+            runtime_json_expression = _build_eval_js_json_expression(
+                str(params.get("expression") or "")
+            )
+            params["expression"] = runtime_json_expression
+            params["returnByValue"] = True
+
+    if method == "Workflow.execute":
+        contract = getattr(agent, "worker_contract", None)
+        task_type = (
+            str(contract.get("task_type") or "general")
+            if isinstance(contract, dict) else "general"
+        )
+        normalized_workflow, workflow_error = validate_workflow_params(
+            params,
+            capability_methods=getattr(agent, "capability_methods", set()),
+            task_type=task_type,
+            allow_runtime=False,
+            enforce_lifecycle=True,
+        )
+        if workflow_error is not None:
+            attach_method_schema(workflow_error, method, agent.method_schemas)
+            agent.logger.write("workflow.execute.rejected", workflow_error)
+            agent.trace.append({"type": "workflow_policy_rejected", "result": workflow_error})
+            return workflow_error, False
+        params = dict(normalized_workflow)
 
     contract_result = _check_worker_contract(agent, method)
     if contract_result is not None:
@@ -1402,6 +1985,16 @@ async def _execute_browser_capability_tool(
             "result": auth_barrier_guard,
         })
         return auth_barrier_guard, False
+
+    lifecycle_guard = await _page_lifecycle_guard_before(agent, method, params)
+    if lifecycle_guard is not None:
+        agent.logger.write("browser.call.lifecycle_gated", lifecycle_guard)
+        agent.trace.append({
+            "type": "page_lifecycle_gate",
+            "method": method,
+            "result": lifecycle_guard,
+        })
+        return lifecycle_guard, False
 
     screenshot_guard = _check_screenshot_misuse(method, params, reason)
     if screenshot_guard is not None:
@@ -1494,8 +2087,14 @@ async def _execute_browser_capability_tool(
                 str(params.get("pageId") or ""),
                 step,
             )
+        _page_lifecycle_before_action(agent, method, params)
         response, _recovery = await runner.call(method, params)
+        _page_lifecycle_after_action(agent, method, params, response)
         response = agent._capture_artifacts(method, response)
+        record_file_action = getattr(agent, "_capture_file_action", None)
+        if callable(record_file_action):
+            record_file_action(method, params, response)
+        response = _annotate_dom_batch_response(method, response)
         page_list_receipt: JsonDict = {}
         if method == "Page.list":
             response, page_list_receipt = _filter_page_list_response(
@@ -1515,6 +2114,35 @@ async def _execute_browser_capability_tool(
             "params": params,
             "response": response,
         }
+        if runtime_receipt:
+            result["runtimePolicy"] = runtime_receipt
+            if runtime_receipt.get("resultMode") == "json":
+                payload = _runtime_any_json_payload(result)
+                if payload is None and runtime_json_expression:
+                    payload = await _eval_json_via_title(
+                        agent,
+                        str(params.get("pageId") or ""),
+                        runtime_json_expression,
+                        step,
+                        str(params.get("purpose") or reason or "Read Runtime JSON result"),
+                    )
+                if isinstance(payload, dict) and payload.get("error"):
+                    result["runtimeJSONError"] = {
+                        "error": str(payload.get("error")),
+                        "stack": str(payload.get("stack") or "")[:1000],
+                    }
+                elif isinstance(payload, dict) and "value" in payload:
+                    _attach_runtime_json_value(
+                        agent,
+                        result,
+                        payload.get("value"),
+                        runtime_receipt,
+                        step=step,
+                    )
+                else:
+                    result["runtimeJSONError"] = {
+                        "error": "Runtime.evaluate did not return a JSON envelope"
+                    }
         if page_list_receipt:
             result.update(page_list_receipt)
         if isinstance(response, dict) and response.get("error"):
@@ -1618,6 +2246,8 @@ async def _invoke_browser_method(
     allow_rematch: bool = False,
     internal: bool = False,
     redact_params: Optional[Set[str]] = None,
+    runtime_policy: Optional[JsonDict] = None,
+    lifecycle_cleanup_bypass: bool = False,
 ) -> JsonDict:
     # internal=True marks a harness plumbing call (e.g. the title side-channel's
     # PENDING/READY/CHUNK markers): it must not enter the observation chain —
@@ -1625,6 +2255,24 @@ async def _invoke_browser_method(
     # only a compact audit log. Such calls also never count as progress.
     if internal:
         count_progress = False
+    runtime_receipt: JsonDict = {}
+    if method == "Runtime.evaluate":
+        origin = str((runtime_policy or {}).get("origin") or "").strip()
+        policy_payload = dict(runtime_policy or {})
+        policy_payload.pop("origin", None)
+        prepared, policy_error = _prepare_runtime_evaluation(
+            agent,
+            params,
+            policy_payload,
+            origin=origin or "harness_unspecified",
+        )
+        if policy_error is not None:
+            logger = getattr(agent, "logger", None)
+            if logger is not None:
+                logger.write("runtime.evaluate.rejected", policy_error)
+            return policy_error
+        params = dict(prepared.params)
+        runtime_receipt = dict(prepared.receipt)
     # redact_params: the browser still receives the real values, but these keys
     # are masked everywhere the call surfaces (result/log/trace/model_result,
     # and the render-recovery logs/advisory), so secrets (e.g. Input.type text
@@ -1651,6 +2299,16 @@ async def _invoke_browser_method(
     )
     if auth_barrier_guard is not None:
         return auth_barrier_guard
+    if lifecycle_cleanup_bypass and not internal:
+        return {
+            "status": "rejected",
+            "policy_violation": "lifecycle_cleanup_bypass_requires_internal",
+            "tool_was_executed": False,
+        }
+    if not lifecycle_cleanup_bypass:
+        lifecycle_guard = await _page_lifecycle_guard_before(agent, method, params)
+        if lifecycle_guard is not None:
+            return lifecycle_guard
     _ensure_hitl_request_reason(method, params, str(params.get("purpose") or ""))
     hitl_claim_guard = await _claim_fleet_auth_barrier_for_hitl(
         agent, method, params
@@ -1683,8 +2341,13 @@ async def _invoke_browser_method(
                 str(params.get("pageId") or ""),
                 step,
             )
+        _page_lifecycle_before_action(agent, method, params)
         response, _recovery = await runner.call(method, params, **runner_kwargs)
+        _page_lifecycle_after_action(agent, method, params, response)
         response = agent._capture_artifacts(method, response)
+        record_file_action = getattr(agent, "_capture_file_action", None)
+        if callable(record_file_action):
+            record_file_action(method, params, response)
         axtree_snapshot = _precompute_axtree_snapshot(method, params, response)
         response = agent._offload_response(method, params, response, step)
         hitl_pause_succeeded = (
@@ -1697,6 +2360,8 @@ async def _invoke_browser_method(
             "params": _shown_params(params),
             "response": response,
         }
+        if runtime_receipt:
+            result["runtimePolicy"] = runtime_receipt
         if isinstance(response, dict) and response.get("error"):
             attach_method_schema(result, method, agent.method_schemas)
     except ABCPTransportError as exc:
@@ -1796,6 +2461,12 @@ async def _extract_dom_records(agent: Any, tool_input: JsonDict, step: int) -> J
             "purpose": purpose,
         },
         step,
+        runtime_policy={
+            "origin": "structured_dom_composite",
+            "intent": "extract",
+            "effect": "read_only",
+            "result_mode": "json",
+        },
     )
 
     payload = _runtime_json_payload(eval_result)
@@ -1916,7 +2587,19 @@ async def _eval_js_json_tool(agent: Any, tool_input: JsonDict, step: int) -> Jso
             "purpose": purpose,
         },
         step,
+        runtime_policy={
+            "origin": "model_legacy_alias",
+            "intent": "extract" if record_name else "diagnostic",
+            "effect": "read_only",
+            "reason_kind": reason_kind,
+            "why_structured_tools_insufficient": why_dom_primitives_insufficient,
+            "cross_check_plan": cross_check_plan,
+            "result_mode": "json",
+            "record_name": record_name,
+        },
     )
+    if isinstance(eval_result, dict) and eval_result.get("policy_violation"):
+        return eval_result
 
     payload = _runtime_any_json_payload(eval_result)
     if payload is None:
@@ -2180,7 +2863,6 @@ async def _navigate_verified(agent: Any, tool_input: JsonDict, step: int) -> Jso
     expected_url_pattern = str(tool_input.get("expectedUrlPattern") or "").strip()
     expected_title_pattern = str(tool_input.get("expectedTitlePattern") or "").strip()
     timeout_seconds = max(1.0, min(float(tool_input.get("timeoutSeconds") or 20.0), 120.0))
-    poll_interval = max(0.25, min(float(tool_input.get("pollIntervalSeconds") or 1.0), 5.0))
     max_retries = max(1, min(optional_int(tool_input.get("maxRetries"), 1) or 1, 3))
     if not page_id:
         return {"status": "failed", "error": "pageId is required"}
@@ -2191,15 +2873,11 @@ async def _navigate_verified(agent: Any, tool_input: JsonDict, step: int) -> Jso
     title_re = re.compile(expected_title_pattern) if expected_title_pattern else None
     url_re = re.compile(pattern)
     attempts: List[JsonDict] = []
-    internal_poll_count = 0
+    state_resync_count = 0
     last_challenge_summary: JsonDict = {}
-    challenge_poll_limit = _navigate_challenge_poll_limit(
-        timeout_seconds,
-        poll_interval,
-        max_retries,
-    )
 
     for attempt in range(1, max_retries + 1):
+        deadline = time.monotonic() + timeout_seconds
         nav = await _invoke_browser_method(
             agent,
             "Page.navigate",
@@ -2214,21 +2892,35 @@ async def _navigate_verified(agent: Any, tool_input: JsonDict, step: int) -> Jso
         if _result_has_auto_hitl(nav):
             return _navigate_hitl_result(page_id, attempt, nav)
         last_challenge_summary = _page_challenge_summary(agent, page_id)
-        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        tracker = getattr(agent, "page_lifecycle", None)
+        settlement = "unknown"
+        if isinstance(tracker, PageLifecycleTracker):
+            settlement = await tracker.wait_for_settlement(page_id, timeout_seconds)
+        redirect_settlements = 0
         last_state: JsonDict = {}
         while True:
+            # Register the fresh settlement waiter before Page.getState so a
+            # redirect that starts/finishes during the RPC cannot fall through
+            # the gap. This is event-driven redirect tolerance, not polling.
+            remaining = max(0.0, deadline - time.monotonic())
+            redirect_waiter = None
+            if redirect_settlements < 5 and remaining > 0:
+                redirect_waiter = _fresh_page_settlement_task(
+                    agent, page_id, remaining
+                )
             state_result = await _invoke_browser_method(
                 agent,
                 "Page.getState",
                 {
                     "pageId": page_id,
-                    "purpose": "Verify navigation reached the expected page",
+                    "purpose": "Synchronize state once after navigation settlement",
                 },
                 step,
                 count_progress=False,
             )
-            internal_poll_count += 1
+            state_resync_count += 1
             if _result_has_auto_hitl(state_result):
+                await _cancel_waiter(redirect_waiter)
                 return _navigate_hitl_result(page_id, attempt, state_result)
             data = _response_data(state_result)
             current_url = str(data.get("url") or "")
@@ -2244,9 +2936,31 @@ async def _navigate_verified(agent: Any, tool_input: JsonDict, step: int) -> Jso
                 "urlOk": url_ok,
                 "titleOk": title_ok,
                 "titleLingering": title_is_lingering,
+                "settlement": settlement,
+                "redirectSettlements": redirect_settlements,
             }
             last_challenge_summary = _page_challenge_summary(agent, page_id)
             if url_ok and title_ok and not title_is_lingering:
+                await _cancel_waiter(redirect_waiter)
+                # Page.navigate invalidates DOM identity. Refresh the AXTree before
+                # returning so callers cannot inherit a clean-looking stale cache.
+                tree_result = await _invoke_browser_method(
+                    agent,
+                    "DOM.getAXTree",
+                    {
+                        "pageId": page_id,
+                        "purpose": "Refresh DOM identity after verified navigation",
+                    },
+                    step,
+                    count_progress=False,
+                )
+                if _invoke_result_failed(tree_result):
+                    attempts.append({
+                        "attempt": attempt,
+                        "lastState": last_state,
+                        "axtreeRefresh": tree_result,
+                    })
+                    break
                 _clear_navigation_challenge_state(agent, page_id)
                 return {
                     "status": "done",
@@ -2257,29 +2971,17 @@ async def _navigate_verified(agent: Any, tool_input: JsonDict, step: int) -> Jso
                     "attempt": attempt,
                     "navigateResult": _strip_challenge_fields(nav),
                     "state": last_state,
-                    "internalPollCount": internal_poll_count,
+                    "stateResyncCount": state_resync_count,
+                    "redirectSettlementCount": redirect_settlements,
+                    "axtreeRefreshed": True,
                 }
-            if _should_block_navigation_for_challenge(
-                agent,
-                page_id,
-                challenge_poll_limit=challenge_poll_limit,
-                internal_poll_count=internal_poll_count,
-                title_is_lingering=title_is_lingering,
-            ):
-                return _navigate_challenge_blocked_result(
-                    page_id=page_id,
-                    attempt=attempt,
-                    last_state=last_state,
-                    attempts=attempts,
-                    internal_poll_count=internal_poll_count,
-                    challenge_summary=last_challenge_summary,
-                    expected_url_pattern=pattern,
-                    expected_title_pattern=expected_title_pattern,
-                    trigger="bounded_lingering_challenge",
-                )
-            if asyncio.get_running_loop().time() >= deadline:
+            settlement_event = (
+                await redirect_waiter if redirect_waiter is not None else None
+            )
+            if settlement_event is None:
                 break
-            await asyncio.sleep(poll_interval)
+            redirect_settlements += 1
+            settlement = str(settlement_event.get("event") or "redirect_settled")
         attempts.append({"attempt": attempt, "lastState": last_state})
 
     if _challenge_score(last_challenge_summary) >= 80:
@@ -2288,7 +2990,7 @@ async def _navigate_verified(agent: Any, tool_input: JsonDict, step: int) -> Jso
             attempt=max_retries,
             last_state=attempts[-1].get("lastState", {}) if attempts else {},
             attempts=attempts,
-            internal_poll_count=internal_poll_count,
+            state_resync_count=state_resync_count,
             challenge_summary=last_challenge_summary,
             expected_url_pattern=pattern,
             expected_title_pattern=expected_title_pattern,
@@ -2301,7 +3003,7 @@ async def _navigate_verified(agent: Any, tool_input: JsonDict, step: int) -> Jso
         "expectedUrlPattern": pattern,
         "expectedTitlePattern": expected_title_pattern or None,
         "attempts": attempts,
-        "internalPollCount": internal_poll_count,
+        "stateResyncCount": state_resync_count,
         "suspectedChallenge": last_challenge_summary or None,
         "next_instruction": (
             "Do not assume navigation succeeded. Reuse the reported actual URL/title,"
@@ -2310,13 +3012,46 @@ async def _navigate_verified(agent: Any, tool_input: JsonDict, step: int) -> Jso
     }
 
 
-def _navigate_challenge_poll_limit(
+def _fresh_page_settlement_task(
+    agent: Any,
+    page_id: str,
     timeout_seconds: float,
-    poll_interval: float,
-    max_retries: int,
-) -> int:
-    budget_polls = int((timeout_seconds * max_retries) / max(poll_interval, 0.25))
-    return max(8, min(30, budget_polls))
+) -> Optional["asyncio.Task[Optional[JsonDict]]"]:
+    waiter = getattr(getattr(agent, "browser", None), "wait_for_notification", None)
+    if not callable(waiter):
+        return None
+
+    def predicate(message: JsonDict) -> bool:
+        event = unwrap_notification(message)
+        if event is None or str(event.get("event") or "") not in {
+            "Page.loaded", "Page.loadFailed", "Page.crashed",
+        }:
+            return False
+        payload = event.get("payload")
+        return bool(
+            isinstance(payload, dict)
+            and str(payload.get("pageId") or "") == page_id
+        )
+
+    async def wait() -> Optional[JsonDict]:
+        try:
+            message = await waiter(predicate, timeout=max(0.0, timeout_seconds))
+        except TypeError:
+            message = await waiter(predicate, max(0.0, timeout_seconds))
+        return unwrap_notification(message)
+
+    return asyncio.create_task(wait())
+
+
+async def _cancel_waiter(waiter: Optional["asyncio.Task[Any]"]) -> None:
+    if waiter is None:
+        return
+    if not waiter.done():
+        waiter.cancel()
+    try:
+        await waiter
+    except asyncio.CancelledError:
+        pass
 
 
 def _page_challenge_summary(agent: Any, page_id: str) -> JsonDict:
@@ -2330,32 +3065,6 @@ def _challenge_score(summary: JsonDict) -> int:
         return int(summary.get("suspicionScore") or 0)
     except (TypeError, ValueError):
         return 0
-
-
-def _vl_unavailable(agent: Any) -> bool:
-    vl_config = getattr(getattr(agent.runtime, "harness", None), "vl", None)
-    return not bool(vl_config is not None and getattr(vl_config, "enabled", False))
-
-
-def _should_block_navigation_for_challenge(
-    agent: Any,
-    page_id: str,
-    *,
-    challenge_poll_limit: int,
-    internal_poll_count: int,
-    title_is_lingering: bool,
-) -> bool:
-    if not title_is_lingering or not _vl_unavailable(agent):
-        return False
-    tracker = getattr(agent, "challenge_tracker", None)
-    state = tracker.get_state(page_id) if tracker is not None and page_id else None
-    if state is None:
-        return False
-    return (
-        state.suspicion_score >= 80
-        and internal_poll_count >= challenge_poll_limit
-        and state.lingering_title_count >= challenge_poll_limit
-    )
 
 
 def _clear_navigation_challenge_state(agent: Any, page_id: str) -> None:
@@ -2399,7 +3108,7 @@ def _navigate_challenge_blocked_result(
     attempt: int,
     last_state: JsonDict,
     attempts: List[JsonDict],
-    internal_poll_count: int,
+    state_resync_count: int,
     challenge_summary: JsonDict,
     expected_url_pattern: str,
     expected_title_pattern: str,
@@ -2411,7 +3120,7 @@ def _navigate_challenge_blocked_result(
         "attempt": attempt,
         "lastState": last_state,
         "attempts": attempts,
-        "internalPollCount": internal_poll_count,
+        "stateResyncCount": state_resync_count,
         "expectedUrlPattern": expected_url_pattern,
         "expectedTitlePattern": expected_title_pattern or None,
         "suspectedChallenge": challenge_summary or None,
@@ -2627,6 +3336,8 @@ def _invoke_result_failed(result: Any) -> bool:
     only reads result["error"] would report a failed retry as succeeded."""
     if not isinstance(result, dict):
         return False
+    if result.get("tool_was_executed") is False:
+        return True
     if result.get("error"):
         return True
     if result.get("status") == "stale_element_reference":
@@ -3567,13 +4278,33 @@ async def _promote_visual_locate(
             step,
         )
         lines = (_response_data(ax) or {}).get("lines") or []
-        dpr_resp = await _invoke_browser_method(
-            agent, "Runtime.evaluate",
-            {"pageId": page_id, "returnByValue": True,
-             "expression": "return {dpr: window.devicePixelRatio || 1};",
-             "purpose": "read devicePixelRatio to map screenshot px to CSS px"},
-            step,
-        )
+        try:
+            dpr_resp = await _invoke_browser_method(
+                agent, "Runtime.evaluate",
+                {"pageId": page_id, "returnByValue": True,
+                 "expression": "return {dpr: window.devicePixelRatio || 1};",
+                 "purpose": "read devicePixelRatio to map screenshot px to CSS px"},
+                step,
+                runtime_policy={
+                    "origin": "harness_read_only_oracle",
+                    "intent": "diagnostic",
+                    "effect": "read_only",
+                    "result_mode": "raw",
+                },
+            )
+        except TypeError as exc:
+            # Compatibility for instrumented/legacy test doubles that expose
+            # the historical four-argument helper signature. The real helper
+            # accepts runtime_policy, so production calls never take this path.
+            if "runtime_policy" not in str(exc):
+                raise
+            dpr_resp = await _invoke_browser_method(
+                agent, "Runtime.evaluate",
+                {"pageId": page_id, "returnByValue": True,
+                 "expression": "return {dpr: window.devicePixelRatio || 1};",
+                 "purpose": "read devicePixelRatio to map screenshot px to CSS px"},
+                step,
+            )
         dpr = float((_response_data(dpr_resp) or {}).get("dpr") or 1.0) or 1.0
         promo = promote_locate(lines, verdict["point"], shot_w=shot_w, shot_h=shot_h, dpr=dpr)
         promo = apply_promotion_guard(
@@ -3858,6 +4589,93 @@ def _rows_from_eval_value(value: Any) -> Optional[List[JsonDict]]:
     return rows if len(rows) == len(candidate) else None
 
 
+def _attach_runtime_json_value(
+    agent: Any,
+    result: JsonDict,
+    value: Any,
+    runtime_receipt: JsonDict,
+    *,
+    step: int,
+) -> None:
+    """Attach JSON-mode Runtime output and preserve extraction guarantees.
+
+    Runtime.evaluate's browser_call path used to report ``recordName`` in its
+    policy receipt even when a non-row value could not be persisted.  Keep the
+    raw value available for diagnostics, but make that contract failure
+    explicit and apply the same unrecorded-row gate as the legacy alias.
+    """
+    result["runtimeValue"] = value
+    result["runtimeValueType"] = type(value).__name__
+    record_name = str(runtime_receipt.get("recordName") or "").strip()
+    rows = _rows_from_eval_value(value)
+    if record_name:
+        if rows is None:
+            message = (
+                "record_name was provided, but Runtime.evaluate returned neither"
+                " a list of objects nor an object with rows=[...]"
+            )
+            result["runtimeJSONError"] = {
+                "code": "runtime_record_value_not_rows",
+                "error": message,
+            }
+            result["recordExtraction"] = {
+                "status": "failed",
+                "error": message,
+                "tool_was_executed": False,
+            }
+            return
+        record_result = _record_extraction(
+            agent,
+            {
+                "name": record_name,
+                "rows": rows,
+                "schema": {"source": "Runtime.evaluate"},
+                "description": "Rows extracted by Runtime.evaluate",
+            },
+        )
+        result["recordExtraction"] = record_result
+        if _record_extraction_persisted(record_result):
+            agent.pending_unrecorded_extraction = None
+        return
+    if rows:
+        agent.pending_unrecorded_extraction = {
+            "source": "Runtime.evaluate",
+            "step": step,
+            "rowCount": len(rows),
+            "turns": 0,
+        }
+
+
+def _json_sidechannel_ready_event(
+    message: Any,
+    page_id: str,
+    prefix: str,
+) -> bool:
+    """Accept only a terminal title side-channel notification.
+
+    ``PENDING`` is deliberately excluded: accepting it releases the waiter
+    before asynchronous evaluation has produced a result.
+    """
+    if not isinstance(message, dict):
+        return False
+    notification = message.get("notification")
+    envelope = notification if isinstance(notification, dict) else message
+    event = str(envelope.get("event") or envelope.get("method") or "")
+    if event != "Page.titleUpdated":
+        return False
+    payload = envelope.get("params")
+    if not isinstance(payload, dict):
+        payload = envelope.get("data")
+    payload = payload if isinstance(payload, dict) else envelope
+    observed_page = str(payload.get("pageId") or envelope.get("pageId") or "")
+    if page_id and observed_page != page_id:
+        return False
+    title = str(payload.get("title") or "")
+    return title.startswith(f"{prefix}|READY|") or title.startswith(
+        f"{prefix}|ERROR|"
+    )
+
+
 async def _eval_json_via_title(
     agent: Any,
     page_id: str,
@@ -3873,9 +4691,23 @@ async def _eval_json_via_title(
     internal: bool = False,
 ) -> Optional[Any]:
     prefix = "__ABCP_JSON__"
+    world_params = (
+        {"world": "isolated"}
+        if RuntimeEvaluationService(
+            getattr(agent, "method_schemas", {})
+        ).supports_world()
+        else {}
+    )
+    compatibility_policy = {
+        "origin": "harness_compatibility",
+        "intent": "diagnostic",
+        "effect": "state_changing",
+        "result_mode": "raw",
+    }
     setup = f"""
 (async () => {{
   try {{
+    window.__abcpOriginalTitle = document.title;
     document.title = "{prefix}|PENDING|0";
     const __abcpJsonText = await ({json_string_expression});
     const text = String(__abcpJsonText ?? "null");
@@ -3895,66 +4727,107 @@ async def _eval_json_via_title(
   }}
 }})()
 """
-    await _invoke_browser_method(
-        agent,
-        "Runtime.evaluate",
-        {
-            "pageId": page_id,
-            "expression": setup,
-            "returnByValue": True,
-            "purpose": f"{purpose}; initialize JSON title side-channel",
-        },
-        step,
-        read_only_eval=read_only_eval,
-        internal=internal,
-    )
-    title = ""
-    deadline = asyncio.get_running_loop().time() + max(1.0, ready_timeout_seconds)
-    error_title = ""
-    while asyncio.get_running_loop().time() < deadline:
+    async def cleanup() -> None:
+        cleanup_expression = f"""
+(() => {{
+  if (typeof window.__abcpOriginalTitle === "string") {{
+    document.title = window.__abcpOriginalTitle;
+  }}
+  delete window.__abcpOriginalTitle;
+  delete window.__abcpJsonB64;
+  delete window.__abcpJsonOffset;
+  return true;
+}})()
+"""
+        await _invoke_browser_method(
+            agent,
+            "Runtime.evaluate",
+            {
+                "pageId": page_id,
+                "expression": cleanup_expression,
+                "returnByValue": True,
+                "purpose": "Restore title and clear JSON side-channel state",
+                **world_params,
+            },
+            step,
+            read_only_eval=read_only_eval,
+            internal=True,
+            runtime_policy=compatibility_policy,
+            lifecycle_cleanup_bypass=True,
+        )
+
+    try:
+        setup_result = await _invoke_browser_method(
+            agent,
+            "Runtime.evaluate",
+            {
+                "pageId": page_id,
+                "expression": setup,
+                "returnByValue": True,
+                "purpose": f"{purpose}; initialize JSON title side-channel",
+                **world_params,
+            },
+            step,
+            read_only_eval=read_only_eval,
+            internal=internal,
+            runtime_policy=compatibility_policy,
+        )
+        if _invoke_result_failed(setup_result):
+            return {
+                "error": "JSON title side-channel setup was rejected or failed",
+                "setupResult": setup_result,
+            }
+        waiter = getattr(getattr(agent, "browser", None), "wait_for_notification", None)
+        if callable(waiter):
+            def title_event(message: JsonDict) -> bool:
+                return _json_sidechannel_ready_event(message, page_id, prefix)
+            try:
+                await waiter(
+                    title_event,
+                    timeout=max(1.0, ready_timeout_seconds),
+                    replay_window_seconds=2.0,
+                )
+            except TypeError:
+                await waiter(title_event, max(1.0, ready_timeout_seconds))
+        # One state synchronization after the event wait (or as its timeout
+        # fallback). This replaces the old Page.getState polling loop.
         ready = await _invoke_browser_method(
             agent,
             "Page.getState",
-            {"pageId": page_id, "purpose": "Read JSON side-channel ready marker"},
+            {"pageId": page_id, "purpose": "Read JSON side-channel ready marker once"},
             step,
             read_only_eval=read_only_eval,
             internal=internal,
         )
         title = str(_response_data(ready).get("title") or "")
-        if title.startswith(f"{prefix}|READY|"):
-            break
         if title.startswith(f"{prefix}|ERROR|"):
-            error_title = title
-            break
-        await asyncio.sleep(max(0.05, poll_interval_seconds))
-    if error_title:
-        return {
-            "error": error_title.split("|", 2)[-1] if "|ERROR|" in error_title else "unknown title side-channel error"
-        }
-    if not title.startswith(f"{prefix}|READY|"):
-        return {
-            "error": (
-                "Timed out waiting for eval_js_json title side-channel READY marker"
-                f" after {ready_timeout_seconds:.1f}s"
-            )
-        }
-    try:
-        total_len = int(title.rsplit("|", 1)[-1])
-    except ValueError:
-        return {
-            "error": f"Invalid eval_js_json READY marker length: {title[:200]}"
-        }
-
-    chunks: List[str] = []
-    while sum(len(chunk) for chunk in chunks) < total_len:
-        if len(chunks) >= max_chunks:
+            return {
+                "error": title.split("|", 2)[-1] if "|ERROR|" in title else "unknown title side-channel error"
+            }
+        if not title.startswith(f"{prefix}|READY|"):
             return {
                 "error": (
-                    "eval_js_json title side-channel exceeded max_chunks="
-                    f"{max_chunks} before reading {total_len} base64 chars"
+                    "Timed out waiting for eval_js_json title side-channel READY marker"
+                    f" after {ready_timeout_seconds:.1f}s"
                 )
             }
-        chunk_expr = f"""
+        try:
+            total_len = int(title.rsplit("|", 1)[-1])
+        except ValueError:
+            return {
+                "error": f"Invalid eval_js_json READY marker length: {title[:200]}"
+            }
+
+        chunks: List[str] = []
+        while sum(len(chunk) for chunk in chunks) < total_len:
+            if len(chunks) >= max_chunks:
+                return {
+                    "error": (
+                        "eval_js_json title side-channel exceeded max_chunks="
+                        f"{max_chunks} before reading {total_len} base64 chars"
+                    )
+                }
+            chunk_expr = f"""
 (() => {{
   const text = String(window.__abcpJsonB64 || "bnVsbA==");
   const start = Number(window.__abcpJsonOffset || 0);
@@ -3964,42 +4837,46 @@ async def _eval_json_via_title(
   return document.title;
 }})()
 """
-        await _invoke_browser_method(
-            agent,
-            "Runtime.evaluate",
-            {
-                "pageId": page_id,
-                "expression": chunk_expr,
-                "returnByValue": True,
-                "purpose": "Emit JSON title side-channel chunk",
-            },
-            step,
-            read_only_eval=read_only_eval,
-            internal=internal,
-        )
-        state = await _invoke_browser_method(
-            agent,
-            "Page.getState",
-            {"pageId": page_id, "purpose": "Read JSON title side-channel chunk"},
-            step,
-            read_only_eval=read_only_eval,
-            internal=internal,
-        )
-        title = str(_response_data(state).get("title") or "")
-        parts = title.split("|", 3)
-        if len(parts) != 4 or parts[0] != prefix or parts[1] != "CHUNK":
-            return {
-                "error": f"Invalid eval_js_json CHUNK marker: {title[:200]}"
-            }
-        chunks.append(parts[3])
+            await _invoke_browser_method(
+                agent,
+                "Runtime.evaluate",
+                {
+                    "pageId": page_id,
+                    "expression": chunk_expr,
+                    "returnByValue": True,
+                    "purpose": "Emit JSON title side-channel chunk",
+                    **world_params,
+                },
+                step,
+                read_only_eval=read_only_eval,
+                internal=internal,
+                runtime_policy=compatibility_policy,
+            )
+            state = await _invoke_browser_method(
+                agent,
+                "Page.getState",
+                {"pageId": page_id, "purpose": "Read JSON title side-channel chunk"},
+                step,
+                read_only_eval=read_only_eval,
+                internal=internal,
+            )
+            title = str(_response_data(state).get("title") or "")
+            parts = title.split("|", 3)
+            if len(parts) != 4 or parts[0] != prefix or parts[1] != "CHUNK":
+                return {
+                    "error": f"Invalid eval_js_json CHUNK marker: {title[:200]}"
+                }
+            chunks.append(parts[3])
 
-    try:
-        text = base64.b64decode("".join(chunks).encode("ascii")).decode("utf-8")
-        return json.loads(text)
-    except (ValueError, UnicodeDecodeError) as exc:
-        return {
-            "error": f"Failed to decode eval_js_json title side-channel payload: {exc}"
-        }
+        try:
+            text = base64.b64decode("".join(chunks).encode("ascii")).decode("utf-8")
+            return json.loads(text)
+        except (ValueError, UnicodeDecodeError) as exc:
+            return {
+                "error": f"Failed to decode eval_js_json title side-channel payload: {exc}"
+            }
+    finally:
+        await cleanup()
 
 
 def _response_data(result: JsonDict) -> JsonDict:
@@ -4845,6 +5722,62 @@ def _check_target_param_requirements(
     if not isinstance(params, dict):
         return None
     has_selector_or_id = _non_empty_param(params, "selector") or _non_empty_param(params, "id")
+    batch_methods = {"DOM.getText", "DOM.getAttribute", "DOM.getImg"}
+    raw_targets = params.get("targets")
+    has_batch_targets = isinstance(raw_targets, list) and bool(raw_targets)
+    if method in batch_methods and has_batch_targets:
+        schema = method_schemas.get(method) if isinstance(method_schemas, dict) else None
+        schema_params = schema.get("params") if isinstance(schema, dict) else None
+        if isinstance(schema_params, dict) and "targets" not in schema_params:
+            return {
+                "method": method,
+                "params": params,
+                "status": "capability_not_supported",
+                "error": f"The connected ABCP schema for {method} does not expose params.targets.",
+                "tool_was_executed": False,
+                "next_instruction": (
+                    "Use the single-target selector/id shape for this server version,"
+                    " or upgrade ABCP before using native batch reads."
+                ),
+            }
+        for index, target in enumerate(raw_targets):
+            if not isinstance(target, dict) or not (
+                _non_empty_param(target, "selector") or _non_empty_param(target, "id")
+            ):
+                return {
+                    "method": method,
+                    "params": params,
+                    "status": "invalid_params",
+                    "error": f"{method} params.targets[{index}] requires selector or id.",
+                    "invalidParam": f"targets[{index}]",
+                    "tool_was_executed": False,
+                }
+            id_error = _check_id_param_format(method, target, method_schemas)
+            if id_error is not None:
+                id_error["invalidParam"] = f"targets[{index}].id"
+                return id_error
+        if method == "DOM.getImg":
+            options = params.get("options")
+            path = options.get("path") if isinstance(options, dict) else None
+            if not isinstance(path, str) or not path.strip():
+                return {
+                    "method": method,
+                    "params": params,
+                    "status": "invalid_params",
+                    "error": "DOM.getImg requires params.options.path as an output directory.",
+                    "invalidParam": "options.path",
+                    "tool_was_executed": False,
+                }
+        return None
+    if method == "DOM.getImg" and not has_batch_targets:
+        return {
+            "method": method,
+            "params": params,
+            "status": "invalid_params",
+            "error": "DOM.getImg requires a non-empty params.targets array.",
+            "tool_was_executed": False,
+            "missingAnyOf": [["targets"]],
+        }
     if method in {"DOM.getText", "DOM.getAttribute", "Input.type"} and not has_selector_or_id:
         return {
             "method": method,
@@ -4887,6 +5820,39 @@ def _check_target_param_requirements(
     if id_format_error is not None:
         return id_format_error
     return None
+
+
+def _annotate_dom_batch_response(method: str, response: Any) -> Any:
+    """Add a compact receipt without changing the native ordered item envelope."""
+
+    if method not in {"DOM.getText", "DOM.getAttribute", "DOM.getImg"}:
+        return response
+    if not isinstance(response, dict):
+        return response
+    data = response.get("data")
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return response
+    succeeded = sum(
+        1 for item in items
+        if isinstance(item, dict)
+        and item.get("error") is None
+        and isinstance(item.get("info"), dict)
+    )
+    failed = len(items) - succeeded
+    # Only the outer envelope and data mapping change. Keep the potentially
+    # large native item payload shared instead of recursively copying it.
+    copied = dict(response)
+    copied_data = dict(data)
+    copied["data"] = copied_data
+    copied_data["batchSummary"] = {
+        "total": len(items),
+        "succeeded": succeeded,
+        "failed": failed,
+        "partialFailure": bool(succeeded and failed),
+        "targetOrderPreserved": True,
+    }
+    return copied
 
 
 def _check_screenshot_misuse(
@@ -5405,6 +6371,9 @@ async def _post_hitl_raw_browser_call(
             agent.render_recovery_runner = runner
         response, _recovery = await runner.call(method, params)
         response = agent._capture_artifacts(method, response)
+        record_file_action = getattr(agent, "_capture_file_action", None)
+        if callable(record_file_action):
+            record_file_action(method, params, response)
         if capture_axtree_text and method == "DOM.getAXTree":
             private_axtree_text = "\n".join(_axtree_lines_from_value(response))
         response = agent._offload_response(method, params, response, step)
@@ -6631,6 +7600,7 @@ def _validate_recorded_extraction(agent: Any, saved_path: str) -> JsonDict:
             artifacts=list(getattr(agent, "artifacts", []) or []),
             attempt_artifacts=[saved_path],
             prior_artifacts=prior_artifacts,
+            file_evidence=list(getattr(agent, "file_action_evidence", []) or []),
             task_dir=agent.logger.task_dir,
         )
     except Exception as exc:
@@ -7113,4 +8083,8 @@ def build_browser_agent_tool_specs(
         spec
         for spec in BROWSER_TOOLS.tool_specs(capability_methods)
         if spec.get("name") not in hidden
+        # Compatibility alias remains dispatchable for old traces/tests, but
+        # the model sees one free-form JavaScript entrance only:
+        # browser_call(method="Runtime.evaluate") + runtime_policy.
+        and spec.get("name") != "eval_js_json"
     ]

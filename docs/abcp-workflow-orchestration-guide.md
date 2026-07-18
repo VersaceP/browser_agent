@@ -2,6 +2,12 @@
 
 Use `Workflow.execute` for stable subflows where the next steps are known: action sequences, waits, simple branching, bounded loops, event handling, or value extraction. Do not use it for open-ended browsing, visual judgment, CAPTCHA/login/HITL waits, or decisions that require fresh semantic reasoning after every page change.
 
+Inside this harness, model-authored workflows must use
+`execute_browser_workflow` (or the equivalently gated raw capability path).
+The harness validates action policy, task type, listen events, loop bounds,
+timeouts, and lifecycle sequencing before forwarding. It forbids nested
+workflows and `Runtime.evaluate` in ephemeral/model-authored workflows.
+
 `System.describeAction` can explain a callable action's params, but it does not teach workflow-only step types (`if`, `loop`, `listen`, `transform`) or runtime path/cache behavior. Use this guide for workflow structure; use `System.describeAction` for each action's real params.
 
 ## 1. Use Workflow When
@@ -92,7 +98,7 @@ After each action, workflow auto-extracts top-level or nested `data` keys ending
 
 Perception cache is written only by successful action steps. After `DOM.getAXTree`, workflow stores that result in `$cache.axTree`; after `DOM.getSemanticTree`, it stores that result in `$cache.semanticTree`. `$cache.lastResult` is updated only after a successful action step, not after `listen`, `if`, `loop`, or `transform`.
 
-`$cache.axTree` and `$cache.semanticTree` remain available to later `if`, `loop`, `transform`, and action param resolution until one of these events arrives: `Page.navigate`, `Page.loaded`, `Page.crashed`, `Page.recovered`. On those events, workflow clears both perception caches automatically. After a navigation, reload, crash, or recovery, call `DOM.getAXTree` again before using old element ids or old cached tree lines.
+`$cache.axTree` and `$cache.semanticTree` remain available to later `if`, `loop`, `transform`, and action param resolution until one of these events arrives: `Page.navigate`, `Page.loaded`, `Page.crashed`, `Page.recovered`. On those events, workflow clears both perception caches automatically. Treat `Page.navigate` and `Page.recovered` as DOM-invalidating. After settlement, call `Page.getState` and then `DOM.getAXTree` before using element ids or cached tree lines. After `Page.dialogClosed` or `File.chooserClosed`, call `Page.getState` because resolving the surface may trigger loading or other UI changes.
 
 For optional or flaky action steps, set `onError:"continue"` or `onError:"retry"` locally. Global `errorConfig` applies when a step has no local `onError`.
 
@@ -113,6 +119,7 @@ Navigate, wait for load, inspect AX tree:
   "steps": [
     { "action": "Page.navigate", "params": { "url": "https://example.com" }, "purpose": "Open target page" },
     { "type": "listen", "event": "Page.loaded", "timeout": 15000, "onTimeout": "stop" },
+    { "action": "Page.getState", "purpose": "Confirm settled page identity" },
     { "action": "DOM.getAXTree", "purpose": "Read accessible page structure" }
   ]
 }

@@ -381,6 +381,12 @@ class HarnessConfig:
     # canary → promote). Closes the rotted-skill self-healing loop; best-effort,
     # gated, and canary-validated so a bad candidate never promotes.
     skill_auto_heal_enabled: bool = True
+    # Current-task only: after one validated row, a batch contract carrying
+    # batch_rows may distill a pure-ABCP workflow, canary it on the second row,
+    # and reuse it for the remainder. Never writes the skill registry.
+    # Disabled by default until the live ABCP canary covers both success and
+    # partial/fallback paths. Operators may opt in explicitly.
+    ephemeral_workflow_enabled: bool = False
     # Guidance (hints) 层的防腐弱信号：worker 结束后把「结局 + 步数 + agent 上报
     # 的 guidance_stale」记进 skills/.guidance_health.json（独立软通道——显式
     # 选择绕过 .skill_health.json，07-07 语义保持）。只标 needs_review 供人工
@@ -401,6 +407,10 @@ class HarnessConfig:
     hitl_no_repause_cooldown_seconds: float = 8.0
     hitl_post_resume_guard_seconds: float = 30.0
     hitl_post_resume_confirm_max_rounds: int = 3
+    # Event-driven page settlement gate. DOM probes wait for Page.loaded (or a
+    # terminal lifecycle event); on timeout the dispatcher performs exactly one
+    # Page.getState resynchronization and never polls.
+    page_settlement_timeout_seconds: float = 15.0
     progress_local_fs_without_extraction_limit: int = 5
     progress_no_artifact_limit: int = 8
     # Browser-side stale-id rematch policy:
@@ -580,6 +590,12 @@ class HarnessConfig:
             skill_auto_heal_enabled=bool(
                 data.get("skill_auto_heal_enabled", cls.skill_auto_heal_enabled)
             ),
+            ephemeral_workflow_enabled=bool(
+                data.get(
+                    "ephemeral_workflow_enabled",
+                    cls.ephemeral_workflow_enabled,
+                )
+            ),
             skill_guidance_signal_enabled=bool(
                 data.get(
                     "skill_guidance_signal_enabled",
@@ -600,6 +616,12 @@ class HarnessConfig:
                 data.get(
                     "hitl_poll_interval_seconds",
                     cls.hitl_poll_interval_seconds,
+                )
+            ),
+            page_settlement_timeout_seconds=float(
+                data.get(
+                    "page_settlement_timeout_seconds",
+                    cls.page_settlement_timeout_seconds,
                 )
             ),
             hitl_wait_timeout_seconds=float(

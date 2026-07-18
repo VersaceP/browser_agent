@@ -39,6 +39,7 @@ from harness.local_fs import local_fs_read, local_fs_search
 from harness.lifecycle import LifecycleContext, default_lifecycle_manager
 from harness.model_config import browser_agent_model_config, lead_agent_model_config
 from harness.observation.event_observer import BrowserEventObserver
+from harness.observation.page_lifecycle import PageLifecycleTracker
 from harness.observation.loop_nudge import ActionLoopNudge
 from harness.offload import (
     offload_large_response_fields,
@@ -50,6 +51,8 @@ from harness.observation.page_fingerprint import (
     render_page_stats_for_prompt,
 )
 from harness.progress import ProgressAccountant
+from harness.pacing import merge_pacing
+from harness.skill.ephemeral import pending_ephemeral_final_rejection
 from harness.render_recovery import (
     RenderRecoveryOutcome,
     build_render_recovery_runner,
@@ -73,6 +76,7 @@ from harness.schema_cache import (
     write_cached_capability_hash,
 )
 from harness.spawner import BrowserAgentHandle, BrowserAgentSpawner
+from harness.file_evidence import saved_paths_from_value
 from harness.strategy_bank import (
     compact_strategy_bank,
     load_strategy_bank,
@@ -135,6 +139,93 @@ from llm import (
 # 9d5655d3: the lead accepted one as a self-reported completion and died
 # silently at step 10/50 mislabeled as step_cap).
 TRUNCATION_STREAK_LIMIT = 3
+
+
+_STABLE_BROWSER_METHOD_PREFIXES = (
+    "System.get",
+    "System.list",
+    "System.describe",
+    "DOM.get",
+    "Download.get",
+    "Download.list",
+    "Memory.get",
+    "Memory.list",
+    "Bookmark.get",
+    "Bookmark.list",
+    "Bookmark.search",
+    "Bookmark.is",
+    "History.get",
+    "History.list",
+    "History.search",
+)
+_STABLE_BROWSER_METHODS = {
+    "Page.getState",
+    "Page.list",
+    "Page.screenshot",
+}
+_STATE_BOUNDARY_HARNESS_TOOLS = {
+    "navigate_verified",
+    "dismiss_overlay",
+    "fill_field_verified",
+    "collect_items",
+    "execute_selected_skill",
+    "execute_browser_workflow",
+    "eval_js_json",
+}
+
+
+def _tool_call_state_boundary(
+    tool_call: JsonDict,
+    result: Optional[JsonDict] = None,
+) -> bool:
+    """Conservative same-turn barrier classification.
+
+    Calls not known to be stable reads end the pre-generated tool batch.  The
+    next model turn must inspect their result before constructing more calls.
+    """
+    name = str(tool_call.get("name") or "").strip()
+    if name == "record_extraction":
+        return bool(
+            isinstance(result, dict)
+            and (
+                result.get("browserStateMayHaveChanged") is True
+                or result.get("requiresModelReplan") is True
+            )
+        )
+    if name in _STATE_BOUNDARY_HARNESS_TOOLS:
+        return True
+    tool_input = tool_call.get("input") if isinstance(tool_call.get("input"), dict) else {}
+    method = str(tool_input.get("method") or "").strip() if name == "browser_call" else name
+    if not method or "." not in method:
+        return False
+    if method in _STABLE_BROWSER_METHODS:
+        return False
+    if any(method.startswith(prefix) for prefix in _STABLE_BROWSER_METHOD_PREFIXES):
+        return False
+    return True
+
+
+def _deferred_tool_result(
+    tool_call: JsonDict,
+    *,
+    after_tool_call: JsonDict,
+    reason: str,
+) -> JsonDict:
+    return {
+        "type": "tool_result",
+        "tool_use_id": tool_call.get("id"),
+        "content": json.dumps({
+            "status": "deferred_due_to_state_change",
+            "tool_was_executed": False,
+            "deferredTool": tool_call.get("name"),
+            "afterTool": after_tool_call.get("name"),
+            "reason": reason,
+            "next_instruction": (
+                "Inspect the preceding tool result and regenerate this call in"
+                " the next model turn with fresh page state and handles."
+            ),
+        }, ensure_ascii=False),
+    }
 
 
 RUNTIME_AUTH_INTERRUPT_SOP = """- Treat login walls, QR/SMS/2FA prompts, CAPTCHAs, and human-verification challenges as runtime interrupts of the CURRENT worker, even when the phase did not predict them. Do not finalize merely to hand the page back to LeadAgent and do not ask LeadAgent to spawn a separate auth-probe or HITL worker.
@@ -317,6 +408,11 @@ def update_cache_pressure_state(
     return streak, None
 
 
+def _saved_paths_from_value(value: Any) -> List[str]:
+    # Compatibility wrapper retained for local callers/tests.
+    return saved_paths_from_value(value)
+
+
 class BrowserAgent:
     def __init__(
         self,
@@ -336,7 +432,9 @@ class BrowserAgent:
         self.purpose_hints: Dict[str, str] = {}
         self.skills_doc: str = ""
         self.artifacts: List[str] = []
+        self.file_action_evidence: List[JsonDict] = []
         self.extraction_attempt_artifacts: List[str] = []
+        self.pending_ephemeral_rows: Optional[JsonDict] = None
         self.trace: List[JsonDict] = []
         self.final_status = WORKER_STATUS_RUNNING
         self.diagnostics = WorkerDiagnostics()
@@ -370,6 +468,7 @@ class BrowserAgent:
         self.axtree_event_page_id = ""
         self._render_recovery_recent: Dict[str, float] = {}
         self.render_recovery_runner = None
+        self.page_lifecycle = PageLifecycleTracker()
         self.event_observer = BrowserEventObserver(self)
         self.recent_tool_signatures: List[str] = []
         self._cache_pressure_streak = 0
@@ -590,6 +689,31 @@ class BrowserAgent:
                         }, ensure_ascii=False)
                         should_finish = True
                         break
+                    pending_rejection = pending_ephemeral_final_rejection(
+                        self, WORKER_STATUS_DONE
+                    )
+                    if pending_rejection is not None:
+                        # A text-only response is a legacy terminal path. Keep
+                        # it in the same completion barrier as final_answer so
+                        # an LLM cannot silently abandon fallback batch rows.
+                        messages.append({"role": "assistant", "content": [{
+                            "type": "text",
+                            "text": text.strip(),
+                        }]})
+                        messages.append({"role": "user", "content": [{
+                            "type": "text",
+                            "text": (
+                                "<ephemeral_fallback_incomplete>\n"
+                                f"{json.dumps(pending_rejection, ensure_ascii=False)}\n"
+                                "</ephemeral_fallback_incomplete>"
+                            ),
+                        }]})
+                        self.logger.write(
+                            "agent.text_final.ephemeral_rows_rejected",
+                            pending_rejection,
+                        )
+                        truncation_streak = 0
+                        continue
                     final_answer = text.strip()
                     # Treat a text-only assistant turn as a self-reported done;
                     # the classifier below may still override if a hard signal
@@ -617,7 +741,7 @@ class BrowserAgent:
                 messages.append({"role": "assistant", "content": assistant_content})
 
                 tool_results: List[JsonDict] = []
-                for tool_call in tool_calls:
+                for tool_index, tool_call in enumerate(tool_calls):
                     self.loop_nudge.record_action(tool_call, step=step)
                     result, should_stop = await dispatch_tool(tool_call, step)
                     self._observe_tool_result(tool_call, result)
@@ -671,12 +795,33 @@ class BrowserAgent:
                             "content": self._to_model_json(model_result),
                         }
                     )
+                    boundary = _tool_call_state_boundary(tool_call, result)
+                    if (should_stop or boundary) and tool_index + 1 < len(tool_calls):
+                        reason = (
+                            "preceding_tool_terminated_agent"
+                            if should_stop
+                            else "preceding_tool_may_change_browser_state"
+                        )
+                        for deferred in tool_calls[tool_index + 1:]:
+                            tool_results.append(_deferred_tool_result(
+                                deferred,
+                                after_tool_call=tool_call,
+                                reason=reason,
+                            ))
+                        self.logger.write("tool_batch.deferred", {
+                            "step": step,
+                            "afterTool": tool_call.get("name"),
+                            "reason": reason,
+                            "deferredCount": len(tool_calls) - tool_index - 1,
+                        })
                     if should_stop:
                         final_answer = result.get("answer", "")
                         model_reported_status = (
                             str(result.get("status")) if result.get("status") else None
                         )
                         should_finish = True
+                        break
+                    if boundary:
                         break
 
                 if not should_finish:
@@ -1034,7 +1179,7 @@ L1. Contracts, Feedback, Memory
 - Reusable authenticated fleet memory uses this exact JSON contract: {auth_fleet_json}. Treat it as a verified session index only, never as a credential store.
 
 L2. Perception And Evidence
-- DOM.getAXTree is the default perception tool for structure, labels, controls, state, and canonical ids. DOM.getText reads exact visible text for a known target. DOM.getAttribute reads href/src/id/aria-/data-/value and other attributes. Canonical element ids are three-segment frameId:axNodeId:domNodeId (e.g. 2:5367:5367); copy them verbatim from the latest AXTree and never truncate to two segments.
+- DOM.getAXTree is the default perception tool for structure, labels, controls, state, and canonical ids. DOM.getText reads exact visible text for known targets. DOM.getAttribute reads href/src/id/aria-/data-/value and other attributes. When the live methodSchema exposes `targets`, read related targets from the same page in ONE native batch call instead of multiple single-target calls. Consume response.data.items in target order and inspect each item independently: successful getText items use info.textContent, successful getAttribute items use info.attributes (missing=null, empty=""), and failed items use item.error. A partial item failure is not a whole-call failure. Canonical element ids are three-segment frameId:axNodeId:domNodeId (e.g. 2:5367:5367); copy them verbatim from the latest AXTree and never truncate to two segments.
 - Read AXTree lines as `depth [id] role "label" flags # @x,y,w,h`. `#` marks a preferred actionable target; `@x,y,w,h` is the element's viewport rect (absent on unpositioned nodes) — use it for spatial reasoning (relative position, overlap, on/off-screen), not for deriving click coordinates; act through the canonical id or a selector, never coordinates read off the rect. Layout flags such as `hidden`, `off`, `blocked`, `scroll` (scrollable container), `sticky`, `clip`, `zN` (stacking order) may appear before the `#`/`@` markers, and can be present on non-actionable lines too. Prefer `#` targets whose line shows no `hidden`/`blocked` flag; treat `blocked` as occlusion (dismiss the blocker first) and `scroll` as the container to scroll in nested-scroll flows.
 - AXTree ids are epoch-bound physical anchors. Any Page.navigate, render recovery/recovered feedback, Page.create/switch/close, Runtime.evaluate, Hitl transition, or Input.* action can invalidate them. After such a change, call Page.getState as needed, then DOM.getAXTree and derive fresh ids before targeting. For same-instance multi-page workflows, track each pageId with its URL/title/purpose, switch serially with Page.switchTo, and never assume a snapshot from one page remains valid after Page.create or Page.switchTo.
 - Large DOM/text/attribute/tool results are offloaded under observations/. The model-visible stub includes `savedPath`, `outline`, `format`, and `query_with`; inspect savedPath with local_fs_search or local_fs_read before deriving params from offloaded evidence.
@@ -1042,7 +1187,7 @@ L2. Perception And Evidence
 
 L3. Lifecycle And HITL
 - Page.* handles lifecycle/navigation/dialogs/screenshots/page state. Event names such as Page.loaded, Page.dialogOpened, or Hitl.resumed are not actions.
-- After navigation/loading/download/state changes, wait for live feedback/events when provided; if uncertain, call Page.getState once to resync, then DOM.getAXTree.
+- After Page.startedLoading or a navigation/download/state change, do not issue DOM probes until Page.loaded or another settlement event. If no settlement event arrives before the harness timeout, call Page.getState exactly once to resync; never poll. Treat Page.navigate and Page.recovered as DOM-invalidating: refresh Page.getState and DOM.getAXTree before targeting.
 - On page identity events (Page.open, Page.close, Page.switchTo, Page.popupRequested), refresh handles with Page.list or Page.getState and stop using closed or stale pageIds. After Page.dialogClosed or File.chooserClosed, call Page.getState before continuing. On Page.loadFailed, inspect the failure details before retrying; after Page.crashed, discard stale targets and resync or recreate the page.
 - A BrowserAgent may manage multiple tabs/pages inside its own instance. Use Page.create for additional pages and Page.switchTo/Page.list to select the active page. Control pages serially, not concurrently, and refresh Page/DOM perception after every switch before acting.
 {RUNTIME_AUTH_INTERRUPT_SOP}
@@ -1052,9 +1197,12 @@ L3. Lifecycle And HITL
 L4. Actions, Verification, Data
 - Prefer Input.* for focus, scrolling, stabilization, and occlusion-aware interactions. Use canonical ids from the latest AXTree when possible; stable semantic selectors are fallback (avoid dynamic hash classes); raw coordinates are last resort. Do not add manual scroll or wait steps before standard Input.* interactions — they already handle focus, scrolling, and stabilization; manually scroll only nested scrollable containers or lazy-loading flows.
 - Verify every state-changing action with the cheapest reliable signal: ActionFeedback, Page.getState for navigation/lifecycle, refreshed DOM.getAXTree, DOM.getText, or DOM.getAttribute(value).
-- Use extract_dom_records for uniform lists/cards/tables. Use eval_js_json only when DOM primitives cannot express the relationship; give a valid reason_kind and cross-check at least one target field with DOM evidence before record_extraction. Never use eval_js_json or Runtime.evaluate to bypass permissions, casually mutate page state, or replace form interactions — form entry goes through Input.*/fill_field_verified.
+- Extraction priority is: native batched DOM.getText/DOM.getAttribute when live schema supports `targets`; single-target DOM reads; extract_dom_records for uniform lists/cards/tables; gated browser_call(method="Runtime.evaluate") only when structured tools cannot express the required data or behavior. Runtime.evaluate requires `runtime_policy` with intent/effect/reason_kind/why_dom_primitives_insufficient/cross_check_plan. Use result_mode="json" for JSON parsing/recording. Never use JavaScript to bypass permissions, casually mutate state, or replace form/upload interactions. If `world` is exposed by the live schema, use `main` only for page globals, `isolated` for pristine DOM APIs, and an explicit world for any state-changing script; do not rely on auto retry when side effects are possible.
+- Use DOM.getImg only to export actual <img> assets and only when the live capability exists. Send one batch `targets` array plus required `options.path` output directory; prefer imageFormat="auto". Read each info.savedPath independently, preserve fallback-screenshot method receipts, and do not retry non-<img> errors as screenshots.
+- Use execute_browser_workflow only for a stable, bounded sequence known before execution. Navigation steps must settle, then Page.getState and DOM.getAXTree; Runtime.evaluate is forbidden in model-authored ephemeral workflows. Open-ended discovery remains ordinary browser_call turns.
 - When <selected_skill> names a workflow skill and the zero-LLM fast path did not finish, call execute_selected_skill with live page/fleet handles plus variables or rows. The harness executes the selected frozen recipe; never search for workflow.json, reconstruct its steps from markdown, or copy them into browser_call.
 - Any reusable data handed to LeadAgent must go through record_extraction. Row keys must match expected_artifact fields exactly. Critical fields need sourceTool, sourceSelectorOrAxId, pageUrl, and canonical <field>EvidenceText evidence fields such as rankEvidenceText where applicable.
+- If record_extraction returns ephemeralWorkflow.fallback, the temporary workflow did not finish the batch. Process every fallback.remainingRows item with ordinary browser calls, preserve/merge any partialArtifact rows, and re-record the combined dataset. final_answer(done/partial) is mechanically blocked while fallback rows remain; use incomplete only when a real blocker prevents completion.
 - Reject empty, guessed, order-only, placeholder, sample, or template values. If the page truly shows absence/placeholder content, set `placeholderDetected: true` so validation can classify it. Never write a failure narrative (e.g. "未获取", "未明确展示", "located in an iframe", "not in the main DOM", "N/A") into a data field — that is a placeholder and validation rejects it; either obtain the real value or report a blocker.
 - A selector returning 0 rows is NOT proof the content is absent. Tabbed/sectioned detail pages (e.g. 包装信息 / 商品详情 / Reviews / Specs) only render their content after the tab/section is activated, and many images are lazy-loaded (real URL in data-src/srcset, revealed on scroll). Before concluding absence: click the relevant tab/heading, refresh Page.getState + DOM.getAXTree, scroll the section into view, then re-extract (extract_dom_records src auto-resolves lazy images). Content inside an iframe surfaces through frame-aware canonical ids (DOM.getAXTree / DOM.getSemanticTree emit frameId:axNodeId:domNodeId across frames) — try targeting those ids; there is no frame-switch action (Page.switchTo changes tabs/pages, not frames), so if the frame's content cannot be reached with the available DOM tools, report a blocker instead of assuming absence. Only report absence after these steps.
 
@@ -1089,13 +1237,42 @@ L6. Termination
     def _capture_artifacts(self, method: str, response: Any) -> Any:
         if not isinstance(response, dict):
             return response
-        return strip_image_payload(
+        captured = strip_image_payload(
             logger=self.logger,
             method=method,
             response=response,
             artifacts=self.artifacts,
             prefix=self.runtime.agent_id,
         )
+        return captured
+
+    def _capture_file_action(
+        self,
+        method: str,
+        params: JsonDict,
+        response: Any,
+    ) -> None:
+        file_method = (
+            method == "DOM.getImg"
+            or method == "File.download"
+            or method == "File.handleChooser"
+            or method.startswith("Download.")
+        )
+        if not file_method:
+            return
+        for saved_path in _saved_paths_from_value(response):
+            if saved_path not in self.artifacts:
+                self.artifacts.append(saved_path)
+        self.file_action_evidence.append({
+            "method": method,
+            "params": trim_large_strings(dict(params or {}), max_chars=2000),
+            "response": trim_large_strings(response, max_chars=4000),
+        })
+        # Evidence is a diagnostic/validator ledger, not an unbounded trace.
+        # Retain a generous recent window while preventing long download or
+        # image-export batches from growing worker memory without limit.
+        if len(self.file_action_evidence) > 200:
+            del self.file_action_evidence[:-200]
 
     def _offload_response(
         self,
@@ -1705,6 +1882,15 @@ class LeadAgent:
             override,
             default_task_type=plan_task_type,
         )
+        plan_pacing = (
+            self.task_plan.get("pacing")
+            if isinstance(self.task_plan, dict) else None
+        )
+        contract["pacing"] = merge_pacing(
+            plan_pacing,
+            phase.get("pacing"),
+            override.get("pacing") if isinstance(override, dict) else None,
+        )
         contract["orchestration_policy"] = self._browser_worker_orchestration_policy()
         return contract
 
@@ -2081,7 +2267,7 @@ class LeadAgent:
                 messages.append({"role": "assistant", "content": assistant_content})
 
                 tool_results: List[JsonDict] = []
-                for tool_call in tool_calls:
+                for tool_index, tool_call in enumerate(tool_calls):
                     result, should_stop = await dispatch_tool(tool_call)
                     model_result = offload_tool_result_for_model(
                         logger=self.logger,
@@ -2112,6 +2298,12 @@ class LeadAgent:
                         ),
                     })
                     if should_stop:
+                        for deferred in tool_calls[tool_index + 1:]:
+                            tool_results.append(_deferred_tool_result(
+                                deferred,
+                                after_tool_call=tool_call,
+                                reason="preceding_tool_terminated_agent",
+                            ))
                         final_answer = result.get("answer", "")
                         final_trigger = str(result.get("trigger") or "lead_decided")
                         should_finish = True
@@ -2325,7 +2517,9 @@ Strategy bank entries are procedural defaults, not permissions and not hard scri
 Lead state flow:
 0. First call `emit_task_plan` with a v1 phase plan. The plan must include task_type. Each phase needs objective, worker_task, stage_hint, stage_hint_reason, expected_artifact, validators, worker_contract, and max_attempts. Use max_attempts=3 by default unless the task is trivial or unsafe to retry.
    Phase scheduling is driven by depends_on: OMITTING it means the phase implicitly depends on ALL phases listed before it (strict serial order); depends_on=[] declares an independent phase; depends_on=["p1"] lists the exact data dependencies. Declare only true data dependencies — e.g. every detail phase depends only on the collection phase, not on its sibling detail phases — so independent phases can run in parallel. A spawn whose dependencies are not yet validated_done is rejected with dependency_not_ready; wait for the dependency instead of retrying. A replan is a COMPLETE replacement: first wait for all live workers, then include every currently known remediation phase in the same emit_task_plan call. Multi-phase replans must set depends_on explicitly on every phase; use [] for independent repairs so they remain parallel.
-   validators is an ARRAY of typed objects (never a dict keyed by validator name). Valid validator types (exact enum): """ + ", ".join(sorted(VALIDATOR_TYPES)) + """. Common shapes: {"type":"exact_rows","count":11}, {"type":"range","field":"rank","min":40,"max":50}, {"type":"set_equals","field":"rank","values":[39,41]} for an exact NON-CONTIGUOUS target set, {"type":"unique","fields":["detailUrl"]}, {"type":"url_pattern","field":"detailUrl","pattern":"^https://..."}, {"type":"required_fields","fields":[...]}, {"type":"field_nonempty","fields":[...]}. A range includes every value between min/max and cannot express {38,40}; use set_equals or attach explicit skill_rows for such remediation. Do not invent type names (url_format/rank_range/no_duplicates are wrong).
+   If the user requests spacing between batch rows or dependent phases, set plan/phase pacing with row_interval_seconds or phase_interval_seconds plus optional jitter_ratio. Row pacing keeps the warm tab; phase pacing waits before slot reservation. Do not invent task-level pacing.
+   For at least three homogeneous rows with no selected frozen workflow skill, attach worker_contract.batch_rows only after the row identities/URLs are grounded in a validated upstream artifact. The worker executes row 0 normally; the harness may compile its successful trace, canary row 1, and run later rows through an in-memory workflow. Never use batch_rows for heterogeneous rows, HITL/visual flows, or when later rows require semantic decisions based on earlier results.
+   validators is an ARRAY of typed objects (never a dict keyed by validator name). Valid validator types (exact enum): """ + ", ".join(sorted(VALIDATOR_TYPES)) + """. Common shapes: {"type":"exact_rows","count":11}, {"type":"range","field":"rank","min":40,"max":50}, {"type":"set_equals","field":"rank","values":[39,41]} for an exact NON-CONTIGUOUS target set, {"type":"unique","fields":["detailUrl"]}, {"type":"url_pattern","field":"detailUrl","pattern":"^https://..."}, {"type":"required_fields","fields":[...]}, {"type":"field_nonempty","fields":[...]}. File phases use dedicated evidence validators: file_download normally combines download_completed with file_integrity; file_upload uses upload_selected and, when the page exposes a confirmation, upload_confirmed with its evidence field/pattern; DOM.getImg exports use image_exported. Keep file_download and file_upload as separate task_type values. A range includes every value between min/max and cannot express {38,40}; use set_equals or attach explicit skill_rows for such remediation. Do not invent type names (url_format/rank_range/no_duplicates are wrong).
    Plan at skill granularity: <known_skills> lists reusable skills, each tagged with a `kind`. kind="workflow": a frozen Workflow.execute recipe that runs the phase with ZERO worker LLM steps (fast path) — for these you may attach worker_contract.skill_rows (multi-row) or skill_variables (single-row). kind="guidance": a hints-only skill that has NO fast path and produces NO artifact by itself — it only injects page knowledge (selectors, negative knowledge, filtering rules) into the worker's context; the worker still performs the task and record_extraction itself, so plan its phase exactly as a normal browser phase (full expected_artifact + validators) and do NOT attach skill_rows/skill_variables to it. Skill use is a USER decision (skill_selection_mode=manual, the default): you must NOT pick a skill on your own; a skill engages only when the operator forced one (--skill / /skill, which may name a single skill or a suite whose members route per phase by stage_hint/fields). When a workflow skill IS forced, shape the plan for it: use the skill's declared field names verbatim in expected_artifact (never invent synonyms like productUrl for its detailUrl), set worker_contract.skill_id, and for a multi-row phase either omit skill_rows when a validated upstream artifact exactly covers the validator-selected slice (the harness auto-builds them), or attach worker_contract.skill_rows=[one dict per row using the skill's row_variables]. Explicit rows are accepted for enrichment only after an exact validated identity-set match; never copy rows from a prose summary when an artifact exists. The fast path iterates rows on one warm tab. A single-row phase uses worker_contract.skill_variables instead.
    Valid stage_hint values: collection, detail_sections, attribute_links, form_interaction, computed_relationship, generic. Use generic only when the phase truly cannot be classified.
    Do not hand-author ABCP method lists. BrowserAgent method access is governed by task_type policy, which already disables whole method domains worker-side — a web_scrape worker cannot call Download/File/Bookmark/History methods no matter what the plan says, so you normally need NO forbidden_methods at all (the acceptance receipt echoes the policy-disabled domains). Add forbidden_methods only for an EXTRA restriction beyond policy, using canonical method names or Domain.* wildcards; never guess method names — unknown names in forbidden_methods are dropped with a warning, and unknown names in allowed_methods reject the plan. If a workflow crosses task types, split phases and replan with the correct task_type. Canonical task_type values include web_search, web_scrape, file_download, file_upload, form_filling, browser_state_management, and general. web_scrape/web_search intentionally disable Download and File methods, so a worker cannot save or upload files there. For file/image/PDF/export saving, use a dedicated task_type="file_download" phase: first discover and validate the resolved URL in web_scrape/web_search, then pass that URL/path plan to file_download, where File.download and Download.* are available. For native upload controls, use task_type="file_upload", where File.handleChooser is available after the worker opens the page and triggers the chooser. For ordinary data entry, submission, login, settings changes, or forms that may include an upload control, use task_type="form_filling"; it has DOM/Input plus File.handleChooser, but not File.download or Download.*. Use task_type="browser_state_management" only for targeted Bookmark/History/Memory state work; it does not expose File.download, File.handleChooser, Download.*, Bookmark.clearAll, or History.clearAll. Legacy aliases download_file, form_fill, browser_action, and browser_data_collection are accepted but should not be emitted in new plans.
@@ -2367,7 +2561,7 @@ Artifact and evidence rules:
 - record_extraction artifacts are the trusted handoff format. Final data should reference artifact savedPath paths when large.
 - lead_save_artifact is only for reshaping trustworthy evidence already present in extraction artifacts, not for inventing missing data.
 - For order/rank/date/price/count/status fields, require explicit page evidence or provenance. Do not infer from position alone unless the page evidence proves that relation.
-- eval_js_json is a BrowserAgent harness tool, not an ABCP browser_call method. In BrowserAgent tasks, mention it as a preferred harness tool with reason_kind and a cross-check plan; do not instruct the worker to call browser_call with method="eval_js_json". Valid reason_kind values: computed_geometry, cross_node_relationship, shadow_dom_traversal, cross_frame_aggregation, non_dom_state, legacy_no_dom_equivalent.
+- JavaScript has one model-facing path: browser_call(method="Runtime.evaluate") with runtime_policy. It is last-resort, boundary-gated, and must include a valid reason_kind (computed_geometry, cross_node_relationship, shadow_dom_traversal, cross_frame_aggregation, non_dom_state, legacy_no_dom_equivalent), why native DOM reads are insufficient, and a DOM cross-check plan. Do not mention the hidden eval_js_json compatibility alias in worker tasks.
 
 The final_answer must include:
 - Completed data range or artifact locations.

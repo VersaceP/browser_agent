@@ -9,7 +9,7 @@ import copy
 import hashlib
 import re
 from difflib import SequenceMatcher
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import AbstractSet, Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
@@ -26,6 +26,16 @@ from harness.constants import (
 from harness.extraction_artifacts import field_name_from_spec, field_names_from_specs
 from harness.auth_fleet import normalize_auth_verification_contract
 from harness.fleet_coordinator import normalize_page_policy, normalize_reuse_scope
+from harness.file_evidence import saved_paths_from_value
+from harness.pacing import (
+    MAX_PACING_INTERVAL_SECONDS,
+    PACING_FIELDS,
+    PACING_INTERVAL_FIELDS,
+    jittered_interval,
+    merge_pacing,
+    normalized_pacing,
+    parse_utc_timestamp,
+)
 from harness.task_types import (
     VALID_TASK_TYPES,
     normalize_task_type,
@@ -154,7 +164,21 @@ VALIDATOR_TYPES = {
     "cross_field_contains",
     "action_outcome",
     "field_provenance",
+    "download_completed",
+    "file_integrity",
+    "upload_selected",
+    "upload_confirmed",
+    "image_exported",
 }
+
+FILE_VALIDATOR_TYPES = frozenset({
+    "download_completed",
+    "file_integrity",
+    "upload_selected",
+    "upload_confirmed",
+    "image_exported",
+})
+FILE_RECEIPT_ONLY_VALIDATOR_TYPES = FILE_VALIDATOR_TYPES - {"upload_confirmed"}
 
 # High-frequency intuitive names models emit before learning the canonical
 # enum (task 9d5655d3 burned two plan rejections on exactly these guesses).
@@ -315,6 +339,47 @@ def _validated_task_type(
     return text
 
 
+def _validate_pacing(value: Any, errors: List[str], *, where: str) -> JsonDict:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        errors.append(f"{where} must be an object")
+        return {}
+    allowed = set(PACING_FIELDS)
+    unknown = sorted(str(key) for key in value if str(key) not in allowed)
+    if unknown:
+        errors.append(f"{where} contains unknown fields: {unknown}")
+    for key in PACING_INTERVAL_FIELDS:
+        if key not in value:
+            continue
+        try:
+            number = float(value[key])
+        except (TypeError, ValueError):
+            errors.append(f"{where}.{key} must be a number")
+            continue
+        if number < 0 or number > MAX_PACING_INTERVAL_SECONDS:
+            errors.append(
+                f"{where}.{key} must be between 0 and"
+                f" {MAX_PACING_INTERVAL_SECONDS:g}"
+            )
+    if "jitter_ratio" in value:
+        try:
+            jitter = float(value["jitter_ratio"])
+        except (TypeError, ValueError):
+            errors.append(f"{where}.jitter_ratio must be a number")
+        else:
+            if jitter < 0 or jitter > 1:
+                errors.append(f"{where}.jitter_ratio must be between 0 and 1")
+    normalized = normalized_pacing(value)
+    # Preserve override semantics: omitted phase keys inherit the plan value;
+    # materializing them as zero here would silently erase that inheritance.
+    return {
+        key: normalized[key]
+        for key in allowed
+        if key in value
+    }
+
+
 def validate_task_plan(
     raw_plan: Any,
     *,
@@ -337,6 +402,7 @@ def validate_task_plan(
         return None, ["plan must be a JSON object"]
 
     warnings: List[JsonDict] = []
+    plan_pacing = _validate_pacing(raw_plan.get("pacing"), errors, where="pacing")
     goal = str(raw_plan.get("goal") or "").strip()
     if not goal:
         errors.append("goal is required")
@@ -522,6 +588,14 @@ def validate_task_plan(
             # schedules — `or []` used to collapse both into [], erasing the
             # planner's only syntax for parallel phases (task 2ed5a466).
             "depends_on": _normalized_depends_on(raw_phase.get("depends_on")),
+            "pacing": (
+                _validate_pacing(
+                    raw_phase.get("pacing"), errors,
+                    where=f"phase {phase_id}: pacing",
+                )
+                if raw_phase.get("pacing") is not None
+                else None
+            ),
             "fanout_from": raw_phase.get("fanout_from"),
             "join": raw_phase.get("join"),
             "expected_artifact": expected_artifact,
@@ -553,6 +627,7 @@ def validate_task_plan(
         "version": "v1",
         "goal": goal,
         "task_type": task_type,
+        "pacing": plan_pacing,
         "phases": phases,
     }
     if warnings:
@@ -693,14 +768,26 @@ def phase_contract(
             phase_id=phase_id or "worker",
         )
 
+    resolved_task_type = _first_valid_task_type(
+        contract.get("task_type"),
+        phase.get("task_type"),
+        default_task_type,
+    )
+    file_only_contract = bool(validators) and all(
+        str(item.get("type") or "") in FILE_RECEIPT_ONLY_VALIDATOR_TYPES
+        for item in validators
+        if isinstance(item, dict)
+    )
+    default_must_record = not (
+        resolved_task_type in {"file_download", "file_upload"}
+        and file_only_contract
+        and not expected_artifact.get("fields")
+        and not expected_artifact.get("required_fields")
+    )
     payload: JsonDict = {
         "version": "v1",
         "phase_id": phase_id,
-        "task_type": _first_valid_task_type(
-            contract.get("task_type"),
-            phase.get("task_type"),
-            default_task_type,
-        ),
+        "task_type": resolved_task_type,
         "stage_hint": str(contract.get("stage_hint") or phase.get("stage_hint") or "generic"),
         "stage_hint_reason": str(
             contract.get("stage_hint_reason")
@@ -728,11 +815,16 @@ def phase_contract(
         "must_record_extraction": bool(
             contract.get("must_record_extraction")
             if "must_record_extraction" in contract
-            else True
+            else default_must_record
         ),
         "stop_condition": str(
             contract.get("stop_condition")
             or "Record the required extraction artifact, then call final_answer."
+        ),
+        "pacing": normalized_pacing(
+            contract.get("pacing")
+            if isinstance(contract.get("pacing"), dict)
+            else phase.get("pacing")
         ),
     }
     # Pass through skill-selection fields the LeadAgent set on the worker_contract.
@@ -742,7 +834,7 @@ def phase_contract(
     # gate and spawn_browser_agent kept re-returning skill_selection_required
     # (an unbreakable loop for the Lead). Preserve them verbatim when present.
     for skill_key in (
-        "skill_id", "skill_variables", "skill_rows", "skill_selection", "domain",
+        "skill_id", "skill_variables", "skill_rows", "batch_rows", "skill_selection", "domain",
         "needs_isolated_session", "reuse_scope", "session_key", "page_policy",
     ):
         value = contract.get(skill_key)
@@ -1762,6 +1854,93 @@ def _phase_dependency_ids(phase: JsonDict) -> Optional[List[str]]:
     ]
 
 
+def phase_pacing_remaining_seconds(
+    plan: Optional[JsonDict],
+    logger: RunLogger,
+    *,
+    phase_id: Optional[str],
+    worker_contract: Optional[JsonDict] = None,
+    now: Optional[datetime] = None,
+    random_value: Optional[float] = None,
+) -> float:
+    """Remaining dependency-to-start delay for a phase.
+
+    Independent phases (depends_on=[]) have no dependency completion anchor and
+    therefore never wait.  The caller invokes this only after the dependency
+    gate reports ready and before reserving a BrowserAgent slot.
+    """
+    if not isinstance(plan, dict) or not phase_id:
+        return 0.0
+    plan_phases = [item for item in plan.get("phases", []) if isinstance(item, dict)]
+    prior_ids: List[str] = []
+    target: Optional[JsonDict] = None
+    for phase in plan_phases:
+        current_id = str(phase.get("id") or "")
+        if current_id == str(phase_id):
+            target = phase
+            break
+        prior_ids.append(current_id)
+    if target is None:
+        return 0.0
+    dependencies = _phase_dependency_ids(target)
+    if dependencies == []:
+        return 0.0
+    if dependencies is None:
+        dependencies = prior_ids
+    if not dependencies:
+        return 0.0
+
+    pacing = merge_pacing(
+        plan.get("pacing"),
+        target.get("pacing"),
+        worker_contract.get("pacing") if isinstance(worker_contract, dict) else None,
+    )
+    interval = jittered_interval(
+        pacing["phase_interval_seconds"],
+        pacing["jitter_ratio"],
+        random_value=random_value,
+    )
+    if interval <= 0.0:
+        return 0.0
+
+    state = load_task_state(logger)
+    states = state.get("phases") if isinstance(state.get("phases"), dict) else {}
+    completed_at: List[datetime] = []
+    for dependency_id in dependencies:
+        dependency_state = states.get(dependency_id)
+        if not isinstance(dependency_state, dict):
+            return 0.0
+        attempts = dependency_state.get("attempts")
+        timestamps = [
+            parse_utc_timestamp(item.get("finished_at"))
+            for item in (attempts if isinstance(attempts, list) else [])
+            if isinstance(item, dict) and _attempt_was_validated_done(item)
+        ]
+        timestamps = [item for item in timestamps if item is not None]
+        if not timestamps:
+            return 0.0
+        completed_at.append(max(timestamps))
+    anchor = max(completed_at)
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    elapsed = max(0.0, (current.astimezone(timezone.utc) - anchor).total_seconds())
+    return max(0.0, interval - elapsed)
+
+
+def _attempt_was_validated_done(attempt: JsonDict) -> bool:
+    """True only for the attempt that actually established dependency readiness."""
+    if str(attempt.get("status") or "") == "validated_done":
+        return True
+    if str(attempt.get("validatedStatus") or "") == "validated_done":
+        return True
+    validation = attempt.get("validation")
+    return bool(
+        isinstance(validation, dict)
+        and str(validation.get("status") or "") == "done"
+    )
+
+
 def _dependency_blocker(
     phase: JsonDict,
     phases: JsonDict,
@@ -2098,6 +2277,7 @@ def validate_worker_artifacts(
     task_dir: Path,
     attempt_artifacts: Optional[List[str]] = None,
     prior_artifacts: Optional[List[str]] = None,
+    file_evidence: Optional[List[JsonDict]] = None,
 ) -> JsonDict:
     if not contract:
         return {"status": "skipped", "reason": "no worker_contract"}
@@ -2121,6 +2301,14 @@ def validate_worker_artifacts(
             phase_id=str(contract.get("phase_id") or "worker"),
         )
 
+    row_validators = [
+        validator for validator in validators
+        if str(validator.get("type") or "") not in FILE_VALIDATOR_TYPES
+    ]
+    file_validators = [
+        validator for validator in validators
+        if str(validator.get("type") or "") in FILE_VALIDATOR_TYPES
+    ]
     extraction_artifacts = [
         path for path in artifacts
         if "/artifacts/extractions/" in str(path)
@@ -2169,7 +2357,13 @@ def validate_worker_artifacts(
         if not expected_name or item.get("payload", {}).get("name") == expected_name
     ]
 
-    must_record = bool(contract.get("must_record_extraction", True))
+    has_row_contract = bool(
+        expected.get("name")
+        or expected.get("fields")
+        or expected.get("required_fields")
+        or row_validators
+    )
+    must_record = bool(contract.get("must_record_extraction", has_row_contract))
     if must_record and not candidates and not attempt_candidates and not prior_candidates:
         failures.append({
             "type": "artifact_required",
@@ -2221,7 +2415,7 @@ def validate_worker_artifacts(
                     "message": "selected artifact has no rows array",
                     "path": item.get("path"),
                 })
-        for validator in validators:
+        for validator in row_validators:
             cand_failures.extend(_run_validator(validator, cand_rows))
         cand_failures.extend(_detect_placeholder_rows(cand_rows))
         cand_failures.extend(_detect_stub_rows(cand_rows, expected))
@@ -2248,7 +2442,7 @@ def validate_worker_artifacts(
     if failures:
         cumulative_rows, cumulative_sources, cumulative_failures = (
             _validate_cumulative_artifacts(
-                validators=validators,
+                validators=row_validators,
                 expected=expected,
                 candidates=[
                     *prior_candidates,
@@ -2263,9 +2457,21 @@ def validate_worker_artifacts(
             warnings = _detect_near_stub_rows(rows, expected)
             cumulative = True
 
+    file_failures: List[JsonDict] = []
+    for validator in file_validators:
+        file_failures.extend(_run_file_validator(
+            validator,
+            artifacts=artifacts,
+            evidence=file_evidence or [],
+            rows=rows,
+        ))
+    failures.extend(file_failures)
+
     status = "done" if not failures else "failed"
     result_artifacts = cumulative_sources if cumulative else (
-        [selected.get("path")] if selected else []
+        [selected.get("path")] if selected else (
+            _unique_paths(artifacts) if file_validators else []
+        )
     )
     valid_extraction_artifacts = cumulative_sources if cumulative else (
         [selected.get("path")] if selected and not failures else []
@@ -2280,6 +2486,11 @@ def validate_worker_artifacts(
         "validExtractionArtifacts": valid_extraction_artifacts,
         "attemptExtractionArtifacts": extraction_attempt_artifacts,
         "priorExtractionArtifacts": prior_extraction_artifacts,
+        "fileArtifacts": _unique_paths([
+            path for path in artifacts
+            if "/artifacts/extractions/" not in str(path)
+        ]),
+        "fileEvidenceCount": len(file_evidence or []),
         "failures": failures,
     }
     if cumulative:
@@ -2530,6 +2741,9 @@ def classify_artifact_validation_failures(
     }:
         category = "data_wrong_value"
         hint = "Rows were saved, but one or more values failed semantic validators."
+    elif failure_types & FILE_VALIDATOR_TYPES:
+        category = "file_validation_failed"
+        hint = "The file action ran, but completion, selection, confirmation, or on-disk integrity evidence is insufficient."
     else:
         category = "data_wrong_value" if failures else "unknown"
         hint = "Validation failed; inspect failures and choose a different recovery path."
@@ -2796,6 +3010,198 @@ def _run_validator(validator: JsonDict, rows: List[JsonDict]) -> List[JsonDict]:
         "validator": validator_type,
         "message": f"validator type must be one of {sorted(VALIDATOR_TYPES)}",
     }]
+
+
+def _run_file_validator(
+    validator: JsonDict,
+    *,
+    artifacts: List[str],
+    evidence: List[JsonDict],
+    rows: List[JsonDict],
+) -> List[JsonDict]:
+    validator_type = str(validator.get("type") or "").strip()
+    file_paths = _unique_paths([
+        str(path) for path in artifacts
+        if str(path).strip() and "/artifacts/extractions/" not in str(path)
+    ])
+
+    if validator_type == "download_completed":
+        receipts = [
+            item for item in evidence
+            if isinstance(item, dict) and (
+                str(item.get("method") or "") == "File.download"
+                or str(item.get("method") or "").startswith("Download.")
+            )
+        ]
+        completed = any(_file_receipt_completed(item) for item in receipts)
+        if completed:
+            return []
+        return [{
+            "type": validator_type,
+            "message": "no successful completed download receipt was recorded",
+            "receiptCount": len(receipts),
+        }]
+
+    if validator_type == "file_integrity":
+        pattern = str(validator.get("path_pattern") or validator.get("pattern") or "").strip()
+        extensions = {
+            str(item).lower().lstrip(".")
+            for item in (validator.get("extensions") or [])
+            if str(item).strip()
+        }
+        raw_min_bytes = validator.get("min_bytes")
+        min_bytes = max(0, int(1 if raw_min_bytes is None else raw_min_bytes))
+        expected_sha256 = str(validator.get("sha256") or "").strip().lower()
+        valid: List[str] = []
+        bad: List[JsonDict] = []
+        regex = re.compile(pattern) if pattern else None
+        for raw_path in file_paths:
+            path = Path(raw_path).expanduser()
+            if regex is not None and regex.search(str(path)) is None:
+                continue
+            if extensions and path.suffix.lower().lstrip(".") not in extensions:
+                continue
+            try:
+                if not path.is_file():
+                    bad.append({"path": str(path), "reason": "not_a_file"})
+                    continue
+                size = path.stat().st_size
+                if size < min_bytes:
+                    bad.append({"path": str(path), "reason": "too_small", "byteSize": size})
+                    continue
+                if expected_sha256:
+                    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                    if digest != expected_sha256:
+                        bad.append({"path": str(path), "reason": "sha256_mismatch", "sha256": digest})
+                        continue
+                valid.append(str(path))
+            except OSError as exc:
+                bad.append({"path": str(path), "reason": "io_error", "error": str(exc)})
+        min_files = max(1, int(validator.get("min_files") or 1))
+        if len(valid) >= min_files:
+            return []
+        return [{
+            "type": validator_type,
+            "message": "downloaded/exported files did not satisfy integrity constraints",
+            "requiredFiles": min_files,
+            "validFiles": valid,
+            "bad": bad[:20],
+            "availableArtifacts": file_paths,
+        }]
+
+    if validator_type in {"upload_selected", "upload_confirmed"}:
+        receipts = [
+            item for item in evidence
+            if isinstance(item, dict)
+            and str(item.get("method") or "") == "File.handleChooser"
+            and _file_receipt_succeeded(item)
+        ]
+        selected_count = max(
+            (_selected_file_count(item.get("params")) for item in receipts),
+            default=0,
+        )
+        min_files = max(1, int(validator.get("min_files") or 1))
+        if not receipts or selected_count < min_files:
+            return [{
+                "type": validator_type,
+                "message": "File.handleChooser did not confirm the required file selection",
+                "requiredFiles": min_files,
+                "selectedFiles": selected_count,
+                "receiptCount": len(receipts),
+            }]
+        if validator_type == "upload_selected":
+            return []
+        field = str(validator.get("field") or "").strip()
+        pattern = str(validator.get("pattern") or "").strip()
+        if not field:
+            return [{
+                "type": validator_type,
+                "message": "upload_confirmed requires a field containing post-upload page evidence",
+            }]
+        regex = re.compile(pattern) if pattern else None
+        confirmed = any(
+            not _is_empty_value(row.get(field))
+            and (regex is None or regex.search(str(row.get(field) or "")) is not None)
+            for row in rows
+        )
+        if confirmed:
+            return []
+        return [{
+            "type": validator_type,
+            "message": "file selection succeeded but post-upload page confirmation is missing",
+            "field": field,
+            "pattern": pattern,
+        }]
+
+    if validator_type == "image_exported":
+        min_files = max(1, int(validator.get("min_files") or 1))
+        image_exts = {"png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff"}
+        exported = [
+            path for path in file_paths
+            if Path(path).suffix.lower().lstrip(".") in image_exts
+        ]
+        receipts = [
+            item for item in evidence
+            if isinstance(item, dict)
+            and str(item.get("method") or "") == "DOM.getImg"
+            and _file_receipt_succeeded(item)
+        ]
+        if receipts and len(exported) >= min_files:
+            return []
+        return [{
+            "type": validator_type,
+            "message": "DOM.getImg did not produce the required image artifacts",
+            "requiredFiles": min_files,
+            "exportedFiles": exported,
+            "receiptCount": len(receipts),
+        }]
+
+    return [{"type": "unknown_file_validator", "validator": validator_type}]
+
+
+def _file_receipt_succeeded(receipt: JsonDict) -> bool:
+    response = receipt.get("response")
+    return isinstance(response, dict) and not response.get("error")
+
+
+def _file_receipt_completed(receipt: JsonDict) -> bool:
+    if not _file_receipt_succeeded(receipt):
+        return False
+    response = receipt.get("response")
+    strings: List[str] = []
+
+    def walk(value: Any, key: str = "") -> None:
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                walk(child, str(child_key))
+        elif isinstance(value, list):
+            for child in value:
+                walk(child, key)
+        elif key.lower() in {"status", "state"}:
+            strings.append(str(value).strip().lower())
+
+    walk(response)
+    if any(value in {"completed", "complete", "done", "success", "succeeded"} for value in strings):
+        return True
+    return bool(_receipt_saved_paths(response))
+
+
+def _receipt_saved_paths(value: Any) -> List[str]:
+    # Compatibility wrapper retained for validator-level tests.
+    return saved_paths_from_value(value)
+
+
+def _selected_file_count(params: Any) -> int:
+    if not isinstance(params, dict):
+        return 0
+    for key in ("files", "paths", "filePaths"):
+        value = params.get(key)
+        if isinstance(value, list):
+            return len([item for item in value if str(item).strip()])
+    for key in ("path", "filePath"):
+        if isinstance(params.get(key), str) and str(params.get(key)).strip():
+            return 1
+    return 0
 
 
 def _validate_action_outcome(
@@ -3246,6 +3652,19 @@ def _normalize_validators(
             )
         normalized_validator = dict(validator)
         normalized_validator["type"] = validator_type
+        if validator_type == "upload_confirmed":
+            confirmation_field = str(normalized_validator.get("field") or "").strip()
+            if not confirmation_field:
+                errors.append(
+                    f"phase {phase_id}: validators[{index}] upload_confirmed"
+                    " requires field"
+                )
+            elif confirmation_field not in field_names:
+                errors.append(
+                    f"phase {phase_id}: upload_confirmed field"
+                    f" {confirmation_field!r} must be declared in"
+                    " expected_artifact.fields so the worker records page evidence"
+                )
         if validator_type == "field_provenance":
             normalized_validator["fields"] = _normalize_provenance_validator_fields(
                 normalized_validator

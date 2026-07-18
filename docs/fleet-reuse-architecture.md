@@ -220,6 +220,42 @@ platform deliverable. The exact contract and safe failure behavior are defined
 in `docs/dispatcher-fleet-delegation-contract.md`. The harness never silently
 falls back to creating another fleet when delegation is unavailable.
 
+## 2026 ABCP lifecycle and batching integration
+
+Fleet/page reuse now shares one harness-owned lifecycle contract. Notification
+callbacks update per-page state only; they never perform an RPC. A
+`Page.startedLoading` event closes the DOM gate until a settlement event. On
+timeout the caller performs exactly one `Page.getState` resynchronization, not
+a poll loop. `Page.navigate` and `Page.recovered` also require a new
+`Page.getState` and `DOM.getAXTree`; dialog/chooser closure requires state
+resynchronization before further work. The same boundary defers remaining tool
+calls from one LLM turn after a state-changing call, so a second call cannot act
+on pre-navigation observations.
+
+Batch pacing is explicit contract data. `row_interval_seconds` applies between
+completed `skill_rows` while retaining the warm tab;
+`phase_interval_seconds` is anchored to the latest dependency completion and
+waits before reserving a worker slot. `jitter_ratio` applies bounded symmetric
+jitter. No task-level interval is implemented because one CLI invocation is one
+task rather than a task queue.
+
+When no frozen workflow skill exists, the slow path may compile the first
+validated row trace into an in-memory ephemeral workflow for the remaining
+homogeneous rows. It validates recursively, forbids Runtime and nested
+workflows, hardens navigation settlement/state/AX refresh, runs one canary, and
+falls back to ordinary LLM turns on any compile/canary/contract failure. It does
+not write the skill registry. Native `DOM.getText`/`DOM.getAttribute` batch
+reads and `DOM.getImg` are exposed only when the live ABCP schema/capabilities
+support them; older servers retain single-target behavior.
+
+JavaScript authorization now lives at the Runtime boundary. All model-facing
+`Runtime.evaluate` calls require the same `runtime_policy`; the hidden
+`eval_js_json` alias and structured harness composites cannot create an
+ungated path. `world` is accepted only when the live schema advertises it.
+Frozen skills preserve an authored world on upgraded servers and omit it only
+from a legacy execution copy. The expression scanner is conservative
+defense-in-depth, not a JavaScript sandbox.
+
 ## Remaining operational probes
 
 Unit/integration coverage exercises generation changes, resolver competition,

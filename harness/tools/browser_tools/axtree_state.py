@@ -235,10 +235,20 @@ def _check_stale_axtree_target(
 
 def _axtree_ids_from_params(params: JsonDict) -> Set[str]:
     ids: Set[str] = set()
-    for key in ("id", "nodeId", "targetId", "selector"):
-        value = params.get(key)
-        if isinstance(value, str) and AXTREE_ID_RE.match(value.strip()):
-            ids.add(value.strip())
+
+    def collect(value: Any) -> None:
+        if not isinstance(value, dict):
+            return
+        for key in ("id", "nodeId", "targetId", "selector"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and AXTREE_ID_RE.match(candidate.strip()):
+                ids.add(candidate.strip())
+
+    collect(params)
+    targets = params.get("targets")
+    if isinstance(targets, list):
+        for target in targets:
+            collect(target)
     return ids
 
 

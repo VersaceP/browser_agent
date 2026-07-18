@@ -23,11 +23,11 @@
         "record_extraction"
       ],
       "cautioned_tools": ["extract_dom_records"],
-      "avoid_tools": ["eval_js_json"],
+      "avoid_tools": ["Runtime.evaluate"],
       "procedure": [
         "Confirm page state, then use DOM.getAXTree to identify item boundaries, labels, controls, and stable anchors.",
         "Scroll only when more items must be materialized; refresh DOM.getAXTree after scrolls.",
-        "Use DOM.getText for visible fields and DOM.getAttribute for attributes.",
+        "Use one native targets batch for related DOM.getText or DOM.getAttribute reads when the live schema supports it; inspect each response.data.items entry independently.",
         "Use extract_dom_records only if the repeated structure is uniform and the preferred DOM path is insufficient.",
         "Persist rows with record_extraction using exact expected_artifact field names."
       ],
@@ -64,7 +64,7 @@
         "record_extraction"
       ],
       "cautioned_tools": ["extract_dom_records"],
-      "avoid_tools": ["eval_js_json"],
+      "avoid_tools": ["Runtime.evaluate"],
       "procedure": [
         "Use DOM.getAXTree to locate the item/control/anchor associated with each attribute.",
         "Use DOM.getAttribute for the target attribute value.",
@@ -108,7 +108,7 @@
         "record_extraction"
       ],
       "cautioned_tools": ["visual_verify"],
-      "avoid_tools": ["eval_js_json", "extract_dom_records"],
+      "avoid_tools": ["Runtime.evaluate", "extract_dom_records"],
       "procedure": [
         "Use DOM.getAXTree to locate headings, controls, tab labels, accordion buttons, show-more controls, anchor links, and section bodies.",
         "Reveal hidden or lazy content through Input.click or Input.scroll only when the AXTree shows an appropriate control or target.",
@@ -144,15 +144,15 @@
       ],
       "preferred_tools": [
         "DOM.getAXTree",
-        "eval_js_json",
+        "Runtime.evaluate",
         "DOM.getText",
         "DOM.getAttribute",
         "record_extraction"
       ],
-      "cautioned_tools": ["Runtime.evaluate"],
+      "cautioned_tools": [],
       "avoid_tools": ["unverified generated values"],
       "procedure": [
-        "State a valid reason_kind before eval_js_json: computed_geometry, cross_node_relationship, shadow_dom_traversal, cross_frame_aggregation, non_dom_state, or legacy_no_dom_equivalent.",
+        "Call browser_call(method=Runtime.evaluate) only with runtime_policy containing intent, effect, a valid reason_kind, why_dom_primitives_insufficient, cross_check_plan, and result_mode.",
         "Keep JavaScript scoped to the computed relationship; do not use it for text or attributes native DOM tools can read.",
         "Return JSON-serializable values only.",
         "Cross-check target fields with DOM.getText or DOM.getAttribute before record_extraction.",
@@ -194,7 +194,7 @@
         "record_extraction"
       ],
       "cautioned_tools": ["visual_verify"],
-      "avoid_tools": ["eval_js_json"],
+      "avoid_tools": ["Runtime.evaluate"],
       "procedure": [
         "Locate controls and labels with DOM.getAXTree.",
         "Fill values with Input.type/Input.press and toggle/select with Input.click using AXTree ids or stable selectors.",
@@ -253,15 +253,15 @@
         "Input.press",
         "DOM.getText",
         "DOM.getAttribute",
-        "eval_js_json"
+        "Runtime.evaluate"
       ],
-      "cautioned_tools": ["visual_verify", "Runtime.evaluate"],
+      "cautioned_tools": ["visual_verify"],
       "avoid_tools": ["repeating the same blocked click"],
       "procedure": [
         "Refresh DOM.getAXTree and identify the blocking overlay, modal, or dialog text before retrying the original action.",
         "If a close, dismiss, not-now, skip, or X control is visible in the current AXTree, click it with its canonical id.",
         "If no explicit close control is available, try Input.press with Escape and refresh DOM.getAXTree.",
-        "If Escape fails and the prompt appears dismissible, verify a backdrop/outside click target before clicking: use eval_js_json with reason_kind=computed_geometry to inspect document.elementFromPoint at a proposed outside point and confirm it maps to the overlay/backdrop/container, not a login, payment, provider, consent-submit, navigation, or content control.",
+        "If Escape fails and the prompt appears dismissible, verify a backdrop/outside click target before clicking: use gated Runtime.evaluate with runtime_policy.reason_kind=computed_geometry to inspect document.elementFromPoint at a proposed outside point and confirm it maps to the overlay/backdrop/container, not a login, payment, provider, consent-submit, navigation, or content control.",
         "Use Input.click with x/y only after that elementFromPoint verification; otherwise report the blocker.",
         "After each dismiss attempt, verify the overlay text disappeared with DOM.getAXTree before retrying the original blocked action once.",
         "If the overlay persists, report the blocker or switch to an auth/session strategy instead of looping."

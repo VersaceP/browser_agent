@@ -82,9 +82,15 @@ or newly created fleet is acceptable.
 - Prefer target order: live AXTree canonical id, stable semantic attribute, stable CSS selector, coordinates as last resort. Avoid dynamic hash classes.
 - Read AXTree lines as `depth [id] role "label" flags # @x,y,w,h`: `#` marks a preferred actionable target, `@x,y,w,h` is a viewport rect (use it for spatial reasoning only — relative position, overlap, on/off-screen — not for deriving click coordinates; act through the canonical id or a selector), and flags such as `hidden`, `off`, `blocked`, `scroll`, `sticky`, `clip`, or `zN` describe compact layout state. Prefer `#` targets without `hidden`/`blocked`.
 - Do not use screenshots to read ordinary text or form values. Use screenshots only for canvas, graphical state, CAPTCHA, layout overlap, or human-audit proof. For visual checks, crop to the element when it can be located (confirm the current `Page.screenshot` element-targeting parameter via `System.describeAction`, then pass `pageId` and a stable selector; omit `options.path` for automatic saving). If element capture fails, do not repeat it; call `Page.getState`, then fall back to a viewport screenshot only if needed.
-- Use `Runtime.evaluate` only when DOM/attribute tools cannot access the required data or relationship. Never use it to bypass permissions, casually mutate page state, or replace form interactions.
+- Prefer one native `DOM.getText` or `DOM.getAttribute` call with `targets:[...]` for related reads when the live schema exposes it. Consume ordered `response.data.items` independently; partial item failure is not whole-call failure.
+- Use `DOM.getImg` only for real `<img>` assets when the capability exists. It requires batched `targets` plus `options.path`; successful items return `info.savedPath`.
+- Use `Runtime.evaluate` only when DOM/attribute tools cannot access the required data or relationship. Never use it to bypass permissions, casually mutate page state, or replace form interactions. If the live schema exposes `world`, use `main` for page globals, `isolated` for pristine DOM APIs, and an explicit world for scripts with possible side effects.
 
 ## Page And Event Loop
+
+After `Page.startedLoading`, pause DOM probes until `Page.loaded` or another
+settlement event. If no event arrives before timeout, call `Page.getState`
+once; do not poll.
 
 After navigation, page recovery, popup/page identity changes, dialog closure, file chooser closure, or HITL resume:
 

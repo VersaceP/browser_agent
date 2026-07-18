@@ -28,7 +28,7 @@ def parse_direct_capability_params(tool_input: JsonDict) -> Tuple[JsonDict, Opti
     return {
         key: value
         for key, value in tool_input.items()
-        if key not in {"method", "reason"}
+        if key not in {"method", "reason", "runtime_policy"}
     }, None
 
 

@@ -3,16 +3,7 @@
 from typing import Dict, Tuple
 
 from harness.utils import JsonDict
-
-EVAL_JS_REASON_KINDS = {
-    "computed_geometry",
-    "cross_node_relationship",
-    "shadow_dom_traversal",
-    "cross_frame_aggregation",
-    "non_dom_state",
-    "legacy_no_dom_equivalent",
-}
-
+from harness.runtime_evaluation import EVAL_JS_REASON_KINDS
 
 def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, JsonDict]:
     method_schema: JsonDict = {
@@ -39,6 +30,23 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                 "reason": {
                     "type": "string",
                     "description": "Short reason for this call (used in logs and as fallback for the `purpose` field).",
+                },
+                "runtime_policy": {
+                    "type": "object",
+                    "description": (
+                        "Harness-only authorization metadata required when method"
+                        " is Runtime.evaluate; it is never forwarded to ABCP."
+                    ),
+                    "properties": {
+                        "intent": {"type": "string", "enum": ["diagnostic", "extract", "state_change"]},
+                        "effect": {"type": "string", "enum": ["read_only", "state_changing"]},
+                        "reason_kind": {"type": "string", "enum": sorted(EVAL_JS_REASON_KINDS)},
+                        "why_structured_tools_insufficient": {"type": "string"},
+                        "cross_check_plan": {"type": "string"},
+                        "result_mode": {"type": "string", "enum": ["raw", "json"]},
+                        "record_name": {"type": "string"},
+                    },
+                    "additionalProperties": False,
                 },
             },
             "required": ["method", "params", "reason"],
@@ -75,6 +83,21 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                 },
             },
             "required": ["pageId", "fleetId", "variables", "rows"],
+            "additionalProperties": False,
+        },
+        "execute_browser_workflow": {
+            "type": "object",
+            "properties": {
+                "pageId": {"type": "string"},
+                "fleetId": {"type": "string"},
+                "description": {"type": "string"},
+                "variables": {"type": "object", "additionalProperties": True},
+                "steps": {"type": "array", "items": {"type": "object"}},
+                "timeout": {"type": "integer", "minimum": 1000, "maximum": 600000},
+                "stepTimeout": {"type": "integer", "minimum": 1000, "maximum": 60000},
+                "errorConfig": {"type": "object", "additionalProperties": True},
+            },
+            "required": ["pageId", "fleetId", "description", "variables", "steps", "timeout", "stepTimeout"],
             "additionalProperties": False,
         },
         "extract_dom_records": {
@@ -189,7 +212,6 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                     "description": "Optional regex for final title; pass \"\" to skip title check.",
                 },
                 "timeoutSeconds": {"type": "number"},
-                "pollIntervalSeconds": {"type": "number"},
                 "maxRetries": {"type": "integer", "minimum": 1, "maximum": 3},
             },
             "required": [
@@ -198,7 +220,6 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                 "expectedUrlPattern",
                 "expectedTitlePattern",
                 "timeoutSeconds",
-                "pollIntervalSeconds",
                 "maxRetries",
             ],
             "additionalProperties": False,

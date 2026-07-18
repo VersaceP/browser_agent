@@ -53,6 +53,14 @@
       "onTimeout": "continue"
     },
     {
+      "action": "Page.getState",
+      "purpose": "Synchronize page state immediately after navigation settlement."
+    },
+    {
+      "action": "DOM.getAXTree",
+      "purpose": "Refresh DOM identity after navigation before any page interaction."
+    },
+    {
       "action": "Input.press",
       "params": {
         "key": "Escape"
@@ -73,7 +81,8 @@
       "action": "Runtime.evaluate",
       "params": {
         "expression": "window.__abcpSkillCollection={seen:{},rows:[]};return {ready:'yes'};",
-        "returnByValue": true
+        "returnByValue": true,
+        "world": "isolated"
       },
       "extract": {
         "collectionInitReady": "ready"
@@ -84,7 +93,8 @@
       "action": "Runtime.evaluate",
       "params": {
         "expression": "const selector=\"a.ai_link\";\nconst expectedHost=\"theresanaiforthat.com\";\nconst pattern=\"^https://theresanaiforthat\\\\.com/ai/\";\nconst state=window.__abcpSkillCollection||{seen:{},rows:[]};\nfor (const anchor of Array.from(document.querySelectorAll(selector))) {\n  let u; try { u=new URL(anchor.href||anchor.getAttribute('href')||'', location.href); } catch (_) { continue; }\n  if (expectedHost && u.hostname.replace(/^www\\./,'') !== expectedHost.replace(/^www\\./,'')) continue;\n  if (pattern) { try { if (!(new RegExp(pattern)).test(u.href)) continue; } catch (_) { continue; } }\n  if (u.search || u.hash) continue;\n  if (!/^\\/ai\\/[^/]+\\/?$/.test(u.pathname)) continue;\n  const productUrl=u.origin+u.pathname;\n  const productName=String(anchor.textContent||'').replace(/\\s+/g,' ').trim();\n  if (!productName || state.seen[productUrl]) continue;\n  state.seen[productUrl]=true; state.rows.push({productName,productUrl});\n}\nwindow.__abcpSkillCollection=state;\nreturn {candidateCount:state.rows.length};",
-        "returnByValue": true
+        "returnByValue": true,
+        "world": "isolated"
       },
       "extract": {
         "collectionCandidateCount": "candidateCount"
@@ -112,7 +122,8 @@
           "action": "Runtime.evaluate",
           "params": {
             "expression": "const selector=\"a.ai_link\";\nconst expectedHost=\"theresanaiforthat.com\";\nconst pattern=\"^https://theresanaiforthat\\\\.com/ai/\";\nconst state=window.__abcpSkillCollection||{seen:{},rows:[]};\nfor (const anchor of Array.from(document.querySelectorAll(selector))) {\n  let u; try { u=new URL(anchor.href||anchor.getAttribute('href')||'', location.href); } catch (_) { continue; }\n  if (expectedHost && u.hostname.replace(/^www\\./,'') !== expectedHost.replace(/^www\\./,'')) continue;\n  if (pattern) { try { if (!(new RegExp(pattern)).test(u.href)) continue; } catch (_) { continue; } }\n  if (u.search || u.hash) continue;\n  if (!/^\\/ai\\/[^/]+\\/?$/.test(u.pathname)) continue;\n  const productUrl=u.origin+u.pathname;\n  const productName=String(anchor.textContent||'').replace(/\\s+/g,' ').trim();\n  if (!productName || state.seen[productUrl]) continue;\n  state.seen[productUrl]=true; state.rows.push({productName,productUrl});\n}\nwindow.__abcpSkillCollection=state;\nreturn {candidateCount:state.rows.length};",
-            "returnByValue": true
+            "returnByValue": true,
+            "world": "isolated"
           },
           "extract": {
             "collectionCandidateCount": "candidateCount"

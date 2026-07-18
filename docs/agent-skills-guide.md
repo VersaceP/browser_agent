@@ -85,6 +85,10 @@ Use Page capabilities for creation, navigation, dialogs, screenshots, and page
 state. The harness receives browser events automatically and surfaces state
 changes through tool results. Follow these behavioral rules:
 
+- On `Page.startedLoading`, or after navigation/download/state changes, pause
+  DOM probes until `Page.loaded` or another settlement event. If no event
+  arrives before the timeout, call `Page.getState` once to resynchronize; do
+  not poll.
 - After `Page.navigate` or render recovery/recovered feedback: call
   `Page.getState`, then refresh `DOM.getAXTree` before targeting. Treat both as
   DOM-invalidating events.
@@ -140,6 +144,22 @@ Use `DOM.getText` for final visible text. Use `DOM.getAttribute` for non-text
 values such as `href`, `src`, `id`, `aria-*`, `data-*`, and `value`. Do not use
 screenshots or JavaScript for text/attributes that DOM tools can read.
 
+When the live `methodSchema` exposes `targets`, combine related reads from one
+page into one native call. Both methods return ordered
+`response.data.items`. Read every item separately: `DOM.getText` successes use
+`item.info.textContent`; `DOM.getAttribute` successes use
+`item.info.attributes`, where a missing attribute is `null` and an empty value
+is `""`; failures use `item.error`. A failed item does not invalidate its
+successful siblings. Fall back to single-target reads on older servers whose
+schema does not expose `targets`.
+
+Use `DOM.getImg` only for actual `<img>` assets and only when the live
+capability exists. It requires a `targets` batch and `options.path` output
+directory. Prefer `imageFormat:"auto"`; successful items return
+`item.info.savedPath`. Preserve `fallback-screenshot` receipts, and treat
+`not-img-element` as an item error rather than converting arbitrary elements
+into screenshots.
+
 After text extraction, reject empty or obvious placeholder-only content in any
 language. Examples include loading prompts, sign-in prompts, first-comment
 prompts, and empty submission forms.
@@ -174,15 +194,42 @@ large row sets.
 
 ## JavaScript Fallback
 
-`eval_js_json` is a last resort for computed geometry, cross-node
-relationships, shadow DOM traversal, cross-frame aggregation, non-DOM state, or
-legacy cases with no DOM equivalent. Provide a valid reason kind, a concrete
-explanation, and a DOM cross-check plan.
+The only model-facing JavaScript path is
+`browser_call({method:"Runtime.evaluate", ...})`. It is a last resort for
+computed geometry, cross-node relationships, shadow DOM traversal, cross-frame
+aggregation, non-DOM state, or legacy cases with no DOM equivalent. Supply the
+harness-only `runtime_policy` with intent, effect, a valid `reason_kind`,
+`why_dom_primitives_insufficient`, `cross_check_plan`, and `result_mode`. The
+old `eval_js_json` name is a hidden compatibility alias, not an agent choice.
+
+Expose `world` only when the live Runtime schema supports it. Use `main` for
+page-defined globals and `isolated` for pristine DOM APIs. Read-only probes may
+use `auto`; scripts with possible side effects must choose an explicit world,
+because auto retry cannot prove the first attempt had no effects.
 
 Do not use JavaScript for ordinary visible text or attributes that
 `DOM.getText`/`DOM.getAttribute` can read. Never use it to bypass permissions,
 casually mutate page state, or replace form interactions — form entry goes
-through Input-level tools.
+through Input-level tools. The harness expression scanner is a conservative
+defense-in-depth heuristic, not a JavaScript parser or security sandbox;
+ABCP's structured interaction, file, permission, and platform boundaries remain
+authoritative.
+
+Frozen skills may declare an explicit Runtime `world` before every deployed
+ABCP server supports it. The harness keeps that declaration on upgraded
+servers and omits it only from the legacy execution copy. Read-only local
+declarations such as `const title = document.title` are not page mutations;
+DOM/global/property writes and mutator calls remain state-changing.
+
+## File Operations
+
+Keep `file_download` and `file_upload` as distinct task types because their
+allowed ABCP domains differ. Download phases should validate the browser
+completion receipt (`download_completed`) separately from on-disk existence,
+size, extension, and optional digest (`file_integrity`). Upload phases should
+validate chooser selection (`upload_selected`) separately from a page-observed
+success state (`upload_confirmed`). Image exports use `image_exported` plus
+`file_integrity` when file contents matter.
 
 ## Offload
 

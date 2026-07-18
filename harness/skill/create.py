@@ -919,6 +919,16 @@ _PAGE_BINDING_STEP = {
     ),
 }
 
+_AX_REFRESH_STEP = {
+    "action": "DOM.getAXTree",
+    "params": {},
+    "onError": "stop",
+    "purpose": (
+        "Refresh DOM perception after navigation settlement and Page.getState;"
+        " never reuse element ids from the previous page epoch."
+    ),
+}
+
 
 def harden_draft_workflow(workflow: Dict[str, Any]) -> List[str]:
     """Conservative auto-hardening (07-06 user decision: read-only defenses
@@ -928,7 +938,8 @@ def harden_draft_workflow(workflow: Dict[str, Any]) -> List[str]:
         navigate CALL return -32001 while the page actually loads; the
         distilled `listen Page.loaded` settles it (an explicit onError set by
         the distiller/human is left untouched);
-      ③ one native Page.getState extract {pageUrl, pageTitle} before the
+      ② one native Page.getState extract {pageUrl, pageTitle}, followed by a
+        fresh DOM.getAXTree, before the
         content reads — declaring the binding activates the harness's
         page_binding_mismatch fail-closed protection (wrong-page rows are
         never persisted in same-tab batches).
@@ -977,8 +988,9 @@ def harden_draft_workflow(workflow: Dict[str, Any]) -> List[str]:
                     break
         if insert_at is not None:
             steps.insert(insert_at, dict(_PAGE_BINDING_STEP))
+            steps.insert(insert_at + 1, dict(_AX_REFRESH_STEP))
             notes.append(
-                "页面绑定: 注入 Page.getState extract {pageUrl, pageTitle}"
+                "页面绑定: 注入 Page.getState extract {pageUrl, pageTitle} + DOM.getAXTree"
                 "（激活 harness 批量防串页 fail-closed——错页行不落盘）")
     return notes
 

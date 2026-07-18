@@ -19,6 +19,14 @@
       "onTimeout": "continue"
     },
     {
+      "action": "Page.getState",
+      "purpose": "Synchronize page state immediately after navigation settlement."
+    },
+    {
+      "action": "DOM.getAXTree",
+      "purpose": "Refresh DOM identity after navigation before using page state."
+    },
+    {
       "action": "Runtime.evaluate",
       "params": {
         "expression": "function chl(){var t=(document.title||'').toLowerCase();var u=(location.href||'').toLowerCase();var m=['just a moment','verify you are human','checking your browser','attention required','cloudflare','cf-chl','__cf_chl','challenge-platform'];return {challenge:m.some(function(s){return t.indexOf(s)>=0||u.indexOf(s)>=0;})?'yes':''};}return chl();",

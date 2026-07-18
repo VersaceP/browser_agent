@@ -14,8 +14,13 @@ Live-verified contract (2026-06-26, headless ABCP):
 """
 from __future__ import annotations
 
+import copy
 import uuid
+import re
 from typing import Any, Dict, List, Optional
+
+from harness.runtime_evaluation import RuntimeEvaluationService
+from harness.workflow_policy import validate_workflow_params
 
 
 def build_execute_params(
@@ -53,6 +58,8 @@ async def run_skill_workflow(
     page_id: Optional[str] = None,
     fleet_id: Optional[str] = None,
     variables: Optional[Dict[str, Any]] = None,
+    capability_methods: Optional[Any] = None,
+    method_schemas: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run a skill's workflow; return a normalized result dict.
 
@@ -64,6 +71,55 @@ async def run_skill_workflow(
     params = build_execute_params(
         skill, run_id=run_id, page_id=page_id, fleet_id=fleet_id, variables=variables
     )
+    method_schemas, schema_error = await _resolve_runtime_schema_for_authored_world(
+        browser,
+        params.get("steps") or [],
+        method_schemas,
+    )
+    if schema_error is not None:
+        return {
+            "succeeded": False,
+            "runId": run_id,
+            "failedStepPath": None,
+            "failedError": schema_error,
+            "failedPurpose": "runtime capability preflight",
+            "variables": variables or {},
+            "priorResults": [],
+            "exc": "Could not capability-gate authored Runtime world",
+        }
+    # Preflight the frozen recipe. Runtime ``world`` is the sole capability-
+    # normalized field: authored intent is preserved on upgraded servers and
+    # omitted from an execution copy for legacy servers that lack the field.
+    # ``validate_workflow_params`` also supplies defaults for newly compiled
+    # workflows; feeding that normalized copy to old skills silently changed
+    # their timeout behavior during this compatibility check.
+    prepared_steps, policy_error = _prepare_frozen_runtime_steps(
+        params.get("steps") or [],
+        method_schemas=method_schemas,
+    )
+    if policy_error is None:
+        params["steps"] = prepared_steps
+        _normalized, policy_error = validate_workflow_params(
+            params,
+            capability_methods=capability_methods,
+            task_type=str(getattr(skill, "task_type", "general") or "general"),
+            # Existing frozen recipes may contain audited Runtime steps. Ephemeral
+            # model-authored workflows remain stricter and reject Runtime entirely.
+            allow_runtime=True,
+            enforce_lifecycle=True,
+            allow_legacy_listen_events=True,
+        )
+    if policy_error is not None:
+        return {
+            "succeeded": False,
+            "runId": run_id,
+            "failedStepPath": None,
+            "failedError": policy_error,
+            "failedPurpose": "workflow preflight policy",
+            "variables": variables or {},
+            "priorResults": [],
+            "exc": "Frozen workflow rejected by harness policy",
+        }
     try:
         res = await browser.call("Workflow.execute", params)
         data = (res or {}).get("data") or {}
@@ -93,6 +149,141 @@ async def run_skill_workflow(
             "variables": snapshot.get("variables") or {},
             "priorResults": results[:-1] if results else [],
             "exc": str(exc),
+        }
+
+
+_RUNTIME_MUTATION_RE = re.compile(
+    # Property/index assignment is observable or alias-ambiguous; a plain
+    # ``var/let/const local = ...`` declaration is not. This deliberately
+    # remains conservative without classifying every local initializer as a
+    # page mutation.
+    r"(?:\.\s*[A-Za-z_$][\w$]*|\[[^\]\n]+\])\s*=(?!=)|\+\+|--|"
+    r"\.push\s*\(|\.pop\s*\(|"
+    r"\.splice\s*\(|\.setAttribute\s*\(|\.removeAttribute\s*\(|"
+    r"\.append(?:Child)?\s*\(|\.remove\s*\(|"
+    r"\b(?:localStorage|sessionStorage)\.(?:setItem|removeItem|clear)\s*\(",
+    re.I,
+)
+
+
+def _prepare_frozen_runtime_steps(
+    steps: List[Any],
+    *,
+    method_schemas: Optional[Dict[str, Any]],
+) -> tuple[List[Any], Optional[Dict[str, Any]]]:
+    prepared_steps = copy.deepcopy(steps)
+    service = RuntimeEvaluationService(method_schemas or {})
+    errors: List[str] = []
+    for path, step in _walk_workflow_steps(prepared_steps):
+        if str(step.get("action") or "") != "Runtime.evaluate":
+            continue
+        params = dict(step.get("params")) if isinstance(step.get("params"), dict) else {}
+        # Frozen recipes may declare their intended world ahead of an ABCP
+        # upgrade. Do not send that unsupported field to a legacy server; the
+        # source skill and all non-Runtime fields remain untouched.
+        if not service.supports_world():
+            params.pop("world", None)
+        expression = str(params.get("expression") or "")
+        effect = "state_changing" if _RUNTIME_MUTATION_RE.search(expression) else "read_only"
+        prepared, runtime_error = service.prepare(
+            params,
+            {
+                "intent": "diagnostic",
+                "effect": effect,
+                "result_mode": "raw",
+            },
+            origin="harness_compatibility",
+        )
+        if runtime_error is not None:
+            errors.append(
+                f"{path}: {runtime_error.get('policy_violation')}:"
+                f" {runtime_error.get('error')}"
+            )
+        elif prepared is not None:
+            step["params"] = prepared.params
+    if not errors:
+        return prepared_steps, None
+    return prepared_steps, {
+        "status": "rejected",
+        "policy_violation": "frozen_workflow_runtime_policy_rejected",
+        "errors": errors,
+        "tool_was_executed": False,
+        "next_instruction": (
+            "Migrate the frozen workflow Runtime steps/world declarations before"
+            " retrying; the authored payload was not modified or executed."
+        ),
+    }
+
+
+def _audit_frozen_runtime_steps(
+    steps: List[Any],
+    *,
+    method_schemas: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Compatibility wrapper for callers that only need an audit verdict."""
+    _prepared, error = _prepare_frozen_runtime_steps(
+        steps,
+        method_schemas=method_schemas,
+    )
+    return error
+
+
+def _walk_workflow_steps(
+    steps: List[Any],
+    path: str = "steps",
+) -> List[tuple[str, Dict[str, Any]]]:
+    found: List[tuple[str, Dict[str, Any]]] = []
+    for index, raw in enumerate(steps):
+        if not isinstance(raw, dict):
+            continue
+        step_path = f"{path}[{index}]"
+        found.append((step_path, raw))
+        for key in ("then", "else", "body"):
+            nested = raw.get(key)
+            if isinstance(nested, list):
+                found.extend(_walk_workflow_steps(nested, f"{step_path}.{key}"))
+    return found
+
+
+async def _resolve_runtime_schema_for_authored_world(
+    browser: Any,
+    steps: List[Any],
+    method_schemas: Optional[Dict[str, Any]],
+) -> tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Probe Runtime schema only for non-agent callers that need world gating.
+
+    BrowserAgent dispatch always passes its bootstrap schema map. Offline
+    skill-create/heal canaries historically call this function directly; when
+    a frozen recipe already declares ``world``, they must not guess whether to
+    retain or strip it.
+    """
+    if method_schemas is not None:
+        return method_schemas, None
+    declares_world = any(
+        str(step.get("action") or "") == "Runtime.evaluate"
+        and isinstance(step.get("params"), dict)
+        and bool(str(step["params"].get("world") or "").strip())
+        for _path, step in _walk_workflow_steps(steps)
+    )
+    if not declares_world:
+        return {}, None
+    try:
+        response = await browser.call(
+            "System.describeAction", {"method": "Runtime.evaluate"}
+        )
+        data = response.get("data") if isinstance(response, dict) else None
+        if not isinstance(data, dict):
+            raise ValueError("System.describeAction returned no schema data")
+        return {"Runtime.evaluate": data}, None
+    except Exception as exc:
+        return {}, {
+            "status": "rejected",
+            "policy_violation": "runtime_world_capability_unknown",
+            "error": (
+                "The frozen workflow declares Runtime world, but the live"
+                f" Runtime.evaluate schema could not be loaded: {exc}"
+            ),
+            "tool_was_executed": False,
         }
 
 

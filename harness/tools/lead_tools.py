@@ -126,6 +126,23 @@ def _validator_item_schema() -> JsonDict:
                     " non-contiguous targets such as ranks [38, 40]."
                 ),
             },
+            "min_files": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Minimum selected/downloaded/exported file count for file validators.",
+            },
+            "min_bytes": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Minimum on-disk byte size for file_integrity.",
+            },
+            "extensions": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Allowed file extensions for file_integrity.",
+            },
+            "sha256": {"type": "string"},
+            "path_pattern": {"type": "string"},
         },
         "required": ["type"],
         "additionalProperties": True,
@@ -175,6 +192,23 @@ def _expected_artifact_schema() -> JsonDict:
 
 
 def _emit_task_plan_schema(_: Any = None) -> JsonDict:
+    from harness.pacing import MAX_PACING_INTERVAL_SECONDS
+
+    pacing_schema = {
+        "type": "object",
+        "properties": {
+            "row_interval_seconds": {
+                "type": "number", "minimum": 0,
+                "maximum": MAX_PACING_INTERVAL_SECONDS,
+            },
+            "phase_interval_seconds": {
+                "type": "number", "minimum": 0,
+                "maximum": MAX_PACING_INTERVAL_SECONDS,
+            },
+            "jitter_ratio": {"type": "number", "minimum": 0, "maximum": 1},
+        },
+        "additionalProperties": False,
+    }
     return {
         "type": "object",
         "properties": {
@@ -201,6 +235,7 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                         # validator type enum.
                         "enum": sorted(VALID_TASK_TYPES),
                     },
+                    "pacing": pacing_schema,
                     "phases": {
                         "type": "array",
                         "items": {
@@ -241,6 +276,7 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                         " phases can run in parallel."
                                     ),
                                 },
+                                "pacing": pacing_schema,
                                 "validators": {
                                     "type": "array",
                                     "description": (
@@ -264,6 +300,17 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                         },
                                         "needs_isolated_session": {"type": "boolean"},
                                         "auth_verification": _auth_verification_schema(),
+                                        "batch_rows": {
+                                            "type": "array",
+                                            "items": {"type": "object"},
+                                            "minItems": 3,
+                                            "description": (
+                                                "Homogeneous current-task rows for online ephemeral workflow reuse"
+                                                " when no frozen workflow skill is selected. Row 0 is executed by"
+                                                " the worker LLM; the harness may compile that trace, canary row 1,"
+                                                " then run the rest with fallback on any failure."
+                                            ),
+                                        },
                                     },
                                     "additionalProperties": True,
                                 },

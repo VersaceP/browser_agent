@@ -107,6 +107,7 @@ def build_read_only_oracle(agent: Any, page_id: str, step: int) -> OracleEval:
     """
 
     async def run(expression: str) -> Any:
+        from harness.runtime_evaluation import RuntimeEvaluationService
         from harness.tools.browser_tools import (  # local import: avoid cycle
             _eval_json_via_title,
             _invoke_browser_method,
@@ -124,6 +125,13 @@ def build_read_only_oracle(agent: Any, page_id: str, step: int) -> OracleEval:
             internal=True,
         )
         original_title = _response_data(state).get("title")
+        world_params = (
+            {"world": "isolated"}
+            if RuntimeEvaluationService(
+                getattr(agent, "method_schemas", {})
+            ).supports_world()
+            else {}
+        )
 
         # Verifier templates evaluate to an object; the side-channel needs a
         # JSON string, so wrap with JSON.stringify.
@@ -148,11 +156,19 @@ def build_read_only_oracle(agent: Any, page_id: str, step: int) -> OracleEval:
                         "expression": f"document.title = {json.dumps(original_title)}; 0",
                         "returnByValue": True,
                         "purpose": "verifier oracle: restore title",
+                        **world_params,
                     },
                     step,
                     count_progress=False,
                     read_only_eval=True,
                     internal=True,
+                    runtime_policy={
+                        "origin": "harness_compatibility",
+                        "intent": "diagnostic",
+                        "effect": "state_changing",
+                        "result_mode": "raw",
+                    },
+                    lifecycle_cleanup_bypass=True,
                 )
 
         if payload is None:

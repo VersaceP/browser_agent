@@ -38,6 +38,7 @@ OFFLOAD_METHODS = {
     "DOM.getAXTree",
     "DOM.getText",
     "DOM.getAttribute",
+    "DOM.getImg",
 }
 OFFLOAD_FIELDS_AS_TEXT = {"lines"}
 OFFLOAD_FIELDS_AS_JSON = {
@@ -46,6 +47,7 @@ OFFLOAD_FIELDS_AS_JSON = {
     "ax",
     "text",
     "attributes",
+    "items",
     "value",
     "layers",
 }
