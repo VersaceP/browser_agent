@@ -1,6 +1,6 @@
 {
-  "method": "File.download",
-  "description": "Download a file from a URL to a specified local path via the browser session.",
+  "method": "Download.start",
+  "description": "Starts a browser-session download and returns its tracking ID immediately.",
   "params": {
     "pageId": {
       "type": "string",
@@ -18,7 +18,7 @@
     "savePath": {
       "type": "string",
       "minLength": 1,
-      "description": "Workspace-relative or absolute save path for the downloaded file.",
+      "description": "Workspace-relative or absolute save path.",
       "required": true
     },
     "purpose": {

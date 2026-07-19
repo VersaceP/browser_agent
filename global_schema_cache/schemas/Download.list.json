@@ -1,7 +1,37 @@
 {
   "method": "Download.list",
-  "description": "Lists recent download history entries.",
+  "description": "Lists recent download records, optionally filtered by ID or lifecycle state.",
   "params": {
+    "fleetId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Fleet ID whose downloads should be queried.",
+      "required": true
+    },
+    "downloadId": {
+      "description": "Optional download record ID to inspect.",
+      "type": "integer",
+      "minimum": -9007199254740991,
+      "maximum": 9007199254740991,
+      "required": false
+    },
+    "states": {
+      "description": "Optional lifecycle states to include.",
+      "minItems": 1,
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "downloading",
+          "paused",
+          "completed",
+          "failed",
+          "cancelled"
+        ]
+      },
+      "required": false
+    },
     "limit": {
       "default": 100,
       "description": "Maximum recent download records to return.",

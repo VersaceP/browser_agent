@@ -1,36 +1,43 @@
 {
-  "method": "Bookmark.remove",
-  "description": "Removes one bookmark or all bookmarks while preserving the folder tree.",
+  "method": "History.remove",
+  "description": "Removes browsing history by record, origin, or all records.",
   "params": {
     "fleetId": {
       "type": "string",
       "format": "uuid",
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Fleet ID whose bookmark store should be changed.",
+      "description": "Fleet ID whose browsing history should be changed.",
       "required": true
     },
     "scope": {
       "type": "string",
       "enum": [
         "item",
+        "origin",
         "all"
       ],
       "description": "Removal scope.",
       "required": true
     },
     "id": {
-      "description": "Bookmark ID when scope is item.",
+      "description": "History record ID when scope is item.",
       "type": "integer",
       "minimum": -9007199254740991,
       "maximum": 9007199254740991,
       "required": false
     },
+    "origin": {
+      "description": "Origin string when scope is origin.",
+      "type": "string",
+      "minLength": 1,
+      "required": false
+    },
     "purpose": {
       "type": "string",
-      "description": "Describe why you are removing this bookmark, set of bookmarks, or folder, e.g., cleaning up unneeded saves",
+      "description": "Describe why you are removing browsing history, e.g., cleaning up sensitive records",
       "required": true
     }
   },
   "requiresPurpose": true,
-  "purposeHint": "Describe why you are removing this bookmark, set of bookmarks, or folder, e.g., cleaning up unneeded saves"
+  "purposeHint": "Describe why you are removing browsing history, e.g., cleaning up sensitive records"
 }

@@ -1,6 +1,6 @@
 {
   "method": "File.handleChooser",
-  "description": "Handles native page file choosers.",
+  "description": "Handles native page file choosers or directly fills a file input/upload component.",
   "params": {
     "pageId": {
       "type": "string",
@@ -8,6 +8,11 @@
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
       "description": "Page ID with the pending file chooser.",
       "required": true
+    },
+    "chooserId": {
+      "description": "Target chooser session id. Required when the page has multiple pending choosers.",
+      "type": "string",
+      "required": false
     },
     "accept": {
       "type": "boolean",
@@ -22,12 +27,22 @@
       },
       "required": false
     },
+    "id": {
+      "description": "Canonical upload target id. Mutually exclusive with selector.",
+      "type": "string",
+      "required": false
+    },
+    "selector": {
+      "description": "CSS selector for a file input or upload component. Mutually exclusive with id.",
+      "type": "string",
+      "required": false
+    },
     "purpose": {
       "type": "string",
-      "description": "Describe your intent for handling this file chooser, e.g., uploading a document",
+      "description": "Describe your intent for handling this file chooser or upload component, e.g., uploading a document",
       "required": true
     }
   },
   "requiresPurpose": true,
-  "purposeHint": "Describe your intent for handling this file chooser, e.g., uploading a document"
+  "purposeHint": "Describe your intent for handling this file chooser or upload component, e.g., uploading a document"
 }

@@ -1,6 +1,6 @@
 {
   "method": "Fleet.status",
-  "description": "View the detailed status of a specified browser instance, including tabs and task queue information.",
+  "description": "View the detailed status of a specified browser instance, including tabs, task queue information, fingerprint profileId, and sanitized proxy configuration.",
   "params": {
     "fleetId": {
       "type": "string",

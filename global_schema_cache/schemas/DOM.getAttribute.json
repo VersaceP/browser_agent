@@ -1,38 +1,85 @@
 {
   "method": "DOM.getAttribute",
-  "description": "Performs a focused attribute read from a known element, such as href, class, aria-*, value, or data-*; use DOM.getAXTree first when the target element is not yet identified.",
+  "description": "Reads one or more attributes from one or more known DOM elements by canonical id or selector.",
   "params": {
     "pageId": {
       "type": "string",
       "format": "uuid",
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Page ID containing the target element.",
+      "description": "Page ID containing the target elements.",
       "required": true
     },
-    "selector": {
-      "description": "Fallback CSS selector for the target element.",
-      "type": "string",
-      "minLength": 1,
-      "required": false
+    "targets": {
+      "minItems": 1,
+      "type": "array",
+      "items": {
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^\\d+:\\d+:\\d+$",
+                "description": "Canonical element ID from DOM.getAXTree."
+              },
+              "selector": {
+                "not": {}
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "selector": {
+                "type": "string",
+                "minLength": 1,
+                "description": "CSS selector for a target element in the main frame."
+              },
+              "id": {
+                "not": {}
+              }
+            },
+            "required": [
+              "selector"
+            ],
+            "additionalProperties": false
+          }
+        ],
+        "description": "DOM query target identified by either canonical id or selector."
+      },
+      "description": "Targets to read, preserving input order in response.data.items.",
+      "required": true
     },
-    "id": {
-      "description": "Preferred canonical element ID from DOM.getAXTree.",
-      "type": "string",
-      "pattern": "^\\d+:\\d+:\\d+$",
-      "required": false
-    },
-    "attribute": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Attribute name to read, such as \"href\", \"value\", or \"aria-checked\".",
+    "attributes": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "description": "Attribute name to read, such as \"href\", \"value\", or \"aria-checked\"."
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Attribute name to read, such as \"href\", \"value\", or \"aria-checked\"."
+          },
+          "description": "Attribute names to read. An empty array reads all attributes."
+        }
+      ],
+      "description": "Attribute name or names to read from every target. Use [] to read all attributes.",
       "required": true
     },
     "purpose": {
       "type": "string",
-      "description": "Describe why this attribute is needed, e.g., checking a link href, validating aria state, reading an input value, or debugging selector stability",
+      "description": "Describe why these attributes are needed, e.g., checking a link href, validating aria state, reading an input value, or debugging selector stability",
       "required": true
     }
   },
   "requiresPurpose": true,
-  "purposeHint": "Describe why this attribute is needed, e.g., checking a link href, validating aria state, reading an input value, or debugging selector stability"
+  "purposeHint": "Describe why these attributes are needed, e.g., checking a link href, validating aria state, reading an input value, or debugging selector stability"
 }

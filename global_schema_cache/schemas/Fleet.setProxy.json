@@ -1,0 +1,16 @@
+{
+  "method": "Fleet.setProxy",
+  "description": "Set the dynamic proxy for the current Fleet. A bootstrap proxy file makes the configuration immutable.",
+  "params": {
+    "config": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string"
+      },
+      "additionalProperties": {},
+      "description": "Normalized proxy configuration.",
+      "required": true
+    }
+  },
+  "requiresPurpose": false
+}

@@ -1,0 +1,50 @@
+{
+  "method": "Page.go",
+  "description": "Moves an existing page through its browser navigation history by direction, relative steps, a domain anchor, or a tagged history entry.",
+  "params": {
+    "pageId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Page ID whose navigation history should be changed.",
+      "required": true
+    },
+    "direction": {
+      "type": "string",
+      "enum": [
+        "back",
+        "forward"
+      ],
+      "description": "Direction in which to search or move through navigation history.",
+      "required": true
+    },
+    "domain": {
+      "description": "Optional hostname anchor, such as example.com; searches the nearest matching entry in the requested direction.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 253,
+      "required": false
+    },
+    "tag": {
+      "description": "Exact history tag to locate in the requested direction.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "required": false
+    },
+    "n": {
+      "description": "Relative number of entries; 0 means the oldest entry when going back or newest entry when going forward.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991,
+      "required": false
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why returning to or revisiting this navigation entry is needed for the task",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why returning to or revisiting this navigation entry is needed for the task"
+}

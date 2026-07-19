@@ -1,11 +1,12 @@
 {
   "method": "Workflow.pause",
-  "description": "Requests an active workflow run to pause at the next safe execution boundary.",
+  "description": "Requests an active workflow execution to pause at the next safe boundary.",
   "params": {
-    "runId": {
+    "executionId": {
       "type": "string",
-      "minLength": 1,
-      "description": "Workflow run ID returned by Workflow.execute or supplied by the caller.",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Workflow execution ID returned by Workflow.execute.",
       "required": true
     },
     "reason": {

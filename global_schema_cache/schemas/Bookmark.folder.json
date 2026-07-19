@@ -1,0 +1,13 @@
+{
+  "method": "Bookmark.folder",
+  "description": "Lists and manages the hierarchical bookmark folder tree.",
+  "params": {
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you are managing bookmark folders, e.g., organizing saved pages",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you are managing bookmark folders, e.g., organizing saved pages"
+}

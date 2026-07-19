@@ -9,6 +9,7 @@ when visual adjudication is unavailable.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 from typing import Any, Dict, List, Optional
 
 from harness.constants import CHALLENGE_KEYWORDS, NAVIGATION_CHALLENGE_TITLE_KEYWORDS
@@ -29,6 +30,41 @@ HIGH_CONFIDENCE_CHALLENGE_KEYWORDS = (
     "验证码",
     "人机验证",
 )
+
+STRUCTURAL_CHALLENGE_CONTROL_MARKERS = (
+    "captcha",
+    "challenge",
+    "verify",
+    "verification",
+    "slide",
+    "slider",
+    "滑块",
+    "拖动",
+    "验证",
+    "我不是机器人",
+)
+
+STRUCTURAL_CHALLENGE_ROOT_MARKERS = tuple(dict.fromkeys((
+    *HIGH_CONFIDENCE_CHALLENGE_KEYWORDS,
+    *CHALLENGE_KEYWORDS,
+    "security verification",
+    "security check",
+    "verification required",
+    "安全检查",
+)))
+
+_AX_LINE_RE = re.compile(
+    r'^\s*(?P<depth>\d+)\s+\[(?P<id>\d+:-?\d+:\d+)\]\s+'
+    r'(?P<role>[a-zA-Z][a-zA-Z0-9_-]*)(?:\s+"(?P<label>[^"]*)")?'
+)
+_STRUCTURAL_ACTION_ROLES = {
+    "button",
+    "checkbox",
+    "combobox",
+    "link",
+    "slider",
+    "textfield",
+}
 
 LINGERING_LOADING_TITLES = (
     "just a moment",
@@ -155,6 +191,8 @@ class PageChallengeState:
     repeated_state_count: int = 0
     lingering_title_count: int = 0
     high_confidence_hit: bool = False
+    structural_challenge: bool = False
+    structural_evidence: Optional[JsonDict] = None
     vl_attempts: int = 0
 
     def add_signal(self, signal: ChallengeSignal) -> None:
@@ -163,7 +201,7 @@ class PageChallengeState:
             self.last_vl_step is not None
             and self.last_vl_verdict == "normal_loading"
             and signal.step - self.last_vl_step < 5
-            and signal.kind not in {"high_confidence_keyword"}
+            and signal.kind not in {"high_confidence_keyword", "structural_challenge"}
         ):
             weight = max(1, weight // 3)
             signal = ChallengeSignal(
@@ -175,7 +213,7 @@ class PageChallengeState:
             )
         self.suspicion_score += weight
         self.last_signal_step = max(self.last_signal_step, signal.step)
-        if signal.kind == "high_confidence_keyword":
+        if signal.kind in {"high_confidence_keyword", "structural_challenge"}:
             self.high_confidence_hit = True
         self.recent_signals.append(signal)
         self.recent_signals = self.recent_signals[-12:]
@@ -199,6 +237,8 @@ class PageChallengeState:
             "pageId": self.page_id,
             "suspicionScore": self.suspicion_score,
             "highConfidenceHit": self.high_confidence_hit,
+            "structuralChallenge": self.structural_challenge,
+            "structuralEvidence": self.structural_evidence,
             "lastVlVerdict": self.last_vl_verdict or None,
             "lastVlStep": self.last_vl_step,
             "signals": [signal.to_dict() for signal in self.recent_signals[-5:]],
@@ -232,7 +272,21 @@ class ChallengeTracker:
         url = str(data.get("url") or "")
         status = str(data.get("status") or "")
 
-        if _contains_high_confidence_keyword(result):
+        structural = _structural_challenge_receipt(result)
+        if structural:
+            state.structural_challenge = True
+            state.structural_evidence = structural
+            state.add_signal(ChallengeSignal(
+                step=step,
+                method=method,
+                kind="structural_challenge",
+                weight=100,
+                detail=(
+                    f"Embedded challenge frame {structural.get('rootLabel')!r}"
+                    f" exposed {len(structural.get('controls') or [])} verification control(s)"
+                ),
+            ))
+        elif _contains_high_confidence_keyword(result):
             state.add_signal(ChallengeSignal(
                 step=step,
                 method=method,
@@ -329,6 +383,105 @@ def response_data(result: Any) -> JsonDict:
             return data
     data = result.get("data")
     return data if isinstance(data, dict) else {}
+
+
+def detect_structural_challenge_from_lines(
+    lines: Any,
+    *,
+    source_method: str = "DOM.getAXTree",
+) -> Optional[JsonDict]:
+    """Detect a visible embedded challenge frame from compact AXTree lines.
+
+    A keyword anywhere on a normal page is not enough.  The evidence must be a
+    depth-0 ``rootwebarea`` whose own label is challenge-like, plus an
+    actionable verification control in that frame.  This catches small or
+    visually unobtrusive CAPTCHA iframes without treating documentation text as
+    a blocking challenge.
+    """
+    if not isinstance(lines, list):
+        return None
+    normalized = [str(line) for line in lines if isinstance(line, str)]
+    roots: List[int] = []
+    parsed: List[Optional[re.Match[str]]] = []
+    for index, line in enumerate(normalized):
+        match = _AX_LINE_RE.match(line)
+        parsed.append(match)
+        if (
+            match is not None
+            and match.group("depth") == "0"
+            and match.group("role").casefold() == "rootwebarea"
+        ):
+            roots.append(index)
+
+    for root_position, start in enumerate(roots):
+        root_match = parsed[start]
+        if root_match is None:
+            continue
+        root_line = normalized[start]
+        root_label = str(root_match.group("label") or "").strip()
+        root_haystack = f"{root_label} {root_line}".casefold()
+        if not any(
+            marker.casefold() in root_haystack
+            for marker in STRUCTURAL_CHALLENGE_ROOT_MARKERS
+        ):
+            continue
+        if re.search(r"(?:^|\s)(?:hidden|off)(?:\s|$)", root_line.casefold()):
+            continue
+
+        end = roots[root_position + 1] if root_position + 1 < len(roots) else len(normalized)
+        frame_id = root_match.group("id").split(":", 1)[0]
+        controls: List[JsonDict] = []
+        for index in range(start + 1, end):
+            match = parsed[index]
+            if match is None:
+                continue
+            node_id = match.group("id")
+            if node_id.split(":", 1)[0] != frame_id:
+                continue
+            role = match.group("role").casefold()
+            if role not in _STRUCTURAL_ACTION_ROLES:
+                continue
+            label = str(match.group("label") or "").strip()
+            line_haystack = f"{label} {normalized[index]}".casefold()
+            if not any(
+                marker.casefold() in line_haystack
+                for marker in STRUCTURAL_CHALLENGE_CONTROL_MARKERS
+            ):
+                continue
+            controls.append({"id": node_id, "role": role, "label": label})
+
+        if controls:
+            return {
+                "kind": "embedded_challenge_frame",
+                "sourceMethod": source_method,
+                "frameId": frame_id,
+                "rootId": root_match.group("id"),
+                "rootLabel": root_label,
+                "controls": controls[:5],
+            }
+    return None
+
+
+def detect_structural_challenge(method: str, response: Any) -> Optional[JsonDict]:
+    if method != "DOM.getAXTree" or not isinstance(response, dict):
+        return None
+    payload = response.get("data")
+    if not isinstance(payload, dict):
+        return None
+    return detect_structural_challenge_from_lines(
+        payload.get("lines"), source_method=method
+    )
+
+
+def _structural_challenge_receipt(result: Any) -> Optional[JsonDict]:
+    if not isinstance(result, dict):
+        return None
+    receipt = result.get("structuralChallenge")
+    if isinstance(receipt, dict) and receipt.get("kind") == "embedded_challenge_frame":
+        return receipt
+    method = str(result.get("method") or "")
+    response = result.get("response")
+    return detect_structural_challenge(method, response)
 
 
 def _contains_high_confidence_keyword(value: Any) -> bool:

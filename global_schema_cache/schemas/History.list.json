@@ -1,7 +1,20 @@
 {
   "method": "History.list",
-  "description": "Lists recent browsing history entries.",
+  "description": "Lists recent browsing history entries, optionally filtered by a keyword.",
   "params": {
+    "fleetId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Fleet ID whose browsing history should be queried.",
+      "required": true
+    },
+    "query": {
+      "description": "Optional text matched against history title, URL, or origin.",
+      "type": "string",
+      "minLength": 1,
+      "required": false
+    },
     "limit": {
       "default": 200,
       "description": "Maximum recent history entries to return.",

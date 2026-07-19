@@ -1,0 +1,37 @@
+{
+  "method": "Download.control",
+  "description": "Controls an active download by pausing, resuming, or cancelling it.",
+  "params": {
+    "fleetId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Fleet ID whose download should be controlled.",
+      "required": true
+    },
+    "downloadId": {
+      "type": "integer",
+      "minimum": -9007199254740991,
+      "maximum": 9007199254740991,
+      "description": "Download record ID to control.",
+      "required": true
+    },
+    "command": {
+      "type": "string",
+      "enum": [
+        "pause",
+        "resume",
+        "cancel"
+      ],
+      "description": "Lifecycle command to execute.",
+      "required": true
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you are changing the download state, e.g., pausing until network recovery",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you are changing the download state, e.g., pausing until network recovery"
+}

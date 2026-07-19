@@ -1,19 +1,31 @@
 {
   "method": "Bookmark.list",
-  "description": "Lists bookmarks, optionally filtered by folder.",
+  "description": "Lists bookmarks with optional keyword, exact URL, or folder filters.",
   "params": {
+    "fleetId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Fleet ID whose bookmark store should be queried.",
+      "required": true
+    },
+    "query": {
+      "description": "Optional keyword matched against bookmark title or URL.",
+      "type": "string",
+      "minLength": 1,
+      "required": false
+    },
+    "url": {
+      "description": "Optional exact URL lookup; an empty result means the URL is not bookmarked.",
+      "type": "string",
+      "format": "uri",
+      "required": false
+    },
     "folderId": {
-      "description": "Folder ID to list from; use null or omit for the root folder.",
-      "anyOf": [
-        {
-          "type": "integer",
-          "minimum": -9007199254740991,
-          "maximum": 9007199254740991
-        },
-        {
-          "type": "null"
-        }
-      ],
+      "description": "Optional folder ID to scope the listing.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991,
       "required": false
     },
     "limit": {

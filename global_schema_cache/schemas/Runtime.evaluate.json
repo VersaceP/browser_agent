@@ -15,6 +15,17 @@
       "description": "JavaScript expression to evaluate in the page context.",
       "required": true
     },
+    "world": {
+      "default": "auto",
+      "description": "Execution world: auto prefers the isolated world and may retry context-mismatch failures in the main world; isolated and main are strict.",
+      "type": "string",
+      "enum": [
+        "auto",
+        "isolated",
+        "main"
+      ],
+      "required": true
+    },
     "returnByValue": {
       "default": true,
       "description": "Return JSON-serializable values directly when true.",

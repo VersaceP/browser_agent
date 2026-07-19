@@ -1,13 +1,6 @@
 {
   "method": "System.register",
-  "description": "Registers an agent session, reclaims existing fleets, and reports whether task memory must be restored or initialized before browser work.",
-  "params": {
-    "agentId": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Stable agent session ID to register or resume.",
-      "required": true
-    }
-  },
+  "description": "Registers the authenticated Agent session and returns its recovery state. Identity always comes from the verified connection.",
+  "params": {},
   "requiresPurpose": false
 }

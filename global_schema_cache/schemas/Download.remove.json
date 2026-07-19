@@ -1,13 +1,29 @@
 {
   "method": "Download.remove",
-  "description": "Removes a download record from history.",
+  "description": "Removes one terminal download record or all terminal download records.",
   "params": {
+    "fleetId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Fleet ID whose download records should be changed.",
+      "required": true
+    },
+    "scope": {
+      "type": "string",
+      "enum": [
+        "item",
+        "finalized"
+      ],
+      "description": "Removal scope.",
+      "required": true
+    },
     "downloadId": {
+      "description": "Download record ID when scope is item.",
       "type": "integer",
       "minimum": -9007199254740991,
       "maximum": 9007199254740991,
-      "description": "Download record ID to remove from history.",
-      "required": true
+      "required": false
     },
     "purpose": {
       "type": "string",

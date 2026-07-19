@@ -1,0 +1,106 @@
+{
+  "method": "DOM.getImg",
+  "description": "Exports rendered image assets from one or more <img> elements by canonical id or selector.",
+  "params": {
+    "pageId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Page ID containing the target image elements.",
+      "required": true
+    },
+    "targets": {
+      "minItems": 1,
+      "type": "array",
+      "items": {
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^\\d+:\\d+:\\d+$",
+                "description": "Canonical element ID from DOM.getAXTree."
+              },
+              "selector": {
+                "not": {}
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "selector": {
+                "type": "string",
+                "minLength": 1,
+                "description": "CSS selector for a target element in the main frame."
+              },
+              "id": {
+                "not": {}
+              }
+            },
+            "required": [
+              "selector"
+            ],
+            "additionalProperties": false
+          }
+        ],
+        "description": "DOM query target identified by either canonical id or selector."
+      },
+      "description": "Targets to export, preserving input order in response.data.items.",
+      "required": true
+    },
+    "options": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Required output directory. Every successful image item is written to this directory with an automatic filename."
+        },
+        "format": {
+          "default": "file",
+          "description": "Response payload format. Successful images are always written to options.path; base64/dataUrl additionally include inline data.",
+          "type": "string",
+          "enum": [
+            "file",
+            "base64",
+            "dataUrl"
+          ]
+        },
+        "imageFormat": {
+          "default": "auto",
+          "description": "Preferred image encoding. auto keeps PNG/JPEG/WebP sources in the same encoding when possible and encodes other source formats as PNG.",
+          "type": "string",
+          "enum": [
+            "auto",
+            "png",
+            "jpeg",
+            "webp"
+          ]
+        },
+        "quality": {
+          "default": 80,
+          "description": "Quality for lossy encodings such as JPEG or WebP.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        }
+      },
+      "required": true,
+      "additionalProperties": false,
+      "description": "Required output options. path is an output directory, not a file path."
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why these image files are needed, e.g., saving product thumbnails, collecting visual assets, or preserving image evidence",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why these image files are needed, e.g., saving product thumbnails, collecting visual assets, or preserving image evidence"
+}

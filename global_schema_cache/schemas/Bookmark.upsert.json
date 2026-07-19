@@ -1,0 +1,44 @@
+{
+  "method": "Bookmark.upsert",
+  "description": "Creates a bookmark or updates its title/favicon; resolves the target folder by name and creates it if missing.",
+  "params": {
+    "fleetId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Fleet ID whose bookmark store should be changed.",
+      "required": true
+    },
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "description": "Bookmark target URL.",
+      "required": true
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Bookmark title to store. Used as the new title when updating an existing bookmark.",
+      "required": true
+    },
+    "faviconUrl": {
+      "description": "Optional favicon URL to store with the bookmark.",
+      "type": "string",
+      "required": false
+    },
+    "folderId": {
+      "description": "Folder ID to place the bookmark under. Omit for the root folder.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991,
+      "required": false
+    },
+    "purpose": {
+      "type": "string",
+      "description": "Describe why you are saving or refreshing this bookmark, e.g., saving an important page for later",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe why you are saving or refreshing this bookmark, e.g., saving an important page for later"
+}

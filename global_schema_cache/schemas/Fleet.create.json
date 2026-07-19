@@ -2,9 +2,27 @@
   "method": "Fleet.create",
   "description": "Creates a new browser instance (Electron window).",
   "params": {
+    "fleetId": {
+      "description": "Optional prepared Fleet ID to claim.",
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "required": false
+    },
     "scope": {
       "description": "Optional memory scope label for the fleet; defaults to fleetId.",
       "type": "string",
+      "required": false
+    },
+    "tags": {
+      "description": "Optional tags; when provided they replace prepared Fleet tags.",
+      "maxItems": 20,
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 32
+      },
       "required": false
     }
   },
