@@ -42,6 +42,7 @@
     },
     "purpose": {
       "type": "string",
+      "minLength": 1,
       "description": "Describe why you are intercepting requests, e.g., blocking ad requests to improve performance",
       "required": true
     }

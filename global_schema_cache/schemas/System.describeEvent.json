@@ -1,12 +1,12 @@
 {
   "method": "System.describeEvent",
-  "description": "Describes one agent-visible push event, including its meaning, severity, payload schema, and recommended response.",
+  "description": "Describes one agent-visible push event, including its meaning, severity, payload schema, and recommended response. The target may be supplied under any parameter name; event is the default name.",
   "params": {
     "event": {
+      "description": "Push event name, such as \"Page.loaded\" or \"Hitl.resumed\".",
       "type": "string",
       "minLength": 1,
-      "description": "Push event name, such as \"Page.loaded\" or \"Hitl.resumed\".",
-      "required": true
+      "required": false
     }
   },
   "requiresPurpose": false

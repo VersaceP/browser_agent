@@ -56,7 +56,8 @@
     },
     "purpose": {
       "type": "string",
-      "description": "Describe why this element text is needed, e.g., verifying a success message, reading a result section, or extracting submitted feedback",
+      "minLength": 1,
+      "description": "Why this text read is needed.",
       "required": true
     }
   },

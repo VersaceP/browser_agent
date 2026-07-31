@@ -1,11 +1,11 @@
 {
   "method": "Memory.save",
-  "description": "Saves or updates agent-scoped task context for a scope, including objective, constraints, credentials notes, and milestones; it does not store page content.",
+  "description": "Saves or updates Fleet-global task context with optimistic concurrency; it does not store page content.",
   "params": {
-    "scope": {
+    "fleetId": {
       "type": "string",
       "minLength": 1,
-      "description": "Memory scope key, usually matching the fleet scope.",
+      "description": "Fleet ID whose shared context is being updated.",
       "required": true
     },
     "context": {
@@ -13,6 +13,13 @@
       "minLength": 1,
       "description": "Free-text task context for this scope, such as goal, constraints, credentials notes, and current milestone.",
       "required": true
+    },
+    "expectedRevision": {
+      "description": "Revision read before editing. Omit only when creating the first record.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991,
+      "required": false
     }
   },
   "requiresPurpose": false

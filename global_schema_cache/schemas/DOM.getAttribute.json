@@ -76,7 +76,8 @@
     },
     "purpose": {
       "type": "string",
-      "description": "Describe why these attributes are needed, e.g., checking a link href, validating aria state, reading an input value, or debugging selector stability",
+      "minLength": 1,
+      "description": "Why this attribute read is needed.",
       "required": true
     }
   },

@@ -23,6 +23,7 @@
     },
     "purpose": {
       "type": "string",
+      "minLength": 1,
       "description": "Describe why you are downloading this file, e.g., saving report data",
       "required": true
     }

@@ -11,6 +11,7 @@
     },
     "purpose": {
       "type": "string",
+      "minLength": 1,
       "description": "Describe why you are clearing the cache, e.g., ensuring the latest page content is loaded",
       "required": true
     }

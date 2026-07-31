@@ -1,6 +1,17 @@
 {
   "method": "Fleet.list",
-  "description": "Lists all active browser instances owned by the current Agent.",
-  "params": {},
+  "description": "Lists the available shared browser Fleets so the Agent can choose a fleetId for subsequent actions.",
+  "params": {
+    "status": {
+      "description": "Optional persisted status filter. Defaults to all Fleets.",
+      "type": "string",
+      "enum": [
+        "active",
+        "prepared",
+        "all"
+      ],
+      "required": false
+    }
+  },
   "requiresPurpose": false
 }

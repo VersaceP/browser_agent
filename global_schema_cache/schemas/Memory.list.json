@@ -1,6 +1,6 @@
 {
   "method": "Memory.list",
-  "description": "Lists all agent-scoped task memory records so the agent can choose the correct scope before resuming, recovering, or updating context.",
+  "description": "Lists all Fleet-global task memory records so the Agent can choose the correct Fleet before resuming, recovering, or updating context.",
   "params": {},
   "requiresPurpose": false
 }

@@ -86,6 +86,7 @@
     },
     "purpose": {
       "type": "string",
+      "minLength": 1,
       "description": "Describe the visual condition to verify, e.g., canvas output, layout overlap, CAPTCHA state, or proof-of-work screen",
       "required": true
     }

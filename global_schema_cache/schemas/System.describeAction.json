@@ -1,11 +1,12 @@
 {
   "method": "System.describeAction",
-  "description": "Describes the exact schema, parameter constraints, and purpose requirement for one callable action before invocation.",
+  "description": "Describes the exact schema, parameter constraints, and purpose requirement for one callable action before invocation. The target may be supplied under any parameter name; action is the default name.",
   "params": {
-    "method": {
+    "action": {
+      "description": "Full Action method name, such as \"Input.click\" or \"DOM.getAXTree\".",
       "type": "string",
-      "description": "Full action method name, such as \"Input.click\" or \"DOM.getAXTree\".",
-      "required": true
+      "minLength": 1,
+      "required": false
     }
   },
   "requiresPurpose": false

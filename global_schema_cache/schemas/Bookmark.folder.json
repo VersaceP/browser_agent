@@ -2,10 +2,50 @@
   "method": "Bookmark.folder",
   "description": "Lists and manages the hierarchical bookmark folder tree.",
   "params": {
+    "operation": {
+      "type": "string",
+      "enum": [
+        "list",
+        "create",
+        "rename",
+        "move",
+        "remove"
+      ],
+      "required": true
+    },
+    "fleetId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "required": true
+    },
+    "parentId": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "required": false
+    },
     "purpose": {
       "type": "string",
+      "minLength": 1,
       "description": "Describe why you are managing bookmark folders, e.g., organizing saved pages",
       "required": true
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "required": false
+    },
+    "folderId": {
+      "type": "string",
+      "minLength": 1,
+      "required": false
     }
   },
   "requiresPurpose": true,

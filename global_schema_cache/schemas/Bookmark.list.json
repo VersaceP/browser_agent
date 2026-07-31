@@ -22,10 +22,9 @@
       "required": false
     },
     "folderId": {
-      "description": "Optional folder ID to scope the listing.",
-      "type": "integer",
-      "minimum": 0,
-      "maximum": 9007199254740991,
+      "description": "Optional opaque folder ID to scope the listing.",
+      "type": "string",
+      "minLength": 1,
       "required": false
     },
     "limit": {
@@ -38,6 +37,7 @@
     },
     "purpose": {
       "type": "string",
+      "minLength": 1,
       "description": "Describe why you are listing bookmarks, e.g., finding a saved page",
       "required": true
     }

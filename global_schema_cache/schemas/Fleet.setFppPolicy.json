@@ -1,0 +1,40 @@
+{
+  "method": "Fleet.setFppPolicy",
+  "description": "Stages a new fingerprint profile and optionally schedules a Client restart. Running pages remain unchanged until restart completes.",
+  "params": {
+    "fleetId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Target Fleet ID.",
+      "required": true
+    },
+    "profileId": {
+      "anyOf": [
+        {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Fingerprint profile ID to stage, or null for system identity.",
+      "required": true
+    },
+    "forceRestart": {
+      "default": false,
+      "description": "Whether to force restart the Fleet Client process immediately after staging (default: false).",
+      "type": "boolean",
+      "required": true
+    },
+    "purpose": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Reason for identity change.",
+      "required": true
+    }
+  },
+  "requiresPurpose": false
+}

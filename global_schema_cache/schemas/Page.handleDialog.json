@@ -21,6 +21,7 @@
     },
     "purpose": {
       "type": "string",
+      "minLength": 1,
       "description": "Describe why the dialog should be accepted or dismissed, e.g., confirming submission or cancelling an unsafe prompt",
       "required": true
     }

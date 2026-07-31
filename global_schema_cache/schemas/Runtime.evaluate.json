@@ -26,14 +26,9 @@
       ],
       "required": true
     },
-    "returnByValue": {
-      "default": true,
-      "description": "Return JSON-serializable values directly when true.",
-      "type": "boolean",
-      "required": true
-    },
     "purpose": {
       "type": "string",
+      "minLength": 1,
       "description": "Describe why custom JavaScript is necessary and why structured actions are insufficient",
       "required": true
     }

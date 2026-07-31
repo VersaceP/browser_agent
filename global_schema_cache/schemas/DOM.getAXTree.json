@@ -23,6 +23,7 @@
     },
     "purpose": {
       "type": "string",
+      "minLength": 1,
       "description": "Describe why you need the current page map, e.g., understanding page structure, locating an actionable target, checking enabled/checked/layout state, or refreshing canonical element ids",
       "required": true
     }

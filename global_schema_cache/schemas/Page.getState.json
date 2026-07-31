@@ -11,6 +11,7 @@
     },
     "purpose": {
       "type": "string",
+      "minLength": 1,
       "description": "Describe why you need state synchronization, e.g., checking load completion, verifying no blocking dialog, or resuming after HITL",
       "required": true
     }

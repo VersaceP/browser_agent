@@ -38,6 +38,7 @@
     },
     "purpose": {
       "type": "string",
+      "minLength": 1,
       "description": "Describe why raw local DOM structure is needed, e.g., diagnosing a selector, inspecting Shadow DOM, bounds, or nested layout after DOM.getAXTree was insufficient",
       "required": true
     }

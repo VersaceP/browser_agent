@@ -41,6 +41,7 @@
     },
     "purpose": {
       "type": "string",
+      "minLength": 1,
       "description": "Describe the intended effect of this click, e.g., opening a menu, selecting a result, or submitting a form",
       "required": true
     }

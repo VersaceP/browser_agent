@@ -41,6 +41,7 @@
     },
     "purpose": {
       "type": "string",
+      "minLength": 1,
       "description": "Describe why scrolling is needed, e.g., loading more results, revealing a target section, or moving inside a nested scroll container",
       "required": true
     }

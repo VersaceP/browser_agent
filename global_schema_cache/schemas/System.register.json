@@ -1,6 +1,13 @@
 {
   "method": "System.register",
-  "description": "Registers the authenticated Agent session and returns its recovery state. Identity always comes from the verified connection.",
-  "params": {},
+  "description": "Registers the current Agent session and returns all shared Fleet recovery state, including tags, remarks, and shared Memory. Authenticated connections must announce their assigned Agent ID; unauthenticated connections may declare an Agent ID for the connection.",
+  "params": {
+    "agentId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Agent ID announced by the Agent during registration.",
+      "required": true
+    }
+  },
   "requiresPurpose": false
 }

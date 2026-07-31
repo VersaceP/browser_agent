@@ -25,6 +25,7 @@
     },
     "purpose": {
       "type": "string",
+      "minLength": 1,
       "description": "Describe why you are viewing browsing history, e.g., revisiting a previously accessed page",
       "required": true
     }

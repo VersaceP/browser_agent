@@ -1,11 +1,11 @@
 {
   "method": "Memory.get",
-  "description": "Retrieves agent-scoped task context, constraints, and milestones for a scope; this is not a page data or browser state query.",
+  "description": "Retrieves Fleet-global task context; this is not a page data or browser state query.",
   "params": {
-    "scope": {
+    "fleetId": {
       "type": "string",
       "minLength": 1,
-      "description": "Memory scope key to read.",
+      "description": "Fleet ID whose shared context should be read.",
       "required": true
     }
   },

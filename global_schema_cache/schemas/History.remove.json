@@ -19,11 +19,10 @@
       "description": "Removal scope.",
       "required": true
     },
-    "id": {
-      "description": "History record ID when scope is item.",
-      "type": "integer",
-      "minimum": -9007199254740991,
-      "maximum": 9007199254740991,
+    "visitId": {
+      "description": "Opaque history visit ID when scope is item.",
+      "type": "string",
+      "minLength": 1,
       "required": false
     },
     "origin": {
@@ -34,6 +33,7 @@
     },
     "purpose": {
       "type": "string",
+      "minLength": 1,
       "description": "Describe why you are removing browsing history, e.g., cleaning up sensitive records",
       "required": true
     }

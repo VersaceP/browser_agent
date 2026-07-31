@@ -10,10 +10,9 @@
       "required": true
     },
     "downloadId": {
-      "description": "Optional download record ID to inspect.",
-      "type": "integer",
-      "minimum": -9007199254740991,
-      "maximum": 9007199254740991,
+      "description": "Optional opaque download ID to inspect.",
+      "type": "string",
+      "minLength": 1,
       "required": false
     },
     "states": {
@@ -42,6 +41,7 @@
     },
     "purpose": {
       "type": "string",
+      "minLength": 1,
       "description": "Describe why you are viewing downloads, e.g., checking if a download has completed",
       "required": true
     }

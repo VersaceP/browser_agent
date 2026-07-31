@@ -11,6 +11,7 @@
     },
     "purpose": {
       "type": "string",
+      "minLength": 1,
       "description": "Describe why this tab needs focus, e.g., continuing a multi-tab workflow or returning to a results page",
       "required": true
     }

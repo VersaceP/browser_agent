@@ -53,6 +53,24 @@
       "type": "number",
       "required": false
     },
+    "toOffset": {
+      "description": "Normalized destination point inside the destination bounds.",
+      "type": "object",
+      "properties": {
+        "x": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "y": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      },
+      "required": false,
+      "additionalProperties": false
+    },
     "dx": {
       "description": "Relative horizontal drag offset when not using an explicit destination.",
       "type": "number",
@@ -65,6 +83,7 @@
     },
     "purpose": {
       "type": "string",
+      "minLength": 1,
       "description": "Describe the intended drag effect, e.g., moving a slider, reordering an item, or dragging one element onto another",
       "required": true
     }

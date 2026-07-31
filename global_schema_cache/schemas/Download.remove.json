@@ -19,14 +19,14 @@
       "required": true
     },
     "downloadId": {
-      "description": "Download record ID when scope is item.",
-      "type": "integer",
-      "minimum": -9007199254740991,
-      "maximum": 9007199254740991,
+      "description": "Opaque download ID when scope is item.",
+      "type": "string",
+      "minLength": 1,
       "required": false
     },
     "purpose": {
       "type": "string",
+      "minLength": 1,
       "description": "Describe why you are removing this download entry, e.g., cleaning up unneeded downloads",
       "required": true
     }

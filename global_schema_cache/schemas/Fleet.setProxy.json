@@ -1,16 +1,102 @@
 {
   "method": "Fleet.setProxy",
-  "description": "Set the dynamic proxy for the current Fleet. A bootstrap proxy file makes the configuration immutable.",
+  "description": "Set the dynamic proxy for the specified Fleet. A bootstrap proxy file makes the configuration immutable.",
   "params": {
+    "fleetId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Fleet whose Client session should apply the proxy.",
+      "required": true
+    },
     "config": {
-      "type": "object",
-      "propertyNames": {
-        "type": "string"
-      },
-      "additionalProperties": {},
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "system"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "direct"
+            }
+          },
+          "required": [
+            "mode"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "fixed"
+            },
+            "protocol": {
+              "type": "string",
+              "enum": [
+                "http",
+                "https",
+                "socks4",
+                "socks5"
+              ]
+            },
+            "host": {
+              "type": "string",
+              "minLength": 1
+            },
+            "port": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            },
+            "username": {
+              "type": "string"
+            },
+            "password": {
+              "type": "string"
+            },
+            "bypass": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "skipCertificateValidation": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "mode",
+            "protocol",
+            "host",
+            "port",
+            "skipCertificateValidation"
+          ],
+          "additionalProperties": false
+        }
+      ],
       "description": "Normalized proxy configuration.",
+      "required": true
+    },
+    "purpose": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Describe the intent for this action.",
       "required": true
     }
   },
-  "requiresPurpose": false
+  "requiresPurpose": true
 }

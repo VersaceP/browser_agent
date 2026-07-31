@@ -19,14 +19,14 @@
       "required": true
     },
     "id": {
-      "description": "Bookmark ID when scope is item.",
-      "type": "integer",
-      "minimum": -9007199254740991,
-      "maximum": 9007199254740991,
+      "description": "Opaque bookmark ID when scope is item.",
+      "type": "string",
+      "minLength": 1,
       "required": false
     },
     "purpose": {
       "type": "string",
+      "minLength": 1,
       "description": "Describe why you are removing this bookmark, set of bookmarks, or folder, e.g., cleaning up unneeded saves",
       "required": true
     }

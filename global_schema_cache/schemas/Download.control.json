@@ -10,10 +10,9 @@
       "required": true
     },
     "downloadId": {
-      "type": "integer",
-      "minimum": -9007199254740991,
-      "maximum": 9007199254740991,
-      "description": "Download record ID to control.",
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque download ID to control.",
       "required": true
     },
     "command": {
@@ -28,6 +27,7 @@
     },
     "purpose": {
       "type": "string",
+      "minLength": 1,
       "description": "Describe why you are changing the download state, e.g., pausing until network recovery",
       "required": true
     }

@@ -89,6 +89,13 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 100
+        },
+        "timeout": {
+          "default": 300,
+          "description": "Maximum batch wait time for image loading, in seconds. 0 waits until every image finishes or fails.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
         }
       },
       "required": true,
@@ -97,7 +104,8 @@
     },
     "purpose": {
       "type": "string",
-      "description": "Describe why these image files are needed, e.g., saving product thumbnails, collecting visual assets, or preserving image evidence",
+      "minLength": 1,
+      "description": "Why this image export is needed.",
       "required": true
     }
   },

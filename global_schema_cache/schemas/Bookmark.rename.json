@@ -10,10 +10,9 @@
       "required": true
     },
     "id": {
-      "type": "integer",
-      "minimum": -9007199254740991,
-      "maximum": 9007199254740991,
-      "description": "Bookmark ID to rename.",
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque bookmark ID to rename.",
       "required": true
     },
     "name": {
@@ -24,6 +23,7 @@
     },
     "purpose": {
       "type": "string",
+      "minLength": 1,
       "description": "Describe why you are renaming this bookmark or folder, e.g., better reflecting its purpose",
       "required": true
     }

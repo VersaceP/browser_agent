@@ -50,6 +50,7 @@
     },
     "purpose": {
       "type": "string",
+      "minLength": 1,
       "description": "Describe why you are setting cookies, e.g., maintaining login state",
       "required": true
     }

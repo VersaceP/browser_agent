@@ -41,6 +41,7 @@
     },
     "purpose": {
       "type": "string",
+      "minLength": 1,
       "description": "Describe why this exact text is being entered, e.g., filling a search query, username, password, or form field",
       "required": true
     }

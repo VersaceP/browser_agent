@@ -39,6 +39,7 @@
     },
     "purpose": {
       "type": "string",
+      "minLength": 1,
       "description": "Describe your intent for handling this file chooser or upload component, e.g., uploading a document",
       "required": true
     }
