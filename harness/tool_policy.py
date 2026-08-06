@@ -88,8 +88,6 @@ HARNESS_DEFAULT_ALLOWED_TOOLS: FrozenSet[str] = frozenset({
     "local_fs_search",
     "local_fs_read",
     "find_in_axtree",
-    "extract_dom_records",
-    "eval_js_json",
     "navigate_verified",
     "visual_verify",
     "dismiss_overlay",
@@ -111,43 +109,61 @@ HARNESS_TOOL_NAMES: FrozenSet[str] = frozenset({
 # worker_contract.forbidden_methods without tripping the unknown-method check
 # (it is now a known capability method). HARNESS-INTERNAL auto-digest use stays
 # separately gated by HarnessConfig.semantic_tree.
+#
+# The three entries below no longer appear in System.getCapabilities as of ABCP
+# v1.1.5, so they are inert today. They are KEPT ON PURPOSE rather than cleaned
+# up: unlike a stale TASK_TYPE_ALLOWED_EXCEPTIONS entry (which silently disables
+# a live method), a stale entry here costs nothing, and each still encodes a
+# policy we would want the moment the platform reintroduces the method —
+# Hitl.* wait/resume is owned by harness/hitl.py, and Memory.delete would let a
+# worker destroy another phase's memory. Re-verify against the capability
+# surface before removing any of them.
 ALWAYS_FORBIDDEN_ABCP_METHODS: FrozenSet[str] = frozenset({
     "Hitl.getTaskSummary",
     "Hitl.resumeEvent",
     "Memory.delete",
 })
 
+# Network is disabled for every declared task_type: cookie read/write and
+# request interception are not part of any current business flow, and the
+# fleet shares one cookie jar — a single worker mutating it would silently
+# change every sibling worker's session. `general` is deliberately absent
+# here (fail-open for unknown/unclassified work), matching the rest of this
+# table's policy.
 TASK_TYPE_DISABLED_DOMAINS = {
-    "web_search": frozenset({"Bookmark", "Download", "File", "History", "Memory"}),
-    "web_scrape": frozenset({"Bookmark", "Download", "File", "History", "Memory"}),
-    "form_filling": frozenset({"Bookmark", "Download", "File", "History", "Memory"}),
-    "file_download": frozenset({"Bookmark", "File", "History", "Memory"}),
-    "file_upload": frozenset({"Bookmark", "Download", "File", "History", "Memory"}),
-    "browser_state_management": frozenset({"Bookmark", "Download", "File", "History", "Memory"}),
+    "web_search": frozenset({"Bookmark", "Download", "File", "History", "Memory", "Network"}),
+    "web_scrape": frozenset({"Bookmark", "Download", "File", "History", "Memory", "Network"}),
+    "form_filling": frozenset({"Bookmark", "Download", "File", "History", "Memory", "Network"}),
+    "file_download": frozenset({"Bookmark", "File", "History", "Memory", "Network"}),
+    "file_upload": frozenset({"Bookmark", "Download", "File", "History", "Memory", "Network"}),
+    "browser_state_management": frozenset({
+        "Bookmark", "Download", "File", "History", "Memory", "Network",
+    }),
 }
 
+# Exceptions are matched by FULL METHOD NAME, so every entry here must exist in
+# the live System.getCapabilities surface. ABCP v1.1.5 (2026-07-31, capability
+# 58 -> 60) consolidated the Bookmark/History APIs; the stale pre-v1.1.5 names
+# that used to live here silently disabled browser_state_management's own core
+# methods (upsert/folder/rename/History.remove) for four weeks, because a name
+# that matches nothing cannot exempt anything from the domain rule above.
 TASK_TYPE_ALLOWED_EXCEPTIONS = {
     "web_search": frozenset({"Memory.get", "Memory.save"}),
     "web_scrape": frozenset({"Memory.get", "Memory.save"}),
     "form_filling": frozenset({"File.handleChooser", "Memory.get", "Memory.save"}),
-    "file_download": frozenset({"File.download", "Memory.get", "Memory.save"}),
+    # Downloads run through the Download.* domain, which is not disabled for
+    # this task_type; the File domain only carries handleChooser (an upload
+    # affordance), so nothing from File needs an exception here.
+    "file_download": frozenset({"Memory.get", "Memory.save"}),
     "file_upload": frozenset({"File.handleChooser", "Memory.get", "Memory.save"}),
     "browser_state_management": frozenset({
-        "Bookmark.add",
-        "Bookmark.createFolder",
-        "Bookmark.deleteFolder",
-        "Bookmark.edit",
-        "Bookmark.isBookmarked",
+        "Bookmark.folder",
         "Bookmark.list",
-        "Bookmark.listFolders",
-        "Bookmark.moveToFolder",
         "Bookmark.remove",
-        "Bookmark.renameFolder",
-        "Bookmark.search",
-        "History.deleteByOrigin",
-        "History.deleteItem",
+        "Bookmark.rename",
+        "Bookmark.upsert",
         "History.list",
-        "History.search",
+        "History.remove",
         "Memory.get",
         "Memory.list",
         "Memory.save",
