@@ -7,6 +7,8 @@ import json
 import os
 import re
 import time
+import uuid
+import weakref
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -14,10 +16,12 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set
 
 from abcp_client import ABCPClient, ABCPTransportError
 from harness.constants import (
+    COLLECTION_CONTRACT_REPLAN_REQUIRED,
     WORKER_STATUS_CANCELLED,
     WORKER_STATUS_DONE,
     WORKER_STATUS_FAILED,
 )
+from harness.call_outcome import classify_call_outcome, evaluate_grant
 from harness.auth_fleet import (
     AuthFleetLedger,
     canonical_origin,
@@ -31,29 +35,38 @@ from harness.fleet_coordinator import (
     handle_records_from_value,
     normalize_page_policy,
     normalize_reuse_scope,
+    resolve_fleet_reference,
 )
 from harness.fleet_runtime import (
     FleetAuthBarrier,
+    FleetClickGate,
     PageLeaseManager,
     PageLeasedBrowserClient,
 )
 from harness.render_recovery import extract_page_id_from_values
+from harness.fast_path import assess_fast_path_candidate
 from runtime_config import RuntimeConfig
 from harness.lifecycle import LifecycleContext, default_lifecycle_manager
 from harness.model_config import browser_agent_model_config
+from harness.observation.event_observer import unwrap_notification
 from harness.schema_cache import global_schemas_dir
 from harness.schema_loader import CapabilityBundle, load_capability_bundle
 from harness.task_control import (
     build_attempt_digest,
     cancel_phase_running_reservation,
     classification_for_worker_status,
+    clear_spawn_acquisition_failures,
     contract_hash_for_phase,
     mark_phase_result,
     mark_phase_running,
     phase_prior_artifact_paths,
     phase_pacing_remaining_seconds,
     phase_start_rejection,
+    record_replan_checkpoint,
+    record_spawn_acquisition_failure,
     repeated_phase_attempt_guard,
+    spawn_acquisition_fingerprint,
+    spawn_acquisition_rejection,
     validate_worker_artifacts,
 )
 from harness.strategy_telemetry import append_strategy_attempt
@@ -72,10 +85,94 @@ from harness.utils import (
     trim_large_strings,
 )
 from harness.worker_result import build_worker_result_levels
+from harness.workflow_runtime import workflow_execution_enabled
 from llm import LLMFactory
 
 
 BrowserAgentFactory = Callable[[Any, ABCPClient, RuntimeConfig, RunLogger], Any]
+
+
+class FleetReadinessError(ABCPTransportError):
+    """Assigned Fleet did not become usable before worker construction."""
+
+    # Readiness has already spent its bounded status probes. Re-entering the
+    # same acquisition path immediately only repeats Fleet startup/restore
+    # pressure, so reuse the existing acquisition ledger's cooldown. Keep the
+    # duration authoritative in task_control rather than duplicating it here.
+    requires_spawn_acquisition_cooldown = True
+
+    def __init__(self, message: str, *, fleet_id: str, owner_slot_id: str):
+        super().__init__(message, rpc_method="Fleet.status")
+        self.fleet_id = str(fleet_id)
+        self.owner_slot_id = str(owner_slot_id)
+
+
+def _is_fleet_open_timeout(exc: BaseException) -> bool:
+    text = str(exc or "").lower()
+    return "-32012" in text and "fleet open timeout" in text
+
+
+def _fresh_click_settlement_class(
+    agent: Any,
+    method: str,
+    params: JsonDict,
+) -> str:
+    """Classify only a current canonical AX target; never read model purpose.
+
+    Unknown selectors/coordinates and stale snapshots keep the conservative
+    settlement window. A current non-link role may use the short window, while
+    links retain the full popup allowance.
+    """
+
+    if agent is None or method != "Input.click":
+        return "conservative"
+    page_id = str(params.get("pageId") or "").strip()
+    target_id = str(params.get("id") or "").strip()
+    if (
+        not page_id
+        or not target_id
+        or bool(getattr(agent, "axtree_invalidated", True))
+        or str(getattr(agent, "axtree_page_id", "") or "") != page_id
+    ):
+        return "conservative"
+    current_ids = set(getattr(agent, "axtree_ids", set()) or set())
+    if target_id not in current_ids:
+        return "conservative"
+    nodes = list(getattr(agent, "axtree_nodes", []) or [])
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        if str(node.get("id") or "") != target_id:
+            continue
+        role = str(node.get("role") or "").strip().lower()
+        if not role:
+            return "conservative"
+        return "fresh_link" if role == "link" else "fresh_non_link"
+    return "conservative"
+
+
+async def _verified_workflow_hitl_settlement(
+    agent: Any,
+    page_id: str,
+) -> JsonDict:
+    """Run the existing verified barrier-open path after opaque Workflow HITL."""
+
+    if agent is None:
+        return {
+            "enabled": True,
+            "opened": False,
+            "reason": "browser_agent_unavailable",
+        }
+    # Local import avoids making spawner/browser_tools initialization cyclic.
+    from harness.tools.browser_tools import (
+        _verify_and_open_fleet_auth_barrier,
+    )
+
+    return await _verify_and_open_fleet_auth_barrier(
+        agent,
+        str(page_id or ""),
+        0,
+    )
 
 
 def _prompt_worker_contract(worker_contract: Any) -> JsonDict:
@@ -123,6 +220,40 @@ def _effective_worker_status(current_status: str, skill_answer: Any) -> str:
     # transition normally changes the constructor default from running -> done.
     # Validation remains a separate dimension in validatedStatus.
     return WORKER_STATUS_DONE if skill_answer is not None else current_status
+
+
+def _apply_content_completeness_validation_veto(
+    artifact_validation: JsonDict,
+    completeness_tracker: Any,
+) -> Optional[JsonDict]:
+    """Prevent shape-valid artifacts from becoming false validated success."""
+    if artifact_validation.get("status") != "done":
+        return None
+    if completeness_tracker is None or not hasattr(
+        completeness_tracker, "terminal_veto"
+    ):
+        return None
+    veto = completeness_tracker.terminal_veto()
+    if not isinstance(veto, dict):
+        return None
+    artifact_validation["status"] = "failed"
+    failures = artifact_validation.get("failures")
+    if not isinstance(failures, list):
+        failures = []
+        artifact_validation["failures"] = failures
+    failures.append({
+        "type": "content_completeness_incomplete",
+        "message": (
+            "artifact fields passed shape validation while a task-declared"
+            " content region remained incomplete"
+        ),
+        "classification": dict(veto),
+    })
+    artifact_validation["classification"] = {
+        **dict(veto),
+        "source": "content_completeness.validated_done_veto",
+    }
+    return dict(veto)
 
 
 def _finalize_skill_execution_metadata(
@@ -230,6 +361,51 @@ class BrowserAgentSlot:
     idle_event_logger: Optional[Callable[[str, JsonDict], None]] = None
 
 
+@dataclass(frozen=True)
+class PinnedBrowserContext:
+    """Trusted task-level routing target supplied outside the Lead plan."""
+
+    fleet_id: str
+    page_id: str = ""
+    source: str = "api"
+
+    @classmethod
+    def from_value(cls, value: Any) -> Optional["PinnedBrowserContext"]:
+        if value in (None, {}, ""):
+            return None
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, dict):
+            raise ValueError("pinned_browser_context must be an object")
+        fleet_id = str(
+            value.get("fleet_id") or value.get("fleetId") or ""
+        ).strip()
+        page_id = str(
+            value.get("page_id") or value.get("pageId") or ""
+        ).strip()
+        source = str(value.get("source") or "api").strip() or "api"
+        if not fleet_id:
+            raise ValueError("pinned_browser_context.fleet_id is required")
+        for label, raw in (("fleet_id", fleet_id), ("page_id", page_id)):
+            if not raw:
+                continue
+            try:
+                uuid.UUID(raw)
+            except (ValueError, AttributeError) as exc:
+                raise ValueError(
+                    f"pinned_browser_context.{label} must be a UUID"
+                ) from exc
+        return cls(fleet_id=fleet_id, page_id=page_id, source=source)
+
+    def to_dict(self) -> JsonDict:
+        return {
+            "fleetId": self.fleet_id,
+            "pageId": self.page_id or None,
+            "source": self.source,
+            "mode": "existing_only",
+        }
+
+
 @dataclass
 class _SessionStartLock:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -248,10 +424,27 @@ class BrowserAgentSpawner:
         runtime: RuntimeConfig,
         logger: RunLogger,
         browser_agent_factory: BrowserAgentFactory,
+        pinned_browser_context: Any = None,
     ):
         self.runtime = runtime
         self.browser_agent_factory = browser_agent_factory
         self.logger = logger
+        pinned_browser_context = PinnedBrowserContext.from_value(
+            pinned_browser_context
+        )
+        if (
+            pinned_browser_context is not None
+            and not getattr(
+                self.runtime.harness,
+                "fleet_reuse_enabled",
+                True,
+            )
+        ):
+            raise ValueError(
+                "pinned_browser_context requires"
+                " runtime.harness.fleet_reuse_enabled=true"
+            )
+        self.pinned_browser_context = pinned_browser_context
         self._handles: Dict[str, BrowserAgentHandle] = {}
         self._slots: Dict[str, BrowserAgentSlot] = {}
         self._counter = 0
@@ -267,7 +460,13 @@ class BrowserAgentSpawner:
         if not ledger_path.is_absolute():
             ledger_path = Path(self.runtime.harness.worktree_dir) / ledger_path
         self.auth_fleet_ledger = AuthFleetLedger(ledger_path)
-        self.page_lease_manager = PageLeaseManager()
+        self.page_lease_manager = PageLeaseManager(
+            wait_timeout_seconds=getattr(
+                self.runtime.harness,
+                "page_lease_wait_timeout_seconds",
+                30.0,
+            )
+        )
         self.fleet_auth_barrier = FleetAuthBarrier(
             wait_timeout_seconds=getattr(
                 self.runtime.harness,
@@ -275,6 +474,65 @@ class BrowserAgentSpawner:
                 120.0,
             )
         )
+        if getattr(
+            self.runtime.harness,
+            "fleet_click_gate_enabled",
+            True,
+        ):
+            self.fleet_click_gate = FleetClickGate(
+                acquire_timeout_seconds=getattr(
+                    self.runtime.harness,
+                    "fleet_click_gate_acquire_timeout_seconds",
+                    30.0,
+                ),
+                soft_settlement_seconds=getattr(
+                    self.runtime.harness,
+                    "fleet_click_gate_navigation_settlement_seconds",
+                    0.75,
+                ),
+                non_link_settlement_seconds=getattr(
+                    self.runtime.harness,
+                    "fleet_click_gate_non_link_settlement_seconds",
+                    0.10,
+                ),
+                submit_settlement_seconds=getattr(
+                    self.runtime.harness,
+                    "fleet_click_gate_submit_settlement_seconds",
+                    2.5,
+                ),
+                late_guard_seconds=getattr(
+                    self.runtime.harness,
+                    "fleet_click_gate_late_guard_seconds",
+                    5.0,
+                ),
+                popup_inventory_observation_enabled=getattr(
+                    self.runtime.harness,
+                    "fleet_click_gate_popup_inventory_observation_enabled",
+                    True,
+                ),
+                workflow_hitl_late_guard_seconds=getattr(
+                    self.runtime.harness,
+                    "fleet_click_gate_workflow_hitl_late_guard_seconds",
+                    15.0,
+                ),
+                logger=self.logger,
+            )
+        else:
+            self.fleet_click_gate = None
+            self.logger.write(
+                "fleet_click_gate.disabled",
+                {
+                    "warning": (
+                        "Process-local Fleet click serialization is disabled;"
+                        " same-Fleet workers may dispatch concurrent clicks."
+                    ),
+                    "sameFleetMultiworkerEnabled": bool(getattr(
+                        self.runtime.harness,
+                        "same_fleet_multiworker_enabled",
+                        False,
+                    )),
+                },
+            )
         self.static_context_block, self.static_context_hash = build_static_context_block(
             self.runtime.harness.context_file
         )
@@ -285,6 +543,12 @@ class BrowserAgentSpawner:
         self._broken_slot_recovery_lock = None
         self._session_start_locks: Dict[str, _SessionStartLock] = {}
         self._notification_relays: Dict[tuple[str, str, str], Callable[[], None]] = {}
+        # Concurrent phases assigned to one Fleet share one authoritative
+        # readiness probe. Completed tasks are removed immediately: this is
+        # single-flight coordination, not a stale readiness cache.
+        self._fleet_readiness_tasks: Dict[
+            tuple[str, str], "asyncio.Task[JsonDict]"
+        ] = {}
 
     async def spawn_browser_agent(
         self,
@@ -300,10 +564,28 @@ class BrowserAgentSpawner:
         preferred_slot_id: Optional[str] = None,
         reuse_from_worker_id: Optional[str] = None,
         reuse_scope: Optional[str] = None,
+        fleet_id: Optional[str] = None,
         session_key: Optional[str] = None,
         page_policy: Optional[str] = None,
     ) -> JsonDict:
         effective_contract = worker_contract or {}
+        pinned = self.pinned_browser_context
+        if pinned is not None and (
+            effective_contract.get("needs_isolated_session")
+            or fleet_id
+            or effective_contract.get("fleet_id")
+            or session_key
+            or effective_contract.get("session_key")
+        ):
+            return {
+                "status": "invalid_fleet_routing",
+                "error": (
+                    "pinned existing browser context cannot be combined with"
+                    " fleet_id, session_key, or needs_isolated_session"
+                ),
+                "pinnedBrowserContext": pinned.to_dict(),
+                "tool_was_executed": False,
+            }
         if "auth_verification" in effective_contract:
             try:
                 effective_contract["auth_verification"] = (
@@ -332,6 +614,21 @@ class BrowserAgentSpawner:
                 "error": "session_key must be a string or null",
                 "tool_was_executed": False,
             }
+        if fleet_id is not None and not isinstance(fleet_id, str):
+            return {
+                "status": "invalid_fleet_routing",
+                "error": "fleet_id must be a string or null",
+                "tool_was_executed": False,
+            }
+        if (
+            "fleet_id" in effective_contract
+            and not isinstance(effective_contract.get("fleet_id"), str)
+        ):
+            return {
+                "status": "invalid_fleet_routing",
+                "error": "worker_contract.fleet_id must be a string",
+                "tool_was_executed": False,
+            }
         if (
             "session_key" in effective_contract
             and not isinstance(effective_contract.get("session_key"), str)
@@ -345,13 +642,25 @@ class BrowserAgentSpawner:
             str(preferred_slot_id or "").strip()
             or str(reuse_from_worker_id or "").strip()
         )
+        requested_reuse_scope = str(
+            reuse_scope or effective_contract.get("reuse_scope") or ""
+        )
+        requested_page_policy = str(
+            page_policy or effective_contract.get("page_policy") or ""
+        )
+        if pinned is not None and pinned.page_id:
+            requested_reuse_scope = "page"
+            requested_page_policy = "existing"
+        elif pinned is not None and not requested_reuse_scope:
+            requested_reuse_scope = "fleet"
+            requested_page_policy = requested_page_policy or "new"
         try:
             effective_reuse_scope = normalize_reuse_scope(
-                str(reuse_scope or effective_contract.get("reuse_scope") or ""),
+                requested_reuse_scope,
                 explicit_continuation=explicit_continuation,
             )
             effective_page_policy = normalize_page_policy(
-                str(page_policy or effective_contract.get("page_policy") or ""),
+                requested_page_policy,
                 reuse_scope=effective_reuse_scope,
             )
         except ValueError as exc:
@@ -363,6 +672,69 @@ class BrowserAgentSpawner:
         effective_session_key = str(
             session_key or effective_contract.get("session_key") or ""
         ).strip()
+        direct_fleet_reference = str(fleet_id or "").strip()
+        contract_fleet_reference = str(
+            effective_contract.get("fleet_id") or ""
+        ).strip()
+        if (
+            direct_fleet_reference
+            and contract_fleet_reference
+            and direct_fleet_reference.lower()
+            != contract_fleet_reference.lower()
+        ):
+            return {
+                "status": "invalid_fleet_routing",
+                "error": (
+                    "spawn fleet_id and worker_contract.fleet_id must"
+                    " reference the same existing Fleet"
+                ),
+                "tool_was_executed": False,
+            }
+        effective_fleet_reference = (
+            direct_fleet_reference or contract_fleet_reference
+        )
+        if (
+            effective_fleet_reference
+            and not getattr(
+                self.runtime.harness,
+                "fleet_reuse_enabled",
+                True,
+            )
+        ):
+            return {
+                "status": "invalid_fleet_routing",
+                "error": (
+                    "fleet_id requires"
+                    " runtime.harness.fleet_reuse_enabled=true"
+                ),
+                "tool_was_executed": False,
+            }
+        if effective_fleet_reference and effective_session_key:
+            return {
+                "status": "invalid_fleet_routing",
+                "error": "fleet_id and session_key are mutually exclusive",
+                "tool_was_executed": False,
+                "next_instruction": (
+                    "Use fleet_id for an existing Fleet UUID/prefix. Use"
+                    " session_key only to create or reuse a named harness"
+                    " session whose Fleet does not yet have to exist."
+                ),
+            }
+        if (
+            effective_fleet_reference
+            and effective_contract.get("needs_isolated_session") is True
+        ):
+            return {
+                "status": "invalid_fleet_routing",
+                "error": (
+                    "fleet_id cannot be combined with"
+                    " needs_isolated_session"
+                ),
+                "tool_was_executed": False,
+            }
+        if effective_fleet_reference and not requested_reuse_scope:
+            effective_reuse_scope = "fleet"
+            effective_page_policy = "new"
         start_rejection = phase_start_rejection(
             task_plan,
             self.logger,
@@ -420,6 +792,49 @@ class BrowserAgentSpawner:
             self.logger.write("spawner.browser.repeated_guard", repeated_guard)
             return repeated_guard
 
+        acquisition_fingerprint = spawn_acquisition_fingerprint(
+            phase,
+            effective_contract,
+            reuse_scope=effective_reuse_scope,
+            page_policy=effective_page_policy,
+            session_key=effective_session_key,
+            fleet_id=effective_fleet_reference,
+            preferred_slot_id=preferred_slot_id,
+            reuse_from_worker_id=reuse_from_worker_id,
+        )
+        acquisition_rejection = spawn_acquisition_rejection(
+            self.logger,
+            acquisition_fingerprint=acquisition_fingerprint,
+            phase_id=phase_id,
+        )
+        if acquisition_rejection is not None:
+            self.logger.write(
+                "spawner.slot.acquire_exhausted", acquisition_rejection
+            )
+            return acquisition_rejection
+
+        isolation_declared = (
+            isinstance(effective_contract, dict)
+            and effective_contract.get("needs_isolated_session") is not None
+        )
+        effective_contract = self._apply_worker_session_isolation(
+            effective_contract,
+            phase_id=phase_id,
+            session_key=effective_session_key,
+            fleet_reference=effective_fleet_reference,
+            reuse_from_worker_id=reuse_from_worker_id,
+        )
+        # Only the phase's own declaration is an identity boundary the task
+        # fleet cap must fail closed on; deployment-default isolation is a
+        # preference the cap may drop. Recording the provenance here keeps that
+        # distinction race-free — the budget can fill between this point and
+        # the fleet decision.
+        isolation_auto_applied = bool(
+            not isolation_declared
+            and isinstance(effective_contract, dict)
+            and effective_contract.get("needs_isolated_session") is True
+        )
+
         worker_id = self._next_id("browser")
         agent_name = name or worker_id
         mark_phase_running(
@@ -432,6 +847,7 @@ class BrowserAgentSpawner:
         slot: Any = None
         registration: JsonDict = {}
         assignment: Optional[FleetAssignment] = None
+        readiness_receipt: JsonDict = {}
         try:
             fleet_group_key = self._fleet_group_key(
                 session_key=effective_session_key,
@@ -464,13 +880,25 @@ class BrowserAgentSpawner:
                         preferred_slot_id=preferred_slot_id,
                         reuse_from_worker_id=reuse_from_worker_id,
                         session_key=effective_session_key,
+                        fleet_id=effective_fleet_reference,
                     )
                 if not isinstance(slot, dict):
                     await self._initialize_reserved_slot(slot)
+                    prepare_kwargs: JsonDict = {
+                        # An explicit existing-Fleet reference must resolve
+                        # against a fresh Fleet.list snapshot even when the
+                        # ordinary slot inventory TTL has not expired.
+                        "expose_reusable_pages": (
+                            expose_reusable_pages
+                            or bool(effective_fleet_reference)
+                        ),
+                    }
+                    if effective_fleet_reference:
+                        prepare_kwargs["required_fleet_id"] = str(
+                            effective_fleet_reference
+                        )
                     registration = await self._prepare_slot_for_worker(
-                        slot,
-                        worker_id,
-                        expose_reusable_pages=expose_reusable_pages,
+                        slot, worker_id, **prepare_kwargs
                     )
                     assignment = await self._assign_fleet_for_worker(
                         slot,
@@ -479,12 +907,31 @@ class BrowserAgentSpawner:
                         reuse_scope=effective_reuse_scope,
                         page_policy=effective_page_policy,
                         session_key=effective_session_key,
+                        fleet_id=effective_fleet_reference,
                         reuse_from_worker_id=str(
                             reuse_from_worker_id or ""
                         ).strip(),
                         fleet_group_key=fleet_group_key,
+                        isolation_auto_applied=isolation_auto_applied,
                     )
                     self._ensure_notification_relay(slot, assignment)
+                    readiness_receipt = await self._ensure_assigned_fleet_ready(
+                        slot,
+                        assignment,
+                        worker_id=worker_id,
+                    )
+                    if assignment is not None and (
+                        expose_reusable_pages
+                        or bool(
+                            self.pinned_browser_context
+                            and self.pinned_browser_context.page_id
+                        )
+                    ):
+                        await self._sync_assigned_fleet_pages(
+                            slot,
+                            assignment,
+                            worker_id=worker_id,
+                        )
         except asyncio.CancelledError:
             cancel_phase_running_reservation(
                 self.logger,
@@ -560,7 +1007,11 @@ class BrowserAgentSpawner:
                 worker_id=worker_id,
             )
             if isinstance(slot, BrowserAgentSlot):
-                if isinstance(exc, ABCPTransportError):
+                if isinstance(exc, FleetReadinessError):
+                    # A Fleet restore timeout is an acquisition failure, not
+                    # proof that its owner WebSocket is corrupt.
+                    self._release_slot_start_failure(slot, worker_id=worker_id)
+                elif isinstance(exc, ABCPTransportError):
                     slot.status = "broken"
                     self.fleet_coordinator.mark_slot_suspect(slot.slot_id)
                     slot.current_worker_id = None
@@ -569,12 +1020,21 @@ class BrowserAgentSpawner:
                         slot.client = None
                 else:
                     self._release_slot_start_failure(slot, worker_id=worker_id)
+            failure_receipt = record_spawn_acquisition_failure(
+                self.logger,
+                acquisition_fingerprint=acquisition_fingerprint,
+                phase_id=phase_id,
+                exc=exc,
+            )
             result = {
+                **failure_receipt,
                 "status": "failed",
                 "error": str(exc),
                 "workerId": worker_id,
                 "name": agent_name,
             }
+            if failure_receipt.get("status") == "spawn_infrastructure_exhausted":
+                result["status"] = "spawn_infrastructure_exhausted"
             self.logger.write("spawner.slot.acquire_failed", result)
             return result
         if isinstance(slot, dict):
@@ -600,6 +1060,7 @@ class BrowserAgentSpawner:
                 phase_id=phase_id,
                 worker_contract=effective_contract,
                 phase=phase or {},
+                readiness_receipt=readiness_receipt,
             )
         )
         self._handles[worker_id] = BrowserAgentHandle(
@@ -614,6 +1075,10 @@ class BrowserAgentSpawner:
             async_task=async_task,
             slot_id=slot.slot_id,
         )
+        clear_spawn_acquisition_failures(
+            self.logger,
+            acquisition_fingerprint=acquisition_fingerprint,
+        )
         self.logger.write(
             "spawner.browser.spawn",
             {
@@ -625,7 +1090,9 @@ class BrowserAgentSpawner:
                 "reuseScope": effective_reuse_scope,
                 "pagePolicy": effective_page_policy,
                 "sessionKey": effective_session_key,
+                "fleetReference": effective_fleet_reference,
                 "fleetGroupKey": fleet_group_key,
+                "fleetReadiness": readiness_receipt,
                 "name": agent_name,
                 "task": task,
                 "resultContract": result_contract,
@@ -644,9 +1111,259 @@ class BrowserAgentSpawner:
             "reuseScope": effective_reuse_scope,
             "pagePolicy": effective_page_policy,
             "sessionKey": effective_session_key,
+            "fleetReference": effective_fleet_reference,
             "fleetGroupKey": fleet_group_key,
             "fleetAssignment": assignment.to_dict() if assignment else None,
+            "fleetReadiness": readiness_receipt,
         }
+
+    def _apply_worker_session_isolation(
+        self,
+        worker_contract: JsonDict,
+        *,
+        phase_id: str,
+        session_key: str,
+        fleet_reference: str,
+        reuse_from_worker_id: str,
+    ) -> JsonDict:
+        """Give each worker its own Fleet when the deployment asks for it.
+
+        `same_fleet_multiworker_enabled=False` is NOT enough on its own: it only
+        drops the cross-slot task group. Two workers landing on one slot still
+        converge on that slot's fleet through the `slot_default` / eligible
+        fallback in `FleetCoordinator.choose_existing`, which is how
+        browser-005 would have inherited browser-002's cookie jar in task
+        48b4d7d7. Real per-worker isolation is `needs_isolated_session`.
+
+        Anything that explicitly asks to SHARE wins: a named `session_key`, an
+        explicit `fleet_id`, a hand-off from another worker, or an explicit
+        `needs_isolated_session` in the contract. Those are the login flows —
+        one Fleet carries one logged-in identity, so they cannot be split.
+        """
+        if not isinstance(worker_contract, dict):
+            return worker_contract
+        if worker_contract.get("needs_isolated_session") is not None:
+            return worker_contract
+        if not getattr(
+            self.runtime.harness, "worker_session_isolation_enabled", False
+        ):
+            return worker_contract
+        shared_intent = (
+            str(session_key or "").strip()
+            or str(fleet_reference or "").strip()
+            or str(reuse_from_worker_id or "").strip()
+            or self.pinned_browser_context is not None
+        )
+        if shared_intent:
+            return worker_contract
+        if self._task_fleet_budget_exhausted():
+            # Isolation is a preference here, not a declared identity boundary,
+            # and honoring it would need a fleet the task no longer has budget
+            # for. Leave the contract generic so ordinary reuse can serve it.
+            self.logger.write("spawner.fleet.worker_isolation_skipped", {
+                "phaseId": phase_id,
+                "reason": "task_fleet_limit_reached",
+                "maxTaskFleets": self._task_fleet_limit(),
+                "taskFleetIds": sorted(
+                    self.fleet_coordinator.task_fleet_ids()
+                ),
+            })
+            return worker_contract
+        isolated = dict(worker_contract)
+        isolated["needs_isolated_session"] = True
+        self.logger.write("spawner.fleet.worker_isolation_applied", {
+            "phaseId": phase_id,
+            "reason": "worker_session_isolation_enabled",
+        })
+        return isolated
+
+    def _task_fleet_limit(self) -> int:
+        """Configured ceiling on distinct Fleets for this task (0 = unlimited)."""
+
+        return max(
+            0,
+            optional_int(getattr(self.runtime.harness, "max_task_fleets", 0), 0)
+            or 0,
+        )
+
+    def _task_fleet_budget_exhausted(self) -> bool:
+        limit = self._task_fleet_limit()
+        return bool(limit) and len(
+            self.fleet_coordinator.task_fleet_ids()
+        ) >= limit
+
+    def _busy_task_fleet_ids(self, worker_id: str) -> Set[str]:
+        """Fleets a currently running worker is holding.
+
+        The cap's reuse path ranks these last so a spare fleet absorbs the
+        worker first. It does not refuse them: ordinary routing already places
+        two live workers in one fleet, so refusing here would reject a worker
+        for something allowed one fleet earlier. The requesting worker's own
+        slot is already marked with its id and is not a conflict with itself.
+        """
+
+        busy: Set[str] = set()
+        for slot in self._slots.values():
+            holder = str(slot.current_worker_id or "").strip()
+            if not holder or holder == str(worker_id):
+                continue
+            assignment = self.fleet_coordinator.assignment_for_worker(holder)
+            if assignment is not None:
+                busy.add(assignment.fleet_id)
+        return busy
+
+    async def _assign_within_task_fleet_cap(
+        self,
+        slot: BrowserAgentSlot,
+        *,
+        worker_id: str,
+        reuse_scope: str,
+        page_policy: str,
+        session_key: str,
+        needs_isolated_session: bool,
+        isolation_auto_applied: bool,
+        fleet_group_key: str,
+    ) -> Optional[FleetAssignment]:
+        """Gate the one place a task creates a Fleet against its fleet budget.
+
+        Returning None means the budget still has room and the caller may create.
+        The harness never closes a Fleet, so an uncapped task keeps every fleet
+        it ever opened for as long as the platform reports it.
+
+        An identity boundary is never merged into another cookie jar: a new
+        named session, or an isolation flag the phase itself declared, fails
+        closed with a retryable receipt. Isolation the deployment applied by
+        default carries no identity, so it degrades to reuse instead.
+
+        A fleet a running worker already holds is ranked last but still
+        reusable: ordinary routing puts two live workers in one fleet, so the
+        cap must not be stricter than the rule it degrades from.
+
+        Nothing here is decided on a stale view. `slot.fleet_ids` is a
+        30-second cache, so a fleet another slot created moments ago can be
+        missing from it, and a fleet the platform already dropped can still be
+        in it. Before the cap refuses anything it re-reads the authoritative
+        Fleet.list once — the same rule an explicit fleet_id reference follows —
+        and re-decides, which is also what lets a vanished fleet hand its budget
+        back. It still never binds a fleet the acting connection has not seen.
+        """
+
+        limit = self._task_fleet_limit()
+        if not limit:
+            return None
+        if len(self.fleet_coordinator.task_fleet_ids()) < limit:
+            return None
+
+        identity_boundary = bool(session_key) or (
+            needs_isolated_session and not isolation_auto_applied
+        )
+
+        def select() -> Optional[FleetAssignment]:
+            if identity_boundary:
+                return None
+            return self.fleet_coordinator.choose_under_cap(
+                worker_id=worker_id,
+                slot_id=slot.slot_id,
+                owner_agent_id=slot.agent_id,
+                candidate_fleet_ids=slot.fleet_ids,
+                reuse_scope=reuse_scope,
+                page_policy=page_policy,
+                fleet_group_key=fleet_group_key,
+                busy_fleet_ids=self._busy_task_fleet_ids(worker_id),
+            )
+
+        def receipt_for(occupied: Set[str]) -> JsonDict:
+            return {
+                "workerId": worker_id,
+                "slotId": slot.slot_id,
+                "maxTaskFleets": limit,
+                "taskFleetIds": sorted(occupied),
+                "sessionKey": session_key,
+                "needsIsolatedSession": bool(needs_isolated_session),
+                "isolationAutoApplied": bool(isolation_auto_applied),
+                "busyFleetIds": sorted(self._busy_task_fleet_ids(worker_id)),
+            }
+
+        assignment = select()
+        if assignment is None:
+            # The cached inventory says "refuse". Confirm that against the
+            # authoritative view before acting on it.
+            await self._sync_slot_registry(
+                slot,
+                worker_id=worker_id,
+                include_page_details=False,
+            )
+            self._observe_slot_fleets(slot)
+            if not any(
+                str(error).startswith("Fleet.list")
+                for error in slot.sync_errors
+            ):
+                # Fleet.list answered, so this connection now holds a complete
+                # inventory. `_observe_slot_fleets` can only retire this slot's
+                # own records; a fleet another slot created and the platform has
+                # since dropped would otherwise hold task budget forever.
+                retired = self.fleet_coordinator.reconcile_missing_fleets(
+                    slot.fleet_ids
+                )
+                if retired:
+                    self.logger.write("spawner.fleet.inventory_retired", {
+                        "workerId": worker_id,
+                        "slotId": slot.slot_id,
+                        "retiredFleetIds": retired,
+                    })
+            occupied = self.fleet_coordinator.task_fleet_ids()
+            if len(occupied) < limit:
+                self.logger.write(
+                    "spawner.fleet.cap_released",
+                    receipt_for(occupied),
+                )
+                return None
+            assignment = select()
+
+        occupied = self.fleet_coordinator.task_fleet_ids()
+        if assignment is None:
+            receipt = receipt_for(occupied)
+            self.logger.write("spawner.fleet.cap_blocked", receipt)
+            if identity_boundary:
+                raise FleetRoutingError(
+                    "task_fleet_limit_reached",
+                    (
+                        f"the task already occupies {len(occupied)} of"
+                        f" {limit} allowed fleets and this worker asks for a"
+                        " separate session identity"
+                    ),
+                    retryable=True,
+                    next_instruction=(
+                        "Waiting does not clear this: the harness does not"
+                        " close fleets, so a finished worker keeps its fleet."
+                        " Continue on a fleet the task already has — drop"
+                        " needs_isolated_session, or pass the exact session_key"
+                        " already bound to it — or raise harness.max_task_fleets."
+                    ),
+                    details=receipt,
+                )
+            raise FleetRoutingError(
+                "task_fleet_limit_reached",
+                (
+                    f"the task already occupies {len(occupied)} of"
+                    f" {limit} allowed fleets and none of them may be lent to a"
+                    " generic worker (each one is bound to, or released from, a"
+                    " named session)"
+                ),
+                retryable=True,
+                next_instruction=(
+                    "Waiting does not release a named session; its fleet stays"
+                    " bound after the worker ends. Continue that session with"
+                    " its exact session_key, release the binding through the"
+                    " auth-recovery flow, or raise harness.max_task_fleets."
+                ),
+                details=receipt,
+            )
+        self.logger.write(
+            "spawner.fleet.cap_reuse",
+            {**receipt_for(occupied), "assignedFleetId": assignment.fleet_id},
+        )
+        return assignment
 
     def _fleet_group_key(
         self,
@@ -736,6 +1453,7 @@ class BrowserAgentSpawner:
         preferred_slot_id: Optional[str],
         reuse_from_worker_id: Optional[str],
         session_key: str = "",
+        fleet_id: str = "",
     ) -> Any:
         self._cleanup_retired_slots()
         max_slots = (
@@ -778,6 +1496,56 @@ class BrowserAgentSpawner:
         )
         if explicit_rejection is not None:
             return explicit_rejection
+
+        pinned = self.pinned_browser_context
+        if pinned is not None and pinned.page_id:
+            owner_slot_id = self.fleet_coordinator.owner_slot_for_fleet(
+                pinned.fleet_id
+            )
+            owner_slot = self._slots.get(owner_slot_id) if owner_slot_id else None
+            matching_slots = [
+                slot
+                for slot in live_slots
+                if (
+                    pinned.fleet_id in slot.fleet_ids
+                    and pinned.page_id in slot.page_registry
+                )
+            ]
+            idle_matches = [
+                item
+                for item in matching_slots
+                if item.status == "idle" and not item.current_worker_id
+            ]
+            pinned_slot = owner_slot or (
+                None
+                if idle_matches
+                else (
+                    sorted(matching_slots, key=lambda item: item.slot_id)[0]
+                    if matching_slots
+                    else None
+                )
+            )
+            if (
+                pinned_slot is not None
+                and (
+                    pinned_slot.status != "idle"
+                    or pinned_slot.current_worker_id
+                )
+            ):
+                return {
+                    "status": "pinned_browser_context_busy",
+                    "error": (
+                        f"pinned page {pinned.page_id!r} is attached to busy"
+                        f" slot {pinned_slot.slot_id!r}"
+                    ),
+                    "pinnedBrowserContext": pinned.to_dict(),
+                    "slot": self._slot_summary(pinned_slot),
+                    "tool_was_executed": False,
+                    "next_instruction": (
+                        "Wait for the worker using the pinned page to finish;"
+                        " do not create or select another fleet/page."
+                    ),
+                }
 
         session_slot_id = self.fleet_coordinator.preferred_slot_for_session(
             session_key
@@ -867,6 +1635,7 @@ class BrowserAgentSpawner:
             preferred_slot_id=preferred_slot_id,
             reuse_from_worker_id=reuse_from_worker_id,
             session_key=session_key,
+            fleet_id=fleet_id,
         )
         if slot is None:
             if len(live_slots) >= max_slots:
@@ -960,6 +1729,7 @@ class BrowserAgentSpawner:
         preferred_slot_id: Optional[str],
         reuse_from_worker_id: Optional[str],
         session_key: str,
+        fleet_id: str = "",
     ) -> Optional[BrowserAgentSlot]:
         idle_slots = [
             slot for slot in self._slots.values()
@@ -967,6 +1737,60 @@ class BrowserAgentSpawner:
         ]
         if not idle_slots:
             return None
+
+        # Prefer the stable owner (or an idle observer) when the Lead supplied
+        # an existing Fleet UUID/prefix.  Final uniqueness/existence proof is
+        # intentionally deferred until the selected slot has refreshed its
+        # authoritative Fleet.list inventory.
+        fleet_reference = str(fleet_id or "").strip().lower()
+        if fleet_reference:
+            known_ids = {
+                known_fleet
+                for candidate_slot in self._slots.values()
+                for known_fleet in candidate_slot.fleet_ids
+                if str(known_fleet).lower().startswith(fleet_reference)
+            }
+            if len(known_ids) == 1:
+                resolved = next(iter(known_ids))
+                owner_slot_id = self.fleet_coordinator.owner_slot_for_fleet(
+                    resolved
+                )
+                owner_slot = (
+                    self._slots.get(owner_slot_id) if owner_slot_id else None
+                )
+                if owner_slot in idle_slots:
+                    return owner_slot
+                matching_slots = [
+                    item for item in idle_slots
+                    if resolved in item.fleet_ids
+                ]
+                if matching_slots:
+                    return sorted(
+                        matching_slots, key=lambda item: item.slot_id
+                    )[0]
+
+        pinned = self.pinned_browser_context
+        if pinned is not None:
+            owner_slot_id = self.fleet_coordinator.owner_slot_for_fleet(
+                pinned.fleet_id
+            )
+            owner_slot = self._slots.get(owner_slot_id) if owner_slot_id else None
+            if owner_slot is not None and owner_slot.status == "idle":
+                if not pinned.page_id or pinned.page_id in owner_slot.page_registry:
+                    return owner_slot
+            pinned_matches = [
+                slot
+                for slot in idle_slots
+                if (
+                    pinned.fleet_id in slot.fleet_ids
+                    and (
+                        not pinned.page_id
+                        or pinned.page_id in slot.page_registry
+                    )
+                )
+            ]
+            if pinned_matches:
+                return sorted(pinned_matches, key=lambda item: item.slot_id)[0]
 
         session_slot_id = self.fleet_coordinator.preferred_slot_for_session(
             session_key
@@ -1273,6 +2097,7 @@ class BrowserAgentSpawner:
     ) -> None:
         """Single transition for returning a healthy slot to the idle pool."""
 
+        self.page_lease_manager.release_worker(worker_id)
         if remember_worker:
             slot.last_worker_id = worker_id
         if slot.current_worker_id == worker_id:
@@ -1292,6 +2117,7 @@ class BrowserAgentSpawner:
         worker_id: str,
         *,
         expose_reusable_pages: bool,
+        required_fleet_id: str = "",
     ) -> JsonDict:
         if slot.client is None:
             raise ABCPTransportError(f"Slot {slot.slot_id} has no browser client")
@@ -1303,7 +2129,12 @@ class BrowserAgentSpawner:
         self._replace_slot_fleets_from_response(slot, registration)
         self._update_slot_registry_from_value(slot, registration)
         if expose_reusable_pages or self._slot_sync_due(slot):
-            await self._sync_slot_registry(slot, worker_id=worker_id)
+            await self._sync_slot_registry(
+                slot,
+                worker_id=worker_id,
+                required_fleet_id=required_fleet_id,
+                include_page_details=False,
+            )
         self._observe_slot_fleets(slot)
         return registration
 
@@ -1376,11 +2207,22 @@ class BrowserAgentSpawner:
         page_policy: str,
         session_key: str,
         reuse_from_worker_id: str,
+        fleet_id: str = "",
         fleet_group_key: str = "",
+        isolation_auto_applied: bool = False,
     ) -> Optional[FleetAssignment]:
         lock_key = str(
-            fleet_group_key or (f"session:{session_key}" if session_key else "")
+            fleet_group_key
+            or (f"fleet:{fleet_id.lower()}" if fleet_id else "")
+            or (f"session:{session_key}" if session_key else "")
         ).strip()
+        if self._task_fleet_limit():
+            # The per-task fleet budget is one shared counter, so the narrower
+            # group/session/fleet keys are not enough: two undirected spawns
+            # would both read "under the cap" and both create. One key for every
+            # fleet decision is strictly stronger serialization than the keys it
+            # replaces, and the readiness barrier still runs outside this guard.
+            lock_key = "task_fleet_budget"
         async with self._session_start_guard(
             f"assignment:{lock_key}" if lock_key else ""
         ):
@@ -1391,8 +2233,10 @@ class BrowserAgentSpawner:
                 reuse_scope=reuse_scope,
                 page_policy=page_policy,
                 session_key=session_key,
+                fleet_id=fleet_id,
                 reuse_from_worker_id=reuse_from_worker_id,
                 fleet_group_key=fleet_group_key,
+                isolation_auto_applied=isolation_auto_applied,
             )
 
     async def _assign_fleet_for_worker_locked(
@@ -1405,7 +2249,9 @@ class BrowserAgentSpawner:
         page_policy: str,
         session_key: str,
         reuse_from_worker_id: str,
+        fleet_id: str = "",
         fleet_group_key: str = "",
+        isolation_auto_applied: bool = False,
     ) -> Optional[FleetAssignment]:
         """Select or create the one fleet the worker is allowed to address.
 
@@ -1422,6 +2268,107 @@ class BrowserAgentSpawner:
         needs_isolated_session = bool(
             worker_contract.get("needs_isolated_session", False)
         )
+        pinned = self.pinned_browser_context
+        if pinned is not None:
+            if pinned.fleet_id not in slot.fleet_ids:
+                raise FleetRoutingError(
+                    "pinned_fleet_unavailable",
+                    (
+                        f"pinned fleet {pinned.fleet_id!r} was not returned by"
+                        f" the authoritative inventory for slot {slot.slot_id!r}"
+                    ),
+                    retryable=False,
+                    next_instruction=(
+                        "Do not create a replacement fleet. Ask the user to"
+                        " reopen or reselect the pinned browser instance."
+                    ),
+                    details={"pinnedBrowserContext": pinned.to_dict()},
+                )
+            if pinned.page_id and pinned.page_id in slot.page_registry:
+                page = slot.page_registry.get(pinned.page_id)
+                if (
+                    not isinstance(page, dict)
+                    or str(page.get("fleetId") or "") != pinned.fleet_id
+                ):
+                    raise FleetRoutingError(
+                        "pinned_page_unavailable",
+                        (
+                            f"pinned page {pinned.page_id!r} was not found in"
+                            f" fleet {pinned.fleet_id!r}"
+                        ),
+                        retryable=False,
+                        next_instruction=(
+                            "Do not create or navigate a replacement page. Ask"
+                            " the user to reopen the pinned page."
+                        ),
+                        details={"pinnedBrowserContext": pinned.to_dict()},
+                    )
+            stable_owner_slot_id = (
+                self.fleet_coordinator.owner_slot_for_fleet(pinned.fleet_id)
+                or slot.slot_id
+            )
+            return self.fleet_coordinator.bind_assignment(
+                worker_id=worker_id,
+                slot_id=slot.slot_id,
+                owner_agent_id=slot.agent_id,
+                fleet_id=pinned.fleet_id,
+                assignment_reason="user_pinned_existing_fleet",
+                reuse_scope=reuse_scope,
+                page_policy=page_policy,
+                allowed_fleet_ids=[pinned.fleet_id],
+                created_for_worker=False,
+                owner_slot_id=stable_owner_slot_id,
+                fleet_group_key=fleet_group_key,
+                delegated=stable_owner_slot_id != slot.slot_id,
+            )
+        if fleet_id:
+            resolved_fleet_id = resolve_fleet_reference(
+                fleet_id,
+                slot.fleet_ids,
+            )
+            source_worker = str(reuse_from_worker_id or "").strip()
+            if source_worker:
+                source_assignment = self.fleet_coordinator.assignment_for_worker(
+                    source_worker
+                )
+                if (
+                    source_assignment is None
+                    or source_assignment.fleet_id != resolved_fleet_id
+                ):
+                    raise FleetRoutingError(
+                        "fleet_routing_conflict",
+                        (
+                            "fleet_id and reuse_from_worker_id resolve to"
+                            " different Fleets"
+                        ),
+                        details={
+                            "fleetReference": fleet_id,
+                            "resolvedFleetId": resolved_fleet_id,
+                            "reuseFromWorkerId": source_worker,
+                            "reuseFleetId": (
+                                source_assignment.fleet_id
+                                if source_assignment is not None else None
+                            ),
+                        },
+                    )
+            stable_owner_slot_id = (
+                self.fleet_coordinator.owner_slot_for_fleet(resolved_fleet_id)
+                or slot.slot_id
+            )
+            return self.fleet_coordinator.bind_assignment(
+                worker_id=worker_id,
+                slot_id=slot.slot_id,
+                owner_agent_id=slot.agent_id,
+                fleet_id=resolved_fleet_id,
+                assignment_reason="explicit_fleet_reference",
+                reuse_scope=reuse_scope,
+                page_policy=page_policy,
+                allowed_fleet_ids=[resolved_fleet_id],
+                created_for_worker=False,
+                owner_slot_id=stable_owner_slot_id,
+                fleet_group_key=fleet_group_key,
+                delegated=stable_owner_slot_id != slot.slot_id,
+            )
         assignment = self.fleet_coordinator.choose_existing(
             worker_id=worker_id,
             slot_id=slot.slot_id,
@@ -1442,6 +2389,18 @@ class BrowserAgentSpawner:
             ),
         )
         if assignment is None:
+            assignment = await self._assign_within_task_fleet_cap(
+                slot,
+                worker_id=worker_id,
+                reuse_scope=reuse_scope,
+                page_policy=page_policy,
+                session_key=session_key,
+                needs_isolated_session=needs_isolated_session,
+                isolation_auto_applied=isolation_auto_applied,
+                fleet_group_key=fleet_group_key,
+            )
+
+        if assignment is None:
             before = set(slot.fleet_ids)
             response = await slot.client.call("Fleet.create", {})
             self._update_slot_registry_from_value(slot, response)
@@ -1449,7 +2408,11 @@ class BrowserAgentSpawner:
             if not created_ids:
                 # A successful response is expected to carry fleetId.  Refresh
                 # once from the authoritative owner view before failing closed.
-                await self._sync_slot_registry(slot, worker_id=worker_id)
+                await self._sync_slot_registry(
+                    slot,
+                    worker_id=worker_id,
+                    include_page_details=False,
+                )
                 created_ids = sorted(slot.fleet_ids.difference(before))
             if not created_ids:
                 raise ABCPTransportError(
@@ -1504,6 +2467,295 @@ class BrowserAgentSpawner:
         self.logger.write("spawner.fleet.assigned", assignment.to_dict())
         return assignment
 
+    @staticmethod
+    def _fleet_status_ready(response: Any, fleet_id: str) -> bool:
+        """Treat a successful Fleet.status response as authoritative readiness.
+
+        Current ABCP returns data.status="active". Keeping the accepted set
+        narrow catches a future explicit transitional state, while accepting a
+        response without status preserves compatibility with older clients and
+        test doubles: the status RPC itself could only complete after opening
+        the Fleet.
+        """
+
+        explicit_statuses: List[str] = []
+        root_data = response.get("data") if isinstance(response, dict) else None
+        if isinstance(root_data, dict):
+            root_fleet_id = str(
+                root_data.get("fleetId") or root_data.get("fleet_id") or ""
+            ).strip()
+            root_status = str(root_data.get("status") or "").strip().lower()
+            if root_status and (not root_fleet_id or root_fleet_id == fleet_id):
+                explicit_statuses.append(root_status)
+        for item in handle_records_from_value(response):
+            item_fleet_id = str(
+                item.get("fleetId") or item.get("fleet_id") or ""
+            ).strip()
+            status = str(item.get("status") or "").strip().lower()
+            # Ignore nested page/task status fields. Only the record carrying
+            # this Fleet's identity may certify its lifecycle state.
+            if status and item_fleet_id == fleet_id:
+                explicit_statuses.append(status)
+        if not explicit_statuses:
+            return True
+        return any(
+            status in {"active", "ready", "running", "idle"}
+            for status in explicit_statuses
+        )
+
+    @staticmethod
+    def _fleet_ready_notification(message: Any, fleet_id: str) -> bool:
+        event = unwrap_notification(message)
+        if event is None or str(event.get("event") or "") != "Fleet.ready":
+            return False
+        payload = event.get("payload")
+        return bool(
+            isinstance(payload, dict)
+            and str(payload.get("fleetId") or "").strip() == fleet_id
+        )
+
+    async def _probe_fleet_readiness(
+        self,
+        owner_slot: BrowserAgentSlot,
+        *,
+        fleet_id: str,
+        worker_id: str,
+    ) -> JsonDict:
+        if owner_slot.client is None:
+            raise FleetReadinessError(
+                "Fleet readiness owner connection is unavailable",
+                fleet_id=fleet_id,
+                owner_slot_id=owner_slot.slot_id,
+            )
+        client = owner_slot.client
+        timeout = max(
+            0.01,
+            float(getattr(
+                self.runtime.harness,
+                "fleet_readiness_wait_seconds",
+                45.0,
+            )),
+        )
+        started = time.monotonic()
+        deadline = started + timeout
+        event_waiter: Optional["asyncio.Task[Optional[JsonDict]]"] = None
+        wait_for_notification = getattr(client, "wait_for_notification", None)
+        if callable(wait_for_notification):
+            predicate = (
+                lambda message: self._fleet_ready_notification(message, fleet_id)
+            )
+
+            async def wait_for_ready_event() -> Optional[JsonDict]:
+                try:
+                    return await wait_for_notification(
+                        predicate,
+                        timeout=timeout,
+                        replay_window_seconds=5.0,
+                    )
+                except TypeError:
+                    # Compatibility with minimal ABCP test doubles and older
+                    # clients lacking replay-window keyword support.
+                    return await wait_for_notification(predicate, timeout)
+
+            event_waiter = asyncio.create_task(wait_for_ready_event())
+        self.logger.write("spawner.fleet.readiness_started", {
+            "fleetId": fleet_id,
+            "ownerSlotId": owner_slot.slot_id,
+            "workerId": worker_id,
+            "timeoutSeconds": timeout,
+        })
+        initial_error = ""
+        initial_status = ""
+        try:
+            try:
+                response = await client.call("Fleet.status", {"fleetId": fleet_id})
+                if self._fleet_status_ready(response, fleet_id):
+                    receipt = {
+                        "fleetId": fleet_id,
+                        "ownerSlotId": owner_slot.slot_id,
+                        "status": "ready",
+                        "verifiedBy": "status",
+                        "elapsedMs": int((time.monotonic() - started) * 1000),
+                    }
+                    self.logger.write("spawner.fleet.readiness_ready", receipt)
+                    return receipt
+                initial_status = "transitional"
+            except Exception as exc:
+                initial_error = str(exc)[:500]
+
+            event = None
+            if event_waiter is not None:
+                remaining = max(0.0, deadline - time.monotonic())
+                if remaining > 0:
+                    # Never spend the entire remaining budget waiting for an
+                    # event. ABCP emits Fleet.ready for process startup, but a
+                    # later session-restore completion has no corresponding
+                    # control event. Reserve at least half of this window for
+                    # one terminal Fleet.status retry.
+                    event_wait_seconds = min(5.0, remaining / 2.0)
+                    try:
+                        event = await asyncio.wait_for(
+                            asyncio.shield(event_waiter),
+                            timeout=event_wait_seconds,
+                        )
+                    except asyncio.TimeoutError:
+                        event = None
+            # A Fleet.ready signal must be confirmed, but its absence does not
+            # prove session restore is still pending. Probe exactly once more
+            # even when the soft signal budget was consumed by the first RPC.
+            # Never loop or cancel an already-dispatched WebSocket RPC: the
+            # actual wall-clock duration may therefore exceed `timeout`.
+            try:
+                response = await client.call(
+                    "Fleet.status", {"fleetId": fleet_id}
+                )
+                if self._fleet_status_ready(response, fleet_id):
+                    receipt = {
+                        "fleetId": fleet_id,
+                        "ownerSlotId": owner_slot.slot_id,
+                        "status": "ready",
+                        "verifiedBy": (
+                            "event_then_status"
+                            if event is not None
+                            else "status_retry"
+                        ),
+                        "elapsedMs": int(
+                            (time.monotonic() - started) * 1000
+                        ),
+                    }
+                    self.logger.write(
+                        "spawner.fleet.readiness_ready", receipt
+                    )
+                    return receipt
+                initial_status = "transitional_after_retry"
+            except Exception as exc:
+                initial_error = str(exc)[:500]
+
+            detail = initial_error or initial_status or "Fleet.ready was not observed"
+            failure = {
+                "fleetId": fleet_id,
+                "ownerSlotId": owner_slot.slot_id,
+                "workerId": worker_id,
+                "elapsedMs": int((time.monotonic() - started) * 1000),
+                "error": detail,
+            }
+            self.logger.write("spawner.fleet.readiness_failed", failure)
+            raise FleetReadinessError(
+                (
+                    f"Fleet {fleet_id} did not become ready before worker startup:"
+                    f" {detail}"
+                ),
+                fleet_id=fleet_id,
+                owner_slot_id=owner_slot.slot_id,
+            )
+        finally:
+            if event_waiter is not None and not event_waiter.done():
+                event_waiter.cancel()
+                try:
+                    await event_waiter
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+    async def _ensure_assigned_fleet_ready(
+        self,
+        acting_slot: BrowserAgentSlot,
+        assignment: Optional[FleetAssignment],
+        *,
+        worker_id: str,
+    ) -> JsonDict:
+        if assignment is None or not getattr(
+            self.runtime.harness,
+            "fleet_readiness_barrier_enabled",
+            True,
+        ):
+            return {
+                "status": "not_applicable" if assignment is None else "disabled"
+            }
+        owner_slot_id = assignment.owner_slot_id or acting_slot.slot_id
+        owner_slot = self._slots.get(owner_slot_id)
+        if owner_slot is None and owner_slot_id == acting_slot.slot_id:
+            owner_slot = acting_slot
+        if owner_slot is None or owner_slot.client is None:
+            raise FleetReadinessError(
+                "Fleet readiness owner slot is unavailable",
+                fleet_id=assignment.fleet_id,
+                owner_slot_id=owner_slot_id,
+            )
+        key = (owner_slot_id, assignment.fleet_id)
+        task = self._fleet_readiness_tasks.get(key)
+        shared = task is not None and not task.done()
+        if not shared:
+            task = asyncio.create_task(self._probe_fleet_readiness(
+                owner_slot,
+                fleet_id=assignment.fleet_id,
+                worker_id=worker_id,
+            ))
+            self._fleet_readiness_tasks[key] = task
+
+            def discard(completed: "asyncio.Task[JsonDict]") -> None:
+                if self._fleet_readiness_tasks.get(key) is completed:
+                    self._fleet_readiness_tasks.pop(key, None)
+
+            task.add_done_callback(discard)
+        receipt = dict(await asyncio.shield(task))
+        receipt["sharedProbe"] = shared
+        return receipt
+
+    async def _sync_assigned_fleet_pages(
+        self,
+        acting_slot: BrowserAgentSlot,
+        assignment: FleetAssignment,
+        *,
+        worker_id: str,
+    ) -> None:
+        """Inspect pages only after the selected Fleet is ready.
+
+        Inventory discovery before assignment remains Fleet.list-only. This
+        targeted pass prevents an unrelated restoring Fleet from generating a
+        storm of Page.list/Page.getState calls during another worker's spawn.
+        """
+
+        owner_slot_id = assignment.owner_slot_id or acting_slot.slot_id
+        owner_slot = self._slots.get(owner_slot_id)
+        if owner_slot is None and owner_slot_id == acting_slot.slot_id:
+            owner_slot = acting_slot
+        if owner_slot is None:
+            raise FleetReadinessError(
+                "Fleet page inventory owner slot is unavailable",
+                fleet_id=assignment.fleet_id,
+                owner_slot_id=owner_slot_id,
+            )
+        await self._sync_slot_registry(
+            owner_slot,
+            worker_id=worker_id,
+            required_fleet_id=assignment.fleet_id,
+            include_page_details=True,
+        )
+        if owner_slot is not acting_slot:
+            for page_id, page in owner_slot.page_registry.items():
+                if str(page.get("fleetId") or "") == assignment.fleet_id:
+                    acting_slot.page_registry[page_id] = dict(page)
+        pinned = self.pinned_browser_context
+        if pinned is not None and pinned.page_id:
+            page = acting_slot.page_registry.get(pinned.page_id)
+            if (
+                not isinstance(page, dict)
+                or str(page.get("fleetId") or "") != pinned.fleet_id
+            ):
+                raise FleetRoutingError(
+                    "pinned_page_unavailable",
+                    (
+                        f"pinned page {pinned.page_id!r} was not found in"
+                        f" fleet {pinned.fleet_id!r} after readiness"
+                    ),
+                    retryable=False,
+                    next_instruction=(
+                        "Do not create or navigate a replacement page. Ask the"
+                        " user to reopen the pinned page."
+                    ),
+                    details={"pinnedBrowserContext": pinned.to_dict()},
+                )
+
     def _ensure_notification_relay(
         self,
         acting_slot: BrowserAgentSlot,
@@ -1511,10 +2763,10 @@ class BrowserAgentSpawner:
     ) -> None:
         """Relay owner-socket notifications to a delegated acting socket.
 
-        Dispatcher currently delivers fleet events only to the registered
-        owner agent.  The relay preserves that single owner connection while
-        allowing waiters/observers attached to a delegated BrowserAgent to see
-        the same notification stream.
+        Legacy/resource-associated events may still reach only the registered
+        owner, while newer pending-target and Fleet-fallback paths can also
+        deliver directly to the acting Agent. The relay therefore filters by
+        Fleet and shares stable-event deduplication with direct delivery.
         """
 
         if assignment is None or not assignment.delegated:
@@ -1531,12 +2783,27 @@ class BrowserAgentSpawner:
             return
         target_hub = getattr(acting_slot.client, "notifications", None)
         publish = getattr(target_hub, "publish", None)
+        publish_once = getattr(target_hub, "publish_once", None)
         subscribe = getattr(owner_slot.client, "subscribe_notifications", None)
         if not callable(publish) or not callable(subscribe):
             return
 
         def relay(message: JsonDict) -> None:
-            publish(message)
+            fleet_id = self._notification_fleet_id(message)
+            if fleet_id != assignment.fleet_id:
+                return
+            relayed_message = dict(message)
+            relayed_message["deliveryProvenance"] = {
+                "kind": "owner_relay",
+                "ownerRegisteredAgentId": owner_slot.agent_id,
+                "actingRegisteredAgentId": acting_slot.agent_id,
+                "fleetId": assignment.fleet_id,
+                "authoritativeForCausality": False,
+            }
+            if callable(publish_once):
+                publish_once(relayed_message)
+            else:
+                publish(relayed_message)
 
         self._notification_relays[key] = subscribe(relay)
         self.logger.write(
@@ -1547,6 +2814,28 @@ class BrowserAgentSpawner:
                 "actingSlotId": acting_slot.slot_id,
             },
         )
+
+    @staticmethod
+    def _notification_fleet_id(message: JsonDict) -> str:
+        candidates: List[JsonDict] = []
+        if isinstance(message, dict):
+            candidates.append(message)
+            params = message.get("params")
+            if isinstance(params, dict):
+                candidates.append(params)
+                data = params.get("data")
+                if isinstance(data, dict):
+                    candidates.append(data)
+            data = message.get("data")
+            if isinstance(data, dict):
+                candidates.append(data)
+        for candidate in candidates:
+            fleet_id = str(
+                candidate.get("fleetId") or candidate.get("fleet_id") or ""
+            ).strip()
+            if fleet_id:
+                return fleet_id
+        return ""
 
     def _record_verified_auth_session(
         self,
@@ -1715,6 +3004,8 @@ class BrowserAgentSpawner:
         slot: BrowserAgentSlot,
         *,
         worker_id: str,
+        required_fleet_id: str = "",
+        include_page_details: bool = True,
     ) -> None:
         if slot.client is None:
             return
@@ -1743,7 +3034,26 @@ class BrowserAgentSpawner:
             slot.page_registry.pop(pid, None)
             slot.page_quarantine.pop(pid, None)
 
-        for fleet_id in sorted(slot.fleet_ids)[:6]:
+        fleet_timeout_counts: Dict[str, int] = {}
+        unavailable_fleets: Set[str] = set()
+
+        def note_fleet_timeout(fleet_id: str, exc: BaseException) -> None:
+            if not _is_fleet_open_timeout(exc):
+                return
+            count = fleet_timeout_counts.get(fleet_id, 0) + 1
+            fleet_timeout_counts[fleet_id] = count
+            if count >= 2:
+                unavailable_fleets.add(fleet_id)
+
+        required = str(required_fleet_id or "").strip()
+        fleet_ids_to_scan = (
+            [required]
+            if include_page_details and required and required in slot.fleet_ids
+            else sorted(slot.fleet_ids)[:6]
+            if include_page_details
+            else []
+        )
+        for fleet_id in fleet_ids_to_scan:
             try:
                 pages_response = await slot.client.call(
                     "Page.list",
@@ -1756,9 +3066,53 @@ class BrowserAgentSpawner:
                 )
                 self._update_slot_registry_from_value(slot, pages_response)
             except Exception as exc:
+                note_fleet_timeout(fleet_id, exc)
                 slot.sync_errors.append(f"Page.list({fleet_id}): {str(exc)[:240]}")
 
-        for page_id in sorted(slot.page_registry.keys())[:12]:
+        eligible_page_ids = [
+            page_id
+            for page_id in sorted(slot.page_registry.keys())
+            if not required
+            or str(
+                (slot.page_registry.get(page_id) or {}).get("fleetId") or ""
+            ).strip() == required
+        ]
+        # The scan is capped, and the cap used to be applied to an id-sorted
+        # list. A slot holding more than the cap could therefore starve its
+        # quarantined pages of the very Page.getState that decides whether they
+        # are usable again or due for retirement, leaving them stuck forever on
+        # a technicality of id ordering. Quarantined pages are also the ones
+        # whose state we know the least about, so they go first: expired ones
+        # (a retirement decision is pending) ahead of the rest.
+        def _scan_rank(page_id: str) -> int:
+            if page_id not in slot.page_quarantine:
+                return 2
+            return 0 if self._quarantine_expired(slot, page_id) else 1
+
+        def _last_seen(page_id: str) -> float:
+            # Within a rank, least-recently-rechecked first. Every scanned page
+            # that is not retired gets re-marked, which refreshes
+            # lastQuarantinedAt and sends it to the back — so consecutive syncs
+            # rotate through the quarantine set instead of replaying the same
+            # id-sorted prefix. Without this, more quarantined pages than the
+            # cap would leave the tail permanently unexamined whenever the head
+            # keeps failing to close.
+            entry = slot.page_quarantine.get(page_id)
+            if not isinstance(entry, dict):
+                return 0.0
+            stamp = entry.get("lastQuarantinedAt") or entry.get("quarantinedAt")
+            return float(stamp) if isinstance(stamp, (int, float)) else 0.0
+
+        page_ids_to_scan = sorted(
+            eligible_page_ids,
+            key=lambda pid: (_scan_rank(pid), _last_seen(pid), pid),
+        )[:12] if include_page_details else []
+        for page_id in page_ids_to_scan:
+            page_fleet_id = str(
+                (slot.page_registry.get(page_id) or {}).get("fleetId") or ""
+            ).strip()
+            if page_fleet_id and page_fleet_id in unavailable_fleets:
+                continue
             try:
                 state_response = await slot.client.call(
                     "Page.getState",
@@ -1781,13 +3135,27 @@ class BrowserAgentSpawner:
                     {"pageId": page_id, **state_data, "state": state_response},
                 )
                 if _state_response_indicates_paused(state_response):
-                    self._mark_page_quarantined(
-                        slot,
-                        page_id,
-                        reason="Page.getState reports the page is still paused.",
-                        worker_id=worker_id,
-                        status="paused",
-                    )
+                    # This getState IS the TTL re-check: the sync already asks
+                    # the authoritative question every pass, so retirement
+                    # needs no extra probe — only the verdict plus the age of
+                    # the quarantine.
+                    retired = False
+                    if self._quarantine_expired(slot, page_id):
+                        retired = await self._retire_expired_quarantined_page(
+                            slot,
+                            page_id,
+                            reason="Page.getState still reports paused after the quarantine TTL.",
+                            verdict="still_paused",
+                        )
+                    if not retired:
+                        self._mark_page_quarantined(
+                            slot,
+                            page_id,
+                            reason="Page.getState reports the page is still paused.",
+                            worker_id=worker_id,
+                            status="paused",
+                            recheck_verdict=True,
+                        )
                 else:
                     self._clear_page_quarantine(
                         slot,
@@ -1796,15 +3164,53 @@ class BrowserAgentSpawner:
                     )
                     self._mark_page_fresh(slot, page_id)
             except Exception as exc:
+                if page_fleet_id:
+                    note_fleet_timeout(page_fleet_id, exc)
                 error_text = str(exc)[:240]
-                if _text_indicates_paused_error(error_text):
-                    self._mark_page_quarantined(
-                        slot,
-                        page_id,
-                        reason=error_text,
-                        worker_id=worker_id,
-                        status="paused",
-                    )
+                quarantine = slot.page_quarantine.get(page_id)
+                was_quarantined = isinstance(quarantine, dict)
+                # Two independent questions. The paused-error text decides
+                # whether a page enters quarantine in the first place; whether
+                # a page is ALREADY quarantined decides whether this pass is a
+                # failed re-check. Gating the re-check on the error text too
+                # would mean a quarantined page whose Page.getState keeps
+                # timing out (a plain transport error, no "paused" anywhere in
+                # it) never accrues a failure and so never reaches retirement —
+                # the exact indefinite quarantine the TTL exists to end.
+                if was_quarantined or _text_indicates_paused_error(error_text):
+                    # The re-check produced no verdict — only a bounded
+                    # tolerance for verdict-less passes before an already
+                    # expired quarantine is retired anyway.
+                    retired = False
+                    if was_quarantined and self._quarantine_expired(slot, page_id):
+                        failures = (optional_int(
+                            quarantine.get("recheckFailures"), 0
+                        ) or 0) + 1
+                        quarantine["recheckFailures"] = failures
+                        max_failures = int(getattr(
+                            self.runtime.harness,
+                            "page_quarantine_recheck_max_failures",
+                            2,
+                        ))
+                        if failures > max_failures:
+                            retired = await self._retire_expired_quarantined_page(
+                                slot,
+                                page_id,
+                                reason=error_text,
+                                verdict="recheck_failed",
+                            )
+                    if not retired:
+                        self._mark_page_quarantined(
+                            slot,
+                            page_id,
+                            reason=error_text,
+                            worker_id=worker_id,
+                            # A failed re-check is not evidence about WHY the
+                            # page was quarantined, so it must not relabel it.
+                            status=str(
+                                quarantine.get("status") or "paused"
+                            ) if was_quarantined else "paused",
+                        )
                 else:
                     page = dict(slot.page_registry.get(page_id) or {"pageId": page_id})
                     page["status"] = "stale"
@@ -1819,7 +3225,14 @@ class BrowserAgentSpawner:
                     "slotId": slot.slot_id,
                     "workerId": worker_id,
                     "errors": slot.sync_errors[-5:],
+                    "fleetTimeoutCounts": fleet_timeout_counts,
+                    "unavailableFleetIds": sorted(unavailable_fleets),
                 },
+            )
+        if required and required in unavailable_fleets:
+            raise ABCPTransportError(
+                f"-32012 Fleet open timeout for required fleet {required}; "
+                "retry the same phase id after the acquisition cooldown"
             )
 
     def _render_slot_context(
@@ -1836,17 +3249,18 @@ class BrowserAgentSpawner:
         )
         payload["reuseRules"] = [
             (
-                "Calls targeting the same page are serialized by the harness;"
-                " different delegated pages in the assigned fleet may run concurrently."
+                "A live worker holds a persistent page lease. Another worker's"
+                " call to that page is rejected with page_busy; different pages"
+                " in the assigned fleet may run concurrently."
                 if getattr(
                     self.runtime.harness,
                     "same_fleet_multiworker_enabled",
                     False,
                 )
-                else "Calls targeting the same page must be serialized."
+                else "Do not issue concurrent calls targeting the same page."
             ),
             "During login/CAPTCHA resolution the fleet-wide auth barrier pauses every non-resolver worker.",
-            "After any Page.switchTo, Page.create, or Page.navigate, refresh DOM.getAXTree before targeting elements.",
+            "After any Page.switchTo, Page.create, Page.navigate, Page.reload, or Page.go, refresh Page.getState and DOM.getAXTree before targeting elements.",
         ]
         if assignment is not None:
             payload["reuseRules"].extend([
@@ -1875,13 +3289,15 @@ class BrowserAgentSpawner:
         else:
             payload["reuseRules"].extend([
                 (
-                    "This assignment reuses only the browser connection. Do not"
-                    " use pageIds left by previous workers."
+                    "This assignment reuses only the browser connection. Begin"
+                    " on a fresh page; Page.list may also reveal a result tab"
+                    " opened by your action. A same-fleet row is usable only"
+                    " when claimable=true and quarantined=false."
                 ),
                 (
-                    "Start browser work by creating or navigating a fresh page"
-                    " for this task, then use Page.getState to record its current"
-                    " pageId/fleetId/url/title/status."
+                    "Use Page.create for a fresh task page. If an action opens a"
+                    " new tab, call Page.list and address its pageId on first use;"
+                    " the harness atomically claims it."
                 ),
             ])
         return (
@@ -1902,13 +3318,20 @@ class BrowserAgentSpawner:
         if assignment is None or not expose_reusable_pages:
             return {}
         allowed_fleets = set(assignment.allowed_fleet_ids)
+        pinned_page_id = (
+            self.pinned_browser_context.page_id
+            if self.pinned_browser_context is not None
+            else ""
+        )
         return {
             str(page_id): str(page.get("fleetId") or "")
             for page_id, page in slot.page_registry.items()
             if (
                 str(page_id).strip()
                 and str(page.get("fleetId") or "") in allowed_fleets
+                and (not pinned_page_id or str(page_id) == pinned_page_id)
                 and not _page_hidden_from_reuse(slot, page)
+                and not self.page_lease_manager.owner_for(str(page_id))
             )
         }
 
@@ -1980,20 +3403,42 @@ class BrowserAgentSpawner:
         worker_id: str = "",
         phase_id: Optional[str] = None,
         status: str = "stale_pause_deadlock",
+        recheck_verdict: bool = False,
     ) -> None:
         page_id = str(page_id or "").strip()
         if not page_id:
             return
+        now = time.time()
+        existing = slot.page_quarantine.get(page_id)
+        existing = existing if isinstance(existing, dict) else {}
+        # `quarantinedAt` is the FIRST time this page was quarantined, and it
+        # deliberately survives re-marking. The registry sync re-runs this call
+        # on every pass for as long as Page.getState keeps reporting `paused`,
+        # so refreshing the timestamp here would hold the TTL permanently in
+        # the future and the retirement path below could never fire — exactly
+        # the leak it exists to close. `lastQuarantinedAt` carries the
+        # per-observation time for anyone who needs it.
+        first_at = existing.get("quarantinedAt")
         quarantine = {
             "pageId": page_id,
             "status": status or "quarantined",
             "reason": str(reason or "")[:300],
             "workerId": str(worker_id or "")[:120],
             "phaseId": str(phase_id or "")[:120],
-            "quarantinedAt": time.time(),
+            "quarantinedAt": (
+                float(first_at) if isinstance(first_at, (int, float)) else now
+            ),
+            "lastQuarantinedAt": now,
+            # A pass that produced an authoritative verdict clears the
+            # verdict-less streak: the tolerance exists for re-checks that
+            # could not answer, not for answers we did not like.
+            "recheckFailures": 0 if recheck_verdict else (
+                optional_int(existing.get("recheckFailures"), 0) or 0
+            ),
             "doNotUse": True,
         }
         slot.page_quarantine[page_id] = quarantine
+        self.page_lease_manager.quarantine_page(page_id)
         page = dict(slot.page_registry.get(page_id) or {"pageId": page_id})
         self._apply_page_quarantine(slot, page_id, page)
         slot.page_registry[page_id] = page
@@ -2009,6 +3454,101 @@ class BrowserAgentSpawner:
             },
         )
 
+    def _quarantine_expired(self, slot: BrowserAgentSlot, page_id: str) -> bool:
+        """Has this page been quarantined longer than the configured TTL?"""
+        ttl = float(
+            getattr(self.runtime.harness, "page_quarantine_ttl_seconds", 300.0)
+            or 0.0
+        )
+        if ttl <= 0.0:
+            return False
+        quarantine = slot.page_quarantine.get(page_id)
+        if not isinstance(quarantine, dict):
+            return False
+        first_at = quarantine.get("quarantinedAt")
+        if not isinstance(first_at, (int, float)):
+            return False
+        return (time.time() - float(first_at)) > ttl
+
+    async def _retire_expired_quarantined_page(
+        self,
+        slot: BrowserAgentSlot,
+        page_id: str,
+        *,
+        reason: str,
+        verdict: str,
+    ) -> bool:
+        """Close a page whose quarantine outlived the TTL. True if retired.
+
+        Only reached after a re-check already said the page is still unusable,
+        so this is not a timer guessing that the challenge expired — closing is
+        the same remedy `_close_deadlocked_page` applies when the platform will
+        not clear a pause flag: give up on this page so a fresh one can be
+        created, rather than leaving it open and assignable to nobody.
+
+        Clearing the quarantine entry is safe precisely BECAUSE the page is
+        gone: the entry exists to keep workers off a live-but-unusable page.
+        If the close fails the page still exists, so the quarantine stays.
+        """
+        closed = False
+        close_error = ""
+        client = getattr(slot, "client", None)
+        if client is not None:
+            try:
+                close_response = await client.call("Page.close", {
+                    "pageId": page_id,
+                    "purpose": (
+                        "Retire a page whose quarantine outlived its TTL so the"
+                        " fleet can reclaim the slot."
+                    ),
+                })
+                # "Did not raise" is NOT "closed", and neither is "the call
+                # succeeded". ABCPClient only raises on a JSON-RPC
+                # {error:{...}} envelope, so a domain-level failure arrives as
+                # an ordinary response with a negative observation; and a
+                # generically-successful envelope still says nothing about THIS
+                # page — `classify_call_outcome` alone accepts an observation-
+                # only failure, and even a receipt announcing that some OTHER
+                # page was closed. Discharging inventory needs the registered
+                # Page.close evidence (data.closed is True AND data.pageId
+                # matches), which is exactly what the grant layer encodes.
+                # Getting this wrong is fail-open: the quarantine would be
+                # cleared on a page that is still open and still unusable,
+                # strictly worse than the leak this method exists to close.
+                decision = evaluate_grant(
+                    kind="inventory_discharge_page_close",
+                    method="Page.close",
+                    result={"response": close_response},
+                    page_id=page_id,
+                )
+                closed = decision.allowed
+                if not closed:
+                    close_error = str(
+                        decision.reason or "close not acknowledged"
+                    )[:240]
+            except Exception as exc:  # noqa: BLE001 - retirement is best effort
+                close_error = str(exc)[:240]
+        self.logger.write("spawner.slot.page_quarantine_retired", {
+            "slotId": slot.slot_id,
+            "pageId": page_id,
+            "verdict": verdict,
+            "reason": str(reason or "")[:300],
+            "closed": closed,
+            "error": close_error or None,
+            "ttlSeconds": float(
+                getattr(self.runtime.harness, "page_quarantine_ttl_seconds", 300.0)
+            ),
+        })
+        if not closed:
+            return False
+        slot.page_registry.pop(page_id, None)
+        self._clear_page_quarantine(
+            slot,
+            page_id,
+            reason="Page retired after its quarantine outlived the TTL.",
+        )
+        return True
+
     def _clear_page_quarantine(
         self,
         slot: BrowserAgentSlot,
@@ -2020,6 +3560,7 @@ class BrowserAgentSpawner:
         if not page_id or page_id not in slot.page_quarantine:
             return
         slot.page_quarantine.pop(page_id, None)
+        self.page_lease_manager.clear_page_quarantine(page_id)
         page = slot.page_registry.get(page_id)
         if isinstance(page, dict):
             page.pop("quarantineReason", None)
@@ -2147,7 +3688,7 @@ class BrowserAgentSpawner:
             result=result,
             trace=trace,
         )
-        self._mark_slot_idle(slot, worker_id=worker_id, result=result)
+        self._mark_slot_idle(slot, worker_id=worker_id)
 
     def _record_slot_result(
         self,
@@ -2214,7 +3755,6 @@ class BrowserAgentSpawner:
         slot: BrowserAgentSlot,
         *,
         worker_id: str,
-        result: JsonDict,
     ) -> None:
         self._release_slot_to_pool(
             slot,
@@ -2378,6 +3918,12 @@ class BrowserAgentSpawner:
             for page in list(slot.page_registry.values())[:20]
             if (
                 str(page.get("fleetId") or "") in allowed_fleet_ids
+                and (
+                    self.pinned_browser_context is None
+                    or not self.pinned_browser_context.page_id
+                    or str(page.get("pageId") or "")
+                    == self.pinned_browser_context.page_id
+                )
                 and not _page_hidden_from_reuse(slot, page)
             )
         ]
@@ -2550,6 +4096,8 @@ class BrowserAgentSpawner:
         (completed rows persisted; the note tells the slow path what remains),
         or None (caller runs the normal LLM loop with the original task).
         Any error falls back to the LLM loop — must never break the worker."""
+        if not workflow_execution_enabled(self.runtime):
+            return None
         if not getattr(self.runtime.harness, "skill_fast_path_enabled", True):
             return None
         registry = self._get_skill_registry()
@@ -2591,6 +4139,8 @@ class BrowserAgentSpawner:
         succeeded for a degraded skill, distill the trace → candidate → canary →
         promote. Best-effort; any error is swallowed (never affects the worker)."""
         if fast_path_handled or not slow_path_succeeded:
+            return
+        if not workflow_execution_enabled(self.runtime):
             return
         if not getattr(self.runtime.harness, "skill_auto_heal_enabled", True):
             return
@@ -2678,6 +4228,7 @@ class BrowserAgentSpawner:
         phase_id: Optional[str],
         worker_contract: JsonDict,
         phase: Optional[JsonDict],
+        readiness_receipt: Optional[JsonDict] = None,
     ) -> JsonDict:
         worker_runtime = replace(
             self.runtime,
@@ -2710,6 +4261,12 @@ class BrowserAgentSpawner:
                 expose_reusable_pages=expose_reusable_pages,
                 assignment=assignment,
             )
+            if readiness_receipt:
+                slot_context = (
+                    f"{slot_context}\n\n<fleet_readiness>\n"
+                    f"{json.dumps(readiness_receipt, ensure_ascii=False, indent=2)}\n"
+                    "</fleet_readiness>"
+                )
             effective_context = context or "(none)"
             if slot_context:
                 effective_context = f"{effective_context}\n\n{slot_context}".strip()
@@ -2718,6 +4275,7 @@ class BrowserAgentSpawner:
                 skill_context = selected_skill_context(
                     self._get_skill_registry(),
                     worker_contract or {},
+                    workflow_enabled=workflow_execution_enabled(worker_runtime),
                 )
             except Exception as exc:
                 self.logger.write("skill.context.error", {"error": str(exc)})
@@ -2742,14 +4300,77 @@ class BrowserAgentSpawner:
                 slot.client,
                 self.page_lease_manager,
                 fleet_owner_client=owner_client,
+                fleet_click_gate=self.fleet_click_gate,
+                fleet_auth_barrier=(
+                    self.fleet_auth_barrier
+                    if getattr(
+                        self.runtime.harness,
+                        "fleet_auth_barrier_enabled",
+                        False,
+                    )
+                    else None
+                ),
+                assigned_fleet_id=assignment.fleet_id if assignment else "",
+                registered_agent_id=slot.agent_id,
+                worker_id=worker_id,
+            )
+            worker_logger = self.logger.bind_context(
+                workerId=worker_id,
+                slotId=slot.slot_id,
+                agentId=slot.agent_id,
+                phaseId=str(phase_id or ""),
             )
             harness = self.browser_agent_factory(
                 provider,
                 worker_browser,
                 worker_runtime,
-                self.logger,
+                worker_logger,
             )
+            try:
+                harness_ref = weakref.ref(harness)
+            except TypeError:
+                worker_browser.set_click_settlement_classifier(
+                    lambda method, params, current=harness: (
+                        _fresh_click_settlement_class(
+                            current, method, params
+                        )
+                    )
+                )
+                worker_browser.set_workflow_hitl_settlement_handler(
+                    lambda page_id, current=harness: (
+                        _verified_workflow_hitl_settlement(
+                            current,
+                            page_id,
+                        )
+                    )
+                )
+            else:
+                worker_browser.set_click_settlement_classifier(
+                    lambda method, params, ref=harness_ref: (
+                        _fresh_click_settlement_class(ref(), method, params)
+                    )
+                )
+                worker_browser.set_workflow_hitl_settlement_handler(
+                    lambda page_id, ref=harness_ref: (
+                        _verified_workflow_hitl_settlement(
+                            ref(),
+                            page_id,
+                        )
+                    )
+                )
             harness.worker_contract = worker_contract or {}
+            batch_rows = (
+                harness.worker_contract.get("batch_rows")
+                if isinstance(harness.worker_contract, dict)
+                else None
+            )
+            progress = getattr(harness, "progress", None)
+            if progress is not None and hasattr(
+                progress, "configure_history_navigation_credits"
+            ):
+                progress.configure_history_navigation_credits(
+                    len(batch_rows) if isinstance(batch_rows, list) else 0
+                )
             harness.preloaded_registration = registration
             harness.preloaded_capability_bundle = bundle
             harness.assigned_fleet_id = assignment.fleet_id if assignment else ""
@@ -2763,7 +4384,18 @@ class BrowserAgentSpawner:
             )
             harness.allowed_page_ids = set(page_bindings)
             harness.page_fleet_ids = dict(page_bindings)
-            harness.page_reuse_allowed = bool(expose_reusable_pages)
+            self.page_lease_manager.seed_worker_pages(worker_id, page_bindings)
+            harness.fleet_page_fleet_ids = {}
+            harness.pinned_browser_context = (
+                self.pinned_browser_context.to_dict()
+                if self.pinned_browser_context is not None
+                else {}
+            )
+            harness.pinned_page_id = (
+                self.pinned_browser_context.page_id
+                if self.pinned_browser_context is not None
+                else ""
+            )
             harness.fleet_assignment_reason = (
                 assignment.assignment_reason if assignment else ""
             )
@@ -2775,7 +4407,10 @@ class BrowserAgentSpawner:
                 assignment.is_isolated if assignment else False
             )
             harness.worker_id = worker_id
+            harness.slot_id = slot.slot_id
+            harness.phase_id = phase_id
             harness.page_lease_manager = self.page_lease_manager
+            harness.fleet_click_gate = self.fleet_click_gate
             harness.fleet_auth_barrier = (
                 self.fleet_auth_barrier
                 if getattr(
@@ -2808,7 +4443,6 @@ class BrowserAgentSpawner:
                 if assignment is not None and assignment.session_key
                 else None
             )
-
             skill_outcome = await self._try_skill_fast_path(
                 harness,
                 worker_contract=worker_contract or {},
@@ -2852,6 +4486,15 @@ class BrowserAgentSpawner:
             challenge_tracker = getattr(harness, "challenge_tracker", None)
             if challenge_tracker is not None and hasattr(challenge_tracker, "suspected_pages"):
                 trace_summary["suspectedChallengePages"] = challenge_tracker.suspected_pages()
+            completeness_tracker = getattr(
+                harness, "content_completeness_tracker", None
+            )
+            if completeness_tracker is not None and hasattr(
+                completeness_tracker, "summaries"
+            ):
+                trace_summary["contentCompletenessPages"] = (
+                    completeness_tracker.summaries()
+                )
             offloaded_files = trace_summary.pop("offloadedFiles", [])
             progress = getattr(harness, "progress", None)
             progress_snapshot = (
@@ -2904,6 +4547,26 @@ class BrowserAgentSpawner:
                     ],
                 )
                 if feedback_classification is not None:
+                    if (
+                        feedback_classification.get("category")
+                        in {"target_absent", "instruction_infeasible"}
+                        and completeness_tracker is not None
+                        and hasattr(completeness_tracker, "terminal_veto")
+                    ):
+                        completeness_veto = completeness_tracker.terminal_veto()
+                        if isinstance(completeness_veto, dict):
+                            feedback_classification = dict(completeness_veto)
+                            feedback_classification["source"] = (
+                                "content_completeness.semantic_terminal_veto"
+                            )
+                            self.logger.write(
+                                "content_completeness.semantic_terminal_veto",
+                                {
+                                    "workerId": worker_id,
+                                    "phaseId": phase_id,
+                                    "classification": feedback_classification,
+                                },
+                            )
                     artifact_validation["classification"] = feedback_classification
                     if feedback_classification.get("evidenceGate"):
                         self.logger.write("semantic_terminal.evidence_gate", {
@@ -2917,12 +4580,45 @@ class BrowserAgentSpawner:
                                 "evidenceGate"
                             ),
                         })
+            # Artifact shape validation alone cannot certify a task-declared
+            # repeated region: an 8-row array may satisfy required_fields while
+            # the completeness tracker still has shell_seen/stalled evidence.
+            # Fail closed here as a second boundary even if the model bypassed
+            # BrowserAgent final_answer or a skill supplied the terminal result.
+            contract_validation = json.loads(json.dumps(artifact_validation))
+            completeness_veto = _apply_content_completeness_validation_veto(
+                artifact_validation,
+                completeness_tracker,
+            )
+            content_completeness_validation: JsonDict = {
+                "status": "failed" if isinstance(completeness_veto, dict) else "done",
+                "classification": (
+                    dict(completeness_veto)
+                    if isinstance(completeness_veto, dict) else None
+                ),
+            }
+            if isinstance(completeness_veto, dict):
+                self.logger.write(
+                    "content_completeness.validated_done_veto",
+                    {
+                        "workerId": worker_id,
+                        "phaseId": phase_id,
+                        "classification": completeness_veto,
+                    },
+                )
             validated_status = (
                 "validated_done"
                 if artifact_validation.get("status") == "done"
                 else "validation_failed"
                 if artifact_validation.get("status") == "failed"
                 else "not_validated"
+            )
+            fast_path_assessment = assess_fast_path_candidate(
+                trace=getattr(harness, "trace", []) or [],
+                trace_summary=trace_summary,
+                worker_contract=worker_contract or {},
+                phase=phase or {},
+                validation=artifact_validation,
             )
             # Self-heal loop: the fast path fell back (skill_answer is None) but the
             # slow path produced a validated result — distill its trace into a
@@ -2945,6 +4641,48 @@ class BrowserAgentSpawner:
                 answer=str(answer or ""),
             )
             diagnostics = getattr(harness, "diagnostics", None)
+            captcha_receipts = list(
+                getattr(harness, "captcha_autosolve_receipts", []) or []
+            )
+            vl_cleared_statuses = {
+                "solved", "cleared", "not_a_challenge", "already_cleared",
+            }
+            hitl_request_count = sum(
+                1 for item in (getattr(harness, "trace", []) or [])
+                if isinstance(item, dict)
+                and item.get("type") == "browser_call"
+                and item.get("method") == "Hitl.requestPause"
+            )
+            challenge_receipt = {
+                "observed": bool(
+                    trace_summary.get("suspectedChallengePages")
+                    or captcha_receipts
+                    or hitl_request_count
+                ),
+                "observedCount": max(
+                    len(trace_summary.get("suspectedChallengePages") or []),
+                    len(captcha_receipts),
+                    int(bool(hitl_request_count)),
+                ),
+                "vlSolveAttempts": sum(
+                    len(item.get("attempts") or [])
+                    for item in captcha_receipts if isinstance(item, dict)
+                ),
+                "vlSolvedCount": sum(
+                    1 for item in captcha_receipts
+                    if isinstance(item, dict)
+                    and str(item.get("status") or "") in vl_cleared_statuses
+                ),
+                "hitlRequests": hitl_request_count,
+                "hitlResumes": int(bool(
+                    getattr(diagnostics, "hitl_resumed_observed", False)
+                )),
+            }
+            challenge_receipt["unresolved"] = bool(
+                challenge_receipt["observed"]
+                and not challenge_receipt["vlSolvedCount"]
+                and not challenge_receipt["hitlResumes"]
+            )
             result = {
                 "status": harness.final_status,
                 "statusCategory": status_category(harness.final_status),
@@ -2963,6 +4701,9 @@ class BrowserAgentSpawner:
                     [],
                 ),
                 "artifactValidation": artifact_validation,
+                "contractValidation": contract_validation,
+                "contentCompletenessValidation": content_completeness_validation,
+                "finalArtifactValidation": artifact_validation,
                 "tracePath": trace_path,
                 "traceSummary": trace_summary,
                 "progressSnapshot": progress_snapshot,
@@ -2974,7 +4715,15 @@ class BrowserAgentSpawner:
                 "diagnostics": diagnostics.to_log_payload()
                 if diagnostics is not None
                 else {},
+                "fastPathAssessment": fast_path_assessment,
+                "downloadOperationReceipts": list(
+                    getattr(harness, "download_operation_receipts", {}).values()
+                ),
+                "challengeReceipt": challenge_receipt,
             }
+            receipt_candidate = fast_path_assessment.get("candidate")
+            if isinstance(receipt_candidate, dict):
+                result["fastPathReceiptCandidate"] = receipt_candidate
             if assignment is not None:
                 result["fleetAssignment"] = assignment.to_dict()
             self._update_slot_after_worker(
@@ -3021,7 +4770,7 @@ class BrowserAgentSpawner:
                 result=result,
                 trace=trace,
             )
-            self._mark_slot_idle(slot, worker_id=worker_id, result=result)
+            self._mark_slot_idle(slot, worker_id=worker_id)
             self._remove_notification_relay_for_assignment(assignment)
             await self.fleet_auth_barrier.abandon_worker(worker_id)
             mark_phase_result(
@@ -3071,7 +4820,7 @@ class BrowserAgentSpawner:
                 result=result,
                 trace=None,
             )
-            self._mark_slot_idle(slot, worker_id=worker_id, result=result)
+            self._mark_slot_idle(slot, worker_id=worker_id)
 
         self._remove_notification_relay_for_assignment(assignment)
         await self.fleet_auth_barrier.abandon_worker(worker_id)
@@ -3102,13 +4851,34 @@ class BrowserAgentSpawner:
             phase=phase,
             worker_contract=worker_contract,
         )
+        checkpoint = record_replan_checkpoint(
+            self.logger,
+            phase=phase,
+            worker_contract=worker_contract,
+            worker_id=worker_id,
+            fast_path_assessment=(
+                result.get("fastPathAssessment")
+                if isinstance(result.get("fastPathAssessment"), dict)
+                else None
+            ),
+        )
+        if isinstance(checkpoint, dict):
+            result["replanCheckpoint"] = checkpoint
+            checkpoint_assessment = checkpoint.get("fastPathAssessment")
+            if isinstance(checkpoint_assessment, dict):
+                result["fastPathAssessment"] = checkpoint_assessment
+                receipt_candidate = checkpoint_assessment.get("candidate")
+                if isinstance(receipt_candidate, dict):
+                    result["fastPathReceiptCandidate"] = receipt_candidate
+                else:
+                    result.pop("fastPathReceiptCandidate", None)
         append_strategy_attempt(
             logger=self.logger,
             worker_contract=worker_contract or {},
             result=result,
         )
         if slot.status == "running":
-            self._mark_slot_idle(slot, worker_id=worker_id, result=result)
+            self._mark_slot_idle(slot, worker_id=worker_id)
         self.logger.write("spawner.browser.result", trim_large_strings(result, 8000))
         return result
 
@@ -3509,13 +5279,44 @@ def _worker_feedback_classification(
     trace_classification = _classification_from_contract_violation(trace)
     if trace_classification is not None:
         return trace_classification
+    collection_contract = _classification_from_collection_contract_preflight(trace)
+    if collection_contract is not None:
+        return collection_contract
     browser_call_classification = _classification_from_browser_call(trace)
     if browser_call_classification is not None:
         return browser_call_classification
     return _classification_from_final_answer(
         answer,
         persisted_artifacts=persisted_artifacts,
+        traversal=_page_traversal_evidence(trace),
     )
+
+
+def _classification_from_collection_contract_preflight(
+    trace: List[JsonDict],
+) -> Optional[JsonDict]:
+    """Recover immutable-plan defects mechanically from collect_items trace."""
+    for item in reversed(trace or []):
+        if not isinstance(item, dict) or item.get("type") != "collect_items":
+            continue
+        result = item.get("result")
+        if not isinstance(result, dict):
+            continue
+        classification = result.get("classification")
+        if not isinstance(classification, dict):
+            continue
+        if str(classification.get("category") or "").strip() != (
+            COLLECTION_CONTRACT_REPLAN_REQUIRED
+        ):
+            continue
+        recovered = dict(classification)
+        recovered.setdefault(
+            "hint",
+            "LeadAgent must replan expected_artifact with a nested array field.",
+        )
+        recovered["source"] = "collect_items.contractPreflight"
+        return recovered
+    return None
 
 
 def _classification_from_browser_call(
@@ -3602,11 +5403,103 @@ def _blocker_evidence_paths(
     return [str(item).strip() for item in raw if str(item).strip()]
 
 
+def _scroll_delta_applied(result: JsonDict) -> Optional[float]:
+    """Pixels an `Input.scroll` actually moved, or None when unreported.
+
+    None and 0 must stay distinct: None means this platform build ships no
+    scroll receipt, while 0 is a positive report that the page did not move.
+    """
+    response = result.get("response")
+    if not isinstance(response, dict):
+        return None
+    data = response.get("data")
+    if not isinstance(data, dict) or "deltaApplied" not in data:
+        return None
+    raw = data.get("deltaApplied")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return abs(float(raw))
+
+
+def _page_traversal_evidence(trace: Optional[List[JsonDict]]) -> JsonDict:
+    """Did this worker ever move past the first screenful?
+
+    A `target_absent` report can be perfectly self-consistent and still be
+    wrong: the upstream batch says `[]`, the worker enumerates what it can see,
+    a screenshot confirms the target is not there, confidence is high — and the
+    viewport never moved, so every one of those observations describes the same
+    screenful. No judge can catch that, because nothing in the report is false;
+    the missing piece is a mechanical fact about what WE did, which only our
+    own ledger holds.
+
+    Two signals count, both decidable from the trace:
+      * an `Input.scroll` that moved the page — we asked, and the page obeyed
+      * a collection exhaustion proof — we enumerated a container to its end
+
+    "Moved the page" needs the platform's scroll receipt, because a wheel event
+    dispatched into a page that ignores it still returns a success envelope: a
+    worker can scroll three times, travel zero pixels, and look fully traversed.
+    When `deltaApplied` is present it decides the question; builds that do not
+    report it leave `scrollEffectEvidence="unavailable"` and keep the older,
+    weaker reading, so this gate never fabricates evidence in either direction.
+
+    The two branches below verify success DIFFERENTLY on purpose, and the
+    asymmetry is load-bearing rather than an oversight. `classify_call_outcome`
+    reads the native ABCP envelope (`result.response` + executionId/observation
+    /data) and is fail-closed: absent that envelope it reports FAILED. A
+    composite such as collect_items returns a FLAT result with no `response`
+    key at all, so routing the exhaustion branch through the same classifier
+    would score every real proof as a failure and silently zero out traversal
+    evidence for every collection-based claim. The composite instead proves
+    itself: its failure paths return `{"status": "failed", ...}` and never
+    construct an exhaustionEvidence block, so a non-empty `kind` is already
+    positive evidence that the enumeration ran.
+    """
+    scrolls = 0
+    scrolls_without_effect = 0
+    scroll_effect_evidence = "unavailable"
+    exhaustion_proofs = 0
+    for item in trace or []:
+        if not isinstance(item, dict):
+            continue
+        result = item.get("result")
+        if not isinstance(result, dict):
+            continue
+        if str(item.get("method") or "") == "Input.scroll":
+            if not classify_call_outcome(result).succeeded:
+                continue
+            delta = _scroll_delta_applied(result)
+            if delta is None:
+                # No scroll receipt in this ABCP build. The success envelope
+                # proves only that the wheel event was dispatched, so keep
+                # counting it and record that the effect is unproven rather
+                # than inventing evidence either way.
+                scrolls += 1
+                continue
+            scroll_effect_evidence = "receipt"
+            if delta > 0:
+                scrolls += 1
+            else:
+                scrolls_without_effect += 1
+            continue
+        evidence = result.get("exhaustionEvidence")
+        if isinstance(evidence, dict) and str(evidence.get("kind") or "").strip():
+            exhaustion_proofs += 1
+    return {
+        "scrolls": scrolls,
+        "scrollsWithoutEffect": scrolls_without_effect,
+        "scrollEffectEvidence": scroll_effect_evidence,
+        "exhaustionProofs": exhaustion_proofs,
+        "traversed": bool(scrolls or exhaustion_proofs),
+    }
+
+
 def _semantic_terminal_evidence_failure(
     category: str,
     blocker: JsonDict,
     classification: JsonDict,
     persisted_artifacts: Optional[List[str]],
+    traversal: Optional[JsonDict] = None,
 ) -> Optional[str]:
     """Return None when the semantic-terminal claim may go terminal, else a
     short human-readable reason why it must be downgraded to retryable."""
@@ -3619,6 +5512,31 @@ def _semantic_terminal_evidence_failure(
     ).strip()
     if not reason_text:
         return "blocker carries no reason text"
+    if (
+        category == "target_absent"
+        and isinstance(traversal, dict)
+        and not traversal.get("traversed")
+    ):
+        # Checked ahead of the artifact ledger on purpose: a persisted artifact
+        # proves we saved what we saw, never that we looked past the fold.
+        try:
+            ignored_scrolls = int(traversal.get("scrollsWithoutEffect") or 0)
+        except (TypeError, ValueError):
+            ignored_scrolls = 0
+        if ignored_scrolls:
+            # Distinguishable only with a scroll receipt, and worth saying out
+            # loud: repeating the same scroll is exactly the wrong next move.
+            return (
+                f"{ignored_scrolls} scroll(s) were dispatched but the page did"
+                " not move, and no collection was enumerated to exhaustion, so"
+                " every observation behind this claim describes the same"
+                " screenful"
+            )
+        return (
+            "the page was never scrolled and no collection was enumerated to"
+            " exhaustion, so every observation behind this claim describes the"
+            " same screenful"
+        )
     evidence_paths = _blocker_evidence_paths(blocker, classification)
     ledger = {
         os.path.normpath(str(path).strip())
@@ -3648,6 +5566,7 @@ def _semantic_terminal_evidence_failure(
 def _classification_from_final_answer(
     answer: str,
     persisted_artifacts: Optional[List[str]] = None,
+    traversal: Optional[JsonDict] = None,
 ) -> Optional[JsonDict]:
     try:
         payload = json.loads(str(answer or ""))
@@ -3679,8 +5598,11 @@ def _classification_from_final_answer(
         if category not in {
             "blocked_cross_task_type_required",
             "blocked_infrastructure",
+            COLLECTION_CONTRACT_REPLAN_REQUIRED,
             "target_absent",
             "instruction_infeasible",
+            "route_sensitive_content_suppression",
+            "blocked_content_suppression",
         }:
             continue
         if category in {"target_absent", "instruction_infeasible"}:
@@ -3689,19 +5611,51 @@ def _classification_from_final_answer(
                 blocker,
                 classification,
                 persisted_artifacts,
+                traversal=traversal,
             )
             if gate_failure is not None:
+                if isinstance(traversal, dict):
+                    classification["pageTraversal"] = dict(traversal)
                 # Downgrade, never drop silently: keep the claim visible so
                 # the Lead/next worker can persist evidence and re-declare,
                 # but do not let it mint a terminal phase status.
                 classification["category"] = f"{category}_unverified"
                 classification["claimedCategory"] = category
                 classification["evidenceGate"] = gate_failure
+                untraversed = (
+                    isinstance(traversal, dict)
+                    and not traversal.get("traversed")
+                    and category == "target_absent"
+                )
+                scroll_ignored = untraversed and bool(
+                    isinstance(traversal, dict)
+                    and traversal.get("scrollsWithoutEffect")
+                )
+                if scroll_ignored:
+                    # Repeating a scroll the page already swallowed just burns
+                    # steps, so point at the container instead of the viewport.
+                    remedy = (
+                        "Do not repeat the same viewport scroll: it was"
+                        " dispatched and the page did not move. Scroll the"
+                        " scrollable container itself (pass its canonical id or"
+                        " selector to Input.scroll), or enumerate that container"
+                        " to exhaustion, and re-check before declaring absence."
+                    )
+                elif untraversed:
+                    remedy = (
+                        "Scroll the page (or enumerate the target container to"
+                        " exhaustion) and re-check before declaring absence;"
+                        " a screenshot of the first screenful cannot settle it."
+                    )
+                else:
+                    remedy = (
+                        "Persist the observed evidence via record_extraction"
+                        " and re-declare with its savedPath in"
+                        " evidenceArtifacts, or keep working the phase."
+                    )
                 classification.setdefault("hint", (
                     f"Worker claimed {category} but the evidence gate failed:"
-                    f" {gate_failure}. Persist the observed evidence via"
-                    " record_extraction and re-declare with its savedPath in"
-                    " evidenceArtifacts, or keep working the phase."
+                    f" {gate_failure}. {remedy}"
                 )[:500])
                 classification["source"] = "final_answer.blockers"
                 return classification
@@ -3714,10 +5668,27 @@ def _classification_from_final_answer(
                 " Client before retrying."
                 if category == "blocked_infrastructure"
                 else (
-                    "LeadAgent should stop retrying the same target and ask the"
-                    " user to revise the range/source."
-                    if category in {"target_absent", "instruction_infeasible"}
-                    else "LeadAgent should replan with a task_type that permits the required method."
+                    "LeadAgent should preserve a search/listing page and enter"
+                    " the target through its real anchor instead of retrying"
+                    " the same direct detail URL."
+                    if category == "route_sensitive_content_suppression"
+                    else (
+                        "The bounded listing-link recovery was exhausted;"
+                        " preserve this blocker and do not mark dependent"
+                        " phases successful."
+                        if category == "blocked_content_suppression"
+                        else (
+                            "LeadAgent should stop retrying the same target and ask the"
+                            " user to revise the range/source."
+                            if category in {"target_absent", "instruction_infeasible"}
+                            else (
+                                "LeadAgent should replan expected_artifact with"
+                                " the nested array shape carried in expectedShape."
+                                if category == COLLECTION_CONTRACT_REPLAN_REQUIRED
+                                else "LeadAgent should replan with a task_type that permits the required method."
+                            )
+                        )
+                    )
                 )
             )
         )
@@ -3726,6 +5697,10 @@ def _classification_from_final_answer(
             classification.setdefault("method", blocker.get("method"))
         if blocker.get("task_type"):
             classification.setdefault("task_type", blocker.get("task_type"))
+        if blocker.get("field"):
+            classification.setdefault("field", blocker.get("field"))
+        if isinstance(blocker.get("expectedShape"), dict):
+            classification.setdefault("expectedShape", blocker.get("expectedShape"))
         classification["source"] = "final_answer.blockers"
         return classification
     return None

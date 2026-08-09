@@ -14,14 +14,22 @@ reports/axtree_events_probe_*.json, confirmed live 2026-06-14):
   (same shape as a DOM.getAXTree response). recommendedResponse:
   "Use the supplied lines and layers to continue; do not reuse stale element ids."
 
-Discipline (v4 §6 Layer 0): these updates NEVER enter the model context. They
-only refresh agent.axtree_* bookkeeping and write to the run log for audit. The
-callback runs inside the websocket read loop, so it must be fast, non-blocking,
-and exception-safe — a bad event must never kill the reader.
+Discipline (v4 §6 Layer 0): event CONTENT never enters the model context. These
+updates refresh agent.axtree_*/lifecycle bookkeeping and write to the run log
+for audit. The callback runs inside the websocket read loop, so it must be fast,
+non-blocking, and exception-safe — a bad event must never kill the reader.
+
+One narrow exception exists, and its width is the whole point: a page-inventory
+CHANGE BIT may be injected into a later tool receipt (see
+harness.observation.page_inventory). No pageId, URL, title, opener, or timing
+crosses the line — only "the set of pages in your fleet is not what you last
+saw, call Page.list". Anything richer would be causal attribution smuggled back
+in through the observer, which is exactly what this architecture removed.
 """
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Callable, Optional
 
 from harness.utils import JsonDict
@@ -50,6 +58,7 @@ class BrowserEventObserver:
         self.agent = agent
         self._unsubscribe: Optional[Callable[[], None]] = None
         self.event_counts: dict[str, int] = {}
+        self._background_tasks: set["asyncio.Task[Any]"] = set()
 
     def attach(self, client: Any) -> None:
         if self._unsubscribe is not None:
@@ -64,6 +73,9 @@ class BrowserEventObserver:
                 self._unsubscribe()
             finally:
                 self._unsubscribe = None
+        for task in list(self._background_tasks):
+            task.cancel()
+        self._background_tasks.clear()
 
     # The subscribed callback. Must not raise into the read loop.
     def handle_message(self, message: Any) -> None:
@@ -79,14 +91,81 @@ class BrowserEventObserver:
                 lifecycle_state = tracker.observe_event(name, event.get("payload"))
             if name in {"Page.navigate", "Page.recovered", "Page.crashed"}:
                 self._mark_invalidated(f"lifecycle_event:{name}")
+            if name in {"Page.open", "Page.close", "Page.closed"}:
+                self._observe_page_inventory(name, event.get("payload"))
             if lifecycle_state is not None:
                 self._log("page.lifecycle.event", tracker.receipt(lifecycle_state.page_id))
+            if name in {"Hitl.paused", "Hitl.requested"}:
+                self._claim_workflow_hitl(name, event.get("payload"))
             if name == "DOM.axTreeUpdated":
                 self._handle_axtree_updated(event.get("payload"))
         except Exception as exc:  # noqa: BLE001 - never break the reader
             logger = getattr(self.agent, "logger", None)
             if logger is not None:
                 logger.write("event_observer.error", {"error": str(exc)[:300]})
+
+    def _observe_page_inventory(self, event_name: str, payload: Any) -> None:
+        """Record that the fleet's page set moved, without judging why.
+
+        No opener, sourceUrl, or timing is consulted: this deliberately cannot
+        express "that page came from your click". It only notes that a page the
+        worker has not been shown exists, and the worker is told to go look.
+        """
+        signal = getattr(self.agent, "page_inventory_signal", None)
+        if signal is None or not isinstance(payload, dict):
+            return
+        fleet_id = payload.get("fleetId")
+        page_id = payload.get("pageId")
+        if event_name == "Page.open":
+            if signal.observe_opened(fleet_id, page_id):
+                self._log("page_inventory.changed", {
+                    "fleetId": str(fleet_id or ""),
+                    "generation": signal.generation,
+                })
+        else:
+            signal.observe_closed(fleet_id, page_id)
+
+    def _claim_workflow_hitl(self, event_name: str, payload: Any) -> None:
+        """Bridge HITL to the Fleet barrier outside a single RPC lifetime."""
+
+        gate = getattr(self.agent, "fleet_click_gate", None)
+        barrier = getattr(self.agent, "fleet_auth_barrier", None)
+        claim = getattr(gate, "claim_workflow_hitl", None)
+        if not callable(claim) or barrier is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(claim(
+            event_name=event_name,
+            payload=payload,
+            barrier=barrier,
+        ))
+        self._background_tasks.add(task)
+
+        def completed(done: "asyncio.Task[Any]") -> None:
+            self._background_tasks.discard(done)
+            if done.cancelled():
+                return
+            try:
+                receipt = done.result()
+            except BaseException as exc:
+                self._log(
+                    "workflow.hitl_barrier.event_bridge_error",
+                    {
+                        "errorType": type(exc).__name__,
+                        "error": str(exc)[:300],
+                    },
+                )
+                return
+            if isinstance(receipt, dict) and not receipt.get("claimed"):
+                self._log(
+                    "workflow.hitl_barrier.event_ignored",
+                    dict(receipt),
+                )
+
+        task.add_done_callback(completed)
 
     def _handle_axtree_updated(self, payload: Any) -> None:
         """The browser refreshed the AX tree after a stale target. Rebuild the

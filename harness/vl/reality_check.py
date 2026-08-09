@@ -69,15 +69,13 @@ _NL_RECOVERY_RE = re.compile(
 # from classify_target_yield (does not touch the streak).
 _ROW_YIELD_TOOLS = frozenset({
     "collect_items",
-    "extract_dom_records",
-    "eval_js_json",
     "find_in_axtree",
     "record_extraction",
 })
 
-# collect_items stop reasons that mean "the page was exhausted without
-# meeting the target" — a shortfall signal even when rows were harvested.
-_EXHAUSTED_STOP_REASONS = frozenset({
+# Legacy collect_items stop reasons that indicate target shortfall.  Despite
+# historical naming, these are not trusted exhaustion evidence.
+_COLLECT_SHORTFALL_STOP_REASONS = frozenset({
     "stagnant",
     "load_more_exhausted",
     "max_rounds",
@@ -129,21 +127,33 @@ def classify_target_yield(tool_name: str, result: JsonDict) -> Optional[bool]:
             return embedded
 
     if tool_name == "collect_items":
+        collection_state = str(result.get("collectionState") or "")
+        if collection_state in {"target_reached", "explicitly_exhausted"}:
+            return False
+        if collection_state == "materialization_stalled":
+            return True
+        if collection_state == "blocked":
+            # Challenge/auth/overlay classifiers own this outcome.
+            return None
+        # Legacy traces have no collectionState; keep their conservative
+        # stopReason/count fallback in the same branch.
         stop_reason = str(result.get("stopReason") or "")
         if stop_reason == "target_met":
             return False
         rows = result.get("rows")
         items = result.get("itemsCollected")
+        reported_count = result.get("rowCount")
         row_count = (
             len(rows) if isinstance(rows, list)
             else items if isinstance(items, (int, float))
+            else reported_count if isinstance(reported_count, (int, float))
             else None
         )
         if row_count == 0:
             return True
-        if stop_reason in _EXHAUSTED_STOP_REASONS:
-            # The page was exhausted; whatever was harvested did not meet
-            # the target or stopReason would say target_met.
+        if stop_reason in _COLLECT_SHORTFALL_STOP_REASONS:
+            # Legacy traces have no mechanical exhaustion evidence.  Treat
+            # these stops conservatively as shortfall.
             return True
         return None
 
@@ -154,13 +164,6 @@ def classify_target_yield(tool_name: str, result: JsonDict) -> Optional[bool]:
         count = result.get("matchCount")
         if isinstance(count, (int, float)):
             return True if count == 0 else None
-        return None
-
-    if tool_name == "eval_js_json":
-        value = result.get("value")
-        if isinstance(value, list):
-            return True if len(value) == 0 else None
-        # Scalar/object evaluations are not collection probes.
         return None
 
     rows = result.get("rows")

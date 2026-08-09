@@ -31,7 +31,25 @@ NotificationCallback = Callable[[JsonDict], None]
 
 
 class ABCPTransportError(RuntimeError):
-    """Raised when the WebSocket transport cannot complete a request."""
+    """Raised when the WebSocket transport cannot complete a request.
+
+    JSON-RPC failures retain their machine-readable code/data.  Callers that
+    need to distinguish a remote action timeout from a local socket failure
+    must not parse the rendered exception string.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        rpc_code: Optional[int] = None,
+        rpc_method: str = "",
+        rpc_data: Any = None,
+    ) -> None:
+        super().__init__(message)
+        self.rpc_code = rpc_code
+        self.rpc_method = str(rpc_method or "")
+        self.rpc_data = rpc_data
 
 
 @dataclass
@@ -59,6 +77,9 @@ class NotificationHub:
     def __init__(self, *, replay_size: int = 64, replay_ttl_seconds: float = 30.0):
         self._replay: Deque[Tuple[float, JsonDict]] = deque(maxlen=replay_size)
         self._replay_ttl_seconds = replay_ttl_seconds
+        self._dedupe_limit = max(64, replay_size * 4)
+        self._dedupe_order: Deque[Tuple[float, str]] = deque()
+        self._dedupe_keys: set[str] = set()
         self._waiters: List[_NotificationWaiter] = []
         self._subscribers: List[NotificationCallback] = []
         self._closed = False
@@ -85,6 +106,66 @@ class NotificationHub:
                 # Subscribers are passive observers; don't let a buggy one
                 # break delivery for others.
                 pass
+
+    def publish_once(self, message: JsonDict) -> bool:
+        """Publish one logical ABCP control event at most once.
+
+        ABCP may deliver the same persisted event through its default Agent
+        stream, an explicit Events.watch subscription, and a Harness owner
+        relay.  Stable eventId/cursor identity is transport metadata, not a
+        second occurrence of the browser action.
+
+        Messages without stable control-event identity retain the historical
+        broadcast behavior.  ``publish`` also remains unconditional for local
+        synthetic notifications and tests.
+        """
+
+        if self._closed:
+            return False
+        key = self._control_event_key(message)
+        if key:
+            now = time.monotonic()
+            cutoff = now - max(0.0, self._replay_ttl_seconds)
+            while self._dedupe_order and (
+                self._dedupe_order[0][0] < cutoff
+                or len(self._dedupe_order) >= self._dedupe_limit
+            ):
+                _timestamp, expired_key = self._dedupe_order.popleft()
+                self._dedupe_keys.discard(expired_key)
+            if key in self._dedupe_keys:
+                return False
+            self._dedupe_keys.add(key)
+            self._dedupe_order.append((now, key))
+        self.publish(message)
+        return True
+
+    @staticmethod
+    def _control_event_key(message: JsonDict) -> Optional[str]:
+        candidates: List[JsonDict] = []
+        if isinstance(message, dict):
+            candidates.append(message)
+            params = message.get("params")
+            if isinstance(params, dict):
+                candidates.append(params)
+                data = params.get("data")
+                if isinstance(data, dict):
+                    candidates.append(data)
+            data = message.get("data")
+            if isinstance(data, dict):
+                candidates.append(data)
+
+        for candidate in candidates:
+            event_id = str(
+                candidate.get("eventId") or candidate.get("event_id") or ""
+            ).strip()
+            if event_id:
+                return f"event:{event_id}"
+        for candidate in candidates:
+            cursor = candidate.get("cursor")
+            event = str(candidate.get("event") or "").strip()
+            if cursor is not None and event:
+                return f"cursor:{cursor}:{event}"
+        return None
 
     async def wait_for(
         self,
@@ -167,6 +248,8 @@ class NotificationHub:
         self._waiters.clear()
         self._subscribers.clear()
         self._replay.clear()
+        self._dedupe_order.clear()
+        self._dedupe_keys.clear()
 
 
 def _connect_supports_proxy_arg() -> bool:
@@ -304,8 +387,17 @@ class ABCPClient:
 
         if "error" in raw_response and not self._is_implicit_error_envelope(raw_response):
             self._emit("response", raw_response)
+            rpc_error = (
+                raw_response.get("error")
+                if isinstance(raw_response.get("error"), dict)
+                else {}
+            )
+            raw_code = rpc_error.get("code")
             raise ABCPTransportError(
-                self._format_jsonrpc_error(method, raw_response)
+                self._format_jsonrpc_error(method, raw_response),
+                rpc_code=raw_code if isinstance(raw_code, int) else None,
+                rpc_method=method,
+                rpc_data=rpc_error.get("data"),
             )
         response = self._unwrap_response(raw_response)
         self._emit("response", response)
@@ -375,7 +467,7 @@ class ABCPClient:
                 self._emit("orphan_response", message)
             return
         self._emit("notify", message)
-        self.notifications.publish(message)
+        self.notifications.publish_once(message)
 
     def _is_response_for_pending(self, message: JsonDict) -> bool:
         if self._pending_call is None:

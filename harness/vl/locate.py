@@ -373,14 +373,19 @@ async def _resolve_axtree(browser: Any, page_id: str,
 
 
 async def _viewport_dpr(browser: Any, page_id: str) -> Dict[str, Any]:
+    """Read an optional native page-state scale factor without executing JS."""
     try:
-        resp = await browser.call("Runtime.evaluate", {
-            "pageId": page_id, "returnByValue": True,
-            "expression": "return {dpr: window.devicePixelRatio || 1};",
-            "purpose": "read devicePixelRatio to map screenshot px to CSS px",
+        resp = await browser.call("Page.getState", {
+            "pageId": page_id,
+            "purpose": "read native page metrics for VL coordinate mapping",
         })
         data = ((resp or {}).get("data") or {})
-        dpr = float(data.get("dpr") or 1.0) or 1.0
+        dpr = float(
+            data.get("deviceScaleFactor")
+            or data.get("devicePixelRatio")
+            or data.get("dpr")
+            or 1.0
+        ) or 1.0
         return {"dpr": dpr}
     except Exception:
         return {"dpr": 1.0}

@@ -365,6 +365,113 @@ def vl_dismiss_target_is_safe(
     return False
 
 
+def _element_identity_fields(element: Any) -> List[str]:
+    source = element if isinstance(element, dict) else {}
+    return [
+        text for text in (
+            str(source.get(key) or "").strip()
+            for key in ("text", "ariaLabel", "name", "title", "value", "alt")
+        ) if text
+    ]
+
+
+def _element_is_actionable(element: Any) -> bool:
+    source = element if isinstance(element, dict) else {}
+    tag = str(source.get("tag") or "").lower()
+    role = str(source.get("role") or "").lower()
+    return tag in {"button", "a", "input", "select", "textarea"} or role in ACTIONABLE_ROLES
+
+
+def captcha_point_is_safe(occluder_stack: Any) -> Tuple[bool, JsonDict]:
+    """Negative safety gate for a VL-proposed CAPTCHA solve point.
+
+    A puzzle piece, slider handle, or grid tile has no stable positive identity
+    to whitelist against (that is exactly why the VL is being asked), so unlike
+    `vl_dismiss_target_is_safe` this gate is a BLOCK-list over the LIVE elements
+    at the point.
+
+    It inspects the WHOLE elementsFromPoint stack, not just the topmost node:
+    the hit-test stack is the topmost element plus its ancestor chain, and a
+    transparent/empty `<span>` sitting on a "Sign in" `<button>` would otherwise
+    pass while the click still lands on the button.
+
+    Two rules, both fail-closed:
+      * the topmost element must not read consequential in ANY identity field —
+        it is what actually receives the event;
+      * no ACTIONABLE element anywhere in the stack (button/link/input/role) may
+        read consequential.
+    Non-actionable ancestors are deliberately not blocking: a slider inside a
+    "手机号登录" dialog is a legitimate, live-verified case, and the dialog's own
+    wording must not veto solving the puzzle it contains.
+
+    Returns (safe, evidence) so callers can log WHY a solve was abandoned."""
+    stack = occluder_stack if isinstance(occluder_stack, list) else []
+    elements = [item for item in stack if isinstance(item, dict)]
+    if not elements:
+        return False, {"reason": "no_element_at_point"}
+    for depth, element in enumerate(elements):
+        actionable = _element_is_actionable(element)
+        if depth and not actionable:
+            continue  # non-actionable ancestor: its wording is context, not a target
+        for candidate in _element_identity_fields(element):
+            if is_never_click(candidate) or is_sensitive_target("", candidate):
+                return False, {
+                    "reason": "consequential_control_at_point",
+                    "label": candidate[:60],
+                    "tag": str(element.get("tag") or ""),
+                    "role": str(element.get("role") or ""),
+                    "stackDepth": depth,
+                }
+    top = elements[0]
+    return True, {
+        "tag": str(top.get("tag") or ""),
+        "role": str(top.get("role") or ""),
+        "label": next(iter(_element_identity_fields(top)), "")[:60],
+        "stackChecked": len(elements),
+    }
+
+
+# Positive allow-list for the field an OCR answer may be typed into. A block-list
+# would silently accept every future/exotic input type (checkbox, radio, range,
+# date, color, button ...), so only these are considered a plain text box.
+ALLOWED_TEXT_INPUT_TYPES = {"", "text", "search"}
+
+
+def captcha_text_target_is_safe(active_element: Any) -> Tuple[bool, JsonDict]:
+    """Gate the element that will actually receive an OCR answer.
+
+    The focus point was already coordinate-checked; this checks what has focus
+    NOW, and only ALLOW-LISTED shapes pass: `<input>` with no type / text /
+    search, `<textarea>`, an explicitly contenteditable node, or role=textbox —
+    plus a label that does not read credential-shaped. Everything else
+    (password/email/tel/file/checkbox/date/…, an unreadable probe, nothing
+    focused) fails closed."""
+    element = active_element if isinstance(active_element, dict) else {}
+    if element.get("status") == "oracle_unavailable" or not element.get("present"):
+        return False, {"reason": "no_focused_element"}
+    tag = str(element.get("tag") or "").lower()
+    field_type = str(element.get("type") or "").lower()
+    role = str(element.get("role") or "").lower()
+    editable = bool(element.get("editable"))
+    if tag == "input":
+        if field_type not in ALLOWED_TEXT_INPUT_TYPES:
+            return False, {"reason": "input_type_not_a_plain_text_box", "type": field_type}
+    elif not (tag == "textarea" or editable or role == "textbox"):
+        return False, {"reason": "focus_is_not_a_text_field", "tag": tag, "role": role}
+    for candidate in (
+        str(element.get("ariaLabel") or ""),
+        str(element.get("placeholder") or ""),
+        str(element.get("name") or ""),
+        str(element.get("id") or ""),
+    ):
+        if candidate and (is_never_click(candidate) or is_sensitive_target("", candidate)):
+            return False, {
+                "reason": "consequential_field_label",
+                "label": candidate[:60],
+            }
+    return True, {"tag": tag, "type": field_type or None, "role": role or None}
+
+
 def backdrop_point_is_safe(occluder_stack: List[JsonDict]) -> bool:
     """A backdrop click is safe only when the topmost element at the point is a
     non-interactive surface (the overlay/backdrop itself), never a button,

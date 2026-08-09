@@ -67,7 +67,7 @@ class PageLifecycleTracker:
         state = self.ensure(page_id)
         if state is None:
             return
-        if method == "Page.navigate":
+        if method in {"Page.navigate", "Page.reload", "Page.go"}:
             self._mark_loading(state, method)
             state.requires_state_resync = True
             state.requires_ax_refresh = True
@@ -156,6 +156,18 @@ class PageLifecycleTracker:
         state = self.ensure(page_id)
         if state is not None:
             state.requires_ax_refresh = False
+
+    def invalidate_ax_refresh(self, page_id: Any) -> None:
+        """Restore the AX refresh obligation after a stale result was isolated.
+
+        A successful DOM.getAXTree response normally clears the obligation in
+        ``observe_ax_refresh``. Callers that subsequently prove that response
+        belonged to an older navigation generation must be able to roll back
+        that optimistic transition without manufacturing another navigation.
+        """
+        state = self.ensure(page_id)
+        if state is not None:
+            state.requires_ax_refresh = True
 
     async def wait_for_settlement(self, page_id: Any, timeout_seconds: float) -> str:
         state = self.ensure(page_id)

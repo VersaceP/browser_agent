@@ -13,6 +13,7 @@ System.register/Fleet.list before assigning each worker.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Mapping, Optional, Set
@@ -22,6 +23,15 @@ VALID_REUSE_SCOPES = frozenset({"connection", "fleet", "page"})
 VALID_PAGE_POLICIES = frozenset({"new", "existing"})
 
 ROUTING_ERROR_GUIDANCE = {
+    "fleet_reference_invalid": (
+        "Use an existing Fleet UUID or a hexadecimal UUID prefix of at least 8 characters."
+    ),
+    "fleet_reference_not_found": (
+        "Refresh the authoritative Fleet inventory and choose an existing Fleet; do not create a replacement."
+    ),
+    "ambiguous_fleet_reference": (
+        "Use a longer Fleet UUID prefix that identifies exactly one existing Fleet."
+    ),
     "fleet_routing_conflict": (
         "Remove the conflicting selector and retry with one session/worker/slot route."
     ),
@@ -43,7 +53,72 @@ ROUTING_ERROR_GUIDANCE = {
     "released_fleet_conflict": (
         "Do not revive a released session fleet; create a fresh fleet through the coordinator."
     ),
+    "task_fleet_limit_reached": (
+        "Continue on a fleet the task already has (drop needs_isolated_session,"
+        " or pass the exact session_key bound to it) or raise"
+        " harness.max_task_fleets; waiting does not free a fleet, and a fresh"
+        " one is never the answer."
+    ),
 }
+
+
+_FLEET_UUID_PREFIX_RE = re.compile(r"^[0-9a-fA-F]{8}[0-9a-fA-F-]*$")
+
+
+def resolve_fleet_reference(
+    fleet_reference: object,
+    candidate_fleet_ids: Iterable[str],
+) -> str:
+    """Resolve one existing Fleet UUID from an exact id or unique prefix.
+
+    The candidate set must come from the current authoritative Dispatcher
+    inventory.  A model-provided value is only a selector: it never proves
+    that the Fleet exists and it never authorizes a replacement Fleet.
+    """
+
+    reference = str(fleet_reference or "").strip()
+    candidates = sorted({
+        str(item or "").strip()
+        for item in candidate_fleet_ids
+        if str(item or "").strip()
+    })
+    if (
+        len(reference) < 8
+        or not _FLEET_UUID_PREFIX_RE.fullmatch(reference)
+    ):
+        raise FleetRoutingError(
+            "fleet_reference_invalid",
+            (
+                "fleet_id must be an existing Fleet UUID or a hexadecimal"
+                " UUID prefix of at least 8 characters"
+            ),
+            details={"fleetReference": reference},
+        )
+
+    lowered = reference.lower()
+    exact = [item for item in candidates if item.lower() == lowered]
+    matches = exact or [
+        item for item in candidates if item.lower().startswith(lowered)
+    ]
+    if not matches:
+        raise FleetRoutingError(
+            "fleet_reference_not_found",
+            f"fleet_id reference {reference!r} matched no active Fleet",
+            details={"fleetReference": reference},
+        )
+    if len(matches) > 1:
+        raise FleetRoutingError(
+            "ambiguous_fleet_reference",
+            (
+                f"fleet_id reference {reference!r} matched multiple active"
+                " Fleets"
+            ),
+            details={
+                "fleetReference": reference,
+                "matchingFleetIds": matches,
+            },
+        )
+    return matches[0]
 
 
 class FleetRoutingError(RuntimeError):
@@ -204,8 +279,12 @@ class FleetCoordinator:
                     admitted=bool(admit_unbound),
                 )
                 self._fleets[fleet_id] = record
-            record.slot_id = slot_id
-            record.owner_agent_id = owner_agent_id
+            # Inventory can be Agent-global: several live slot connections may
+            # observe the same fleet. Once explicitly admitted/bound, a later
+            # observer must not steal ownership merely by refreshing Fleet.list.
+            if not record.admitted or record.slot_id == str(slot_id):
+                record.slot_id = slot_id
+                record.owner_agent_id = owner_agent_id
             record.last_seen_at = now
             record.status = (
                 "released" if record.retired_from_session else "active"
@@ -234,6 +313,60 @@ class FleetCoordinator:
         default_fleet = self._slot_defaults.get(slot_id)
         if default_fleet and default_fleet not in observed:
             self._slot_defaults.pop(slot_id, None)
+
+    def reconcile_missing_fleets(self, observed_fleet_ids: Iterable[str]) -> List[str]:
+        """Retire records absent from a COMPLETE inventory read, whoever owns them.
+
+        `observe_slot` deliberately retires only the records it owns: one slot's
+        snapshot is no evidence about another slot's fleets. ABCP's Fleet.list is
+        different — the dispatcher answers it from the whole fleets table
+        (`SELECT * FROM fleets`, no agent or connection scoping) and the harness
+        stores every returned row — so one successful read is authoritative for
+        every fleet, including those another slot created. Pass the result of
+        exactly such a read; never a partial or failed one.
+
+        Named sessions stay as `missing` tombstones rather than disappearing, so
+        a lost cookie jar keeps failing closed instead of silently rebinding.
+        """
+
+        observed = {
+            str(fleet_id).strip()
+            for fleet_id in observed_fleet_ids
+            if str(fleet_id).strip()
+        }
+        retired: List[str] = []
+        for fleet_id, record in list(self._fleets.items()):
+            if fleet_id in observed:
+                continue
+            record.status = "missing"
+            if record.session_key:
+                continue
+            retired.append(fleet_id)
+            self._fleets.pop(fleet_id, None)
+            self._slot_defaults = {
+                slot_id: default_fleet
+                for slot_id, default_fleet in self._slot_defaults.items()
+                if default_fleet != fleet_id
+            }
+            for group_key, grouped_fleet in list(self._fleet_groups.items()):
+                if grouped_fleet == fleet_id:
+                    self._fleet_groups.pop(group_key, None)
+        return sorted(retired)
+
+    def owner_slot_for_fleet(
+        self,
+        fleet_id: str,
+        *,
+        admitted_only: bool = True,
+    ) -> str:
+        """Return the stable owner slot for one active fleet, if known."""
+
+        record = self._fleets.get(str(fleet_id or "").strip())
+        if record is None or record.status != "active":
+            return ""
+        if admitted_only and not record.admitted:
+            return ""
+        return str(record.slot_id or "")
 
     def restore_auth_binding(
         self,
@@ -678,6 +811,104 @@ class FleetCoordinator:
                 selected_record is not None
                 and selected_record.slot_id != str(slot_id)
             ),
+        )
+
+    def task_fleet_ids(self) -> Set[str]:
+        """Return the fleets this task actually occupies, for its fleet budget.
+
+        Fleet.list inventory is Agent-global — one connection also reports
+        fleets belonging to other tasks — so the budget is counted over fleets
+        bound to THIS coordinator's workers. A fleet the owner inventory no
+        longer reports (missing/released) stops consuming budget; a fleet whose
+        slot is merely reconnecting ("suspect") still exists on the platform and
+        keeps its share.
+        """
+
+        occupied: Set[str] = set()
+        for assignment in self._worker_assignments.values():
+            record = self._fleets.get(assignment.fleet_id)
+            if record is not None and record.status in {"active", "suspect"}:
+                occupied.add(assignment.fleet_id)
+        return occupied
+
+    def choose_under_cap(
+        self,
+        *,
+        worker_id: str,
+        slot_id: str,
+        owner_agent_id: str,
+        candidate_fleet_ids: Iterable[str],
+        reuse_scope: str,
+        page_policy: str,
+        fleet_group_key: str = "",
+        busy_fleet_ids: Iterable[str] = (),
+    ) -> Optional[FleetAssignment]:
+        """Reuse one of the task's own fleets once its fleet cap is full.
+
+        This is the cap's degraded path, not ordinary routing: unlike
+        `choose_existing` it may hand back a fleet that was created isolated,
+        because an operator ceiling on live browser instances outranks the
+        deployment's per-worker isolation preference. It still never touches a
+        named-session cookie jar and never revives a released one — a caller
+        that carries a real identity boundary must fail closed instead.
+
+        `busy_fleet_ids` (fleets a running worker already holds) only ranks
+        last, it never filters. Ordinary routing already lets two live workers
+        share one fleet — `choose_existing` picks a slot's healthy fleet without
+        asking who else is on it, and the click gate plus page leases are what
+        keep that safe — so excluding them here would reject a worker for
+        something allowed one fleet earlier.
+        """
+
+        candidates = {
+            str(fleet_id).strip()
+            for fleet_id in candidate_fleet_ids
+            if str(fleet_id).strip()
+        }
+        busy = {
+            str(fleet_id).strip()
+            for fleet_id in busy_fleet_ids
+            if str(fleet_id).strip()
+        }
+        reusable = [
+            fleet_id
+            for fleet_id in self.task_fleet_ids() & candidates
+            if (
+                (record := self._fleets.get(fleet_id)) is not None
+                and record.status == "active"
+                and record.admitted
+                and not record.session_key
+                and not record.retired_from_session
+            )
+        ]
+        if not reusable:
+            return None
+        selected = max(
+            reusable,
+            key=lambda fleet_id: (
+                fleet_id not in busy,
+                not self._fleets[fleet_id].is_isolated,
+                self._fleets[fleet_id].slot_id == str(slot_id),
+                self._fleets[fleet_id].last_used_at,
+                self._fleets[fleet_id].last_seen_at,
+                fleet_id,
+            ),
+        )
+        selected_record = self._fleets[selected]
+        return self.bind_assignment(
+            worker_id=worker_id,
+            slot_id=slot_id,
+            owner_agent_id=selected_record.owner_agent_id or owner_agent_id,
+            fleet_id=selected,
+            assignment_reason="task_fleet_cap_reuse",
+            reuse_scope=reuse_scope,
+            page_policy=page_policy,
+            allowed_fleet_ids=[selected],
+            created_for_worker=False,
+            is_isolated=selected_record.is_isolated,
+            owner_slot_id=selected_record.slot_id or slot_id,
+            fleet_group_key=fleet_group_key,
+            delegated=selected_record.slot_id != str(slot_id),
         )
 
     def bind_assignment(

@@ -256,7 +256,14 @@ def page_fingerprint_from_result(
     name = str(tool_call.get("name") or "")
     raw_input = tool_call.get("input") if isinstance(tool_call.get("input"), dict) else {}
     method = str(raw_input.get("method") or "") if name == "browser_call" else name
-    if method not in {"DOM.getAXTree", "Page.getState", "Page.navigate", "navigate_verified"}:
+    if method not in {
+        "DOM.getAXTree",
+        "Page.getState",
+        "Page.navigate",
+        "Page.reload",
+        "Page.go",
+        "navigate_verified",
+    }:
         return None
     params = raw_input.get("params") if isinstance(raw_input.get("params"), dict) else raw_input
     page_id = str(params.get("pageId") or "")
@@ -405,9 +412,8 @@ def render_page_stats_for_prompt(page_stats: JsonDict) -> str:
                     "next": (
                         "For dismissible business overlays, refresh DOM.getAXTree,"
                         " try a visible close/dismiss control if present, then"
-                        " Escape, then"
-                        " verified backdrop click only if the click target is"
-                        " outside modal content. Do not click login/provider or"
+                        " Escape. Do not use coordinate backdrop/VL clicks without"
+                        " an independent native point hit-test. Do not click login/provider or"
                         " payment buttons automatically."
                     ),
                 },

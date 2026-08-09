@@ -83,6 +83,22 @@ STRONG_PAYWALL_KEYWORDS = (
     "订阅后继续",
 )
 
+# Exact document titles are stronger than an incidental "sign in" phrase in
+# article text.  Keep this generic authentication vocabulary in the dedicated
+# overlay/auth detector; downstream classifiers consume only its structured
+# result and do not duplicate these words.
+AUTH_PAGE_TITLES = frozenset({
+    "login",
+    "log in",
+    "sign in",
+    "signin",
+    "authentication required",
+    "登录",
+    "用户登录",
+    "账号登录",
+    "请登录",
+})
+
 DIALOG_ROLE_MARKERS = (
     "] dialog",
     "] alertdialog",
@@ -91,7 +107,24 @@ DIALOG_ROLE_MARKERS = (
 
 def detect_overlay_from_result(result: Any) -> Optional[JsonDict]:
     text = _collect_page_text(result)
-    return detect_overlay_from_text(text)
+    detected = detect_overlay_from_text(text)
+    if detected is not None:
+        return detected
+    title = _page_title(result)
+    if title_looks_like_auth_page(title):
+        return {
+            "type": "business_overlay",
+            "subtype": "auth_prompt",
+            "confidence": 0.85,
+            "dismissibleSignal": False,
+            "evidence": [f"document title: {title}"],
+            "hint": _overlay_hint("auth_prompt"),
+        }
+    return None
+
+
+def title_looks_like_auth_page(title: Any) -> bool:
+    return str(title or "").strip().casefold() in AUTH_PAGE_TITLES
 
 
 def detect_overlay_from_text(text: str) -> Optional[JsonDict]:
@@ -161,7 +194,7 @@ def _overlay_hint(subtype: str) -> str:
         return (
             "Business auth prompt detected. Do not click login/provider buttons"
             " automatically; first try a non-submit dismiss path such as close,"
-            " Escape, or a verified backdrop click, then refresh DOM.getAXTree."
+            " or Escape, then refresh DOM.getAXTree."
         )
     if subtype == "paywall":
         return (
@@ -175,7 +208,8 @@ def _overlay_hint(subtype: str) -> str:
         )
     return (
         "Modal or overlay detected. Use DOM.getAXTree to find a close/dismiss"
-        " control, try Escape, or use a verified backdrop click before retrying."
+        " control or try Escape before retrying. Coordinate clicks require an"
+        " independent native point hit-test."
     )
 
 
@@ -227,3 +261,18 @@ def _collect_page_text(value: Any, *, limit: int = 120_000) -> str:
 
     visit(value)
     return "\n".join(chunks)
+
+
+def _page_title(value: Any, *, depth: int = 0) -> str:
+    if depth > 5 or not isinstance(value, dict):
+        return ""
+    title = value.get("title")
+    if isinstance(title, str) and title.strip():
+        return title.strip()
+    for key in ("response", "data"):
+        nested = value.get(key)
+        if isinstance(nested, dict):
+            found = _page_title(nested, depth=depth + 1)
+            if found:
+                return found
+    return ""

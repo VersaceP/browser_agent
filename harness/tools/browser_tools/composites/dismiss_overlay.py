@@ -4,16 +4,17 @@ import asyncio
 from typing import Any, List, Optional, Tuple
 
 from harness.observation.overlay_actions import (
-    backdrop_point_is_safe,
-    compute_backdrop_point,
     find_close_control,
     is_sensitive_method,
     is_sensitive_target,
-    normalized_point_to_css,
     visible_layers_occluded,
-    vl_dismiss_target_is_safe,
 )
 from harness.observation.overlay_detector import detect_overlay_from_result
+from harness.observation.verifiers import (
+    CONFIDENCE_LOW,
+    CONFIDENCE_MEDIUM,
+    VerifierResult,
+)
 from harness.utils import JsonDict, optional_int
 
 
@@ -35,14 +36,6 @@ def _layers_from_result(result: JsonDict) -> List[JsonDict]:
     return _bt()._layers_from_result(result)
 
 
-def _viewport_from_layers(layers: List[JsonDict]) -> JsonDict:
-    return _bt()._viewport_from_layers(layers)
-
-
-def _screenshot_saved_path(result: JsonDict) -> str:
-    return _bt()._screenshot_saved_path(result)
-
-
 def _axtree_seen_signature(agent: Any, node_id: str, page_id: str) -> Optional[JsonDict]:
     return _bt()._axtree_seen_signature(agent, node_id, page_id)
 
@@ -61,24 +54,33 @@ def _log_dismiss_overlay(
     return _bt()._log_dismiss_overlay(agent, page_id, status, overlay, attempts)
 
 
-def build_read_only_oracle(agent: Any, page_id: str, step: int) -> Any:
-    return _bt().build_read_only_oracle(agent, page_id, step)
-
-
-async def probe_occluder(*args: Any, **kwargs: Any) -> JsonDict:
-    return await _bt().probe_occluder(*args, **kwargs)
-
-
-async def probe_viewport_metrics(*args: Any, **kwargs: Any) -> JsonDict:
-    return await _bt().probe_viewport_metrics(*args, **kwargs)
-
-
-async def verify_overlay_gone(*args: Any, **kwargs: Any) -> Any:
-    return await _bt().verify_overlay_gone(*args, **kwargs)
-
-
-async def visual_verify_image(*args: Any, **kwargs: Any) -> JsonDict:
-    return await _bt().visual_verify_image(*args, **kwargs)
+async def _verify_overlay_gone_native(
+    agent: Any,
+    page_id: str,
+    step: int,
+) -> VerifierResult:
+    inspect = await _invoke_browser_method(
+        agent,
+        "DOM.getAXTree",
+        {"pageId": page_id, "purpose": "dismiss_overlay: verify via native AXTree"},
+        step,
+        count_progress=False,
+    )
+    if _invoke_result_failed(inspect):
+        return VerifierResult(
+            ok=False,
+            confidence=CONFIDENCE_LOW,
+            method="native_axtree_unavailable",
+            reason="DOM.getAXTree failed while verifying overlay state",
+        )
+    overlay = detect_overlay_from_result(inspect)
+    return VerifierResult(
+        ok=not isinstance(overlay, dict),
+        confidence=CONFIDENCE_MEDIUM,
+        method="native_axtree",
+        evidence={"overlay": overlay} if isinstance(overlay, dict) else {"overlay": None},
+        reason="overlay still present" if isinstance(overlay, dict) else "no overlay in refreshed AXTree",
+    )
 
 
 DISMISS_OVERLAY_MAX_ATTEMPTS = 3
@@ -105,7 +107,6 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
         max_duration_ms = DISMISS_OVERLAY_MAX_DURATION_MS
     deadline = asyncio.get_running_loop().time() + max_duration_ms / 1000.0
 
-    oracle = build_read_only_oracle(agent, page_id, step)
     attempts: List[JsonDict] = []
 
     inspect = await _invoke_browser_method(
@@ -124,7 +125,6 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
         return {**interrupt, "attempts": attempts}
     overlay = detect_overlay_from_result(inspect)
     layers = _layers_from_result(inspect)
-    viewport = _viewport_from_layers(layers)
     occluded_frames = visible_layers_occluded(layers)
 
     if isinstance(overlay, dict) and overlay.get("subtype") in {"auth_prompt", "paywall"}:
@@ -179,7 +179,7 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
                 "id": close.get("id"),
                 "name": str(close.get("name") or "")[:60],
             })
-            last_verdict = await verify_overlay_gone(oracle=oracle)
+            last_verdict = await _verify_overlay_gone_native(agent, page_id, step)
             if last_verdict.ok:
                 success = True
                 break
@@ -195,47 +195,24 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
         if interrupt:
             return _interrupt_return(interrupt)
         attempts.append({"attempt": attempt, "rung": "escape"})
-        last_verdict = await verify_overlay_gone(oracle=oracle)
+        last_verdict = await _verify_overlay_gone_native(agent, page_id, step)
         if last_verdict.ok:
             success = True
             break
 
-        backdrop_ok, backdrop_meta = await _try_backdrop_click(
-            agent, page_id, oracle, last_verdict, viewport, step
-        )
-        if backdrop_meta.get("interrupt"):
-            return _interrupt_return(backdrop_meta["interrupt"])
-        attempts.append({"attempt": attempt, "rung": "backdrop", **backdrop_meta})
-        if backdrop_ok:
-            success = True
-            break
-
-        # Clicks/Escape invalidated the snapshot; refresh nodes for the next
-        # attempt's close-control search.
-        reinspect = await _invoke_browser_method(
-            agent,
-            "DOM.getAXTree",
-            {"pageId": page_id, "purpose": "dismiss_overlay: re-inspect"},
-            step,
-            count_progress=False,
-        )
-        interrupt = _loop_interrupt_from_result(reinspect)
-        if interrupt:
-            return _interrupt_return(interrupt)
+        # The Escape verifier refreshed both the native AXTree and the cached
+        # canonical nodes. No extra re-inspection is needed before the next
+        # attempt. Coordinate backdrop clicks are deliberately unavailable:
+        # ABCP has no independent native hit-test with which to prove safety.
 
     vl_arbiter_meta: Optional[JsonDict] = None
     if not success:
-        # Last resort: the VL arbiter. Only reached after the deterministic ladder
-        # (close control -> Escape -> verified backdrop) fully failed. It locates a
-        # safe dismiss control visually, back-translates to CSS coords, runs an
-        # INDEPENDENT elementFromPoint safety check, then clicks. Gated by vl.enabled
-        # + the per-worker VL budget; never clicks a consequential control.
-        overlay_subtype = overlay.get("subtype") if isinstance(overlay, dict) else None
+        # Keep an explicit capability receipt for callers that previously
+        # expected coordinate/VL fallback. Without a native point hit-test the
+        # arbiter cannot safely turn a visual coordinate into an input action.
         vl_ok, vl_arbiter_meta = await _vl_overlay_arbiter(
-            agent, page_id, oracle, step, subtype=overlay_subtype
+            agent, page_id, oracle=None, step=step
         )
-        if vl_arbiter_meta.get("interrupt"):
-            return _interrupt_return(vl_arbiter_meta["interrupt"])
         attempts.append({"attempt": "vl_arbiter", **vl_arbiter_meta})
         if vl_ok:
             success = True
@@ -249,10 +226,11 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
             "attempts": attempts[-3:],
             "vlArbiter": vl_arbiter_meta,
             "next_instruction": (
-                "The dismiss ladder (including the VL arbiter) did not clear the"
-                " overlay within the attempt budget. Inspect with DOM.getAXTree,"
-                " try a visual_verify overlay_check, request HITL, or report a"
-                " blocker."
+                "Native close-control and Escape attempts did not clear the"
+                " overlay. Coordinate backdrop and VL clicks were not attempted"
+                " because no independent native point hit-test is available."
+                " Refresh DOM.getAXTree, request HITL when human action is"
+                " genuinely required, or report a blocker."
             ),
         }
 
@@ -272,161 +250,16 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
     }
 
 
-async def _try_backdrop_click(
-    agent: Any,
-    page_id: str,
-    oracle: Any,
-    verdict: Any,
-    viewport: JsonDict,
-    step: int,
-) -> Tuple[bool, JsonDict]:
-    dialog_rect = None
-    dialogs = getattr(verdict, "evidence", {}).get("dialogs") if verdict else None
-    if isinstance(dialogs, list) and dialogs and isinstance(dialogs[0], dict):
-        dialog_rect = dialogs[0].get("rect")
-    point = compute_backdrop_point(dialog_rect, viewport)
-    if point is None:
-        return False, {"skipped": "no_safe_backdrop"}
-    x, y = point
-    probe = await probe_occluder(oracle=oracle, x=x, y=y)
-    if probe.get("status") != "done":
-        return False, {"skipped": "occluder_unavailable"}
-    if not backdrop_point_is_safe(list(probe.get("stack") or [])):
-        return False, {"skipped": "unsafe_point", "point": [x, y]}
-    click_result = await _invoke_browser_method(
-        agent,
-        "Input.click",
-        {"pageId": page_id, "x": x, "y": y, "purpose": "dismiss_overlay: backdrop click"},
-        step,
-        count_progress=False,
-    )
-    interrupt = _loop_interrupt_from_result(click_result)
-    if interrupt:
-        return False, {"point": [x, y], "interrupt": interrupt}
-    after = await verify_overlay_gone(oracle=oracle)
-    return bool(after.ok), {"point": [x, y]}
-
-
 async def _vl_overlay_arbiter(
     agent: Any,
     page_id: str,
-    oracle: Any,
-    step: int,
+    oracle: Any = None,
+    step: int = 0,
     subtype: Optional[str] = None,
 ) -> Tuple[bool, JsonDict]:
-    """Phase 7.1 visual arbiter — the dismiss ladder's last rung.
-
-    Pipeline: viewport screenshot -> VL overlay_classify -> back-translate the
-    proposed dismiss point from NORMALIZED 0-1000 coords to CSS coords ->
-    INDEPENDENT elementFromPoint positive-whitelist safety check -> coordinate
-    click -> verify overlay gone. The VL is an arbiter, never on the main path:
-    it runs only after the deterministic ladder failed, is gated by vl.enabled +
-    the per-worker VL budget, refuses any control the VL itself flags
-    consequential, and clicks ONLY a positively-identified dismiss control
-    (consent controls gated on the overlay subtype, same as find_close_control)."""
-    vl_config = getattr(agent.runtime.harness, "vl", None)
-    if vl_config is None or not getattr(vl_config, "enabled", False):
-        return False, {"rung": "vl_arbiter", "skipped": "vl_disabled"}
-    raw_max = optional_int(getattr(vl_config, "max_checks_per_worker", 2), 2)
-    max_checks = max(0, raw_max if raw_max is not None else 2)
-    if getattr(agent, "vl_check_count", 0) >= max_checks:
-        return False, {"rung": "vl_arbiter", "skipped": "vl_budget", "maxChecks": max_checks}
-
-    before_artifacts = {str(p) for p in getattr(agent, "artifacts", [])}
-    screenshot = await _invoke_browser_method(
-        agent,
-        "Page.screenshot",
-        {
-            "pageId": page_id,
-            "fullPage": False,
-            "options": {"format": "base64"},
-            "purpose": "dismiss_overlay: VL arbiter screenshot",
-        },
-        step,
-        count_progress=False,
-    )
-    interrupt = _loop_interrupt_from_result(screenshot)
-    if interrupt:
-        return False, {"rung": "vl_arbiter", "interrupt": interrupt}
-    image_path = _screenshot_saved_path(screenshot)
-    if not image_path:
-        after_new = [
-            str(p) for p in getattr(agent, "artifacts", [])
-            if str(p) not in before_artifacts
-        ]
-        image_path = after_new[-1] if after_new else ""
-    if not image_path:
-        return False, {"rung": "vl_arbiter", "skipped": "no_screenshot"}
-
-    metrics = await probe_viewport_metrics(oracle=oracle)
-    if metrics.get("status") != "done":
-        return False, {"rung": "vl_arbiter", "skipped": "viewport_unavailable"}
-    css_viewport = {"width": metrics.get("width"), "height": metrics.get("height")}
-
-    agent.vl_check_count = getattr(agent, "vl_check_count", 0) + 1
-    verdict = await visual_verify_image(
-        config=vl_config,
-        image_path=image_path,
-        expected={},
-        mode="overlay_classify",
-        question=(
-            "An automated browser action was blocked by an overlay. Find the safe"
-            " control that dismisses it."
-        ),
-    )
-    agent.logger.write(
-        "vl.overlay_classify",
-        {key: value for key, value in verdict.items() if key not in {"usage", "visible_evidence"}},
-    )
-    if verdict.get("status") != "done":
-        return False, {"rung": "vl_arbiter", "skipped": "vl_failed", "error": verdict.get("error")}
-    if verdict.get("verdict") != "dismiss_found":
-        return False, {"rung": "vl_arbiter", "skipped": "no_dismiss", "verdict": verdict.get("verdict")}
-    if verdict.get("is_consequential"):
-        return False, {
-            "rung": "vl_arbiter",
-            "skipped": "consequential_control",
-            "label": str(verdict.get("control_label") or "")[:60],
-        }
-
-    css_point = normalized_point_to_css(verdict.get("dismiss_point"), css_viewport)
-    if css_point is None:
-        return False, {"rung": "vl_arbiter", "skipped": "point_untranslatable"}
-    cx, cy = css_point
-
-    probe = await probe_occluder(oracle=oracle, x=cx, y=cy)
-    if probe.get("status") != "done":
-        return False, {"rung": "vl_arbiter", "skipped": "occluder_unavailable"}
-    stack = list(probe.get("stack") or [])
-    top = stack[0] if stack and isinstance(stack[0], dict) else {}
-    if not vl_dismiss_target_is_safe(
-        top, str(verdict.get("control_label") or ""), subtype=subtype
-    ):
-        return False, {
-            "rung": "vl_arbiter",
-            "skipped": "unsafe_point",
-            "point": [cx, cy],
-            "top": str(top.get("text") or "")[:60] if isinstance(top, dict) else "",
-        }
-
-    click_result = await _invoke_browser_method(
-        agent,
-        "Input.click",
-        {"pageId": page_id, "x": cx, "y": cy, "purpose": "dismiss_overlay: VL arbiter click"},
-        step,
-        count_progress=False,
-    )
-    interrupt = _loop_interrupt_from_result(click_result)
-    if interrupt:
-        return False, {"rung": "vl_arbiter", "point": [cx, cy], "interrupt": interrupt}
-    after = await verify_overlay_gone(oracle=oracle)
-    return bool(after.ok), {
-        "rung": "vl_arbiter",
-        "point": [cx, cy],
-        "label": str(verdict.get("control_label") or "")[:60],
-        "confidence": verdict.get("confidence"),
-        "verified": bool(after.ok),
-    }
+    """Return an explicit receipt for the unavailable visual-coordinate rung."""
+    _ = (agent, page_id, oracle, step, subtype)
+    return False, {"rung": "vl_arbiter", "skipped": "native_hit_test_unavailable"}
 
 
 async def _maybe_retry_original_action(

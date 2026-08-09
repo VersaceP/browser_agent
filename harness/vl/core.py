@@ -10,11 +10,15 @@ import json
 import mimetypes
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Optional
 
 from runtime_config import VLConfig
 from harness.utils import JsonDict
+# Single source of truth for "which challenge types may be driven, with which
+# action" — the harness solve loop imports the same table.
+from harness.vl.captcha import TYPE_ACTIONS as _TYPE_ACTIONS
 
 
 VISUAL_VERIFY_SYSTEM = (
@@ -132,14 +136,25 @@ def build_visual_verify_prompt(
             " challenge. Classify it and, ONLY for a purely visual puzzle, output"
             " an ordered solve plan so the harness can drive it.\n"
             "BE HONEST ABOUT SOLVABILITY (critical):\n"
-            "- visual_self_consistent: the answer is fully in the picture — slider"
-            " gap, pick-the-tiles grid, rotate-to-upright, click-the-target, read"
-            " the distorted text (OCR). These are solvable; give a solve_plan.\n"
+            "- visual_self_consistent: everything needed to finish is visible —"
+            " slider gap, pick-the-tiles grid, rotate-to-upright,"
+            " click-the-target, read the distorted text (OCR). These are"
+            " solvable; give a solve_plan.\n"
+            "  A plain drag track with NO puzzle image (a handle at one end of a"
+            " bar reading 'slide to verify' / '请按住滑块拖动' or similar) also"
+            " belongs here: the whole task is 'move the handle to the far end',"
+            " and it is fully determined by what you can see. Classify it"
+            " challenge_type=slider, challenge_category=visual_self_consistent,"
+            " and give the drag step. Do NOT call it behavioral_risk merely"
+            " because the site may also score the drag, and do NOT report a"
+            " missing gap as 'target not rendered' — a bare track has no gap by"
+            " design.\n"
             "- behavioral_risk: reCAPTCHA v2/v3, hCaptcha, Cloudflare Turnstile —"
-            " these score mouse trajectory / timing / fingerprint / entropy, NOT a"
-            " visual answer. You CANNOT solve these. Set challenge_category="
-            "behavioral_risk, verdict=unsolvable, and solve_plan=[] (empty). Do not"
-            " guess a plan — wrong attempts escalate difficulty or trigger bans.\n"
+            " these score mouse trajectory / timing / fingerprint / entropy and"
+            " expose NO visible task to complete. You CANNOT solve these. Set"
+            " challenge_category=behavioral_risk, verdict=unsolvable, and"
+            " solve_plan=[] (empty). Do not guess a plan — wrong attempts"
+            " escalate difficulty or trigger bans.\n"
             "- unknown / not a challenge: set solve_plan=[] and the matching verdict.\n"
             f"question: {question or '(none)'}\n"
             f"expected: {json.dumps(expected or {}, ensure_ascii=False, default=str)}\n\n"
@@ -154,6 +169,9 @@ def build_visual_verify_prompt(
             "- solve_plan: array of steps (NON-EMPTY only for visual_self_consistent)."
             " Each step is one of:\n"
             "    slider:       {action:'drag', from:{x,y}, dx:number, dy:number}\n"
+            "                  (from = the handle's CENTER; dx = how far it must"
+            " travel. For a bare track that is the full remaining width of the"
+            " track, not a guess.)\n"
             "    rotate:       {action:'drag_arc', from:{x,y}, to:{x,y}}\n"
             "    grid:         {action:'click', at:{x,y}, label:string}\n"
             "    click_target: {action:'click', at:{x,y}, label:string}\n"
@@ -216,6 +234,17 @@ async def visual_verify_image(
     )
 
     provider = (config.provider or "openai").strip().lower()
+    started = time.monotonic()
+    timeout_seconds = (
+        float(getattr(config, "captcha_solve_timeout_seconds", 150.0) or 150.0)
+        if mode == "captcha_solve"
+        else float(config.default_timeout_seconds)
+    )
+    role_extra_params = (
+        getattr(config, "captcha_solve_extra_params", {}) or {}
+        if mode == "captcha_solve"
+        else {}
+    )
     try:
         if provider == "openai":
             raw_text, usage = await _call_openai_compatible(
@@ -223,6 +252,8 @@ async def visual_verify_image(
                 image_b64=image_b64,
                 mime_type=mime_type,
                 prompt=prompt,
+                timeout_seconds=timeout_seconds,
+                role_extra_params=role_extra_params,
             )
         elif provider == "anthropic":
             raw_text, usage = await _call_anthropic_compatible(
@@ -230,6 +261,8 @@ async def visual_verify_image(
                 image_b64=image_b64,
                 mime_type=mime_type,
                 prompt=prompt,
+                timeout_seconds=timeout_seconds,
+                role_extra_params=role_extra_params,
             )
         else:
             return {
@@ -238,9 +271,14 @@ async def visual_verify_image(
                 "provider": config.provider,
             }
     except Exception as exc:
+        error_type = _vl_provider_error_type(exc)
+        error_text = str(exc).strip() or error_type
         return {
             "status": "failed",
-            "error": str(exc),
+            "error": error_text,
+            "errorType": error_type,
+            "elapsedMs": int((time.monotonic() - started) * 1000),
+            "timeoutSeconds": timeout_seconds,
             "provider": provider,
             "model": config.model_id,
         }
@@ -380,6 +418,7 @@ _CAPTCHA_TYPES = {"slider", "grid", "rotate", "click_target", "text_ocr",
                   "behavioral", "hybrid", "unknown"}
 _CAPTCHA_CATEGORIES = {"visual_self_consistent", "behavioral_risk", "unknown"}
 _SOLVE_ACTIONS = {"drag", "drag_arc", "click", "type"}
+_AUTO_SOLVABLE_TYPES = frozenset(_TYPE_ACTIONS)
 
 
 def _norm_point(raw: Any) -> Optional[JsonDict]:
@@ -534,6 +573,29 @@ def _finalize_captcha_solve(parsed: JsonDict, usage: JsonDict) -> JsonDict:
         solve_plan = []
         if verdict == "solvable":
             verdict = "unsolvable"
+    # Type allow-list, independent of the category the model chose: `hybrid`
+    # (part visual, part behavioral scoring) and `behavioral`/`unknown` are never
+    # driven, even when the model also labels them visual_self_consistent.
+    elif ctype not in _AUTO_SOLVABLE_TYPES:
+        if solve_plan:
+            short_circuit_reason = (
+                f"challenge_type={ctype} is not auto-solvable; plan discarded"
+            )
+        solve_plan = []
+        if verdict == "solvable":
+            verdict = "unsolvable"
+    # Type/action consistency: a `slider` verdict carrying grid clicks means the
+    # model contradicted itself, and a self-contradicting classification is not
+    # something to act on.
+    elif solve_plan and any(
+        step.get("action") not in _TYPE_ACTIONS[ctype] for step in solve_plan
+    ):
+        short_circuit_reason = (
+            f"solve plan actions do not match challenge_type={ctype}; plan discarded"
+        )
+        solve_plan = []
+        if verdict == "solvable":
+            verdict = "uncertain"
     # A 'solvable' verdict with nothing to do is not actionable.
     elif verdict == "solvable" and not solve_plan:
         verdict = "uncertain"
@@ -565,6 +627,8 @@ async def _call_openai_compatible(
     image_b64: str,
     mime_type: str,
     prompt: str,
+    timeout_seconds: float,
+    role_extra_params: JsonDict,
 ) -> tuple[str, JsonDict]:
     try:
         from openai import AsyncOpenAI
@@ -574,7 +638,14 @@ async def _call_openai_compatible(
     api_key = config.api_key or os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("VL OpenAI-compatible api_key is missing")
-    client = AsyncOpenAI(api_key=api_key, base_url=config.base_url)
+    # Disable the SDK's hidden retry loop: otherwise a 429/5xx can consume the
+    # whole caller timeout and be misreported as a model timeout.
+    client = AsyncOpenAI(
+        api_key=api_key,
+        base_url=config.base_url,
+        max_retries=0,
+        timeout=timeout_seconds,
+    )
     params: JsonDict = {
         "model": config.model_id,
         "messages": [
@@ -596,10 +667,8 @@ async def _call_openai_compatible(
         "max_tokens": 800,
     }
     params.update(config.extra_params or {})
-    response = await asyncio.wait_for(
-        client.chat.completions.create(**params),
-        timeout=config.default_timeout_seconds,
-    )
+    params.update(role_extra_params or {})
+    response = await client.chat.completions.create(**params)
     text = response.choices[0].message.content or ""
     usage = getattr(response, "usage", None)
     return text, {
@@ -616,6 +685,8 @@ async def _call_anthropic_compatible(
     image_b64: str,
     mime_type: str,
     prompt: str,
+    timeout_seconds: float,
+    role_extra_params: JsonDict,
 ) -> tuple[str, JsonDict]:
     try:
         from anthropic import AsyncAnthropic
@@ -625,31 +696,37 @@ async def _call_anthropic_compatible(
     api_key = config.api_key or os.getenv("ANTHROPIC_AUTH_TOKEN")
     if not api_key:
         raise RuntimeError("VL Anthropic-compatible api_key is missing")
-    client = AsyncAnthropic(api_key=api_key, base_url=config.base_url)
-    response = await asyncio.wait_for(
-        client.messages.create(
-            model=config.model_id,
-            system=VISUAL_VERIFY_SYSTEM,
-            max_tokens=int((config.extra_params or {}).get("max_tokens", 800)),
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": mime_type,
-                                "data": image_b64,
-                            },
-                        },
-                    ],
-                }
-            ],
-        ),
-        timeout=config.default_timeout_seconds,
+    client = AsyncAnthropic(
+        api_key=api_key,
+        base_url=config.base_url,
+        max_retries=0,
+        timeout=timeout_seconds,
     )
+    params: JsonDict = {
+        "model": config.model_id,
+        "system": VISUAL_VERIFY_SYSTEM,
+        "max_tokens": int((config.extra_params or {}).get("max_tokens", 800)),
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": mime_type,
+                            "data": image_b64,
+                        },
+                    },
+                ],
+            }
+        ],
+    }
+    # Symmetric with the OpenAI-compatible path, but still role-scoped: these
+    # parameters are never present for an ordinary visual_verify call.
+    params.update(role_extra_params or {})
+    response = await client.messages.create(**params)
     text = ""
     for block in response.content:
         if getattr(block, "type", None) == "text":
@@ -661,6 +738,21 @@ async def _call_anthropic_compatible(
         "input_tokens": int(getattr(usage, "input_tokens", 0) or 0) if usage else 0,
         "output_tokens": int(getattr(usage, "output_tokens", 0) or 0) if usage else 0,
     }
+
+
+def _vl_provider_error_type(exc: BaseException) -> str:
+    """Stable provider-failure taxonomy; never turn transport into semantics."""
+
+    name = type(exc).__name__.lower()
+    text = str(exc or "").lower()
+    status = getattr(exc, "status_code", None)
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or "timeout" in name:
+        return "model_timeout"
+    if status == 429 or "ratelimit" in name or "rate limit" in text:
+        return "model_rate_limited"
+    if isinstance(status, int) and status >= 500:
+        return "model_upstream_error"
+    return "model_transport_error"
 
 
 def _parse_json_object(text: str) -> Optional[JsonDict]:

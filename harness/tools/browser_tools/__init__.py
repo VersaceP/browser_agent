@@ -5,6 +5,7 @@ harness.tools.browser_tools - BrowserAgent tool schemas and dispatch factory.
 import asyncio
 import base64
 import copy
+import hashlib
 import re
 import sys
 import time
@@ -18,9 +19,15 @@ from urllib.parse import urlparse
 
 from abcp_client import ABCPTransportError
 from harness.challenge_detector import (
+    HIGH_CONFIDENCE_CHALLENGE_KEYWORDS,
     ChallengeTracker,
+    detect_structural_challenge,
+    detect_structural_challenge_from_lines,
     extract_page_id,
     is_lingering_loading_title,
+)
+from harness.content_completeness import (
+    ContentCompletenessTracker,
 )
 from harness.diagnostics.error_classification import attach_error_classification
 from harness.extraction_artifacts import (
@@ -28,6 +35,14 @@ from harness.extraction_artifacts import (
     save_extraction_artifact,
     validate_extraction_rows,
 )
+from harness.artifact_evidence import detect_blocker_data_rows
+from harness.call_outcome import (
+    auto_hitl_is_actionable,
+    classify_call_outcome,
+    evaluate_grant,
+    page_state_evidence_ok,
+)
+from harness.fleet_runtime import FleetClickGateTimeout
 from harness.hitl import wait_for_hitl_resume
 from harness.lifecycle import LifecycleContext, lifecycle_for
 from harness.local_fs import local_fs_read, local_fs_search
@@ -41,11 +56,15 @@ from harness.observation.overlay_actions import (
     visible_layers_occluded,
     vl_dismiss_target_is_safe,
 )
-from harness.observation.overlay_detector import detect_overlay_from_result
+from harness.observation.overlay_detector import (
+    detect_overlay_from_result,
+    title_looks_like_auth_page,
+)
 from harness.observation.semantic_index import discover_selector_candidates
 from harness.observation.page_lifecycle import PageLifecycleTracker
 from harness.observation.event_observer import unwrap_notification
 from harness.observation.verifiers import (
+    build_collection_oracle,
     build_read_only_oracle,
     collect_rows,
     probe_occluder,
@@ -55,11 +74,20 @@ from harness.observation.verifiers import (
     verify_overlay_gone,
 )
 from harness.offload import offload_large_tool_result
-from harness.progress import extraction_artifact_count
+from harness.progress import NO_ARTIFACT_DIAGNOSTIC_TOOLS, extraction_artifact_count
 from harness.pacing import wait_between_rows
 from harness.render_recovery import build_render_recovery_runner
-from harness.runtime_evaluation import RuntimeEvaluationService
-from harness.task_control import phase_prior_artifact_paths, validate_worker_artifacts
+from harness.screenshot_policy import normalize_screenshot_output_params
+from harness.runtime_evaluation import (
+    MAIN_WORLD_REQUIRED_PREFIX,
+    RuntimeEvaluationService,
+    runtime_last_resort_evidence,
+)
+from harness.task_control import (
+    phase_prior_artifact_paths,
+    validate_worker_artifacts,
+)
+from harness.task_types import resolve_task_type_fail_closed
 from harness.tool_policy import (
     disabled_reason_for_method,
     hidden_harness_tools_for_task_type,
@@ -74,6 +102,10 @@ from harness.tools.parsers import (
 )
 from harness.tools.registry import ToolContext, ToolRegistry
 from harness.utils import JsonDict, exception_payload, optional_int, trim_large_strings
+from harness.workflow_runtime import (
+    workflow_execution_disabled_result,
+    workflow_execution_enabled,
+)
 from .schemas import EVAL_JS_REASON_KINDS, _browser_input_schemas
 from .axtree_state import (
     AXTREE_INVALIDATING_METHODS,
@@ -124,6 +156,94 @@ def _prepare_runtime_evaluation(
     return RuntimeEvaluationService(
         getattr(agent, "method_schemas", {})
     ).prepare(params, policy, origin=origin)
+
+
+# Which explicit provenance declarations each method accepts. A landing page
+# opened by the SITE has no ABCP opener relation the harness may trust, and
+# guessing one from Page.list ordering is the same weak attribution this
+# architecture removed from the click gate. The model states the link instead,
+# on the first call it makes against the page it claimed.
+_NAVIGATION_CONTEXT_KINDS = {
+    "Page.create": ("route_recovery_new_page",),
+    "Page.getState": ("route_recovery_claimed_page",),
+}
+
+
+def _prepare_navigation_context(
+    agent: Any,
+    method: str,
+    raw: Any,
+) -> Tuple[JsonDict, Optional[JsonDict]]:
+    """Validate model-supplied Page.create provenance without forwarding it.
+
+    ABCP Page.create exposes no opener/source relation.  This sideband is
+    accepted only when the named source page belongs to the worker and the
+    completeness tracker has already classified it as an unresolved recovery
+    candidate.  That makes the exemption causal and fail-closed rather than a
+    "most recently used page" guess.
+    """
+    if raw is None:
+        return {}, None
+    if not isinstance(raw, dict):
+        return {}, {
+            "status": "invalid_navigation_context",
+            "error": "navigation_context must be an object",
+            "tool_was_executed": False,
+        }
+    kind = str(raw.get("kind") or "").strip()
+    source_page_id = str(raw.get("sourcePageId") or "").strip()
+    allowed_kinds = _NAVIGATION_CONTEXT_KINDS.get(method, ())
+    if not allowed_kinds:
+        return {}, {
+            "status": "invalid_navigation_context",
+            "error": (
+                "navigation_context is supported only for Page.create and"
+                " Page.getState"
+            ),
+            "tool_was_executed": False,
+        }
+    if kind not in allowed_kinds or not source_page_id:
+        return {}, {
+            "status": "invalid_navigation_context",
+            "error": (
+                f"navigation_context on {method} requires kind in"
+                f" {sorted(allowed_kinds)} and a non-empty sourcePageId"
+            ),
+            "tool_was_executed": False,
+        }
+    allowed = getattr(agent, "allowed_page_ids", set())
+    if source_page_id not in allowed:
+        return {}, {
+            "status": "invalid_navigation_context",
+            "error": "navigation_context.sourcePageId is not owned by this worker",
+            "sourcePageId": source_page_id,
+            "tool_was_executed": False,
+        }
+    tracker = getattr(agent, "content_completeness_tracker", None)
+    if (
+        tracker is None
+        or not getattr(tracker, "enabled", False)
+        or not hasattr(tracker, "can_designate_recovery_source")
+        or not tracker.can_designate_recovery_source(source_page_id)
+    ):
+        return {}, {
+            "status": "invalid_navigation_context",
+            "error": (
+                "sourcePageId is not a tracker-confirmed unresolved"
+                " route-recovery source"
+            ),
+            "sourcePageId": source_page_id,
+            "tool_was_executed": False,
+            "next_instruction": (
+                "Use Page.getState plus DOM evidence on the source page first."
+                " Supply navigation_context only after contentCompleteness"
+                " reports materialization_required or route_recovery_required."
+            ),
+        }
+    return {
+        "kind": kind,
+        "sourcePageId": source_page_id,
+    }, None
 
 
 def _lifecycle_page_id(agent: Any, params: Any) -> str:
@@ -213,7 +333,13 @@ async def _page_lifecycle_guard_before(
                 " Page.getState."
             ),
         }
-    lifecycle_recovery_methods = {"Page.getState", "Page.navigate", "Page.close"}
+    lifecycle_recovery_methods = {
+        "Page.getState",
+        "Page.navigate",
+        "Page.reload",
+        "Page.go",
+        "Page.close",
+    }
     # Download controls are mutually composable (pause -> resume/cancel). They
     # may dirty page state for later DOM work, but must not deadlock each other
     # behind that deferred resynchronization obligation.
@@ -449,7 +575,14 @@ async def execute_browser_tool(agent: Any, tool_call: JsonDict, step: int) -> Tu
     result = await action.handler(ctx)
     if action.trace_type:
         _observe_progress_after(agent, name, result)
-        agent.trace.append({"type": action.trace_type, "result": result})
+        trace_entry: JsonDict = {"type": action.trace_type, "result": result}
+        if name == "collect_items":
+            from harness.fast_path import trace_params_for_fast_path
+
+            stable_params = trace_params_for_fast_path(name, tool_input)
+            if stable_params:
+                trace_entry["params"] = stable_params
+        agent.trace.append(trace_entry)
     return result, False
 
 
@@ -488,9 +621,12 @@ async def _browser_call(ctx: ToolContext) -> JsonDict:
     contract_check=True,
 )
 async def _browser_execute_selected_skill(ctx: ToolContext) -> JsonDict:
+    if not workflow_execution_enabled(ctx.agent):
+        return workflow_execution_disabled_result(source="execute_selected_skill")
     from harness.skill.contract import skill_selection_declined
     from harness.skill.dispatch import (
         _align_row_fields_to_expected,
+        auth_fence_outcome,
         _expected_fields_of,
         _provenance_evidence_requirements,
         _run_with_transient_retry,
@@ -623,6 +759,24 @@ async def _browser_execute_selected_skill(ctx: ToolContext) -> JsonDict:
             variables=variables,
             event_prefix="skill.selected_workflow",
         )
+        auth_fence = auth_fence_outcome(run_result)
+        if auth_fence is not None:
+            result = {
+                "status": "partial" if output_rows else "workflow_auth_fenced",
+                "skill": skill.skill_id,
+                "completedRows": len(output_rows),
+                "failedRow": index,
+                "rows": output_rows,
+                "runs": runs,
+                "authFence": auth_fence,
+                "next_instruction": (
+                    "The shared authentication generation changed or its"
+                    " barrier closed. Preserve completed rows, re-perceive the"
+                    " current page, and retry only the failed row."
+                ),
+            }
+            _record_selected_skill_tool_trace(agent, result)
+            return result
         hitl = classify_run_for_hitl(run_result, observed_signal)
         verdict = check_success_contract(skill, run_result)
         mismatch = page_binding_mismatch(skill, run_result, variables)
@@ -702,6 +856,8 @@ async def _browser_execute_selected_skill(ctx: ToolContext) -> JsonDict:
     contract_check=True,
 )
 async def _browser_execute_browser_workflow(ctx: ToolContext) -> JsonDict:
+    if not workflow_execution_enabled(ctx.agent):
+        return workflow_execution_disabled_result(source="execute_browser_workflow")
     params = {
         "description": str(ctx.tool_input.get("description") or "Temporary browser workflow"),
         "variables": dict(ctx.tool_input.get("variables") or {}),
@@ -751,60 +907,12 @@ def _record_selected_skill_tool_trace(agent: Any, result: JsonDict) -> None:
 
 
 @BROWSER_TOOLS.register(
-    name="extract_dom_records",
-    description=(
-        "Extract a repeated DOM collection into structured rows without hand-written JS."
-        " Use this for lists, tables, cards, and link collections instead of parsing"
-        " large AXTree text. PREFER this over eval_js_json whenever the extraction is"
-        " expressible as one selector + field specs — it adds matchedCount diagnostics"
-        " and record_name persistence for free."
-        " Internally wraps Runtime.evaluate in an explicit return IIFE."
-        " Field specs: text, href, src, imgAlt, ariaLabel, role, rect, ancestorText,"
-        " or attr:<name>. The src spec auto-resolves lazy images (falls back to"
-        " data-src/data-original/srcset and absolutizes the URL) so blank 1x1"
-        " placeholders are skipped; for images not yet in the DOM, scroll or use"
-        " collect_items first to mount them."
-    ),
-    input_schema=_browser_schema_for("extract_dom_records"),
-    contract_check=True,
-    trace_type="extract_dom_records",
-)
-async def _browser_extract_dom_records(ctx: ToolContext) -> JsonDict:
-    return await _extract_dom_records(ctx.agent, ctx.tool_input, ctx.step)
-
-
-@BROWSER_TOOLS.register(
-    name="eval_js_json",
-    description=(
-        "Evaluate a JavaScript expression and force a JSON return through a"
-        " harness wrapper. Last-resort fallback for structured data only"
-        " when DOM.getAXTree + DOM.getText/DOM.getAttribute cannot express"
-        " the needed relationship. If the data is a flat repeated collection"
-        " reachable by ONE CSS selector, use extract_dom_records instead;"
-        " reserve this for cross-node/cross-section logic (heading-scoped"
-        " aggregation, computed relations). For statement bodies, pass an IIFE"
-        " expression such as (() => { const rows = []; return rows; })()."
-    ),
-    input_schema=_browser_schema_for("eval_js_json"),
-    contract_check=True,
-    trace_type="eval_js_json",
-)
-async def _browser_eval_js_json(ctx: ToolContext) -> JsonDict:
-    result = await _eval_js_json_tool(ctx.agent, ctx.tool_input, ctx.step)
-    return await _maybe_auto_hitl_for_challenge(
-        ctx.agent,
-        "eval_js_json",
-        {"pageId": ctx.tool_input.get("pageId")},
-        result,
-        ctx.step,
-    )
-
-
-@BROWSER_TOOLS.register(
     name="navigate_verified",
     description=(
-        "Navigate to a URL, poll Page.getState, and verify actual URL/title."
-        " Prefer this over raw Page.navigate when URL correctness matters."
+        "Navigate to a URL once, follow redirects, and report the actual"
+        " URL/title. Exactly one Page.navigate is dispatched per call: an unmet"
+        " expectation returns navigation_arrived_expectation_mismatch with the"
+        " page that did arrive, never a second request."
     ),
     input_schema=_browser_schema_for("navigate_verified"),
     contract_check=True,
@@ -815,6 +923,9 @@ async def _browser_navigate_verified(ctx: ToolContext) -> JsonDict:
     result = await _navigate_verified(ctx.agent, ctx.tool_input, ctx.step)
     if result.get("status") not in {
         "done",
+        # Nothing was dispatched and no page was touched, so there is no new
+        # page state for challenge adjudication to read.
+        "expectation_pattern_invalid",
         "blocked_by_challenge",
         "hitl_required",
         "hitl_timeout",
@@ -836,11 +947,13 @@ async def _browser_navigate_verified(ctx: ToolContext) -> JsonDict:
     description=(
         "Dismiss an overlay/modal/cookie-banner blocking a target action. Runs"
         " the dismiss ladder internally (find close control -> click -> verify"
-        " -> Escape -> verify -> verified backdrop click -> verify) and reports"
+        " -> Escape -> verify) and reports"
         " a structured result. Auth/login and paywall overlays are never"
         " auto-dismissed (returns status=blocked). Optionally retries the"
         " original action after the overlay is gone, but never a consequential"
-        " one (submit/pay/login -> status=dismissed_pending_action)."
+        " one (submit/pay/login -> status=dismissed_pending_action). Coordinate"
+        " backdrop/VL clicks are unavailable until ABCP exposes an independent"
+        " native point hit-test."
     ),
     input_schema=_browser_schema_for("dismiss_overlay"),
     contract_check=True,
@@ -853,21 +966,42 @@ async def _browser_dismiss_overlay(ctx: ToolContext) -> JsonDict:
 @BROWSER_TOOLS.register(
     name="collect_items",
     description=(
-        "Collect a repeated list/card/row collection that grows by scrolling or"
-        " a load-more button, without burning a model step per round. Harvests"
-        " rows every round and dedups by a stable key, so lazy-loaded AND"
-        " virtualized lists (rows recycled out of the DOM) are fully captured."
-        " Stops on target count, stagnation, or the round budget, then persists"
-        " the rows via record_extraction. Use a freshly created tab (a reused"
-        " tab can cap some sites' lazy-loader). Not for filter/search/sort,"
-        " which change the data set."
+        "Collect one single-level homogeneous list/card/row collection that"
+        " grows through ONE scroll container or ONE load-more control, without"
+        " burning a model step per round. Harvests rows every round and dedups"
+        " by a stable key, so lazy-loaded and virtualized rows can be retained."
+        " On an unknown site, first probe DOM/SemanticTree to identify the"
+        " repeated-item selector and the actual scroll container/load-more"
+        " control; do not guess them."
+        " Use this only when the collection cannot be read from one DOM snapshot;"
+        " otherwise enumerate canonical ids and batch DOM.getText/DOM.getAttribute."
+        " Persists through record_extraction"
+        " only after target_reached or mechanically evidenced exhaustion; stalled"
+        " or blocked partial rows are not persisted. When content completeness is"
+        " declared, pass an explicit regionId or a matching collectionField."
+        " Use a freshly created tab (a reused tab can cap some sites'"
+        " lazy-loader). Nested lists, multiple scroll layers, next-page"
+        " pagination, filter/search/sort, and dependent per-row expansion are"
+        " outside this preset's complete coverage; decompose/probe them in the"
+        " BrowserAgent slow path."
     ),
     input_schema=_browser_schema_for("collect_items"),
     contract_check=True,
     trace_type="collect_items",
 )
 async def _browser_collect_items(ctx: ToolContext) -> JsonDict:
-    return await _collect_items(ctx.agent, ctx.tool_input, ctx.step)
+    # collect_items needs the declared min_records before it starts its bounded
+    # loop.  Do not rely on an earlier model-facing DOM call to have initialized
+    # the tracker incidentally.
+    _ensure_content_completeness_tracker(ctx.agent)
+    result = await _collect_items(ctx.agent, ctx.tool_input, ctx.step)
+    return _observe_content_completeness_after(
+        ctx.agent,
+        "collect_items",
+        ctx.tool_input,
+        result,
+        ctx.step,
+    )
 
 
 @BROWSER_TOOLS.register(
@@ -921,16 +1055,20 @@ async def _browser_visual_verify(ctx: ToolContext) -> JsonDict:
 )
 async def _browser_final_answer(ctx: ToolContext) -> JsonDict:
     answer = str(ctx.tool_input.get("answer", "")).strip()
-    pending_rejection = _pending_ephemeral_final_rejection(
-        ctx.agent, str(ctx.tool_input.get("status") or "done")
+    rejection = _final_answer_content_completeness_rejection(
+        ctx.agent,
+        answer,
+        status=str(ctx.tool_input.get("status") or "done"),
     )
-    if pending_rejection is not None:
-        ctx.agent.logger.write("final_answer.ephemeral_rows_rejected", pending_rejection)
+    if rejection is not None:
+        ctx.agent.logger.write(
+            "final_answer.content_completeness_rejected", rejection
+        )
         ctx.agent.trace.append({
             "type": "final_answer_rejected",
-            "result": pending_rejection,
+            "result": rejection,
         })
-        return pending_rejection
+        return rejection
     rejection = _final_answer_reality_check_rejection(ctx.agent, answer)
     if rejection is not None:
         ctx.agent.logger.write("final_answer.reality_check_rejected", {
@@ -972,310 +1110,7 @@ async def _browser_record_extraction(ctx: ToolContext) -> JsonDict:
     result = _record_extraction(ctx.agent, ctx.tool_input)
     if _record_extraction_persisted(result):
         ctx.agent.pending_unrecorded_extraction = None
-        _consume_pending_ephemeral_rows(ctx.agent, ctx.tool_input.get("rows"))
-        result = await _maybe_run_ephemeral_batch_after_first_row(
-            ctx.agent, ctx.tool_input, result, step=ctx.step
-        )
     return result
-
-
-def _consume_pending_ephemeral_rows(agent: Any, observed_rows: Any) -> None:
-    pending = getattr(agent, "pending_ephemeral_rows", None)
-    if not isinstance(pending, dict):
-        return
-    planned = [
-        dict(row) for row in (pending.get("rows") or [])
-        if isinstance(row, dict)
-    ]
-    observed = [
-        dict(row) for row in (observed_rows or [])
-        if isinstance(row, dict)
-    ] if isinstance(observed_rows, list) else []
-    if not observed:
-        return
-    from harness.skill.ephemeral import canonical_page_target
-
-    preferred = str(pending.get("bindingVariable") or "")
-    completed_urls = {
-        canonical_page_target(row, preferred_field=preferred)
-        for row in observed
-    }
-    completed_urls.discard("")
-    if not completed_urls:
-        return
-    remaining = [
-        row for row in planned
-        if canonical_page_target(row, preferred_field=preferred) not in completed_urls
-    ]
-    if remaining:
-        pending["rows"] = remaining
-        agent.pending_ephemeral_rows = pending
-    else:
-        agent.pending_ephemeral_rows = None
-
-
-def _pending_ephemeral_final_rejection(
-    agent: Any,
-    final_status: str,
-) -> Optional[JsonDict]:
-    from harness.skill.ephemeral import pending_ephemeral_final_rejection
-
-    return pending_ephemeral_final_rejection(agent, final_status)
-
-
-def _attach_ephemeral_fallback(
-    agent: Any,
-    record_result: JsonDict,
-    report: JsonDict,
-    *,
-    remaining_rows: List[JsonDict],
-    binding_variable: str,
-    reason: str,
-) -> JsonDict:
-    remaining = [dict(row) for row in remaining_rows if isinstance(row, dict)]
-    if remaining:
-        agent.pending_ephemeral_rows = {
-            "rows": remaining,
-            "bindingVariable": binding_variable or None,
-            "reason": reason,
-        }
-    fallback = dict(report.get("fallback") or {})
-    fallback.update({
-        "reason": reason,
-        "remainingRowCount": len(remaining),
-        "remainingRows": remaining,
-    })
-    report["fallback"] = fallback
-    record_result["ephemeralWorkflow"] = report
-    record_result["requiresModelReplan"] = bool(remaining)
-    if remaining:
-        record_result["next_instruction"] = (
-            "Ephemeral workflow reuse stopped. Continue every fallback.remainingRows"
-            " item through the ordinary browser slow path, then call"
-            " record_extraction with a combined dataset. Do not finalize done"
-            " while pending rows remain."
-        )
-    return record_result
-
-
-def _persist_ephemeral_partial(
-    agent: Any,
-    record_input: JsonDict,
-    rows: List[JsonDict],
-    *,
-    reason: str,
-) -> Optional[JsonDict]:
-    if len(rows) <= 1:
-        return None
-    return _record_extraction(agent, {
-        "name": str(record_input.get("name") or "ephemeral_batch"),
-        "rows": rows,
-        "schema": {"source": "ephemeral_workflow_partial", "reason": reason},
-        "description": (
-            "Rows preserved before temporary workflow fallback; ordinary slow"
-            " path must complete and re-record the combined dataset."
-        ),
-    })
-
-
-async def _maybe_run_ephemeral_batch_after_first_row(
-    agent: Any,
-    record_input: JsonDict,
-    record_result: JsonDict,
-    *,
-    step: int,
-) -> JsonDict:
-    if bool(getattr(agent, "_ephemeral_workflow_attempted", False)):
-        return record_result
-    if not bool(getattr(agent.runtime.harness, "ephemeral_workflow_enabled", False)):
-        return record_result
-    contract = getattr(agent, "worker_contract", None)
-    contract = contract if isinstance(contract, dict) else {}
-    batch_rows = contract.get("batch_rows")
-    batch_rows = [dict(row) for row in batch_rows if isinstance(row, dict)] if isinstance(batch_rows, list) else []
-    observed_rows = record_input.get("rows")
-    observed_rows = [dict(row) for row in observed_rows if isinstance(row, dict)] if isinstance(observed_rows, list) else []
-    # One validated probe row + at least two remaining rows is the minimum at
-    # which compilation/canary can save work. Multi-row artifacts are already a
-    # batch result and must not trigger this path.
-    if len(observed_rows) != 1 or len(batch_rows) < 3:
-        return record_result
-    expected = contract.get("expected_artifact")
-    expected_fields = (
-        [str(field) for field in expected.get("fields") or [] if str(field)]
-        if isinstance(expected, dict) else []
-    )
-    if any(observed_rows[0].get(field) in (None, "") for field in expected_fields):
-        return record_result
-    page_id = str(getattr(agent, "axtree_page_id", "") or "").strip()
-    if not page_id:
-        return record_result
-
-    agent._ephemeral_workflow_attempted = True
-    from harness.skill.ephemeral import (
-        canonical_page_target,
-        compile_ephemeral_workflow,
-        execute_ephemeral_rows,
-    )
-    workflow, compile_report = compile_ephemeral_workflow(
-        list(getattr(agent, "trace", []) or []),
-        capability_methods=getattr(agent, "capability_methods", set()),
-        task_type=str(contract.get("task_type") or "general"),
-    )
-    if workflow is None:
-        report = {**compile_report, "executionStatus": "fallback_required"}
-        return _attach_ephemeral_fallback(
-            agent,
-            record_result,
-            report,
-            remaining_rows=batch_rows[1:],
-            binding_variable="",
-            reason=str(compile_report.get("reason") or "workflow_not_compilable"),
-        )
-    binding_variable = str(workflow.get("pageBindingVariable") or "").strip()
-    first_url = canonical_page_target(
-        observed_rows[0], preferred_field=binding_variable
-    )
-    planned_first_url = canonical_page_target(
-        batch_rows[0], preferred_field=binding_variable
-    )
-    if not first_url or not planned_first_url or first_url != planned_first_url:
-        report = {
-            **compile_report,
-            "executionStatus": "fallback_required",
-            "reason": "first_row_page_binding_unknown_or_mismatch",
-            "bindingVariable": binding_variable or None,
-        }
-        return _attach_ephemeral_fallback(
-            agent,
-            record_result,
-            report,
-            remaining_rows=batch_rows[1:],
-            binding_variable=binding_variable,
-            reason="first_row_page_binding_unknown_or_mismatch",
-        )
-
-    async def execute_workflow(params: JsonDict) -> JsonDict:
-        result = await _invoke_browser_method(
-            agent,
-            "Workflow.execute",
-            params,
-            step,
-            count_progress=False,
-        )
-        if not _invoke_result_failed(result):
-            # Workflow inner calls still emit lifecycle notifications, but are
-            # opaque to the outer dispatcher. The compiler/policy guarantees
-            # Page.getState + DOM.getAXTree after navigation, so reconcile the
-            # tracker from the workflow's final extracted state instead of
-            # forcing two redundant RPCs per row.
-            tracker = getattr(agent, "page_lifecycle", None)
-            if isinstance(tracker, PageLifecycleTracker):
-                variables = _response_data(result).get("variables")
-                variables = variables if isinstance(variables, dict) else {}
-                tracker.observe_state_response(page_id, {
-                    "data": {"status": variables.get("pageStatus") or "idle"}
-                })
-                tracker.observe_ax_refresh(page_id)
-        return result
-
-    batch_result = await execute_ephemeral_rows(
-        agent,
-        workflow,
-        batch_rows[1:],
-        worker_contract=contract,
-        page_id=page_id,
-        fleet_id=str(getattr(agent, "assigned_fleet_id", "") or ""),
-        execute_workflow=execute_workflow,
-    )
-    if batch_result.get("workflowAttempted"):
-        record_result["browserStateMayHaveChanged"] = True
-    report = {
-        **compile_report,
-        "executionStatus": batch_result.get("status"),
-        "canaryPassed": bool(batch_result.get("canaryPassed")),
-        "completedRows": batch_result.get("completedRows", 0),
-        "runs": batch_result.get("runs") or [],
-        "persistedToRegistry": False,
-    }
-    if batch_result.get("status") != "done":
-        completed_count = int(batch_result.get("completedRows") or 0)
-        preserved_rows = [
-            observed_rows[0],
-            *list(batch_result.get("rows") or []),
-        ]
-        partial_artifact = _persist_ephemeral_partial(
-            agent,
-            record_input,
-            preserved_rows,
-            reason=str(batch_result.get("reason") or batch_result.get("status") or "partial"),
-        )
-        if partial_artifact is not None:
-            report["partialArtifact"] = partial_artifact
-        report["fallback"] = {
-            "reason": batch_result.get("reason"),
-            "nextRowOffset": 1 + completed_count,
-        }
-        return _attach_ephemeral_fallback(
-            agent,
-            record_result,
-            report,
-            remaining_rows=batch_rows[1 + completed_count:],
-            binding_variable=binding_variable,
-            reason=str(batch_result.get("reason") or batch_result.get("status") or "partial"),
-        )
-
-    combined_rows = [observed_rows[0], *list(batch_result.get("rows") or [])]
-    missing = [
-        {"row": index, "field": field}
-        for index, row in enumerate(combined_rows)
-        for field in expected_fields
-        if not isinstance(row, dict) or row.get(field) in (None, "")
-    ]
-    if missing:
-        report["executionStatus"] = "partial"
-        partial_artifact = _persist_ephemeral_partial(
-            agent,
-            record_input,
-            combined_rows,
-            reason="compiled_rows_missing_expected_fields",
-        )
-        if partial_artifact is not None:
-            report["partialArtifact"] = partial_artifact
-        report["fallback"] = {
-            "reason": "compiled_rows_missing_expected_fields",
-            "missing": missing[:20],
-        }
-        missing_indexes = sorted({int(item["row"]) for item in missing})
-        return _attach_ephemeral_fallback(
-            agent,
-            record_result,
-            report,
-            remaining_rows=[
-                batch_rows[index]
-                for index in missing_indexes
-                if 0 <= index < len(batch_rows)
-            ],
-            binding_variable=binding_variable,
-            reason="compiled_rows_missing_expected_fields",
-        )
-    merged_artifact = _record_extraction(agent, {
-        "name": str(record_input.get("name") or "ephemeral_batch"),
-        "rows": combined_rows,
-        "schema": {
-            "source": "ephemeral_workflow",
-            "canary": "second_row",
-        },
-        "description": (
-            str(record_input.get("description") or "")
-            or "First row observed by LLM; remaining rows ran through a canary-gated ephemeral workflow."
-        ),
-    })
-    report["mergedArtifact"] = merged_artifact
-    report["totalRows"] = len(combined_rows)
-    agent.pending_ephemeral_rows = None
-    record_result["ephemeralWorkflow"] = report
-    return record_result
 
 
 @BROWSER_TOOLS.register(
@@ -1389,6 +1224,44 @@ def _apply_fleet_binding(
         "assignmentReason": assignment_reason,
         "fleetInjected": False,
     }
+    pinned_page_id = str(
+        getattr(agent, "pinned_page_id", "") or ""
+    ).strip()
+    if pinned_page_id and method == "Page.create":
+        return {
+            "status": "pinned_browser_context_violation",
+            "error": (
+                "Page.create cannot replace the user-pinned existing page"
+                f" {pinned_page_id!r}."
+            ),
+            "assignedFleetId": assigned_fleet_id,
+            "pinnedPageId": pinned_page_id,
+            "tool_was_executed": False,
+            "next_instruction": (
+                "Use the pinned pageId from slot_context. If that page is no"
+                " longer usable, report pinned_page_unavailable to LeadAgent;"
+                " do not create a substitute page."
+            ),
+        }, receipt
+    if (
+        pinned_page_id
+        and method == "Page.close"
+        and str(params.get("pageId") or "").strip() == pinned_page_id
+    ):
+        return {
+            "status": "pinned_browser_context_violation",
+            "error": (
+                "Page.close cannot close the user-pinned existing page"
+                f" {pinned_page_id!r}."
+            ),
+            "assignedFleetId": assigned_fleet_id,
+            "pinnedPageId": pinned_page_id,
+            "tool_was_executed": False,
+            "next_instruction": (
+                "Leave the pinned page open and continue on that page, or"
+                " report pinned_page_unavailable if it cannot be used."
+            ),
+        }, receipt
     if method == "Fleet.create":
         return {
             "status": "fleet_create_coordinator_owned",
@@ -1484,24 +1357,11 @@ def _check_page_binding(
 
     if not _fleet_reuse_enabled(agent) or not isinstance(params, dict):
         return None
-    if method == "Page.list" and not bool(
-        getattr(agent, "page_reuse_allowed", False)
-    ):
-        return {
-            "status": "page_reuse_not_allowed",
-            "error": (
-                "Page.list is unavailable for this fresh-page assignment;"
-                " prior worker pages are intentionally hidden."
-            ),
-            "assignedFleetId": str(
-                getattr(agent, "assigned_fleet_id", "") or ""
-            ),
-            "tool_was_executed": False,
-            "next_instruction": (
-                "Create a fresh page with Page.create. Existing pages are"
-                " available only to an explicit reuse_scope=page continuation."
-            ),
-        }
+    # Page.list stays readable for every assignment: a worker that cannot see
+    # the Fleet cannot tell "my action did nothing" from "my result opened in a
+    # tab I am not allowed to look at". Visibility and usability are separate
+    # concerns — the pageId binding check below still governs what may be
+    # operated, and _filter_page_list_response marks which rows are delegated.
     page_id = str(params.get("pageId") or "").strip()
     if not page_id:
         return None
@@ -1521,25 +1381,94 @@ def _check_page_binding(
     if assigned_fleet:
         allowed_fleets.add(assigned_fleet)
     page_fleet = str(page_fleets.get(page_id) or "").strip()
-    if page_id not in allowed_pages or (
+    if page_id in allowed_pages and not (
         page_fleet and page_fleet not in allowed_fleets
     ):
-        return {
-            "status": "page_binding_violation",
-            "error": (
-                f"pageId {page_id!r} is outside this worker's"
-                " coordinator-issued page delegation."
-            ),
-            "pageId": page_id,
-            "pageFleetId": page_fleet,
-            "assignedFleetId": assigned_fleet,
-            "tool_was_executed": False,
-            "next_instruction": (
-                "Use a pageId returned by this worker's Page.create, or an"
-                " existing page explicitly supplied by reuse_scope=page."
-            ),
-        }
-    return None
+        return None
+    if _page_is_claimable(agent, page_id):
+        # This is admission only. The shared PageLeaseManager performs the
+        # authoritative atomic claim immediately before transport dispatch;
+        # mutating allowed_page_ids here would recreate a check-then-act race.
+        return None
+    manager = getattr(agent, "page_lease_manager", None)
+    worker_id = str(getattr(agent, "worker_id", "") or "").strip()
+    owner = (
+        str(manager.owner_for(page_id) or "")
+        if manager is not None and hasattr(manager, "owner_for")
+        else ""
+    )
+    quarantined = bool(
+        manager is not None
+        and hasattr(manager, "page_is_quarantined")
+        and manager.page_is_quarantined(page_id)
+    )
+    return {
+        "status": (
+            "page_quarantined"
+            if quarantined
+            else "page_busy"
+            if owner and owner != worker_id
+            else "page_binding_violation"
+        ),
+        "error": (
+            f"pageId {page_id!r} is outside this worker's Fleet or is held by"
+            " another worker."
+        ),
+        "pageId": page_id,
+        "pageFleetId": page_fleet,
+        "assignedFleetId": assigned_fleet,
+        "ownerWorkerId": owner or None,
+        "quarantined": quarantined,
+        "tool_was_executed": False,
+        "next_instruction": (
+            "Call Page.list to see this Fleet's pages; rows with"
+            " claimable=true can be used directly. Quarantined rows must not"
+            " be used. Otherwise create your own"
+            " page with Page.create."
+        ),
+    }
+
+
+def _page_is_claimable(agent: Any, page_id: str) -> bool:
+    """Whether an undelegated page may be taken over on first use.
+
+    Two conditions, both plain facts rather than inferences: the page belongs
+    to a Fleet this worker was assigned, and no other live worker holds it.
+    Cross-worker interference is the risk worth guarding; a stray site popup is
+    only a wasted step the model corrects on its own.
+    """
+
+    if not page_id:
+        return False
+    fleet_pages = getattr(agent, "fleet_page_fleet_ids", None)
+    if not isinstance(fleet_pages, dict):
+        return False
+    page_fleet = str(fleet_pages.get(page_id) or "").strip()
+    if not page_fleet:
+        return False
+    allowed_fleets = {
+        str(item).strip()
+        for item in (getattr(agent, "allowed_fleet_ids", set()) or set())
+        if str(item).strip()
+    }
+    assigned = str(getattr(agent, "assigned_fleet_id", "") or "").strip()
+    if assigned:
+        allowed_fleets.add(assigned)
+    if page_fleet not in allowed_fleets:
+        return False
+    manager = getattr(agent, "page_lease_manager", None)
+    worker_id = str(getattr(agent, "worker_id", "") or "").strip()
+    if manager is not None and hasattr(manager, "owner_for"):
+        if (
+            hasattr(manager, "page_is_quarantined")
+            and manager.page_is_quarantined(page_id)
+        ):
+            return False
+        owner = str(manager.owner_for(page_id) or "")
+        return not owner or owner == worker_id
+    # Lightweight helper users have no concurrent worker runtime. Production
+    # workers always receive the shared manager from BrowserAgentSpawner.
+    return True
 
 
 def _observe_page_binding_after(
@@ -1574,13 +1503,37 @@ def _observe_page_binding_after(
     if assigned_fleet:
         allowed_fleets.add(assigned_fleet)
 
+    addressed_page_id = str(params.get("pageId") or "").strip()
+    manager = getattr(agent, "page_lease_manager", None)
+    worker_id = str(getattr(agent, "worker_id", "") or "").strip()
+    if (
+        addressed_page_id
+        and method != "Page.close"
+        and manager is not None
+        and hasattr(manager, "owner_for")
+        and str(manager.owner_for(addressed_page_id) or "") == worker_id
+    ):
+        fleet_id = str(
+            getattr(agent, "fleet_page_fleet_ids", {}).get(addressed_page_id)
+            or assigned_fleet
+            or ""
+        ).strip()
+        if fleet_id in allowed_fleets:
+            allowed_pages.add(addressed_page_id)
+            page_fleets[addressed_page_id] = fleet_id
+
     if method in {"Page.create", "Page.list"}:
         inherited_fleet = str(params.get("fleetId") or assigned_fleet).strip()
         for page in _pages_from_value(result):
             page_id = str(page.get("pageId") or page.get("page_id") or "").strip()
-            fleet_id = str(
-                page.get("fleetId") or page.get("fleet_id") or inherited_fleet
+            row_fleet_id = str(
+                page.get("fleetId") or page.get("fleet_id") or ""
             ).strip()
+            fleet_id = (
+                row_fleet_id
+                if method == "Page.list"
+                else row_fleet_id or inherited_fleet
+            )
             if method == "Page.list" and page_id not in allowed_pages:
                 continue
             if page_id and fleet_id in allowed_fleets:
@@ -1591,33 +1544,89 @@ def _observe_page_binding_after(
         if page_id:
             allowed_pages.discard(page_id)
             page_fleets.pop(page_id, None)
+            fleet_pages = getattr(agent, "fleet_page_fleet_ids", None)
+            if isinstance(fleet_pages, dict):
+                fleet_pages.pop(page_id, None)
+
+
+def _shown_page_inventory_rows(value: Any) -> List[JsonDict]:
+    """Return the page identities actually present in a Page.list response.
+
+    This is a harness-private evidence sidecar, not an authorization decision.
+    Keep it available even when Fleet reuse is disabled: in that mode the raw
+    response is shown unchanged, so those rows still count as pages the model
+    has seen and may discharge the inventory-change notification.
+    """
+    rows: List[JsonDict] = []
+    seen = set()
+    for page in _pages_from_value(value):
+        page_id = str(page.get("pageId") or page.get("page_id") or "").strip()
+        fleet_id = str(
+            page.get("fleetId") or page.get("fleet_id") or ""
+        ).strip()
+        key = (fleet_id, page_id)
+        if not page_id or not fleet_id or key in seen:
+            continue
+        seen.add(key)
+        rows.append({"pageId": page_id, "fleetId": fleet_id})
+    return rows
 
 
 def _filter_page_list_response(
     agent: Any,
     response: Any,
 ) -> Tuple[Any, JsonDict]:
-    """Expose Page.list as a view of already delegated pages only.
+    """Annotate Page.list rows with delegation and claimability.
 
-    Page.create is the only model-visible operation that may add a new page
-    handle dynamically. An explicit continuation may use Page.list to refresh
-    its delegated pages, but must not discover or adopt other pages in the same
-    fleet. Filtering happens before result offload so hidden handles cannot leak
-    through an offloaded raw response.
+    Hiding non-delegated rows made a worker unable to observe that its own
+    submit had opened a result tab, which reads as "the action did nothing" and
+    drives pointless retries. Every row in the assigned Fleet is therefore
+    returned, tagged ``delegated`` (already this worker's) and ``claimable``
+    (usable on first touch because no other worker holds it).
+
+    This listing is also what teaches the binding guard which pages exist and
+    where: a page can only be claimed after the worker has seen it here, which
+    keeps discovery an explicit model act rather than an inference.
+
+    Rows outside the assigned Fleet remain hidden — that is a tenancy boundary,
+    not a usability one.
     """
 
     if not _fleet_reuse_enabled(agent):
-        return response, {}
+        return response, {
+            "_shownInventoryPages": _shown_page_inventory_rows(response),
+        }
     allowed_pages = {
         str(item).strip()
         for item in (getattr(agent, "allowed_page_ids", set()) or set())
         if str(item).strip()
     }
+    allowed_fleets = {
+        str(item).strip()
+        for item in (getattr(agent, "allowed_fleet_ids", set()) or set())
+        if str(item).strip()
+    }
+    assigned_fleet = str(getattr(agent, "assigned_fleet_id", "") or "").strip()
+    if assigned_fleet:
+        allowed_fleets.add(assigned_fleet)
+    manager = getattr(agent, "page_lease_manager", None)
+    worker_id = str(getattr(agent, "worker_id", "") or "").strip()
+    shown_inventory_pages: List[JsonDict] = []
+    # Remember where each visible page lives so the binding guard can decide
+    # claimability later without re-listing.
+    fleet_pages = getattr(agent, "fleet_page_fleet_ids", None)
+    if not isinstance(fleet_pages, dict):
+        fleet_pages = {}
+        agent.fleet_page_fleet_ids = fleet_pages
     hidden_count = 0
-    visible_count = 0
+    delegated_count = 0
+    claimable_count = 0
+    held_count = 0
+    quarantined_count = 0
 
     def filtered(value: Any) -> Any:
-        nonlocal hidden_count, visible_count
+        nonlocal hidden_count, delegated_count, claimable_count
+        nonlocal held_count, quarantined_count
         if isinstance(value, list):
             is_page_list = any(
                 isinstance(item, dict)
@@ -1632,11 +1641,58 @@ def _filter_page_list_response(
                     page_id = str(
                         item.get("pageId") or item.get("page_id") or ""
                     ).strip()
-                    if page_id in allowed_pages:
-                        visible_count += 1
-                        kept.append(filtered(item))
-                    else:
+                    row_fleet = str(
+                        item.get("fleetId") or item.get("fleet_id") or ""
+                    ).strip()
+                    if not page_id or not row_fleet:
                         hidden_count += 1
+                        continue
+                    if allowed_fleets and row_fleet not in allowed_fleets:
+                        hidden_count += 1
+                        continue
+                    fleet_pages[page_id] = row_fleet
+                    if manager is not None and hasattr(manager, "observe_inventory"):
+                        manager.observe_inventory(
+                            row_fleet,
+                            [page_id],
+                        )
+                    shown_inventory_pages.append({
+                        "pageId": page_id,
+                        "fleetId": row_fleet,
+                    })
+                    owner = (
+                        str(manager.owner_for(page_id) or "")
+                        if manager is not None and hasattr(manager, "owner_for")
+                        else ""
+                    )
+                    delegated = page_id in allowed_pages or bool(
+                        worker_id and owner == worker_id
+                    )
+                    quarantined = bool(
+                        manager is not None
+                        and hasattr(manager, "page_is_quarantined")
+                        and manager.page_is_quarantined(page_id)
+                    )
+                    if manager is not None and hasattr(manager, "owner_for"):
+                        claimable = not delegated and not owner and not quarantined
+                    else:
+                        claimable = not delegated and not quarantined
+                    row = filtered(item)
+                    if isinstance(row, dict):
+                        row["delegated"] = delegated
+                        row["claimable"] = claimable
+                        row["leasedByMe"] = bool(worker_id and owner == worker_id)
+                        row["busy"] = bool(owner and owner != worker_id)
+                        row["quarantined"] = quarantined
+                    if quarantined:
+                        quarantined_count += 1
+                    elif delegated:
+                        delegated_count += 1
+                    elif claimable:
+                        claimable_count += 1
+                    else:
+                        held_count += 1
+                    kept.append(row)
                 return kept
             return [filtered(item) for item in value]
         if isinstance(value, dict):
@@ -1644,23 +1700,92 @@ def _filter_page_list_response(
         return value
 
     sanitized = filtered(copy.deepcopy(response))
-    return sanitized, {
+    receipt: JsonDict = {
         "pageListFiltered": True,
-        "visiblePageCount": visible_count,
+        "delegatedPageCount": delegated_count,
+        "claimablePageCount": claimable_count,
+        "heldByOtherWorkerCount": held_count,
+        "quarantinedPageCount": quarantined_count,
         "hiddenPageCount": hidden_count,
+        # Harness-private sidecar. The caller removes it before merging the
+        # public receipt and defers discharge until all result post-processing
+        # has completed successfully.
+        "_shownInventoryPages": shown_inventory_pages,
     }
+    if claimable_count:
+        receipt["next_instruction"] = (
+            "Rows with claimable=true are free: address one by its pageId and"
+            " it becomes yours on first use. If an action of yours looked like"
+            " it did nothing, its result most likely rendered in one of these"
+            " tabs rather than in your current page. Rows with busy=true are"
+            " held by another worker; rows with quarantined=true are unusable."
+        )
+    return sanitized, receipt
+
+
+# Methods a worker may still issue while re-perception is pending. The two
+# reads are the exit condition itself. Hitl.requestPause is here because the
+# ownerless-barrier whitelist below (`resolverRequired`) already allows it: a
+# worker that decides it needs a human must be able to say so. Rejecting it
+# left browser-003 in task 48b4d7d7 unable to escalate — it could read the
+# CAPTCHA page and nothing else, and died as `blocked_content_suppression`
+# with "Hitl.requestPause also blocked by fleet_reperception_required gate".
+_REPERCEPTION_ALLOWED_METHODS = {
+    "Page.getState",
+    "DOM.getAXTree",
+    "Hitl.requestPause",
+}
 
 
 async def _fleet_auth_barrier_before_call(
     agent: Any,
     method: str,
     params: JsonDict,
+    *,
+    emit_workflow_telemetry: bool = False,
 ) -> Optional[JsonDict]:
     barrier = getattr(agent, "fleet_auth_barrier", None)
     fleet_id = str(getattr(agent, "assigned_fleet_id", "") or "").strip()
     worker_id = str(getattr(agent, "worker_id", "") or "").strip()
     if barrier is None or not fleet_id or not worker_id:
         return None
+    if method == "Workflow.execute":
+        receipt = await barrier.workflow_fence_before(
+            fleet_id,
+            worker_id,
+            seen_generation=int(
+                getattr(agent, "fleet_barrier_generation", 0) or 0
+            ),
+        )
+        if emit_workflow_telemetry:
+            payload = {
+                **dict(receipt),
+                "source": "raw_workflow",
+                "method": method,
+                "runId": None,
+                "workerId": worker_id,
+            }
+            logger = getattr(agent, "logger", None)
+            if logger is not None and hasattr(logger, "write"):
+                logger.write("workflow.auth_fence.before", payload)
+                if (
+                    not receipt.get("allowed")
+                    and receipt.get("generationChanged")
+                ):
+                    logger.write(
+                        "workflow.auth_generation_changed",
+                        payload,
+                    )
+        if receipt.get("allowed"):
+            return None
+        return {
+            **receipt,
+            "next_instruction": (
+                "Do not start or trust an opaque workflow while shared"
+                " authentication is changing. After the barrier opens, call"
+                " Page.getState and DOM.getAXTree, then retry the same row."
+            ),
+        }
     receipt = await barrier.before_call(
         fleet_id,
         worker_id,
@@ -1671,12 +1796,14 @@ async def _fleet_auth_barrier_before_call(
     if not receipt.get("allowed"):
         if receipt.get("resolverRequired") and method in {
             "Page.getState",
+            "Page.create",
             "DOM.getAXTree",
             "Hitl.requestPause",
         }:
-            # An ownerless but still-closed gate permits read-only diagnosis.
-            # Hitl.requestPause proceeds to the explicit atomic claim below;
-            # no arbitrary business call may become resolver implicitly.
+            # An ownerless but still-closed gate permits page-scoped diagnosis.
+            # Page.create and Hitl.requestPause proceed to explicit atomic
+            # claims below; Page.list remains delegation-scoped and no
+            # arbitrary business call becomes resolver.
             return None
         return receipt
     if receipt.get("generationChanged"):
@@ -1700,7 +1827,7 @@ async def _fleet_auth_barrier_before_call(
             agent.axtree_invalidated = True
     if not getattr(agent, "fleet_reperception_pending", False):
         return None
-    if method not in {"Page.getState", "DOM.getAXTree"}:
+    if method not in _REPERCEPTION_ALLOWED_METHODS:
         return {
             "status": "fleet_reperception_required",
             "reasonKind": "fleet_reperception_required",
@@ -1716,6 +1843,67 @@ async def _fleet_auth_barrier_before_call(
     return None
 
 
+def _workflow_auth_started_generation(agent: Any, method: str) -> Optional[int]:
+    if method != "Workflow.execute":
+        return None
+    barrier = getattr(agent, "fleet_auth_barrier", None)
+    fleet_id = str(getattr(agent, "assigned_fleet_id", "") or "").strip()
+    worker_id = str(getattr(agent, "worker_id", "") or "").strip()
+    if barrier is None or not fleet_id or not worker_id:
+        return None
+    return int(barrier.generation(fleet_id))
+
+
+async def _quarantine_workflow_result_after_auth_change(
+    agent: Any,
+    method: str,
+    result: JsonDict,
+    *,
+    started_generation: Optional[int],
+    emit_telemetry: bool,
+) -> JsonDict:
+    if method != "Workflow.execute" or started_generation is None:
+        return result
+    barrier = getattr(agent, "fleet_auth_barrier", None)
+    fleet_id = str(getattr(agent, "assigned_fleet_id", "") or "").strip()
+    if barrier is None or not fleet_id:
+        return result
+    receipt = await barrier.workflow_fence_after(
+        fleet_id,
+        started_generation=int(started_generation),
+    )
+    if receipt.get("valid"):
+        return result
+    logger = getattr(agent, "logger", None)
+    payload = {
+        **receipt,
+        "source": "raw_workflow",
+        "method": method,
+        "runId": None,
+        "workerId": str(getattr(agent, "worker_id", "") or ""),
+    }
+    if emit_telemetry and logger is not None and hasattr(logger, "write"):
+        if receipt.get("generationChanged"):
+            logger.write("workflow.auth_generation_changed", payload)
+        logger.write("workflow.row_quarantined", payload)
+    return {
+        "method": method,
+        "params": result.get("params") if isinstance(result, dict) else {},
+        "status": "workflow_row_quarantined",
+        "error": (
+            "Workflow result was isolated because the shared authentication"
+            " barrier or generation changed while it was in flight."
+        ),
+        "authFence": receipt,
+        "tool_was_executed": True,
+        "retryable": True,
+        "next_instruction": (
+            "Call Page.getState and DOM.getAXTree after the barrier opens, then"
+            " retry only this row. Do not persist variables from this run."
+        ),
+    }
+
+
 def _fleet_auth_barrier_after_call(
     agent: Any,
     method: str,
@@ -1723,7 +1911,13 @@ def _fleet_auth_barrier_after_call(
 ) -> None:
     if not getattr(agent, "fleet_reperception_pending", False):
         return
-    if _invoke_result_failed(result):
+    # The exit condition is "this worker re-read the page", which is a fact
+    # about the CALL, not about the page's health. `_invoke_result_failed`
+    # answers a different question: it also fails on `response.data.error`,
+    # which for Page.getState is the page's own last-navigation error. On a
+    # risk-controlled page that field is permanent, so the gate whose exit
+    # requires reading the page could never be opened by reading the page.
+    if not classify_call_outcome(result).succeeded:
         return
     if method == "Page.getState":
         agent.fleet_reperception_state_seen = True
@@ -1746,14 +1940,27 @@ async def _claim_fleet_auth_barrier_for_hitl(
     method: str,
     params: JsonDict,
 ) -> Optional[JsonDict]:
-    """Atomically select the one worker allowed to enter manual HITL."""
+    """Admit, then atomically select the one worker allowed to enter HITL.
+
+    Every `Hitl.requestPause` — the model's own call and the harness's
+    auto-adjudicated one — passes through here, so this is where attendance and
+    the cumulative pause budget are ENFORCED and ACCOUNTED. Putting them only in
+    the auto path left the manual call as a hole wide enough to drive the whole
+    mechanism through: a model handed an `hitl_unattended` verdict could reach
+    the same 900-second wait by calling the tool itself.
+    """
 
     if method != "Hitl.requestPause":
         return None
+    page_id = str(params.get("pageId") or "").strip()
+    admission = _hitl_admission(agent, page_id)
+    if admission is not None:
+        return await _refuse_hitl(agent, admission, page_id, method)
     barrier = getattr(agent, "fleet_auth_barrier", None)
     fleet_id = str(getattr(agent, "assigned_fleet_id", "") or "").strip()
     worker_id = str(getattr(agent, "worker_id", "") or "").strip()
     if barrier is None or not fleet_id or not worker_id:
+        _count_hitl_pause_round(agent, page_id)
         return None
     claim = await barrier.claim(
         fleet_id,
@@ -1761,6 +1968,9 @@ async def _claim_fleet_auth_barrier_for_hitl(
         str(params.get("reason") or params.get("purpose") or "manual HITL"),
     )
     if claim.get("claimed"):
+        # Counted only once the pause is actually going to be dispatched: a
+        # worker turned away at the gate never bothered a human.
+        _count_hitl_pause_round(agent, page_id)
         return None
     return {
         "status": "fleet_auth_gated",
@@ -1775,6 +1985,60 @@ async def _claim_fleet_auth_barrier_for_hitl(
             "Do not request HITL or act on the shared cookie jar until it finishes."
         ),
     }
+
+
+async def _claim_ownerless_fleet_auth_barrier_for_page_create(
+    agent: Any,
+    method: str,
+    params: JsonDict,
+) -> Tuple[Optional[JsonDict], bool]:
+    """Select one resolver before Page.create crosses an ownerless gate.
+
+    Returns ``(guard, takeover_claimed)``. Open fleets do not need a claim;
+    an existing resolver may continue; a competing worker remains gated.
+    """
+
+    if method != "Page.create":
+        return None, False
+    barrier = getattr(agent, "fleet_auth_barrier", None)
+    fleet_id = str(getattr(agent, "assigned_fleet_id", "") or "").strip()
+    worker_id = str(getattr(agent, "worker_id", "") or "").strip()
+    if barrier is None or not fleet_id or not worker_id:
+        return None, False
+    claim = await barrier.claim_ownerless(
+        fleet_id,
+        worker_id,
+        "Create or recover a page for ownerless authentication recovery",
+    )
+    if not claim.get("required"):
+        return None, False
+    if claim.get("claimed"):
+        takeover = bool(claim.get("takeover"))
+        if takeover:
+            logger = getattr(agent, "logger", None)
+            if logger is not None:
+                logger.write(
+                    "auth_fleet.resolver_claimed_for_page_create",
+                    {
+                        "fleetId": fleet_id,
+                        "workerId": worker_id,
+                        "generation": claim.get("generation"),
+                    },
+                )
+        return None, takeover
+    return {
+        "status": "fleet_auth_gated",
+        "reasonKind": "fleet_auth_gated",
+        "fleetId": fleet_id,
+        "resolverWorkerId": claim.get("resolverWorkerId"),
+        "generation": claim.get("generation"),
+        "tool_was_executed": False,
+        "retryable": True,
+        "next_instruction": (
+            "Another worker atomically claimed ownerless authentication recovery. "
+            "Do not create a page or act on the shared cookie jar until it finishes."
+        ),
+    }, False
 
 
 async def _relinquish_fleet_auth_resolver_after_failed_pause(
@@ -1800,6 +2064,37 @@ async def _relinquish_fleet_auth_resolver_after_failed_pause(
         if logger is not None:
             logger.write(
                 "auth_fleet.resolver_relinquished",
+                {"fleetId": fleet_id, "workerId": worker_id, **receipt},
+            )
+    return receipt
+
+
+async def _relinquish_fleet_auth_resolver_after_failed_recovery_page_create(
+    agent: Any,
+    method: str,
+    *,
+    takeover_claimed: bool,
+    call_succeeded: bool,
+) -> JsonDict:
+    """Release a failed Page.create takeover without opening the gate."""
+
+    if method != "Page.create" or not takeover_claimed or call_succeeded:
+        return {}
+    barrier = getattr(agent, "fleet_auth_barrier", None)
+    fleet_id = str(getattr(agent, "assigned_fleet_id", "") or "").strip()
+    worker_id = str(getattr(agent, "worker_id", "") or "").strip()
+    if barrier is None or not fleet_id or not worker_id:
+        return {}
+    receipt = await barrier.relinquish(
+        fleet_id,
+        worker_id,
+        reason="Recovery Page.create failed before a challenge page was available",
+    )
+    if receipt.get("relinquished"):
+        logger = getattr(agent, "logger", None)
+        if logger is not None:
+            logger.write(
+                "auth_fleet.resolver_relinquished_after_page_create",
                 {"fleetId": fleet_id, "workerId": worker_id, **receipt},
             )
     return receipt
@@ -1844,6 +2139,17 @@ async def _execute_browser_capability_tool(
         tool_input.get("runtime_policy")
         if isinstance(tool_input, dict) else None
     )
+    raw_navigation_context = (
+        tool_input.get("navigation_context")
+        if tool_name == "browser_call" and isinstance(tool_input, dict)
+        else None
+    )
+    raw_content_binding = (
+        tool_input.get("content_binding")
+        if tool_name == "browser_call" and isinstance(tool_input, dict)
+        else None
+    )
+    navigation_context: JsonDict = {}
     runtime_receipt: JsonDict = {}
     runtime_json_expression = ""
 
@@ -1857,7 +2163,13 @@ async def _execute_browser_capability_tool(
         attach_method_schema(result, method, agent.method_schemas)
         agent.logger.write("browser.call.params_error", result)
         _observe_progress_after(agent, method or "browser_call.params_error", result)
-        progress_result = _check_progress_before(agent, method or "browser_call", None, step)
+        progress_result = _check_progress_before(
+            agent,
+            method or "browser_call",
+            params if isinstance(params, dict) else tool_input,
+            step,
+            charge_diagnostic=False,
+        )
         if progress_result is not None:
             agent.trace.append({"type": "progress_intervention", "result": progress_result})
             return progress_result, False
@@ -1873,12 +2185,58 @@ async def _execute_browser_capability_tool(
         attach_method_schema(result, method, agent.method_schemas)
         agent.logger.write("browser.call.rejected", result)
         _observe_progress_after(agent, method or "browser_call_rejected", result)
-        progress_result = _check_progress_before(agent, method or "browser_call", None, step)
+        progress_result = _check_progress_before(
+            agent, method or "browser_call", params, step,
+            charge_diagnostic=False,
+        )
         if progress_result is not None:
             agent.trace.append({"type": "progress_intervention", "result": progress_result})
             return progress_result, False
         agent.trace.append({"type": "browser_call_rejected", "result": result})
         return result, False
+
+    params, shadow_dom_defaulted = _default_semantic_tree_shadow_dom(
+        method,
+        params,
+        getattr(agent, "method_schemas", {}),
+    )
+    if shadow_dom_defaulted:
+        agent.logger.write(
+            "semantic_tree.shadow_dom_defaulted",
+            {
+                "method": method,
+                "pageId": str(params.get("pageId") or ""),
+                "includeShadowDom": True,
+            },
+        )
+
+    navigation_context, navigation_context_error = _prepare_navigation_context(
+        agent,
+        method,
+        raw_navigation_context,
+    )
+    if navigation_context_error is not None:
+        attach_method_schema(
+            navigation_context_error,
+            method,
+            agent.method_schemas,
+        )
+        agent.logger.write(
+            "browser.call.navigation_context_rejected",
+            navigation_context_error,
+        )
+        agent.trace.append({
+            "type": "navigation_context_rejected",
+            "result": navigation_context_error,
+        })
+        return navigation_context_error, False
+
+    params, screenshot_output_receipt = _normalize_screenshot_output(method, params)
+    if screenshot_output_receipt is not None:
+        agent.logger.write(
+            "browser.call.screenshot_output_normalized",
+            {"method": method, **screenshot_output_receipt},
+        )
 
     if method == "Runtime.evaluate":
         prepared, policy_error = _prepare_runtime_evaluation(
@@ -1892,20 +2250,43 @@ async def _execute_browser_capability_tool(
             agent.logger.write("runtime.evaluate.rejected", policy_error)
             agent.trace.append({"type": "runtime_policy_rejected", "result": policy_error})
             return policy_error, False
+        escalation, escalation_error = runtime_last_resort_evidence(
+            agent,
+            page_id=str(params.get("pageId") or ""),
+        )
+        if escalation_error is not None:
+            attach_method_schema(escalation_error, method, agent.method_schemas)
+            agent.logger.write("runtime.evaluate.escalation_rejected", escalation_error)
+            agent.trace.append({
+                "type": "runtime_escalation_rejected",
+                "result": escalation_error,
+            })
+            return escalation_error, False
         params = dict(prepared.params)
         runtime_receipt = dict(prepared.receipt)
+        runtime_receipt["lastResortEvidence"] = escalation
+        agent.logger.write("runtime.evaluate.escalation_authorized", escalation)
         if runtime_receipt.get("resultMode") == "json":
-            runtime_json_expression = _build_eval_js_json_expression(
+            runtime_json_expression = _build_runtime_json_expression(
                 str(params.get("expression") or "")
             )
             params["expression"] = runtime_json_expression
             params["returnByValue"] = True
 
     if method == "Workflow.execute":
+        if not workflow_execution_enabled(agent):
+            disabled = workflow_execution_disabled_result(
+                source="browser_call.Workflow.execute"
+            )
+            agent.logger.write("workflow.execute.runtime_disabled", disabled)
+            agent.trace.append({
+                "type": "workflow_runtime_disabled",
+                "result": disabled,
+            })
+            return disabled, False
         contract = getattr(agent, "worker_contract", None)
-        task_type = (
-            str(contract.get("task_type") or "general")
-            if isinstance(contract, dict) else "general"
+        task_type = resolve_task_type_fail_closed(
+            contract.get("task_type") if isinstance(contract, dict) else None
         )
         normalized_workflow, workflow_error = validate_workflow_params(
             params,
@@ -1927,7 +2308,10 @@ async def _execute_browser_capability_tool(
         attach_method_schema(contract_result, method, agent.method_schemas)
         agent.logger.write("browser.call.contract_violation", contract_result)
         _observe_progress_after(agent, method or "browser_call.contract_violation", contract_result)
-        progress_result = _check_progress_before(agent, method or "browser_call", None, step)
+        progress_result = _check_progress_before(
+            agent, method or "browser_call", params, step,
+            charge_diagnostic=False,
+        )
         if progress_result is not None:
             agent.trace.append({"type": "progress_intervention", "result": progress_result})
             return progress_result, False
@@ -1974,7 +2358,10 @@ async def _execute_browser_capability_tool(
         return page_binding_guard, False
 
     auth_barrier_guard = await _fleet_auth_barrier_before_call(
-        agent, method, params
+        agent,
+        method,
+        params,
+        emit_workflow_telemetry=True,
     )
     if auth_barrier_guard is not None:
         agent.logger.write("browser.call.fleet_auth_gated", auth_barrier_guard)
@@ -1985,6 +2372,9 @@ async def _execute_browser_capability_tool(
             "result": auth_barrier_guard,
         })
         return auth_barrier_guard, False
+    workflow_auth_started_generation = _workflow_auth_started_generation(
+        agent, method
+    )
 
     lifecycle_guard = await _page_lifecycle_guard_before(agent, method, params)
     if lifecycle_guard is not None:
@@ -2010,7 +2400,10 @@ async def _execute_browser_capability_tool(
         attach_method_schema(target_param_guard, method, agent.method_schemas)
         agent.logger.write("browser.call.params_error", target_param_guard)
         _observe_progress_after(agent, method or "browser_call.params_error", target_param_guard)
-        progress_result = _check_progress_before(agent, method or "browser_call", None, step)
+        progress_result = _check_progress_before(
+            agent, method or "browser_call", params, step,
+            charge_diagnostic=False,
+        )
         if progress_result is not None:
             agent.trace.append({"type": "progress_intervention", "result": progress_result})
             return progress_result, False
@@ -2030,7 +2423,7 @@ async def _execute_browser_capability_tool(
         agent.trace.append({"type": "stale_axtree_target", "result": stale_target})
         return stale_target, False
 
-    progress_result = _check_progress_before(agent, method, None, step)
+    progress_result = _check_progress_before(agent, method, params, step)
     if progress_result is not None:
         agent.trace.append({"type": "progress_intervention", "result": progress_result})
         return progress_result, False
@@ -2050,6 +2443,36 @@ async def _execute_browser_capability_tool(
             },
         )
     _ensure_hitl_request_reason(method, params, reason)
+    page_create_claim_guard, page_create_takeover_claimed = (
+        await _claim_ownerless_fleet_auth_barrier_for_page_create(
+            agent, method, params
+        )
+    )
+    if page_create_claim_guard is not None:
+        agent.logger.write("browser.call.fleet_auth_gated", page_create_claim_guard)
+        agent.trace.append({
+            "type": "fleet_auth_gate",
+            "method": method,
+            "params": params,
+            "result": page_create_claim_guard,
+        })
+        return page_create_claim_guard, False
+    # A bounded VL solve runs before the pause is issued. It claims the fleet auth
+    # barrier itself (inside the autosolver) so concurrent same-fleet workers can
+    # never drive the same challenge; on success it verifies and releases the
+    # barrier, on failure it keeps ownership and the pause below inherits it.
+    captcha_short_circuit = await _maybe_autosolve_before_model_pause(
+        agent, method, params, step
+    )
+    if captcha_short_circuit is not None:
+        agent.logger.write("browser.call.captcha_auto_solved", captcha_short_circuit)
+        agent.trace.append({
+            "type": "captcha_auto_solved",
+            "method": method,
+            "params": params,
+            "result": captcha_short_circuit,
+        })
+        return captcha_short_circuit, False
     hitl_claim_guard = await _claim_fleet_auth_barrier_for_hitl(
         agent, method, params
     )
@@ -2065,6 +2488,7 @@ async def _execute_browser_capability_tool(
 
     page_create_should_stop = False
     hitl_pause_succeeded = False
+    page_list_shown: Optional[List[JsonDict]] = None
     try:
         runner = getattr(agent, "render_recovery_runner", None)
         if runner is None:
@@ -2088,9 +2512,170 @@ async def _execute_browser_capability_tool(
                 step,
             )
         _page_lifecycle_before_action(agent, method, params)
-        response, _recovery = await runner.call(method, params)
+        reused_download = (
+            _reusable_download_response(agent, params)
+            if method == "Download.start" else None
+        )
+        if method == "Download.start" and reused_download is None:
+            reused_download = await _refresh_active_download_response(
+                agent, runner, params,
+            )
+        download_timeout_error: Optional[ABCPTransportError] = None
+        if reused_download is not None:
+            response, _recovery = reused_download, None
+            agent.logger.write(
+                "download.operation_reused",
+                reused_download.get("downloadReconciliation") or {},
+            )
+        else:
+            try:
+                response, _recovery = await runner.call(method, params)
+            except ABCPTransportError as exc:
+                # JSON-RPC action timeouts may happen after Electron has begun
+                # a download.  Contain this one method locally so reconciliation
+                # runs before the generic transport handler discards the call.
+                if method != "Download.start" or not _download_start_timed_out(exc):
+                    raise
+                download_timeout_error = exc
+                response, _recovery = {}, None
+
+        if method == "Download.list":
+            known_downloads = _download_receipt_store(agent)
+            for download_record in _download_records(response):
+                if _download_operation_key(download_record) in known_downloads:
+                    _remember_download_record(agent, download_record)
+        elif method == "Download.start" and (
+            download_timeout_error is not None
+            or _download_start_timed_out(response)
+        ):
+            reconciliation = await _reconcile_download_start_timeout(
+                agent=agent,
+                runner=runner,
+                params=params,
+                timeout_error=download_timeout_error,
+            )
+            agent.logger.write(
+                "download.timeout_reconciled",
+                {
+                    "url": str(params.get("url") or ""),
+                    "savePath": str(params.get("savePath") or ""),
+                    **reconciliation,
+                },
+            )
+            if reconciliation.get("classification") in {"completed", "active"}:
+                receipt = reconciliation.get("receipt") or {}
+                response = {
+                    "observation": (
+                        "Download.start timed out, but Download.list proved"
+                        " that the operation exists. Do not retry it."
+                    ),
+                    "data": {
+                        "success": True,
+                        "downloadId": receipt.get("downloadId"),
+                        "state": receipt.get("state"),
+                        "savePath": receipt.get("savePath"),
+                        "url": receipt.get("url"),
+                        "reconciledAfterTimeout": True,
+                    },
+                    "downloadReconciliation": reconciliation,
+                }
+            elif reconciliation.get("classification") == "failed":
+                response = {
+                    "error": "The reconciled download reached a terminal failed state.",
+                    "downloadReconciliation": reconciliation,
+                    "suggested_prompt": (
+                        "The exact prior operation is proven failed, so one"
+                        " bounded retry is allowed after checking page readiness."
+                    ),
+                }
+            else:
+                response = {
+                    "error": str(download_timeout_error or "Download.start timed out"),
+                    "downloadReconciliation": reconciliation,
+                    "suggested_prompt": (
+                        "This Download.start timed out and the exact requested"
+                        " URL/savePath operation could not be verified. The"
+                        " redirect may already have saved a file to the browser's"
+                        " default download directory. Do not resend the same URL."
+                        " If the page exposes a final direct file URL, retry that"
+                        " direct URL once with the required savePath."
+                    ),
+                }
+        elif method == "Download.start" and isinstance(response, dict):
+            data = response.get("data")
+            if isinstance(data, dict) and (
+                data.get("downloadId") or data.get("id")
+            ):
+                _remember_download_record(agent, {
+                    **params,
+                    **data,
+                })
+        if method == "Runtime.evaluate" and runtime_receipt:
+            runtime_receipt["attempts"] = [
+                _runtime_attempt_receipt(response, "isolated")
+            ]
+            if (
+                _invoke_result_failed({"method": method, "response": response})
+                and runtime_receipt.get("mainFallbackAuthorized") is True
+                and _runtime_main_fallback_signaled(response)
+            ):
+                main_params = {**params, "world": "main"}
+                agent.logger.write(
+                    "runtime.evaluate.main_fallback_authorized",
+                    {
+                        "pageId": str(params.get("pageId") or ""),
+                        "reasonKind": runtime_receipt.get("reasonKind"),
+                        "signal": MAIN_WORLD_REQUIRED_PREFIX,
+                    },
+                )
+                response, _recovery = await runner.call(method, main_params)
+                runtime_receipt["attempts"].append(
+                    _runtime_attempt_receipt(response, "main")
+                )
+
+            final_attempt = runtime_receipt["attempts"][-1]
+            runtime_receipt["executedWorld"] = final_attempt.get("executedWorld")
+            expected_world = str(final_attempt.get("requestedWorld") or "")
+            runtime_receipt["dispatchedWorld"] = expected_world
+            runtime_receipt["worldEvidenceStrength"] = final_attempt.get(
+                "evidenceStrength", "strong"
+            )
+            if not _invoke_result_failed({"method": method, "response": response}):
+                metadata_supplied = _runtime_response_world_metadata_supplied(response)
+                if metadata_supplied and not _runtime_response_world_verified(
+                    response, expected_world
+                ):
+                    response = {
+                        "error": (
+                            "Runtime.evaluate completed with invalid or mismatched"
+                            " platform world evidence"
+                            f" (expected {expected_world})"
+                        )
+                    }
+                    final_attempt["status"] = "failed"
+                    final_attempt["failureKind"] = "world_evidence_mismatch"
+                    final_attempt["evidence"] = "platform_response_invalid"
+                    final_attempt["evidenceStrength"] = "invalid"
+                    final_attempt["error"] = str(response["error"])
+                    runtime_receipt["worldEvidenceStrength"] = "invalid"
+                elif not metadata_supplied:
+                    # Compatibility path for deployed panels predating the
+                    # runtimeEvaluation response envelope.  This proves only
+                    # which strict world the harness dispatched; it deliberately
+                    # does not claim which world the platform executed.
+                    agent.logger.write(
+                        "runtime.evaluate.world_evidence_degraded",
+                        {
+                            "pageId": str(params.get("pageId") or ""),
+                            "reasonKind": runtime_receipt.get("reasonKind"),
+                            "dispatchedWorld": expected_world,
+                            "evidence": "harness_dispatched_world",
+                            "resultAccepted": True,
+                        },
+                    )
         _page_lifecycle_after_action(agent, method, params, response)
         response = agent._capture_artifacts(method, response)
+        structural_challenge = detect_structural_challenge(method, response)
         record_file_action = getattr(agent, "_capture_file_action", None)
         if callable(record_file_action):
             record_file_action(method, params, response)
@@ -2100,6 +2685,11 @@ async def _execute_browser_capability_tool(
             response, page_list_receipt = _filter_page_list_response(
                 agent, response
             )
+            shown_sidecar = page_list_receipt.pop("_shownInventoryPages", None)
+            if isinstance(shown_sidecar, list):
+                page_list_shown = [
+                    dict(row) for row in shown_sidecar if isinstance(row, dict)
+                ]
         axtree_snapshot = _precompute_axtree_snapshot(method, params, response)
         response = agent._offload_response(method, params, response, step)
 
@@ -2114,18 +2704,12 @@ async def _execute_browser_capability_tool(
             "params": params,
             "response": response,
         }
+        if structural_challenge:
+            result["structuralChallenge"] = structural_challenge
         if runtime_receipt:
             result["runtimePolicy"] = runtime_receipt
             if runtime_receipt.get("resultMode") == "json":
                 payload = _runtime_any_json_payload(result)
-                if payload is None and runtime_json_expression:
-                    payload = await _eval_json_via_title(
-                        agent,
-                        str(params.get("pageId") or ""),
-                        runtime_json_expression,
-                        step,
-                        str(params.get("purpose") or reason or "Read Runtime JSON result"),
-                    )
                 if isinstance(payload, dict) and payload.get("error"):
                     result["runtimeJSONError"] = {
                         "error": str(payload.get("error")),
@@ -2147,14 +2731,33 @@ async def _execute_browser_capability_tool(
             result.update(page_list_receipt)
         if isinstance(response, dict) and response.get("error"):
             attach_method_schema(result, method, agent.method_schemas)
+    except FleetClickGateTimeout as exc:
+        result = {
+            "method": method,
+            "params": params,
+            "error": str(exc),
+            **exc.receipt,
+        }
+        attach_method_schema(result, method, agent.method_schemas)
     except ABCPTransportError as exc:
         result = {
             "method": method,
             "params": params,
             "error": str(exc),
+            **_transport_error_metadata(method, exc),
         }
         attach_method_schema(result, method, agent.method_schemas)
 
+    if runtime_receipt and "runtimePolicy" not in result:
+        result["runtimePolicy"] = runtime_receipt
+
+    result = await _quarantine_workflow_result_after_auth_change(
+        agent,
+        method,
+        result,
+        started_generation=workflow_auth_started_generation,
+        emit_telemetry=True,
+    )
     relinquished = await _relinquish_fleet_auth_resolver_after_failed_pause(
         agent,
         method,
@@ -2175,18 +2778,132 @@ async def _execute_browser_capability_tool(
             params,
             result,
         )
+    page_create_relinquished = (
+        await _relinquish_fleet_auth_resolver_after_failed_recovery_page_create(
+            agent,
+            method,
+            takeover_claimed=page_create_takeover_claimed,
+            call_succeeded=not _invoke_result_failed(result),
+        )
+    )
+    if page_create_relinquished:
+        result["fleetAuthBarrier"] = page_create_relinquished
     _observe_page_binding_after(agent, method, params, result)
     if fleet_binding_receipt and (
         method in {"Page.create", "Page.list"} or method.startswith("Fleet.")
     ):
         result.update(fleet_binding_receipt)
     attach_error_classification(result, method=method)
+    result = _apply_select_failure_guidance(agent, method, params, result)
+    if method == "Runtime.evaluate" and _invoke_result_failed(result):
+        attempts = list(runtime_receipt.get("attempts") or [])
+        attempted_main = any(
+            item.get("requestedWorld") == "main"
+            for item in attempts if isinstance(item, dict)
+        )
+        signaled = any(
+            MAIN_WORLD_REQUIRED_PREFIX in str(item.get("error") or "")
+            for item in attempts if isinstance(item, dict)
+        )
+        classification = (
+            "runtime_execution_world_unverified"
+            if attempts and attempts[-1].get("failureKind") == "world_evidence_mismatch"
+            else "runtime_main_evaluation_failed" if attempted_main
+            else "runtime_isolated_context_blocked"
+            if signaled
+            else "runtime_isolated_evaluation_failed"
+        )
+        result["status"] = "blocked"
+        result["runtimeBlocker"] = {
+            "classification": classification,
+            "attempts": attempts,
+            "error": _runtime_evaluation_error_text(result)[:2000],
+            "final": True,
+        }
+        result["next_instruction"] = (
+            "The guarded Runtime evaluation exhausted its authorized strict"
+            " world attempts or received invalid/mismatched platform world"
+            " evidence. Do not"
+            " request main directly or repeat Runtime.evaluate; report this blocker."
+        )
     _fleet_auth_barrier_after_call(agent, method, result)
     result = _attach_navigation_check(result, method=method, params=params)
     result = _attach_runtime_strategy_hints(result, method=method)
     if not page_create_should_stop:
         result = await _maybe_auto_hitl_for_challenge(agent, method, params, result, step)
     result = _attach_normalized_handles(result)
+    result = _settle_page_inventory_signal(
+        agent,
+        method,
+        params,
+        result,
+        page_list_shown=page_list_shown,
+    )
+    content_observation_params = params
+    if navigation_context:
+        content_observation_params = {
+            **params,
+            "_harnessNavigationContext": navigation_context,
+        }
+    result = _observe_content_completeness_after(
+        agent,
+        method,
+        content_observation_params,
+        result,
+        step,
+        content_binding=raw_content_binding,
+    )
+    if navigation_context:
+        source_page_id = str(navigation_context.get("sourcePageId") or "")
+        kind = str(navigation_context.get("kind") or "")
+        tracker = getattr(agent, "content_completeness_tracker", None)
+        source_state = (
+            tracker.pages.get(source_page_id)
+            if tracker is not None and hasattr(tracker, "pages")
+            else None
+        )
+        # Each declaration kind is recorded differently, so `accepted` has to
+        # ask the mechanism that actually consumed it. Probing Page.create's
+        # pending map for every kind reported a successful claimed-page binding
+        # as rejected, inviting the model to replay a declaration that had
+        # already been consumed.
+        if kind == "route_recovery_claimed_page":
+            accepted = bool(
+                tracker is not None
+                and getattr(tracker, "last_declaration_accepted", False)
+            )
+        else:
+            accepted = bool(
+                tracker is not None
+                and str(
+                    getattr(
+                        tracker,
+                        "pending_explicit_recovery_sources",
+                        {},
+                    ).get(
+                        str(
+                            _response_data(result).get("pageId")
+                            or _response_data(result).get("id")
+                            or ""
+                        ),
+                        "",
+                    )
+                    or ""
+                ) == source_page_id
+            )
+        result["navigationContext"] = {
+            **navigation_context,
+            "accepted": accepted,
+            "sourceExemptionPendingTargetEvidence": True,
+            "forwardedToABCP": False,
+        }
+        if not accepted:
+            result["navigationContext"]["next_instruction"] = (
+                "The declaration was not recorded. Do not replay it: check"
+                " that the call succeeded and that sourcePageId is a listing"
+                " click the harness reported as unresolved."
+            )
+    _observe_navigation_progress_after(agent, method, params, result)
     # Record THIS call's AXTree snapshot first (precomputed_snapshot is the
     # pre-auto-intercept tree). Auto-intercept runs AFTER: its dismiss_overlay
     # mutates the page and its own internal calls invalidate/refresh the snapshot,
@@ -2235,6 +2952,9 @@ async def _execute_browser_capability_tool(
     return model_result, page_create_should_stop
 
 
+_TRUSTED_COLLECTION_RUNTIME_TOKEN = object()
+
+
 async def _invoke_browser_method(
     agent: Any,
     method: str,
@@ -2248,31 +2968,37 @@ async def _invoke_browser_method(
     redact_params: Optional[Set[str]] = None,
     runtime_policy: Optional[JsonDict] = None,
     lifecycle_cleanup_bypass: bool = False,
+    _trusted_collection_runtime_token: Any = None,
 ) -> JsonDict:
-    # internal=True marks a harness plumbing call (e.g. the title side-channel's
-    # PENDING/READY/CHUNK markers): it must not enter the observation chain —
+    # internal=True marks a harness plumbing call: it must not enter the observation chain —
     # no challenge adjudication, diagnostics, progress, or model-facing trace —
     # only a compact audit log. Such calls also never count as progress.
     if internal:
         count_progress = False
+    params, screenshot_output_receipt = _normalize_screenshot_output(method, params)
+    if screenshot_output_receipt is not None:
+        logger = getattr(agent, "logger", None)
+        if logger is not None:
+            logger.write(
+                "browser.call.screenshot_output_normalized",
+                {"method": method, **screenshot_output_receipt},
+            )
     runtime_receipt: JsonDict = {}
     if method == "Runtime.evaluate":
-        origin = str((runtime_policy or {}).get("origin") or "").strip()
-        policy_payload = dict(runtime_policy or {})
-        policy_payload.pop("origin", None)
-        prepared, policy_error = _prepare_runtime_evaluation(
-            agent,
-            params,
-            policy_payload,
-            origin=origin or "harness_unspecified",
+        trusted_collection_call = (
+            _trusted_collection_runtime_token is _TRUSTED_COLLECTION_RUNTIME_TOKEN
+            and internal
+            and read_only_eval
         )
-        if policy_error is not None:
+        if not trusted_collection_call:
+            error = RuntimeEvaluationService._error(
+                "runtime_internal_path_forbidden",
+                "Harness-internal Runtime.evaluate paths are disabled; only the model-facing browser_call boundary or the registered collect_items templates may authorize execution.",
+            )
             logger = getattr(agent, "logger", None)
             if logger is not None:
-                logger.write("runtime.evaluate.rejected", policy_error)
-            return policy_error
-        params = dict(prepared.params)
-        runtime_receipt = dict(prepared.receipt)
+                logger.write("runtime.evaluate.rejected", error)
+            return error
     # redact_params: the browser still receives the real values, but these keys
     # are masked everywhere the call surfaces (result/log/trace/model_result,
     # and the render-recovery logs/advisory), so secrets (e.g. Input.type text
@@ -2299,6 +3025,9 @@ async def _invoke_browser_method(
     )
     if auth_barrier_guard is not None:
         return auth_barrier_guard
+    workflow_auth_started_generation = _workflow_auth_started_generation(
+        agent, method
+    )
     if lifecycle_cleanup_bypass and not internal:
         return {
             "status": "rejected",
@@ -2310,6 +3039,13 @@ async def _invoke_browser_method(
         if lifecycle_guard is not None:
             return lifecycle_guard
     _ensure_hitl_request_reason(method, params, str(params.get("purpose") or ""))
+    page_create_claim_guard, page_create_takeover_claimed = (
+        await _claim_ownerless_fleet_auth_barrier_for_page_create(
+            agent, method, params
+        )
+    )
+    if page_create_claim_guard is not None:
+        return page_create_claim_guard
     hitl_claim_guard = await _claim_fleet_auth_barrier_for_hitl(
         agent, method, params
     )
@@ -2334,6 +3070,12 @@ async def _invoke_browser_method(
         # mid-call (race fix) without letting a cross-page event suppress it.
         event_serial_before = int(getattr(agent, "axtree_event_serial", 0) or 0)
         page_before = str(getattr(agent, "axtree_page_id", "") or "")
+        # No page-open intent is armed here on purpose. This is the internal
+        # dispatch used by composites and harness machinery (focus clicks,
+        # overlay dismissal, load-more), and it has no settlement tail — an
+        # intent armed here would outlive its action and let an unrelated site
+        # popup claim it. Adoption is a model-facing grant, so only the
+        # model's own dispatch path arms one.
         if method == "Hitl.requestPause":
             await _capture_hitl_pause_snapshot(
                 agent,
@@ -2345,6 +3087,7 @@ async def _invoke_browser_method(
         response, _recovery = await runner.call(method, params, **runner_kwargs)
         _page_lifecycle_after_action(agent, method, params, response)
         response = agent._capture_artifacts(method, response)
+        structural_challenge = detect_structural_challenge(method, response)
         record_file_action = getattr(agent, "_capture_file_action", None)
         if callable(record_file_action):
             record_file_action(method, params, response)
@@ -2360,14 +3103,36 @@ async def _invoke_browser_method(
             "params": _shown_params(params),
             "response": response,
         }
+        if structural_challenge:
+            result["structuralChallenge"] = structural_challenge
         if runtime_receipt:
             result["runtimePolicy"] = runtime_receipt
         if isinstance(response, dict) and response.get("error"):
             attach_method_schema(result, method, agent.method_schemas)
+    except FleetClickGateTimeout as exc:
+        result = {
+            "method": method,
+            "params": _shown_params(params),
+            "error": str(exc),
+            **exc.receipt,
+        }
+        attach_method_schema(result, method, agent.method_schemas)
     except ABCPTransportError as exc:
-        result = {"method": method, "params": _shown_params(params), "error": str(exc)}
+        result = {
+            "method": method,
+            "params": _shown_params(params),
+            "error": str(exc),
+            **_transport_error_metadata(method, exc),
+        }
         attach_method_schema(result, method, agent.method_schemas)
 
+    result = await _quarantine_workflow_result_after_auth_change(
+        agent,
+        method,
+        result,
+        started_generation=workflow_auth_started_generation,
+        emit_telemetry=False,
+    )
     relinquished = await _relinquish_fleet_auth_resolver_after_failed_pause(
         agent,
         method,
@@ -2384,13 +3149,25 @@ async def _invoke_browser_method(
         )
         if "params" in result:
             result["params"] = _shown_params(params)
+    page_create_relinquished = (
+        await _relinquish_fleet_auth_resolver_after_failed_recovery_page_create(
+            agent,
+            method,
+            takeover_claimed=page_create_takeover_claimed,
+            call_succeeded=not _invoke_result_failed(result),
+        )
+    )
+    if page_create_relinquished:
+        result["fleetAuthBarrier"] = page_create_relinquished
     attach_error_classification(result, method=method)
+    result = _apply_select_failure_guidance(agent, method, params, result)
     _fleet_auth_barrier_after_call(agent, method, result)
     result = _attach_navigation_check(result, method=method, params=params)
     result = _attach_runtime_strategy_hints(result, method=method)
     if not internal:
         result = await _maybe_auto_hitl_for_challenge(agent, method, params, result, step)
     result = _attach_normalized_handles(result)
+    result = _settle_page_inventory_signal(agent, method, params, result)
     _observe_axtree_state_after(
         agent,
         method,
@@ -2403,6 +3180,17 @@ async def _invoke_browser_method(
     )
     if internal:
         agent.logger.write("browser.call.internal", {"method": method})
+        if (
+            method == "Runtime.evaluate"
+            and _trusted_collection_runtime_token is _TRUSTED_COLLECTION_RUNTIME_TOKEN
+        ):
+            # The fixed collection result can legitimately contain hundreds of
+            # rows.  Model-facing cleanup truncates long strings, which would
+            # corrupt the JSON envelope before the in-process collector parses
+            # it.  This raw return never reaches the model or trace; the trusted
+            # helper immediately decodes it and only collect_items' bounded
+            # digest is exposed.
+            return result
         return agent._clean_for_model(result)
     agent.diagnostics.observe_browser_call(method, params, result)
     agent.logger.write("browser.call.result", agent._trim_for_log(result))
@@ -2417,325 +3205,6 @@ async def _invoke_browser_method(
         "result": agent._clean_for_model(model_result),
     })
     return model_result
-
-
-async def _extract_dom_records(agent: Any, tool_input: JsonDict, step: int) -> JsonDict:
-    page_id = str(tool_input.get("pageId") or "").strip()
-    selector = str(tool_input.get("selector") or "").strip()
-    if not page_id:
-        return {"status": "failed", "error": "pageId is required"}
-    if not selector:
-        return {"status": "failed", "error": "selector is required"}
-
-    fields = tool_input.get("fields")
-    if not isinstance(fields, dict) or not fields:
-        fields = {
-            "text": "text",
-            "href": "href",
-            "imgAlt": "imgAlt",
-            "visible": "visible",
-            "ancestorText": "ancestorText",
-        }
-    visible_only = bool(tool_input.get("visibleOnly", True))
-    include_rect = bool(tool_input.get("includeRect", True))
-    include_ancestor_text = bool(tool_input.get("includeAncestorText", True))
-    limit = max(1, min(optional_int(tool_input.get("limit"), 200) or 200, 1000))
-    record_name = str(tool_input.get("record_name") or "").strip()
-
-    expression = _build_extract_dom_records_expression(
-        selector=selector,
-        fields=fields,
-        visible_only=visible_only,
-        include_rect=include_rect,
-        include_ancestor_text=include_ancestor_text,
-        limit=limit,
-    )
-    purpose = f"Extract structured DOM records for selector {selector!r}"
-    eval_result = await _invoke_browser_method(
-        agent,
-        "Runtime.evaluate",
-        {
-            "pageId": page_id,
-            "expression": expression,
-            "returnByValue": True,
-            "purpose": purpose,
-        },
-        step,
-        runtime_policy={
-            "origin": "structured_dom_composite",
-            "intent": "extract",
-            "effect": "read_only",
-            "result_mode": "json",
-        },
-    )
-
-    payload = _runtime_json_payload(eval_result)
-    if payload is None:
-        payload = await _eval_json_via_title(agent, page_id, expression, step, purpose)
-    if not isinstance(payload, dict):
-        return {
-            "status": "failed",
-            "error": "Runtime.evaluate did not return a JSON object",
-            "runtimeResult": agent._trim_for_model(eval_result),
-        }
-    if payload.get("error"):
-        return {
-            "status": "failed",
-            "error": str(payload.get("error")),
-            "stack": str(payload.get("stack") or "")[:1000],
-        }
-
-    rows = payload.get("rows") if isinstance(payload.get("rows"), list) else []
-    rows = [row for row in rows if isinstance(row, dict)]
-    matched_count = int(payload.get("matchedCount") or 0)
-    result: JsonDict = {
-        "status": "done",
-        "selector": selector,
-        # matchedCount = selector hits BEFORE visibleOnly/limit filtering; rowCount
-        # = rows returned. Exposing both lets the model tell "selector wrong /
-        # content absent" (matchedCount 0) apart from "matched but filtered out"
-        # (matchedCount > 0, rowCount 0 -> usually not-yet-visible lazy content).
-        "matchedCount": matched_count,
-        "rowCount": len(rows),
-        "rows": rows,
-        # filteredCount = scanned nodes dropped by visibleOnly; truncated STRICTLY
-        # means the scan stopped early because `limit` was reached (filtered-out
-        # nodes never set it, so lazyHint and truncated can't contradict).
-        "filteredCount": int(payload.get("filteredCount") or 0),
-        "truncated": bool(payload.get("truncated")),
-        "next_step": (
-            "If these rows are target data, call record_extraction now."
-            if not record_name
-            else "Rows were automatically persisted via record_extraction."
-        ),
-    }
-    if matched_count > 0 and not rows:
-        result["lazyHint"] = (
-            f"Selector matched {matched_count} node(s) but 0 rows passed the filter"
-            " (likely visibleOnly hiding not-yet-visible lazy content). Scroll the"
-            " section into view or use collect_items, then re-extract before"
-            " concluding the content is absent."
-        )
-    if record_name:
-        record_result = _record_extraction(
-            agent,
-            {
-                "name": record_name,
-                "rows": rows,
-                "schema": {
-                    "source": "extract_dom_records",
-                    "selector": selector,
-                    "fields": fields,
-                },
-                "description": f"Rows extracted from DOM selector {selector!r}",
-            },
-        )
-        result["recordExtraction"] = record_result
-        if _record_extraction_persisted(record_result):
-            agent.pending_unrecorded_extraction = None
-    elif rows:
-        agent.pending_unrecorded_extraction = {
-            "source": "extract_dom_records",
-            "step": step,
-            "rowCount": len(rows),
-            "turns": 0,
-        }
-    return result
-
-
-async def _eval_js_json_tool(agent: Any, tool_input: JsonDict, step: int) -> JsonDict:
-    page_id = str(tool_input.get("pageId") or "").strip()
-    expression = str(tool_input.get("expression") or "").strip()
-    record_name = str(tool_input.get("record_name") or "").strip()
-    description = str(tool_input.get("description") or "").strip()
-    why_dom_primitives_insufficient = str(
-        tool_input.get("why_dom_primitives_insufficient") or ""
-    ).strip()
-    reason_kind = str(tool_input.get("reason_kind") or "").strip()
-    cross_check_plan = str(tool_input.get("cross_check_plan") or "").strip()
-    if not page_id:
-        return {"status": "failed", "error": "pageId is required"}
-    if not expression:
-        return {"status": "failed", "error": "expression is required"}
-
-    policy_warnings = _eval_js_policy_warnings(
-        record_name=record_name,
-        reason_kind=reason_kind,
-        why_dom_primitives_insufficient=why_dom_primitives_insufficient,
-        cross_check_plan=cross_check_plan,
-    )
-    if record_name and policy_warnings:
-        return {
-            "status": "rejected",
-            "policy_violation": "eval_js_json_requires_justification_for_target_data",
-            "policyWarnings": policy_warnings,
-            "next_instruction": (
-                "Use native DOM/Page/Input tools, or provide a valid reason_kind,"
-                " a concrete why_dom_primitives_insufficient, and a cross_check_plan."
-            ),
-        }
-
-    wrapped_expression = _build_eval_js_json_expression(expression)
-    purpose = "Evaluate JavaScript expression and return JSON via harness wrapper"
-    eval_result = await _invoke_browser_method(
-        agent,
-        "Runtime.evaluate",
-        {
-            "pageId": page_id,
-            "expression": wrapped_expression,
-            "returnByValue": True,
-            "purpose": purpose,
-        },
-        step,
-        runtime_policy={
-            "origin": "model_legacy_alias",
-            "intent": "extract" if record_name else "diagnostic",
-            "effect": "read_only",
-            "reason_kind": reason_kind,
-            "why_structured_tools_insufficient": why_dom_primitives_insufficient,
-            "cross_check_plan": cross_check_plan,
-            "result_mode": "json",
-            "record_name": record_name,
-        },
-    )
-    if isinstance(eval_result, dict) and eval_result.get("policy_violation"):
-        return eval_result
-
-    payload = _runtime_any_json_payload(eval_result)
-    if payload is None:
-        payload = await _eval_json_via_title(
-            agent,
-            page_id,
-            wrapped_expression,
-            step,
-            purpose,
-        )
-    if not isinstance(payload, dict):
-        return {
-            "status": "failed",
-            "error": "Runtime.evaluate did not return a JSON object",
-            "runtimeResult": agent._trim_for_model(eval_result),
-        }
-    if payload.get("error"):
-        return {
-            "status": "failed",
-            "error": str(payload.get("error")),
-            "stack": str(payload.get("stack") or "")[:1000],
-        }
-
-    value = payload.get("value")
-    rows = _rows_from_eval_value(value)
-    result: JsonDict = {
-        "status": "done",
-        "value": value,
-        "valueType": type(value).__name__,
-        "next_step": (
-            "If this value is target data, call record_extraction now."
-            if not record_name
-            else "Rows were automatically persisted via record_extraction."
-        ),
-    }
-    if policy_warnings:
-        result["policyWarnings"] = policy_warnings
-    # Advisory routing only (never blocks): a flat selector+map extraction is
-    # exactly what extract_dom_records expresses declaratively.
-    if _looks_like_flat_collection_js(expression):
-        result["routingHint"] = (
-            "This expression is a flat querySelectorAll+map extraction;"
-            " prefer extract_dom_records (selector + field specs) next time —"
-            " it adds matchedCount diagnostics, lazy-src resolution, and"
-            " record_name persistence."
-        )
-    if record_name:
-        if rows is None:
-            return {
-                **result,
-                "status": "failed",
-                "error": (
-                    "record_name was provided, but evaluated value was not a"
-                    " list of objects or an object with rows=[...]"
-                ),
-            }
-        record_result = _record_extraction(
-            agent,
-            {
-                "name": record_name,
-                "rows": rows,
-                "schema": {"source": "eval_js_json"},
-                "description": description or "Rows extracted by eval_js_json",
-            },
-        )
-        result["recordExtraction"] = record_result
-        if _record_extraction_persisted(record_result):
-            agent.pending_unrecorded_extraction = None
-    elif rows:
-        agent.pending_unrecorded_extraction = {
-            "source": "eval_js_json",
-            "step": step,
-            "rowCount": len(rows),
-            "turns": 0,
-        }
-    return result
-
-
-_FLAT_COLLECTION_MAP_RE = re.compile(r"\.map\s*\(|forEach\s*\(")
-# Cross-node markers extract_dom_records cannot express — their presence means
-# the free-form JS is justified. Note: r"querySelector\s*\(" does NOT match
-# "querySelectorAll(" ("querySelector" is followed by "All", not "(").
-_CROSS_NODE_JS_RE = re.compile(
-    r"\bclosest\s*\(|\.parentElement\b|\.parentNode\b"
-    r"|\.next(?:Element)?Sibling\b|\.previous(?:Element)?Sibling\b"
-    r"|\.children\b|\.childNodes\b"
-    r"|\.(?:first|last)(?:Element)?Child\b"
-    r"|querySelector\s*\("
-)
-
-
-def _looks_like_flat_collection_js(expression: str) -> bool:
-    """True when the JS is a single querySelectorAll + map/forEach projection —
-    the shape extract_dom_records covers declaratively. Advisory only."""
-    expr = str(expression or "")
-    if expr.count("querySelectorAll") != 1:
-        return False
-    if not _FLAT_COLLECTION_MAP_RE.search(expr):
-        return False
-    return not _CROSS_NODE_JS_RE.search(expr)
-
-
-def _eval_js_policy_warnings(
-    *,
-    record_name: str,
-    reason_kind: str,
-    why_dom_primitives_insufficient: str,
-    cross_check_plan: str,
-) -> List[JsonDict]:
-    warnings: List[JsonDict] = []
-    if reason_kind not in EVAL_JS_REASON_KINDS:
-        warnings.append({
-            "type": "eval_js_json_invalid_reason_kind",
-            "reason_kind": reason_kind,
-            "allowed": sorted(EVAL_JS_REASON_KINDS),
-        })
-    if len(why_dom_primitives_insufficient.strip()) < 30:
-        warnings.append({
-            "type": "eval_js_json_without_sufficient_dom_reason",
-            "message": (
-                "State why DOM.getAXTree + DOM.getText/DOM.getAttribute cannot"
-                " solve this extraction."
-            ),
-        })
-    if len(cross_check_plan.strip()) < 20:
-        warnings.append({
-            "type": "eval_js_json_without_cross_check_plan",
-            "message": (
-                "State how at least one target field will be cross-checked with"
-                " DOM.getText or DOM.getAttribute before record_extraction."
-            ),
-        })
-    if warnings and not record_name:
-        for warning in warnings:
-            warning["severity"] = "warning"
-    return warnings
 
 
 def _find_in_axtree(agent: Any, tool_input: JsonDict) -> JsonDict:
@@ -2857,159 +3326,800 @@ def _find_in_axtree(agent: Any, tool_input: JsonDict) -> JsonDict:
     }
 
 
+_URL_DEFAULT_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443}
+
+# One Page.navigate reaches the site as one real request. Bounding the redirect
+# read loop keeps verification cheap without ever re-issuing that request.
+NAVIGATE_VERIFIED_DEFAULT_STATE_CHECKS = 5
+NAVIGATE_VERIFIED_MAX_STATE_CHECKS = 10
+NAVIGATE_VERIFIED_STATE_RECHECK_SECONDS = 0.5
+_NAVIGATION_IN_FLIGHT_STATUSES = {"loading", "navigating", "pending"}
+_NAVIGATION_FAILED_STATUSES = {"failed", "loadfailed", "load_failed", "crashed"}
+
+
+def _normalize_url_for_equivalence(raw: str) -> str:
+    """Canonicalize only the URL differences no server can distinguish.
+
+    Scheme/host case and an explicit default port are erased, and an empty path
+    becomes "/" so `https://x.com` and `https://x.com/` compare equal. Path,
+    query (including its order) and fragment stay byte-exact: a redirect that
+    rewrites the path or appends tracking parameters must still read as a
+    mismatch, because it means the caller did not land where it asked to.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return text
+    if not parsed.scheme or not parsed.netloc:
+        return text
+    try:
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+    except ValueError:
+        # A malformed port makes the authority unparseable; comparing the raw
+        # text is wrong-but-honest, whereas guessing an authority is not.
+        return text
+    if not host:
+        return text
+    scheme = parsed.scheme.lower()
+    userinfo = ""
+    if parsed.username:
+        userinfo = parsed.username
+        if parsed.password:
+            userinfo = f"{userinfo}:{parsed.password}"
+        userinfo = f"{userinfo}@"
+    netloc = f"{userinfo}{host}"
+    if port is not None and port != _URL_DEFAULT_PORTS.get(scheme):
+        netloc = f"{netloc}:{port}"
+    rebuilt = f"{scheme}://{netloc}{parsed.path or '/'}"
+    if parsed.query:
+        rebuilt = f"{rebuilt}?{parsed.query}"
+    if parsed.fragment:
+        rebuilt = f"{rebuilt}#{parsed.fragment}"
+    return rebuilt
+
+
+def _make_url_matcher(
+    url_re: Any,
+    target_url: str,
+) -> Callable[[str], bool]:
+    """Return the URL acceptance test for one navigate_verified call.
+
+    A caller-supplied regex is used verbatim. Without one the harness compares
+    normalized URLs instead of synthesizing a regex: an unanchored `re.escape`
+    pattern would accept `https://phish.example/?next=<target>`, and an anchored
+    one rejects a bare trailing-slash difference the browser always adds.
+    """
+    if url_re is not None:
+        return lambda actual: bool(url_re.search(actual or ""))
+    expected = _normalize_url_for_equivalence(target_url)
+    return lambda actual: _normalize_url_for_equivalence(actual) == expected
+
+
+def _possible_double_escape(pattern: str, actual_url: str) -> Optional[JsonDict]:
+    """Flag a caller pattern that fails ONLY because it looks over-escaped.
+
+    All three conditions must hold together, so a legitimately escaped pattern
+    that simply does not describe this page is never flagged: the original does
+    not match, dropping one escaping layer still compiles, and the de-escaped
+    form does match. The pattern is reported, never rewritten or applied — a
+    syntactically valid regex belongs to its caller.
+    """
+    if not pattern or "\\\\" not in pattern or not actual_url:
+        return None
+    try:
+        if re.compile(pattern).search(actual_url):
+            return None
+    except re.error:
+        return None
+    candidate = pattern.replace("\\\\", "\\")
+    if candidate == pattern:
+        return None
+    try:
+        candidate_re = re.compile(candidate)
+    except re.error:
+        return None
+    if not candidate_re.search(actual_url):
+        return None
+    return {
+        "code": "possible_double_escape",
+        "expectedUrlPattern": pattern[:200],
+        "deEscapedCandidate": candidate[:200],
+        "detail": (
+            "expectedUrlPattern fails only because it appears to carry an extra"
+            " escaping layer. The harness did not rewrite or apply the"
+            " candidate. This is a note about how to write the pattern next"
+            " time — it is NOT a reason to re-navigate to this URL, which has"
+            " already loaded."
+        ),
+    }
+
+
 async def _navigate_verified(agent: Any, tool_input: JsonDict, step: int) -> JsonDict:
+    """Navigate once and report what was actually observed.
+
+    The audit fields are merged onto whatever terminal receipt the
+    implementation returns, so `navigateDispatchCount` is present and truthful
+    on EVERY branch — including the early input rejections, HITL handoffs, and
+    AX-refresh failures that each build their own dict.
+    """
+    audit: JsonDict = {"navigateDispatchCount": 0}
+    result = await _navigate_verified_impl(agent, tool_input, step, audit)
+    if isinstance(result, dict):
+        result.update(audit)
+    return result
+
+
+async def _navigate_verified_impl(
+    agent: Any,
+    tool_input: JsonDict,
+    step: int,
+    audit: JsonDict,
+) -> JsonDict:
     page_id = str(tool_input.get("pageId") or "").strip()
     url = str(tool_input.get("url") or "").strip()
     expected_url_pattern = str(tool_input.get("expectedUrlPattern") or "").strip()
     expected_title_pattern = str(tool_input.get("expectedTitlePattern") or "").strip()
     timeout_seconds = max(1.0, min(float(tool_input.get("timeoutSeconds") or 20.0), 120.0))
-    max_retries = max(1, min(optional_int(tool_input.get("maxRetries"), 1) or 1, 3))
+    # `maxRetries` used to multiply Page.navigate dispatches, so a caller
+    # expectation that could never match spent N real requests on a page that
+    # had already arrived. It now only bounds read-side redirect settlement,
+    # under its new name; the legacy key keeps working and says so in the receipt.
+    legacy_retries = optional_int(tool_input.get("maxRetries"), None)
+    max_state_checks = optional_int(
+        tool_input.get("maxStateChecks"),
+        legacy_retries if legacy_retries is not None else NAVIGATE_VERIFIED_DEFAULT_STATE_CHECKS,
+    )
+    max_state_checks = max(
+        1,
+        min(
+            max_state_checks or NAVIGATE_VERIFIED_DEFAULT_STATE_CHECKS,
+            NAVIGATE_VERIFIED_MAX_STATE_CHECKS,
+        ),
+    )
     if not page_id:
         return {"status": "failed", "error": "pageId is required"}
     if not url:
         return {"status": "failed", "error": "url is required"}
 
-    pattern = expected_url_pattern or f"^{re.escape(url)}$"
-    title_re = re.compile(expected_title_pattern) if expected_title_pattern else None
-    url_re = re.compile(pattern)
+    # Compile before dispatching. An expectation that cannot compile can never
+    # be satisfied, so navigating first would spend a real request on a call
+    # that is already doomed.
+    url_re = None
+    if expected_url_pattern:
+        try:
+            url_re = re.compile(expected_url_pattern)
+        except re.error as exc:
+            return _navigate_pattern_invalid_result(
+                page_id=page_id,
+                field="expectedUrlPattern",
+                pattern=expected_url_pattern,
+                error=str(exc),
+            )
+    title_re = None
+    if expected_title_pattern:
+        try:
+            title_re = re.compile(expected_title_pattern)
+        except re.error as exc:
+            return _navigate_pattern_invalid_result(
+                page_id=page_id,
+                field="expectedTitlePattern",
+                pattern=expected_title_pattern,
+                error=str(exc),
+            )
+
+    url_matches = _make_url_matcher(url_re, url)
+    expectation_mode = "caller_regex" if url_re is not None else "normalized_url_equality"
     attempts: List[JsonDict] = []
     state_resync_count = 0
     last_challenge_summary: JsonDict = {}
+    audit["urlExpectationMode"] = expectation_mode
+    audit["maxStateChecks"] = max_state_checks
+    if legacy_retries is not None and tool_input.get("maxStateChecks") is None:
+        audit["maxRetriesInterpretedAs"] = "state_checks"
 
-    for attempt in range(1, max_retries + 1):
-        deadline = time.monotonic() + timeout_seconds
-        nav = await _invoke_browser_method(
+    # Exactly one Page.navigate per call, unconditionally. A failed expectation
+    # is not a failed navigation, and this composite must never hide a second
+    # request from the model that authorized one.
+    attempt = 1
+    deadline = time.monotonic() + timeout_seconds
+    nav = await _invoke_browser_method(
+        agent,
+        "Page.navigate",
+        {
+            "pageId": page_id,
+            "url": url,
+            "purpose": "Navigate and verify URL",
+        },
+        step,
+        count_progress=False,
+    )
+    # The count is what actually reached transport, not what this composite
+    # intended. A pre-dispatch guard answers `tool_was_executed=False` without
+    # the panel ever seeing the call, and reporting 1 there would contradict
+    # the `navigation_not_dispatched` status sitting beside it.
+    if nav.get("tool_was_executed") is not False:
+        audit["navigateDispatchCount"] = 1
+    if _result_has_auto_hitl(nav):
+        return _navigate_hitl_result(page_id, attempt, nav)
+    if _invoke_result_failed(nav):
+        return await _navigate_dispatch_failure_result(
             agent,
-            "Page.navigate",
+            page_id=page_id,
+            url=url,
+            nav=nav,
+            step=step,
+        )
+    last_challenge_summary = _page_challenge_summary(agent, page_id)
+    tracker = getattr(agent, "page_lifecycle", None)
+    settlement = "unknown"
+    if isinstance(tracker, PageLifecycleTracker):
+        settlement = await tracker.wait_for_settlement(
+            page_id,
+            max(0.0, deadline - time.monotonic()),
+        )
+    redirect_settlements = 0
+    state_checks_used = 0
+    state_read_failed = False
+    last_state: JsonDict = {}
+    while True:
+        # ONE budget for every Page.getState this settlement loop issues,
+        # whichever path asked for it. Two separate counters let a redirect
+        # keep granting reads that the recheck budget had already refused.
+        if state_checks_used >= max_state_checks:
+            break
+        # Register the fresh settlement waiter before Page.getState so a
+        # redirect that starts/finishes during the RPC cannot fall through
+        # the gap. This is event-driven redirect tolerance, not polling.
+        remaining = max(0.0, deadline - time.monotonic())
+        redirect_waiter = None
+        if state_checks_used + 1 < max_state_checks and remaining > 0:
+            redirect_waiter = _fresh_page_settlement_task(
+                agent, page_id, remaining
+            )
+        state_result = await _invoke_browser_method(
+            agent,
+            "Page.getState",
             {
                 "pageId": page_id,
-                "url": url,
-                "purpose": f"Navigate and verify URL for attempt {attempt}",
+                "purpose": "Synchronize state once after navigation settlement",
             },
             step,
             count_progress=False,
         )
-        if _result_has_auto_hitl(nav):
-            return _navigate_hitl_result(page_id, attempt, nav)
+        state_resync_count += 1
+        state_checks_used += 1
+        if _result_has_auto_hitl(state_result):
+            await _cancel_waiter(redirect_waiter)
+            return _navigate_hitl_result(page_id, attempt, state_result)
+        # A failed read yields an empty snapshot, which looks exactly like "the
+        # page is at about:blank with no title". Remember that the state is
+        # unknown so the terminal branch cannot report it as an arrival.
+        state_outcome = classify_call_outcome(state_result)
+        state_read_failed = not (
+            state_outcome.succeeded
+            and page_state_evidence_ok(page_id, state_result)
+        )
+        last_state = _navigation_state_snapshot(
+            _response_data(state_result),
+            url_matches=url_matches,
+            title_re=title_re,
+            settlement=settlement,
+            redirect_settlements=redirect_settlements,
+        )
+        current_url = str(last_state.get("url") or "")
+        title = str(last_state.get("title") or "")
+        status = str(last_state.get("status") or "")
+        title_is_lingering = bool(last_state.get("titleLingering"))
+        url_ok = bool(last_state.get("urlOk"))
+        title_ok = bool(last_state.get("titleOk"))
         last_challenge_summary = _page_challenge_summary(agent, page_id)
-        tracker = getattr(agent, "page_lifecycle", None)
-        settlement = "unknown"
-        if isinstance(tracker, PageLifecycleTracker):
-            settlement = await tracker.wait_for_settlement(page_id, timeout_seconds)
-        redirect_settlements = 0
-        last_state: JsonDict = {}
-        while True:
-            # Register the fresh settlement waiter before Page.getState so a
-            # redirect that starts/finishes during the RPC cannot fall through
-            # the gap. This is event-driven redirect tolerance, not polling.
-            remaining = max(0.0, deadline - time.monotonic())
-            redirect_waiter = None
-            if redirect_settlements < 5 and remaining > 0:
-                redirect_waiter = _fresh_page_settlement_task(
-                    agent, page_id, remaining
+        # A matching URL/title is not arrival on a tab that is still fetching
+        # or that reported a failed load. The harness's own doctrine forbids
+        # DOM probes before settlement, so `done` in either state would
+        # contradict the instruction the model is given.
+        if (
+            url_ok
+            and title_ok
+            and not title_is_lingering
+            and not state_read_failed
+            and status not in _NAVIGATION_IN_FLIGHT_STATUSES
+            and status not in _NAVIGATION_FAILED_STATUSES
+        ):
+            await _cancel_waiter(redirect_waiter)
+            # Page.navigate invalidates DOM identity. Refresh the AXTree before
+            # returning so callers cannot inherit a clean-looking stale cache.
+            # AX refresh failure is not navigation failure: retry only the
+            # perception leg, never Page.navigate, after URL/title are proven.
+            tree_result, tree_attempts, ax_state_resyncs, ax_latest_state = (
+                await _refresh_axtree_after_verified_navigation(
+                    agent,
+                    page_id=page_id,
+                    step=step,
+                    deadline=deadline,
+                    url_matches=url_matches,
+                    title_re=title_re,
                 )
+            )
+            state_resync_count += ax_state_resyncs
+            if _result_has_auto_hitl(tree_result):
+                return _navigate_hitl_result(page_id, attempt, tree_result)
+            if isinstance(ax_latest_state, dict):
+                if tree_result.get("status") == "navigation_redirected_during_ax_refresh":
+                    return {
+                        "status": "navigation_redirected_during_ax_refresh",
+                        "error": (
+                            "page URL/title changed after navigation was"
+                            " verified and before AX refresh completed"
+                        ),
+                        "pageId": page_id,
+                        "url": ax_latest_state.get("url"),
+                        "title": ax_latest_state.get("title"),
+                        "pageStatus": ax_latest_state.get("status"),
+                        "attempt": attempt,
+                        "navigationVerified": False,
+                        "previousVerifiedState": last_state,
+                        "currentState": ax_latest_state,
+                        "stateResyncCount": state_resync_count,
+                        "redirectSettlementCount": redirect_settlements,
+                        "axtreeRefreshed": False,
+                        "axtreeRefreshAttempts": len(tree_attempts),
+                        "axtreeRefreshResults": tree_attempts,
+                        "suspectedChallenge": (
+                            _page_challenge_summary(agent, page_id) or None
+                        ),
+                        "next_instruction": (
+                            "Do not report the earlier navigation as verified"
+                            " and do not guess the new page's meaning. Inspect"
+                            " the reported current URL/title and recover or"
+                            " re-verify from the current page state."
+                        ),
+                    }
+                last_state = ax_latest_state
+                current_url = str(last_state.get("url") or "")
+                title = str(last_state.get("title") or "")
+                status = str(last_state.get("status") or "")
+            if tree_result.get("status") == "navigation_state_resync_failed_during_ax":
+                return {
+                    "status": "navigation_verified_state_resync_failed",
+                    "error": (
+                        "navigation URL/title were verified, but page state"
+                        " resynchronization failed during AX refresh"
+                    ),
+                    "pageId": page_id,
+                    "url": current_url,
+                    "title": title,
+                    "pageStatus": status,
+                    "attempt": attempt,
+                    "navigationVerified": True,
+                    "state": last_state,
+                    "stateResyncCount": state_resync_count,
+                    "axtreeRefreshed": bool(
+                        tree_result.get("axtreeRefreshed")
+                    ),
+                    "axtreeRefreshAttempts": len(tree_attempts),
+                    "axtreeRefreshResults": tree_attempts,
+                    "next_instruction": (
+                        "Do NOT call navigate_verified again for this"
+                        " navigation. Complete the required Page.getState"
+                        " resynchronization on this page before issuing"
+                        " dependent page actions."
+                    ),
+                }
+            if _invoke_result_failed(tree_result):
+                attempt_receipt = {
+                    "attempt": attempt,
+                    "lastState": last_state,
+                    "axtreeRefreshAttempts": len(tree_attempts),
+                    "axtreeRefreshResults": tree_attempts,
+                }
+                attempts.append(attempt_receipt)
+                last_challenge_summary = _page_challenge_summary(agent, page_id)
+                if _challenge_score(last_challenge_summary) >= 80:
+                    return _navigate_challenge_blocked_result(
+                        page_id=page_id,
+                        attempt=attempt,
+                        last_state=last_state,
+                        attempts=attempts,
+                        state_resync_count=state_resync_count,
+                        challenge_summary=last_challenge_summary,
+                        expected_url_pattern=expected_url_pattern,
+                        expected_title_pattern=expected_title_pattern,
+                        trigger="verified_navigation_ax_refresh_failed_with_challenge",
+                    )
+                return {
+                    "status": "navigation_verified_ax_refresh_failed",
+                    "error": (
+                        "navigation URL/title were verified, but the fresh"
+                        " AXTree could not be obtained"
+                    ),
+                    "pageId": page_id,
+                    "url": current_url,
+                    "title": title,
+                    "pageStatus": status,
+                    "attempt": attempt,
+                    "navigationVerified": True,
+                    "navigateResult": _strip_challenge_fields(nav),
+                    "state": last_state,
+                    "stateResyncCount": state_resync_count,
+                    "redirectSettlementCount": redirect_settlements,
+                    "axtreeRefreshed": False,
+                    "axtreeRefreshAttempts": len(tree_attempts),
+                    "axtreeRefreshResults": tree_attempts,
+                    "next_instruction": (
+                        "Do NOT call navigate_verified again: the target URL"
+                        " and title are already verified. Recover the current"
+                        " renderer/page if needed, then retry DOM.getAXTree on"
+                        " this pageId."
+                    ),
+                }
+            _clear_navigation_challenge_state(agent, page_id)
+            return {
+                "status": "done",
+                "pageId": page_id,
+                "url": current_url,
+                "title": title,
+                "pageStatus": status,
+                "attempt": attempt,
+                "navigationCommitted": True,
+                "navigateResult": _strip_challenge_fields(nav),
+                "state": last_state,
+                "stateResyncCount": state_resync_count,
+                "redirectSettlementCount": redirect_settlements,
+                "axtreeRefreshed": True,
+                "axtreeRefreshAttempts": len(tree_attempts),
+                "axtreeRefreshResults": tree_attempts,
+            }
+        settlement_event = (
+            await redirect_waiter if redirect_waiter is not None else None
+        )
+        if settlement_event is not None:
+            redirect_settlements += 1
+            settlement = str(settlement_event.get("event") or "redirect_settled")
+            continue
+        # No settlement event arrived, but a page that is still loading or still
+        # showing an interstitial title has not finished arriving. Re-read its
+        # state instead of declaring a mismatch: Page.getState never touches the
+        # site, unlike the Page.navigate replay this loop used to fall back on.
+        if (
+            state_checks_used < max_state_checks
+            and time.monotonic() < deadline
+            and (
+                state_read_failed
+                or title_is_lingering
+                or status in _NAVIGATION_IN_FLIGHT_STATUSES
+            )
+        ):
+            settlement = "state_recheck"
+            await asyncio.sleep(NAVIGATE_VERIFIED_STATE_RECHECK_SECONDS)
+            continue
+        break
+    attempts.append({"attempt": attempt, "lastState": last_state})
+
+    if _challenge_score(last_challenge_summary) >= 80:
+        return _navigate_challenge_blocked_result(
+            page_id=page_id,
+            attempt=attempt,
+            last_state=attempts[-1].get("lastState", {}) if attempts else {},
+            attempts=attempts,
+            state_resync_count=state_resync_count,
+            challenge_summary=last_challenge_summary,
+            expected_url_pattern=expected_url_pattern,
+            expected_title_pattern=expected_title_pattern,
+            trigger="navigation_verification_exhausted_with_challenge",
+        )
+
+    # Verification did not pass. "The page arrived but your pattern was wrong"
+    # is only ONE of the reasons that can happen, and it is the only one that
+    # licenses the model to keep working from this page. Claiming it when the
+    # state was unreadable, still loading, or reported a load failure would put
+    # a fact in the receipt that the harness never observed.
+    actual_url = str(last_state.get("url") or "")
+    actual_title = str(last_state.get("title") or "")
+    page_status = str(last_state.get("status") or "")
+    lifecycle_state = (
+        tracker.state(page_id)
+        if isinstance(tracker, PageLifecycleTracker)
+        else None
+    )
+    lifecycle_status = (
+        str(getattr(lifecycle_state, "status", "") or "")
+        if lifecycle_state is not None
+        else ""
+    )
+    common: JsonDict = {
+        "tool_was_executed": True,
+        "pageId": page_id,
+        "requestedUrl": url,
+        "actualUrl": actual_url,
+        "actualTitle": actual_title,
+        "pageStatus": page_status,
+        "lifecycleStatus": lifecycle_status or None,
+        "expectedUrlPattern": expected_url_pattern or None,
+        "expectedTitlePattern": expected_title_pattern or None,
+        "attempts": attempts,
+        "stateResyncCount": state_resync_count,
+        "suspectedChallenge": last_challenge_summary or None,
+    }
+
+    if state_read_failed:
+        return {
+            **common,
+            "status": "navigation_outcome_unknown",
+            "navigationCommitted": None,
+            "reason": "state_unreadable",
+            "error": "Page.getState did not return a readable state",
+            "next_instruction": (
+                "The navigation was dispatched but the page state could not be"
+                " read, so where the page landed is unknown. Do NOT call"
+                " navigate_verified again for this navigation, and do not treat"
+                " actualUrl as observed: recover the page or re-read its state"
+                " with Page.getState first."
+            ),
+        }
+
+    if lifecycle_status in {"failed", "crashed"} or page_status in _NAVIGATION_FAILED_STATUSES:
+        return {
+            **common,
+            "status": "navigation_load_failed",
+            "navigationCommitted": False,
+            "error": f"page reported a failed load (status={page_status or lifecycle_status})",
+            "next_instruction": (
+                "The browser received the navigation and the page failed to"
+                " load. Inspect the failure before deciding whether a retry is"
+                " warranted; this composite will not re-dispatch it for you."
+            ),
+        }
+
+    if bool(last_state.get("titleLingering")) or page_status in _NAVIGATION_IN_FLIGHT_STATUSES:
+        return {
+            **common,
+            "status": "navigation_settlement_incomplete",
+            "navigationCommitted": True,
+            "titleLingering": bool(last_state.get("titleLingering")),
+            "next_instruction": (
+                "The navigation committed but the page had not finished"
+                " settling when the read budget ran out. Do NOT call"
+                " navigate_verified again for this navigation — that would"
+                " re-request the URL. Call Page.getState once to see whether it"
+                " settled, and do not treat actualTitle as final until it has."
+            ),
+        }
+
+    result: JsonDict = {
+        **common,
+        "status": "navigation_arrived_expectation_mismatch",
+        "navigationCommitted": True,
+        "urlOk": bool(last_state.get("urlOk")),
+        "titleOk": bool(last_state.get("titleOk")),
+        "titleLingering": False,
+        "next_instruction": (
+            "The browser reached actualUrl/actualTitle; only the expectation"
+            " failed. Do NOT call navigate_verified again for this navigation:"
+            " the page is already here, so continue read-only with"
+            " Page.getState/DOM.getAXTree. Apply any corrected expectation only"
+            " to a future, genuinely different navigation."
+        ),
+    }
+    suspect = _possible_double_escape(expected_url_pattern, actual_url)
+    if suspect:
+        result["expectationPatternSuspect"] = suspect
+    return result
+
+
+NAVIGATE_VERIFIED_AX_REFRESH_MAX_ATTEMPTS = 3
+
+
+def _navigation_state_snapshot(
+    data: Any,
+    *,
+    url_matches: Callable[[str], bool],
+    title_re: Any,
+    settlement: str,
+    redirect_settlements: int,
+) -> JsonDict:
+    data = data if isinstance(data, dict) else {}
+    current_url = str(data.get("url") or "")
+    title = str(data.get("title") or "")
+    return {
+        "url": current_url,
+        "title": title,
+        "status": str(data.get("status") or ""),
+        "urlOk": bool(url_matches(current_url)),
+        "titleOk": True if title_re is None else bool(title_re.search(title)),
+        "titleLingering": is_lingering_loading_title(title),
+        "settlement": settlement,
+        "redirectSettlements": redirect_settlements,
+    }
+
+
+async def _refresh_axtree_after_verified_navigation(
+    agent: Any,
+    *,
+    page_id: str,
+    step: int,
+    deadline: float,
+    url_matches: Callable[[str], bool],
+    title_re: Any,
+) -> Tuple[JsonDict, List[JsonDict], int, Optional[JsonDict]]:
+    """Refresh post-navigation DOM identity without replaying navigation.
+
+    ``Page.navigate`` may already have committed even when AX collection hits a
+    transient renderer/lifecycle failure. Replaying it can duplicate side
+    effects and restart loading. Keep this recovery leg bounded by the original
+    navigation attempt deadline and retry only state synchronization/AX.
+    """
+    attempts: List[JsonDict] = []
+    state_resync_count = 0
+    latest_state: Optional[JsonDict] = None
+    last_result: JsonDict = {
+        "status": "axtree_refresh_deadline_exhausted",
+        "tool_was_executed": False,
+    }
+    force_next_ax = False
+    for ax_attempt in range(1, NAVIGATE_VERIFIED_AX_REFRESH_MAX_ATTEMPTS + 1):
+        # The first AX refresh is a required consistency check after navigation,
+        # even when Page.navigate/settlement consumed the nominal deadline. Only
+        # tolerance retries (attempts 2-3) are suppressed after budget expiry.
+        if ax_attempt > 1 and time.monotonic() >= deadline and not force_next_ax:
+            break
+        force_next_ax = False
+        tracker = getattr(agent, "page_lifecycle", None)
+        lifecycle_before = (
+            tracker.state(page_id)
+            if isinstance(tracker, PageLifecycleTracker)
+            else None
+        )
+        generation_before = (
+            lifecycle_before.generation if lifecycle_before is not None else None
+        )
+        tree_result = await _invoke_browser_method(
+            agent,
+            "DOM.getAXTree",
+            {
+                "pageId": page_id,
+                "purpose": (
+                    "Refresh DOM identity after verified navigation"
+                    f" (AX attempt {ax_attempt})"
+                ),
+            },
+            step,
+            count_progress=False,
+        )
+        last_result = tree_result
+        attempt_receipt: JsonDict = {"attempt": ax_attempt, "result": tree_result}
+        attempts.append(attempt_receipt)
+        if _result_has_auto_hitl(tree_result):
+            return tree_result, attempts, state_resync_count, latest_state
+
+        # A redirect/recovery can begin between the verified Page.getState and
+        # the AX RPC. Discharge only the newly raised state-resync obligation;
+        # never convert it into another Page.navigate attempt.
+        lifecycle_state = (
+            tracker.state(page_id)
+            if isinstance(tracker, PageLifecycleTracker)
+            else None
+        )
+        generation_changed = bool(
+            lifecycle_state is not None
+            and generation_before is not None
+            and lifecycle_state.generation != generation_before
+        )
+        crashed = bool(
+            lifecycle_state is not None
+            and (
+                lifecycle_state.status == "crashed"
+                or lifecycle_state.last_event == "Page.crashed"
+            )
+        )
+        identity_invalidated = bool(generation_changed or crashed)
+        state_resync_required = bool(
+            lifecycle_state is not None
+            and lifecycle_state.requires_state_resync
+        )
+        tree_failed = _invoke_result_failed(tree_result)
+        if not tree_failed and not identity_invalidated and not state_resync_required:
+            return tree_result, attempts, state_resync_count, latest_state
+        if identity_invalidated:
+            # Even a successful AX response is stale when navigation generation
+            # changed (or the renderer crashed) during the RPC. Quarantine it
+            # and require a new AX after state synchronization; never combine
+            # old-tree evidence with the new page's URL/title.
+            quarantine_reason = (
+                "page_generation_changed_during_ax"
+                if generation_changed
+                else "page_crashed_during_ax"
+            )
+            attempt_receipt["quarantined"] = quarantine_reason
+            if isinstance(tracker, PageLifecycleTracker):
+                tracker.invalidate_ax_refresh(page_id)
+            _invalidate_axtree_snapshot(
+                agent,
+                "navigate_verified.ax_identity_invalidated",
+                {"pageId": page_id},
+            )
+            last_result = {
+                "status": "axtree_refresh_invalidated_by_navigation",
+                "tool_was_executed": False,
+            }
+        if state_resync_required:
             state_result = await _invoke_browser_method(
                 agent,
                 "Page.getState",
                 {
                     "pageId": page_id,
-                    "purpose": "Synchronize state once after navigation settlement",
+                    "purpose": (
+                        "Synchronize state after post-navigation AX refresh failure"
+                    ),
                 },
                 step,
                 count_progress=False,
             )
             state_resync_count += 1
             if _result_has_auto_hitl(state_result):
-                await _cancel_waiter(redirect_waiter)
-                return _navigate_hitl_result(page_id, attempt, state_result)
-            data = _response_data(state_result)
-            current_url = str(data.get("url") or "")
-            title = str(data.get("title") or "")
-            status = str(data.get("status") or "")
-            title_is_lingering = is_lingering_loading_title(title)
-            url_ok = bool(url_re.search(current_url))
-            title_ok = True if title_re is None else bool(title_re.search(title))
-            last_state = {
-                "url": current_url,
-                "title": title,
-                "status": status,
-                "urlOk": url_ok,
-                "titleOk": title_ok,
-                "titleLingering": title_is_lingering,
-                "settlement": settlement,
-                "redirectSettlements": redirect_settlements,
-            }
-            last_challenge_summary = _page_challenge_summary(agent, page_id)
-            if url_ok and title_ok and not title_is_lingering:
-                await _cancel_waiter(redirect_waiter)
-                # Page.navigate invalidates DOM identity. Refresh the AXTree before
-                # returning so callers cannot inherit a clean-looking stale cache.
-                tree_result = await _invoke_browser_method(
-                    agent,
-                    "DOM.getAXTree",
+                return state_result, attempts, state_resync_count, latest_state
+            state_outcome = classify_call_outcome(state_result)
+            if not (
+                state_outcome.succeeded
+                and page_state_evidence_ok(page_id, state_result)
+            ):
+                return (
                     {
-                        "pageId": page_id,
-                        "purpose": "Refresh DOM identity after verified navigation",
+                        "status": "navigation_state_resync_failed_during_ax",
+                        "tool_was_executed": False,
+                        "axtreeRefreshed": bool(
+                            not tree_failed and not identity_invalidated
+                        ),
                     },
-                    step,
-                    count_progress=False,
+                    attempts,
+                    state_resync_count,
+                    latest_state,
                 )
-                if _invoke_result_failed(tree_result):
-                    attempts.append({
-                        "attempt": attempt,
-                        "lastState": last_state,
-                        "axtreeRefresh": tree_result,
-                    })
-                    break
-                _clear_navigation_challenge_state(agent, page_id)
-                return {
-                    "status": "done",
-                    "pageId": page_id,
-                    "url": current_url,
-                    "title": title,
-                    "pageStatus": status,
-                    "attempt": attempt,
-                    "navigateResult": _strip_challenge_fields(nav),
-                    "state": last_state,
-                    "stateResyncCount": state_resync_count,
-                    "redirectSettlementCount": redirect_settlements,
-                    "axtreeRefreshed": True,
-                }
-            settlement_event = (
-                await redirect_waiter if redirect_waiter is not None else None
+            latest_state = _navigation_state_snapshot(
+                _response_data(state_result),
+                url_matches=url_matches,
+                title_re=title_re,
+                settlement="ax_refresh_state_resync",
+                redirect_settlements=0,
             )
-            if settlement_event is None:
-                break
-            redirect_settlements += 1
-            settlement = str(settlement_event.get("event") or "redirect_settled")
-        attempts.append({"attempt": attempt, "lastState": last_state})
-
-    if _challenge_score(last_challenge_summary) >= 80:
-        return _navigate_challenge_blocked_result(
-            page_id=page_id,
-            attempt=max_retries,
-            last_state=attempts[-1].get("lastState", {}) if attempts else {},
-            attempts=attempts,
-            state_resync_count=state_resync_count,
-            challenge_summary=last_challenge_summary,
-            expected_url_pattern=pattern,
-            expected_title_pattern=expected_title_pattern,
-            trigger="navigation_verification_exhausted_with_challenge",
-        )
-
-    return {
-        "status": "failed",
-        "error": "navigation verification failed",
-        "expectedUrlPattern": pattern,
-        "expectedTitlePattern": expected_title_pattern or None,
-        "attempts": attempts,
-        "stateResyncCount": state_resync_count,
-        "suspectedChallenge": last_challenge_summary or None,
-        "next_instruction": (
-            "Do not assume navigation succeeded. Reuse the reported actual URL/title,"
-            " retry with a corrected expected pattern, or open a fresh page."
-        ),
-    }
+            if (
+                not latest_state.get("urlOk")
+                or not latest_state.get("titleOk")
+                or latest_state.get("titleLingering")
+            ):
+                if not identity_invalidated:
+                    attempt_receipt["quarantined"] = (
+                        "page_state_mismatch_during_ax"
+                    )
+                    if isinstance(tracker, PageLifecycleTracker):
+                        tracker.invalidate_ax_refresh(page_id)
+                    _invalidate_axtree_snapshot(
+                        agent,
+                        "navigate_verified.ax_state_mismatch",
+                        {"pageId": page_id},
+                    )
+                return (
+                    {
+                        "status": "navigation_redirected_during_ax_refresh",
+                        "tool_was_executed": False,
+                    },
+                    attempts,
+                    state_resync_count,
+                    latest_state,
+                )
+            if not tree_failed and not identity_invalidated:
+                # Dialog/chooser/download events require state synchronization
+                # but do not invalidate DOM identity. Keep the successful AX and
+                # return without an unnecessary replacement AX RPC.
+                return tree_result, attempts, state_resync_count, latest_state
+            # The preceding AX failed or belongs to the previous lifecycle
+            # generation. Its replacement is a mandatory consistency check, not
+            # a tolerance retry, so it gets one bounded attempt past deadline.
+            force_next_ax = True
+    return last_result, attempts, state_resync_count, latest_state
 
 
 def _fresh_page_settlement_task(
@@ -3060,6 +4170,252 @@ def _page_challenge_summary(agent: Any, page_id: str) -> JsonDict:
     return state.to_summary() if state is not None else {}
 
 
+def _ensure_content_completeness_tracker(
+    agent: Any,
+) -> Optional[ContentCompletenessTracker]:
+    """Install the worker's normalized completeness contract when needed."""
+    contract = getattr(agent, "worker_contract", None)
+    config = (
+        contract.get("content_completeness")
+        if isinstance(contract, dict) else None
+    )
+    config_source = (
+        str(contract.get("content_completeness_source") or "explicit")
+        if isinstance(contract, dict) else "explicit"
+    )
+    tracker = getattr(agent, "content_completeness_tracker", None)
+    if tracker is None or (not tracker.enabled and bool(config)):
+        tracker = ContentCompletenessTracker(
+            config,
+            config_source=config_source,
+        )
+        agent.content_completeness_tracker = tracker
+    return tracker
+
+
+def _observe_content_completeness_after(
+    agent: Any,
+    method: str,
+    params: JsonDict,
+    result: JsonDict,
+    step: int,
+    *,
+    content_binding: Any = None,
+) -> JsonDict:
+    contract = getattr(agent, "worker_contract", None)
+    tracker = _ensure_content_completeness_tracker(agent)
+    if tracker is None or not tracker.enabled:
+        return result
+    if hasattr(tracker, "observe_auth_generation"):
+        tracker.observe_auth_generation(
+            getattr(agent, "fleet_barrier_generation", 0)
+        )
+    upstream_blocker = _content_completeness_upstream_blocker(
+        agent,
+        method,
+        params,
+        result,
+    )
+    summary = tracker.observe(
+        method=method,
+        params=params,
+        result=result,
+        step=step,
+        upstream_blocker=upstream_blocker,
+    )
+    binding_receipt = tracker.observe_content_binding(
+        method=method,
+        params=params,
+        result=result,
+        binding=content_binding,
+    ) if isinstance(content_binding, dict) else None
+    if isinstance(binding_receipt, dict) and binding_receipt.get("status") in {
+        "accepted", "unchanged",
+    }:
+        binding_page_id = str(
+            params.get("pageId") if isinstance(params, dict) else ""
+        )
+        binding_state = getattr(tracker, "pages", {}).get(binding_page_id)
+        if binding_state is not None:
+            summary = binding_state.summary()
+    logger = getattr(agent, "logger", None)
+    if logger is not None and hasattr(logger, "write"):
+        phase_id = str(contract.get("phase_id") or "") if isinstance(contract, dict) else ""
+        for telemetry in tracker.drain_telemetry_events():
+            event_name = str(telemetry.pop("event", "") or "")
+            if not event_name:
+                continue
+            payload = {"phaseId": phase_id or None, **telemetry}
+            for key in ("sourceUrl", "targetUrl"):
+                raw_url = str(payload.get(key) or "")
+                if not raw_url:
+                    continue
+                try:
+                    parsed = urlparse(raw_url)
+                    payload[key] = (
+                        f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                        if parsed.scheme and parsed.netloc else parsed.path
+                    )
+                except ValueError:
+                    payload[key] = raw_url.split("?", 1)[0]
+            logger.write(event_name, payload)
+    if not isinstance(summary, dict):
+        return result
+    enriched = dict(result)
+    enriched["contentCompleteness"] = summary
+    if isinstance(binding_receipt, dict):
+        enriched["contentBinding"] = binding_receipt
+        if binding_receipt.get("status") == "rejected":
+            existing_next_step = str(enriched.get("next_step") or "").strip()
+            enriched["next_step"] = " ".join(value for value in (
+                existing_next_step,
+                "Use content_binding.regionId from the declared"
+                " content_completeness expected regions, or omit the binding.",
+            ) if value)
+    page_id = str(summary.get("pageId") or "")
+    recovery_receipt = (
+        tracker.recovery_receipt(page_id)
+        if hasattr(tracker, "recovery_receipt") else None
+    )
+    if isinstance(recovery_receipt, dict):
+        enriched["routeRecovery"] = recovery_receipt
+    route_preference = (
+        tracker.route_preference_for_page(page_id)
+        if hasattr(tracker, "route_preference_for_page") else None
+    )
+    if isinstance(route_preference, dict):
+        enriched["routePreference"] = route_preference
+    binding_instruction = str(
+        summary.get("collectionBindingNextInstruction") or ""
+    ).strip()
+    recovery_instruction = str(
+        (recovery_receipt or {}).get("next_instruction")
+        if isinstance(recovery_receipt, dict) else ""
+    ).strip()
+    decision_instruction = str(
+        summary.get("decisionNextInstruction") or ""
+    ).strip()
+    if binding_instruction or recovery_instruction or decision_instruction:
+        existing_next_step = str(enriched.get("next_step") or "").strip()
+        enriched["next_step"] = " ".join(
+            value for value in (
+                existing_next_step,
+                binding_instruction,
+                recovery_instruction,
+                decision_instruction,
+            ) if value
+        )
+    if logger is not None and hasattr(logger, "write"):
+        logger.write("content_completeness.observed", summary)
+        if (
+            summary.get("decision") != "inconclusive"
+            or summary.get("contentState") != "absent"
+        ):
+            logger.write("content_completeness.decision", summary)
+    return enriched
+
+
+def _content_completeness_upstream_blocker(
+    agent: Any,
+    method: str,
+    params: JsonDict,
+    result: JsonDict,
+) -> str:
+    """Return an existing higher-priority page classification, if any.
+
+    Content completeness must not reinterpret authentication, challenge,
+    lifecycle, navigation, or infrastructure failures as route-sensitive
+    suppression.  Vocabulary remains owned by the dedicated detectors; this
+    adapter consumes their structured receipts only.
+    """
+    if _invoke_result_failed(result):
+        classification = (
+            result.get("errorClassification")
+            if isinstance(result.get("errorClassification"), dict) else {}
+        )
+        kind = str(classification.get("type") or "browser_call_failed").strip()
+        return f"error:{kind}"
+
+    page_id = extract_page_id(params, result)
+    data = _response_data(result)
+    hitl = data.get("hitl") if isinstance(data.get("hitl"), dict) else {}
+    if hitl.get("isPaused") is True or isinstance(result.get("pausedState"), dict):
+        return "hitl_paused"
+
+    if method == "collect_items" and str(result.get("collectionState") or "") == "blocked":
+        overlay_receipt = (
+            result.get("overlayEncountered")
+            if isinstance(result.get("overlayEncountered"), dict) else {}
+        )
+        overlay_subtype = str(overlay_receipt.get("subtype") or "").strip()
+        if overlay_subtype:
+            return f"overlay:{overlay_subtype}"
+        stop_reason = str(result.get("stopReason") or "").strip()
+        if stop_reason in {"overlay_blocked", "overlay_unresolved"}:
+            return f"overlay:{stop_reason.removeprefix('overlay_')}"
+
+    lifecycle = getattr(agent, "page_lifecycle", None)
+    lifecycle_state = (
+        lifecycle.state(page_id)
+        if lifecycle is not None and page_id and hasattr(lifecycle, "state")
+        else None
+    )
+    lifecycle_status = str(getattr(lifecycle_state, "status", "") or "").lower()
+    if lifecycle_status in {"loading", "failed", "crashed"}:
+        return f"lifecycle:{lifecycle_status}"
+
+    status = str(data.get("status") or "").strip().lower().replace("_", "")
+    if status in {"loading", "navigating", "startedloading"}:
+        return "lifecycle:loading"
+    if status in {"failed", "loadfailed", "error", "crashed"}:
+        return f"lifecycle:{status}"
+
+    navigation_check = (
+        result.get("navigationCheck")
+        if isinstance(result.get("navigationCheck"), dict) else {}
+    )
+    navigation_status = str(navigation_check.get("status") or "")
+    if navigation_status == "challenge_pending":
+        return "challenge:navigation"
+    if navigation_status == "off_target":
+        return "navigation:off_target"
+
+    if isinstance(result.get("structuralChallenge"), dict):
+        return "challenge:structural"
+    auto_hitl = result.get("autoHitl")
+    if isinstance(auto_hitl, dict) and _auto_hitl_is_actionable(auto_hitl):
+        return "challenge:hitl"
+    challenge = _page_challenge_summary(agent, page_id)
+    tracker = getattr(agent, "challenge_tracker", None)
+    threshold = int(getattr(tracker, "threshold", 70) or 70)
+    if (
+        challenge.get("structuralChallenge")
+        or challenge.get("highConfidenceHit")
+        or _challenge_score(challenge) >= threshold
+    ):
+        return "challenge:detected"
+
+    overlay = detect_overlay_from_result(result)
+    subtype = str((overlay or {}).get("subtype") or "")
+    if subtype in {"auth_prompt", "paywall"}:
+        return f"overlay:{subtype}"
+    # DOM responses do not always repeat the document title.  Reuse the title
+    # most recently recorded by the completeness tracker, but classify it via
+    # the dedicated auth detector rather than adding auth vocabulary here.
+    content_tracker = getattr(agent, "content_completeness_tracker", None)
+    content_state = (
+        content_tracker.pages.get(page_id)
+        if content_tracker is not None
+        and isinstance(getattr(content_tracker, "pages", None), dict)
+        and page_id
+        else None
+    )
+    remembered_title = str(getattr(content_state, "title", "") or "")
+    if title_looks_like_auth_page(remembered_title):
+        return "overlay:auth_prompt"
+    return ""
+
+
 def _challenge_score(summary: JsonDict) -> int:
     try:
         return int(summary.get("suspicionScore") or 0)
@@ -3076,14 +4432,112 @@ def _clear_navigation_challenge_state(agent: Any, page_id: str) -> None:
         logger.write("challenge.navigation_cleared", {"pageId": page_id})
 
 
-def _notify_navigation_success(agent: Any, page_id: str) -> None:
+def _notify_navigation_success(
+    agent: Any,
+    page_id: str,
+    *,
+    navigation_kind: str = "verified",
+) -> Optional[JsonDict]:
     progress = getattr(agent, "progress", None)
     if progress is None or not hasattr(progress, "notify_navigation_success"):
-        return
-    result = progress.notify_navigation_success(page_id)
+        return None
+    result = progress.notify_navigation_success(
+        page_id,
+        navigation_kind=navigation_kind,
+    )
     logger = getattr(agent, "logger", None)
     if logger is not None:
-        logger.write("progress.navigation_success", result)
+        event = (
+            "progress.history_navigation_credit_exhausted"
+            if result.get("status") == "history_navigation_credit_exhausted"
+            else "progress.navigation_success"
+        )
+        logger.write(event, result)
+    return result
+
+
+def _observe_navigation_progress_after(
+    agent: Any,
+    method: str,
+    params: JsonDict,
+    result: JsonDict,
+) -> None:
+    page_id = str(params.get("pageId") or "").strip()
+    pending = getattr(agent, "navigation_progress_pending_pages", None)
+    if not isinstance(pending, dict):
+        pending = {}
+        agent.navigation_progress_pending_pages = pending
+    last_urls = getattr(agent, "navigation_progress_last_urls", None)
+    if not isinstance(last_urls, dict):
+        last_urls = {}
+        agent.navigation_progress_last_urls = last_urls
+    # Only the explicit history-return primitive earns a reset on this raw
+    # browser-call path. Page.reload is same-route retry and raw Page.navigate
+    # is not URL/title verified; either could otherwise loop with Page.getState
+    # to replenish the no-artifact and heavy-diagnostic budgets indefinitely.
+    # navigate_verified has its own verified reset in _observe_progress_after.
+    if method == "Page.go":
+        pending.pop(page_id, None)
+        if page_id and not _invoke_result_failed(result):
+            pending[page_id] = str(last_urls.get(page_id) or "")
+        return
+    if method in {"Page.navigate", "Page.reload"}:
+        pending.pop(page_id, None)
+        return
+    if method == "Page.getState" and page_id in pending:
+        current_url = str(
+            _response_data(result).get("url")
+            or _response_data(result).get("currentUrl")
+            or ""
+        ).strip()
+        previous_url = str(pending.pop(page_id, "") or "").strip()
+        if not _invoke_result_failed(result):
+            if current_url:
+                last_urls[page_id] = current_url
+            if previous_url and current_url and current_url != previous_url:
+                progress_receipt = _notify_navigation_success(
+                    agent,
+                    page_id,
+                    navigation_kind="history",
+                )
+                if isinstance(progress_receipt, dict):
+                    result["progressNavigation"] = progress_receipt
+            else:
+                result["progressNavigation"] = {
+                    "status": "history_navigation_unverified",
+                    "pageId": page_id,
+                    "navigationKind": "history",
+                    "previousUrl": previous_url or None,
+                    "currentUrl": current_url or None,
+                    "creditApplied": False,
+                }
+                logger = getattr(agent, "logger", None)
+                if logger is not None:
+                    logger.write(
+                        "progress.history_navigation_unverified",
+                        {
+                            "pageId": page_id,
+                            "previousUrl": previous_url or None,
+                            "currentUrl": current_url or None,
+                            "creditApplied": False,
+                            "reason": (
+                                "missing_pre_navigation_url"
+                                if not previous_url
+                                else "missing_post_navigation_url"
+                                if not current_url
+                                else "url_unchanged"
+                            ),
+                        },
+                    )
+        return
+    if method == "Page.getState" and page_id and not _invoke_result_failed(result):
+        current_url = str(
+            _response_data(result).get("url")
+            or _response_data(result).get("currentUrl")
+            or ""
+        ).strip()
+        if current_url:
+            last_urls[page_id] = current_url
 
 
 def _strip_challenge_fields(value: Any) -> Any:
@@ -3100,6 +4554,325 @@ def _strip_challenge_fields(value: Any) -> Any:
     if isinstance(value, list):
         return [_strip_challenge_fields(item) for item in value]
     return value
+
+
+def _page_inventory_is_discoverable(agent: Any, page_id: str) -> bool:
+    """Whether an unseen page is worth telling this worker to go look for.
+
+    A page another live worker already holds is not a discovery opportunity, so
+    signalling it would be pure noise. Ownership is checked here rather than
+    when the event arrived because the lease is recorded only after the
+    creating RPC returns — at event time every page still looks unowned.
+    """
+    manager = getattr(agent, "page_lease_manager", None)
+    if manager is None or not hasattr(manager, "owner_for"):
+        return True
+    worker_id = str(getattr(agent, "worker_id", "") or "").strip()
+    owner = str(manager.owner_for(page_id) or "").strip()
+    return not owner or owner == worker_id
+
+
+def _settle_page_inventory_signal(
+    agent: Any,
+    method: str,
+    params: JsonDict,
+    result: JsonDict,
+    *,
+    page_list_shown: Optional[List[JsonDict]] = None,
+) -> JsonDict:
+    """Discharge pages the worker now knows about, then attach the change bit.
+
+    Discharge runs BEFORE the receipt is built so a call that itself reveals a
+    page never carries a signal about that page: Page.create names the tab it
+    just made, Page.list shows the model every row, Page.close removes one.
+    """
+    signal = getattr(agent, "page_inventory_signal", None)
+    if signal is None or not isinstance(result, dict):
+        return result
+
+    if method == "Page.create":
+        # The response names the tab this worker just made. Without this the
+        # worker would be told to go find its own page: the Page.open event
+        # always lands BEFORE the response that identifies it.
+        for page_id in _result_page_ids_for_inventory(result.get("response")):
+            grant = evaluate_grant(
+                kind="inventory_discharge_page_create",
+                method=method,
+                result=result,
+                page_id=page_id,
+            )
+            if grant.allowed:
+                signal.discharge([page_id])
+    elif method == "Page.close":
+        page_id = str(params.get("pageId") or "").strip()
+        grant = evaluate_grant(
+            kind="inventory_discharge_page_close",
+            method=method,
+            result=result,
+            page_id=page_id,
+        )
+        if grant.allowed:
+            signal.discharge([page_id])
+    elif method == "Page.list" and page_list_shown is not None:
+        grant = evaluate_grant(
+            kind="inventory_discharge_page_list",
+            method=method,
+            result=result,
+        )
+        if grant.allowed:
+            for row in page_list_shown:
+                if not isinstance(row, dict):
+                    continue
+                signal.discharge(
+                    [row.get("pageId")],
+                    fleet_id=row.get("fleetId"),
+                )
+
+    fleet_id = str(getattr(agent, "assigned_fleet_id", "") or "").strip()
+    if not fleet_id:
+        return result
+    receipt = signal.receipt(
+        fleet_id,
+        is_discoverable=lambda page_id: _page_inventory_is_discoverable(
+            agent, page_id
+        ),
+    )
+    if receipt:
+        result["pageInventoryChanged"] = True
+        result["pageInventoryInstruction"] = receipt["next_instruction"]
+    return result
+
+
+def _result_page_ids_for_inventory(response: Any) -> List[str]:
+    data = response.get("data") if isinstance(response, dict) else None
+    if isinstance(data, dict):
+        page_id = str(data.get("pageId") or "").strip()
+        return [page_id] if page_id else []
+    return []
+
+
+def _navigate_pattern_invalid_result(
+    *,
+    page_id: str,
+    field: str,
+    pattern: str,
+    error: str,
+) -> JsonDict:
+    """Reject an uncompilable expectation BEFORE spending a real navigation."""
+    return {
+        "status": "expectation_pattern_invalid",
+        "tool_was_executed": False,
+        "navigationCommitted": False,
+        "pageId": page_id,
+        "field": field,
+        "pattern": pattern[:200],
+        "error": f"{field} is not a valid regular expression: {error}"[:300],
+        "next_instruction": (
+            f"No navigation was dispatched. Fix {field} — or omit it, which"
+            " accepts the requested URL itself (expectedUrlPattern) or skips"
+            " the title check (expectedTitlePattern) — then call"
+            " navigate_verified again."
+        ),
+    }
+
+
+def _nested_response_error(result: Any) -> str:
+    """Return the browser-side error text carried inside `response`."""
+    if not isinstance(result, dict):
+        return ""
+    response = result.get("response")
+    if not isinstance(response, dict):
+        return ""
+    for candidate in (
+        response.get("error"),
+        (response.get("data") or {}).get("error")
+        if isinstance(response.get("data"), dict)
+        else None,
+    ):
+        if isinstance(candidate, dict):
+            text = str(candidate.get("message") or candidate.get("error") or "")
+            if text:
+                return text
+        elif candidate:
+            return str(candidate)
+    return ""
+
+
+async def _read_page_state_once(
+    agent: Any,
+    page_id: str,
+    step: int,
+) -> JsonDict:
+    """One read-only Page.getState, reported as observation or as unreadable."""
+    state_result = await _invoke_browser_method(
+        agent,
+        "Page.getState",
+        {
+            "pageId": page_id,
+            "purpose": "Observe page state after a failed navigation",
+        },
+        step,
+        count_progress=False,
+    )
+    outcome = classify_call_outcome(state_result)
+    if outcome.interrupted:
+        # A challenge/HITL pause is a terminal state, not an unreadable page.
+        # Flattening it here hid the whole hitl_wait payload and let the model
+        # keep acting on a page the platform had paused.
+        return {
+            "observedState": "hitl_interrupted",
+            "autoHitl": outcome.auto_hitl,
+            "next_instruction": (
+                "The page entered human-intervention handling while its state"
+                " was being read. Inspect autoHitl.hitl_wait and stop acting on"
+                " this page until it reports resumed."
+            ),
+        }
+    if not outcome.succeeded or not page_state_evidence_ok(page_id, state_result):
+        return {
+            "observedState": "unreadable",
+            "observedStateError": (
+                outcome.error or "Page.getState returned no usable page state"
+            ),
+        }
+    data = _response_data(state_result) or {}
+    return {
+        "observedState": "read",
+        "observedUrl": str(data.get("url") or ""),
+        "observedTitle": str(data.get("title") or ""),
+        "observedPageStatus": str(data.get("status") or ""),
+    }
+
+
+async def _navigate_dispatch_failure_result(
+    agent: Any,
+    *,
+    page_id: str,
+    url: str,
+    nav: JsonDict,
+    step: int = 0,
+) -> JsonDict:
+    """Classify a failed Page.navigate by what the harness actually OBSERVED.
+
+    Only two facts are ever available first-hand, and only they may be stated:
+
+    * A pre-dispatch guard answered ``tool_was_executed=False``. The call never
+      reached the panel, so the page is provably untouched.
+    * The lifecycle tracker received ``Page.loadFailed`` for this page. The
+      navigation was attempted and provably did not arrive.
+
+    Everything else — transport exceptions, ``-32005``, a dead renderer, a
+    precondition rejection, any Chrome ``net::ERR_*`` string — leaves the commit
+    position genuinely unknown. Earlier revisions tried to rank those by
+    parsing the error text, which meant guessing browser semantics: ERR_ABORTED
+    is raised when another navigation supersedes this one, and
+    ERR_BLOCKED_BY_CLIENT fires before the request leaves. Neither proves the
+    page stayed put. They now share one status, with the distinction kept as
+    non-load-bearing diagnostics, because the model's next move is identical in
+    every case: read the page state before deciding anything.
+    """
+    classification = nav.get("errorClassification")
+    # A transport exception lands at the top level; a browser-side failure is
+    # nested in the response.
+    error_text = str(nav.get("error") or _nested_response_error(nav) or "")[:300]
+
+    if nav.get("tool_was_executed") is False:
+        return {
+            "status": "navigation_not_dispatched",
+            "tool_was_executed": False,
+            "navigationCommitted": False,
+            "pageId": page_id,
+            "requestedUrl": url,
+            "guardStatus": str(nav.get("status") or "") or None,
+            "error": error_text or None,
+            "errorClassification": classification,
+            "navigateResult": _strip_challenge_fields(nav),
+            "next_instruction": (
+                "A harness guard refused the call before it reached the"
+                " browser, so the page is untouched. Read guardStatus, clear"
+                " that condition, then decide whether to navigate."
+            ),
+        }
+
+    challenge = _page_challenge_summary(agent, page_id)
+    # Snapshot the lifecycle BEFORE reading: Page.getState feeds the tracker and
+    # would overwrite the Page.loadFailed this branch exists to detect.
+    lifecycle_state = (
+        agent.page_lifecycle.state(page_id)
+        if isinstance(getattr(agent, "page_lifecycle", None), PageLifecycleTracker)
+        else None
+    )
+    lifecycle_reported_failure = (
+        str(getattr(lifecycle_state, "status", "") or "") == "failed"
+    )
+    # The request was dispatched and failed, so where the page sits is a
+    # question only the page can answer. Read it ONCE here rather than telling
+    # the model to: Page.getState issues no network request, and a receipt that
+    # merely says "go look" leaves the model to act on a state nobody observed.
+    observed = await _read_page_state_once(agent, page_id, step)
+    if observed.get("observedState") == "hitl_interrupted":
+        # The read itself hit the human-intervention path. That outranks any
+        # navigation classification: the model must handle the pause, not the
+        # failed navigate.
+        return {
+            "status": "navigation_interrupted_by_hitl",
+            "tool_was_executed": True,
+            "navigationCommitted": None,
+            "pageId": page_id,
+            "requestedUrl": url,
+            "error": error_text,
+            "errorClassification": classification,
+            **observed,
+        }
+    common: JsonDict = {
+        "pageId": page_id,
+        "requestedUrl": url,
+        "error": error_text,
+        "errorClassification": classification,
+        "navigateResult": _strip_challenge_fields(nav),
+        "suspectedChallenge": challenge or None,
+        **observed,
+    }
+
+    if lifecycle_reported_failure:
+        return {
+            **common,
+            "status": "navigation_load_failed",
+            "tool_was_executed": True,
+            "navigationCommitted": False,
+            "next_instruction": (
+                "The browser reported Page.loadFailed for this navigation."
+                " observedUrl/observedTitle are where the page actually sits."
+                " Decide from those whether a fresh navigation is warranted;"
+                " this composite will not re-dispatch it for you."
+            ),
+        }
+
+    error_type = (
+        str(classification.get("type") or "")
+        if isinstance(classification, dict)
+        else ""
+    )
+    if error_type in {"page_crashed", "render_lost"}:
+        reason = "page_unavailable"
+    elif nav.get("error"):
+        reason = "transport_error"
+    else:
+        reason = "browser_action_failed"
+    return {
+        **common,
+        "status": "navigation_outcome_unknown",
+        "tool_was_executed": True,
+        "navigationCommitted": None,
+        "reason": reason,
+        "next_instruction": (
+            "Page.navigate failed without proving where the page ended up, so"
+            " the harness read the page for you: observedUrl/observedTitle are"
+            " its actual state. Decide from those; do NOT call"
+            " navigate_verified again for this navigation."
+        ),
+    }
+
 
 
 def _navigate_challenge_blocked_result(
@@ -3147,14 +4920,12 @@ def _auto_hitl_is_actionable(auto: Any) -> bool:
     HITL (skipped/cooldown/stale verdicts go to `suspected_challenge.adjudication`
     instead), so in practice every autoHitl is actionable. This guard keeps
     `_loop_interrupt_from_result` honest against a future short-circuit that could
-    attach a `tool_was_executed: False` / `status: "skipped*"` autoHitl."""
-    if not isinstance(auto, dict):
-        return False
-    if auto.get("tool_was_executed") is False:
-        return False
-    if str(auto.get("status") or "").lower().startswith("skipped"):
-        return False
-    return True
+    attach a `tool_was_executed: False` / `status: "skipped*"` autoHitl.
+
+    The rule itself lives in harness.call_outcome so the shared verdict and this
+    loop guard cannot drift apart; a second, weaker copy of it treated every
+    skipped adjudication as a pause."""
+    return auto_hitl_is_actionable(auto)
 
 
 def _navigate_hitl_result(page_id: str, attempt: int, result: JsonDict) -> JsonDict:
@@ -3329,11 +5100,29 @@ def _loop_interrupt_from_result(result: Any) -> Optional[JsonDict]:
 
 
 def _invoke_result_failed(result: Any) -> bool:
-    """True when an _invoke_browser_method result represents a failed action.
+    """True when an _invoke_browser_method result represents a failed ACTION.
 
     Browser-side action errors surface in response.error / response.data.error
     (top-level `error` is only set on transport exceptions), so a check that
-    only reads result["error"] would report a failed retry as succeeded."""
+    only reads result["error"] would report a failed retry as succeeded.
+
+    NOT interchangeable with `classify_call_outcome`, and the difference is
+    `response.data.error`:
+
+    * this predicate answers "did the ACTION achieve its page effect", and for
+      an action method a page-level error means it did not — retry paths and
+      recovery ladders want that reading;
+    * `classify_call_outcome` answers "did the CALL execute and come back",
+      and deliberately ignores `data.error` because for a read like
+      Page.getState that field is the PAGE's last-navigation error, permanent
+      on a risk-controlled page. Anything that GRANTS state — re-perception
+      credit, recovery credit, content binding, inventory baselines — must use
+      the verdict, not this. Task 48b4d7d7 deadlocked for 84 minutes because a
+      gate whose exit condition was "re-read the page" used this predicate.
+
+    Two general failure predicates in one tree is the shape that caused that
+    bug. Collapsing the ~20 call sites onto the verdict is tracked separately;
+    until then, choose by the question you are asking."""
     if not isinstance(result, dict):
         return False
     if result.get("tool_was_executed") is False:
@@ -3353,6 +5142,530 @@ def _invoke_result_failed(result: Any) -> bool:
     if isinstance(classification, dict) and classification.get("type"):
         return True
     return False
+
+
+def _transport_error_metadata(
+    method: str,
+    exc: ABCPTransportError,
+) -> JsonDict:
+    """Keep machine-readable RPC failure data where recovery needs it.
+
+    ``rpcData`` is surfaced only for the select API pair. Other actions may
+    carry typed or otherwise sensitive values in provider diagnostics; their
+    numeric code/method remain useful without copying that opaque payload into
+    the model-facing result.
+    """
+
+    metadata: JsonDict = {}
+    local_receipt = getattr(exc, "receipt", None)
+    if isinstance(local_receipt, dict):
+        for key in (
+            "status",
+            "reasonKind",
+            "pageId",
+            "fleetId",
+            "workerId",
+            "ownerWorkerId",
+            "methodKind",
+            "retryable",
+            "quarantined",
+            "tool_was_executed",
+            "next_instruction",
+        ):
+            if key in local_receipt:
+                metadata[key] = local_receipt.get(key)
+    rpc_code = getattr(exc, "rpc_code", None)
+    rpc_method = str(getattr(exc, "rpc_method", "") or "")
+    if rpc_code is not None:
+        metadata["rpcCode"] = rpc_code
+    if rpc_method:
+        metadata["rpcMethod"] = rpc_method
+    rpc_data = getattr(exc, "rpc_data", None)
+    if method in {"DOM.inspectSelect", "Input.select"} and rpc_data is not None:
+        metadata["rpcData"] = trim_large_strings(rpc_data, 4000)
+    return metadata
+
+
+_SELECT_FAILURE_GUIDANCE: Dict[str, Tuple[int, str]] = {
+    "select-option-stale": (
+        1,
+        "Call DOM.inspectSelect again, copy only fields returned for the requested"
+        " option, then retry Input.select once, preferring its exact value or"
+        " label when present and using option id only as fallback. Do not open"
+        " or operate the popup manually or reuse an arbitrary AXTree option id.",
+    ),
+    "select-option-not-found": (
+        1,
+        "Call DOM.inspectSelect again with an appropriate query/maxOptions and"
+        " inspect its loadMore/truncated state. Retry once only with an exact"
+        " option descriptor returned by that inspection.",
+    ),
+    "select-option-disabled": (
+        0,
+        "The requested option is disabled. Stop retrying and report that it is"
+        " unavailable; do not silently choose a different option.",
+    ),
+    "select-popup-lost": (
+        0,
+        "ABCP lost the select popup while executing the atomic Input.select"
+        " action. Do not repeat the call, reload the page, or operate the popup"
+        " manually; report the platform failure with this receipt.",
+    ),
+    "select-navigation-stalled": (
+        0,
+        "ABCP could not advance the cascading selection. Do not repeat the same"
+        " path or replace it with manual popup clicks; report the platform"
+        " failure with the DOM.inspectSelect path used.",
+    ),
+}
+
+
+def _apply_select_failure_guidance(
+    agent: Any,
+    method: str,
+    params: JsonDict,
+    result: JsonDict,
+) -> JsonDict:
+    """Attach code-specific, mechanically bounded Input.select recovery."""
+
+    if not isinstance(result, dict):
+        return result
+    if method == "DOM.inspectSelect":
+        classification = result.get("errorClassification")
+        error_code = (
+            str(classification.get("errorCode") or "")
+            if isinstance(classification, dict)
+            else ""
+        )
+        if error_code == "select-control-not-visible":
+            result["next_instruction"] = (
+                "Refresh DOM.getAXTree and target only a currently visible"
+                " select-like control. Do not retry the same hidden container"
+                " selector or construct an Input.select request from hidden"
+                " option rows."
+            )
+            result["selectRecovery"] = {
+                "errorCode": error_code,
+                "retryAllowed": False,
+            }
+        elif error_code == "select-control-unsupported":
+            result["next_instruction"] = (
+                "This element is not an ABCP-supported select-like control. Do"
+                " not call Input.select for it. If it is an ordinary visible"
+                " category/list browser, use fresh DOM.getAXTree targets and"
+                " one verified Input.click per visible level; this is a"
+                " non-select UI fallback, not manual popup management."
+            )
+            result["selectRecovery"] = {
+                "errorCode": error_code,
+                "retryAllowed": False,
+            }
+        return result
+    if method != "Input.select":
+        return result
+    target = str(params.get("selector") or params.get("id") or "<unknown>")
+    page_id = str(params.get("pageId") or "")
+    ledger = getattr(agent, "_select_failure_ledger", None)
+    if not _invoke_result_failed(result):
+        if isinstance(ledger, dict):
+            for key in list(ledger):
+                if key[:2] == (page_id, target):
+                    ledger.pop(key, None)
+        return result
+    classification = result.get("errorClassification")
+    error_code = (
+        str(classification.get("errorCode") or "")
+        if isinstance(classification, dict)
+        else ""
+    )
+    guidance = _SELECT_FAILURE_GUIDANCE.get(error_code)
+    if guidance is None:
+        return result
+    max_retries, instruction = guidance
+    if not isinstance(ledger, dict):
+        ledger = {}
+        setattr(agent, "_select_failure_ledger", ledger)
+    key = (page_id, target, error_code)
+    failures = int(ledger.get(key) or 0) + 1
+    ledger[key] = failures
+    retry_allowed = failures <= max_retries
+    if max_retries and not retry_allowed:
+        instruction = (
+            "The one permitted recovery retry for this select/control/error has"
+            " already failed. Stop retrying and report an ABCP select contract"
+            " failure with the inspect and select receipts."
+        )
+    result["selectRecovery"] = {
+        "errorCode": error_code,
+        "failureCount": failures,
+        "maxRetries": max_retries,
+        "retryAllowed": retry_allowed,
+        "controlTarget": target,
+    }
+    result["next_instruction"] = instruction
+    return result
+
+
+def _download_operation_key(params: Any) -> str:
+    if not isinstance(params, dict):
+        return ""
+    url = str(params.get("url") or "").strip()
+    save_path = str(params.get("savePath") or "").strip()
+    return json.dumps([url, save_path], ensure_ascii=False) if url and save_path else ""
+
+
+def _download_records(value: Any) -> List[JsonDict]:
+    records: List[JsonDict] = []
+    seen: Set[str] = set()
+
+    def visit(item: Any, depth: int = 0) -> None:
+        if depth > 6:
+            return
+        if isinstance(item, dict):
+            url = str(item.get("url") or "").strip()
+            save_path = str(item.get("savePath") or "").strip()
+            state = str(item.get("state") or "").strip()
+            if url and save_path and state:
+                identity = str(item.get("id") or item.get("downloadId") or "")
+                dedupe = identity or json.dumps(
+                    [url, save_path, state, item.get("startedAt")],
+                    ensure_ascii=False,
+                )
+                if dedupe not in seen:
+                    seen.add(dedupe)
+                    records.append(dict(item))
+            for nested in item.values():
+                if isinstance(nested, (dict, list)):
+                    visit(nested, depth + 1)
+        elif isinstance(item, list):
+            for nested in item:
+                visit(nested, depth + 1)
+
+    visit(value)
+    return records
+
+
+def _download_receipt_store(agent: Any) -> Dict[str, JsonDict]:
+    store = getattr(agent, "download_operation_receipts", None)
+    if not isinstance(store, dict):
+        store = {}
+        agent.download_operation_receipts = store
+    return store
+
+
+DOWNLOAD_TIMEOUT_RECONCILIATION_DELAY_SECONDS = 4.0
+
+
+def _remember_download_record(agent: Any, record: JsonDict) -> JsonDict:
+    key = str(record.get("operationKey") or "") or _download_operation_key(record)
+    receipt = {
+        "downloadId": str(record.get("id") or record.get("downloadId") or ""),
+        "url": str(record.get("url") or ""),
+        "savePath": str(record.get("savePath") or ""),
+        "state": str(record.get("state") or ""),
+        "totalBytes": int(record.get("totalBytes") or 0),
+        "receivedBytes": int(record.get("receivedBytes") or 0),
+        "source": "Download.list",
+    }
+    if key:
+        _download_receipt_store(agent)[key] = receipt
+    return receipt
+
+
+def _remember_unverified_download_timeout(
+    agent: Any,
+    params: JsonDict,
+    *,
+    rpc_code: Optional[int],
+) -> JsonDict:
+    """Remember an uncertain side effect without laundering it as success."""
+    key = _download_operation_key(params)
+    receipt = {
+        "downloadId": "",
+        "url": str(params.get("url") or ""),
+        "savePath": str(params.get("savePath") or ""),
+        "state": "timeout_unverified",
+        "totalBytes": 0,
+        "receivedBytes": 0,
+        "source": "Download.start_timeout",
+        "rpcCode": rpc_code,
+        "possibleSideEffect": True,
+    }
+    if key:
+        _download_receipt_store(agent)[key] = receipt
+    return receipt
+
+
+def _reusable_download_response(agent: Any, params: JsonDict) -> Optional[JsonDict]:
+    key = _download_operation_key(params)
+    store = _download_receipt_store(agent)
+    receipt = store.get(key) if key else None
+    requested_url = str(params.get("url") or "").strip()
+    # An uncertain redirect side effect is URL-scoped, not path-scoped: merely
+    # changing savePath must not let the model re-dispatch the same URL and
+    # create another file in the browser's default download directory.
+    unverified = next(
+        (
+            item for item in store.values()
+            if isinstance(item, dict)
+            and str(item.get("state") or "") == "timeout_unverified"
+            and str(item.get("url") or "").strip() == requested_url
+        ),
+        None,
+    )
+    if (
+        isinstance(unverified, dict)
+        and str((receipt or {}).get("state") or "") != "completed"
+    ):
+        receipt = unverified
+    # Active receipts are observations from an earlier instant.  Reusing them
+    # forever can make a stalled/failed operation impossible to retry; callers
+    # must refresh those by downloadId through Download.list first.
+    if not isinstance(receipt, dict):
+        return None
+    state = str(receipt.get("state") or "")
+    if state == "timeout_unverified":
+        return {
+            "error": "A prior Download.start for this exact URL/savePath timed out with an unverified side effect.",
+            "downloadReconciliation": {
+                "classification": "timeout_unverified",
+                "receipt": dict(receipt),
+            },
+            "suggested_prompt": (
+                "Do not resend the same URL. The redirected file may already"
+                " exist in the browser's default download directory. Obtain"
+                " the final direct file URL before one bounded retry."
+            ),
+        }
+    if state != "completed":
+        return None
+    return {
+        "observation": "Reused an existing reconciled download operation.",
+        "data": {
+            "success": True,
+            "downloadId": receipt.get("downloadId"),
+            "state": receipt.get("state"),
+            "savePath": receipt.get("savePath"),
+            "url": receipt.get("url"),
+            "reused": True,
+        },
+        "downloadReconciliation": {
+            "classification": "already_started",
+            "receipt": dict(receipt),
+        },
+    }
+
+
+async def _refresh_active_download_response(
+    agent: Any,
+    runner: Any,
+    params: JsonDict,
+) -> Optional[JsonDict]:
+    """Refresh an old active receipt before deciding whether to retry."""
+    key = _download_operation_key(params)
+    receipt = _download_receipt_store(agent).get(key) if key else None
+    if not isinstance(receipt, dict) or str(receipt.get("state") or "") not in {
+        "downloading", "paused",
+    }:
+        return None
+    download_id = str(receipt.get("downloadId") or "").strip()
+    fleet_id = str(getattr(agent, "assigned_fleet_id", "") or "").strip()
+    if not download_id or not fleet_id:
+        if key:
+            _download_receipt_store(agent).pop(key, None)
+        return None
+    try:
+        listed, _recovery = await runner.call(
+            "Download.list",
+            {
+                "fleetId": fleet_id,
+                "downloadId": download_id,
+                "limit": 1,
+                "purpose": "Refresh an existing download before retrying it",
+            },
+        )
+    except ABCPTransportError:
+        # A failed refresh does not prove the old operation is gone.  Surface
+        # uncertainty rather than dispatching a duplicate side effect.
+        return {
+            "error": "Existing download state could not be refreshed.",
+            "downloadReconciliation": {
+                "classification": "active_unverified",
+                "receipt": dict(receipt),
+            },
+            "suggested_prompt": (
+                "Do not retry this Download.start until Download.list can"
+                " confirm the prior operation's terminal state."
+            ),
+        }
+    records = [
+        row for row in _download_records(listed)
+        if str(row.get("id") or row.get("downloadId") or "") == download_id
+    ]
+    if len(records) != 1:
+        if key:
+            _download_receipt_store(agent).pop(key, None)
+        return None
+    refreshed = _remember_download_record(
+        agent,
+        {**records[0], "operationKey": key},
+    )
+    state = str(refreshed.get("state") or "")
+    if state not in {"downloading", "paused", "completed"}:
+        if key:
+            _download_receipt_store(agent).pop(key, None)
+        return None
+    return {
+        "observation": "Refreshed and reused an existing download operation.",
+        "data": {
+            "success": True,
+            "downloadId": refreshed.get("downloadId"),
+            "state": state,
+            "savePath": refreshed.get("savePath"),
+            "url": refreshed.get("url"),
+            "reused": True,
+        },
+        "downloadReconciliation": {
+            "classification": "already_started",
+            "receipt": dict(refreshed),
+        },
+    }
+
+
+def _download_start_timed_out(response: Any) -> bool:
+    if isinstance(response, ABCPTransportError):
+        return getattr(response, "rpc_code", None) == -32014
+    if not isinstance(response, dict):
+        return False
+
+    candidates: List[Any] = [response]
+    nested = response.get("response")
+    if isinstance(nested, dict):
+        candidates.append(nested)
+    for candidate in candidates:
+        error = candidate.get("error") if isinstance(candidate, dict) else None
+        if isinstance(error, dict) and error.get("code") == -32014:
+            return True
+    return False
+
+
+def _classify_download_reconciliation(
+    *,
+    params: JsonDict,
+    list_response: Any,
+) -> JsonDict:
+    url = str(params.get("url") or "").strip()
+    save_path = str(params.get("savePath") or "").strip()
+    matches = [
+        row for row in _download_records(list_response)
+        if str(row.get("url") or "").strip() == url
+        and str(row.get("savePath") or "").strip() == save_path
+    ]
+    if len(matches) > 1:
+        return {"classification": "ambiguous", "matches": matches}
+    if not matches:
+        return {"classification": "not_observed", "matches": []}
+    record = matches[0]
+    state = str(record.get("state") or "")
+    classification = (
+        "completed" if state == "completed"
+        else "active" if state in {"downloading", "paused"}
+        else "failed" if state in {"failed", "cancelled"}
+        else "ambiguous"
+    )
+    return {"classification": classification, "matches": [record]}
+
+
+async def _reconcile_download_start_timeout(
+    *,
+    agent: Any,
+    runner: Any,
+    params: JsonDict,
+    timeout_error: Optional[ABCPTransportError] = None,
+) -> JsonDict:
+    """Reconcile a possibly-side-effecting timeout without blind retry.
+
+    Download records are created asynchronously by Electron's will-download
+    hook and can appear a few seconds after the RPC timeout.  Only an exact
+    requested URL/path match is authoritative here.  Redirected orphan records
+    are deliberately not claimed by time proximity because concurrent workers
+    (or a human) may download in the same Fleet.
+    """
+    fleet_id = str(getattr(agent, "assigned_fleet_id", "") or "").strip()
+    rpc_code = getattr(timeout_error, "rpc_code", None)
+    if not fleet_id:
+        receipt = _remember_unverified_download_timeout(
+            agent, params, rpc_code=rpc_code,
+        )
+        return {
+            "classification": "timeout_unverified",
+            "matches": [],
+            "reason": "assigned_fleet_id_unavailable",
+            "receipt": receipt,
+        }
+
+    last_result: JsonDict = {
+        "classification": "not_observed",
+        "matches": [],
+    }
+    observations: List[JsonDict] = []
+    for check_index in range(2):
+        if check_index:
+            await asyncio.sleep(DOWNLOAD_TIMEOUT_RECONCILIATION_DELAY_SECONDS)
+        try:
+            list_response, _list_recovery = await runner.call(
+                "Download.list",
+                {
+                    "fleetId": fleet_id,
+                    "limit": 100,
+                    "purpose": (
+                        "Reconcile whether a timed-out Download.start already"
+                        " produced the exact requested browser-side operation"
+                    ),
+                },
+            )
+        except ABCPTransportError as exc:
+            observations.append({
+                "check": check_index + 1,
+                "classification": "list_failed",
+                "error": str(exc),
+            })
+            last_result = {
+                "classification": "ambiguous",
+                "matches": [],
+                "reason": "download_list_failed",
+                "error": str(exc),
+            }
+            continue
+        last_result = _classify_download_reconciliation(
+            params=params,
+            list_response=list_response,
+        )
+        observations.append({
+            "check": check_index + 1,
+            "classification": last_result.get("classification"),
+            "matchCount": len(last_result.get("matches") or []),
+        })
+        if last_result.get("classification") in {
+            "completed", "active", "failed", "ambiguous",
+        }:
+            break
+
+    last_result = dict(last_result)
+    last_result["checks"] = observations
+    matches = last_result.get("matches") or []
+    if len(matches) == 1 and isinstance(matches[0], dict):
+        record = {**matches[0], "operationKey": _download_operation_key(params)}
+        last_result["receipt"] = _remember_download_record(agent, record)
+    elif last_result.get("classification") in {"not_observed", "ambiguous"}:
+        last_result["classification"] = "timeout_unverified"
+        last_result["reason"] = (
+            last_result.get("reason") or "exact_operation_not_observed"
+        )
+        last_result["receipt"] = _remember_unverified_download_timeout(
+            agent, params, rpc_code=rpc_code,
+        )
+    return last_result
 
 
 def _result_occlusion_blocked(result: Any) -> bool:
@@ -3769,7 +6082,7 @@ async def _visual_verify(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
     screenshot_params: JsonDict = {
         "pageId": page_id,
         "fullPage": full_page,
-        "options": {"format": "base64"},
+        "options": {"format": "file"},
         "purpose": f"Visual verification for {mode or 'action_outcome'}",
     }
     if selector:
@@ -3818,7 +6131,7 @@ async def _visual_verify(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
         fallback_params: JsonDict = {
             "pageId": page_id,
             "fullPage": False,
-            "options": {"format": "base64"},
+            "options": {"format": "file"},
             "purpose": "Viewport fallback after element screenshot failure",
         }
         before_artifacts = set(str(path) for path in getattr(agent, "artifacts", []))
@@ -4252,6 +6565,62 @@ def _final_answer_reality_check_rejection(
     }
 
 
+def _final_answer_content_completeness_rejection(
+    agent: Any,
+    answer: str,
+    *,
+    status: str = "",
+) -> Optional[JsonDict]:
+    """Reject semantic absence or false success while content is incomplete."""
+    tracker = getattr(agent, "content_completeness_tracker", None)
+    veto = tracker.terminal_veto() if tracker is not None else None
+    if not isinstance(veto, dict):
+        return None
+    payload: JsonDict = {}
+    try:
+        parsed = json.loads(str(answer or ""))
+        payload = parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        payload = {}
+    claimed_statuses = {
+        str(status or "").strip().casefold(),
+        str(payload.get("status") or "").strip().casefold(),
+        str(payload.get("outcome") or "").strip().casefold(),
+    }
+    claims_success = bool(
+        claimed_statuses
+        & {"done", "success", "completed", "complete", "validated_done"}
+    )
+    claims_semantic_terminal = False
+    try:
+        blockers = payload.get("blockers") if isinstance(payload, dict) else None
+        for blocker in blockers if isinstance(blockers, list) else []:
+            if not isinstance(blocker, dict):
+                continue
+            raw = blocker.get("classification")
+            category = (
+                str(raw.get("category") or "").strip()
+                if isinstance(raw, dict)
+                else str(
+                    raw or blocker.get("category") or blocker.get("type") or ""
+                ).strip()
+            )
+            if category in {"target_absent", "instruction_infeasible"}:
+                claims_semantic_terminal = True
+                break
+    except Exception:
+        claims_semantic_terminal = False
+    if not (claims_success or claims_semantic_terminal):
+        return None
+    return {
+        "status": "rejected_content_incomplete",
+        "classification": veto,
+        "claimedSuccess": claims_success,
+        "tool_was_executed": False,
+        "next_instruction": str(veto.get("next_instruction") or ""),
+    }
+
+
 async def _promote_visual_locate(
     agent: Any,
     page_id: str,
@@ -4278,34 +6647,10 @@ async def _promote_visual_locate(
             step,
         )
         lines = (_response_data(ax) or {}).get("lines") or []
-        try:
-            dpr_resp = await _invoke_browser_method(
-                agent, "Runtime.evaluate",
-                {"pageId": page_id, "returnByValue": True,
-                 "expression": "return {dpr: window.devicePixelRatio || 1};",
-                 "purpose": "read devicePixelRatio to map screenshot px to CSS px"},
-                step,
-                runtime_policy={
-                    "origin": "harness_read_only_oracle",
-                    "intent": "diagnostic",
-                    "effect": "read_only",
-                    "result_mode": "raw",
-                },
-            )
-        except TypeError as exc:
-            # Compatibility for instrumented/legacy test doubles that expose
-            # the historical four-argument helper signature. The real helper
-            # accepts runtime_policy, so production calls never take this path.
-            if "runtime_policy" not in str(exc):
-                raise
-            dpr_resp = await _invoke_browser_method(
-                agent, "Runtime.evaluate",
-                {"pageId": page_id, "returnByValue": True,
-                 "expression": "return {dpr: window.devicePixelRatio || 1};",
-                 "purpose": "read devicePixelRatio to map screenshot px to CSS px"},
-                step,
-            )
-        dpr = float((_response_data(dpr_resp) or {}).get("dpr") or 1.0) or 1.0
+        # Avoid hidden Runtime.evaluate probes. AXTree rectangles and the
+        # standard screenshot path use the same CSS-pixel coordinate contract;
+        # promotion is guarded by label/role matching before any action.
+        dpr = 1.0
         promo = promote_locate(lines, verdict["point"], shot_w=shot_w, shot_h=shot_h, dpr=dpr)
         promo = apply_promotion_guard(
             promo, vl_label=verdict.get("control_label"),
@@ -4344,8 +6689,14 @@ async def _promote_visual_locate(
 
 def _screenshot_saved_path(result: JsonDict) -> Optional[str]:
     data = _response_data(result)
+    if not data:
+        data = _raw_response_data(result)
     for key in ("savedPath", "path", "filePath"):
         value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    if str(data.get("encoding") or "").lower() == "file":
+        value = data.get("data")
         if isinstance(value, str) and value.strip():
             return value
     response = result.get("response") if isinstance(result, dict) else None
@@ -4356,172 +6707,10 @@ def _screenshot_saved_path(result: JsonDict) -> Optional[str]:
                 value = data.get(key)
                 if isinstance(value, str) and value.strip():
                     return value
-    return None
-
-
-def _build_extract_dom_records_expression(
-    *,
-    selector: str,
-    fields: JsonDict,
-    visible_only: bool,
-    include_rect: bool,
-    include_ancestor_text: bool,
-    limit: int,
-) -> str:
-    selector_json = json.dumps(selector)
-    fields_json = json.dumps(fields, ensure_ascii=False)
-    visible_json = "true" if visible_only else "false"
-    rect_json = "true" if include_rect else "false"
-    ancestor_json = "true" if include_ancestor_text else "false"
-    return f"""
-(() => {{
-  try {{
-    const selector = {selector_json};
-    const fieldSpecs = {fields_json};
-    const limit = {int(limit)};
-    const visibleOnly = {visible_json};
-    const includeRect = {rect_json};
-    const includeAncestorText = {ancestor_json};
-    const norm = (value, max = 1000) => String(value ?? "")
-      .replace(/\\s+/g, " ")
-      .trim()
-      .slice(0, max);
-    const rectOf = (el) => {{
-      const r = el.getBoundingClientRect();
-      return {{
-        x: Math.round(r.x), y: Math.round(r.y),
-        top: Math.round(r.top), left: Math.round(r.left),
-        width: Math.round(r.width), height: Math.round(r.height),
-        pageX: Math.round(r.left + window.scrollX),
-        pageY: Math.round(r.top + window.scrollY)
-      }};
-    }};
-    const isVisible = (el) => {{
-      const r = el.getBoundingClientRect();
-      const s = window.getComputedStyle(el);
-      return !!(r.width && r.height)
-        && s.visibility !== "hidden"
-        && s.display !== "none"
-        && Number(s.opacity || "1") > 0;
-    }};
-    const ancestorText = (el) => {{
-      let node = el.parentElement;
-      for (let depth = 0; node && depth < 4; depth++, node = node.parentElement) {{
-        if (node === document.body || node === document.documentElement) break;
-        const text = norm(node.innerText || node.textContent || "", 1500);
-        if (text && text !== norm(el.innerText || el.textContent || "", 1500)) {{
-          return text;
-        }}
-      }}
-      return "";
-    }};
-    const read = (el, spec) => {{
-      spec = String(spec || "text");
-      if (spec === "text" || spec === "textContent") return norm(el.innerText || el.textContent || "");
-      if (spec === "href") return el.href || (el.closest && el.closest("a[href]") ? el.closest("a[href]").href : "");
-      if (spec === "src") {{
-        // Site-agnostic lazy-image resolver: many sites (1688/taobao/amazon...)
-        // keep the real URL in data-src/srcset until the <img> scrolls into view
-        // and only set a 1x1/blank placeholder on .src. Fall back to the common
-        // lazy attributes when .src is empty or a placeholder, then absolutize.
-        const isPh = (u) => !u
-          || /^data:image\\/(gif|svg)/i.test(u)
-          || /(blank|placeholder|spacer|loading|transparent|grey|gray|1x1|s\\.gif)\\.(gif|png|svg|webp)/i.test(u);
-        let u = el.currentSrc || el.src || "";
-        if (isPh(u)) {{
-          u = el.getAttribute("data-src") || el.getAttribute("data-lazy-src")
-            || el.getAttribute("data-original") || el.getAttribute("data-ks-lazyload")
-            || el.getAttribute("data-url") || el.getAttribute("data-image") || u;
-        }}
-        if (isPh(u)) {{
-          const ss = el.getAttribute("srcset") || el.getAttribute("data-srcset") || "";
-          if (ss) {{ const first = ss.split(",")[0].trim().split(/\\s+/)[0]; if (first) u = first; }}
-        }}
-        try {{ if (u && !/^(https?:|data:|\\/\\/)/i.test(u)) u = new URL(u, location.href).href; }} catch (e) {{}}
-        if (/^\\/\\//.test(u)) u = location.protocol + u;
-        return u || "";
-      }}
-      if (spec === "imgAlt") {{
-        const img = el.matches && el.matches("img") ? el : el.querySelector && el.querySelector("img");
-        return img ? norm(img.getAttribute("alt") || img.alt || "") : "";
-      }}
-      if (spec === "visible") return isVisible(el);
-      if (spec === "rect" || spec === "boundingRect") return rectOf(el);
-      if (spec === "ancestorText") return ancestorText(el);
-      if (spec === "tag") return el.tagName ? el.tagName.toLowerCase() : "";
-      if (spec === "id") return el.id || "";
-      if (spec === "class") return el.className || "";
-      if (spec === "ariaLabel") return el.getAttribute("aria-label") || "";
-      if (spec === "role") return el.getAttribute("role") || "";
-      if (spec.startsWith("attr:")) return el.getAttribute(spec.slice(5)) || "";
-      return norm(el.innerText || el.textContent || "");
-    }};
-    const rows = [];
-    const nodes = Array.from(document.querySelectorAll(selector));
-    let filteredCount = 0;
-    let stoppedByLimit = false;
-    for (let domOrder = 0; domOrder < nodes.length; domOrder++) {{
-      if (rows.length >= limit) {{ stoppedByLimit = true; break; }}
-      const el = nodes[domOrder];
-      const visible = isVisible(el);
-      if (visibleOnly && !visible) {{ filteredCount++; continue; }}
-      const row = {{ domOrder, visible }};
-      for (const [name, spec] of Object.entries(fieldSpecs || {{}})) {{
-        row[name] = read(el, spec);
-      }}
-      if (includeRect) row.boundingRect = rectOf(el);
-      if (includeAncestorText && row.ancestorText === undefined) row.ancestorText = ancestorText(el);
-      rows.push(row);
-    }}
-    return JSON.stringify({{
-      rows,
-      rowCount: rows.length,
-      matchedCount: nodes.length,
-      filteredCount,
-      stoppedByLimit,
-      truncated: stoppedByLimit
-    }});
-  }} catch (err) {{
-    return JSON.stringify({{
-      error: String(err && err.message || err),
-      stack: String(err && err.stack || "")
-    }});
-  }}
-}})()
-"""
-
-
-def _runtime_json_payload(result: JsonDict) -> Optional[Any]:
-    values: List[Any] = []
-    response = result.get("response") if isinstance(result, dict) else None
-    data = response.get("data") if isinstance(response, dict) else None
-    if isinstance(data, dict):
-        if "rows" in data or "error" in data:
-            values.append(data)
-        values.extend([
-            data.get("result"),
-            data.get("value"),
-            data.get("returnValue"),
-        ])
-    elif data is not None:
-        values.append(data)
-    for value in list(values):
-        if isinstance(value, dict):
-            values.extend([
-                value.get("value"),
-                value.get("result"),
-                value.get("returnValue"),
-            ])
-    for value in values:
-        if isinstance(value, str):
-            try:
-                return json.loads(value)
-            except json.JSONDecodeError:
-                continue
-        if isinstance(value, dict) and ("rows" in value or "error" in value):
-            return value
-        if isinstance(value, list):
-            return value
+            if str(data.get("encoding") or "").lower() == "file":
+                value = data.get("data")
+                if isinstance(value, str) and value.strip():
+                    return value
     return None
 
 
@@ -4531,10 +6720,13 @@ def _runtime_any_json_payload(result: JsonDict) -> Optional[Any]:
     data = response.get("data") if isinstance(response, dict) else None
     if isinstance(data, dict):
         values.extend([
-            data,
-            data.get("result"),
+            # Runtime.evaluate now returns a platform evidence envelope:
+            # {value, runtimeEvaluation:{requestedWorld,executedWorld,...}}.
+            # Unwrap value before considering legacy direct-object payloads.
             data.get("value"),
+            data.get("result"),
             data.get("returnValue"),
+            data,
         ])
     elif data is not None:
         values.append(data)
@@ -4556,37 +6748,203 @@ def _runtime_any_json_payload(result: JsonDict) -> Optional[Any]:
     return None
 
 
-def _build_eval_js_json_expression(expression: str) -> str:
+async def _invoke_trusted_collection_template(
+    agent: Any,
+    *,
+    template_id: str,
+    bindings: JsonDict,
+    page_id: str,
+    step: int,
+) -> Any:
+    """Execute one registered, read-only ``collect_items`` template.
+
+    This is the only harness-internal Runtime exception.  The caller cannot
+    supply JavaScript: the verifier registry renders a fixed source template
+    from JSON-encoded bindings, and this function hard-codes strict isolated
+    execution. It intentionally does not require the model-facing platform
+    world-evidence envelope; do not route model-authored scripts through this
+    compatibility path. The payload is returned as JSON directly; the former
+    document.title side channel is not restored.
+    """
+    from harness.observation.verifiers import render_trusted_collection_template
+
+    try:
+        rendered = render_trusted_collection_template(template_id, dict(bindings))
+    except (TypeError, ValueError) as exc:
+        return {
+            "_oracle_error": str(exc),
+            "_oracle_error_code": "trusted_collection_template_invalid",
+        }
+    expression = f"JSON.stringify(({rendered}))"
+    digest = hashlib.sha256(expression.encode("utf-8")).hexdigest()
+    logger = getattr(agent, "logger", None)
+    if logger is not None:
+        logger.write(
+            "runtime.evaluate.trusted_collection_template",
+            {
+                "templateId": template_id,
+                "expressionSha256": digest,
+                "pageId": page_id,
+                "bindingNames": sorted(bindings),
+            },
+        )
+    result = await _invoke_browser_method(
+        agent,
+        "Runtime.evaluate",
+        {
+            "pageId": page_id,
+            "expression": expression,
+            "world": "isolated",
+            "purpose": f"collect_items fixed read-only template: {template_id}",
+        },
+        step,
+        count_progress=False,
+        read_only_eval=True,
+        internal=True,
+        _trusted_collection_runtime_token=_TRUSTED_COLLECTION_RUNTIME_TOKEN,
+    )
+    if _invoke_result_failed(result):
+        error_text = str(
+            result.get("error")
+            or ((result.get("response") or {}).get("error") if isinstance(result.get("response"), dict) else "")
+            or "trusted collection template execution failed"
+        )[:500]
+        normalized = error_text.casefold()
+        error_code = (
+            "stealth_probe_unavailable"
+            if "stealthprobe is unavailable" in normalized
+            else "stealth_probe_timeout"
+            if "stealthprobe" in normalized and "timed out" in normalized
+            else "trusted_collection_runtime_failed"
+        )
+        return {
+            "_oracle_error": error_text,
+            "_oracle_error_code": error_code,
+        }
+    payload = _runtime_any_json_payload(result)
+    if payload is None:
+        return {
+            "_oracle_error": "trusted collection template returned no JSON payload",
+            "_oracle_error_code": "trusted_collection_payload_invalid",
+        }
+    return payload
+
+
+def _build_runtime_json_expression(expression: str) -> str:
     expression_json = json.dumps(expression)
     return f"""
 (async () => {{
-  try {{
-    const __abcpExpression = {expression_json};
-    const __abcpValue = (0, eval)("(" + __abcpExpression + ")");
-    const __abcpResolved = (
-      __abcpValue && typeof __abcpValue.then === "function"
-    ) ? await __abcpValue : __abcpValue;
-    return JSON.stringify({{ value: __abcpResolved }});
-  }} catch (err) {{
-    return JSON.stringify({{
-      error: String(err && err.message || err),
-      stack: String(err && err.stack || "")
-    }});
-  }}
+  const __abcpExpression = {expression_json};
+  const __abcpValue = (0, eval)("(" + __abcpExpression + ")");
+  const __abcpResolved = (
+    __abcpValue && typeof __abcpValue.then === "function"
+  ) ? await __abcpValue : __abcpValue;
+  return JSON.stringify({{ value: __abcpResolved }});
 }})()
 """
 
 
+def _runtime_evaluation_error_text(result: JsonDict) -> str:
+    if not isinstance(result, dict):
+        return "Runtime.evaluate failed"
+    if result.get("error"):
+        return str(result.get("error"))
+    response = result.get("response")
+    if isinstance(response, dict):
+        if response.get("error"):
+            return str(response.get("error"))
+        data = response.get("data")
+        if isinstance(data, dict) and data.get("error"):
+            return str(data.get("error"))
+    return "Runtime.evaluate failed without an error message"
+
+
+def _runtime_execution_metadata(response: Any) -> JsonDict:
+    """Read platform-issued world evidence from a Runtime.evaluate response."""
+    if not isinstance(response, dict):
+        return {}
+    data = response.get("data")
+    if not isinstance(data, dict):
+        nested = response.get("response")
+        data = nested.get("data") if isinstance(nested, dict) else None
+    metadata = data.get("runtimeEvaluation") if isinstance(data, dict) else None
+    return dict(metadata) if isinstance(metadata, dict) else {}
+
+
+def _runtime_response_world_metadata_supplied(response: Any) -> bool:
+    """Whether the platform attempted to supply its world-evidence envelope.
+
+    Presence is kept separate from validity: a legacy response with no field may
+    use degraded harness dispatch evidence, while a present but malformed field
+    must fail closed instead of being mistaken for legacy compatibility.
+    """
+    if not isinstance(response, dict):
+        return False
+    data = response.get("data")
+    if not isinstance(data, dict):
+        nested = response.get("response")
+        data = nested.get("data") if isinstance(nested, dict) else None
+    return isinstance(data, dict) and "runtimeEvaluation" in data
+
+
+def _runtime_attempt_receipt(response: Any, requested_world: str) -> JsonDict:
+    metadata = _runtime_execution_metadata(response)
+    metadata_supplied = _runtime_response_world_metadata_supplied(response)
+    failed = _invoke_result_failed(
+        {"method": "Runtime.evaluate", "response": response}
+        if isinstance(response, dict) and "response" not in response
+        else response
+    )
+    receipt = {
+        "requestedWorld": requested_world,
+        "executedWorld": str(metadata.get("executedWorld") or "") or None,
+        "status": "failed" if failed else "done",
+        "evidence": (
+            "platform_response"
+            if metadata
+            else "platform_response_invalid"
+            if metadata_supplied
+            else "harness_dispatched_world"
+        ),
+        **(
+            {"fallbackReason": str(metadata.get("fallbackReason"))}
+            if metadata.get("fallbackReason") else {}
+        ),
+        **(
+            {"error": _runtime_evaluation_error_text({"response": response})[:500]}
+            if failed else {}
+        ),
+    }
+    if not metadata_supplied:
+        receipt["dispatchedWorld"] = requested_world
+        receipt["evidenceStrength"] = "degraded"
+    elif not metadata:
+        receipt["evidenceStrength"] = "invalid"
+    return receipt
+
+
+def _runtime_response_world_verified(response: Any, expected_world: str) -> bool:
+    metadata = _runtime_execution_metadata(response)
+    return (
+        str(metadata.get("requestedWorld") or "") == expected_world
+        and str(metadata.get("executedWorld") or "") == expected_world
+    )
+
+
+def _runtime_main_fallback_signaled(response: Any) -> bool:
+    return MAIN_WORLD_REQUIRED_PREFIX in _runtime_evaluation_error_text(
+        {"response": response}
+    )
+
+
 def _rows_from_eval_value(value: Any) -> Optional[List[JsonDict]]:
-    candidate = None
-    if isinstance(value, list):
-        candidate = value
-    elif isinstance(value, dict) and isinstance(value.get("rows"), list):
-        candidate = value.get("rows")
-    if not isinstance(candidate, list):
-        return None
-    rows = [item for item in candidate if isinstance(item, dict)]
-    return rows if len(rows) == len(candidate) else None
+    if isinstance(value, list) and all(isinstance(item, dict) for item in value):
+        return value
+    if isinstance(value, dict):
+        rows = value.get("rows")
+        if isinstance(rows, list) and all(isinstance(item, dict) for item in rows):
+            return rows
+    return None
 
 
 def _attach_runtime_json_value(
@@ -4599,10 +6957,8 @@ def _attach_runtime_json_value(
 ) -> None:
     """Attach JSON-mode Runtime output and preserve extraction guarantees.
 
-    Runtime.evaluate's browser_call path used to report ``recordName`` in its
-    policy receipt even when a non-row value could not be persisted.  Keep the
-    raw value available for diagnostics, but make that contract failure
-    explicit and apply the same unrecorded-row gate as the legacy alias.
+    Keep the raw value available for diagnostics, but make a non-row
+    ``recordName`` contract failure explicit and apply the unrecorded-row gate.
     """
     result["runtimeValue"] = value
     result["runtimeValueType"] = type(value).__name__
@@ -4644,239 +7000,6 @@ def _attach_runtime_json_value(
             "rowCount": len(rows),
             "turns": 0,
         }
-
-
-def _json_sidechannel_ready_event(
-    message: Any,
-    page_id: str,
-    prefix: str,
-) -> bool:
-    """Accept only a terminal title side-channel notification.
-
-    ``PENDING`` is deliberately excluded: accepting it releases the waiter
-    before asynchronous evaluation has produced a result.
-    """
-    if not isinstance(message, dict):
-        return False
-    notification = message.get("notification")
-    envelope = notification if isinstance(notification, dict) else message
-    event = str(envelope.get("event") or envelope.get("method") or "")
-    if event != "Page.titleUpdated":
-        return False
-    payload = envelope.get("params")
-    if not isinstance(payload, dict):
-        payload = envelope.get("data")
-    payload = payload if isinstance(payload, dict) else envelope
-    observed_page = str(payload.get("pageId") or envelope.get("pageId") or "")
-    if page_id and observed_page != page_id:
-        return False
-    title = str(payload.get("title") or "")
-    return title.startswith(f"{prefix}|READY|") or title.startswith(
-        f"{prefix}|ERROR|"
-    )
-
-
-async def _eval_json_via_title(
-    agent: Any,
-    page_id: str,
-    json_string_expression: str,
-    step: int,
-    purpose: str,
-    *,
-    chunk_chars: int = 700,
-    max_chunks: int = 300,
-    ready_timeout_seconds: float = 30.0,
-    poll_interval_seconds: float = 0.25,
-    read_only_eval: bool = False,
-    internal: bool = False,
-) -> Optional[Any]:
-    prefix = "__ABCP_JSON__"
-    world_params = (
-        {"world": "isolated"}
-        if RuntimeEvaluationService(
-            getattr(agent, "method_schemas", {})
-        ).supports_world()
-        else {}
-    )
-    compatibility_policy = {
-        "origin": "harness_compatibility",
-        "intent": "diagnostic",
-        "effect": "state_changing",
-        "result_mode": "raw",
-    }
-    setup = f"""
-(async () => {{
-  try {{
-    window.__abcpOriginalTitle = document.title;
-    document.title = "{prefix}|PENDING|0";
-    const __abcpJsonText = await ({json_string_expression});
-    const text = String(__abcpJsonText ?? "null");
-    const bytes = new TextEncoder().encode(text);
-    let binary = "";
-    const step = 0x8000;
-    for (let i = 0; i < bytes.length; i += step) {{
-      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + step));
-    }}
-    window.__abcpJsonB64 = btoa(binary);
-    window.__abcpJsonOffset = 0;
-    document.title = "{prefix}|READY|" + String(window.__abcpJsonB64.length);
-    return document.title;
-  }} catch (err) {{
-    document.title = "{prefix}|ERROR|" + String(err && err.message || err).slice(0, 500);
-    return document.title;
-  }}
-}})()
-"""
-    async def cleanup() -> None:
-        cleanup_expression = f"""
-(() => {{
-  if (typeof window.__abcpOriginalTitle === "string") {{
-    document.title = window.__abcpOriginalTitle;
-  }}
-  delete window.__abcpOriginalTitle;
-  delete window.__abcpJsonB64;
-  delete window.__abcpJsonOffset;
-  return true;
-}})()
-"""
-        await _invoke_browser_method(
-            agent,
-            "Runtime.evaluate",
-            {
-                "pageId": page_id,
-                "expression": cleanup_expression,
-                "returnByValue": True,
-                "purpose": "Restore title and clear JSON side-channel state",
-                **world_params,
-            },
-            step,
-            read_only_eval=read_only_eval,
-            internal=True,
-            runtime_policy=compatibility_policy,
-            lifecycle_cleanup_bypass=True,
-        )
-
-    try:
-        setup_result = await _invoke_browser_method(
-            agent,
-            "Runtime.evaluate",
-            {
-                "pageId": page_id,
-                "expression": setup,
-                "returnByValue": True,
-                "purpose": f"{purpose}; initialize JSON title side-channel",
-                **world_params,
-            },
-            step,
-            read_only_eval=read_only_eval,
-            internal=internal,
-            runtime_policy=compatibility_policy,
-        )
-        if _invoke_result_failed(setup_result):
-            return {
-                "error": "JSON title side-channel setup was rejected or failed",
-                "setupResult": setup_result,
-            }
-        waiter = getattr(getattr(agent, "browser", None), "wait_for_notification", None)
-        if callable(waiter):
-            def title_event(message: JsonDict) -> bool:
-                return _json_sidechannel_ready_event(message, page_id, prefix)
-            try:
-                await waiter(
-                    title_event,
-                    timeout=max(1.0, ready_timeout_seconds),
-                    replay_window_seconds=2.0,
-                )
-            except TypeError:
-                await waiter(title_event, max(1.0, ready_timeout_seconds))
-        # One state synchronization after the event wait (or as its timeout
-        # fallback). This replaces the old Page.getState polling loop.
-        ready = await _invoke_browser_method(
-            agent,
-            "Page.getState",
-            {"pageId": page_id, "purpose": "Read JSON side-channel ready marker once"},
-            step,
-            read_only_eval=read_only_eval,
-            internal=internal,
-        )
-        title = str(_response_data(ready).get("title") or "")
-        if title.startswith(f"{prefix}|ERROR|"):
-            return {
-                "error": title.split("|", 2)[-1] if "|ERROR|" in title else "unknown title side-channel error"
-            }
-        if not title.startswith(f"{prefix}|READY|"):
-            return {
-                "error": (
-                    "Timed out waiting for eval_js_json title side-channel READY marker"
-                    f" after {ready_timeout_seconds:.1f}s"
-                )
-            }
-        try:
-            total_len = int(title.rsplit("|", 1)[-1])
-        except ValueError:
-            return {
-                "error": f"Invalid eval_js_json READY marker length: {title[:200]}"
-            }
-
-        chunks: List[str] = []
-        while sum(len(chunk) for chunk in chunks) < total_len:
-            if len(chunks) >= max_chunks:
-                return {
-                    "error": (
-                        "eval_js_json title side-channel exceeded max_chunks="
-                        f"{max_chunks} before reading {total_len} base64 chars"
-                    )
-                }
-            chunk_expr = f"""
-(() => {{
-  const text = String(window.__abcpJsonB64 || "bnVsbA==");
-  const start = Number(window.__abcpJsonOffset || 0);
-  const chunk = text.slice(start, start + {int(chunk_chars)});
-  window.__abcpJsonOffset = start + chunk.length;
-  document.title = "{prefix}|CHUNK|" + String(start) + "|" + chunk;
-  return document.title;
-}})()
-"""
-            await _invoke_browser_method(
-                agent,
-                "Runtime.evaluate",
-                {
-                    "pageId": page_id,
-                    "expression": chunk_expr,
-                    "returnByValue": True,
-                    "purpose": "Emit JSON title side-channel chunk",
-                    **world_params,
-                },
-                step,
-                read_only_eval=read_only_eval,
-                internal=internal,
-                runtime_policy=compatibility_policy,
-            )
-            state = await _invoke_browser_method(
-                agent,
-                "Page.getState",
-                {"pageId": page_id, "purpose": "Read JSON title side-channel chunk"},
-                step,
-                read_only_eval=read_only_eval,
-                internal=internal,
-            )
-            title = str(_response_data(state).get("title") or "")
-            parts = title.split("|", 3)
-            if len(parts) != 4 or parts[0] != prefix or parts[1] != "CHUNK":
-                return {
-                    "error": f"Invalid eval_js_json CHUNK marker: {title[:200]}"
-                }
-            chunks.append(parts[3])
-
-        try:
-            text = base64.b64decode("".join(chunks).encode("ascii")).decode("utf-8")
-            return json.loads(text)
-        except (ValueError, UnicodeDecodeError) as exc:
-            return {
-                "error": f"Failed to decode eval_js_json title side-channel payload: {exc}"
-            }
-    finally:
-        await cleanup()
 
 
 def _response_data(result: JsonDict) -> JsonDict:
@@ -5164,16 +7287,47 @@ async def _recover_page_create_32005(
     page_candidates: List[JsonDict] = []
     if _fleet_reuse_enabled(agent):
         # A coordinator-managed fresh worker must never turn a create failure
-        # into implicit adoption of another worker's page.  Explicit page
-        # continuations already carry their delegated handles, so probe only
-        # those handles and do not expose global Fleet/Page inventory.
+        # into implicit adoption of another worker's page. Probe only explicit
+        # local bindings plus pages authoritatively leased to this worker (the
+        # latter covers direct skill/fast-path calls that bypass tool post-hooks).
         page_fleets = getattr(agent, "page_fleet_ids", None)
         page_fleets = page_fleets if isinstance(page_fleets, dict) else {}
-        for page_id in sorted(getattr(agent, "allowed_page_ids", set()) or set()):
+        candidate_page_fleets = {
+            str(page_id or "").strip(): str(fleet_id or "").strip()
+            for page_id, fleet_id in page_fleets.items()
+            if str(page_id or "").strip()
+        }
+        manager = getattr(agent, "page_lease_manager", None)
+        worker_id = str(getattr(agent, "worker_id", "") or "").strip()
+        if (
+            manager is not None
+            and hasattr(manager, "page_fleets_for_worker")
+            and worker_id
+        ):
+            candidate_page_fleets.update(
+                manager.page_fleets_for_worker(worker_id)
+            )
+        allowed_page_ids = {
+            str(page_id or "").strip()
+            for page_id in (getattr(agent, "allowed_page_ids", set()) or set())
+            if str(page_id or "").strip()
+        }
+        allowed_page_ids.update(
+            page_id
+            for page_id in candidate_page_fleets
+            if (
+                manager is not None
+                and hasattr(manager, "owner_for")
+                and str(manager.owner_for(page_id) or "") == worker_id
+            )
+        )
+        for page_id in sorted(allowed_page_ids):
             page_id = str(page_id or "").strip()
             if not page_id:
                 continue
-            candidate_fleet_id = str(page_fleets.get(page_id) or "").strip()
+            candidate_fleet_id = str(
+                candidate_page_fleets.get(page_id) or ""
+            ).strip()
             if not candidate_fleet_id or (
                 assigned_fleet_id
                 and candidate_fleet_id != assigned_fleet_id
@@ -5659,6 +7813,98 @@ def _non_negative_numeric_param(params: JsonDict, key: str) -> bool:
     return False
 
 
+def _check_select_param_requirements(
+    method: str,
+    params: JsonDict,
+) -> Optional[JsonDict]:
+    """Fail early on malformed Input.select selection envelopes.
+
+    The live schema intentionally permits id/value/label metadata to coexist,
+    so the harness requires at least one usable identity field rather than
+    imposing an artificial oneOf. Cascading paths are validated recursively.
+    """
+
+    if method != "Input.select":
+        return None
+    selections = params.get("selections")
+    if not isinstance(selections, list) or not selections:
+        return {
+            "method": method,
+            "params": params,
+            "status": "invalid_params",
+            "error": "Input.select requires a non-empty params.selections array.",
+            "invalidParam": "selections",
+            "missingAnyOf": [["selections"]],
+            "tool_was_executed": False,
+            "next_instruction": (
+                "Call DOM.inspectSelect when choices are unknown, then pass"
+                " selections as an array even for one choice. Copy only the"
+                " id/value/label or complete path fields returned for the"
+                " intended option, preferring exact value or label when present;"
+                " Input.select manages the popup atomically."
+            ),
+        }
+
+    canonical_id = re.compile(r"^\d+:\d+:\d+$")
+
+    def invalid(path: str, detail: str) -> JsonDict:
+        return {
+            "method": method,
+            "params": params,
+            "status": "invalid_params",
+            "error": detail,
+            "invalidParam": path,
+            "tool_was_executed": False,
+            "next_instruction": (
+                "Copy only option descriptor fields returned by"
+                " DOM.inspectSelect: id, exact value, exact label, or a complete"
+                " cascade path. Do not synthesize identifiers or operate the"
+                " popup manually."
+            ),
+        }
+
+    def validate_choice(choice: Any, path: str, *, allow_path: bool) -> Optional[JsonDict]:
+        if not isinstance(choice, dict):
+            return invalid(path, f"Input.select {path} must be an object.")
+        raw_id = choice.get("id")
+        if raw_id is not None and (
+            not isinstance(raw_id, str) or canonical_id.fullmatch(raw_id.strip()) is None
+        ):
+            return invalid(f"{path}.id", f"Input.select {path}.id is not a canonical option id.")
+        direct_identity = (
+            isinstance(choice.get("id"), str)
+            and bool(choice.get("id").strip())
+        ) or isinstance(choice.get("value"), str) or (
+            isinstance(choice.get("label"), str)
+            and bool(choice.get("label").strip())
+        )
+        cascade = choice.get("path")
+        if cascade is not None:
+            if not allow_path:
+                return invalid(f"{path}.path", "Nested Input.select cascade paths are not supported.")
+            if not isinstance(cascade, list) or len(cascade) < 2:
+                return invalid(
+                    f"{path}.path",
+                    f"Input.select {path}.path must contain at least two ordered choices.",
+                )
+            for index, step in enumerate(cascade):
+                error = validate_choice(step, f"{path}.path[{index}]", allow_path=False)
+                if error is not None:
+                    return error
+        elif not direct_identity:
+            return invalid(
+                path,
+                f"Input.select {path} requires id, value, label, or a cascade path.",
+            )
+        return None
+
+    for index, selection in enumerate(selections):
+        error = validate_choice(selection, f"selections[{index}]", allow_path=True)
+        if error is not None:
+            return error
+    return None
+
+
 def _check_id_param_format(
     method: str,
     params: JsonDict,
@@ -5778,7 +8024,13 @@ def _check_target_param_requirements(
             "tool_was_executed": False,
             "missingAnyOf": [["targets"]],
         }
-    if method in {"DOM.getText", "DOM.getAttribute", "Input.type"} and not has_selector_or_id:
+    if method in {
+        "DOM.getText",
+        "DOM.getAttribute",
+        "DOM.inspectSelect",
+        "Input.select",
+        "Input.type",
+    } and not has_selector_or_id:
         return {
             "method": method,
             "params": params,
@@ -5792,6 +8044,9 @@ def _check_target_param_requirements(
                 " pageId/purpose or without a target element."
             ),
         }
+    select_error = _check_select_param_requirements(method, params)
+    if select_error is not None:
+        return select_error
     if method == "Input.click" and not has_selector_or_id:
         has_coordinates = (
             _non_negative_numeric_param(params, "x")
@@ -5881,10 +8136,52 @@ def _check_screenshot_misuse(
         "next_instruction": (
             "Page.screenshot returns only a savedPath; the model cannot inspect"
             " that image from this tool result. Use DOM.getAXTree,"
-            " DOM.getText, DOM.getAttribute, extract_dom_records, or"
+            " DOM.getText, DOM.getAttribute, or"
             " visual_verify for bounded visual arbitration."
         ),
     }
+
+
+def _default_semantic_tree_shadow_dom(
+    method: str,
+    params: JsonDict,
+    method_schemas: Any,
+) -> Tuple[JsonDict, bool]:
+    """Include shadow content unless the caller explicitly opts out.
+
+    An omitted flag makes a rendered custom-element host look like an empty
+    subtree, which led workers to classify tall v-detail-* hosts as a platform
+    limitation and skip exportable images. This default is applied only when
+    the connected schema advertises the parameter, so older ABCP versions do
+    not receive an invented argument. Explicit false remains an escape hatch
+    for a deliberately light diagnostic.
+    """
+    if method != "DOM.getSemanticTree" or "includeShadowDom" in params:
+        return params, False
+    schema = (
+        method_schemas.get(method)
+        if isinstance(method_schemas, dict) else None
+    )
+    schema_params = schema.get("params") if isinstance(schema, dict) else None
+    if not isinstance(schema_params, dict) or "includeShadowDom" not in schema_params:
+        return params, False
+    normalized = dict(params)
+    normalized["includeShadowDom"] = True
+    return normalized, True
+
+
+def _normalize_screenshot_output(
+    method: str,
+    params: JsonDict,
+) -> Tuple[JsonDict, Optional[JsonDict]]:
+    """Force Page.screenshot to return a file handle, never image bytes.
+
+    Image payload stripping happens only after the WebSocket response arrives,
+    which is too late for a large full-page base64 frame.  ABCP owns the output
+    path; model-provided path/quality/encoding options are intentionally not
+    forwarded because Page.screenshot is a savedPath-only harness primitive.
+    """
+    return normalize_screenshot_output_params(method, params)
 
 
 def _attach_normalized_handles(result: JsonDict) -> JsonDict:
@@ -6030,7 +8327,14 @@ async def _post_hitl_recovery_loop(
     step: int,
 ) -> JsonDict:
     vl_config = getattr(agent.runtime.harness, "vl", None)
-    if vl_config is None or not getattr(vl_config, "enabled", False):
+    vl_enabled = bool(vl_config is not None and getattr(vl_config, "enabled", False))
+    structural_receipts = getattr(agent, "hitl_structural_challenges", None)
+    structural_expected = (
+        structural_receipts.get(str(page_id))
+        if isinstance(structural_receipts, dict)
+        else None
+    )
+    if not vl_enabled and not isinstance(structural_expected, dict):
         return wait_result
 
     max_rounds = max(
@@ -6067,6 +8371,67 @@ async def _post_hitl_recovery_loop(
             current_wait["postHitlRecovery"] = {
                 **recovery,
             }
+            return current_wait
+
+        if isinstance(structural_expected, dict):
+            structural_check = await _post_hitl_structural_challenge_check(
+                agent, page_id, step, round_index + 1
+            )
+            if structural_check.get("status") == "challenge_present":
+                round_record = {
+                    "round": round_index + 1,
+                    "structural": structural_check,
+                }
+                rounds.append(round_record)
+                if round_index >= max_rounds - 1:
+                    return {
+                        **current_wait,
+                        "status": "still_challenge_after_hitl",
+                        "postHitlRecovery": {
+                            "status": "max_rounds_reached",
+                            "verificationMode": "structural_axtree",
+                            "rounds": rounds,
+                        },
+                    }
+                next_wait = await _repause_for_structural_challenge(
+                    agent,
+                    page_id,
+                    step,
+                    round_index + 1,
+                    structural_check,
+                )
+                round_record["retryWait"] = {
+                    key: value
+                    for key, value in next_wait.items()
+                    if key in {"status", "via", "elapsedMs", "reason", "error"}
+                }
+                current_wait = next_wait
+                continue
+            if structural_check.get("status") == "check_failed":
+                rounds.append({
+                    "round": round_index + 1,
+                    "structural": structural_check,
+                })
+                if not vl_enabled:
+                    return {
+                        **current_wait,
+                        "status": "browser_error_after_hitl",
+                        "postHitlRecovery": {
+                            "status": "structural_check_failed",
+                            "rounds": rounds,
+                        },
+                    }
+            elif not vl_enabled:
+                current_wait["postHitlRecovery"] = {
+                    "status": "recovered_by_structural_axtree",
+                    "rounds": rounds + [{
+                        "round": round_index + 1,
+                        "structural": structural_check,
+                    }],
+                }
+                return current_wait
+
+        if not vl_enabled:
             return current_wait
 
         vl_result = await _post_hitl_recovery_vl_check(
@@ -6146,6 +8511,102 @@ async def _post_hitl_recovery_loop(
         current_wait = next_wait
 
     return current_wait
+
+
+async def _post_hitl_structural_challenge_check(
+    agent: Any,
+    page_id: str,
+    step: int,
+    round_index: int,
+) -> JsonDict:
+    tree = await _post_hitl_raw_browser_call(
+        agent,
+        "DOM.getAXTree",
+        {
+            "pageId": page_id,
+            "purpose": (
+                "Verify that the embedded CAPTCHA/verification frame is gone"
+                f" after HITL round {round_index}."
+            ),
+        },
+        step,
+        capture_axtree_text=True,
+    )
+    raw_text = str(tree.pop("_authAXTreeText", "") or "")
+    if _invoke_result_failed(tree) or not raw_text:
+        return {
+            "status": "check_failed",
+            "round": round_index,
+            "reason": "fresh_axtree_unavailable",
+        }
+    evidence = detect_structural_challenge_from_lines(
+        raw_text.splitlines(), source_method="DOM.getAXTree"
+    )
+    if evidence:
+        return {
+            "status": "challenge_present",
+            "round": round_index,
+            "evidence": evidence,
+        }
+    return {
+        "status": "challenge_cleared",
+        "round": round_index,
+        "freshAXTree": True,
+    }
+
+
+async def _repause_for_structural_challenge(
+    agent: Any,
+    page_id: str,
+    step: int,
+    round_index: int,
+    structural_check: JsonDict,
+) -> JsonDict:
+    state_call = await _post_hitl_raw_browser_call(
+        agent,
+        "Page.getState",
+        {
+            "pageId": page_id,
+            "purpose": "Preserve current detail state before repeating HITL for a remaining embedded challenge.",
+        },
+        step,
+    )
+    state_data = _response_data(state_call)
+    pause_call = await _post_hitl_raw_browser_call(
+        agent,
+        "Hitl.requestPause",
+        {
+            "pageId": page_id,
+            "purpose": (
+                "The embedded verification frame and control remain after"
+                " HITL; pause the same detail page again without navigation."
+            ),
+            "reason": "请继续完成当前详情页中仍存在的验证码/滑块验证。",
+        },
+        step,
+    )
+    response = pause_call.get("response") if isinstance(pause_call, dict) else None
+    if not _hitl_pause_succeeded(response):
+        return {
+            "status": "browser_error_after_hitl",
+            "error": "Hitl.requestPause failed for remaining structural challenge",
+            "structural": structural_check,
+        }
+    harness_cfg = agent.runtime.harness
+    return await wait_for_hitl_resume(
+        browser=agent.browser,
+        page_id=str(page_id),
+        timeout_seconds=getattr(harness_cfg, "hitl_wait_timeout_seconds", 900.0),
+        poll_interval_seconds=getattr(harness_cfg, "hitl_poll_interval_seconds", 2.0),
+        diagnostics=getattr(agent, "diagnostics", None),
+        logger=agent.logger,
+        challenge_verifier=_make_hitl_challenge_verifier(agent, str(page_id), step),
+        pause_snapshot={
+            "url": str(state_data.get("url") or ""),
+            "title": str(state_data.get("title") or ""),
+            "round": round_index,
+        },
+    )
 
 
 async def _post_hitl_recovery_vl_check(
@@ -6329,7 +8790,7 @@ async def _refresh_and_wait_for_post_hitl_retry(
     wait_result = await wait_for_hitl_resume(
         browser=agent.browser,
         page_id=str(page_id),
-        timeout_seconds=getattr(harness_cfg, "hitl_wait_timeout_seconds", 1200.0),
+        timeout_seconds=getattr(harness_cfg, "hitl_wait_timeout_seconds", 900.0),
         poll_interval_seconds=getattr(harness_cfg, "hitl_poll_interval_seconds", 2.0),
         diagnostics=getattr(agent, "diagnostics", None),
         logger=agent.logger,
@@ -6378,12 +8839,24 @@ async def _post_hitl_raw_browser_call(
             private_axtree_text = "\n".join(_axtree_lines_from_value(response))
         response = agent._offload_response(method, params, response, step)
         result = {"method": method, "params": params, "response": response}
+    except FleetClickGateTimeout as exc:
+        result = {
+            "method": method,
+            "params": params,
+            "status": "fleet_click_gated",
+            "error": str(exc),
+            **exc.receipt,
+        }
+        attach_method_schema(
+            result, method, getattr(agent, "method_schemas", {})
+        )
     except ABCPTransportError as exc:
         result = {
             "method": method,
             "params": params,
             "status": "browser_error_after_hitl",
             "error": str(exc),
+            **_transport_error_metadata(method, exc),
         }
         attach_method_schema(result, method, getattr(agent, "method_schemas", {}))
     except Exception as exc:
@@ -6395,6 +8868,7 @@ async def _post_hitl_raw_browser_call(
         }
 
     attach_error_classification(result, method=method)
+    result = _apply_select_failure_guidance(agent, method, params, result)
     result = _attach_normalized_handles(result)
     logger = getattr(agent, "logger", None)
     if logger is not None and hasattr(logger, "write"):
@@ -6405,6 +8879,220 @@ async def _post_hitl_raw_browser_call(
         # callers must not persist or expose the raw accessibility text.
         result["_authAXTreeText"] = private_axtree_text
     return result
+
+
+def _clear_challenge_state_after_recovery(agent: Any, page_id: str, *, event: str) -> None:
+    """Shared bookkeeping for "this page is no longer challenged".
+
+    Used by the HITL resume path and by a successful VL auto-solve: drop the
+    accumulated suspicion, forget the structural receipt, and hold a short
+    re-pause guard so residual challenge wording in the next tool result cannot
+    trigger a second pause before the worker has re-perceived the page.
+    """
+    harness_cfg = getattr(getattr(agent, "runtime", None), "harness", None)
+    cooldown_seconds = float(
+        getattr(harness_cfg, "hitl_no_repause_cooldown_seconds", 8.0) or 0.0
+    )
+    agent.hitl_no_repause_until = time.monotonic() + max(0.0, cooldown_seconds)
+    guard_seconds = float(
+        getattr(harness_cfg, "hitl_post_resume_guard_seconds", 30.0) or 0.0
+    )
+    _record_post_hitl_repause_guard(
+        agent, str(page_id), max(cooldown_seconds, guard_seconds)
+    )
+    tracker = getattr(agent, "challenge_tracker", None)
+    if tracker is not None:
+        tracker.clear_page(str(page_id))
+    structural_receipts = getattr(agent, "hitl_structural_challenges", None)
+    if isinstance(structural_receipts, dict):
+        structural_receipts.pop(str(page_id), None)
+    logger = getattr(agent, "logger", None)
+    if logger is not None and hasattr(logger, "write"):
+        logger.write(event, {"pageId": str(page_id)})
+
+
+async def _maybe_autosolve_before_hitl(
+    agent: Any,
+    page_id: str,
+    step: int,
+    *,
+    trigger: str,
+    vl_only_detection: bool,
+    reason: str,
+) -> JsonDict:
+    """Bounded VL attempt to clear a detected challenge BEFORE asking a human.
+
+    Returns {} when the role is switched off, so a disabled deployment keeps the
+    exact pre-existing straight-to-HITL behavior. Never raises: the human path
+    must stay reachable no matter how the solve fails.
+    """
+    from harness.tools.browser_tools.captcha_autosolve import (
+        autosolve_enabled,
+        maybe_autosolve_captcha,
+    )
+
+    if not autosolve_enabled(agent):
+        return {}
+    try:
+        return await maybe_autosolve_captcha(
+            agent,
+            str(page_id),
+            step,
+            trigger=trigger,
+            vl_only_detection=vl_only_detection,
+            reason=reason,
+        )
+    except Exception as exc:
+        logger = getattr(agent, "logger", None)
+        if logger is not None and hasattr(logger, "write"):
+            logger.write("vl.captcha_autosolve.failed", {
+                "pageId": str(page_id),
+                "trigger": trigger,
+                "errorType": type(exc).__name__,
+                "error": str(exc)[:300],
+            })
+        return {
+            "status": "error",
+            "attempted": False,
+            "trigger": trigger,
+            "errorType": type(exc).__name__,
+            "reason": str(exc)[:300],
+        }
+
+
+def _autosolve_cleared(receipt: Any) -> bool:
+    from harness.tools.browser_tools.captcha_autosolve import CLEARED_STATUSES
+
+    return bool(
+        isinstance(receipt, dict)
+        and receipt.get("attempted")
+        and str(receipt.get("status") or "") in CLEARED_STATUSES
+    )
+
+
+def _autosolve_cleared_result(
+    agent: Any,
+    enriched: JsonDict,
+    page_id: str,
+    step: int,
+    solve: JsonDict,
+    *,
+    pause_skipped: bool = False,
+) -> JsonDict:
+    """Build the "solved without a human" result and reset the page's challenge
+    bookkeeping so the next observation starts from a clean slate."""
+    out = dict(enriched)
+    suspected = dict(out.get("suspected_challenge") or {})
+    suspected["adjudication"] = "auto_solved_by_vl"
+    out["suspected_challenge"] = suspected
+    out["captchaAutoSolve"] = solve
+    _clear_challenge_state_after_recovery(
+        agent, page_id, event="challenge.autosolve_cleared"
+    )
+    out["next_instruction"] = (
+        (
+            "Your Hitl.requestPause was NOT executed: the harness cleared this"
+            " challenge automatically with a bounded VL solve first, so no human"
+            " was interrupted and no pause is pending."
+            if pause_skipped
+            else "The harness cleared this challenge automatically with a bounded"
+            " VL solve; no human pause was requested and no Hitl.* call is pending."
+        )
+        + " Treat the page as unverified until you re-perceive it: refresh"
+        " Page.getState and DOM.getAXTree, confirm the target content is"
+        " actually present, then continue the original action. If the challenge"
+        " is still there, report it — this page will not be auto-solved again."
+    )
+    return out
+
+
+def _reason_with_autosolve(reason: str, solve: Any) -> str:
+    """Tell the human why automation gave up, in the pause reason they read."""
+    from harness.tools.browser_tools.captcha_autosolve import solve_summary
+
+    summary = solve_summary(solve)
+    return f"{reason} ({summary})" if summary else reason
+
+
+def _model_pause_challenge_evidence(agent: Any, params: JsonDict) -> Optional[JsonDict]:
+    """Decide whether a model-issued pause is CAPTCHA-shaped enough to try solving.
+
+    Login walls, SMS/QR/2FA and payment confirmations are human-only by nature —
+    spending a screenshot plus a VL round-trip on them would only make the person
+    wait longer. The evidence is reused, never re-invented: the page's own
+    accumulated challenge state, or the model's stated reason matching the shared
+    high-confidence challenge vocabulary. Returns None when it is not worth trying.
+    """
+    page_id = str(params.get("pageId") or "").strip()
+    tracker = getattr(agent, "challenge_tracker", None)
+    state = tracker.get_state(page_id) if (tracker is not None and page_id) else None
+    if state is not None and state.structural_challenge:
+        return {"source": "structural_challenge", "vlOnly": False}
+    if state is not None and state.high_confidence_hit:
+        return {"source": "high_confidence_signal", "vlOnly": True}
+    haystack = " ".join(
+        str(params.get(key) or "") for key in ("reason", "purpose")
+    ).lower()
+    if any(keyword in haystack for keyword in HIGH_CONFIDENCE_CHALLENGE_KEYWORDS):
+        return {"source": "model_pause_reason", "vlOnly": True}
+    return None
+
+
+async def _maybe_autosolve_before_model_pause(
+    agent: Any,
+    method: str,
+    params: JsonDict,
+    step: int,
+) -> Optional[JsonDict]:
+    """Intercept a model-issued Hitl.requestPause for a visual challenge.
+
+    Returns a short-circuit result when the challenge was solved (the pause is
+    never issued), else None so the pause proceeds exactly as before — with the
+    solve attempt appended to the reason the human reads.
+    """
+    if method != "Hitl.requestPause" or not isinstance(params, dict):
+        return None
+    from harness.tools.browser_tools.captcha_autosolve import autosolve_enabled
+
+    if not autosolve_enabled(agent):
+        return None
+    page_id = str(params.get("pageId") or "").strip()
+    if not page_id:
+        return None
+    evidence = _model_pause_challenge_evidence(agent, params)
+    if evidence is None:
+        return None
+    reason = str(params.get("reason") or params.get("purpose") or "")
+    solve = await _maybe_autosolve_before_hitl(
+        agent,
+        page_id,
+        step,
+        trigger="model_request_pause",
+        vl_only_detection=bool(evidence.get("vlOnly", True)),
+        reason=reason,
+    )
+    if isinstance(solve, dict):
+        solve = {**solve, "detectionEvidence": evidence}
+    if not _autosolve_cleared(solve):
+        # The pause the model asked for still happens; the human just gets to
+        # see that automation already tried and how it failed.
+        enriched_reason = _reason_with_autosolve(reason, solve)
+        if enriched_reason != reason:
+            params["reason"] = enriched_reason
+        return None
+    return _autosolve_cleared_result(
+        agent,
+        {
+            "method": method,
+            "status": "captcha_auto_solved",
+            "tool_was_executed": False,
+            "pageId": page_id,
+        },
+        page_id,
+        step,
+        solve,
+        pause_skipped=True,
+    )
 
 
 async def _adjudicate_and_maybe_hitl(
@@ -6425,6 +9113,58 @@ async def _adjudicate_and_maybe_hitl(
         "adjudication": "pending",
         "triggerMethod": trigger_method,
     }
+
+    # A challenge-labelled embedded root plus an actionable verification
+    # control is stronger than a whole-page visual verdict.  Small iframes can
+    # be visually inconspicuous while still blocking one business subrequest;
+    # do not let VL "normal_loading" suppress deterministic AX evidence.
+    if state is not None and state.structural_challenge:
+        evidence = state.structural_evidence or {}
+        controls = (
+            evidence.get("controls")
+            if isinstance(evidence.get("controls"), list)
+            else []
+        )
+        control_labels = [
+            str(control.get("label") or control.get("role") or "").strip()
+            for control in controls
+            if isinstance(control, dict)
+        ]
+        control_summary = ", ".join(label for label in control_labels if label)[:160]
+        enriched["suspected_challenge"]["adjudication"] = "structural_confirmed"
+        challenge_reason = (
+            "Embedded verification frame detected: "
+            f"{evidence.get('rootLabel') or 'challenge'}"
+            + (f"; control: {control_summary}" if control_summary else "")
+        )
+        solve = await _maybe_autosolve_before_hitl(
+            agent,
+            page_id,
+            step,
+            trigger="structural_challenge",
+            vl_only_detection=False,
+            reason=challenge_reason,
+        )
+        if _autosolve_cleared(solve):
+            return _autosolve_cleared_result(agent, enriched, page_id, step, solve)
+        if solve:
+            enriched["captchaAutoSolve"] = solve
+        enriched["autoHitl"] = await _request_hitl_for_challenge(
+            agent,
+            page_id,
+            trigger_method,
+            step,
+            reason=_reason_with_autosolve(challenge_reason, solve),
+            trigger_result=result,
+        )
+        enriched["next_instruction"] = (
+            "A cross-frame AXTree challenge and an actionable verification"
+            " control were detected. The harness requested HITL without"
+            " allowing a whole-page VL verdict to override that evidence."
+            " After resume, follow autoHitl.resumeCheckpoint and revalidate"
+            " the original business content."
+        )
+        return enriched
 
     if vl_enabled:
         agent.challenge_adjudicating = True
@@ -6457,12 +9197,25 @@ async def _adjudicate_and_maybe_hitl(
             tracker.record_vl_verdict(page_id, step, verdict)
         enriched["challengeAdjudication"] = vl_result
         if verdict == "confirmed_challenge":
+            challenge_reason = str(vl_result.get("reason") or "VL confirmed challenge")
+            solve = await _maybe_autosolve_before_hitl(
+                agent,
+                page_id,
+                step,
+                trigger="vl_confirmed_challenge",
+                vl_only_detection=True,
+                reason=challenge_reason,
+            )
+            if _autosolve_cleared(solve):
+                return _autosolve_cleared_result(agent, enriched, page_id, step, solve)
+            if solve:
+                enriched["captchaAutoSolve"] = solve
             enriched["autoHitl"] = await _request_hitl_for_challenge(
                 agent,
                 page_id,
                 trigger_method,
                 step,
-                reason=str(vl_result.get("reason") or "VL confirmed challenge"),
+                reason=_reason_with_autosolve(challenge_reason, solve),
                 trigger_result=result,
             )
             enriched["next_instruction"] = (
@@ -6514,6 +9267,121 @@ async def _adjudicate_and_maybe_hitl(
     return enriched
 
 
+def _hitl_pause_rounds(agent: Any) -> Dict[str, int]:
+    """Pause rounds spent, keyed by pageId; the "" key is the worker total."""
+    rounds = getattr(agent, "hitl_pause_rounds", None)
+    if not isinstance(rounds, dict):
+        rounds = {}
+        agent.hitl_pause_rounds = rounds
+    return rounds
+
+
+def _count_hitl_pause_round(agent: Any, page_id: str) -> Dict[str, int]:
+    """Charge one pause round. Called from exactly one place.
+
+    `_claim_fleet_auth_barrier_for_hitl` is the single choke point every
+    dispatched Hitl.requestPause crosses, so counting there — and only there —
+    keeps the auto path (which claims the barrier itself first, then dispatches
+    through the same guard) from being charged twice for one pause.
+    """
+    rounds = _hitl_pause_rounds(agent)
+    key = str(page_id or "")
+    if key:
+        rounds[key] = int(rounds.get(key, 0)) + 1
+    rounds[""] = int(rounds.get("", 0)) + 1
+    return rounds
+
+
+async def _refuse_hitl(
+    agent: Any,
+    admission: JsonDict,
+    page_id: str,
+    trigger_method: str,
+) -> JsonDict:
+    """Hand back a refusal, releasing the lease without opening the gate."""
+    released = await _release_fleet_auth_after_hitl_refusal(
+        agent, f"HITL refused: {admission['reasonKind']}"
+    )
+    if released:
+        admission = {**admission, "fleetAuthBarrier": released}
+    logger = getattr(agent, "logger", None)
+    if logger is not None and hasattr(logger, "write"):
+        logger.write("hitl.refused", {
+            "pageId": page_id,
+            "triggerMethod": trigger_method,
+            "reasonKind": admission["reasonKind"],
+            "budgetScope": admission.get("budgetScope"),
+            "pauseRoundsUsed": admission.get("pauseRoundsUsed"),
+        })
+    return admission
+
+
+def _hitl_admission(agent: Any, page_id: str) -> Optional[JsonDict]:
+    """Decide whether asking a human is still worth doing.
+
+    Returns None to proceed, or a terminal receipt to hand back instead. Both
+    refusals are returned BEFORE the fleet auth barrier is claimed: a pause
+    nobody will answer must not also shut the gate on every sibling worker.
+    """
+    harness_cfg = getattr(getattr(agent, "runtime", None), "harness", None)
+    attendance = str(
+        getattr(harness_cfg, "hitl_attendance", "attended") or "attended"
+    ).strip().lower()
+    if attendance == "unattended":
+        return {
+            "status": "hitl_unattended",
+            "reasonKind": "hitl_unattended",
+            "tool_was_executed": False,
+            "retryable": False,
+            "pageId": page_id,
+            "next_instruction": (
+                "This deployment is configured as unattended (hitl_attendance)."
+                " No human will resolve this challenge. Do not pause, retry, or"
+                " navigate around it: report it as a blocker and finish."
+            ),
+        }
+    rounds = _hitl_pause_rounds(agent)
+    per_page = max(0, int(getattr(harness_cfg, "hitl_max_pause_rounds_per_page", 3) or 0))
+    per_worker = max(0, int(getattr(harness_cfg, "hitl_max_pause_rounds_per_worker", 3) or 0))
+    page_used = int(rounds.get(str(page_id), 0))
+    worker_used = int(rounds.get("", 0))
+    if per_page and page_used >= per_page:
+        scope, used, budget = "page", page_used, per_page
+    elif per_worker and worker_used >= per_worker:
+        scope, used, budget = "worker", worker_used, per_worker
+    else:
+        return None
+    return {
+        "status": "hitl_budget_exhausted",
+        "reasonKind": "hitl_budget_exhausted",
+        "tool_was_executed": False,
+        "retryable": False,
+        "pageId": page_id,
+        "budgetScope": scope,
+        "pauseRoundsUsed": used,
+        "pauseRoundsBudget": budget,
+        "next_instruction": (
+            f"The cumulative HITL budget for this {scope} is spent"
+            f" ({used}/{budget} pauses). A human did not resolve the challenge"
+            " in the earlier rounds and re-pausing holds the fleet gate shut"
+            " for every sibling worker. Report this as a blocker and finish."
+        ),
+    }
+
+
+async def _release_fleet_auth_after_hitl_refusal(agent: Any, reason: str) -> JsonDict:
+    """Hand the gate back when this worker will not be asking a human."""
+    barrier = getattr(agent, "fleet_auth_barrier", None)
+    fleet_id = str(getattr(agent, "assigned_fleet_id", "") or "").strip()
+    worker_id = str(getattr(agent, "worker_id", "") or "").strip()
+    if barrier is None or not fleet_id or not worker_id:
+        return {}
+    try:
+        return await barrier.relinquish(fleet_id, worker_id, reason=reason) or {}
+    except Exception:  # noqa: BLE001 - a refusal must never raise
+        return {}
+
+
 async def _request_hitl_for_challenge(
     agent: Any,
     page_id: str,
@@ -6523,6 +9391,22 @@ async def _request_hitl_for_challenge(
     reason: str,
     trigger_result: Optional[JsonDict] = None,
 ) -> JsonDict:
+    # Checked here as well as at the dispatch guard, because this path claims
+    # the barrier BEFORE dispatching: a pause nobody will answer must not shut
+    # the gate on every sibling worker first and be refused afterwards.
+    # Releasing the lease is not the same as opening the gate — the fleet is
+    # still challenged, so waiters keep getting a terminal verdict rather than
+    # a pass onto a cookie jar that is still under risk control. The round is
+    # NOT charged here; the dispatch guard owns accounting.
+    admission = _hitl_admission(agent, page_id)
+    if admission is not None:
+        return await _refuse_hitl(agent, admission, page_id, trigger_method)
+    structural_evidence = (
+        trigger_result.get("structuralChallenge")
+        if isinstance(trigger_result, dict)
+        and isinstance(trigger_result.get("structuralChallenge"), dict)
+        else None
+    )
     barrier = getattr(agent, "fleet_auth_barrier", None)
     fleet_id = str(getattr(agent, "assigned_fleet_id", "") or "").strip()
     worker_id = str(getattr(agent, "worker_id", "") or "").strip()
@@ -6538,6 +9422,12 @@ async def _request_hitl_for_challenge(
                 "tool_was_executed": False,
                 "retryable": True,
             }
+    if isinstance(structural_evidence, dict):
+        receipts = getattr(agent, "hitl_structural_challenges", None)
+        if not isinstance(receipts, dict):
+            receipts = {}
+            agent.hitl_structural_challenges = receipts
+        receipts[str(page_id)] = dict(structural_evidence)
     # Capture the pre-pause surface here so every auto-HITL path (VL-confirmed,
     # VL-disabled high-confidence, future callers) records the snapshot that the
     # verified-settlement title gate compares against.
@@ -6552,19 +9442,25 @@ async def _request_hitl_for_challenge(
             snapshots = {}
             agent.hitl_pause_snapshots = snapshots
         snapshots[str(page_id)] = snapshot
+    rounds = _hitl_pause_rounds(agent)
     agent.logger.write(
         "hitl.auto_request_pause",
         {
             "pageId": page_id,
             "triggerMethod": trigger_method,
             "reason": reason,
+            "structuralEvidence": structural_evidence,
             "pauseSnapshot": snapshot,
             "authBarrier": barrier_claim or None,
+            # Charged by the dispatch guard below, so this reports the rounds
+            # already spent before this one.
+            "pauseRoundsBefore": int(rounds.get(str(page_id), 0)),
+            "workerPauseRoundsBefore": int(rounds.get("", 0)),
         },
     )
     agent.challenge_adjudicating = True
     try:
-        return await _invoke_browser_method(
+        pause_result = await _invoke_browser_method(
             agent,
             "Hitl.requestPause",
             {
@@ -6579,28 +9475,38 @@ async def _request_hitl_for_challenge(
         )
     finally:
         agent.challenge_adjudicating = False
+    if isinstance(pause_result, dict):
+        pause_result = dict(pause_result)
+        pause_result["resumeCheckpoint"] = {
+            "pageId": page_id,
+            "triggerMethod": trigger_method,
+            "challengeReason": reason,
+            "structuralEvidence": structural_evidence,
+            "requiredSequence": [
+                "Page.getState",
+                "DOM.getAXTree",
+                "retry_original_materialization_if_needed",
+                "DOM.getSemanticTree",
+                "validate_requested_record_count",
+            ],
+            "successCondition": (
+                "The challenge frame is absent and the original task-required"
+                " content or requested record count is materialized."
+            ),
+            "doNotAccept": [
+                "normal page title alone",
+                "drawer shell alone",
+                "loading skeleton",
+                "preview rows outside the target subtree",
+            ],
+        }
+    return pause_result
 
 PROGRESS_GATE_MAX_BLOCKS = 2
 PROGRESS_GATE_RECOVERY_TOOLS = frozenset({
-    "find_in_axtree",
+    *NO_ARTIFACT_DIAGNOSTIC_TOOLS,
     "local_fs_read",
     "local_fs_search",
-    "visual_verify",
-    "DOM.getAXTree",
-    "DOM.getSemanticTree",
-    "DOM.getText",
-    "DOM.getAttribute",
-    "Input.scroll",
-    "Input.press",
-    "Memory.get",
-    "Memory.save",
-    "Page.create",
-    "Page.getState",
-    "Page.list",
-    "Page.screenshot",
-    "System.describeAction",
-    "System.describeEvent",
-    "System.getCapabilities",
 })
 
 
@@ -6692,9 +9598,8 @@ def _check_extraction_progress_gate(
         "tool_was_executed": False,
         "next_instruction": (
             "You already extracted structured rows but did not persist them."
-            " Call record_extraction now if the rows are relevant, rerun"
-            " extract_dom_records with record_name set, use recovery tools such"
-            " as DOM.getAXTree/DOM.getText/DOM.getAttribute/Input.scroll to"
+            " Call record_extraction now if the rows are relevant, or use recovery"
+            " tools such as DOM.getAXTree/DOM.getText/DOM.getAttribute/Input.scroll to"
             " gather missing evidence, or call final_answer with a blocker if"
             " they are not trustworthy."
         ),
@@ -6766,18 +9671,21 @@ def _check_worker_contract(agent: Any, method_or_tool: str) -> Optional[JsonDict
             "next_instruction": "Choose an allowed method or finalize with a blocker.",
         }
 
+    resolved_contract_task_type = resolve_task_type_fail_closed(
+        contract.get("task_type")
+    )
     disabled_reason = ""
     if "." in str(method_or_tool):
         disabled_reason = disabled_reason_for_method(
             method_or_tool,
-            contract.get("task_type"),
+            resolved_contract_task_type,
         )
     if disabled_reason:
         return {
             "status": "contract_violation",
             "method": method_or_tool,
             "error": disabled_reason,
-            "task_type": contract.get("task_type") or "general",
+            "task_type": resolved_contract_task_type,
             "classification": {
                 "category": "blocked_cross_task_type_required",
                 "hint": (
@@ -6785,7 +9693,7 @@ def _check_worker_contract(agent: Any, method_or_tool: str) -> Optional[JsonDict
                     " LeadAgent should replan a phase with the appropriate task_type."
                 ),
                 "method": method_or_tool,
-                "task_type": contract.get("task_type") or "general",
+                "task_type": resolved_contract_task_type,
             },
             "next_instruction": (
                 "Use a method allowed by the task_type policy, or finalize with"
@@ -6850,6 +9758,8 @@ def _check_progress_before(
     tool_name: str,
     tool_input: Optional[JsonDict] = None,
     step: Optional[int] = None,
+    *,
+    charge_diagnostic: bool = True,
 ) -> Optional[JsonDict]:
     progress = getattr(agent, "progress", None)
     if progress is None:
@@ -6873,6 +9783,23 @@ def _check_progress_before(
         or contract.get("expected_artifact")
         or contract.get("validators")
     )
+    page_id = str((tool_input or {}).get("pageId") or "")
+    mandatory_recovery_generation: Optional[int] = None
+    lifecycle = getattr(agent, "page_lifecycle", None)
+    if isinstance(lifecycle, PageLifecycleTracker) and page_id:
+        lifecycle_state = lifecycle.state(page_id)
+        if lifecycle_state is not None and (
+            (
+                tool_name == "Page.getState"
+                and lifecycle_state.requires_state_resync
+            )
+            or (
+                tool_name == "DOM.getAXTree"
+                and not lifecycle_state.requires_state_resync
+                and lifecycle_state.requires_ax_refresh
+            )
+        ):
+            mandatory_recovery_generation = lifecycle_state.generation
     result = progress.before_tool(
         tool_name=tool_name,
         artifact_count=extraction_artifact_count(getattr(agent, "artifacts", [])),
@@ -6883,7 +9810,24 @@ def _check_progress_before(
             agent, tool_name, (tool_input or {}).get("path"),
         ),
         step=step,
+        page_id=page_id,
+        charge_heavy_diagnostic=charge_diagnostic,
+        mandatory_recovery_generation=mandatory_recovery_generation,
     )
+    mandatory_allowance = getattr(
+        progress, "last_mandatory_recovery_allowance", None
+    )
+    if isinstance(mandatory_allowance, dict):
+        agent.logger.write(
+            "progress.mandatory_recovery_credit_used",
+            dict(mandatory_allowance),
+        )
+    allowance = (
+        progress.consume_diagnostic_allowance()
+        if hasattr(progress, "consume_diagnostic_allowance") else None
+    )
+    if isinstance(allowance, dict) and tool_name == "DOM.getSemanticTree":
+        agent.logger.write("semantic_tree.diagnostic_bypass", allowance)
     if result is not None:
         # Saves that carried schemaWarnings were persisted but deliberately NOT
         # credited to the artifact ledger ("trust the ledger, not the claim").
@@ -6945,7 +9889,18 @@ def _observe_progress_after(agent: Any, tool_name: str, result: Optional[JsonDic
     agent.logger.write("progress.snapshot", progress.to_log_payload())
 
 
-def _record_extraction(agent: Any, tool_input: JsonDict) -> JsonDict:
+def _record_extraction(
+    agent: Any,
+    tool_input: JsonDict,
+) -> JsonDict:
+    """Persist a structured extraction artifact."""
+    return _record_extraction_persist(agent, tool_input)
+
+
+def _record_extraction_persist(
+    agent: Any,
+    tool_input: JsonDict,
+) -> JsonDict:
     """Persist a structured extraction artifact for LeadAgent consumption.
 
     Returns a stub describing the saved file.
@@ -6990,6 +9945,37 @@ def _record_extraction(agent: Any, tool_input: JsonDict) -> JsonDict:
             "Field-level slow-path repair merged into trusted fast-path baseline"
         )
 
+    contract = getattr(agent, "worker_contract", None)
+    expected = (
+        contract.get("expected_artifact")
+        if isinstance(contract, dict)
+        and isinstance(contract.get("expected_artifact"), dict)
+        else {}
+    )
+    blocker_failures = detect_blocker_data_rows(rows, expected)
+    if blocker_failures:
+        result = {
+            "status": "rejected",
+            "error": (
+                "blocker or challenge explanation cannot be stored in a"
+                " declared business data field"
+            ),
+            "failures": blocker_failures,
+            "next_instruction": (
+                "Keep observed business values in the declared data fields."
+                " Report authentication/challenge state through HITL and the"
+                " worker blocker/status channel; do not pad rows with failure"
+                " notes or structured blocker tokens."
+            ),
+        }
+        agent.logger.write("tool.record_extraction.rejected", {
+            "name": raw_name,
+            "rowCount": len(rows),
+            "reason": "blocker_as_business_data",
+            "failures": blocker_failures,
+        })
+        return result
+
     schema_warnings = [
         *_record_extraction_schema_warnings(agent, rows),
         *_record_extraction_content_warnings(rows),
@@ -7026,7 +10012,27 @@ def _record_extraction(agent: Any, tool_input: JsonDict) -> JsonDict:
             manifest["workingArtifact"] = str(result["savedPath"])
     validation = _validate_recorded_extraction(agent, str(result.get("savedPath") or ""))
     if validation:
-        result["artifactValidation"] = trim_large_strings(validation, 3000)
+        contract_validation = trim_large_strings(validation, 3000)
+        result["artifactValidation"] = contract_validation
+        # Name this boundary explicitly: spawner may later compose a separate
+        # content-completeness veto, but phase credit must consume only the
+        # artifact/row contract result or it would depend circularly on itself.
+        result["contractValidation"] = contract_validation
+        tracker = _ensure_content_completeness_tracker(agent)
+        if tracker is not None and tracker.enabled:
+            if validation.get("status") == "done":
+                credit = tracker.observe_contract_validated_artifact(
+                    rows=rows,
+                    artifact_name=raw_name,
+                    saved_path=str(result.get("savedPath") or ""),
+                )
+                result["contentRegionCredit"] = credit
+                agent.logger.write(
+                    "content_completeness.artifact_region_credit",
+                    credit,
+                )
+            else:
+                tracker.observe_failed_artifact_attempt()
         if validation.get("status") == "failed":
             failures = [
                 failure for failure in (validation.get("failures") or [])
@@ -7944,6 +10950,36 @@ async def _verify_and_open_fleet_auth_barrier(
     }
 
 
+def _hitl_resumed_suggested_prompt(wait_result: Any) -> str:
+    recovery = (
+        wait_result.get("postHitlRecovery")
+        if isinstance(wait_result, dict) else None
+    )
+    rounds = recovery.get("rounds") if isinstance(recovery, dict) else None
+    structural_cleared = any(
+        isinstance(item, dict)
+        and isinstance(item.get("structural"), dict)
+        and item["structural"].get("status") == "challenge_cleared"
+        for item in (rounds if isinstance(rounds, list) else [])
+    )
+    if structural_cleared:
+        return (
+            "Page has resumed from HITL and a fresh AXTree no longer shows the"
+            " blocking structural challenge. Re-check Page.getState and"
+            " DOM.getAXTree, then resume the original business checkpoint. If"
+            " target content is still a skeleton, retry its reveal/materialize"
+            " action once and verify with DOM.getSemanticTree plus the requested"
+            " record count; do not finalize from page title or drawer shell alone."
+        )
+    return (
+        "Page has resumed from HITL. Re-check Page.getState and DOM.getAXTree"
+        " before resuming the original business checkpoint; this resume receipt"
+        " does not by itself prove that every prior challenge surface or target"
+        " skeleton has disappeared. Retry the original reveal/materialize action"
+        " when needed and verify the requested content with DOM.getSemanticTree."
+    )
+
+
 async def _enrich_pause_with_wait(
     agent: Any,
     params: JsonDict,
@@ -7962,7 +10998,7 @@ async def _enrich_pause_with_wait(
     wait_result = await wait_for_hitl_resume(
         browser=agent.browser,
         page_id=str(page_id),
-        timeout_seconds=getattr(harness_cfg, "hitl_wait_timeout_seconds", 1200.0),
+        timeout_seconds=getattr(harness_cfg, "hitl_wait_timeout_seconds", 900.0),
         poll_interval_seconds=getattr(harness_cfg, "hitl_poll_interval_seconds", 2.0),
         diagnostics=diagnostics,
         logger=agent.logger,
@@ -7986,28 +11022,10 @@ async def _enrich_pause_with_wait(
     enriched = dict(response)
     enriched["hitl_wait"] = wait_result
     if wait_result.get("status") == "resumed":
-        cooldown_seconds = float(
-            getattr(harness_cfg, "hitl_no_repause_cooldown_seconds", 8.0) or 0.0
+        _clear_challenge_state_after_recovery(
+            agent, str(page_id), event="challenge.hitl_resume_cleared"
         )
-        agent.hitl_no_repause_until = time.monotonic() + max(0.0, cooldown_seconds)
-        guard_seconds = float(
-            getattr(harness_cfg, "hitl_post_resume_guard_seconds", 30.0) or 0.0
-        )
-        _record_post_hitl_repause_guard(
-            agent,
-            str(page_id),
-            max(cooldown_seconds, guard_seconds),
-        )
-        tracker = getattr(agent, "challenge_tracker", None)
-        if tracker is not None:
-            tracker.clear_page(str(page_id))
-            logger = getattr(agent, "logger", None)
-            if logger is not None and hasattr(logger, "write"):
-                logger.write("challenge.hitl_resume_cleared", {"pageId": str(page_id)})
-        enriched["suggested_prompt"] = (
-            "Page has resumed from HITL. Re-check page state before issuing"
-            " new actions; the user may have navigated."
-        )
+        enriched["suggested_prompt"] = _hitl_resumed_suggested_prompt(wait_result)
     elif wait_result.get("status") in {
         "still_challenge_after_hitl",
         "browser_error_after_hitl",
@@ -8048,7 +11066,6 @@ from .composites.dismiss_overlay import (
     DISMISS_OVERLAY_MAX_DURATION_MS,
     _dismiss_overlay,
     _maybe_retry_original_action,
-    _try_backdrop_click,
     _vl_overlay_arbiter,
 )
 from .composites.collect_items import (
@@ -8076,15 +11093,25 @@ from .composites.fill_field_verified import (
 
 def build_browser_agent_tool_specs(
     capability_methods: Set[str],
-    task_type: Any = "general",
+    task_type: Any = "web_scrape",
+    *,
+    workflow_enabled: bool = False,
 ) -> List[JsonDict]:
     hidden = hidden_harness_tools_for_task_type(task_type)
+    # A live capability does not authorize Harness execution by itself. Both
+    # the control-plane master switch and the ABCP capability must be present.
+    workflow_visible = bool(
+        workflow_enabled and "Workflow.execute" in capability_methods
+    )
     return [
         spec
         for spec in BROWSER_TOOLS.tool_specs(capability_methods)
         if spec.get("name") not in hidden
-        # Compatibility alias remains dispatchable for old traces/tests, but
-        # the model sees one free-form JavaScript entrance only:
-        # browser_call(method="Runtime.evaluate") + runtime_policy.
-        and spec.get("name") != "eval_js_json"
+        and (
+            workflow_visible
+            or spec.get("name") not in {
+                "execute_selected_skill",
+                "execute_browser_workflow",
+            }
+        )
     ]

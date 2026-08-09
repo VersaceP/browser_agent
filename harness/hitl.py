@@ -6,11 +6,9 @@ ABCP rejects most tools while the page is paused (see prior investigation:
 getTaskSummary routing-error, resumeEvent method-not-found, getActionLog
 ERR_PAGE_PAUSED).
 
-Protocol (verified against task b44df3e6, 2026-06-12): the panel does NOT emit
-`Hitl.resumed` on its own when the human finishes the challenge — that event
-only fires after someone calls Hitl.resolvePause, and the resolvePause schema
-makes ending the pause the agent's job ("after human intervention has
-completed"). So this helper resumes via two paths:
+Protocol boundary: HITL progress is notification-driven. Page state may confirm
+that a notification has settled, but Page.getState never creates a resume
+signal on its own. This helper resumes via two notification paths:
 
   1. Explicit `Hitl.resumed`-style notification — kept as a fast path for
      builds/panels that do emit it.
@@ -21,7 +19,6 @@ completed"). So this helper resumes via two paths:
      verdict is available, a qualifying post-pause title that no longer looks
      like a challenge is required. Only after that evidence does the helper
      call Hitl.resolvePause and confirm via Page.getState.
-
 Without a `challenge_verifier`, lifecycle events are ignored entirely (strict
 explicit-resume contract — challenge pages load, fail, and retitle themselves
 without human intervention).
@@ -36,6 +33,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from abcp_client import ABCPClient
 from harness.challenge_detector import (
+    VL_CLEARANCE_VERDICTS,
     is_lingering_loading_title,
     title_looks_like_challenge,
 )
@@ -112,10 +110,16 @@ def _is_challenge_url(url: Any) -> bool:
 def _notification_view(msg: Dict[str, Any]) -> Dict[str, Any]:
     """Return a normalized event view for both legacy and current envelopes.
 
-    Current ABCP notifications look like:
+    Legacy/current ABCP notifications may look like:
       params.type == "event"
       params.data.event == "Page.loaded"
       params.data.payload.pageId/url/title == ...
+
+    New control-stream notifications look like:
+      params.type == "control.event"
+      params.data.kind == "pageLoaded" / "hitlResumed"
+      params.data.payload.sourceEvent == "Page.loaded" / "Hitl.resumed"
+      params.data.payload.page.pageId/url/title == ...
 
     Some tests and older dispatchers use the flatter form:
       params.type == "Page.loaded"
@@ -124,14 +128,21 @@ def _notification_view(msg: Dict[str, Any]) -> Dict[str, Any]:
     params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
     data = params.get("data") if isinstance(params.get("data"), dict) else {}
     payload = data.get("payload") if isinstance(data.get("payload"), dict) else {}
+    page = payload.get("page") if isinstance(payload.get("page"), dict) else {}
 
-    raw_type = data.get("event") or params.get("type")
+    raw_type = (
+        data.get("event")
+        or data.get("sourceEvent")
+        or payload.get("sourceEvent")
+        or data.get("kind")
+        or params.get("type")
+    )
     ntype = _normalize_notification_type(raw_type)
     return {
         "type": ntype,
-        "pageId": payload.get("pageId") or data.get("pageId"),
-        "title": payload.get("title") or data.get("title"),
-        "url": payload.get("url") or data.get("url"),
+        "pageId": payload.get("pageId") or page.get("pageId") or data.get("pageId"),
+        "title": payload.get("title") or page.get("title") or data.get("title"),
+        "url": payload.get("url") or page.get("url") or data.get("url"),
     }
 
 
@@ -616,12 +627,12 @@ async def wait_for_hitl_resume(
 ) -> Dict[str, Any]:
     """Block until the paused page resumes or `timeout_seconds` elapses.
 
-    `challenge_verifier`, when provided, enables the verified-settlement path:
-    lifecycle events on the paused page trigger a verification (VL adjudicator
-    first, post-pause title evidence as fallback) and only a positive verdict
-    leads to Hitl.resolvePause. Without it, only explicit resume notifications
-    are honored. `pause_snapshot` ({"url", "title"} captured at pause time) is
-    used to require that the settled title actually changed.
+    Resume can be established by an explicit Agent-visible HITL notification or
+    by a verifier-backed lifecycle notification followed by Hitl.resolvePause.
+    Page.getState is used only after such a notification to confirm settlement;
+    it is never polled to infer that a missing resume notification occurred.
+    `pause_snapshot` ({"url", "title"} captured at pause time) supplies the
+    verifier comparison baseline.
 
     Returns a structured outcome consumed by the caller. BrowserAgent enriches
     the tool_result with the HITL wait outcome.
@@ -678,6 +689,9 @@ async def wait_for_hitl_resume(
     # fact the notification branch had blown up on an unknown kwarg).
     task_errors: List[Dict[str, Any]] = []
     verifier_calls = 0
+    # Latches for the whole pause: once the oracle has seen a challenge, weaker
+    # evidence may never release it.
+    challenge_ever_confirmed = False
     last_settled_title = ""
     last_settled_url = ""
     settlement_rejections: List[Dict[str, Any]] = []
@@ -835,8 +849,10 @@ async def wait_for_hitl_resume(
 
         decision = ""
         decision_info: Dict[str, Any] = {}
+        verifier_ran = False
         if verifier_calls < _SETTLEMENT_VERIFIER_MAX_CALLS:
             verifier_calls += 1
+            verifier_ran = True
             try:
                 raw_verdict = await challenge_verifier(dict(evidence_view))
             except Exception as exc:
@@ -855,16 +871,51 @@ async def wait_for_hitl_resume(
             }
             if verdict == "confirmed_challenge":
                 decision = "challenge"
-            elif verdict in {"normal_loading", "unrelated_block", "no_challenge", "passed"}:
+                challenge_ever_confirmed = True
+            elif verdict in VL_CLEARANCE_VERDICTS:
                 decision = "passed"
         if not decision:
-            # VL was uncertain/unavailable (or its budget is spent): require
-            # strong title evidence that the challenge surface is gone.
-            if _title_clears_challenge(last_settled_title, pause_snapshot):
+            if challenge_ever_confirmed:
+                # The oracle SAW the challenge during this pause. Spending the
+                # verifier budget does not make that observation go away, and a
+                # later title change is not evidence that a human cleared it —
+                # resuming here would hand the worker a page the run already
+                # knows is blocked. Only an explicit visual clearance, or the
+                # human resolving the pause, may end it now.
+                decision = "insufficient"
+                decision_info = {
+                    **decision_info,
+                    "titleEvidenceSuppressed": True,
+                    "titleEvidenceSuppressedReason": (
+                        "a challenge was visually confirmed during this pause;"
+                        " only visual clearance can release it"
+                    ),
+                }
+            elif verifier_ran:
+                # The visual oracle ran and could not confirm a clear. A title
+                # is far too weak to overrule that on its own: a page can
+                # retitle for any reason while the challenge is still up, and
+                # the check cannot tell a real destination title from a
+                # corrupted one. Keep waiting for an event the oracle can read
+                # rather than resuming the worker onto an unverified page.
+                decision = "insufficient"
+                decision_info = {
+                    **decision_info,
+                    "titleEvidenceSuppressed": True,
+                    "titleEvidenceSuppressedReason": (
+                        "visual clearance was not confirmed; a title change"
+                        " alone cannot release a HITL pause"
+                    ),
+                }
+            elif _title_clears_challenge(last_settled_title, pause_snapshot):
+                # Bounded escape hatch: the verifier budget is spent, so the
+                # only remaining evidence is the title. Reaching here already
+                # means several adjudications failed to confirm a challenge.
                 decision = "passed"
                 decision_info = {
                     **decision_info,
-                    "gate": "title_evidence" if not decision_info else "vl+title_evidence",
+                    "gate": "title_evidence_after_verifier_budget",
+                    "verifierCalls": verifier_calls,
                 }
             else:
                 decision = "insufficient"
@@ -963,7 +1014,13 @@ def _slim_evidence(value: Any) -> Any:
     if not isinstance(value, dict):
         return value
     keep: Dict[str, Any] = {}
-    for key in ("observation", "suggested_prompt", "method", "errorType"):
+    for key in (
+        "observation",
+        "suggested_prompt",
+        "method",
+        "errorType",
+        "gate",
+    ):
         if key in value:
             keep[key] = str(value[key])[:300]
     for key in ("settlement", "confirmation"):

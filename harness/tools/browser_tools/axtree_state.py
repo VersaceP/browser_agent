@@ -56,6 +56,8 @@ def _axtree_flags_and_rect(rest: str) -> Tuple[List[str], Optional[JsonDict]]:
 AXTREE_INVALIDATING_METHODS = {
     "Page.create",
     "Page.navigate",
+    "Page.reload",
+    "Page.go",
     "Page.recovered",
     "Page.close",
     "Page.switchTo",
@@ -63,6 +65,7 @@ AXTREE_INVALIDATING_METHODS = {
     "File.handleChooser",
     "Runtime.evaluate",
     "Input.click",
+    "Input.select",
     "Input.type",
     "Input.press",
     "Input.scroll",
@@ -300,23 +303,9 @@ def _observe_axtree_state_after(
     if recovered is not None:
         _apply_recovered_target(agent, method, params, result, recovered)
 
-    if method in AXTREE_INVALIDATING_METHODS:
-        if read_only_eval and method == "Runtime.evaluate":
-            # Harness-internal read-only oracle templates provably do not
-            # mutate the DOM, so the cached id snapshot stays trustworthy.
-            # The flag is not exposed to the model and other methods ignore it.
-            logger = getattr(agent, "logger", None)
-            if logger is not None:
-                logger.write(
-                    "axtree.invalidation_skipped",
-                    {
-                        "method": method,
-                        "reason": "read_only_oracle_template",
-                        "pageId": str(params.get("pageId") or "") if isinstance(params, dict) else "",
-                        "epoch": int(getattr(agent, "axtree_epoch", 0) or 0),
-                    },
-                )
-            return
+    if method in AXTREE_INVALIDATING_METHODS and not (
+        method == "Runtime.evaluate" and read_only_eval
+    ):
         # Message-ordering race: if a same-page DOM.axTreeUpdated arrived DURING
         # this call (notification dispatched before the action response — a legal
         # websocket order), BrowserEventObserver already rebuilt a fresh full

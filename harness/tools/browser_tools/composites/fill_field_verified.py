@@ -36,14 +36,6 @@ def _invoke_result_failed(result: Any) -> bool:
     return _bt()._invoke_result_failed(result)
 
 
-def build_read_only_oracle(agent: Any, page_id: str, step: int) -> Any:
-    return _bt().build_read_only_oracle(agent, page_id, step)
-
-
-async def verify_field_value(*args: Any, **kwargs: Any) -> Any:
-    return await _bt().verify_field_value(*args, **kwargs)
-
-
 FILL_FIELD_STOPWORDS = {
     "your", "the", "please", "enter", "type", "input", "field", "a", "an",
     "of", "to", "for", "address", "请", "输入", "填写",
@@ -111,10 +103,9 @@ async def _fill_field_action(
 
 async def _fill_field_verified(agent: Any, tool_input: JsonDict, step: int) -> JsonDict:
     """Composite tool: type a value and verify it was actually accepted by
-    reading the field's live .value (via the read-only title side-channel,
-    since returnByValue is dead on the panel). On mismatch, clear harder and
-    retry once; on ambiguity or not-found, yield instead of claiming success.
-    Never submits — that is a separate verified action."""
+    reading the exact target's live value through native batched
+    DOM.getAttribute. On mismatch, clear harder and retry once. Never submits —
+    that is a separate verified action."""
     page_id = str(tool_input.get("pageId") or "").strip()
     text = tool_input.get("text")
     target_id = str(tool_input.get("id") or "").strip()
@@ -129,8 +120,6 @@ async def _fill_field_verified(agent: Any, tool_input: JsonDict, step: int) -> J
     mask = bool(tool_input.get("mask", False))
     max_retries = max(0, min(optional_int(tool_input.get("maxRetries"), 1) or 1, 3))
     target: JsonDict = {"id": target_id} if target_id else {"selector": selector}
-
-    oracle = build_read_only_oracle(agent, page_id, step)
 
     # Force a layout viewport (fresh tab) and refresh nodes so we can read the
     # target's accessible name for the verify keywords.
@@ -199,28 +188,18 @@ async def _fill_field_verified(agent: Any, tool_input: JsonDict, step: int) -> J
                         " selector."
                     )}
 
-        if not keywords:
-            # No way to locate the field for verification (no name, no explicit
-            # keywords). Report honestly rather than claim verified.
-            return {
-                "status": "typed_unverified", "target": target,
-                "next_instruction": (
-                    "Typed the value but could not verify it: the target has no"
-                    " accessible name to derive a locator. Re-call with"
-                    " verifyKeywords, or confirm via DOM.getAttribute(value)."
-                ),
-            }
-
-        verdict = await verify_field_value(
-            oracle=oracle, keywords=keywords, expected_value=text, mask_value=mask,
+        verdict = await _read_field_value_native(
+            agent, page_id, target, step, internal=mask,
         )
         last_verdict = verdict
-        attempts.append({"attempt": attempt, "ok": verdict.ok,
-                         "method": verdict.method, "confidence": verdict.confidence})
+        attempts.append({
+            "attempt": attempt,
+            "ok": verdict.get("status") == "done" and verdict.get("value") == text,
+            "method": "DOM.getAttribute",
+            "confidence": "high" if verdict.get("status") == "done" else "low",
+        })
 
-        if verdict.method == "oracle_no_match":
-            # Field not located by keywords; refresh AXTree once and, on the
-            # last attempt, surface it as a locate failure.
+        if verdict.get("status") == "not_found":
             refresh = await _invoke_browser_method(
                 agent, "DOM.getAXTree",
                 {"pageId": page_id, "purpose": "fill_field_verified: refresh after no-match"},
@@ -237,28 +216,26 @@ async def _fill_field_verified(agent: Any, tool_input: JsonDict, step: int) -> J
                             " concrete selector or corrected verifyKeywords."
                         ), "attempts": attempts}
             continue
-        if verdict.evidence.get("matchCount", 0) > 1:
-            # Ambiguous locator: do not claim success even if some match held
-            # the value. Yield for the model to disambiguate.
-            return {"status": "ambiguous", "keywords": keywords, "target": target,
-                    "evidence": verdict.evidence, "reason": verdict.reason,
-                    "next_instruction": (
-                        "Multiple fields matched the verify keywords; cannot"
-                        " confirm the right one. Provide a more specific selector"
-                        " or verifyKeywords."
-                    ), "attempts": attempts}
-        if verdict.ok:
+        if verdict.get("status") != "done":
+            return {
+                "status": "typed_unverified",
+                "target": target,
+                "reason": str(verdict.get("error") or "native attribute read unavailable"),
+                "next_instruction": (
+                    "Input.type completed but native DOM.getAttribute could not"
+                    " verify the exact target value. Refresh DOM.getAXTree and"
+                    " retry with a canonical id."
+                ),
+                "attempts": attempts,
+            }
+        if verdict.get("value") == text:
             return {"status": "done", "target": target, "verified": True,
-                    "confidence": verdict.confidence, "keywords": keywords,
+                    "confidence": "high", "keywords": keywords,
                     "attempts": attempts}
         # Plain single-field mismatch: loop clears harder and retries; if the
         # budget is exhausted, fall through to the mismatch yield below.
 
-    actual = ""
-    if last_verdict is not None:
-        matches = last_verdict.evidence.get("matches") or []
-        if matches and isinstance(matches[0], dict):
-            actual = str(matches[0].get("value") or "")
+    actual = shown(str((last_verdict or {}).get("value") or ""))
     return {"status": "mismatch", "target": target, "keywords": keywords,
             "expected": shown(text), "actual": actual,
             "next_instruction": (
@@ -266,3 +243,55 @@ async def _fill_field_verified(agent: Any, tool_input: JsonDict, step: int) -> J
                 " element may be a custom/controlled widget; inspect it or use a"
                 " different input strategy."
             ), "attempts": attempts}
+
+
+def _attribute_value(info: Any) -> Optional[str]:
+    if not isinstance(info, dict):
+        return None
+    if "value" in info and not isinstance(info.get("value"), (dict, list)):
+        return str(info.get("value") or "")
+    attributes = info.get("attributes")
+    if isinstance(attributes, dict) and "value" in attributes:
+        return str(attributes.get("value") or "")
+    if isinstance(attributes, list):
+        for entry in attributes:
+            if isinstance(entry, dict) and str(entry.get("name") or "") == "value":
+                return str(entry.get("value") or "")
+    return None
+
+
+async def _read_field_value_native(
+    agent: Any,
+    page_id: str,
+    target: JsonDict,
+    step: int,
+    *,
+    internal: bool,
+) -> JsonDict:
+    result = await _invoke_browser_method(
+        agent,
+        "DOM.getAttribute",
+        {
+            "pageId": page_id,
+            "targets": [dict(target)],
+            "attributes": ["value"],
+            "purpose": "fill_field_verified: verify exact target value",
+        },
+        step,
+        count_progress=False,
+        internal=internal,
+    )
+    if _invoke_result_failed(result):
+        return {"status": "not_found", "error": "DOM.getAttribute failed"}
+    response = result.get("response") if isinstance(result, dict) else None
+    data = response.get("data") if isinstance(response, dict) else None
+    items = data.get("items") if isinstance(data, dict) else None
+    if isinstance(items, list):
+        if not items or not isinstance(items[0], dict) or items[0].get("error"):
+            return {"status": "not_found"}
+        value = _attribute_value(items[0].get("info"))
+    else:
+        value = _attribute_value(data)
+    if value is None:
+        return {"status": "unavailable", "error": "value attribute missing from response"}
+    return {"status": "done", "value": value}

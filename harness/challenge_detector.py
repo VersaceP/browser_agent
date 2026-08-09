@@ -93,6 +93,20 @@ CHALLENGE_TITLE_KEYWORDS = tuple(dict.fromkeys((
 )))
 
 
+# The only VL verdicts that count as POSITIVE evidence a challenge surface is
+# gone. Everything else (confirmed_challenge, uncertain, an unavailable VL) is
+# treated as "still blocked", because both consumers — the HITL verified-
+# settlement gate and the auto-solve clearance check — decide whether a human
+# gets skipped. A false "clear" silently bypasses human verification; a false
+# "still blocked" only costs a retry or a wait.
+VL_CLEARANCE_VERDICTS = frozenset({
+    "normal_loading",
+    "unrelated_block",
+    "no_challenge",
+    "passed",
+})
+
+
 def is_lingering_loading_title(title: str) -> bool:
     title_lower = str(title or "").lower()
     return bool(title_lower and any(marker in title_lower for marker in LINGERING_LOADING_TITLES))
@@ -241,6 +255,7 @@ class PageChallengeState:
             "structuralEvidence": self.structural_evidence,
             "lastVlVerdict": self.last_vl_verdict or None,
             "lastVlStep": self.last_vl_step,
+            "vlAttempts": self.vl_attempts,
             "signals": [signal.to_dict() for signal in self.recent_signals[-5:]],
         }
 

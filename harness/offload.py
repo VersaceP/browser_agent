@@ -59,10 +59,46 @@ def outline_large_field(value: Any, max_bytes: int = GENERIC_TOOL_RESULT_KEEP_FI
 
 SUGGESTED_PROMPT_SUCCESS_MAX_CHARS = 200
 
+# A `data:` URL carries the file's own payload inside the URL. Download.start is
+# the only way this harness can write a file, so agents legitimately submit text
+# that way — but the download ledger stores the url verbatim and Download.list
+# echoes every stored record on every call, fleet-wide. One written text file
+# therefore inflates every later listing for every worker, and percent-encoded
+# CJK expands ~6x, which is both token waste and a provider content-moderation
+# trigger.  Fold the payload for download bookkeeping only: a page-authored
+# `data:` asset (an <img> src the agent still has to hand to Download.start)
+# must survive untouched, so this never applies outside Download.*/File.download.
+DATA_URL_ELIDE_MIN_CHARS = 256
+DATA_URL_PAYLOAD_METHODS = ("Download.", "File.download")
 
-def compact_model_facing_tool_result(value: Any) -> Any:
+
+def _elide_data_url(value: str) -> str:
+    """Replace a long `data:` URL payload with its size, keeping the mediatype."""
+    if len(value) < DATA_URL_ELIDE_MIN_CHARS or not value.startswith("data:"):
+        return value
+    head, separator, payload = value.partition(",")
+    if not separator:
+        # No payload separator: not a usable data URL, leave it alone.
+        return value
+    return f"{head},…[{len(payload)} chars of payload elided by harness]"
+
+
+def _has_data_url_payload_method(value: JsonDict) -> bool:
+    method = str(value.get("method") or "")
+    return any(method.startswith(prefix) for prefix in DATA_URL_PAYLOAD_METHODS)
+
+
+def compact_model_facing_tool_result(
+    value: Any,
+    *,
+    fold_data_urls: bool = False,
+) -> Any:
     """Drop low-value successful-result chatter before it reaches the model."""
     if isinstance(value, dict):
+        # The browser-call boundary puts the ABCP method at the top of the
+        # result, so the download scope is decided once, here, and inherited by
+        # every nested params/response/record below it.
+        fold_data_urls = fold_data_urls or _has_data_url_payload_method(value)
         compacted: JsonDict = {}
         for key, item in value.items():
             if key == "suspected_challenge" and _empty_challenge_summary(item):
@@ -75,10 +111,17 @@ def compact_model_facing_tool_result(value: Any) -> Any:
                 if trimmed:
                     compacted[key] = trimmed
                 continue
-            compacted[key] = compact_model_facing_tool_result(item)
+            compacted[key] = compact_model_facing_tool_result(
+                item, fold_data_urls=fold_data_urls,
+            )
         return compacted
     if isinstance(value, list):
-        return [compact_model_facing_tool_result(item) for item in value]
+        return [
+            compact_model_facing_tool_result(item, fold_data_urls=fold_data_urls)
+            for item in value
+        ]
+    if fold_data_urls and isinstance(value, str):
+        return _elide_data_url(value)
     return value
 
 
@@ -342,6 +385,33 @@ def strip_image_payload(
     if not isinstance(payload, dict):
         return copied
 
+    existing_path = next((
+        str(payload.get(key)).strip()
+        for key in ("savedPath", "path", "filePath")
+        if isinstance(payload.get(key), str) and str(payload.get(key)).strip()
+    ), "")
+    encoding = str(payload.get("encoding") or payload.get("format") or "").lower()
+    if not existing_path and encoding == "file":
+        value = payload.get("data")
+        if isinstance(value, str) and value.strip():
+            existing_path = value.strip()
+    if existing_path:
+        payload["savedPath"] = existing_path
+        if existing_path not in artifacts:
+            artifacts.append(existing_path)
+        # Some ABCP builds return the file path in data with encoding=file.
+        # Normalize that shape so downstream code never mistakes it for image
+        # bytes and only one compact path crosses the model boundary.
+        raw_data = payload.get("data")
+        if isinstance(raw_data, str) and raw_data:
+            payload.pop("data", None)
+            if not (encoding == "file" and raw_data == existing_path):
+                payload["dataOmitted"] = True
+                payload["omissionReason"] = (
+                    "image payload omitted because savedPath is available"
+                )
+        return copied
+
     image_b64 = payload.get("data")
     if not isinstance(image_b64, str) or not image_b64:
         return copied
@@ -375,3 +445,96 @@ def strip_image_payload(
         " when configured"
     )
     return copied
+
+
+# Folding threshold for a moderation-rejected conversation. Below this a block
+# is not plausibly what tripped the filter and stripping it would only lose
+# context, so a conversation whose bulk is all small folds nothing and the
+# rejection stays fatal rather than being silently retried forever.
+MODERATION_FOLD_MIN_CHARS = 512
+
+
+def _moderation_withheld_stub(reason: str, original_chars: int) -> str:
+    return json.dumps(
+        {
+            "_withheld": True,
+            "reason": (
+                "The model provider refused the request input"
+                f" ({reason}); this tool result was removed so the step could"
+                " proceed."
+            ),
+            "originalChars": original_chars,
+            "next_instruction": (
+                "Do not re-run the call that produced this result: the same"
+                " payload will be refused again. Continue from the evidence you"
+                " already have, or finalize with a blocker describing what is"
+                " missing."
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+
+def fold_tool_results_after_moderation(
+    messages: List[Any],
+    *,
+    reason: str,
+) -> Optional[JsonDict]:
+    """Strip bulky harness-authored payloads from a refused conversation.
+
+    Mutates ``messages`` in place, which is the point: a copy would fix only
+    the retried request and let the very next step resend the payload the
+    provider just refused. Returns a receipt, or None when nothing was large
+    enough to be worth folding — the caller must then treat the rejection as
+    fatal instead of retrying an unchanged request.
+
+    Only ``user``-role blocks the harness itself wrote are eligible. Assistant
+    turns are the model's own output and hold the ``tool_use`` blocks that
+    ``tool_result`` ids pair with, so rewriting them would corrupt the
+    conversation; message 0 carries the task itself, and folding the mission to
+    satisfy a content filter would leave the agent working on nothing.
+    """
+    folded: List[JsonDict] = []
+    freed_chars = 0
+    for index, message in enumerate(messages):
+        if index == 0 or not isinstance(message, dict):
+            continue
+        if str(message.get("role") or "") != "user":
+            continue
+        blocks = message.get("content")
+        if not isinstance(blocks, list):
+            continue
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            block_type = str(block.get("type") or "")
+            if block_type == "tool_result":
+                key = "content"
+            elif block_type == "text":
+                key = "text"
+            else:
+                continue
+            payload = block.get(key)
+            if not isinstance(payload, str):
+                continue
+            if len(payload) < MODERATION_FOLD_MIN_CHARS:
+                continue
+            if '"_withheld": true' in payload:
+                # Already folded by an earlier rejection in this run.
+                continue
+            block[key] = _moderation_withheld_stub(reason, len(payload))
+            freed_chars += len(payload) - len(block[key])
+            folded.append({
+                "messageIndex": index,
+                "blockType": block_type,
+                "toolUseId": block.get("tool_use_id"),
+                "originalChars": len(payload),
+            })
+    if not folded:
+        return None
+    return {
+        "reason": reason,
+        "foldedBlocks": len(folded),
+        "freedChars": freed_chars,
+        "blocks": folded[:20],
+    }

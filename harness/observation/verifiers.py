@@ -1,14 +1,13 @@
 """
 harness.observation.verifiers - Read-only semantic oracles for micro-loops.
 
-Design contract (micro-loop oracle phase 1):
-- Oracle JS comes only from the fixed templates below; the model never writes
-  or sees it. Bindings are JSON-encoded before substitution.
-- Oracles run through the harness read_only_eval channel, which skips the
-  pessimistic AXTree invalidation bookkeeping. Because of that, the templates
-  must stay provably read-only: no assignments, no DOM mutation APIs, and no
-  title side-channel. If returnByValue fails, the verifier reports
-  oracle_unavailable instead of escalating to the (mutating) side-channel.
+Design contract:
+- The generic expression oracle fails closed. Most composites verify through
+  native DOM/AXTree operations; model-authored Runtime remains a trace-gated
+  last resort.
+- ``collect_items`` alone may select one of three registered read-only templates
+  and supply JSON-encoded bindings. It cannot submit JavaScript and does not use
+  the former title/window side channel.
 - Every locator-style template reports matchCount so ambiguity is surfaced
   instead of silently picking the first hit.
 """
@@ -28,6 +27,14 @@ CONFIDENCE_LOW = "low"
 # An oracle takes a rendered JS expression and returns either the parsed JSON
 # payload produced by the template, or {"_oracle_error": "..."} on failure.
 OracleEval = Callable[[str], Awaitable[Any]]
+# Unlike ``OracleEval``, this callable never accepts model- or caller-authored
+# JavaScript.  Callers select one registered template and provide JSON values
+# for its bindings; the browser-tools boundary renders and audits it.
+TrustedCollectionEval = Callable[[str, Dict[str, Any]], Awaitable[Any]]
+
+COLLECTION_TEMPLATE_ITEMS_COUNT = "collection.items_count.v1"
+COLLECTION_TEMPLATE_ROWS = "collection.rows.v1"
+COLLECTION_TEMPLATE_STATE = "collection.state.v1"
 
 
 @dataclass(frozen=True)
@@ -86,99 +93,48 @@ class VerifierResult:
 
 
 def build_read_only_oracle(agent: Any, page_id: str, step: int) -> OracleEval:
-    """OracleEval bound to one agent/page.
+    """Return a fail-closed oracle.
 
-    Data path: the live ABCP panel returns `data: null` for EVERY
-    Runtime.evaluate(returnByValue) — confirmed against ws://localhost:9300
-    for `1+2`, `document.title`, objects, everything (see
-    reports/dismiss_overlay_probe_*.json and the abcp-side-channel-pattern
-    memory). The eval's side effects still apply, so the document.title
-    side-channel is the only working way to read a value back. We capture and
-    restore the original title around the side-channel so challenge_detector
-    and PageFingerprint (both consume title) never see the marker traffic.
-
-    read_only_eval=True keeps the AXTree id bookkeeping intact: writing
-    document.title does not change canonical DOM ids, so the cached snapshot
-    stays valid even though we executed JS. internal=True keeps every marker
-    call out of the progress/challenge/diagnostics/trace chain — the side-channel
-    is harness plumbing, only the decoded payload is a real observation.
-
-    Lazy-imports browser_tools to avoid an import cycle.
+    The former implementation used hidden Runtime.evaluate calls and a
+    document.title mutation side-channel. Runtime execution is now reserved for
+    explicitly authorized model last-resort reads, so deterministic composites
+    must fall back to native DOM/AXTree verification instead.
     """
 
     async def run(expression: str) -> Any:
-        from harness.runtime_evaluation import RuntimeEvaluationService
-        from harness.tools.browser_tools import (  # local import: avoid cycle
-            _eval_json_via_title,
-            _invoke_browser_method,
-            _response_data,
-        )
-
-        # Capture the current title so we can restore it afterwards.
-        state = await _invoke_browser_method(
-            agent,
-            "Page.getState",
-            {"pageId": page_id, "purpose": "verifier oracle: capture title"},
-            step,
-            count_progress=False,
-            read_only_eval=True,
-            internal=True,
-        )
-        original_title = _response_data(state).get("title")
-        world_params = (
-            {"world": "isolated"}
-            if RuntimeEvaluationService(
-                getattr(agent, "method_schemas", {})
-            ).supports_world()
-            else {}
-        )
-
-        # Verifier templates evaluate to an object; the side-channel needs a
-        # JSON string, so wrap with JSON.stringify.
-        json_expression = f"JSON.stringify(({expression}))"
-        try:
-            payload = await _eval_json_via_title(
-                agent,
-                page_id,
-                json_expression,
-                step,
-                "read-only verifier oracle (harness template)",
-                read_only_eval=True,
-                internal=True,
+        _ = (agent, page_id, step, expression)
+        return {
+            "_oracle_error": (
+                "semantic Runtime oracle disabled; use native DOM/AXTree verification"
             )
-        finally:
-            if isinstance(original_title, str):
-                await _invoke_browser_method(
-                    agent,
-                    "Runtime.evaluate",
-                    {
-                        "pageId": page_id,
-                        "expression": f"document.title = {json.dumps(original_title)}; 0",
-                        "returnByValue": True,
-                        "purpose": "verifier oracle: restore title",
-                        **world_params,
-                    },
-                    step,
-                    count_progress=False,
-                    read_only_eval=True,
-                    internal=True,
-                    runtime_policy={
-                        "origin": "harness_compatibility",
-                        "intent": "diagnostic",
-                        "effect": "state_changing",
-                        "result_mode": "raw",
-                    },
-                    lifecycle_cleanup_bypass=True,
-                )
+        }
 
-        if payload is None:
-            return {"_oracle_error": "title side-channel returned no payload"}
-        # _eval_json_via_title reports failures as {"error": ...}; a nested
-        # ABCP runtime error must not pass as a valid template result, or a
-        # verifier reading absent fields would default to ok.
-        if isinstance(payload, dict) and payload.get("error"):
-            return {"_oracle_error": str(payload.get("error"))}
-        return payload
+    return run
+
+
+def build_collection_oracle(
+    agent: Any,
+    page_id: str,
+    step: int,
+) -> TrustedCollectionEval:
+    """Return the narrow executor used only by ``collect_items``.
+
+    This is intentionally not a replacement for ``build_read_only_oracle``:
+    it accepts a registered template id plus JSON bindings, never arbitrary
+    source.  The browser-tools boundary owns the registry lookup, Runtime
+    authorization token, audit record, and JSON decoding.
+    """
+
+    async def run(template_id: str, bindings: Dict[str, Any]) -> Any:
+        import harness.tools.browser_tools as browser_tools
+
+        return await browser_tools._invoke_trusted_collection_template(
+            agent,
+            template_id=template_id,
+            bindings=dict(bindings),
+            page_id=page_id,
+            step=step,
+        )
 
     return run
 
@@ -192,6 +148,12 @@ def _oracle_error(payload: Any) -> Optional[str]:
             return str(payload.get("_oracle_error"))
         if payload.get("error"):
             return str(payload.get("error"))
+    return None
+
+
+def _oracle_error_code(payload: Any) -> Optional[str]:
+    if isinstance(payload, dict) and payload.get("_oracle_error_code"):
+        return str(payload.get("_oracle_error_code"))
     return None
 
 
@@ -396,6 +358,41 @@ async def probe_occluder(*, oracle: OracleEval, x: float, y: float) -> JsonDict:
     return {"status": "done", **payload}
 
 
+ACTIVE_ELEMENT_PROBE_JS = r"""
+(() => {
+  const el = document.activeElement;
+  if (!el || el === document.body) return { present: false };
+  return {
+    present: true,
+    tag: el.tagName.toLowerCase(),
+    type: String(el.getAttribute('type') || '').toLowerCase(),
+    role: String(el.getAttribute('role') || '').toLowerCase(),
+    name: String(el.getAttribute('name') || '').slice(0, 60),
+    id: String(el.id || '').slice(0, 60),
+    ariaLabel: String(el.getAttribute('aria-label') || '').slice(0, 80),
+    placeholder: String(el.getAttribute('placeholder') || '').slice(0, 80),
+    editable: !!el.isContentEditable,
+  };
+})()
+"""
+
+
+async def probe_active_element(*, oracle: OracleEval) -> JsonDict:
+    """Identify the element that will actually receive typed text.
+
+    Coordinates say where a click landed; this says what has focus now, which is
+    what a following Input.type will fill. Used by the CAPTCHA auto-solve to
+    refuse typing an OCR answer into a credential field.
+    """
+    payload = await oracle(SemanticLocator(ACTIVE_ELEMENT_PROBE_JS).render())
+    error = _oracle_error(payload)
+    if error:
+        return {"status": "oracle_unavailable", "reason": error}
+    if not isinstance(payload, dict):
+        return {"status": "oracle_unavailable", "reason": "non-object payload"}
+    return {"status": "done", **payload}
+
+
 VIEWPORT_METRICS_JS = r"""
 (() => {
   return {
@@ -433,19 +430,22 @@ async def probe_viewport_metrics(*, oracle: OracleEval) -> JsonDict:
 
 async def verify_items_grew(
     *,
-    oracle: OracleEval,
+    oracle: Optional[OracleEval] = None,
+    collection_oracle: Optional[TrustedCollectionEval] = None,
     selector: str,
     before_count: int,
     known_keys: Optional[Set[str]] = None,
     limit: int = 300,
 ) -> VerifierResult:
     """One RPC returns count + stable keys; harvest callers reuse the keys."""
-    locator = SemanticLocator.bind(
-        ITEMS_COUNT_JS,
-        selector=selector,
-        limit=int(limit),
-    )
-    payload = await oracle(locator.render())
+    bindings = {"selector": selector, "limit": int(limit)}
+    if collection_oracle is not None:
+        payload = await collection_oracle(COLLECTION_TEMPLATE_ITEMS_COUNT, bindings)
+    elif oracle is not None:
+        locator = SemanticLocator.bind(ITEMS_COUNT_JS, **bindings)
+        payload = await oracle(locator.render())
+    else:
+        return _unavailable("no collection oracle was provided")
     error = _oracle_error(payload)
     if error:
         return _unavailable(error)
@@ -492,7 +492,7 @@ COLLECT_ROWS_JS = r"""
     return { error: 'invalid selector: ' + String(err && err.message || err) };
   }
   const norm = (v, max = 600) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim().slice(0, max);
-  // Site-agnostic lazy-image resolver (kept in sync with extract_dom_records):
+  // Site-agnostic lazy-image resolver for native verifier output:
   // many sites keep the real URL in data-src/srcset until the <img> scrolls
   // into view and only put a 1x1/blank placeholder on .src.
   const isPh = (u) => !u
@@ -541,7 +541,8 @@ COLLECT_ROWS_JS = r"""
 
 async def collect_rows(
     *,
-    oracle: OracleEval,
+    oracle: Optional[OracleEval] = None,
+    collection_oracle: Optional[TrustedCollectionEval] = None,
     selector: str,
     fields: Dict[str, str],
     key_field: str = "",
@@ -555,18 +556,29 @@ async def collect_rows(
     only the count reflects what is currently attached to the DOM. The harvest
     accumulator (collect_items) dedups across rounds by __key, which is how
     virtualized lists that recycle rows still get fully collected."""
-    locator = SemanticLocator.bind(
-        COLLECT_ROWS_JS,
-        selector=selector,
-        fields=fields,
-        keyfield=key_field or "",
-        offset=int(offset),
-        limit=int(limit),
-    )
-    payload = await oracle(locator.render())
+    bindings = {
+        "selector": selector,
+        "fields": fields,
+        "keyfield": key_field or "",
+        "offset": int(offset),
+        "limit": int(limit),
+    }
+    if collection_oracle is not None:
+        payload = await collection_oracle(COLLECTION_TEMPLATE_ROWS, bindings)
+    elif oracle is not None:
+        locator = SemanticLocator.bind(COLLECT_ROWS_JS, **bindings)
+        payload = await oracle(locator.render())
+    else:
+        return {"status": "oracle_unavailable", "reason": "no collection oracle was provided"}
     error = _oracle_error(payload)
     if error:
-        return {"status": "oracle_unavailable", "reason": error}
+        return {
+            "status": "oracle_unavailable",
+            "reason": error,
+            "oracleErrorCode": (
+                _oracle_error_code(payload) or "collection_oracle_failed"
+            ),
+        }
     if not isinstance(payload, dict):
         return {"status": "oracle_unavailable", "reason": "non-object payload"}
     if payload.get("error"):
@@ -578,6 +590,169 @@ async def collect_rows(
         "offset": int(payload.get("offset") or offset),
         "returned": int(payload.get("returned") or len(rows)),
         "rows": rows,
+    }
+
+
+COLLECTION_STATE_JS = r"""
+(() => {
+  const itemSelector = __ITEM_SELECTOR__;
+  const containerSelector = __CONTAINER_SELECTOR__;
+  const loadMoreSelector = __LOAD_MORE_SELECTOR__;
+  const result = {
+    itemCount: 0,
+    collectionGeometry: null,
+    loadMore: null,
+  };
+  let items;
+  try {
+    items = Array.from(document.querySelectorAll(itemSelector));
+  } catch (e) {
+    return { error: 'invalid item selector: ' + String(e) };
+  }
+  result.itemCount = items.length;
+  {
+    let container;
+    try {
+      container = containerSelector
+        ? document.querySelector(containerSelector)
+        : (document.scrollingElement || document.documentElement);
+    } catch (e) {
+      return { error: 'invalid container selector: ' + String(e) };
+    }
+    if (!container) {
+      result.collectionGeometry = {
+        present: false,
+        connected: false,
+        itemCount: items.length,
+        itemsInsideContainer: 0,
+        scope: containerSelector ? 'selector' : 'document',
+      };
+    } else {
+      const documentScoped = (
+        container === document.scrollingElement
+        || container === document.documentElement
+        || container === document.body
+      );
+      result.collectionGeometry = {
+        present: true,
+        connected: Boolean(container.isConnected),
+        scrollTop: Number(container.scrollTop),
+        clientHeight: Number(container.clientHeight),
+        scrollHeight: Number(container.scrollHeight),
+        itemCount: items.length,
+        itemsInsideContainer: items.filter((item) => container.contains(item)).length,
+        // Classify the resolved node, not the presence of selector text.
+        // Explicit selectors such as body/html/:root still denote the page
+        // root and cannot prove that a nested lazy collection is exhausted.
+        scope: documentScoped ? 'document' : 'selector',
+      };
+    }
+  }
+  if (loadMoreSelector) {
+    let control;
+    try {
+      control = document.querySelector(loadMoreSelector);
+    } catch (e) {
+      return { error: 'invalid load-more selector: ' + String(e) };
+    }
+    result.loadMore = control ? {
+      present: true,
+      connected: Boolean(control.isConnected),
+      disabled: Boolean(
+        control.disabled
+        || control.getAttribute('disabled') !== null
+        || String(control.getAttribute('aria-disabled') || '').toLowerCase() === 'true'
+      ),
+    } : { present: false, connected: false, disabled: false };
+  }
+  return result;
+})()
+"""
+
+
+def render_trusted_collection_template(
+    template_id: str,
+    bindings: Dict[str, Any],
+) -> str:
+    """Render one allow-listed collection template.
+
+    The registry and the exact binding names live here so adding a new internal
+    Runtime program requires a code review at this boundary.  Unknown or extra
+    bindings fail closed instead of being ignored.
+    """
+    specs = {
+        COLLECTION_TEMPLATE_ITEMS_COUNT: (
+            ITEMS_COUNT_JS,
+            {"selector", "limit"},
+        ),
+        COLLECTION_TEMPLATE_ROWS: (
+            COLLECT_ROWS_JS,
+            {"selector", "fields", "keyfield", "offset", "limit"},
+        ),
+        COLLECTION_TEMPLATE_STATE: (
+            COLLECTION_STATE_JS,
+            {"item_selector", "container_selector", "load_more_selector"},
+        ),
+    }
+    spec = specs.get(str(template_id or ""))
+    if spec is None:
+        raise ValueError(f"unregistered collection template: {template_id!r}")
+    template, expected = spec
+    actual = set(bindings)
+    if actual != expected:
+        raise ValueError(
+            f"invalid bindings for {template_id}: expected {sorted(expected)},"
+            f" got {sorted(actual)}"
+        )
+    return SemanticLocator.bind(template, **bindings).render()
+
+
+async def probe_collection_state(
+    *,
+    oracle: Optional[OracleEval] = None,
+    collection_oracle: Optional[TrustedCollectionEval] = None,
+    item_selector: str,
+    container_selector: str = "",
+    load_more_selector: str = "",
+) -> JsonDict:
+    """Read collection geometry/control state through one fixed oracle.
+
+    This is evidence plumbing for ``collect_items`` only.  It deliberately
+    accepts selectors as JSON-encoded bindings rather than model-authored JS,
+    and it never scrolls, clicks, or mutates the page.
+    """
+    bindings = {
+        "item_selector": item_selector,
+        "container_selector": container_selector,
+        "load_more_selector": load_more_selector,
+    }
+    if collection_oracle is not None:
+        payload = await collection_oracle(COLLECTION_TEMPLATE_STATE, bindings)
+    elif oracle is not None:
+        locator = SemanticLocator.bind(COLLECTION_STATE_JS, **bindings)
+        payload = await oracle(locator.render())
+    else:
+        return {"status": "oracle_unavailable", "reason": "no collection oracle was provided"}
+    error = _oracle_error(payload)
+    if error:
+        return {"status": "oracle_unavailable", "reason": error}
+    if not isinstance(payload, dict):
+        return {"status": "oracle_unavailable", "reason": "non-object payload"}
+    if payload.get("error"):
+        return {"status": "failed", "reason": str(payload.get("error"))}
+    return {
+        "status": "done",
+        "itemCount": int(payload.get("itemCount") or 0),
+        "collectionGeometry": (
+            payload.get("collectionGeometry")
+            if isinstance(payload.get("collectionGeometry"), dict)
+            else None
+        ),
+        "loadMore": (
+            payload.get("loadMore")
+            if isinstance(payload.get("loadMore"), dict)
+            else None
+        ),
     }
 
 

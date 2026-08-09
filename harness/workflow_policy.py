@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from harness.tool_policy import disabled_reason_for_method
+from harness.screenshot_policy import normalize_screenshot_output_params
 
 
 JsonDict = Dict[str, Any]
@@ -18,11 +19,13 @@ LISTENABLE_EVENTS = frozenset({
 
 
 def harden_navigation_lifecycle(steps: Any) -> List[JsonDict]:
-    """Return copied steps with state + AX refresh after every Page.loaded.
+    """Return copied steps with required perception after settlement events.
 
     Trace distillation already inserts the settlement listen. This helper is
     intentionally mechanical and idempotent so online autoheal candidates
-    satisfy the same execution policy as authored workflows.
+    satisfy the same execution policy as authored workflows. A successful
+    Page.loaded settlement needs state + AX refresh; Page.loadFailed needs only
+    Page.getState so the failure can be classified without probing a dead DOM.
     """
     source = steps if isinstance(steps, list) else []
     hardened: List[JsonDict] = []
@@ -34,17 +37,31 @@ def harden_navigation_lifecycle(steps: Any) -> List[JsonDict]:
             if isinstance(step.get(key), list):
                 step[key] = harden_navigation_lifecycle(step[key])
         hardened.append(step)
-        if step.get("type") != "listen" or step.get("event") != "Page.loaded":
+        if step.get("type") != "listen":
             continue
+        event = str(step.get("event") or "")
         next_step = source[index + 1] if index + 1 < len(source) else None
+        if event == "Page.loadFailed":
+            if not (
+                isinstance(next_step, dict)
+                and next_step.get("action") == "Page.getState"
+            ):
+                hardened.append({
+                    "action": "Page.getState",
+                    "purpose": (
+                        "Classify state after distilled navigation load failure"
+                    ),
+                })
+            continue
+        if event != "Page.loaded":
+            continue
         next_next = source[index + 2] if index + 2 < len(source) else None
-        already_hardened = (
+        if not (
             isinstance(next_step, dict)
             and next_step.get("action") == "Page.getState"
             and isinstance(next_next, dict)
             and next_next.get("action") == "DOM.getAXTree"
-        )
-        if not already_hardened:
+        ):
             hardened.extend([
                 {
                     "action": "Page.getState",
@@ -103,9 +120,40 @@ def validate_workflow_params(
     if errors:
         return None, _error(errors)
     normalized = dict(params)
+    normalized["steps"] = _normalize_screenshot_outputs(steps)
     normalized["timeout"] = int(timeout)
     normalized["stepTimeout"] = int(step_timeout)
     return normalized, None
+
+
+def _normalize_screenshot_outputs(steps: List[Any]) -> List[Any]:
+    """Return copied workflow steps with path-only screenshot output.
+
+    Workflow.execute runs child actions inside ABCP, so ordinary browser-call
+    interception cannot rewrite a nested Page.screenshot before transport.  A
+    full-page base64 result can exceed the WebSocket frame limit before the
+    harness gets a chance to offload it.  Normalize recursively at workflow
+    admission and let ABCP choose the output path.
+    """
+    normalized: List[Any] = []
+    for raw in steps:
+        if not isinstance(raw, dict):
+            normalized.append(raw)
+            continue
+        step = dict(raw)
+        for branch in ("then", "else", "body"):
+            nested = step.get(branch)
+            if isinstance(nested, list):
+                step[branch] = _normalize_screenshot_outputs(nested)
+        if str(step.get("action") or "").strip() == "Page.screenshot":
+            raw_params = step.get("params")
+            action_params, _receipt = normalize_screenshot_output_params(
+                "Page.screenshot",
+                raw_params,
+            )
+            step["params"] = action_params
+        normalized.append(step)
+    return normalized
 
 
 def _validate_sequence(
@@ -133,28 +181,35 @@ def _validate_sequence(
 
         if enforce_lifecycle and obligation:
             if obligation == "settlement" and not (
-                step_type == "listen" and str(raw.get("event") or "") == "Page.loaded"
+                step_type == "listen"
+                and str(raw.get("event") or "") in {"Page.loaded", "Page.loadFailed"}
             ):
-                errors.append(f"{step_path} must listen for Page.loaded immediately after navigation")
+                errors.append(
+                    f"{step_path} must listen for Page.loaded or Page.loadFailed"
+                    " immediately after navigation"
+                )
             elif obligation == "state" and action != "Page.getState":
                 errors.append(f"{step_path} must call Page.getState after settlement/recovery")
             elif obligation == "axtree" and action != "DOM.getAXTree":
                 errors.append(f"{step_path} must call DOM.getAXTree after Page.getState")
             elif obligation == "state_only" and action != "Page.getState":
-                errors.append(f"{step_path} must call Page.getState after dialog/chooser close")
+                errors.append(
+                    f"{step_path} must call Page.getState after load failure"
+                    " or dialog/chooser close"
+                )
 
         if action:
             if action == "Workflow.execute":
                 errors.append(f"{step_path}: nested Workflow.execute is forbidden")
             if action == "Runtime.evaluate" and not allow_runtime:
-                errors.append(f"{step_path}: Runtime.evaluate is forbidden in ephemeral workflows")
+                errors.append(f"{step_path}: Runtime.evaluate is forbidden in model-authored workflows")
             if known and action not in known:
                 errors.append(f"{step_path}: unknown ABCP action {action!r}")
             disabled = disabled_reason_for_method(action, task_type)
             if disabled:
                 errors.append(f"{step_path}: {disabled}")
             if enforce_lifecycle:
-                if action == "Page.navigate":
+                if action in {"Page.navigate", "Page.reload", "Page.go"}:
                     obligation = "settlement"
                 elif obligation == "state" and action == "Page.getState":
                     obligation = "axtree"
@@ -171,6 +226,8 @@ def _validate_sequence(
             if enforce_lifecycle:
                 if obligation == "settlement" and event == "Page.loaded":
                     obligation = "state"
+                elif obligation == "settlement" and event == "Page.loadFailed":
+                    obligation = "state_only"
                 elif event in {"Page.recovered", "Page.navigate"}:
                     obligation = "state"
                 elif event in {"Page.dialogClosed", "File.chooserClosed"}:
@@ -229,6 +286,8 @@ def _error(errors: List[str]) -> JsonDict:
         "tool_was_executed": False,
         "next_instruction": (
             "Use only task-type-allowed ABCP actions. After navigation listen for"
-            " Page.loaded, then call Page.getState and DOM.getAXTree."
+            " Page.loaded or Page.loadFailed. After Page.loaded call"
+            " Page.getState and DOM.getAXTree; after Page.loadFailed call"
+            " Page.getState only."
         ),
     }
