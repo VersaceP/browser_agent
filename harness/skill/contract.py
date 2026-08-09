@@ -23,6 +23,27 @@ _SUITE_ROUTE_SOURCE_KEY = "_skill_route_source"
 _SUITE_ROUTE_SOURCE_VALUE = "suite_routed"
 
 
+def _stamp_skill_content_completeness(
+    worker_contract: Dict[str, Any],
+    skill: Any,
+) -> bool:
+    """Copy optional workflow metadata into the runtime worker contract."""
+    if "content_completeness" in worker_contract:
+        return False
+    workflow = getattr(skill, "workflow", None)
+    config = (
+        workflow.get("content_completeness")
+        if isinstance(workflow, dict) else None
+    )
+    if not isinstance(config, dict) or not config.get("expected_regions"):
+        return False
+    worker_contract["content_completeness"] = dict(config)
+    skill_id = str(getattr(skill, "skill_id", "") or "").strip()
+    if skill_id:
+        worker_contract["content_completeness_source"] = f"skill:{skill_id}"
+    return True
+
+
 def is_suite_routed(worker_contract: Dict[str, Any]) -> bool:
     """Whether a suite selected the skill by an exact phase match.
 
@@ -320,6 +341,7 @@ def apply_forced_skill(
                 pass
 
     worker_contract["skill_id"] = chosen.skill_id
+    _stamp_skill_content_completeness(worker_contract, chosen)
     worker_contract.pop("skill_selection", None)  # operator force overrides decline
     if logger is not None and hasattr(logger, "write"):
         try:
@@ -375,6 +397,9 @@ def enrich_worker_contract_with_skill(
         worker_contract["skill_id"] = selected_skill_id
     if skill_selection_declined(worker_contract):
         return None
+    selected_skill = registry.get(selected_skill_id) if selected_skill_id else None
+    if selected_skill is not None:
+        _stamp_skill_content_completeness(worker_contract, selected_skill)
     if worker_contract.get("skill_id") and isinstance(worker_contract.get("skill_variables"), dict):
         return None
     try:
@@ -397,6 +422,8 @@ def enrich_worker_contract_with_skill(
         if not worker_contract.get("skill_id"):
             worker_contract["skill_id"] = skill.skill_id
             info["set_skill_id"] = True
+        if _stamp_skill_content_completeness(worker_contract, skill):
+            info["set_content_completeness"] = True
 
         if not isinstance(worker_contract.get("skill_variables"), dict):
             variables = derive_variables(skill, worker_contract, phase or {}, task, context)
@@ -562,6 +589,7 @@ def selected_skill_context(
     worker_contract: Dict[str, Any],
     *,
     max_markdown_chars: int = 6000,
+    workflow_enabled: bool = True,
 ) -> str:
     """Context block for BrowserAgent fallback slow path.
 
@@ -617,9 +645,14 @@ def selected_skill_context(
             }
     except Exception:  # pragma: no cover - context enrichment must never break spawn
         pass
+    workflow_runtime_disabled = bool(not is_guidance and not workflow_enabled)
     block = {
         "skill_id": skill.skill_id,
-        "kind": "guidance" if is_guidance else "workflow",
+        "kind": (
+            "guidance" if is_guidance
+            else "guidance_runtime_disabled" if workflow_runtime_disabled
+            else "workflow"
+        ),
         "sourcePath": str(skill.directory / "SKILL.md") if skill.directory else "",
         "frontmatter": {
             "domain": skill.domain,
@@ -641,6 +674,13 @@ def selected_skill_context(
             " them under the guidance_protocol (probe first, discard on"
             " mismatch, report guidance_stale)."
         ) if is_guidance else (
+            "The frozen native workflow is retained for future ABCP runtime"
+            " support but Workflow execution is disabled in this run. Use the"
+            " disclosed SKILL.md as calibrated guidance and perform the task"
+            " with ordinary browser calls and Harness composites. Do not call"
+            " execute_selected_skill/Workflow.execute and do not reconstruct"
+            " workflow.json."
+        ) if workflow_runtime_disabled else (
             "If the zero-LLM skill fast path did not complete, execute the frozen"
             " selected recipe with the execute_selected_skill harness tool."
             " Do NOT search for workflow.json, copy steps into browser_call, or"
@@ -665,7 +705,12 @@ def selected_skill_context(
     )
 
 
-def build_known_skills_digest(registry: Any, *, max_skills: int = 12) -> str:
+def build_known_skills_digest(
+    registry: Any,
+    *,
+    max_skills: int = 12,
+    workflow_enabled: bool = True,
+) -> str:
     """Planning-time digest of reusable skills for the LeadAgent system prompt.
 
     The granularity mismatch (batch phases vs single-detail skills) is decided at
@@ -693,11 +738,19 @@ def build_known_skills_digest(registry: Any, *, max_skills: int = 12) -> str:
         try:
             url_var = _url_variable(skill)
             is_guidance = bool(getattr(skill, "is_hints_only", False))
+            workflow_runtime_disabled = bool(
+                not is_guidance and not workflow_enabled
+            )
             entries.append({
                 "skill_id": skill.skill_id,
                 # guidance skill 不自产 artifact：worker 仍是执行主体，skill 只
                 # 提供 hints——planner 不能把它当零 LLM 快路径去塑形 phase。
-                "kind": "guidance" if is_guidance else "workflow",
+                "kind": (
+                    "guidance" if is_guidance
+                    else "guidance_runtime_disabled"
+                    if workflow_runtime_disabled
+                    else "workflow"
+                ),
                 "domain": skill.domain,
                 "task_type": skill.task_type,
                 "stage_hint": skill.stage_hint,
@@ -707,7 +760,8 @@ def build_known_skills_digest(registry: Any, *, max_skills: int = 12) -> str:
                 "row_contract": skill.row_contract,
                 "granularity": (
                     "advisory hints; the worker performs the task itself (no"
-                    " workflow fast path)" if is_guidance
+                    " workflow fast path)"
+                    if is_guidance or workflow_runtime_disabled
                     else f"one {url_var or 'target'} per workflow run"
                 ),
                 "description": str(skill.description or "").strip(),

@@ -24,11 +24,17 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from harness.pacing import wait_between_rows
 from harness.skill.pause import HitlOnsetMonitor, classify_run_for_hitl
 from harness.skill.registry import Skill, SkillRegistry, canonical_field
-from harness.skill.structured_output import structured_output_rows
 from harness.skill.workflow import (
     check_persisted_contract,
     check_success_contract,
     run_skill_workflow,
+)
+from harness.workflow_auth_fence import (
+    auth_fence_failure_result,
+    auth_fence_outcome,
+    reperceive_workflow_auth_generation,
+    workflow_auth_fence_after,
+    workflow_auth_fence_before,
 )
 
 _URL_RE = re.compile(r"https?://[^\s\"'<>)\]]+")
@@ -455,58 +461,6 @@ def _phase_expected_rows(worker_contract: Dict[str, Any]) -> Optional[int]:
         else:
             minimum = max(minimum or 0, value)
     return exact if exact is not None else minimum
-
-
-def _phase_rank_window(
-    worker_contract: Dict[str, Any], field: str,
-) -> Optional[Tuple[int, int]]:
-    """Inclusive numeric range for a structured-output rank field."""
-    validators = worker_contract.get("validators")
-    if not isinstance(validators, list):
-        return None
-    wanted = canonical_field(field)
-    for validator in validators:
-        if not isinstance(validator, dict) or validator.get("type") != "range":
-            continue
-        if canonical_field(str(validator.get("field") or "")) != wanted:
-            continue
-        try:
-            minimum = int(validator.get("min"))
-            maximum = int(validator.get("max"))
-        except (TypeError, ValueError):
-            return None
-        return (minimum, maximum) if minimum <= maximum else None
-    return None
-
-
-def _structured_runtime_variables(
-    skill: Skill,
-    worker_contract: Dict[str, Any],
-    phase: Optional[Dict[str, Any]],
-    task: str,
-    context: str,
-) -> Dict[str, Any]:
-    """Fill declared scalar inputs used by a standard multi-row workflow."""
-    config = skill.structured_output
-    runtime_names = config.get("runtime_variables")
-    runtime_names = runtime_names if isinstance(runtime_names, dict) else {}
-    rank = config.get("rank")
-    rank = rank if isinstance(rank, dict) else {}
-    rank_field = str(rank.get("field") or "rank")
-    window = _phase_rank_window(worker_contract, rank_field)
-    target_url = _find_url(skill.domain, [worker_contract, phase, task, context])
-    expected_rows = _phase_expected_rows(worker_contract)
-    values = {
-        str(runtime_names.get("target_url") or "targetUrl"): target_url,
-        str(runtime_names.get("rank_min") or "minRank"): window[0] if window else None,
-        str(runtime_names.get("rank_max") or "maxRank"): window[1] if window else None,
-        str(runtime_names.get("expected_rows") or "expectedRows"): expected_rows,
-    }
-    template = skill.variable_template
-    return {
-        key: value for key, value in values.items()
-        if key in template and value not in (None, "")
-    }
 
 
 def _row_field_value(row: Dict[str, Any], field: str) -> Any:
@@ -1137,6 +1091,115 @@ def _is_transient_workflow_failure(run_result: Dict[str, Any]) -> bool:
     return bool(_TRANSIENT_WORKFLOW_ERROR_RE.search(text))
 
 
+async def _run_with_auth_generation_fence(
+    agent: Any,
+    skill: Skill,
+    *,
+    run_id: str,
+    page_id: str,
+    fleet_id: str,
+    variables: Dict[str, Any],
+    source: str = "skill.fast_path",
+) -> tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Run one frozen workflow, replaying at most once after an auth epoch."""
+
+    preflight = await workflow_auth_fence_before(
+        agent,
+        fleet_id=fleet_id,
+        run_id=run_id,
+        source=source,
+    )
+    if not preflight.get("allowed") and preflight.get("generationChanged"):
+        refreshed = await reperceive_workflow_auth_generation(
+            agent,
+            page_id=page_id,
+            target_generation=int(preflight.get("generation") or 0),
+            source="frozen workflow preflight",
+        )
+        if refreshed:
+            preflight = await workflow_auth_fence_before(
+                agent,
+                fleet_id=fleet_id,
+                run_id=run_id,
+                source=source,
+            )
+    if not preflight.get("allowed"):
+        return auth_fence_failure_result(preflight, run_id=run_id), None
+
+    started_generation = int(preflight.get("generation") or 0)
+    agent._selected_skill_workflow_attempted = True
+    run_result, observed_signal = await _run_skill_with_optional_control(
+        agent,
+        skill,
+        run_id=run_id,
+        page_id=page_id,
+        fleet_id=fleet_id,
+        variables=variables,
+    )
+    postflight = await workflow_auth_fence_after(
+        agent,
+        fleet_id=fleet_id,
+        run_id=run_id,
+        started_generation=started_generation,
+        source=source,
+    )
+    if postflight.get("valid"):
+        return run_result, observed_signal
+    if not postflight.get("generationChanged"):
+        return auth_fence_failure_result(postflight, run_id=run_id), None
+
+    refreshed = await reperceive_workflow_auth_generation(
+        agent,
+        page_id=page_id,
+        target_generation=int(postflight.get("generation") or 0),
+        source="frozen workflow replay",
+    )
+    if not refreshed:
+        return auth_fence_failure_result(postflight, run_id=run_id), None
+    replay_id = f"{run_id}-auth-replay"
+    replay_preflight = await workflow_auth_fence_before(
+        agent,
+        fleet_id=fleet_id,
+        run_id=replay_id,
+        source=source,
+    )
+    if not replay_preflight.get("allowed"):
+        return auth_fence_failure_result(
+            replay_preflight,
+            run_id=replay_id,
+        ), None
+    _log(agent, "workflow.row_replayed_after_reperception", {
+        "skill": skill.skill_id,
+        "source": source,
+        "method": "Workflow.execute",
+        "runId": replay_id,
+        "priorRunId": run_id,
+        "workerId": str(getattr(agent, "worker_id", "") or ""),
+        "generation": replay_preflight.get("generation"),
+    })
+    replay_result, replay_signal = await _run_skill_with_optional_control(
+        agent,
+        skill,
+        run_id=replay_id,
+        page_id=page_id,
+        fleet_id=fleet_id,
+        variables=variables,
+    )
+    replay_postflight = await workflow_auth_fence_after(
+        agent,
+        fleet_id=fleet_id,
+        run_id=replay_id,
+        started_generation=int(replay_preflight.get("generation") or 0),
+        source=source,
+    )
+    if not replay_postflight.get("valid"):
+        return auth_fence_failure_result(
+            replay_postflight,
+            run_id=replay_id,
+        ), None
+    return replay_result, replay_signal
+
+
 async def _run_with_transient_retry(
     agent: Any,
     skill: Skill,
@@ -1150,10 +1213,9 @@ async def _run_with_transient_retry(
     """One bounded retry, ONLY for transient engine failures on the same warm
     tab. HITL/challenge interruptions and deterministic failures pass through
     untouched — those belong to the hand-off/fallback ladders."""
-    agent._selected_skill_workflow_attempted = True
-    run_result, observed_signal = await _run_skill_with_optional_control(
+    run_result, observed_signal = await _run_with_auth_generation_fence(
         agent, skill, run_id=run_id, page_id=page_id, fleet_id=fleet_id,
-        variables=variables,
+        variables=variables, source=event_prefix,
     )
     if classify_run_for_hitl(run_result, observed_signal) is not None:
         return run_result, observed_signal
@@ -1165,9 +1227,9 @@ async def _run_with_transient_retry(
         "failedError": run_result.get("failedError"),
         "exc": run_result.get("exc"),
     })
-    return await _run_skill_with_optional_control(
+    return await _run_with_auth_generation_fence(
         agent, skill, run_id=f"{run_id}-t2", page_id=page_id,
-        fleet_id=fleet_id, variables=variables,
+        fleet_id=fleet_id, variables=variables, source=event_prefix,
     )
 
 
@@ -1504,6 +1566,13 @@ async def _run_batch_fast_path(
         run_result, observed_signal = await _run_with_transient_retry(
             agent, skill, run_id=run_id, page_id=page_id, fleet_id=fleet_id, variables=variables,
         )
+        auth_fence = auth_fence_outcome(run_result)
+        if auth_fence is not None:
+            return _handoff(
+                "workflow_auth_fenced",
+                index,
+                {"authFence": auth_fence, "runId": run_result.get("runId")},
+            )
 
         hitl = classify_run_for_hitl(run_result, observed_signal)
         if hitl is not None:
@@ -1657,231 +1726,6 @@ async def _run_batch_fast_path(
     }
 
 
-async def _run_structured_output_fast_path(
-    agent: Any,
-    skill: Skill,
-    *,
-    worker_contract: Dict[str, Any],
-    phase: Optional[Dict[str, Any]],
-    task: str,
-    context: str,
-    fleet_ids: Optional[Sequence[str]],
-    record_extraction: Any,
-    health: Any,
-) -> Optional[Dict[str, Any]]:
-    """Run one ordinary Workflow.execute that returns a JSON-string row set."""
-    variables = derive_variables(skill, worker_contract, phase, task, context)
-    variables.update(
-        _structured_runtime_variables(skill, worker_contract, phase, task, context)
-    )
-    if not required_filled(skill, variables):
-        _log(agent, "skill.fast_path.skipped", {
-            "skill": skill.skill_id,
-            "reason": "required_variables_unfilled",
-            "variables": {
-                key: value for key, value in variables.items()
-                if "expression" not in key.lower()
-            },
-        })
-        return None
-
-    config = skill.structured_output
-    rank = config.get("rank")
-    rank = rank if isinstance(rank, dict) else {}
-    rank_field = str(rank.get("field") or "rank")
-    rank_window = _phase_rank_window(worker_contract, rank_field)
-    if isinstance(config.get("window"), dict) and rank_window is None:
-        _log(agent, "skill.fast_path.structured_output_unavailable", {
-            "skill": skill.skill_id,
-            "reason": "rank_window_missing",
-            "field": rank_field,
-        })
-        return None
-
-    page_id, fleet_id = await _ensure_page(agent, fleet_ids)
-    run_id = f"skill-{skill.skill_id}-{uuid.uuid4().hex[:8]}"
-    run_result, observed_signal = await _run_with_transient_retry(
-        agent,
-        skill,
-        run_id=run_id,
-        page_id=page_id,
-        fleet_id=fleet_id,
-        variables=variables,
-    )
-    hitl = classify_run_for_hitl(run_result, observed_signal)
-    if hitl is not None:
-        _log(agent, "skill.fast_path.hitl_required", {
-            "skill": skill.skill_id,
-            "runId": run_id,
-            "pageId": page_id,
-            "signal": hitl,
-        })
-        return None
-
-    result_variables = run_result.get("variables")
-    result_variables = result_variables if isinstance(result_variables, dict) else {}
-    challenge = workflow_challenge_signal(skill, run_result, variables)
-    if challenge is not None:
-        # A challenge page can still execute the frozen JS and return an empty
-        # JSON array. That is an environment/HITL outcome, not evidence that the
-        # skill's selector or contract is rotten, so never debit suite health.
-        _log(agent, "skill.fast_path.hitl_required", {
-            "skill": skill.skill_id,
-            "runId": run_id,
-            "pageId": page_id,
-            "signal": challenge,
-        })
-        return None
-    page_status = str(result_variables.get("pageStatus") or "").lower()
-    if page_status in {"loading", "navigating", "startedloading"}:
-        _log(agent, "skill.fast_path.page_unsettled", {
-            "skill": skill.skill_id,
-            "runId": run_id,
-            "pageId": page_id,
-            "pageStatus": page_status,
-        })
-        return None
-
-    verdict = check_success_contract(skill, run_result)
-    if not (run_result.get("succeeded") and verdict["ok"]):
-        if health is not None:
-            health.record(skill, False)
-        _log(agent, "skill.fast_path.fell_back", {
-            "skill": skill.skill_id,
-            "runId": run_id,
-            "failed_checks": verdict["failed_checks"],
-            "failedStepPath": run_result.get("failedStepPath"),
-            "failedPurpose": run_result.get("failedPurpose"),
-        })
-        return None
-
-    mismatch = page_binding_mismatch(skill, run_result, variables)
-    if mismatch is not None:
-        if health is not None:
-            health.record(skill, False)
-        _log(agent, f"skill.fast_path.{mismatch.get('reason') or 'wrong_page'}", {
-            "skill": skill.skill_id,
-            "runId": run_id,
-            **mismatch,
-        })
-        return None
-
-    rows, failures = structured_output_rows(
-        skill,
-        run_result,
-        rank_window=rank_window,
-    )
-    selector = str(config.get("source_selector") or "Workflow structured output")
-    page_url = str(
-        (run_result.get("variables") or {}).get("pageUrl")
-        or variables.get("targetUrl")
-        or ""
-    )
-    expected_fields = _expected_fields_of(worker_contract)
-    built_rows: List[Dict[str, Any]] = []
-    if not failures:
-        for row in rows:
-            enriched = dict(row)
-            rank_value = _row_field_value(enriched, rank_field)
-            enriched.setdefault("pageUrl", page_url)
-            enriched.setdefault("sourceTool", f"Workflow.execute(skill:{skill.skill_id})")
-            enriched.setdefault("sourceSelectorOrAxId", selector)
-            if rank_value not in (None, ""):
-                enriched.setdefault(
-                    "rankEvidenceText",
-                    f"Rank {rank_value} is derived from the unique filtered DOM order "
-                    f"of {selector} on {page_url}.",
-                )
-            built_rows.append(
-                _align_row_fields_to_expected(enriched, expected_fields)
-            )
-
-    validators = worker_contract.get("validators")
-    if not failures and any(
-        not _row_passes_validators(row, validators) for row in built_rows
-    ):
-        failures.append("structured_output row failed phase row validators")
-    expected_rows = _phase_expected_rows(worker_contract)
-    if expected_rows is not None and len(built_rows) != expected_rows:
-        failures.append(
-            f"phase_rows:{expected_rows}(got {len(built_rows)})"
-        )
-    if failures:
-        if health is not None:
-            health.record(skill, False)
-        _log(agent, "skill.fast_path.structured_output_unmet", {
-            "skill": skill.skill_id,
-            "runId": run_id,
-            "failed_checks": failures,
-            "rowCount": len(built_rows),
-        })
-        return None
-
-    artifact: Dict[str, Any] = {}
-    if record_extraction is not None:
-        try:
-            artifact = record_extraction(agent, {
-                "name": _artifact_name(skill, worker_contract),
-                "rows": built_rows,
-                "description": (
-                    f"Persisted by structured-output skill fast path: {skill.skill_id}"
-                ),
-            }) or {}
-        except Exception as exc:  # pragma: no cover
-            _log(agent, "skill.fast_path.persist_error", {
-                "skill": skill.skill_id, "error": str(exc),
-            })
-            return None
-
-    for row in built_rows:
-        persisted = check_persisted_contract(
-            skill,
-            row,
-            artifact,
-            row_count=len(built_rows),
-            expected_rows=expected_rows,
-        )
-        if not persisted["ok"]:
-            if health is not None:
-                health.record(skill, False)
-            _log(agent, "skill.fast_path.persisted_contract_unmet", {
-                "skill": skill.skill_id,
-                "runId": run_id,
-                "failed_checks": persisted["failed_checks"],
-                "artifactStatus": artifact.get("status"),
-            })
-            return None
-
-    if health is not None:
-        health.record(skill, True)
-    _log(agent, "skill.fast_path.structured_output_completed", {
-        "skill": skill.skill_id,
-        "runId": run_id,
-        "rows": len(built_rows),
-        "row_fields": sorted(built_rows[0]) if built_rows else [],
-    })
-    answer = json.dumps({
-        "outcome": "completed_via_skill",
-        "skill": skill.skill_id,
-        "runId": run_id,
-        "rows": len(built_rows),
-        "data": {"rowCount": len(built_rows)},
-        "evidence": [
-            f"skill {skill.skill_id} returned and persisted {len(built_rows)} structured rows"
-        ],
-        "artifact": artifact.get("savedPath") or artifact.get("relativePath"),
-        "next_steps": "none; structured-output fast path satisfied the phase contract",
-    }, ensure_ascii=False)
-    return {
-        "handled": True,
-        "answer": answer,
-        "skill": skill.skill_id,
-        "runId": run_id,
-        "completedRows": len(built_rows),
-        "totalRows": len(built_rows),
-    }
-
-
 def resolve_skill_and_variables(
     registry: SkillRegistry,
     worker_contract: Optional[Dict[str, Any]],
@@ -1915,27 +1759,6 @@ def _active_control_enabled(agent: Any) -> bool:
     return bool(getattr(harness_cfg, "skill_workflow_active_control_enabled", False))
 
 
-def _should_vl_solve(vl_config: Any, skill: Any = None) -> bool:
-    """Role C (auto-solve a CAPTCHA) needs its OWN opt-in beyond vl.enabled — acting
-    on a challenge is the most consequential VL action (ToS/legal weight).
-
-    Two AND-gates, both default-deny: (1) global vl.enabled && captcha_solve_enabled;
-    (2) the matched skill's frontmatter `allow_auto_captcha: true` (doc §13.8 — a
-    skill may forbid auto-solving its challenges; e.g. TAAFT declares false). A skill
-    that does not opt in falls to the human path even when the global gate is open."""
-    if not (
-        vl_config is not None
-        and getattr(vl_config, "enabled", False)
-        and getattr(vl_config, "captcha_solve_enabled", False)
-    ):
-        return False
-    if skill is not None:
-        frontmatter = getattr(skill, "frontmatter", None) or {}
-        if not bool(frontmatter.get("allow_auto_captcha", False)):
-            return False
-    return True
-
-
 async def _run_skill_with_optional_control(
     agent: Any,
     skill: Skill,
@@ -1945,43 +1768,49 @@ async def _run_skill_with_optional_control(
     fleet_id: str,
     variables: Dict[str, Any],
 ) -> tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
-    """Run the skill workflow. If active control is enabled and a 2nd connection
-    opens, drive pause/resolve/resume over it (observed_signal is None — pauses are
-    handled actively). Otherwise (or on ANY control failure) fall back to the
-    observe-only path. Returns (run_result, observed_signal)."""
+    """Run the skill workflow, optionally with PAGE-level human HITL control.
+
+    CAPTCHA VL auto-solving is owned by the worker/browser-tools hot path. The
+    Skill control transport cannot currently read ``Runtime.evaluate`` return
+    values from the live panel, so active Workflow control must not enable a
+    second solver path whose safety probes are unobservable.
+
+    If active control cannot open or fails, fall back to the observe-only path.
+    Returns ``(run_result, observed_signal)``.
+    """
     if _active_control_enabled(agent):
         try:
             import functools
 
             from harness.skill.control import (
                 ControlChannel,
-                _default_screenshot,
                 make_challenge_poller,
                 resolve_via_hitl,
-                resolve_via_vl_then_hitl,
                 run_workflow_with_control,
             )
 
             logger = getattr(agent, "logger", None)
-            control = ControlChannel.from_browser(agent.browser, logger=logger)
+            runtime = getattr(agent, "runtime", None)
+            control = ControlChannel.from_browser(
+                agent.browser,
+                logger=logger,
+                fleet_auth_barrier=getattr(
+                    agent, "fleet_auth_barrier", None
+                ),
+                fleet_id=fleet_id,
+                worker_id=str(getattr(agent, "worker_id", "") or ""),
+            )
             if control is not None and await control.try_open():
                 harness_cfg = getattr(getattr(agent, "runtime", None), "harness", None)
                 common = dict(
-                    timeout_seconds=float(getattr(harness_cfg, "hitl_wait_timeout_seconds", 1200.0) or 1200.0),
+                    timeout_seconds=float(getattr(harness_cfg, "hitl_wait_timeout_seconds", 900.0) or 900.0),
                     poll_interval_seconds=float(getattr(harness_cfg, "hitl_poll_interval_seconds", 2.0) or 2.0),
                     logger=logger,
                 )
-                vl_config = getattr(harness_cfg, "vl", None)
-                if _should_vl_solve(vl_config, skill):
-                    # VL-first: try to auto-solve a visual CAPTCHA, human fall-back.
-                    resolver = functools.partial(
-                        resolve_via_vl_then_hitl,
-                        vl_config=vl_config, screenshot_fn=_default_screenshot,
-                        max_retries=int(getattr(vl_config, "captcha_solve_max_retries", 2) or 2),
-                        **common,
-                    )
-                else:
-                    resolver = functools.partial(resolve_via_hitl, **common)
+                # Intentionally human-only here. The worker hot path owns CAPTCHA
+                # classification; the control connection has no native hit-test
+                # primitive for safe automated coordinate actions.
+                resolver = functools.partial(resolve_via_hitl, **common)
                 # Per-skill IN-PAGE poll: the primary is blocked in execute, so an
                 # in-page widget firing no navigation is invisible to the notification
                 # leg. The poll mirrors the skill's own challengeFlag JS on the 2nd
@@ -1991,6 +1820,7 @@ async def _run_skill_with_optional_control(
                     run_skill_workflow,
                     capability_methods=getattr(agent, "capability_methods", set()),
                     method_schemas=getattr(agent, "method_schemas", {}),
+                    workflow_runtime=agent,
                 )
                 try:
                     run_result = await run_workflow_with_control(
@@ -2013,6 +1843,7 @@ async def _run_skill_with_optional_control(
             page_id=page_id, fleet_id=fleet_id, variables=variables,
             capability_methods=getattr(agent, "capability_methods", set()),
             method_schemas=getattr(agent, "method_schemas", {}),
+            workflow_runtime=agent,
         )
     finally:
         observed_signal = monitor.stop()
@@ -2096,22 +1927,6 @@ async def maybe_run_skill_fast_path(
              {"skill": skill.skill_id, "health": health.entry(skill.skill_id)})
         return None
 
-    # A standard Workflow.execute may return a JSON string containing multiple
-    # rows. It runs once and owns its own collection/materialization steps, so
-    # the ordinary detail-batch `skill_rows` preflight does not apply.
-    if skill.structured_output:
-        return await _run_structured_output_fast_path(
-            agent,
-            skill,
-            worker_contract=worker_contract,
-            phase=phase,
-            task=task,
-            context=context,
-            fleet_ids=fleet_ids,
-            record_extraction=record_extraction,
-            health=health,
-        )
-
     # Batch mode: a Lead-attached skill_rows list runs the workflow once per row
     # on one page (no LLM loop) instead of forcing a single-detail skill over a
     # batch phase or falling back entirely.
@@ -2184,6 +1999,14 @@ async def maybe_run_skill_fast_path(
     run_result, observed_signal = await _run_with_transient_retry(
         agent, skill, run_id=run_id, page_id=page_id, fleet_id=fleet_id, variables=variables,
     )
+    auth_fence = auth_fence_outcome(run_result)
+    if auth_fence is not None:
+        _log(agent, "skill.fast_path.workflow_auth_fenced", {
+            "skill": skill.skill_id,
+            "runId": run_result.get("runId"),
+            "authFence": auth_fence,
+        })
+        return None
 
     # P4 hand-off: a HITL/challenge interruption is NOT a skill failure. Hand the
     # live (paused) page — it lives in the worker's slot fleet — to the BrowserAgent

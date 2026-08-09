@@ -14,9 +14,12 @@ LIVE-VERIFIED cross-connection semantics (2026-06-27, three-connection probe):
     primary's page.
 
 So active control here is PAGE-level, not engine-level: when a challenge is observed
-mid-execute, the control channel resolves the *page* (human via
-`Hitl.requestPause`→wait `Hitl.resumed`, or VL auto-solve as an `on_pause`
-extension). The workflow continues on its own — it must be authored with a
+mid-execute, production Skill dispatch resolves the *page* through the human
+`Hitl.requestPause`→wait `Hitl.resumed` path. CAPTCHA VL auto-solving is owned by
+the worker/browser-tools hot path because this control transport cannot observe
+the live panel's `Runtime.evaluate` return values. The experimental VL resolver
+below is intentionally not wired into Skill dispatch. The workflow continues on
+its own — it must be authored with a
 challenge-gated `listen Hitl.resumed` boundary (see skills/_template) so it waits at
 the challenge point instead of failing past it; the `Hitl.resumed` that ends the
 pause also satisfies that listen. Everything is gated
@@ -30,6 +33,9 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from harness.skill.pause import hitl_onset_signal
 from harness.skill.workflow import run_skill_workflow
+from harness.screenshot_policy import normalize_screenshot_output_params
+from harness.vl import captcha
+from harness.vl.captcha import run_captcha_solve_loop, solve_plan_to_input_calls
 
 # on_pause resolver: (control, page_id, onset_signal) -> resolved? (True ⇒ page cleared)
 PauseResolver = Callable[["ControlChannel", str, Dict[str, Any]], Awaitable[bool]]
@@ -41,14 +47,34 @@ class ControlChannel:
     `connect`, `close` (i.e. abcp_client.ABCPClient). Engine-level Workflow.pause/
     resume are intentionally absent — they are session-bound and unreachable here."""
 
-    def __init__(self, client: Any, *, owns_client: bool = True, logger: Any = None):
+    def __init__(
+        self,
+        client: Any,
+        *,
+        owns_client: bool = True,
+        logger: Any = None,
+        fleet_auth_barrier: Any = None,
+        fleet_id: str = "",
+        worker_id: str = "",
+    ):
         self.client = client
         self._owns_client = owns_client
         self._logger = logger
         self._open = False
+        self._fleet_auth_barrier = fleet_auth_barrier
+        self._fleet_id = str(fleet_id or "").strip()
+        self._worker_id = str(worker_id or "").strip()
 
     @classmethod
-    def from_browser(cls, browser: Any, *, logger: Any = None) -> Optional["ControlChannel"]:
+    def from_browser(
+        cls,
+        browser: Any,
+        *,
+        logger: Any = None,
+        fleet_auth_barrier: Any = None,
+        fleet_id: str = "",
+        worker_id: str = "",
+    ) -> Optional["ControlChannel"]:
         """Build a control channel mirroring the primary browser's connection
         config (ws_url + auth). Returns None if the primary exposes no config."""
         config = getattr(browser, "config", None)
@@ -58,7 +84,14 @@ class ControlChannel:
             from abcp_client import ABCPClient
         except Exception:  # pragma: no cover - import environment guard
             return None
-        return cls(ABCPClient(config), owns_client=True, logger=logger)
+        return cls(
+            ABCPClient(config),
+            owns_client=True,
+            logger=logger,
+            fleet_auth_barrier=fleet_auth_barrier,
+            fleet_id=fleet_id,
+            worker_id=worker_id,
+        )
 
     async def try_open(self) -> bool:
         """Connect the control channel. Never raises — returns False on failure so
@@ -67,18 +100,57 @@ class ControlChannel:
         try:
             if callable(connect):
                 await connect()
+            # Never register the secondary socket with the primary worker's
+            # agentId. ABCP routes page notifications to one agent socket; a
+            # duplicate registration can steal notifications from the primary
+            # connection. A made-up second identity is not safe either because
+            # it may not own the page. Until ABCP exposes delegated-control
+            # identity, this channel relies only on cross-connection page calls.
             self._open = True
             return True
         except Exception as exc:
             self._log("skill.control.open_failed", {"error": str(exc)})
+            if self._owns_client:
+                close = getattr(self.client, "close", None)
+                if callable(close):
+                    try:
+                        await close()
+                    except Exception:
+                        pass
             self._open = False
             return False
 
     async def call(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        return await self.client.call(method, params or {})
+        # This connection bypasses the BrowserAgent dispatcher, so reuse the
+        # same transport boundary directly rather than maintaining a literal.
+        forwarded, _receipt = normalize_screenshot_output_params(method, params)
+        return await self.client.call(method, forwarded)
 
     async def request_pause(self, page_id: str, reason: str = "skill workflow challenge") -> Dict[str, Any]:
         """Page-level HITL pause (cross-connection verified)."""
+        barrier = self._fleet_auth_barrier
+        if (
+            barrier is not None
+            and self._fleet_id
+            and self._worker_id
+        ):
+            claim = await barrier.claim(
+                self._fleet_id,
+                self._worker_id,
+                "skill control channel requested opaque Workflow HITL",
+            )
+            self._log(
+                "skill.control.auth_barrier_claimed",
+                {
+                    "fleetId": self._fleet_id,
+                    "workerId": self._worker_id,
+                    **dict(claim),
+                },
+            )
+            if not claim.get("claimed"):
+                raise RuntimeError(
+                    "fleet_auth_gated: another worker owns HITL recovery"
+                )
         return await self.call("Hitl.requestPause", {
             "pageId": page_id, "reason": reason,
             "purpose": "pause page so the challenge can be cleared (human/VL)",
@@ -266,18 +338,9 @@ def make_challenge_poller(
     match = boundary["match"]
 
     async def poll(control: "ControlChannel", page_id: str) -> Optional[Dict[str, Any]]:
-        try:
-            resp = await control.call("Runtime.evaluate", {
-                "pageId": page_id, "returnByValue": True, "expression": expression,
-                "purpose": "active in-page challenge poll (2nd connection) mirroring the skill's challengeFlag detection",
-            })
-        except Exception:
-            return None
-        data = ((resp or {}).get("data") or {})
-        value = data.get(result_key) if isinstance(data, dict) else None
-        if _flag_matches(value, match):
-            return {"kind": "challenge_in_page", "flag": flag, "value": value,
-                    "pageId": page_id}
+        # Hidden page-world JavaScript is forbidden. Notification and fresh
+        # AXTree challenge detection remain the authoritative control signals.
+        _ = (control, page_id, expression, result_key, flag, match)
         return None
 
     return poll
@@ -409,100 +472,89 @@ async def resolve_via_hitl(
 # / unknown short-circuit to the human path (enforced in vl._finalize_captcha_solve).
 
 
-def _norm_to_css(point: Dict[str, Any], w: float, h: float) -> tuple[float, float]:
-    """Map a normalized 0-1000 grounding point to CSS px (qwen-VL convention:
-    css = norm/1000 * innerWidth; DPR/image-size independent)."""
-    return float(point.get("x", 0.0)) / 1000.0 * w, float(point.get("y", 0.0)) / 1000.0 * h
-
-
-def solve_plan_to_input_calls(
-    solve_plan: List[Dict[str, Any]],
-    page_id: str,
-    metrics: Dict[str, Any],
-    *,
-    purpose: str = "VL-driven CAPTCHA solve step",
-) -> List[tuple[str, Dict[str, Any]]]:
-    """Pure translation: normalized SolveSteps → ordered (method, params) Input
-    calls, using viewport metrics {w,h} to back-translate to CSS px."""
-    w, h = float(metrics.get("w") or 0.0), float(metrics.get("h") or 0.0)
-    calls: List[tuple[str, Dict[str, Any]]] = []
-    for step in solve_plan:
-        action = step.get("action")
-        if action == "drag":  # slider: source + relative offset
-            x, y = _norm_to_css(step["from"], w, h)
-            dx = float(step.get("dx", 0.0)) / 1000.0 * w
-            dy = float(step.get("dy", 0.0)) / 1000.0 * h
-            calls.append(("Input.drag", {"pageId": page_id, "x": x, "y": y,
-                                         "dx": dx, "dy": dy, "purpose": purpose}))
-        elif action == "drag_arc":  # rotate: source → destination
-            x, y = _norm_to_css(step["from"], w, h)
-            tx, ty = _norm_to_css(step["to"], w, h)
-            calls.append(("Input.drag", {"pageId": page_id, "x": x, "y": y,
-                                         "toX": tx, "toY": ty, "purpose": purpose}))
-        elif action == "click":  # grid / click_target
-            x, y = _norm_to_css(step["at"], w, h)
-            calls.append(("Input.click", {"pageId": page_id, "x": x, "y": y,
-                                          "clickCount": 1, "purpose": purpose}))
-        elif action == "type":  # text_ocr: focus then type
-            x, y = _norm_to_css(step["into"], w, h)
-            calls.append(("Input.click", {"pageId": page_id, "x": x, "y": y,
-                                          "clickCount": 1, "purpose": purpose}))
-            calls.append(("Input.type", {"pageId": page_id, "text": step.get("text", ""),
-                                         "clear": True, "delay": 40, "purpose": purpose}))
-    return calls
+# The translation and the bounded solve loop itself are transport-agnostic and
+# shared with the worker hot path (harness.tools.browser_tools.captcha_autosolve),
+# which runs the same ladder BEFORE any Hitl.requestPause. This module keeps only
+# the control-channel bindings (2nd connection, already-paused page).
 
 
 async def _default_metrics(control: "ControlChannel", page_id: str) -> Dict[str, Any]:
-    resp = await control.call("Runtime.evaluate", {
-        "pageId": page_id, "returnByValue": True,
-        "expression": "return {w: window.innerWidth, h: window.innerHeight};",
-        "purpose": "read viewport size to map VL normalized coords to CSS px",
+    resp = await control.call("Page.getState", {
+        "pageId": page_id,
+        "purpose": "read native viewport metrics for VL coordinate mapping",
     })
     data = ((resp or {}).get("data") or {})
-    if isinstance(data, dict) and ("w" in data or "h" in data):
-        return {"w": data.get("w") or 0, "h": data.get("h") or 0}
+    viewport = data.get("viewport") if isinstance(data, dict) else None
+    viewport = viewport if isinstance(viewport, dict) else {}
+    if isinstance(data, dict):
+        return {
+            "w": viewport.get("width") or data.get("viewportWidth") or 0,
+            "h": viewport.get("height") or data.get("viewportHeight") or 0,
+        }
     return {"w": 0, "h": 0}
 
 
 async def _default_safety(control: "ControlChannel", page_id: str, x: Any, y: Any) -> bool:
-    """elementFromPoint guard: refuse to act on consequential controls (login/pay/
-    submit/oauth) — VL hallucination must not click a sensitive button."""
-    if x is None or y is None:
-        return False
-    resp = await control.call("Runtime.evaluate", {
-        "pageId": page_id, "returnByValue": True,
-        "expression": (
-            f"var el=document.elementFromPoint({float(x)},{float(y)});"
-            "if(!el)return {ok:false};"
-            "var t=((el.innerText||el.value||el.getAttribute('aria-label')||'')+' '+(el.name||'')+' '+(el.id||'')).toLowerCase();"
-            "var bad=['log in','login','sign in','sign up','signup','subscribe','pay','purchase','checkout','continue with google','continue with apple','delete','confirm order'];"
-            "return {ok: !bad.some(function(s){return t.indexOf(s)>=0;}), tag: el.tagName};"
-        ),
-        "purpose": "safety-check the VL target point before acting (avoid sensitive controls)",
-    })
-    data = ((resp or {}).get("data") or {})
-    return bool(isinstance(data, dict) and data.get("ok"))
+    """Live element guard before any VL-proposed action.
+
+    Reads the WHOLE elementsFromPoint stack (topmost + ancestors) and delegates the
+    verdict to the shared `captcha_point_is_safe` block-list, so this path and the
+    worker hot path cannot drift apart again: a transparent node over a "Sign in"
+    button must not pass, while a puzzle inside a login dialog still may.
+
+    ABCP currently exposes no native hit-test operation on this connection, so
+    the gate fails CLOSED (no action). Runtime.evaluate is not used to emulate
+    one because it would enter page execution space and weaken risk controls."""
+    # Without a native hit-test API, fail closed instead of evaluating page JS.
+    _ = (control, page_id, x, y)
+    return False
 
 
-async def _default_verify(control: "ControlChannel", page_id: str, vl_config: Any) -> bool:
-    """L0 authority check: the challenge is gone iff Page.getState url/title no
-    longer reads as a challenge. (VL does not self-verify — doc §7.1 ladder.)
+async def _default_text_target_safety(control: "ControlChannel", page_id: str) -> bool:
+    """OCR guard: what has focus now is what will receive the typed answer, so it
+    must be a plain text box (shared allow-list) and never a credential field."""
+    # Focus safety cannot be proven natively on this control connection.
+    _ = (control, page_id)
+    return False
 
-    LIMITATION: this only catches NAVIGATION-level challenges (Cloudflare etc. that
-    change url/title). An IN-PAGE widget (a slider that mutates no url/title) reads as
-    "gone" by default here — i.e. this default is permissive for in-page challenges.
-    So an in-page solve MUST pass its own `verify_fn` (e.g. polling the widget text),
-    as the yue slider e2e does; the VL-solve loop's max_retries + the downstream
-    contract_verify (Role B) are the backstop if a misjudged `solvable` never cleared."""
+
+async def _default_verify(
+    control: "ControlChannel", page_id: str, vl_config: Any
+) -> Optional[bool]:
+    """Tri-state clearance check: True cleared, False still blocked, None unknown.
+
+    Two independent gates, mirroring the worker hot path: Page.getState url/title,
+    then a fresh AXTree run through the structural challenge detector (which is
+    what catches an in-page slider that mutates no url/title). An unreadable
+    Page.getState or an empty AXTree returns None — "the probes saw nothing" is
+    never clearance, because only a positive clear skips the human."""
+    from harness.challenge_detector import detect_structural_challenge_from_lines
     from harness.skill.pause import _is_challenge_url, _title_is_challenge
 
     resp = await control.call("Page.getState", {
         "pageId": page_id, "purpose": "confirm the challenge cleared after VL solve",
     })
     data = ((resp or {}).get("data") or {})
+    if not isinstance(data, dict) or not data:
+        return None
     url = str(data.get("url") or "")
     title = str(data.get("title") or "")
-    return not (_is_challenge_url(url) or _title_is_challenge(title))
+    if _is_challenge_url(url) or _title_is_challenge(title):
+        return False
+
+    tree = await control.call("DOM.getAXTree", {
+        "pageId": page_id,
+        "purpose": "verify no embedded verification frame remains after the VL solve",
+    })
+    lines = ((tree or {}).get("data") or {})
+    lines = lines.get("lines") if isinstance(lines, dict) else None
+    if not isinstance(lines, list) or not lines:
+        return None  # cannot rule the frame out
+    if detect_structural_challenge_from_lines(
+        [str(line) for line in lines], source_method="DOM.getAXTree"
+    ):
+        return False
+    return True
 
 
 async def resolve_via_vl_then_hitl(
@@ -516,8 +568,9 @@ async def resolve_via_vl_then_hitl(
     metrics_fn: Callable[..., Awaitable[Dict[str, Any]]] = _default_metrics,
     safety_fn: Callable[..., Awaitable[bool]] = _default_safety,
     exec_fn: Optional[Callable[..., Awaitable[Any]]] = None,
-    verify_fn: Callable[..., Awaitable[bool]] = _default_verify,
+    verify_fn: Callable[..., Awaitable[Optional[bool]]] = _default_verify,
     max_retries: int = 2,
+    budget_seconds: float = 180.0,
     timeout_seconds: float = 1200.0,
     poll_interval_seconds: float = 2.0,
     logger: Any = None,
@@ -530,13 +583,29 @@ async def resolve_via_vl_then_hitl(
     I/O is injectable (screenshot/VL/metrics/safety/exec/verify) so the orchestration
     is unit-testable; defaults wire the live-verified Page/Input/Runtime primitives."""
     if vl_config is not None and getattr(vl_config, "enabled", False) and screenshot_fn is not None:
+        # Ownership before any pixel: driving a challenge mutates shared session
+        # state, so same-fleet workers must be serialized here exactly as they are
+        # on the worker hot path. Losing the claim means someone else owns
+        # recovery — go straight to the human path without touching the page.
+        claimed, claim_receipt = await _claim_barrier_for_vl_solve(control, page_id, logger)
+        if not claimed:
+            _log(logger, "skill.control.vl_solve_gated", {
+                "pageId": page_id, **claim_receipt,
+            })
+            return await resolve_via_hitl(
+                control, page_id, signal,
+                timeout_seconds=timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+                logger=logger,
+            )
         try:
             resolved = await _vl_solve_loop(
                 control, page_id, vl_config,
                 captcha_solve_fn=captcha_solve_fn or _default_captcha_solve,
                 screenshot_fn=screenshot_fn, metrics_fn=metrics_fn,
                 safety_fn=safety_fn, exec_fn=exec_fn or _default_exec,
-                verify_fn=verify_fn, max_retries=max_retries, logger=logger,
+                verify_fn=verify_fn, max_retries=max_retries,
+                budget_seconds=budget_seconds, logger=logger,
             )
             if resolved:
                 return True
@@ -560,52 +629,79 @@ async def _vl_solve_loop(
     metrics_fn: Callable[..., Awaitable[Dict[str, Any]]],
     safety_fn: Callable[..., Awaitable[bool]],
     exec_fn: Callable[..., Awaitable[Any]],
-    verify_fn: Callable[..., Awaitable[bool]],
+    verify_fn: Callable[..., Awaitable[Optional[bool]]],
     max_retries: int,
     logger: Any,
+    budget_seconds: float = 0.0,
+    text_target_safety_fn: Callable[..., Awaitable[bool]] = _default_text_target_safety,
 ) -> bool:
-    metrics = await metrics_fn(control, page_id)
-    for attempt in range(max(1, int(max_retries))):
-        shot = await screenshot_fn(control, page_id)
-        if not shot:
-            _log(logger, "skill.control.vl_no_screenshot", {"pageId": page_id})
-            return False
-        vl = await captcha_solve_fn(vl_config, shot)
-        verdict = str(vl.get("verdict") or "uncertain")
-        _log(logger, "skill.control.vl_verdict", {
-            "pageId": page_id, "attempt": attempt, "verdict": verdict,
-            "challenge_category": vl.get("challenge_category"),
-            "challenge_type": vl.get("challenge_type"),
-            "steps": len(vl.get("solve_plan") or []),
-        })
-        if verdict == "not_a_challenge":
-            return True  # misdetection — page is fine, let the workflow continue
-        plan = vl.get("solve_plan") or []
-        if verdict != "solvable" or not plan:
-            return False  # behavioral / unsolvable / uncertain → human path
-        calls = solve_plan_to_input_calls(plan, page_id, metrics)
-        aborted = False
-        for method, params in calls:
-            # Only coordinate-bearing calls go through elementFromPoint safety. A
-            # coordinate-less Input.type (text_ocr: focus-then-type) follows an
-            # already-safety-checked Input.click; gating it on its absent x/y would
-            # make _default_safety reject it and abort the whole solve.
-            has_coords = params.get("x") is not None and params.get("y") is not None
-            if has_coords and not await safety_fn(control, page_id, params.get("x"), params.get("y")):
-                _log(logger, "skill.control.vl_unsafe_point",
-                     {"pageId": page_id, "x": params.get("x"), "y": params.get("y")})
-                aborted = True
-                break
-            await exec_fn(control, method, params)
-        if aborted:
-            return False  # a sensitive control was in the way → human path
-        if await verify_fn(control, page_id, vl_config):
-            await control.signal_resumed(page_id)  # emit Hitl.resumed → workflow listen continues
-            _log(logger, "skill.control.vl_solved", {"pageId": page_id, "attempt": attempt})
-            return True
-        # not gone → retry (slider micro-adjust / next grid pass)
-    _log(logger, "skill.control.vl_exhausted", {"pageId": page_id, "retries": max_retries})
-    return False
+    """Control-channel binding of the shared Role C loop (harness.vl.captcha).
+
+    The engine owns the ladder and the budget; this wrapper only binds the
+    2nd-connection I/O and adds the control-channel-specific success action:
+    emitting `Hitl.resumed` so the blocked workflow's `listen` continues."""
+
+    async def guarded_exec(method: str, params: Dict[str, Any]) -> Any:
+        if method == "Input.type" and not await text_target_safety_fn(control, page_id):
+            raise RuntimeError(
+                "refusing to type an OCR answer: the focused element is not a"
+                " plain text box"
+            )
+        return await exec_fn(control, method, params)
+
+    receipt = await run_captcha_solve_loop(
+        page_id=page_id,
+        vl_config=vl_config,
+        screenshot_fn=lambda: screenshot_fn(control, page_id),
+        captcha_solve_fn=captcha_solve_fn,
+        metrics_fn=lambda: metrics_fn(control, page_id),
+        safety_fn=lambda x, y: safety_fn(control, page_id, x, y),
+        exec_fn=guarded_exec,
+        verify_fn=lambda: verify_fn(control, page_id, vl_config),
+        max_attempts=max_retries,
+        budget_seconds=budget_seconds,
+        min_confidence=float(getattr(vl_config, "captcha_solve_min_confidence", 0.0) or 0.0),
+        min_confidence_ocr=float(
+            getattr(vl_config, "captcha_solve_min_confidence_ocr", 0.0) or 0.0
+        ),
+        logger=logger,
+        log_prefix="skill.control",
+    )
+    status = str(receipt.get("status") or "")
+    if status == captcha.NOT_A_CHALLENGE:
+        return True  # misdetection — page is fine, let the workflow continue
+    if status == captcha.SOLVED:
+        await control.signal_resumed(page_id)  # emit Hitl.resumed → workflow listen continues
+        return True
+    return False  # behavioral / unsafe / exhausted / error → human path
+
+
+async def _claim_barrier_for_vl_solve(
+    control: "ControlChannel",
+    page_id: str,
+    logger: Any,
+) -> tuple[bool, Dict[str, Any]]:
+    """Claim the fleet auth barrier before a VL solve touches the page.
+
+    Mirrors the worker hot path: the same claim the human path makes, taken
+    earlier, so two same-fleet workers can never drive one challenge. Claiming is
+    idempotent for the owner, so the HITL fall-through inherits this ownership."""
+    barrier = getattr(control, "_fleet_auth_barrier", None)
+    fleet_id = str(getattr(control, "_fleet_id", "") or "").strip()
+    worker_id = str(getattr(control, "_worker_id", "") or "").strip()
+    if barrier is None or not fleet_id or not worker_id:
+        return True, {"enabled": False}
+    claim = await barrier.claim(
+        fleet_id, worker_id, f"VL captcha auto-solve on {page_id}"
+    )
+    return bool(claim.get("claimed")), {
+        "enabled": True,
+        "fleetId": fleet_id,
+        "workerId": worker_id,
+        "claimed": bool(claim.get("claimed")),
+        "resolverWorkerId": claim.get("resolverWorkerId"),
+        "generation": claim.get("generation"),
+    }
 
 
 async def _default_captcha_solve(vl_config: Any, image_path: str) -> Dict[str, Any]:
@@ -621,6 +717,7 @@ async def _default_screenshot(control: "ControlChannel", page_id: str) -> Option
     helper reads directly. Returns the path or None."""
     resp = await control.call("Page.screenshot", {
         "pageId": page_id, "fullPage": False,
+        "options": {"format": "file"},
         "purpose": "capture the challenge for VL captcha_solve",
     })
     data = ((resp or {}).get("data") or {})

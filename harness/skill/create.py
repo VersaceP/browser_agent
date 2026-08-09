@@ -57,6 +57,7 @@ from harness.skill.registry import (
     validate_row_contract,
 )
 from harness.skill.structured_output import validate_structured_output_workflow
+from harness.task_types import resolve_task_type_fail_closed
 from harness.skill.workflow import (
     check_persisted_contract,
     check_success_contract,
@@ -179,252 +180,6 @@ def _phase_url_pattern(phase: Dict[str, Any], field: str) -> str:
     return ""
 
 
-def _build_collection_structured_workflow(
-    events: List[Dict[str, Any]],
-    phase: Dict[str, Any],
-    *,
-    domain: str,
-    description: str,
-) -> Optional[Dict[str, Any]]:
-    """Distill validated collect_items evidence into an ordinary Workflow.
-
-    The workflow accumulates filtered candidates in a page global while it
-    scrolls, then JSON.stringify's them into one scalar workflow variable. The
-    harness later assigns DOM-order ranks and slices the current phase window.
-    No historical product URL or rank is frozen into the recipe.
-    """
-    expected = phase.get("expected_artifact")
-    expected = expected if isinstance(expected, dict) else {}
-    exact_rows = _expected_rows_of_phase(phase)
-    fields = [str(field) for field in expected.get("fields") or [] if str(field)]
-    rank_field = next(
-        (field for field in fields if canonical_field(field) == canonical_field("rank")),
-        "",
-    )
-    name_output_field = next(
-        (field for field in fields
-         if canonical_field(field) == canonical_field("productName")),
-        "",
-    )
-    url_output_field = next(
-        (field for field in fields
-         if canonical_field(field) == canonical_field("productUrl")),
-        "",
-    )
-    if not exact_rows or not rank_field or not name_output_field or not url_output_field:
-        return None
-    rank_window = _rank_window_from_phase(phase, rank_field)
-    if rank_window is None or rank_window[1] - rank_window[0] + 1 != exact_rows:
-        return None
-
-    collect_runs = _successful_model_tool_runs(events, "collect_items")
-    record_runs = _successful_model_tool_runs(events, "record_extraction")
-    if not collect_runs or not record_runs:
-        return None
-    artifact_name = str(expected.get("name") or "")
-    final_pair = next((
-        (item, result) for item, result in reversed(record_runs)
-        if isinstance(item.get("rows"), list)
-        and len(item["rows"]) == exact_rows
-        and int(result.get("rowCount") or 0) == exact_rows
-        and (not artifact_name or str(item.get("name") or "") == artifact_name)
-        and (not artifact_name or str(result.get("name") or "") == artifact_name)
-        and isinstance(result.get("artifactValidation"), dict)
-        and str(result["artifactValidation"].get("status") or "") == "done"
-    ), None)
-    if final_pair is None:
-        return None
-    final, _final_result = final_pair
-    final_rows = [row for row in final.get("rows") or [] if isinstance(row, dict)]
-    if len(final_rows) != exact_rows:
-        return None
-
-    try:
-        final_ranks = [int(row.get(rank_field)) for row in final_rows]
-    except (TypeError, ValueError):
-        return None
-    if final_ranks != list(range(rank_window[0], rank_window[1] + 1)):
-        return None
-
-    collect_pair = next((
-        (item, result) for item, result in reversed(collect_runs)
-        if int(result.get("rowCount") or 0) >= rank_window[1]
-        and (
-            not str(result.get("selector") or "")
-            or str(result.get("selector") or "") == str(item.get("selector") or "")
-        )
-        and (
-            not str(result.get("mode") or "")
-            or str(result.get("mode") or "") == str(item.get("mode") or result.get("mode") or "")
-        )
-    ), None)
-    if collect_pair is None:
-        return None
-    collect, _collect_result = collect_pair
-    selector = str(collect.get("selector") or "").strip()
-    raw_fields = collect.get("fields")
-    raw_fields = raw_fields if isinstance(raw_fields, dict) else {}
-    name_field = next((
-        str(name) for name, spec in raw_fields.items()
-        if str(spec) in {"text", "textContent", "imgAlt"}
-        and canonical_field(str(name)) == canonical_field("productName")
-    ), "")
-    url_field = next((
-        str(name) for name, spec in raw_fields.items()
-        if str(spec) == "href"
-        and canonical_field(str(name)) in {
-            canonical_field("productUrl"), canonical_field("detailUrl")
-        }
-    ), "")
-    if not selector or not name_field or not url_field:
-        return None
-    if any(not str(row.get(name_field) or row.get("productName") or "").strip()
-           for row in final_rows):
-        return None
-    final_urls = [
-        str(row.get(url_field) or row.get("productUrl") or row.get("detailUrl") or "").strip()
-        for row in final_rows
-    ]
-    if any(not value.startswith("http") for value in final_urls):
-        return None
-    query_must_be_empty = all("?" not in value and "#" not in value for value in final_urls)
-    exact_ai_path = all(
-        re.match(r"^https?://[^/?#]+/ai/[^/?#]+/?$", value) is not None
-        for value in final_urls
-    )
-    url_pattern = _phase_url_pattern(phase, url_field)
-    target_url = _first_phase_url(phase)
-    if not target_url:
-        return None
-
-    selector_js = json.dumps(selector)
-    domain_js = json.dumps(domain)
-    pattern_js = json.dumps(url_pattern)
-    name_output_js = json.dumps(name_output_field)
-    url_output_js = json.dumps(url_output_field)
-    query_guard = "if (u.search || u.hash) continue;" if query_must_be_empty else ""
-    path_guard = (
-        "if (!/^\\/ai\\/[^/]+\\/?$/.test(u.pathname)) continue;"
-        if exact_ai_path else ""
-    )
-    init_expression = (
-        "window.__abcpSkillCollection={seen:{},rows:[]};"
-        "return {ready:'yes'};"
-    )
-    probe_expression = rf"""
-const selector={selector_js};
-const expectedHost={domain_js};
-const pattern={pattern_js};
-const state=window.__abcpSkillCollection||{{seen:{{}},rows:[]}};
-for (const anchor of Array.from(document.querySelectorAll(selector))) {{
-  let u; try {{ u=new URL(anchor.href||anchor.getAttribute('href')||'', location.href); }} catch (_) {{ continue; }}
-  if (expectedHost && u.hostname.replace(/^www\./,'') !== expectedHost.replace(/^www\./,'')) continue;
-  if (pattern) {{ try {{ if (!(new RegExp(pattern)).test(u.href)) continue; }} catch (_) {{ continue; }} }}
-  {query_guard}
-  {path_guard}
-  const productUrl=u.origin+u.pathname;
-  const productName=String(anchor.textContent||'').replace(/\s+/g,' ').trim();
-  if (!productName || state.seen[productUrl]) continue;
-  const row={{}}; row[{name_output_js}]=productName; row[{url_output_js}]=productUrl;
-  state.seen[productUrl]=true; state.rows.push(row);
-}}
-window.__abcpSkillCollection=state;
-return {{candidateCount:state.rows.length}};
-""".strip()
-    finalize_expression = """
-const state=window.__abcpSkillCollection||{rows:[]};
-return {structuredRowsJson:JSON.stringify({rows:state.rows}),candidateCount:state.rows.length};
-""".strip()
-    try:
-        max_iterations = int(collect.get("maxRounds") or 25)
-    except (TypeError, ValueError):
-        max_iterations = 25
-    max_iterations = max(1, min(50, max_iterations))
-    structured_fields = list(dict.fromkeys(
-        [rank_field, name_output_field, url_output_field]
-    ))
-    return {
-        "description": description,
-        "variables": {
-            "targetUrl": target_url,
-            "minRank": rank_window[0],
-            "maxRank": rank_window[1],
-            "expectedRows": exact_rows,
-        },
-        "errorConfig": {"onError": "stop", "maxRetries": 1},
-        "structured_output": {
-            "version": 1,
-            "transport": "json_variable",
-            "variable": "structuredRowsJson",
-            "fields": structured_fields,
-            "rank": {"field": rank_field, "source": "dom_order", "base": 1},
-            "window": {"source": "phase_validator", "field": rank_field, "inclusive": True},
-            "runtime_variables": {
-                "target_url": "targetUrl",
-                "rank_min": "minRank",
-                "rank_max": "maxRank",
-                "expected_rows": "expectedRows",
-            },
-            "source_selector": (
-                f"{selector} filtered to unique query-free URLs matching {url_pattern or domain}"
-            ),
-        },
-        "steps": [
-            {"action": "Page.navigate", "params": {"url": "$vars.targetUrl"},
-             "onError": "continue",
-             "purpose": (
-                 "Start navigation to the ranked collection page; heavy pages may "
-                 "time out at the call boundary, so Page.loaded settles below."
-             )},
-            {"type": "listen", "event": "Page.loaded", "timeout": 15000,
-             "onTimeout": "continue"},
-            {"action": "Input.press", "params": {"key": "Escape"},
-             "onError": "continue",
-             "purpose": "Dismiss the observed non-auth overlay without submitting anything."},
-            {"action": "Page.getState", "extract": {
-                 "pageUrl": "url", "pageTitle": "title", "pageStatus": "status",
-             },
-             "purpose": "Bind structured collection output to the actual page."},
-            {"action": "Runtime.evaluate", "params": {
-                 "expression": init_expression, "returnByValue": True,
-             },
-             "extract": {"collectionInitReady": "ready"},
-             "purpose": "Initialize the page-local unique collection accumulator."},
-            {"action": "Runtime.evaluate", "params": {
-                 "expression": probe_expression, "returnByValue": True,
-             },
-             "extract": {"collectionCandidateCount": "candidateCount"},
-             "purpose": "Harvest currently materialized clean product links in DOM order."},
-            {"type": "loop", "maxIterations": max_iterations,
-             "condition": {"path": "$vars.collectionCandidateCount", "operator": "lt",
-                           "value": "$vars.maxRank"},
-             "body": [
-                 {"action": "Input.scroll", "params": {"direction": "down", "amount": 1200},
-                  "purpose": "Materialize more ranked collection items."},
-                 {"action": "Runtime.evaluate", "params": {
-                      "expression": probe_expression, "returnByValue": True,
-                  },
-                  "extract": {"collectionCandidateCount": "candidateCount"},
-                  "purpose": "Merge newly materialized clean product links into the accumulator."},
-             ]},
-            {"action": "Runtime.evaluate", "params": {
-                 "expression": finalize_expression, "returnByValue": True,
-             },
-             "extract": {"structuredRowsJson": "structuredRowsJson",
-                         "collectionCandidateCount": "candidateCount"},
-             "purpose": "Serialize accumulated candidates into a scalar JSON workflow variable."},
-            {"action": "Page.getState", "extract": {
-                 "pageUrl": "url", "pageTitle": "title", "pageStatus": "status",
-             },
-             "purpose": "Reconfirm page identity after producing structured output."},
-        ],
-    }
-
-
-# ---------------------------------------------------------------------------
-# distillation + trace selection
-# ---------------------------------------------------------------------------
-
 def _distill_candidates(
     traces: List[Path],
     validated: Dict[str, Dict[str, str]],
@@ -513,7 +268,10 @@ def recheck_source_context(skill: Skill) -> Dict[str, Any]:
         "phase_id": phase_id,
         "phase": phase,
         "expected_rows": _expected_rows_of_phase(phase),
-        "task_type": str(plan.get("task_type") or phase.get("task_type") or ""),
+        # Phase-only: plan.task_type is audit classification and must never be
+        # inherited as the source worker policy. Missing phase provenance stays
+        # visibly empty so the recheck can classify it as inconclusive.
+        "task_type": str(phase.get("task_type") or ""),
         "goal": str(plan.get("goal") or ""),
     }
 
@@ -1221,10 +979,25 @@ async def trial_workflow_live(
     ws_config: Any = None,
     client: Any = None,
     agent_id: str = "skill-create-trial",
+    workflow_runtime: Any = None,
 ) -> Dict[str, Any]:
     """Run the draft workflow live for each instance row on ONE warm tab.
     Returns {"attempted": bool, "runs": [{"variables", "result"}], "error"?}."""
     from harness.skill.workflow import run_skill_workflow
+    from harness.workflow_runtime import (
+        workflow_execution_disabled_result,
+        workflow_execution_enabled,
+    )
+
+    if not workflow_execution_enabled(workflow_runtime):
+        return {
+            **workflow_execution_disabled_result(
+                source="skill_create_live_trial",
+            ),
+            "attempted": False,
+            "runs": [],
+            "status": "inconclusive",
+        }
 
     stub = _stub_skill("skill-create-trial", workflow, {})
     own_client = False
@@ -1248,6 +1021,7 @@ async def trial_workflow_live(
         for variables in rows:
             result = await run_skill_workflow(
                 client, stub, page_id=page_id, fleet_id=fleet_id, variables=dict(variables),
+                workflow_runtime=workflow_runtime,
             )
             runs.append({"variables": dict(variables), "result": result})
         return {"attempted": True, "runs": runs}
@@ -1289,7 +1063,9 @@ def _evaluate_trial(
         "attempted": bool(trial.get("attempted")),
         "tested": tested,
         "results": results,
-        "error": trial.get("error"),
+        "classification": str(trial.get("classification") or ""),
+        "reason": str(trial.get("reason") or ""),
+        "error": trial.get("error") or trial.get("reason"),
     }
 
 
@@ -1454,12 +1230,29 @@ async def recheck_skill_live(
     ws_config: Any = None,
     client: Any = None,
     agent_id: str = "skill-recheck-live",
+    workflow_runtime: Any = None,
 ) -> Dict[str, Any]:
     """Run a real canary against the generation source phase.
 
     The function never writes health; the CLI owns that policy after classifying
     this result as passed, failed, or inconclusive.
     """
+    from harness.workflow_runtime import (
+        workflow_execution_disabled_result,
+        workflow_execution_enabled,
+    )
+
+    if not workflow_execution_enabled(workflow_runtime):
+        disabled = workflow_execution_disabled_result(
+            source="skill_recheck_live",
+        )
+        return {
+            **disabled,
+            "status": "inconclusive",
+            "attempted": False,
+            "reason": str(disabled.get("reason") or ""),
+        }
+
     phase = source_context.get("phase")
     phase = phase if isinstance(phase, dict) else {}
     if not source_context.get("source_exists") or not phase:
@@ -1502,6 +1295,7 @@ async def recheck_skill_live(
             result = await run_skill_workflow(
                 client, skill, page_id=page_id, fleet_id=fleet_id,
                 variables=variables,
+                workflow_runtime=workflow_runtime,
             )
             result_variables = result.get("variables")
             result_variables = (
@@ -1614,6 +1408,7 @@ async def recheck_skill_live(
         trial = await trial_workflow_live(
             skill.workflow, rows, client=client, ws_config=ws_config,
             agent_id=agent_id,
+            workflow_runtime=workflow_runtime,
         )
         runs = [run for run in (trial.get("runs") or []) if isinstance(run, dict)]
         if not trial.get("attempted") or not runs:
@@ -1933,7 +1728,7 @@ def create_skill_from_task(
     best = candidates[0]
 
     phase = _phase_of(plan, best["phase_id"])
-    task_type = str(plan.get("task_type") or "general")
+    task_type = resolve_task_type_fail_closed(phase.get("task_type"))
     stage_hint = str(phase.get("stage_hint") or "")
     expected_raw = phase.get("expected_artifact")
     expected = expected_raw if isinstance(expected_raw, dict) else {}
@@ -1953,15 +1748,22 @@ def create_skill_from_task(
         "errorConfig": {"onError": "stop", "maxRetries": 1},
         "steps": best["steps"],
     }
-    if stage_hint == "collection" and (_expected_rows_of_phase(phase) or 0) > 1:
-        collection_workflow = _build_collection_structured_workflow(
-            _read_jsonl(best["trace"]),
-            phase,
-            domain=domain,
-            description=workflow_description,
-        )
-        if collection_workflow is not None:
-            workflow = collection_workflow
+    def contains_runtime(value: Any) -> bool:
+        if isinstance(value, dict):
+            if str(value.get("action") or "") == "Runtime.evaluate":
+                return True
+            return any(contains_runtime(item) for item in value.values())
+        if isinstance(value, list):
+            return any(contains_runtime(item) for item in value)
+        return False
+
+    if contains_runtime(workflow.get("steps")):
+        return {
+            "status": "error",
+            "messages": [
+                "蒸馏 trace 包含 Runtime.evaluate；请先迁移为原生批量 DOM 工具再创建 skill。"
+            ],
+        }
     if not _is_structurally_valid(workflow):
         return {"status": "error",
                 "messages": ["蒸馏结果未过结构校验（steps 缺 action），不落盘"],
@@ -2491,7 +2293,7 @@ def create_guidance_skill_from_task(
                              "（无 URL/选择器/负知识/遮罩记录），未生成任何文件"]}
 
     phase = _phase_of(plan, best["phase_id"])
-    task_type = str(plan.get("task_type") or "general")
+    task_type = resolve_task_type_fail_closed(phase.get("task_type"))
     stage_hint = str(phase.get("stage_hint") or "")
     expected_raw = phase.get("expected_artifact")
     expected = expected_raw if isinstance(expected_raw, dict) else {}
@@ -2686,6 +2488,15 @@ def _trial_messages(trial_summary: Optional[Dict[str, Any]]) -> List[str]:
     if not trial_summary:
         return []
     if not trial_summary.get("attempted"):
+        if (
+            str(trial_summary.get("classification") or "")
+            == "workflow_runtime_disabled"
+        ):
+            return [
+                "试运行: Workflow 执行被运行时开关关闭"
+                "（harness.workflow_execution_enabled=false），本次未做 live"
+                " 试运行，skill 保持未验证状态"
+            ]
         return ["试运行: 未能执行"
                 + (f"（{trial_summary.get('error')}）" if trial_summary.get("error") else "")]
     lines = []

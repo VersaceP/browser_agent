@@ -1,11 +1,13 @@
 """harness.skill.guidance — skill 的 hints（指导）层。
 
-一个 skill 有两个可各自缺席的层（07-07 定案，"层不是类"）：
-  workflow  冻结的 Workflow.execute 步骤 = 快路径（harness.skill.workflow）
-  hints     给 LLM 慢路径的建议性页面知识 = 本模块
+一个 skill 是分层载体而非二选一类型：
+  workflow       冻结的 ABCP-native 步骤（受 Workflow 总开关保护）
+  orchestration  native segments 与 Harness composite host steps 的混合计划
+  hints          给 LLM 慢路径的建议性页面知识 = 本模块
 
 目录里没有 workflow.json 的 skill 是 *hints-only*（guidance）skill：它从不碰
-workflow 引擎；价值全在 SKILL.md 的 `## 页面知识（hints）` 小节，由
+workflow 引擎；当 Workflow 总开关关闭时，带 workflow.json 的 skill 同样只披露
+guidance。价值全在 SKILL.md 的 `## 页面知识（hints）` 小节，由
 harness.skill.contract.selected_skill_context 注进 worker 上下文。hints 是
 **待验证假设而非事实**：注入协议（guidance_protocol_text）要求 agent 先探针
 锚点、失配即整段弃用转自由探索——这是对锚定偏差（被过期 hints 预热后硬凑
@@ -129,22 +131,12 @@ def guidance_protocol_text() -> str:
 # ---------------------------------------------------------------------------
 
 _TITLE_RE = re.compile(r'title="([^"]{1,120})"')
-# Runtime.evaluate 表达式里的 CSS 选择器（querySelector 调用 / selector = "..."）。
-# JS 字符串里常见转义引号（如 [href^=\"https://...\"]，真 trace 实测形态），
-# 允许 \x 转义序列并在提取后还原。
-_JS_QUERY_RE = re.compile(r"querySelector(?:All)?\(\s*[\"']((?:[^\"'\\]|\\.){2,200})[\"']")
-_JS_SELECTOR_VAR_RE = re.compile(r"selector\s*=\s*[\"']((?:[^\"'\\]|\\.){2,200})[\"']")
-
 # model 事件文本里"关于选择器/过滤/排名"的判断才留（确定性关键词门，滤掉闲聊）。
 # 这些正是探索期最烧步数、成功 trace 步骤序列里不含的判断（发现 1）。
 _JUDGMENT_KEYWORDS = (
-    "selector", "/comment/", "filter", "过滤", "排名", "rank order", "DOM order",
-    "DOM 顺序", "noise", "噪音", "free.theresanaiforthat", "matched", "exclud",
+    "selector", "filter", "过滤", "ordering", "order", "顺序",
+    "noise", "噪音", "matched", "exclud", "binding", "定位",
 )
-
-
-def _unescape_js_selector(sel: str) -> str:
-    return sel.replace('\\"', '"').replace("\\'", "'")
 
 
 def _is_failure(ev: Dict[str, Any]) -> bool:
@@ -175,7 +167,7 @@ def distill_guidance_from_trace(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     selectors: List[Dict[str, str]] = []
     negative: List[str] = []
     overlay: List[str] = []
-    recipes: List[Dict[str, Any]] = []       # collect_items / 非过宽 extract_dom_records 的已证采集配方
+    recipes: List[Dict[str, Any]] = []       # collect_items 的已证采集配方
     broad_selectors: List[Dict[str, Any]] = []  # matched >> rows：只作存在性探针，非抽取规则
     outcomes: List[Dict[str, Any]] = []      # record_extraction 落盘产出
     judgments: List[str] = []                # model 关于选择器/过滤/排名的关键判断（原文摘录）
@@ -210,26 +202,6 @@ def distill_guidance_from_trace(events: List[Dict[str, Any]]) -> Dict[str, Any]:
                                 "rowCount": res.get("rowCount"),
                                 "mode": res.get("mode"),
                                 "stopReason": res.get("stopReason")})
-            continue
-        if etype == "extract_dom_records":
-            res = ev.get("result") or {}
-            sel = str(res.get("selector") or "").strip()
-            matched, rows = res.get("matchedCount"), res.get("rowCount")
-            if sel:
-                too_broad = False
-                try:
-                    too_broad = bool(matched and rows and int(matched) >= int(rows) * 2)
-                except (TypeError, ValueError):
-                    too_broad = False
-                if too_broad:
-                    broad_selectors.append({"selector": sel, "matchedCount": matched,
-                                            "rowCount": rows})
-                else:
-                    key = ("extract", sel)
-                    if key not in seen_recipe:
-                        seen_recipe.add(key)
-                        recipes.append({"tool": "extract_dom_records", "selector": sel,
-                                        "rowCount": rows, "mode": None, "stopReason": None})
             continue
         if etype == "record_extraction":
             res = ev.get("result") or {}
@@ -284,12 +256,6 @@ def distill_guidance_from_trace(events: List[Dict[str, Any]]) -> Dict[str, Any]:
             scroll_count += 1
             scroll_sample = {k: v for k, v in params.items()
                             if k not in ("pageId", "fleetId", "purpose")}
-        elif method == "Runtime.evaluate":
-            expr = str(params.get("expression") or "")
-            for regex in (_JS_QUERY_RE, _JS_SELECTOR_VAR_RE):
-                for sel in regex.findall(expr):
-                    _add_selector(_unescape_js_selector(sel), method, purpose)
-
         _add_selector(params.get("selector"), method, purpose)
 
     return {
@@ -329,8 +295,7 @@ def render_hints_markdown(knowledge: Dict[str, Any], *, provenance: str = "") ->
         title = (knowledge.get("titles") or [None])[0]
         lines.append(f"- 入口: {url}" + (f"（实测标题 \"{title}\"）" if title else ""))
 
-    # 采集配方（发现 1）：collect_items / 非过宽 extract_dom_records 是**已证**能抽
-    # 出行的选择器 —— 比裸 querySelector 可信，优先当锚点探针。
+    # 采集配方（发现 1）：collect_items 是已证能抽出行的选择器。
     recipes = list(knowledge.get("recipes") or [])
     selectors = list(knowledge.get("selectors") or [])
     anchor_sel = ""

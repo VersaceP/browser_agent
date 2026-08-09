@@ -1,4 +1,4 @@
-"""Pure helpers for multi-row output from ordinary workflow skills.
+"""Legacy pure helpers for decoding historical structured workflow output.
 
 ``Workflow.execute`` variables are scalar, so a normal workflow can return a
 collection without introducing another skill execution mode: its final
@@ -17,10 +17,10 @@ string into a declared workflow variable.  The optional declaration lives in
       }
     }
 
-The JSON string may encode either a row array or ``{"rows": [...]}``.  This
-module only decodes and normalizes it; callers remain responsible for field
-alignment, provenance enrichment, persistence, success-contract checks, and
-the authoritative phase validators.
+The JSON string may encode either a row array or ``{"rows": [...]}``. Frozen
+workflows now reject ``Runtime.evaluate``, so no supported workflow can produce
+this transport. The pure decoders remain for migration/inspection, but registry
+and authoring validation reject new ``structured_output`` declarations.
 """
 from __future__ import annotations
 
@@ -144,26 +144,18 @@ def validate_structured_output_workflow(
     raw: Any,
     workflow: Any,
 ) -> Tuple[bool, List[str]]:
-    """Validate the contract plus its workflow-output cross-reference.
-
-    The one-argument validator intentionally has no registry dependency.  Skill
-    loading/recheck, which also has ``workflow.json``, should use this stronger
-    helper so a typo cannot survive until the first live run.
-    """
+    """Reject the legacy json-variable transport in executable workflows."""
 
     valid, failures = validate_structured_output_contract(raw)
     failures = list(failures)
     if raw is None or not valid:
         return not failures, failures
-    if not isinstance(workflow, Mapping):
-        return False, failures + ["structured_output workflow must be an object"]
-    variable = str(raw["variable"])
-    produced = _workflow_output_variables(workflow.get("steps"))
-    if variable not in produced:
-        failures.append(
-            f"structured_output.variable is not produced by a workflow step: {variable}"
-        )
-    return not failures, failures
+    _ = workflow
+    return False, [
+        *failures,
+        "structured_output is unsupported: frozen workflows forbid "
+        "Runtime.evaluate and no native workflow action produces this JSON transport",
+    ]
 
 
 def parse_structured_output_json(value: Any) -> Tuple[Any, List[str]]:

@@ -42,6 +42,11 @@ def distill_trace_to_workflow(
     if not steps:
         return None
     steps = harden_navigation_lifecycle(steps)
+    if any(
+        str(step.get("action") or "") == "Runtime.evaluate"
+        for step in _walk_steps(steps)
+    ):
+        return None
     # Prefer the live skill's variable template (preserves passthrough vars like
     # rank/productName); fall back to what the distiller inferred.
     template = dict(base_skill.variable_template) or (variables or {"detailUrl": ""})
@@ -51,6 +56,21 @@ def distill_trace_to_workflow(
         "errorConfig": base_skill.error_config or {"onError": "stop", "maxRetries": 1},
         "steps": steps,
     }
+
+
+def _walk_steps(steps: List[Any]) -> List[Dict[str, Any]]:
+    found: List[Dict[str, Any]] = []
+    pending = list(steps)
+    while pending:
+        step = pending.pop()
+        if not isinstance(step, dict):
+            continue
+        found.append(step)
+        for key in ("then", "else", "body"):
+            nested = step.get(key)
+            if isinstance(nested, list):
+                pending.extend(nested)
+    return found
 
 
 def is_degraded(skill: Skill, health: Any) -> bool:
@@ -109,7 +129,7 @@ async def maybe_autoheal_from_trace(
             browser=agent.browser,
             canary_variables=canary_variables,
             health=health,
-            page_id=page_id, fleet_id=fleet_id,
+            page_id=page_id, fleet_id=fleet_id, agent=agent,
         )
     except Exception as exc:  # canary/promote must never break the worker
         _log(agent, "skill.autoheal.error", {"skill": skill.skill_id, "error": str(exc)})
