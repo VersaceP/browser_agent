@@ -138,6 +138,7 @@ Anthropic 示例：
     "max_browser_agents": 3,
     "fleet_reuse_enabled": true,
     "same_fleet_multiworker_enabled": false,
+    "max_task_fleets": 3,
     "fleet_auth_barrier_enabled": true,
     "fleet_auth_barrier_wait_seconds": 120,
     "auth_fleet_ledger_path": ".auth_fleet_ledger.json",
@@ -158,6 +159,7 @@ Anthropic 示例：
 - `max_browser_agents`: 同时运行的 browser worker 上限；实际 browser slot 并发仍受 `max_browser_agent_instances` 限制。
 - `fleet_reuse_enabled`: 由协调器为 worker 确定性分配 fleet，并将无 fleetId 的 `Page.create` 收敛到该分配。具名/隔离 fleet 不会进入通用复用池。
 - `same_fleet_multiworker_enabled`: 多 slot 共享 task/session fleet 的灰度开关，默认 `false`；启用后各 worker 使用独立 page，owner 连接保持不变，通知由 harness 中继，同 page 调用串行化。
+- `max_task_fleets`: 单个任务最多占用的 fleet（浏览器实例）数，`0` 表示不限。harness 不会主动关闭 fleet，所以开出来的 fleet 会一直占着额度，直到平台的权威库存不再报告它——从 owner 库存消失的 fleet 会把额度释放回去。计数只统计绑定到本任务 worker 的 fleet，不看 Agent 全局的 `Fleet.list`。任务显式指定的 fleet（`--fleet-id` 固定实例、`worker_contract.fleet_id`、已绑定的 `session_key`、`reuse_from_worker_id`）永远照用不被拦截，但同样计入总数。到达上限后，没指定 fleet 的 worker 自动复用本任务已有的 fleet（优先挑没有在跑的 worker 占着的那个），`worker_session_isolation_enabled` 的默认隔离让位于上限。只有两种情况没法这么服务，返回 `task_fleet_limit_reached` 回执：一是要求独立身份（显式声明 `needs_isolated_session` 或新开 `session_key`）；二是本任务的 fleet 全部绑给了具名会话——登录态的 cookie jar 不外借。这两种**等待都解不开**（harness 不关 fleet，worker 结束后 fleet 还在；具名会话的绑定也不随 worker 结束而释放），所以回执给的是：改用已有 fleet、走可信恢复流程释放 session binding、或调高上限。拒绝之前 cap 会强制重读一次权威 `Fleet.list`。dispatcher 是从整张 fleets 表作答、不按连接分域，所以一次成功的读取既能找到别的 slot 刚建的 fleet，也能退役任何已被平台回收的 fleet（不论原属哪个 slot）并把额度还回来。读取失败则一律不当作"消失"的证据。
 - `fleet_auth_barrier_enabled`: 登录/验证码按 fleet 全域加门，非 resolver 有界等待且超时不放行。等待时间由 `fleet_auth_barrier_wait_seconds` 控制。
 - `auth_fleet_ledger_path`: 持久化的非敏感已验证会话索引；重启回收的 fleet 在账本对账前不会进入通用复用池。
 - `fleet_slot_reconnect_attempts`: 具名会话 slot 每轮使用原 `agentId` 进行的有界重连次数；transport 故障本身不等于 fleet 已丢失。

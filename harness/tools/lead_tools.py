@@ -10,16 +10,26 @@ from harness.extraction_artifacts import (
     save_extraction_artifact,
     validate_extraction_rows,
 )
+from harness.artifact_evidence import VALIDATOR_TYPES
 from harness.fleet_coordinator import VALID_PAGE_POLICIES, VALID_REUSE_SCOPES
 from harness.lifecycle import LifecycleContext, lifecycle_for
 from harness.local_fs import local_fs_read, local_fs_search
 from harness.strategy_bank import render_strategy_guidance
-from harness.task_control import VALIDATOR_TYPES, mark_phase_exhausted_if_needed
+from harness.task_control import (
+    EXECUTION_ROLES,
+    direct_batch_rows_provenance_errors,
+    mark_phase_exhausted_if_needed,
+    materialize_batch_rows_from_source,
+    replan_checkpoint_spawn_rejection,
+    load_task_state,
+)
+from harness.completion_receipt import build_completion_receipt
 from harness.task_types import (
     VALID_TASK_TYPES,
     normalize_task_type,
     task_type_choices_for_error,
 )
+from harness.tool_policy import describe_task_types
 from harness.tools.loop_guard import check_tool_call_loop
 from harness.tools.registry import ToolContext, ToolRegistry
 from harness.utils import (
@@ -78,6 +88,91 @@ def _auth_verification_schema() -> JsonDict:
             },
         },
         "required": ["protected_url_prefixes", "authenticated_markers"],
+        "additionalProperties": False,
+    }
+
+
+def _content_completeness_schema() -> JsonDict:
+    marker = {
+        "type": ["string", "object"],
+        "description": (
+            "A task-declared semantic region name, or an object with id/name"
+            " plus marker/markers strings derived from the user contract,"
+            " selected strategy/skill, or verified live evidence. Set"
+            " min_records only for repeated-record targets; it is a trigger"
+            " line, not a hard minimum when explicit exhaustion is proven."
+        ),
+        "properties": {
+            "id": {"type": "string"},
+            "name": {"type": "string"},
+            "marker": {"type": "string"},
+            "markers": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "fields": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string", "minLength": 1},
+                "description": (
+                    "Artifact field aliases that uniquely bind a"
+                    " collect_items collectionField to this region."
+                ),
+            },
+            "min_records": {"type": "integer", "minimum": 1},
+        },
+        "additionalProperties": False,
+    }
+    return {
+        "type": "object",
+        "description": (
+            "Optional route-sensitive content gate. It distinguishes a loaded"
+            " page shell from task-required detail regions and routes missing"
+            " content through a real listing-link click instead of"
+            " target_absent/HITL."
+        ),
+        "properties": {
+            "shell_markers": {"type": "array", "items": marker},
+            "expected_regions": {
+                "type": "array",
+                "minItems": 1,
+                "items": marker,
+            },
+            "suppression_signals": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "source": {"type": "string"},
+                        "locator": {"type": "string"},
+                        "match": {},
+                        "strength": {
+                            "type": "string",
+                            "enum": ["supporting", "confirmatory"],
+                        },
+                    },
+                    "required": ["name"],
+                    "additionalProperties": True,
+                },
+            },
+            "recovery": {
+                "type": "object",
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["listing_link_click"],
+                    },
+                    "max_attempts_per_item": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 5,
+                    },
+                },
+                "additionalProperties": False,
+            },
+        },
+        "required": ["expected_regions"],
         "additionalProperties": False,
     }
 
@@ -158,8 +253,37 @@ def _expected_artifact_schema() -> JsonDict:
         "type": ["string", "object"],
         "description": (
             "A field name string, or an object field spec using name/field/key"
-            " plus optional type/allow_empty/nonempty metadata."
+            " plus optional type/allow_empty/nonempty metadata. For a repeated"
+            " nested collection, use the canonical shape"
+            " {name, type:'array', items:{required:[...]}}."
         ),
+        # These properties make the nested contract discoverable to the Lead.
+        # Keep additional properties allowed for legacy field metadata and for
+        # conservative gateways that only partially implement JSON Schema.
+        "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "field": {"type": "string", "minLength": 1},
+            "key": {"type": "string", "minLength": 1},
+            "type": {"type": "string", "minLength": 1},
+            "allow_empty": {"type": "boolean"},
+            "nonempty": {"type": "boolean"},
+            "items": {
+                "type": "object",
+                "description": (
+                    "Nested item contract. required lists the exact fields"
+                    " that each collected child row must provide."
+                ),
+                "properties": {
+                    "required": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"type": "string", "minLength": 1},
+                    },
+                },
+                "additionalProperties": True,
+            },
+        },
+        "additionalProperties": True,
     }
     field_list: JsonDict = {"type": "array", "items": field_items}
     return {
@@ -216,9 +340,12 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                 "type": "object",
                 "description": (
                     "Plan object with goal, task_type, and a phases array."
-                    " Each phase needs id, type='browser_worker', objective,"
-                    " worker_task, stage_hint, stage_hint_reason,"
+                    " Each phase needs id, type='browser_worker', task_type,"
+                    " objective, worker_task, stage_hint, stage_hint_reason,"
                     " expected_artifact, validators, and max_attempts."
+                    " Every phase declares its OWN task_type — it is not"
+                    " inherited from the plan, because that is what decides"
+                    " which method domains the phase's worker can call."
                     " Scheduling: depends_on OMITTED = the phase implicitly"
                     " depends on ALL phases listed before it (strict serial"
                     " order); depends_on=[] = independent, startable"
@@ -234,6 +361,28 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                         # runtime with a warning receipt, same policy as the
                         # validator type enum.
                         "enum": sorted(VALID_TASK_TYPES),
+                        "description": (
+                            "Overall classification of the task, used for"
+                            " strategy selection and audit. It does NOT set"
+                            " worker method access — each phase declares its"
+                            " own task_type for that."
+                        ),
+                    },
+                    "replan_checkpoint_id": {
+                        "type": "string",
+                        "description": (
+                            "Legacy single-checkpoint acknowledgement. Use"
+                            " replan_checkpoint_ids when more than one cohort"
+                            " is active."
+                        ),
+                    },
+                    "replan_checkpoint_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "On replan, the exact set of every active"
+                            " checkpointId returned by the harness."
+                        ),
                     },
                     "pacing": pacing_schema,
                     "phases": {
@@ -247,17 +396,34 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                     "type": "string",
                                     "enum": sorted(VALID_TASK_TYPES),
                                     "description": (
-                                        "Optional per-phase override of the"
-                                        " plan task_type (e.g. one"
-                                        " file_download phase inside a"
-                                        " web_scrape plan). Omit to inherit"
-                                        " the plan task_type."
+                                        "REQUIRED per phase. Phases do NOT"
+                                        " inherit the plan task_type: a plan"
+                                        " that collects listings and then"
+                                        " exports media has a web_scrape phase"
+                                        " and a file_download phase, and each"
+                                        " must say so itself. "
+                                        + describe_task_types()
                                     ),
                                 },
                                 "objective": {"type": "string"},
                                 "worker_task": {"type": "string"},
                                 "stage_hint": {"type": "string"},
                                 "stage_hint_reason": {"type": "string"},
+                                "execution_role": {
+                                    "type": "string",
+                                    "enum": sorted(EXECUTION_ROLES),
+                                    "description": (
+                                        "Evidence-driven execution role, not a mandatory three-"
+                                        "stage template. Use probe (at most one row) only when a"
+                                        " reusable path is unknown. Use validation (at most two)"
+                                        " only when the probe checkpoint authorizes confidence"
+                                        " testing, and bulk only after validation authorizes it."
+                                        " If no reusable candidate was produced, use continuation"
+                                        " for remaining BrowserAgent slow-path rows. remediation"
+                                        " consumes an explicit failed-row set. Do not invent empty"
+                                        " validation/bulk phases merely to complete a ladder."
+                                    ),
+                                },
                                 "expected_artifact": {
                                     **_expected_artifact_schema(),
                                 },
@@ -293,6 +459,15 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                             "type": "string",
                                             "enum": sorted(VALID_REUSE_SCOPES),
                                         },
+                                        "fleet_id": {
+                                            "type": "string",
+                                            "description": (
+                                                "Existing Fleet UUID or unique"
+                                                " UUID prefix from the user or"
+                                                " authoritative evidence. Never"
+                                                " use it as session_key."
+                                            ),
+                                        },
                                         "session_key": {"type": "string"},
                                         "page_policy": {
                                             "type": "string",
@@ -300,16 +475,116 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                         },
                                         "needs_isolated_session": {"type": "boolean"},
                                         "auth_verification": _auth_verification_schema(),
+                                        "content_completeness": _content_completeness_schema(),
                                         "batch_rows": {
                                             "type": "array",
                                             "items": {"type": "object"},
-                                            "minItems": 3,
+                                            "minItems": 1,
                                             "description": (
-                                                "Homogeneous current-task rows for online ephemeral workflow reuse"
-                                                " when no frozen workflow skill is selected. Row 0 is executed by"
-                                                " the worker LLM; the harness may compile that trace, canary row 1,"
-                                                " then run the rest with fallback on any failure."
+                                                "Explicit homogeneous input rows, allowed only when"
+                                                " their identities/URLs were supplied directly by the"
+                                                " user and no upstream browser artifact exists. Use"
+                                                " batch_source for browser-discovered rows."
                                             ),
+                                        },
+                                        "batch_source": {
+                                            "type": "object",
+                                            "description": (
+                                                "Validated extraction artifact used to mechanically"
+                                                " construct batch_rows at spawn time."
+                                            ),
+                                            "properties": {
+                                                "artifact_name": {"type": "string"},
+                                                "cohort_selector": {
+                                                    "type": "object",
+                                                    "description": (
+                                                        "Optional stable target"
+                                                        " universe inside a larger"
+                                                        " artifact. It remains"
+                                                        " identical across probe,"
+                                                        " validation, and bulk."
+                                                    ),
+                                                    "properties": {
+                                                        "field": {"type": "string"},
+                                                        "values": {
+                                                            "type": "array",
+                                                            "minItems": 1,
+                                                        },
+                                                    },
+                                                    "required": ["field", "values"],
+                                                    "additionalProperties": False,
+                                                },
+                                                "selector": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "field": {"type": "string"},
+                                                        "values": {"type": "array"},
+                                                        "offset": {"type": "integer", "minimum": 0},
+                                                        "limit": {"type": "integer", "minimum": 1},
+                                                    },
+                                                    "additionalProperties": False,
+                                                },
+                                            },
+                                            "required": ["artifact_name"],
+                                            "additionalProperties": False,
+                                        },
+                                        "replan_checkpoint_id": {
+                                            "type": "string",
+                                            "description": (
+                                                "Bind this phase to exactly one"
+                                                " active checkpoint when a"
+                                                " replan advances multiple"
+                                                " cohorts."
+                                            ),
+                                        },
+                                        "batch_rows_provenance": {
+                                            "type": "object",
+                                            "description": (
+                                                "Required only with direct"
+                                                " batch_rows. Mechanically"
+                                                " proves each row identity came"
+                                                " from the immutable user"
+                                                " instruction rather than a"
+                                                " browser-discovered summary."
+                                            ),
+                                            "properties": {
+                                                "source": {
+                                                    "type": "string",
+                                                    "enum": ["user_instruction"],
+                                                },
+                                                "identity_fields": {
+                                                    "type": "array",
+                                                    "minItems": 1,
+                                                    "items": {
+                                                        "type": "string",
+                                                        "minLength": 1,
+                                                    },
+                                                },
+                                            },
+                                            "required": [
+                                                "source",
+                                                "identity_fields",
+                                            ],
+                                            "additionalProperties": False,
+                                        },
+                                        "batch_policy": {
+                                            "type": "object",
+                                            "properties": {
+                                                "max_rows_per_phase": {
+                                                    "type": "integer", "minimum": 1
+                                                },
+                                                "row_independent": {"type": "boolean"},
+                                                "requires_isolation_per_row": {
+                                                    "type": "boolean",
+                                                    "description": (
+                                                        "True only when each row requires a distinct"
+                                                        " identity/session boundary. This exempts"
+                                                        " singleton phases from cohort consolidation;"
+                                                        " needs_isolated_session alone is worker-level."
+                                                    ),
+                                                },
+                                            },
+                                            "additionalProperties": False,
                                         },
                                     },
                                     "additionalProperties": True,
@@ -318,6 +593,7 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                             },
                             "required": [
                                 "id",
+                                "task_type",
                                 "objective",
                                 "worker_task",
                                 "stage_hint",
@@ -399,6 +675,18 @@ def _spawn_browser_agent_schema(_: Any = None) -> JsonDict:
                     " First use creates a fresh fleet; later uses bind only to"
                     " that exact fleet and fail terminally if it is lost. It is"
                     " not an account credential and must not contain secrets."
+                    " Never put a Fleet UUID or UUID prefix here; use fleet_id"
+                    " for an existing Fleet."
+                ),
+            },
+            "fleet_id": {
+                **_nullable("string"),
+                "description": (
+                    "Existing Fleet UUID or unique UUID prefix. The harness"
+                    " resolves it only against authoritative Fleet inventory;"
+                    " no match or multiple matches fail closed and never"
+                    " create a replacement Fleet. Mutually exclusive with"
+                    " session_key and needs_isolated_session."
                 ),
             },
             "page_policy": {
@@ -417,9 +705,10 @@ def _spawn_browser_agent_schema(_: Any = None) -> JsonDict:
                         "type": "string",
                         "enum": sorted(VALID_TASK_TYPES),
                         "description": (
-                            "Optional task_type override for this worker;"
-                            " method access follows its policy. Omit to use"
-                            " the phase/plan task_type."
+                            "Optional consistency assertion only; when present"
+                            " it MUST equal phase.task_type. Method access is"
+                            " always controlled by the reviewed phase.task_type;"
+                            " re-emit the plan to change it."
                         ),
                     },
                     "needs_isolated_session": {
@@ -431,7 +720,15 @@ def _spawn_browser_agent_schema(_: Any = None) -> JsonDict:
                             " never becomes the generic slot default."
                         ),
                     },
+                    "fleet_id": {
+                        "type": "string",
+                        "description": (
+                            "Existing Fleet UUID or unique UUID prefix. Use"
+                            " session_key instead only for a new named session."
+                        ),
+                    },
                     "auth_verification": _auth_verification_schema(),
+                    "content_completeness": _content_completeness_schema(),
                 },
                 "description": (
                     "Contract override; pass {} when the phase contract is enough."
@@ -644,7 +941,26 @@ async def execute_lead_tool(agent: Any, tool_call: JsonDict) -> Tuple[JsonDict, 
     loop_guard=False,
 )
 async def _lead_emit_task_plan(ctx: ToolContext) -> JsonDict:
-    return ctx.agent.accept_task_plan(ctx.tool_input.get("plan"))
+    raw_plan = ctx.tool_input.get("plan")
+    review = await ctx.agent.review_task_plan_candidate(raw_plan)
+    if review.get("status") in {"rejected", "error"}:
+        result = {
+            "status": "failed",
+            "error": "independent PlanValidator rejected the candidate plan",
+            "planValidator": review,
+            "next_instruction": (
+                "Keep the currently accepted plan unchanged. Correct the"
+                " semantic findings and emit one complete revised plan."
+            ),
+        }
+        ctx.agent.logger.write("task_plan.rejected", result)
+        return result
+    return ctx.agent.accept_task_plan(
+        raw_plan,
+        plan_validator_review=(
+            review if review.get("status") == "approved" else None
+        ),
+    )
 
 
 @LEAD_TOOLS.register(
@@ -652,8 +968,9 @@ async def _lead_emit_task_plan(ctx: ToolContext) -> JsonDict:
     description=(
         "Asynchronously run a BrowserAgent worker in a pooled browser slot."
         " The coordinator assigns a fleet before execution; normal workers"
-        " start a fresh page in that fleet. Use reuse_scope/session_key for"
-        " cookie/session affinity (a new key starts a fresh fleet), and"
+        " start a fresh page in that fleet. Use fleet_id for an existing Fleet"
+        " UUID or unique prefix. Use reuse_scope/session_key for cookie/session"
+        " affinity when a new key should start a fresh fleet, and"
         " reuse_scope=page plus"
         " reuse_from_worker_id or preferred_slot_id only when prior pages must"
         " be exposed."
@@ -703,10 +1020,9 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
                     ),
                     "tool_was_executed": False,
                     "next_instruction": (
-                        "Retry spawn_browser_agent with a canonical task_type,"
-                        " or omit worker_contract.task_type to inherit the"
-                        " phase/plan task_type. Never invent task_type names:"
-                        " an unknown value would bypass method policy."
+                        "Retry spawn_browser_agent without worker_contract.task_type"
+                        " (the phase type is authoritative), or use the same canonical"
+                        " value as phase.task_type. Never invent task_type names."
                     ),
                 }
             raw_contract["task_type"] = canonical_task_type
@@ -714,6 +1030,23 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
         str(phase_id) if isinstance(phase_id, str) and phase_id.strip() else None,
         worker_contract=raw_contract if isinstance(raw_contract, dict) else None,
     )
+    if phase is not None and isinstance(raw_contract, dict):
+        asserted_task_type = str(raw_contract.get("task_type") or "").strip()
+        phase_task_type = normalize_task_type(phase.get("task_type"))
+        if asserted_task_type and asserted_task_type != phase_task_type:
+            return {
+                "status": "invalid_worker_contract",
+                "error": (
+                    "worker_contract.task_type cannot override phase.task_type"
+                    f" ({asserted_task_type!r} != {phase_task_type!r})"
+                ),
+                "tool_was_executed": False,
+                "next_instruction": (
+                    "Re-emit task_plan with a revised phase.task_type if the"
+                    " phase needs different method access; otherwise omit the"
+                    " worker_contract.task_type assertion."
+                ),
+            }
     if phase is None:
         # Pass the structured rejection through verbatim: it carries the real
         # status (dependency_not_ready / blocked_by_dependency /
@@ -746,6 +1079,29 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
         phase,
         raw_contract if isinstance(raw_contract, dict) else None,
     )
+    direct_batch_errors = direct_batch_rows_provenance_errors(
+        worker_contract,
+        user_task=str(getattr(agent, "original_user_task", "") or ""),
+        phase_id=str(phase.get("id") or ""),
+    )
+    if direct_batch_errors:
+        return {
+            "status": "invalid_batch_rows_provenance",
+            "errors": direct_batch_errors,
+            "tool_was_executed": False,
+            "next_instruction": (
+                "Use batch_source for rows discovered by a BrowserAgent. Use"
+                " direct batch_rows only with batch_rows_provenance whose"
+                " identity_fields values are present in the original user task."
+            ),
+        }
+    batch_rejection = materialize_batch_rows_from_source(
+        agent.logger,
+        phase=phase,
+        worker_contract=worker_contract,
+    )
+    if batch_rejection is not None:
+        return batch_rejection
     strategies = (
         agent.strategies_for_phase(phase)
         if hasattr(agent, "strategies_for_phase")
@@ -757,9 +1113,18 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
         for item in strategies
         if isinstance(item, dict) and str(item.get("id") or "").strip()
     ]
-    _merge_strategy_avoid_tools(worker_contract, strategies)
     base_task = str(tool_input.get("task") or phase.get("worker_task") or "")
     base_context = str(tool_input.get("context") or phase.get("context") or "")
+    batch_receipt = worker_contract.get("_batch_source_receipt")
+    if isinstance(batch_receipt, dict):
+        base_context = (
+            f"{base_context}\n\nBATCH EXECUTION CONTRACT: The harness loaded"
+            f" {batch_receipt.get('rowCount')} validated input row(s) into"
+            " worker_contract.batch_rows. Process them serially in artifact"
+            " order, preserve each row identity, and do not silently skip or"
+            " substitute rows. The execution_role and dependency gate define"
+            " whether this is probe, validation, bulk, or remediation."
+        ).strip()
     auth_gate_guidance = _auth_gate_probe_guidance(phase, worker_contract)
     collection_guidance = _collection_contract_guidance(phase, worker_contract)
     if auth_gate_guidance:
@@ -818,6 +1183,13 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
             )
     except Exception:  # never break spawning
         pass
+    checkpoint_rejection = replan_checkpoint_spawn_rejection(
+        agent.logger,
+        phase=phase,
+        worker_contract=worker_contract,
+    )
+    if checkpoint_rejection is not None:
+        return checkpoint_rejection
     return await agent.spawner.spawn_browser_agent(
         task=base_task,
         context=base_context,
@@ -831,34 +1203,10 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
         preferred_slot_id=tool_input.get("preferred_slot_id"),
         reuse_from_worker_id=tool_input.get("reuse_from_worker_id"),
         reuse_scope=tool_input.get("reuse_scope"),
+        fleet_id=tool_input.get("fleet_id"),
         session_key=tool_input.get("session_key"),
         page_policy=tool_input.get("page_policy"),
     )
-
-
-def _merge_strategy_avoid_tools(worker_contract: JsonDict, strategies: List[JsonDict]) -> None:
-    forbidden = [
-        str(item).strip()
-        for item in worker_contract.get("forbidden_methods", [])
-        if str(item).strip()
-    ]
-    allowed = {
-        str(item).strip()
-        for item in worker_contract.get("allowed_methods", [])
-        if str(item).strip()
-    }
-    seen = set(forbidden)
-    for strategy in strategies:
-        if not isinstance(strategy, dict):
-            continue
-        for method in strategy.get("avoid_tools") or []:
-            text = str(method).strip()
-            if not text or text in seen or text in allowed:
-                continue
-            forbidden.append(text)
-            seen.add(text)
-    if forbidden:
-        worker_contract["forbidden_methods"] = forbidden
 
 
 _AUTH_GATE_FIELD_NAMES = {
@@ -1106,7 +1454,7 @@ def _auth_gate_probe_guidance(phase: JsonDict, worker_contract: JsonDict) -> str
 
 
 def _collection_contract_guidance(phase: JsonDict, worker_contract: JsonDict) -> str:
-    """Inject rank/window collection guardrails derived from the contract."""
+    """Inject collection guardrails from declared validators, not field names."""
     stage = str(
         worker_contract.get("stage_hint")
         or phase.get("stage_hint")
@@ -1122,24 +1470,38 @@ def _collection_contract_guidance(phase: JsonDict, worker_contract: JsonDict) ->
     fields = _expected_field_names(expected)
     if not fields:
         return ""
-    field_set = set(fields)
-    rank_like = {"rank", "position", "index"} & field_set
-    link_like = {"detailUrl", "url", "href", "productUrl"} & field_set
-    name_like = {"productName", "name", "title"} & field_set
-    if not (rank_like and link_like and name_like):
-        return ""
     exact_rows = _exact_rows_from_contract(worker_contract)
+    validators = (
+        worker_contract.get("validators")
+        if isinstance(worker_contract.get("validators"), list)
+        else phase.get("validators")
+    )
+    range_fields = [
+        str(item.get("field") or "").strip()
+        for item in (validators if isinstance(validators, list) else [])
+        if isinstance(item, dict)
+        and str(item.get("type") or "") == "range"
+        and str(item.get("field") or "").strip()
+    ]
     exact_text = (
         f"exactly {exact_rows} rows"
         if exact_rows is not None
         else "the requested row count"
     )
+    range_note = ""
+    if range_fields:
+        range_note = (
+            "- For range-validated fields "
+            f"{sorted(set(range_fields))!r}, derive values from the declared"
+            " live ordering/source evidence and persist the contract-declared"
+            " provenance fields; do not infer semantics from a field name.\n"
+        )
     return (
         "<collection_contract_guidance>\n"
         f"- The final record_extraction must satisfy fields {fields!r} and produce {exact_text}; do not treat a broad link harvest as final target data.\n"
-        "- Use collect_items for repeated list/card candidates when useful, but first verify the selector represents the product/card sequence, not all /ai/ links, featured links, nav links, or comment links.\n"
+        "- Use collect_items for repeated candidates when useful, but first verify the selector represents the task-declared entity sequence rather than navigation, featured, or otherwise unrelated elements.\n"
         "- If collect_items returns many more rows than expected or recordExtraction.status=needs_fix, treat the selector as too broad or the row schema as wrong. Narrow the repeated card selector or transform/slice trusted DOM-order rows before final_answer.\n"
-        "- For rank/position tasks, derive rank from the verified DOM/visual order and persist canonical provenance fields such as rankEvidenceText, sourceTool, sourceSelectorOrAxId, and pageUrl.\n"
+        f"{range_note}"
         "</collection_contract_guidance>"
     )
 
@@ -1389,10 +1751,16 @@ def _validate_lead_save_sources(agent: Any, raw_sources: Any) -> Tuple[List[str]
     loop_guard=False,
 )
 async def _lead_final_answer(ctx: ToolContext) -> JsonDict:
+    receipt = build_completion_receipt(
+        state=load_task_state(ctx.agent.logger),
+        spawner=getattr(ctx.agent, "spawner", None),
+    )
+    ctx.agent.logger.write("lead.completion_receipt", receipt)
     return {
         "status": ctx.tool_input.get("status", "done"),
         "answer": str(ctx.tool_input.get("answer", "")).strip(),
         "trigger": "lead_decided",
+        "completionReceipt": receipt,
     }
 
 

@@ -8,6 +8,7 @@ import json
 import re
 import shlex
 import sys
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -31,6 +32,36 @@ _LAST_LOGGER: Optional[RunLogger] = None
 _CANCELLED_LOGGED = False
 
 
+def _validated_pinned_browser_context(
+    args: argparse.Namespace,
+    *,
+    fleet_reuse_enabled: bool = True,
+) -> Optional[Dict[str, str]]:
+    fleet_id = str(getattr(args, "fleet_id", "") or "").strip()
+    page_id = str(getattr(args, "page_id", "") or "").strip()
+    if page_id and not fleet_id:
+        raise ValueError("--page-id requires --fleet-id")
+    for option, raw in (("--fleet-id", fleet_id), ("--page-id", page_id)):
+        if not raw:
+            continue
+        try:
+            uuid.UUID(raw)
+        except (ValueError, AttributeError) as exc:
+            raise ValueError(f"{option} must be a UUID") from exc
+    if not fleet_id:
+        return None
+    if not fleet_reuse_enabled:
+        raise ValueError(
+            "--fleet-id/--page-id requires"
+            " harness.fleet_reuse_enabled=true"
+        )
+    return {
+        "fleet_id": fleet_id,
+        "page_id": page_id,
+        "source": "cli",
+    }
+
+
 class ConsoleProgressReporter:
     def __init__(self) -> None:
         # transport.response payloads don't carry the method name; remember
@@ -49,7 +80,10 @@ class ConsoleProgressReporter:
         if event_type == "lead.step.start":
             return f"[LeadAgent] 第 {payload.get('step')} 步：请求模型..."
         if event_type == "agent.step.start":
-            return f"[BrowserAgent] 第 {payload.get('step')} 步：请求模型..."
+            return (
+                f"[{self._browser_actor_label(payload)}] "
+                f"第 {payload.get('step')} 步：请求模型..."
+            )
         if event_type in {"lead.model", "agent.model"}:
             return self._format_model_event(event_type, payload)
         if event_type == "lead.tool.result":
@@ -84,7 +118,8 @@ class ConsoleProgressReporter:
             )
         if event_type == "agent.step_cap.reminder":
             return (
-                f"[BrowserAgent] 接近步数上限: step={payload.get('step')} "
+                f"[{self._browser_actor_label(payload)}] "
+                f"接近步数上限: step={payload.get('step')} "
                 f"remaining={payload.get('remaining')}"
             )
         if event_type == "browser.call.params_error":
@@ -145,6 +180,36 @@ class ConsoleProgressReporter:
             if payload.get("error"):
                 return f"[{actor}] 浏览器响应: error ({self._format_error(payload)})"
             return f"[{actor}] 浏览器响应: ok"
+        if event_type in {"lead.model_timeout", "agent.model_timeout"}:
+            attempts = len(
+                payload.get("attempts") or payload.get("timeoutAttempts") or []
+            )
+            seconds = payload.get("timeoutSeconds")
+            will_retry = payload.get("willRetry")
+            tail = (
+                "压缩上下文后重试本步。" if will_retry
+                else "重试次数已用尽，本步终止。" if will_retry is False
+                else "本步按空回合处理，由重复守卫接管恢复。"
+            )
+            return (
+                f"[LLM] 模型服务无响应（连续 {seconds}s 未收到新数据，触发空闲超时），"
+                f"连初次请求共尝试 {attempts} 次仍失败；{tail}"
+            )
+        if event_type in {"lead.model_connection_error", "agent.model_connection_error"}:
+            # The provider already retried silently; by the time this fires the
+            # connection is repeatedly dropping, which the user should see
+            # rather than discover as a traceback.
+            attempts = len(payload.get("attempts") or payload.get("connectionAttempts") or [])
+            will_retry = payload.get("willRetry")
+            tail = (
+                "压缩上下文后重试本步。" if will_retry
+                else "重试次数已用尽，本步终止。" if will_retry is False
+                else "本步按空回合处理，由重复守卫接管恢复。"
+            )
+            return (
+                f"[LLM] 与模型服务的连接中断（{payload.get('reason') or 'connection error'}），"
+                f"连初次请求共尝试 {attempts} 次仍失败；{tail}"
+            )
         if event_type in {"run.error", "lead.error", "agent.error"}:
             error = payload.get("error") or payload.get("errorType") or "unknown error"
             return f"[错误] {error}"
@@ -157,7 +222,11 @@ class ConsoleProgressReporter:
         event_type: str,
         payload: Dict[str, Any],
     ) -> str:
-        role = "LeadAgent" if event_type == "lead.model" else "BrowserAgent"
+        role = (
+            "LeadAgent"
+            if event_type == "lead.model"
+            else self._browser_actor_label(payload)
+        )
         tool_calls = payload.get("tool_calls") or []
         tool_summaries = [
             self._format_tool_call(item)
@@ -173,6 +242,16 @@ class ConsoleProgressReporter:
                 )
             return f"[{role}] 模型返回，准备调用: {'; '.join(tool_summaries)}"
         return f"[{role}] 模型返回: {text or '(无文本)'}"
+
+    @staticmethod
+    def _browser_actor_label(payload: Dict[str, Any]) -> str:
+        worker_id = str(payload.get("workerId") or "").strip()
+        slot_id = str(payload.get("slotId") or "").strip()
+        agent_id = str(payload.get("agentId") or "").strip()
+        identity = worker_id or agent_id or "unknown"
+        if slot_id and slot_id != identity:
+            return f"BrowserAgent {identity} / slot {slot_id}"
+        return f"BrowserAgent {identity}"
 
     def _format_tool_call(self, tool_call: Dict[str, Any]) -> str:
         name = str(tool_call.get("name") or "unknown")
@@ -671,7 +750,12 @@ def _build_trial_runner(config_path: Optional[str]):
         async def _run() -> Dict[str, Any]:
             from harness.skill.create import trial_workflow_live
             runtime = load_runtime_config(config_path or "config.json")
-            return await trial_workflow_live(workflow, rows, ws_config=runtime.browser)
+            return await trial_workflow_live(
+                workflow,
+                rows,
+                ws_config=runtime.browser,
+                workflow_runtime=runtime,
+            )
 
         try:
             return _run_coro_blocking(_run())
@@ -692,6 +776,7 @@ def _build_recheck_trial_runner(config_path: Optional[str]):
                 skill,
                 source_context,
                 ws_config=runtime.browser,
+                workflow_runtime=runtime,
             )
 
         try:
@@ -1136,6 +1221,16 @@ async def run_cli(args: argparse.Namespace) -> int:
         return 2
     if _is_skill_create_command(task):
         return _handle_skill_create_command(task, config_path=getattr(args, "config", None))
+    try:
+        pinned_browser_context = _validated_pinned_browser_context(
+            args,
+            fleet_reuse_enabled=bool(
+                getattr(runtime.harness, "fleet_reuse_enabled", True)
+            ),
+        )
+    except ValueError as exc:
+        print(f"浏览器上下文参数错误: {exc}")
+        return 2
 
     # --skill / interactive /skill both land on args.skill; force it for this run
     # without editing config. A name may be a skill_id OR a suite; expand each
@@ -1174,7 +1269,12 @@ async def run_cli(args: argparse.Namespace) -> int:
         provider = LLMFactory.create_provider(
             lead_agent_model_config(runtime.model)
         )
-        harness = LeadAgent(provider, runtime, logger)
+        harness = LeadAgent(
+            provider,
+            runtime,
+            logger,
+            pinned_browser_context=pinned_browser_context,
+        )
         answer = await harness.run(task)
     except asyncio.CancelledError as exc:
         _CANCELLED_LOGGED = True
@@ -1205,6 +1305,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--task", dest="task_option", help="要交给浏览器 agent 完成的任务")
     parser.add_argument("--config", default="config.json", help="配置文件路径")
     parser.add_argument("--agent-id", help="覆盖 config.json 中的 browser.agent_id")
+    parser.add_argument(
+        "--fleet-id",
+        default="",
+        help="复用已存在的 Fleet UUID；目标不存在时禁止创建替代 Fleet",
+    )
+    parser.add_argument(
+        "--page-id",
+        default="",
+        help="复用 --fleet-id 中的 Page UUID；指定后禁止创建替代页面",
+    )
     parser.add_argument("--max-steps", type=int, help="覆盖最大 agent 编排步数")
     parser.add_argument(
         "--skill",

@@ -52,6 +52,10 @@ python main.py --config ./my-config.json --task "Check the current fleet list."
 
 ### Model
 
+The top-level `provider` field is required. Set it explicitly to `openai` or
+`anthropic`; the harness does not infer the wire protocol from `model_id` or
+`base_url`.
+
 OpenAI-compatible example:
 
 ```json
@@ -138,6 +142,7 @@ Common harness options:
     "max_browser_agents": 3,
     "fleet_reuse_enabled": true,
     "same_fleet_multiworker_enabled": false,
+    "max_task_fleets": 3,
     "fleet_auth_barrier_enabled": true,
     "fleet_auth_barrier_wait_seconds": 120,
     "auth_fleet_ledger_path": ".auth_fleet_ledger.json",
@@ -156,8 +161,9 @@ Common harness options:
 - `worker_max_steps`: maximum BrowserAgent rounds.
 - `max_browser_agent_instances`: maximum live BrowserAgent slots kept in the reusable pool. Idle slots keep their ABCP connection and page registry.
 - `max_browser_agents`: maximum concurrently running browser workers. Effective browser-slot concurrency is still bounded by `max_browser_agent_instances`.
-- `fleet_reuse_enabled`: deterministically assign each worker a fleet and force `Page.create` into it. Generic work may reuse an eligible slot fleet; a new `session_key` or isolated worker gets a fresh fleet, and named/isolated fleets never become the generic slot default. Lost named sessions fail with `session_fleet_lost` instead of silently rebinding. Model-initiated `Fleet.create`/`Fleet.close` and out-of-assignment fleet ids fail closed; explicit page continuations may receive prior page candidates.
+- `fleet_reuse_enabled`: deterministically assign each worker a fleet and force `Page.create` into it. Generic work may reuse an eligible slot fleet; a new `session_key` or isolated worker gets a fresh fleet, while `worker_contract.fleet_id` selects an existing Fleet by full UUID or unique prefix and never creates a replacement. Named/isolated fleets never become the generic slot default. Lost named sessions fail with `session_fleet_lost` instead of silently rebinding. Model-initiated `Fleet.create`/`Fleet.close` and out-of-assignment fleet ids fail closed; explicit page continuations may receive prior page candidates.
 - `same_fleet_multiworker_enabled`: opt-in canary for sharing one task/session fleet across parallel slots while keeping separate pages. It defaults to `false`; when enabled, the owner socket remains authoritative, notifications are relayed to delegates, and equal-page calls are serialized.
+- `max_task_fleets`: ceiling on how many distinct fleets (browser instances) one task may occupy; `0` disables it. The harness never closes a fleet, so one it opens holds its budget slot until the platform stops reporting it — a fleet that disappears from the owner inventory releases its slot again. Counted over fleets bound to this task's workers, never over the Agent-global `Fleet.list`. An explicitly selected fleet (`--fleet-id` pin, `worker_contract.fleet_id`, a bound `session_key`, `reuse_from_worker_id`) is always honored and never blocked, but it does consume budget. At the ceiling a fleetless worker reuses one of the task's existing fleets, preferring one no running worker holds, and deployment-default `worker_session_isolation_enabled` yields to the cap. Two cases cannot be served that way and get a `task_fleet_limit_reached` receipt instead: a spawn demanding a separate identity (a phase-declared `needs_isolated_session`, or a new `session_key`), and a ceiling where every task fleet is bound to a named session, since a logged-in cookie jar is never lent to a generic worker. Waiting does not clear either one — the harness closes no fleets and a session binding outlives its worker — so the receipt tells the Lead to continue on an existing fleet, release a session binding through auth recovery, or raise the ceiling. Before refusing, the cap re-reads the authoritative `Fleet.list` once. The dispatcher answers that from the whole fleets table with no per-connection scoping, so one successful read both finds a fleet another slot created seconds ago and retires any fleet the platform has dropped — whichever slot owned it — handing its budget back. A failed read is never treated as proof of disappearance.
 - `fleet_auth_barrier_enabled`: make login/CAPTCHA resolution fleet-wide and fail closed for non-resolver workers. `fleet_auth_barrier_wait_seconds` controls the bounded wait.
 - `auth_fleet_ledger_path`: persistent, non-secret verified session index, relative to `worktree_dir` unless absolute. Reclaimed fleets are quarantined until ledger reconciliation restores their restrictions.
 - `fleet_slot_reconnect_attempts`: bounded same-`agentId` reconnect attempts per recovery cycle. Transport loss never proves that the fleet is lost.
@@ -187,6 +193,21 @@ Override agent id or step count:
 ```bash
 python main.py --agent-id demo-agent --max-steps 20 --task "Check the current fleet list."
 ```
+
+## Tests and Acceptance
+
+Use pytest as the authoritative full-suite runner:
+
+```bash
+conda run --no-capture-output -n agent python -m pytest tests/ -q
+```
+
+The suite contains both `unittest.TestCase` methods and module-level
+`def test_*` functions. `python -m unittest discover` does not collect the
+module-level pytest functions, so it is suitable for targeted diagnostics but
+must not be reported as a complete repository regression run. When reporting
+acceptance results, include the exact command together with pytest's passed,
+skipped, and subtest counts.
 
 ## Logs and Artifacts
 
