@@ -1,6 +1,6 @@
 {
   "method": "Input.press",
-  "description": "Dispatches a physical keyboard key press to the currently focused page or element; establish or verify focus before using it for form submission or shortcuts.",
+  "description": "Dispatches a physical keyboard key press to the current focus or an optional known target; establish or verify focus before using it for form submission or shortcuts.",
   "params": {
     "pageId": {
       "type": "string",
@@ -8,6 +8,18 @@
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
       "description": "Page ID that should receive the key press.",
       "required": true
+    },
+    "id": {
+      "description": "Optional canonical element ID to focus before pressing the key.",
+      "type": "string",
+      "pattern": "^\\d+:\\d+:\\d+$",
+      "required": false
+    },
+    "selector": {
+      "description": "Optional CSS selector to focus before pressing the key.",
+      "type": "string",
+      "minLength": 1,
+      "required": false
     },
     "key": {
       "type": "string",

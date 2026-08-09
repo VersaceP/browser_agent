@@ -17,7 +17,7 @@
     },
     "world": {
       "default": "auto",
-      "description": "Execution world: auto prefers the isolated world and may retry context-mismatch failures in the main world; isolated and main are strict.",
+      "description": "Execution world: isolated and main are strict. auto starts isolated and may retry main only on the dedicated ABCP_MAIN_WORLD_REQUIRED: ReferenceError signal.",
       "type": "string",
       "enum": [
         "auto",

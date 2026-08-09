@@ -39,6 +39,12 @@
       "maximum": 2,
       "required": true
     },
+    "force": {
+      "default": false,
+      "description": "Dispatch even when the resolved element is occluded. Normal browser hit testing still applies, so an overlay may receive the input. Ignored for coordinate-based clicks.",
+      "type": "boolean",
+      "required": true
+    },
     "purpose": {
       "type": "string",
       "minLength": 1,

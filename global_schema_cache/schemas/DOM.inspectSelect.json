@@ -1,0 +1,60 @@
+{
+  "method": "DOM.inspectSelect",
+  "description": "Inspects a select-like control, automatically bringing it into view, temporarily opening custom controls to discover options, and restoring the original open state.",
+  "params": {
+    "id": {
+      "description": "Preferred canonical select control ID from DOM.getAXTree.",
+      "type": "string",
+      "pattern": "^\\d+:\\d+:\\d+$",
+      "required": false
+    },
+    "selector": {
+      "description": "CSS selector for the select control. It must resolve to exactly one control; narrow broad selectors when the page contains multiple selects.",
+      "type": "string",
+      "minLength": 1,
+      "required": false
+    },
+    "pageId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Page ID containing the select-like control.",
+      "required": true
+    },
+    "query": {
+      "description": "Filters currently discovered option labels; it does not enter text into the control.",
+      "type": "string",
+      "minLength": 1,
+      "required": false
+    },
+    "maxOptions": {
+      "default": 100,
+      "description": "Maximum number of currently discovered options to return.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 500,
+      "required": false
+    },
+    "includeDisabled": {
+      "default": false,
+      "description": "Include disabled options when true.",
+      "type": "boolean",
+      "required": false
+    },
+    "timeout": {
+      "description": "Maximum temporary exploration time in seconds. Omit or pass 0 to use 300 seconds.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 300,
+      "required": false
+    },
+    "purpose": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Describe which control choices must be understood, such as enumerating options, checking search, loading more results, or inspecting a cascading picker",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe which control choices must be understood, such as enumerating options, checking search, loading more results, or inspecting a cascading picker"
+}

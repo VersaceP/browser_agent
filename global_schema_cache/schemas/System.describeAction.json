@@ -3,7 +3,7 @@
   "description": "Describes the exact schema, parameter constraints, and purpose requirement for one callable action before invocation. The target may be supplied under any parameter name; action is the default name.",
   "params": {
     "action": {
-      "description": "Full Action method name, such as \"Input.click\" or \"DOM.getAXTree\".",
+      "description": "Canonical Action method or MCP tool name, such as \"Input.click\" or \"input_click\".",
       "type": "string",
       "minLength": 1,
       "required": false

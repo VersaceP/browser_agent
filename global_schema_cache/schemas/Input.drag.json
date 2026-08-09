@@ -1,6 +1,6 @@
 {
   "method": "Input.drag",
-  "description": "Performs a physical drag from a known source to a target, coordinate, or relative offset; prefer canonical ids, use stable selectors as fallback, and use coordinates only as a last resort.",
+  "description": "Drag a source to a target, coordinate, or relative offset. Use toOffset when the target's drop subregion affects the result.",
   "params": {
     "pageId": {
       "type": "string",
@@ -32,13 +32,13 @@
       "required": false
     },
     "toSelector": {
-      "description": "Fallback CSS selector for the drag destination.",
+      "description": "CSS selector for the destination. Without toOffset, the drop point defaults to the destination center.",
       "type": "string",
       "minLength": 1,
       "required": false
     },
     "toId": {
-      "description": "Preferred canonical element ID for the drag destination.",
+      "description": "Canonical destination ID. Without toOffset, the drop point defaults to the destination center.",
       "type": "string",
       "pattern": "^\\d+:\\d+:\\d+$",
       "required": false
@@ -54,7 +54,7 @@
       "required": false
     },
     "toOffset": {
-      "description": "Normalized destination point inside the destination bounds.",
+      "description": "Normalized point inside the destination (0–1). Use y=0.2/0.8 when upper/lower drop zones change the result.",
       "type": "object",
       "properties": {
         "x": {
@@ -84,10 +84,10 @@
     "purpose": {
       "type": "string",
       "minLength": 1,
-      "description": "Describe the intended drag effect, e.g., moving a slider, reordering an item, or dragging one element onto another",
+      "description": "Describe the drag effect, such as moving a slider, reordering an item, or dropping onto a target.",
       "required": true
     }
   },
   "requiresPurpose": true,
-  "purposeHint": "Describe the intended drag effect, e.g., moving a slider, reordering an item, or dragging one element onto another"
+  "purposeHint": "Describe the drag effect, such as moving a slider, reordering an item, or dropping onto a target."
 }

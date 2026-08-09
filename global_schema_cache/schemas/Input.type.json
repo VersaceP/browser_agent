@@ -1,6 +1,6 @@
 {
   "method": "Input.type",
-  "description": "Types text into a known editable target; prefer a canonical id from DOM.getAXTree, use a stable selector as fallback, and set clear=true when replacing existing content.",
+  "description": "Types text into a known visible, editable, and focusable target; prefer a canonical id from DOM.getAXTree, use a stable selector as fallback, and set clear=true when replacing existing content.",
   "params": {
     "pageId": {
       "type": "string",

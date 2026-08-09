@@ -1,0 +1,91 @@
+{
+  "method": "Input.select",
+  "description": "Selects one or more direct choices or complete cascading paths in a native or custom select-like control, automatically bringing the control into view and opening custom controls as needed.",
+  "params": {
+    "pageId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+      "description": "Page ID containing the select-like control.",
+      "required": true
+    },
+    "id": {
+      "description": "Preferred canonical control ID from DOM.getAXTree or DOM.inspectSelect.",
+      "type": "string",
+      "pattern": "^\\d+:\\d+:\\d+$",
+      "required": false
+    },
+    "selector": {
+      "description": "CSS selector that must resolve to exactly one select-like control. Use a narrower selector or a canonical id when it matches multiple controls.",
+      "type": "string",
+      "minLength": 1,
+      "required": false
+    },
+    "selections": {
+      "minItems": 1,
+      "maxItems": 100,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "description": "Opaque canonical option ID returned by DOM.inspectSelect or DOM.getAXTree.",
+            "type": "string",
+            "pattern": "^\\d+:\\d+:\\d+$"
+          },
+          "value": {
+            "description": "Exact option value, only when DOM.inspectSelect returned a value for that option.",
+            "type": "string"
+          },
+          "label": {
+            "description": "Visible option label returned by DOM.inspectSelect.",
+            "type": "string",
+            "minLength": 1
+          },
+          "path": {
+            "description": "Ordered cascade path from the root menu item to the final leaf option.",
+            "minItems": 2,
+            "maxItems": 32,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "description": "Opaque canonical option ID returned by DOM.inspectSelect or DOM.getAXTree.",
+                  "type": "string",
+                  "pattern": "^\\d+:\\d+:\\d+$"
+                },
+                "value": {
+                  "description": "Exact option value, only when DOM.inspectSelect returned a value for that option.",
+                  "type": "string"
+                },
+                "label": {
+                  "description": "Visible option label returned by DOM.inspectSelect.",
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          }
+        }
+      },
+      "description": "Direct choices or complete cascading paths using fields actually returned by DOM.inspectSelect. A one-item array requests a single selection; multiple direct choices request multi-selection.",
+      "required": true
+    },
+    "timeout": {
+      "description": "Maximum exploration time in seconds. Omit or pass 0 to use the 300-second default.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 300,
+      "required": false
+    },
+    "purpose": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Describe the intended selected values, such as choosing a country, date, color, tags, or a root-to-leaf cascading location path.",
+      "required": true
+    }
+  },
+  "requiresPurpose": true,
+  "purposeHint": "Describe the intended selected values, such as choosing a country, date, color, tags, or a root-to-leaf cascading location path."
+}
