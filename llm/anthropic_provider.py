@@ -2,7 +2,9 @@
 llm.anthropic_provider - Anthropic messages API adapter.
 """
 
+import asyncio
 import os
+import traceback
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -10,7 +12,11 @@ try:
 except ImportError:
     AsyncAnthropic = None
 
-from llm.base import BaseLLMProvider
+from llm.base import (
+    BaseLLMProvider,
+    LLMStreamDecodeError,
+    _attempt_reason_summary,
+)
 from llm.cache_control import (
     _build_cache_diagnostics,
     _emit_cache_log,
@@ -57,6 +63,29 @@ def _degenerate_response_problem(response: Any) -> Optional[Dict[str, Any]]:
         "output_tokens": output_tokens,
         "stop_reason": getattr(response, "stop_reason", None),
     }
+
+
+def _is_anthropic_stream_tool_decode_error(exc: BaseException) -> bool:
+    """Identify the SDK's incremental tool-input JSON decoder failure.
+
+    Do not turn arbitrary ValueError exceptions into retryable protocol
+    incidents.  The observed failure originates in Anthropic's streaming
+    message accumulator while parsing a partial tool input.
+    """
+    if not isinstance(exc, ValueError):
+        return False
+    frames = traceback.extract_tb(exc.__traceback__)
+    sdk_stream_frame = any(
+        "anthropic" in str(frame.filename).lower()
+        and "stream" in str(frame.filename).lower()
+        for frame in frames
+    )
+    message = str(exc).lower()
+    json_shape = any(
+        marker in message
+        for marker in ("json", "expected value", "decode", "column", "partial")
+    )
+    return sdk_stream_frame and json_shape
 
 
 class AnthropicProvider(BaseLLMProvider):
@@ -185,18 +214,71 @@ class AnthropicProvider(BaseLLMProvider):
         )
         timeout_attempts: List[Dict[str, Any]] = []
 
+        async def collect_streamed_message(request_kwargs: Dict[str, Any]):
+            """Consume the SSE stream and return the SDK's final Message.
+
+            Streaming stays an implementation detail of the provider: callers
+            continue to receive the same fully-assembled response shape.  Using
+            messages.stream() also avoids the Anthropic SDK's non-streaming
+            ten-minute guard for large max_tokens values.
+            """
+            manager = self.client.messages.stream(**request_kwargs)
+            stream = await asyncio.wait_for(
+                manager.__aenter__(),
+                timeout=self._llm_timeout_seconds(),
+            )
+            active_error: Optional[BaseException] = None
+            try:
+                if hasattr(stream, "__aiter__"):
+                    async for _event in self._iterate_with_llm_idle_timeout(stream):
+                        pass
+                return await asyncio.wait_for(
+                    stream.get_final_message(),
+                    timeout=self._llm_timeout_seconds(),
+                )
+            except BaseException as exc:
+                if _is_anthropic_stream_tool_decode_error(exc):
+                    wrapped = LLMStreamDecodeError(
+                        "Anthropic stream contained malformed incremental tool JSON"
+                    )
+                    active_error = wrapped
+                    raise wrapped from exc
+                active_error = exc
+                raise
+            finally:
+                exit_args = (
+                    (type(active_error), active_error, active_error.__traceback__)
+                    if active_error is not None
+                    else (None, None, None)
+                )
+                try:
+                    await asyncio.wait_for(
+                        manager.__aexit__(*exit_args),
+                        timeout=self._llm_timeout_seconds(),
+                    )
+                except Exception:
+                    if active_error is None:
+                        raise
+
         async def request_with_timeout(request_kwargs: Dict[str, Any]):
+            async def collect_nonstream_message():
+                return await self.client.messages.create(**request_kwargs)
+
             response, attempts = await self._request_with_timeout_retries(
-                lambda: self.client.messages.create(**request_kwargs),
+                lambda: collect_streamed_message(request_kwargs),
                 provider="anthropic",
-                operation="messages.create",
+                operation="messages.stream",
                 response_validator=_degenerate_response_problem,
+                timeout_managed=True,
+                reserved_nonstream_fallback_factory=collect_nonstream_message,
+                fallback_response_validator=_degenerate_response_problem,
             )
             if attempts:
                 timeout_attempts.extend(attempts)
                 _emit_cache_log(
-                    "[Anthropic] messages.create recovered after "
-                    f"{len(attempts)} timeout/degenerate attempt(s)"
+                    "[Anthropic] messages.stream recovered after "
+                    f"{len(attempts)} failed attempt(s) "
+                    f"({_attempt_reason_summary(attempts)})"
                 )
             return response
 
@@ -274,11 +356,23 @@ class AnthropicProvider(BaseLLMProvider):
             "cache_diagnostics": cache_diagnostics,
             "timeout_retries": sum(
                 1 for item in timeout_attempts
-                if item.get("reason") != "degenerate_response"
+                if item.get("reason") == "timeout"
             ),
             "degenerate_retries": sum(
                 1 for item in timeout_attempts
                 if item.get("reason") == "degenerate_response"
+            ),
+            "connection_retries": sum(
+                1 for item in timeout_attempts
+                if item.get("reason") == "connection_error"
+            ),
+            "stream_decode_retries": sum(
+                1 for item in timeout_attempts
+                if item.get("reason") == "stream_decode_error"
+            ),
+            "nonstream_fallback_used": any(
+                item.get("reason") == "nonstream_fallback"
+                for item in timeout_attempts
             ),
             "timeout_attempts": timeout_attempts,
             "timeout_seconds": self._llm_timeout_seconds(),

@@ -196,6 +196,8 @@ class UsageBucket:
     output: int = 0
     timeout_retries: int = 0
     degenerate_retries: int = 0
+    connection_retries: int = 0
+    stream_decode_retries: int = 0
 
     def add(
         self,
@@ -205,14 +207,33 @@ class UsageBucket:
         output: int,
         timeout_retries: int = 0,
         degenerate_retries: int = 0,
+        connection_retries: int = 0,
+        stream_decode_retries: int = 0,
     ) -> None:
         self.calls += 1
         self.cache_read += cache_read
         self.cache_creation += cache_creation
         self.uncached_input += uncached_input
         self.output += output
+        self.add_retries(
+            timeout_retries=timeout_retries,
+            degenerate_retries=degenerate_retries,
+            connection_retries=connection_retries,
+            stream_decode_retries=stream_decode_retries,
+        )
+
+    def add_retries(
+        self,
+        *,
+        timeout_retries: int = 0,
+        degenerate_retries: int = 0,
+        connection_retries: int = 0,
+        stream_decode_retries: int = 0,
+    ) -> None:
         self.timeout_retries += timeout_retries
         self.degenerate_retries += degenerate_retries
+        self.connection_retries += connection_retries
+        self.stream_decode_retries += stream_decode_retries
 
     def summary(self) -> JsonDict:
         return {
@@ -223,6 +244,8 @@ class UsageBucket:
             "output": self.output,
             "timeout_retries": self.timeout_retries,
             "degenerate_retries": self.degenerate_retries,
+            "connection_retries": self.connection_retries,
+            "stream_decode_retries": self.stream_decode_retries,
             "cache_read_rate": _cache_rate(
                 self.cache_read,
                 self.cache_creation,
@@ -243,6 +266,30 @@ class UsageAggregator:
     context_hashes: Set[str] = field(default_factory=set)
     _states: Dict[str, UsageState] = field(default_factory=dict)
 
+    def add_failed_call_retries(self, usage: JsonDict, *, source: str) -> None:
+        """Fold retries from a call that raised instead of returning.
+
+        Such a call has no token usage to report, and counting it under `calls`
+        would dilute the per-call averages with a turn that produced nothing —
+        so only the retry counters move.
+        """
+        counters = {
+            key: _usage_int(usage, key)
+            for key in (
+                "timeout_retries",
+                "degenerate_retries",
+                "connection_retries",
+                "stream_decode_retries",
+            )
+        }
+        if not any(counters.values()):
+            return
+        for bucket in (
+            self.total,
+            self.by_source.setdefault(source, UsageBucket()),
+        ):
+            bucket.add_retries(**counters)
+
     def add(
         self,
         usage: JsonDict,
@@ -259,24 +306,23 @@ class UsageAggregator:
         output = _usage_int(usage, "output")
         timeout_retries = _usage_int(usage, "timeout_retries")
         degenerate_retries = _usage_int(usage, "degenerate_retries")
+        connection_retries = _usage_int(usage, "connection_retries")
+        stream_decode_retries = _usage_int(usage, "stream_decode_retries")
 
-        self.total.add(
-            cache_read,
-            cache_creation,
-            uncached_input,
-            output,
-            timeout_retries,
-            degenerate_retries,
-        )
-        bucket = self.by_source.setdefault(source, UsageBucket())
-        bucket.add(
-            cache_read,
-            cache_creation,
-            uncached_input,
-            output,
-            timeout_retries,
-            degenerate_retries,
-        )
+        for bucket in (
+            self.total,
+            self.by_source.setdefault(source, UsageBucket()),
+        ):
+            bucket.add(
+                cache_read,
+                cache_creation,
+                uncached_input,
+                output,
+                timeout_retries=timeout_retries,
+                degenerate_retries=degenerate_retries,
+                connection_retries=connection_retries,
+                stream_decode_retries=stream_decode_retries,
+            )
         if context_hash:
             self.context_hashes.add(context_hash)
 
@@ -325,6 +371,8 @@ class UsageAggregator:
             "output": output,
             "timeout_retries": timeout_retries,
             "degenerate_retries": degenerate_retries,
+            "connection_retries": connection_retries,
+            "stream_decode_retries": stream_decode_retries,
             "cache_read_rate": _cache_rate(
                 cache_read,
                 cache_creation,
@@ -382,6 +430,23 @@ class RunLogger:
             except Exception:
                 pass
 
+    def bind_context(self, **context: Any) -> "BoundRunLogger":
+        """Return a logger view that injects immutable event identity.
+
+        The underlying file, event sink, task paths, and usage aggregator stay
+        shared.  Context is merged last so a caller cannot spoof or accidentally
+        overwrite coordinator-owned worker identity.
+        """
+        return BoundRunLogger(self, context)
+
+    def record_llm_retries(self, *, source: str, usage: JsonDict) -> None:
+        """Account retries for a model call that raised instead of returning.
+
+        The failure itself is already reported as its own event; this only
+        keeps the retry counters in the usage summary honest.
+        """
+        self.usage_aggregator.add_failed_call_retries(usage, source=source)
+
     def record_llm_usage(
         self,
         *,
@@ -419,6 +484,61 @@ class RunLogger:
             return
         self.write("llm.usage_summary", self.usage_aggregator.summary())
         self._usage_summary_written = True
+
+
+class BoundRunLogger:
+    """Immutable per-actor view over a task-scoped :class:`RunLogger`."""
+
+    def __init__(self, logger: RunLogger, context: Dict[str, Any]):
+        self._logger = logger
+        self._context = dict(context)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._logger, name)
+
+    def bind_context(self, **context: Any) -> "BoundRunLogger":
+        return BoundRunLogger(
+            self._logger,
+            {**self._context, **dict(context)},
+        )
+
+    def write(self, event_type: str, payload: JsonDict) -> None:
+        self._logger.write(
+            event_type,
+            {**dict(payload or {}), **self._context},
+        )
+
+    def record_llm_usage(
+        self,
+        *,
+        source: str,
+        provider: str,
+        model: str,
+        usage: JsonDict,
+        step: Optional[int] = None,
+        conversation_id: Optional[str] = None,
+        context_hash: Optional[str] = None,
+    ) -> JsonDict:
+        payload = self._logger.usage_aggregator.add(
+            usage,
+            source=source,
+            provider=provider,
+            model=model,
+            conversation_id=conversation_id or source,
+            context_hash=context_hash,
+        )
+        if step is not None:
+            payload["step"] = step
+        for key in (
+            "timeout_attempts",
+            "timeout_seconds",
+            "timeout_max_retries",
+            "timeout_retry_interval_seconds",
+        ):
+            if key in usage:
+                payload[key] = usage[key]
+        self.write("llm.usage", payload)
+        return payload
 
 
 def make_browser_event_logger(

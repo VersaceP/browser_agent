@@ -2,8 +2,10 @@
 llm.openai_provider - OpenAI and OpenAI-compatible chat adapter.
 """
 
+import asyncio
 import json
 import os
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -11,7 +13,11 @@ try:
 except ImportError:
     AsyncOpenAI = None
 
-from llm.base import BaseLLMProvider
+from llm.base import (
+    BaseLLMProvider,
+    LLMStreamDecodeError,
+    _attempt_reason_summary,
+)
 from llm.cache_control import (
     _build_cache_diagnostics,
     _emit_cache_log,
@@ -20,6 +26,37 @@ from llm.cache_control import (
     _with_cache_control_diagnostics,
 )
 from runtime_config import ModelConfig
+
+
+def _merge_stream_identity(current: str, incoming: Any) -> str:
+    """Merge an id/name delta without duplicating full-value retransmissions."""
+    value = str(incoming or "")
+    if not value:
+        return current
+    if not current:
+        return value
+    if value == current:
+        return current
+    if value.startswith(current):
+        return value
+    if current.startswith(value):
+        return current
+    return current + value
+
+
+def _is_stream_options_rejection(exc: Exception) -> bool:
+    """Recognize compat gateways that reject stream_options/include_usage."""
+    status = getattr(exc, "status_code", None)
+    response = getattr(exc, "response", None)
+    if status is None and response is not None:
+        status = getattr(response, "status_code", None)
+    text = str(exc).lower()
+    explicitly_named = "stream_options" in text or "include_usage" in text
+    rejection_word = any(
+        word in text
+        for word in ("unknown", "unsupported", "unrecognized", "invalid", "not allowed")
+    )
+    return explicitly_named and rejection_word and (status is None or status in {400, 404, 422})
 
 
 def _degenerate_response_problem(response: Any) -> Optional[Dict[str, Any]]:
@@ -55,6 +92,27 @@ def _degenerate_response_problem(response: Any) -> Optional[Dict[str, Any]]:
                 "finish_reason": getattr(choices[0], "finish_reason", None),
             }
     return None
+
+
+def _validate_tool_argument_json(response: Any) -> None:
+    """Reject broken provider tool JSON before it can reach browser dispatch."""
+    for choice in (getattr(response, "choices", None) or []):
+        message = getattr(choice, "message", None)
+        for tool_call in (getattr(message, "tool_calls", None) or []):
+            function = getattr(tool_call, "function", None)
+            raw = str(getattr(function, "arguments", "") or "")
+            try:
+                parsed = json.loads(raw) if raw else {}
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise LLMStreamDecodeError(
+                    "OpenAI-compatible response contained malformed tool JSON",
+                    raw_arguments=raw,
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise LLMStreamDecodeError(
+                    "OpenAI-compatible tool arguments must decode to an object",
+                    raw_arguments=raw,
+                )
 
 
 class OpenAIProvider(BaseLLMProvider):
@@ -308,6 +366,10 @@ class OpenAIProvider(BaseLLMProvider):
                 "llm_timeout_max_retries",
                 "llm_timeout_backoff_seconds",
                 "llm_timeout_retry_interval_seconds",
+                # Providers always stream internally.  Keeping this reserved
+                # prevents a user-supplied stream=False from conflicting with
+                # the transport contract below.
+                "stream",
             }
             for key, value in self.config.extra_params.items():
                 if key not in reserved_extra_keys:
@@ -343,18 +405,138 @@ class OpenAIProvider(BaseLLMProvider):
 
         timeout_attempts: List[Dict[str, Any]] = []
 
+        async def collect_streamed_completion(request_params: Dict[str, Any]):
+            """Consume Chat Completions chunks into the legacy final shape.
+
+            The OpenAI SDK's high-level chat.completions.stream() accumulator
+            rejects non-strict function tools.  This project intentionally
+            supports both strict and non-strict OpenAI-compatible gateways, so
+            aggregate the lower-level create(stream=True) chunks here instead.
+            """
+            stream_params = dict(request_params)
+            stream_params["stream"] = True
+            # Standard OpenAI streaming only includes token usage when this is
+            # requested. Compatible gateways may omit it; payload responses are
+            # still accepted by the existing degenerate-response policy.
+            include_stream_options = not bool(
+                getattr(self, "_stream_options_disabled_after_reject", False)
+            )
+            if include_stream_options:
+                stream_params.setdefault("stream_options", {"include_usage": True})
+
+            try:
+                stream = await asyncio.wait_for(
+                    self.client.chat.completions.create(**stream_params),
+                    timeout=self._llm_timeout_seconds(),
+                )
+            except Exception as exc:
+                if not include_stream_options or not _is_stream_options_rejection(exc):
+                    raise
+                stream_params.pop("stream_options", None)
+                _emit_cache_log(
+                    "[OpenAI] stream_options rejected; retrying without include_usage"
+                )
+                stream = await asyncio.wait_for(
+                    self.client.chat.completions.create(**stream_params),
+                    timeout=self._llm_timeout_seconds(),
+                )
+                self._stream_options_disabled_after_reject = True
+            content_parts: List[str] = []
+            tool_call_parts: Dict[int, Dict[str, str]] = {}
+            finish_reason = None
+            usage = None
+            saw_primary_choice = False
+
+            async with stream:
+                async for chunk in self._iterate_with_llm_idle_timeout(stream):
+                    chunk_usage = getattr(chunk, "usage", None)
+                    if chunk_usage is not None:
+                        usage = chunk_usage
+
+                    for choice in (getattr(chunk, "choices", None) or []):
+                        if int(getattr(choice, "index", 0) or 0) != 0:
+                            continue
+                        saw_primary_choice = True
+                        choice_finish_reason = getattr(choice, "finish_reason", None)
+                        if choice_finish_reason is not None:
+                            finish_reason = choice_finish_reason
+
+                        delta = getattr(choice, "delta", None)
+                        if delta is None:
+                            continue
+                        content = getattr(delta, "content", None)
+                        if content:
+                            content_parts.append(content)
+
+                        for tool_delta in (getattr(delta, "tool_calls", None) or []):
+                            index = int(getattr(tool_delta, "index", 0) or 0)
+                            parts = tool_call_parts.setdefault(
+                                index,
+                                {"id": "", "name": "", "arguments": ""},
+                            )
+                            tool_id = getattr(tool_delta, "id", None)
+                            if tool_id:
+                                parts["id"] = _merge_stream_identity(parts["id"], tool_id)
+                            function = getattr(tool_delta, "function", None)
+                            if function is not None:
+                                name = getattr(function, "name", None)
+                                arguments = getattr(function, "arguments", None)
+                                if name:
+                                    parts["name"] = _merge_stream_identity(parts["name"], name)
+                                if arguments:
+                                    parts["arguments"] += arguments
+
+            choices = []
+            if saw_primary_choice:
+                assembled_tool_calls = [
+                    SimpleNamespace(
+                        id=parts["id"],
+                        type="function",
+                        function=SimpleNamespace(
+                            name=parts["name"],
+                            arguments=parts["arguments"],
+                        ),
+                    )
+                    for _, parts in sorted(tool_call_parts.items())
+                ]
+                choices.append(
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content="".join(content_parts) or None,
+                            tool_calls=assembled_tool_calls or None,
+                        ),
+                        finish_reason=finish_reason,
+                    )
+                )
+            response = SimpleNamespace(choices=choices, usage=usage)
+            _validate_tool_argument_json(response)
+            return response
+
         async def request_with_timeout(request_params: Dict[str, Any]):
+            async def collect_nonstream_completion():
+                nonstream_params = dict(request_params)
+                nonstream_params["stream"] = False
+                result = await self.client.chat.completions.create(
+                    **nonstream_params
+                )
+                _validate_tool_argument_json(result)
+                return result
+
             response, attempts = await self._request_with_timeout_retries(
-                lambda: self.client.chat.completions.create(**request_params),
+                lambda: collect_streamed_completion(request_params),
                 provider="openai",
-                operation="chat.completions.create",
+                operation="chat.completions.stream",
                 response_validator=_degenerate_response_problem,
+                timeout_managed=True,
+                reserved_nonstream_fallback_factory=collect_nonstream_completion,
+                fallback_response_validator=_degenerate_response_problem,
             )
             if attempts:
                 timeout_attempts.extend(attempts)
                 _emit_cache_log(
-                    "[OpenAI] chat.completions.create recovered after "
-                    f"{len(attempts)} timeout/degenerate attempt(s)"
+                    "[OpenAI] chat.completions.stream recovered after "
+                    f"{len(attempts)} failed attempt(s) "
+                    f"({_attempt_reason_summary(attempts)})"
                 )
             return response
 
@@ -406,13 +588,13 @@ class OpenAIProvider(BaseLLMProvider):
         # 解析工具调用（转换回 Anthropic 格式）
         if message.tool_calls:
             for tc in message.tool_calls:
-                try:
-                    parsed_input = json.loads(tc.function.arguments) if tc.function.arguments else {}
-                except json.JSONDecodeError as e:
-                    parsed_input = {
-                        "_parse_error": str(e),
-                        "_raw_arguments": tc.function.arguments or "",
-                    }
+                # Whole-response validation above guarantees that malformed
+                # transport JSON can never masquerade as model-authored input.
+                parsed_input = (
+                    json.loads(tc.function.arguments)
+                    if tc.function.arguments
+                    else {}
+                )
                 tool_calls.append({
                     "id": tc.id,
                     "name": tc.function.name,
@@ -438,11 +620,23 @@ class OpenAIProvider(BaseLLMProvider):
             "cache_diagnostics": cache_diagnostics,
             "timeout_retries": sum(
                 1 for item in timeout_attempts
-                if item.get("reason") != "degenerate_response"
+                if item.get("reason") == "timeout"
             ),
             "degenerate_retries": sum(
                 1 for item in timeout_attempts
                 if item.get("reason") == "degenerate_response"
+            ),
+            "connection_retries": sum(
+                1 for item in timeout_attempts
+                if item.get("reason") == "connection_error"
+            ),
+            "stream_decode_retries": sum(
+                1 for item in timeout_attempts
+                if item.get("reason") == "stream_decode_error"
+            ),
+            "nonstream_fallback_used": any(
+                item.get("reason") == "nonstream_fallback"
+                for item in timeout_attempts
             ),
             "timeout_attempts": timeout_attempts,
             "timeout_seconds": self._llm_timeout_seconds(),

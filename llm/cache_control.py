@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+from llm.content_moderation import exception_status_code
 from runtime_config import ModelConfig
 _MARKER_POSITION_INDEX_RE = re.compile(r"\.(messages|content)\[\d+\]")
 _CACHE_CONTROL_MODES = {"auto", "on", "off"}
@@ -205,14 +206,7 @@ def _resolve_cache_control_decision(
 
 
 def _exception_status_code(exc: Exception) -> Optional[int]:
-    status_code = getattr(exc, "status_code", None)
-    response = getattr(exc, "response", None)
-    if status_code is None and response is not None:
-        status_code = getattr(response, "status_code", None)
-    try:
-        return int(status_code) if status_code is not None else None
-    except (TypeError, ValueError):
-        return None
+    return exception_status_code(exc)
 
 
 def _cache_control_exclusion_hint(exc: Exception) -> Optional[str]:
