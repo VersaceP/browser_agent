@@ -4,9 +4,10 @@ runtime_config.py - 全项目统一配置表（single source of truth）。
 config.json 的四张配置表全部定义在这一个文件里：
 
     顶层             -> ModelConfig       （LLM 连接：provider/model_id/api_key/超时重试/extra_params）
-    "vl": {...}      -> VLConfig          （视觉模型连接 + 各 VL 角色开关）
-    "browser": {...} -> ABCPClientConfig  （ABCP WebSocket 连接）
-    "harness": {...} -> HarnessConfig     （编排/步数预算/offload/HITL/skill 等运行时行为）
+    "vl": {...}             -> VLConfig            （视觉模型连接 + 各 VL 角色开关）
+    "plan_validator": {...} -> PlanValidatorConfig （独立计划审计模型）
+    "browser": {...}        -> ABCPClientConfig    （ABCP WebSocket 连接）
+    "harness": {...}        -> HarnessConfig       （编排/步数预算/offload/HITL/skill 等运行时行为）
 
 历史位置 llm/config.py、abcp_client.py、harness/config.py 仍从这里 re-export，
 旧 import 路径全部兼容。load_runtime_config() 是唯一装载入口；装载时对
@@ -74,6 +75,21 @@ def _normalize_selection_mode(value: Any) -> str:
     return mode if mode in ("manual", "auto") else "manual"
 
 
+HITL_ATTENDED = "attended"
+HITL_UNATTENDED = "unattended"
+
+
+def _normalize_hitl_attendance(value: Any) -> str:
+    """Unknown spellings fall back to `attended`.
+
+    Deliberately fail-safe rather than fail-fast: mis-reading a typo as
+    `unattended` would silently stop asking a human who IS there, which loses
+    work no retry can recover.
+    """
+    mode = str(value or "").strip().lower()
+    return mode if mode in (HITL_ATTENDED, HITL_UNATTENDED) else HITL_ATTENDED
+
+
 # ---------------------------------------------------------------------------
 # 顶层：ModelConfig（LLM 连接）
 # ---------------------------------------------------------------------------
@@ -99,6 +115,18 @@ class ModelConfig:
 
         with open(filepath, "r", encoding="utf-8") as f:
             data = json.load(f)
+        provider_value = data.get("provider")
+        if not isinstance(provider_value, str) or not provider_value.strip():
+            raise ValueError(
+                "顶层 provider 为必填字段，必须显式设置为"
+                " 'anthropic' 或 'openai'"
+            )
+        provider = provider_value.strip().lower()
+        if provider not in {"anthropic", "openai"}:
+            raise ValueError(
+                "顶层 provider 仅支持 'anthropic' 或 'openai'，"
+                f"当前值: {provider_value!r}"
+            )
         extra_params = (
             data.get("extra_params")
             if isinstance(data.get("extra_params"), dict)
@@ -109,7 +137,7 @@ class ModelConfig:
             return data.get(key, extra_params.get(key, default))
 
         return cls(
-            provider=data.get("provider", "anthropic"),
+            provider=provider,
             model_id=data.get("model_id", "claude-sonnet-4-20250514"),
             api_key=data.get("api_key") or cls._env(data.get("api_key_env")),
             base_url=data.get("base_url") or cls._env(data.get("base_url_env")),
@@ -151,6 +179,108 @@ class ModelConfig:
         if not key:
             return None
         return os.environ.get(key)
+
+
+# ---------------------------------------------------------------------------
+# "plan_validator" 段：独立计划审计模型
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PlanValidatorConfig:
+    enabled: bool = False
+    provider: str = "openai"
+    model_id: str = ""
+    api_key: Optional[str] = None
+    api_key_env: Optional[str] = None
+    base_url: Optional[str] = None
+    base_url_env: Optional[str] = None
+    max_tokens: int = 8000
+    llm_api_timeout_seconds: float = DEFAULT_LLM_API_TIMEOUT_SECONDS
+    llm_timeout_max_retries: int = DEFAULT_LLM_TIMEOUT_MAX_RETRIES
+    llm_timeout_backoff_seconds: float = DEFAULT_LLM_TIMEOUT_BACKOFF_SECONDS
+    llm_timeout_retry_interval_seconds: Optional[float] = None
+    extra_params: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: JsonDict) -> "PlanValidatorConfig":
+        if not isinstance(data, dict):
+            return cls()
+        api_key_env = str(data.get("api_key_env") or "").strip() or None
+        base_url_env = str(data.get("base_url_env") or "").strip() or None
+        return cls(
+            enabled=bool(data.get("enabled", cls.enabled)),
+            provider=str(data.get("provider", cls.provider) or cls.provider),
+            model_id=str(data.get("model_id", cls.model_id) or "").strip(),
+            api_key=(
+                data.get("api_key")
+                or (os.environ.get(api_key_env) if api_key_env else None)
+            ),
+            api_key_env=api_key_env,
+            base_url=(
+                data.get("base_url")
+                or (os.environ.get(base_url_env) if base_url_env else None)
+            ),
+            base_url_env=base_url_env,
+            max_tokens=_int_config(
+                data.get("max_tokens", cls.max_tokens),
+                cls.max_tokens,
+                minimum=256,
+                maximum=65536,
+            ),
+            llm_api_timeout_seconds=_float_config(
+                data.get(
+                    "llm_api_timeout_seconds",
+                    cls.llm_api_timeout_seconds,
+                ),
+                cls.llm_api_timeout_seconds,
+                minimum=1.0,
+            ),
+            llm_timeout_max_retries=_int_config(
+                data.get(
+                    "llm_timeout_max_retries",
+                    cls.llm_timeout_max_retries,
+                ),
+                cls.llm_timeout_max_retries,
+                minimum=0,
+                maximum=10,
+            ),
+            llm_timeout_backoff_seconds=_float_config(
+                data.get(
+                    "llm_timeout_backoff_seconds",
+                    cls.llm_timeout_backoff_seconds,
+                ),
+                cls.llm_timeout_backoff_seconds,
+                minimum=0.0,
+            ),
+            llm_timeout_retry_interval_seconds=_optional_float_config(
+                data.get("llm_timeout_retry_interval_seconds"),
+                minimum=0.0,
+            ),
+            extra_params=(
+                dict(data.get("extra_params"))
+                if isinstance(data.get("extra_params"), dict)
+                else {}
+            ),
+        )
+
+    def model_config(self) -> ModelConfig:
+        extra_params = dict(self.extra_params)
+        extra_params["max_tokens"] = int(self.max_tokens)
+        extra_params["tool_choice"] = "required"
+        extra_params.setdefault("temperature", 0)
+        return ModelConfig(
+            provider=self.provider,
+            model_id=self.model_id,
+            api_key=self.api_key,
+            base_url=self.base_url,
+            extra_params=extra_params,
+            llm_api_timeout_seconds=self.llm_api_timeout_seconds,
+            llm_timeout_max_retries=self.llm_timeout_max_retries,
+            llm_timeout_backoff_seconds=self.llm_timeout_backoff_seconds,
+            llm_timeout_retry_interval_seconds=(
+                self.llm_timeout_retry_interval_seconds
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +333,17 @@ class ABCPClientConfig:
 # "vl" 段：VLConfig（视觉模型 + 各 VL 角色开关）
 # ---------------------------------------------------------------------------
 
+def _clamped_unit(value: Any, default: float) -> float:
+    """Coerce a config value into [0, 1]; malformed input keeps the default so a
+    typo can never silently disable a safety threshold."""
+    if value is None:
+        return max(0.0, min(float(default), 1.0))
+    try:
+        return max(0.0, min(float(value), 1.0))
+    except (TypeError, ValueError):
+        return max(0.0, min(float(default), 1.0))
+
+
 @dataclass
 class VLConfig:
     enabled: bool = False
@@ -212,17 +353,44 @@ class VLConfig:
     api_key: Optional[str] = None
     max_checks_per_worker: int = 2
     default_timeout_seconds: float = 60.0
-    # captcha_solve (§13.4): bounded solve-plan retries before short-circuiting to
-    # HITL. Behavioral-risk / unknown challenges are NEVER retried (honest
-    # short-circuit in vl._finalize_captcha_solve); this only bounds the
-    # visual-self-consistent solve loop.
-    captcha_solve_max_retries: int = 2
-    # VL Role C (§13.4): auto-attempt a visual-self-consistent CAPTCHA via solve-plan
-    # (drag/click) before falling back to a human. Separate, default-OFF gate — this
-    # is the most consequential VL action (it acts on a challenge, with ToS/legal
-    # weight), so it must be opted into INDEPENDENTLY of vl.enabled / the other roles.
-    # When OFF (or vl.enabled OFF), a pause always resolves via the human path.
-    captcha_solve_enabled: bool = False
+    # captcha_solve: bounded solve-plan attempts before short-circuiting to HITL.
+    # Behavioral-risk / unknown challenges are NEVER retried (honest short-circuit
+    # in vl._finalize_captcha_solve); this only bounds the visual-self-consistent
+    # solve loop.
+    captcha_solve_max_retries: int = 3
+    # A CAPTCHA grounding request is materially heavier than an ordinary visual
+    # assertion.  Keep its provider timeout independent so routine visual checks
+    # still fail fast.  Provider failure ends the episode; this is not a retry
+    # budget for HTTP failures.
+    captcha_solve_timeout_seconds: float = 150.0
+    # Wall-clock ceiling for ONE auto-solve episode (screenshots + VL calls +
+    # Input + clearance checks). The human is waiting behind this, so a stuck or
+    # slow VL must not delay the HITL fall-back indefinitely.
+    captcha_solve_budget_seconds: float = 240.0
+    # Provider-specific CAPTCHA parameters (for example OpenAI-compatible
+    # extra_body.enable_thinking) must not silently alter ordinary VL roles.
+    captcha_solve_extra_params: Dict[str, Any] = field(default_factory=dict)
+    # How many auto-solve episodes one worker may spend in total. A page whose
+    # episode failed is additionally never retried — it belongs to the human path.
+    captcha_solve_max_episodes_per_worker: int = 2
+    # Minimum VL self-reported confidence to act on a solve plan, to accept a
+    # "no challenge here" claim, or to accept a post-solve clearance verdict.
+    # Anything below hands the page to a human instead. Clamped to [0, 1]; a
+    # missing/malformed confidence counts as 0.
+    captcha_solve_min_confidence: float = 0.8
+    # OCR carries a higher bar: a misread string is submitted as a real answer
+    # and burns one of the site's own attempts, whereas a misplaced drag usually
+    # just fails to move the puzzle.
+    captcha_solve_min_confidence_ocr: float = 0.9
+    # Auto-solve gate, ANDed with `enabled` (operator decision, 2026-08-05,
+    # superseding the 2026-07-31 "one switch for every role" decision). Both
+    # must be true: `enabled` stays the master VL switch, and this turns the
+    # CAPTCHA role off without giving up the other VL roles. Default True so an
+    # existing deployment keeps today's behaviour (VL on ⇒ auto-solve on).
+    # Read it through `captcha_autosolve_allowed()`, never on its own.
+    # The other independent controls are the per-skill `allow_auto_captcha`
+    # frontmatter flag, the confidence floors, and the budgets above.
+    captcha_solve_enabled: bool = True
     # VL Role A (§13.2): locate an AXTree-blind target visually, then PROMOTE the
     # pixel back to a durable canonical id via bbox containment. Default OFF — a
     # caller (slow-path recovery) opts in before invoking harness.vl.locate.
@@ -250,6 +418,15 @@ class VLConfig:
     reality_check_shortfall_threshold: int = 3
     extra_params: Dict[str, Any] = field(default_factory=dict)
 
+    def captcha_autosolve_allowed(self) -> bool:
+        """The one place the CAPTCHA auto-solve gate is evaluated.
+
+        Both switches must be on: `enabled` is the master VL gate, and
+        `captcha_solve_enabled` scopes the auto-solve role alone. Call sites
+        must not read either field directly, or the AND drifts.
+        """
+        return bool(self.enabled and self.captcha_solve_enabled)
+
     @classmethod
     def from_dict(cls, data: JsonDict) -> "VLConfig":
         if not isinstance(data, dict):
@@ -266,11 +443,42 @@ class VLConfig:
             default_timeout_seconds=float(
                 data.get("default_timeout_seconds", cls.default_timeout_seconds)
             ),
+            captcha_solve_enabled=bool(
+                data.get("captcha_solve_enabled", cls.captcha_solve_enabled)
+            ),
             captcha_solve_max_retries=int(
                 data.get("captcha_solve_max_retries", cls.captcha_solve_max_retries)
             ),
-            captcha_solve_enabled=bool(
-                data.get("captcha_solve_enabled", cls.captcha_solve_enabled)
+            captcha_solve_timeout_seconds=float(
+                data.get(
+                    "captcha_solve_timeout_seconds",
+                    cls.captcha_solve_timeout_seconds,
+                )
+            ),
+            captcha_solve_budget_seconds=float(
+                data.get(
+                    "captcha_solve_budget_seconds",
+                    cls.captcha_solve_budget_seconds,
+                )
+            ),
+            captcha_solve_extra_params=(
+                dict(data.get("captcha_solve_extra_params") or {})
+                if isinstance(data.get("captcha_solve_extra_params"), dict)
+                else {}
+            ),
+            captcha_solve_max_episodes_per_worker=int(
+                data.get(
+                    "captcha_solve_max_episodes_per_worker",
+                    cls.captcha_solve_max_episodes_per_worker,
+                )
+            ),
+            captcha_solve_min_confidence=_clamped_unit(
+                data.get("captcha_solve_min_confidence"),
+                cls.captcha_solve_min_confidence,
+            ),
+            captcha_solve_min_confidence_ocr=_clamped_unit(
+                data.get("captcha_solve_min_confidence_ocr"),
+                cls.captcha_solve_min_confidence_ocr,
             ),
             visual_locate_enabled=bool(
                 data.get("visual_locate_enabled", cls.visual_locate_enabled)
@@ -323,8 +531,106 @@ class HarnessConfig:
     # the same coordinator-owned fleet. The owner socket remains connected and
     # its notifications are relayed in-process to delegated workers.
     same_fleet_multiworker_enabled: bool = False
+    # Give every worker its own Fleet — its own cookie jar — unless its contract
+    # explicitly asks to share (session_key / fleet_id / reuse_from_worker_id /
+    # an explicit needs_isolated_session).
+    #
+    # Turning `same_fleet_multiworker_enabled` off is NOT equivalent: that only
+    # drops the cross-slot task group, while two workers on one slot still
+    # converge on that slot's fleet via the eligible/slot_default fallback in
+    # FleetCoordinator.choose_existing.
+    #
+    # What this buys and what it does not: in task 48b4d7d7 three workers hit
+    # 1688 detail pages within 16 seconds from ONE cookie jar and all three were
+    # bounced, then one CAPTCHA froze the whole fleet for 84 minutes. Isolation
+    # removes the shared-fate half. It does NOT stop the site correlating them,
+    # because Fleet.setProxy / Fleet.setFppPolicy are unavailable here, so every
+    # Fleet still shares one egress IP and fingerprint — pacing, not identity,
+    # is the remaining lever.
+    #
+    # Cost: one Fleet is one browser instance.
+    worker_session_isolation_enabled: bool = False
+    # Upper bound on how many distinct Fleets ONE task may occupy (0 disables
+    # the cap). The harness never closes a Fleet, so a fleet a worker creates
+    # holds its budget slot until the platform stops reporting it: task
+    # 7a8d72db opened seven browser instances for seven sequential workers
+    # because per-worker isolation asks for a fresh cookie jar every time and
+    # nothing counted the total.
+    #
+    # Counted over the fleets actually bound to this task's workers, never over
+    # Fleet.list — that inventory is Agent-global and includes other tasks. A
+    # fleet that vanishes from the authoritative owner inventory stops counting,
+    # so the budget can be released as well as spent.
+    # An explicitly selected fleet (pinned browser context, worker_contract
+    # .fleet_id, a bound session_key, reuse_from_worker_id) is always honored
+    # and is never blocked by the cap; it does consume budget, so fewer fresh
+    # fleets remain for the rest of the task.
+    #
+    # At the cap the coordinator reuses one of the task's existing idle fleets
+    # instead of creating another. A request carrying a real identity boundary
+    # — an explicitly declared needs_isolated_session, or a new session_key —
+    # fails closed with task_fleet_limit_reached instead of quietly sharing a
+    # cookie jar; deployment-default isolation is not an identity boundary and
+    # degrades to reuse. Reuse prefers a fleet no running worker holds but will
+    # still share a busy one — ordinary routing already puts two live workers in
+    # one fleet, so the cap must not be stricter than the rule it degrades from.
+    max_task_fleets: int = 3
+    # Hold BrowserAgent construction until the coordinator-assigned Fleet has
+    # answered Fleet.status successfully. Fleet.ready is only a wake-up signal;
+    # the barrier always confirms readiness with an authoritative RPC. This is
+    # a soft signal-wait budget, not a total wall-clock timeout: up to two
+    # uncancellable ABCP status calls may extend the observed elapsed time.
+    fleet_readiness_barrier_enabled: bool = True
+    fleet_readiness_wait_seconds: float = 45.0
     fleet_auth_barrier_enabled: bool = True
     fleet_auth_barrier_wait_seconds: float = 120.0
+    # A quarantined page leaves the assignable pool until Page.getState proves
+    # it usable again. When the platform keeps reporting `paused` for a page
+    # whose challenge is actually over (the page_settled_after_hitl shape),
+    # that proof never arrives and the page leaks: still open, still holding
+    # fleet capacity, assignable to nobody. After this TTL the registry sync
+    # stops re-quarantining such a page and retires it instead, so a fresh one
+    # can be created. 0 disables retirement and restores indefinite quarantine.
+    page_quarantine_ttl_seconds: float = 300.0
+    # Consecutive failed re-checks (Page.getState itself raising) tolerated
+    # before an expired quarantine is retired without a clean verdict.
+    page_quarantine_recheck_max_failures: int = 2
+    # Page ownership and opaque Workflow exclusion never wait silently forever.
+    # A timed-out waiter receives a retryable fleet_busy receipt; the owning
+    # call is not cancelled.
+    page_lease_wait_timeout_seconds: float = 30.0
+    # Enforced by default. This is an operator emergency escape hatch, not a
+    # routing mode: disabling it removes process-local click serialization for
+    # workers sharing one Fleet and is therefore deliberately noisy.
+    fleet_click_gate_enabled: bool = True
+    # Process-local FleetClickGate. A waiter never blocks indefinitely behind
+    # ordinary lock contention. Opaque Workflow HITL is transferred to the
+    # FleetAuthBarrier instead; this longer bound is only a final backstop.
+    fleet_click_gate_acquire_timeout_seconds: float = 30.0
+    # Link/unknown targets retain the conservative popup settlement window.
+    fleet_click_gate_navigation_settlement_seconds: float = 0.75
+    # A fresh AX target that is mechanically known not to be a link gets a
+    # shorter observation window. The Fleet lock still covers the full call.
+    fleet_click_gate_non_link_settlement_seconds: float = 0.10
+    # A submitting key press (Enter in a search box) round-trips to the server
+    # before its result page exists, so it needs a longer observation window
+    # than a click. This bounds the Fleet lock only; a popup that lands after
+    # the window is still adopted from the Page.open notification stream.
+    fleet_click_gate_submit_settlement_seconds: float = 2.5
+    # Recently dispatched clicks leave a non-locking tombstone so a late popup
+    # or same-page navigation cannot be attributed to the next click.
+    fleet_click_gate_late_guard_seconds: float = 5.0
+    # Whether the click gate may REPORT that opener-compatible pages appeared
+    # during its window. It is an observation, never attribution: the gate no
+    # longer emits a confirmed landing page, because same-opener + same-
+    # sourceUrl + single-candidate is equally satisfied by a page that opens an
+    # ad on a timer. Turning it off only silences the observation; page
+    # discovery still runs through Page.list plus an atomic lease claim.
+    fleet_click_gate_popup_inventory_observation_enabled: bool = True
+    # ABCP can deliver an opaque Workflow HITL control event after the action
+    # RPC has already failed. Keep only its owner provenance longer; this does
+    # not retain the Fleet lock or delay another command.
+    fleet_click_gate_workflow_hitl_late_guard_seconds: float = 15.0
     auth_fleet_ledger_path: str = ".auth_fleet_ledger.json"
     # A transport failure quarantines the slot, then reconnects with the same
     # agentId before the coordinator is allowed to tombstone its session fleets.
@@ -355,10 +661,9 @@ class HarnessConfig:
     cache_pressure_min_remaining_steps: int = 2
     lead_model_timeout_step_retries: int = 1
     log_browser_payloads: bool = True
-    # Try a matching skill's frozen Workflow.execute fast path before the worker
-    # LLM loop (skill_registry.match → run_skill_workflow → success_contract →
-    # record_extraction). Fires only when a skill matches AND its required vars
-    # are derivable; otherwise falls through to the normal BrowserAgent loop.
+    # Subordinate future flag: try a matching skill's frozen Workflow.execute
+    # fast path before the worker LLM loop. It has no effect while the master
+    # workflow_execution_enabled switch is false.
     skill_fast_path_enabled: bool = True
     # How a skill gets selected for a run. "manual" (default, 2026-07-06 user
     # decision): ONLY an explicit user choice (`--skill <id>` / `/skill <id>` →
@@ -368,6 +673,11 @@ class HarnessConfig:
     # steal execution. "auto": restore the pre-07-06 behavior (deterministic
     # unique match + Lead selection gate).
     skill_selection_mode: str = "manual"
+    # Master control-plane gate for every Harness-owned Workflow.execute path.
+    # Keep disabled until ABCP supports pre-armed action events plus dynamic
+    # collection/state primitives required by portable hybrid skills. Workflow
+    # skill markdown remains available as guidance while this is false.
+    workflow_execution_enabled: bool = False
     # Runtime-only operator override (NOT read from config.json): set per run from
     # the terminal via `--skill <id>` or the interactive `/skill <id>` command,
     # which main.run_cli writes here. When set, it forces that skill for every
@@ -375,18 +685,13 @@ class HarnessConfig:
     # a phase whose required variables are not derivable falls back to the normal
     # loop (fail-safe). Empty = off.
     forced_skill_id: str = ""
-    # When the skill fast path falls back AND the BrowserAgent slow path then
+    # When the enabled skill fast path falls back AND the BrowserAgent slow path then
     # succeeds for a degraded (recently-failed) skill, distill the successful
     # trace into a candidate workflow and run skill_heal (write candidate →
     # canary → promote). Closes the rotted-skill self-healing loop; best-effort,
     # gated, and canary-validated so a bad candidate never promotes.
+    # It is also subordinate to workflow_execution_enabled.
     skill_auto_heal_enabled: bool = True
-    # Current-task only: after one validated row, a batch contract carrying
-    # batch_rows may distill a pure-ABCP workflow, canary it on the second row,
-    # and reuse it for the remainder. Never writes the skill registry.
-    # Disabled by default until the live ABCP canary covers both success and
-    # partial/fallback paths. Operators may opt in explicitly.
-    ephemeral_workflow_enabled: bool = False
     # Guidance (hints) 层的防腐弱信号：worker 结束后把「结局 + 步数 + agent 上报
     # 的 guidance_stale」记进 skills/.guidance_health.json（独立软通道——显式
     # 选择绕过 .skill_health.json，07-07 语义保持）。只标 needs_review 供人工
@@ -403,7 +708,22 @@ class HarnessConfig:
     # panel confirms cross-connection control works.
     skill_workflow_active_control_enabled: bool = False
     hitl_poll_interval_seconds: float = 2.0
-    hitl_wait_timeout_seconds: float = 1200.0
+    # Whether a human is actually reachable for this deployment. There is no
+    # platform signal to infer it from (ABCP exposes only Hitl.requestPause /
+    # Hitl.resolvePause, nothing about operator presence), so it is declared.
+    #   attended   - pause and wait; the budgets below apply.
+    #   unattended - nobody will answer, so do not pause at all: hand back a
+    #                terminal needs_human verdict immediately and leave the
+    #                fleet gate untouched.
+    # Task 48b4d7d7 spent 82 of its 128 minutes waiting for a human who was
+    # never there, and the wait held the whole fleet's auth barrier shut.
+    hitl_attendance: str = "attended"
+    hitl_wait_timeout_seconds: float = 900.0
+    # Cumulative pause budget (attended only). `hitl_post_resume_confirm_max_rounds`
+    # bounds rounds WITHIN one tool call; these bound them across calls, which is
+    # what browser-004 escaped by re-pausing four times from four separate calls.
+    hitl_max_pause_rounds_per_page: int = 3
+    hitl_max_pause_rounds_per_worker: int = 3
     hitl_no_repause_cooldown_seconds: float = 8.0
     hitl_post_resume_guard_seconds: float = 30.0
     hitl_post_resume_confirm_max_rounds: int = 3
@@ -471,6 +791,29 @@ class HarnessConfig:
                     cls.same_fleet_multiworker_enabled,
                 )
             ),
+            worker_session_isolation_enabled=bool(
+                data.get(
+                    "worker_session_isolation_enabled",
+                    cls.worker_session_isolation_enabled,
+                )
+            ),
+            max_task_fleets=max(
+                0,
+                int(data.get("max_task_fleets", cls.max_task_fleets)),
+            ),
+            fleet_readiness_barrier_enabled=bool(
+                data.get(
+                    "fleet_readiness_barrier_enabled",
+                    cls.fleet_readiness_barrier_enabled,
+                )
+            ),
+            fleet_readiness_wait_seconds=max(
+                0.01,
+                float(data.get(
+                    "fleet_readiness_wait_seconds",
+                    cls.fleet_readiness_wait_seconds,
+                )),
+            ),
             fleet_auth_barrier_enabled=bool(
                 data.get(
                     "fleet_auth_barrier_enabled",
@@ -485,6 +828,93 @@ class HarnessConfig:
                         cls.fleet_auth_barrier_wait_seconds,
                     )
                 ),
+            ),
+            page_quarantine_ttl_seconds=max(
+                0.0,
+                float(
+                    data.get(
+                        "page_quarantine_ttl_seconds",
+                        cls.page_quarantine_ttl_seconds,
+                    )
+                ),
+            ),
+            page_quarantine_recheck_max_failures=max(
+                0,
+                int(
+                    data.get(
+                        "page_quarantine_recheck_max_failures",
+                        cls.page_quarantine_recheck_max_failures,
+                    )
+                ),
+            ),
+            page_lease_wait_timeout_seconds=max(
+                0.01,
+                float(data.get(
+                    "page_lease_wait_timeout_seconds",
+                    cls.page_lease_wait_timeout_seconds,
+                )),
+            ),
+            fleet_click_gate_enabled=bool(
+                data.get(
+                    "fleet_click_gate_enabled",
+                    cls.fleet_click_gate_enabled,
+                )
+            ),
+            fleet_click_gate_acquire_timeout_seconds=max(
+                0.01,
+                float(data.get(
+                    "fleet_click_gate_acquire_timeout_seconds",
+                    cls.fleet_click_gate_acquire_timeout_seconds,
+                )),
+            ),
+            fleet_click_gate_navigation_settlement_seconds=max(
+                0.0,
+                float(data.get(
+                    "fleet_click_gate_navigation_settlement_seconds",
+                    cls.fleet_click_gate_navigation_settlement_seconds,
+                )),
+            ),
+            fleet_click_gate_non_link_settlement_seconds=max(
+                0.0,
+                float(data.get(
+                    "fleet_click_gate_non_link_settlement_seconds",
+                    cls.fleet_click_gate_non_link_settlement_seconds,
+                )),
+            ),
+            fleet_click_gate_submit_settlement_seconds=max(
+                0.0,
+                float(data.get(
+                    "fleet_click_gate_submit_settlement_seconds",
+                    cls.fleet_click_gate_submit_settlement_seconds,
+                )),
+            ),
+            fleet_click_gate_late_guard_seconds=max(
+                0.0,
+                float(data.get(
+                    "fleet_click_gate_late_guard_seconds",
+                    cls.fleet_click_gate_late_guard_seconds,
+                )),
+            ),
+            fleet_click_gate_popup_inventory_observation_enabled=bool(
+                data.get(
+                    "fleet_click_gate_popup_inventory_observation_enabled",
+                    data.get(
+                        # Accept both pre-rename keys so an existing config that
+                        # explicitly silenced this keeps doing so.
+                        "fleet_click_gate_popup_inventory_attribution_enabled",
+                        data.get(
+                            "fleet_click_gate_legacy_popup_inventory_attribution_enabled",
+                            cls.fleet_click_gate_popup_inventory_observation_enabled,
+                        ),
+                    ),
+                )
+            ),
+            fleet_click_gate_workflow_hitl_late_guard_seconds=max(
+                0.0,
+                float(data.get(
+                    "fleet_click_gate_workflow_hitl_late_guard_seconds",
+                    cls.fleet_click_gate_workflow_hitl_late_guard_seconds,
+                )),
             ),
             auth_fleet_ledger_path=str(
                 data.get(
@@ -590,10 +1020,10 @@ class HarnessConfig:
             skill_auto_heal_enabled=bool(
                 data.get("skill_auto_heal_enabled", cls.skill_auto_heal_enabled)
             ),
-            ephemeral_workflow_enabled=bool(
+            workflow_execution_enabled=bool(
                 data.get(
-                    "ephemeral_workflow_enabled",
-                    cls.ephemeral_workflow_enabled,
+                    "workflow_execution_enabled",
+                    cls.workflow_execution_enabled,
                 )
             ),
             skill_guidance_signal_enabled=bool(
@@ -618,6 +1048,21 @@ class HarnessConfig:
                     cls.hitl_poll_interval_seconds,
                 )
             ),
+            hitl_attendance=_normalize_hitl_attendance(
+                data.get("hitl_attendance", cls.hitl_attendance)
+            ),
+            hitl_max_pause_rounds_per_page=max(0, int(
+                data.get(
+                    "hitl_max_pause_rounds_per_page",
+                    cls.hitl_max_pause_rounds_per_page,
+                )
+            )),
+            hitl_max_pause_rounds_per_worker=max(0, int(
+                data.get(
+                    "hitl_max_pause_rounds_per_worker",
+                    cls.hitl_max_pause_rounds_per_worker,
+                )
+            )),
             page_settlement_timeout_seconds=float(
                 data.get(
                     "page_settlement_timeout_seconds",
@@ -687,6 +1132,9 @@ class RuntimeConfig:
     model: ModelConfig
     browser: ABCPClientConfig
     harness: HarnessConfig
+    plan_validator: PlanValidatorConfig = field(
+        default_factory=PlanValidatorConfig
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -699,6 +1147,7 @@ _TOP_LEVEL_EXTRA_KEYS = {
     "base_url_env",
     "agent_id",
     "vl",
+    "plan_validator",
     "browser",
     "harness",
 }
@@ -736,6 +1185,11 @@ def audit_config_keys(raw: JsonDict) -> List[str]:
     # runtime-only 字段不算“不认识”，下面单独给更准确的专属提示。
     check("harness", raw.get("harness"), _field_names(HarnessConfig))
     check("vl", raw.get("vl"), _field_names(VLConfig) | _VL_ALIAS_KEYS)
+    check(
+        "plan_validator",
+        raw.get("plan_validator"),
+        _field_names(PlanValidatorConfig),
+    )
 
     harness_raw = raw.get("harness")
     if isinstance(harness_raw, dict):
@@ -773,4 +1227,7 @@ def load_runtime_config(config_path: str, *, warn: bool = True) -> RuntimeConfig
         model=model,
         browser=ABCPClientConfig.from_dict(browser_raw),
         harness=harness,
+        plan_validator=PlanValidatorConfig.from_dict(
+            raw.get("plan_validator", {})
+        ),
     )

@@ -17,7 +17,23 @@
     "model_id": "qwen-vl-xxx",
     "base_url": "https://your-qwen-compatible-endpoint.example/v1",
     "api_key": "YOUR_VL_API_KEY",
-    "max_checks_per_worker": 5
+    "max_checks_per_worker": 5,
+    "default_timeout_seconds": 60,
+    "captcha_solve_timeout_seconds": 150,
+    "captcha_solve_budget_seconds": 240,
+    "captcha_solve_extra_params": {
+      "extra_body": {
+        "enable_thinking": false
+      }
+    }
+  },
+  "plan_validator": {
+    "enabled": false,
+    "provider": "openai",
+    "model_id": "YOUR_INDEPENDENT_VALIDATOR_MODEL_ID",
+    "base_url": "https://your-validator-endpoint.example/v1",
+    "api_key_env": "PLAN_VALIDATOR_API_KEY",
+    "max_tokens": 8000
   },
   "browser": {
     "request_shape": "jsonrpc",
@@ -27,15 +43,8 @@
     "max_steps": 50,
     "lead_max_steps": 50,
     "worker_max_steps": 50,
-    "fleet_reuse_enabled": true,
-    "same_fleet_multiworker_enabled": false,
-    "fleet_auth_barrier_enabled": true,
-    "fleet_auth_barrier_wait_seconds": 120,
-    "auth_fleet_ledger_path": ".auth_fleet_ledger.json",
-    "fleet_slot_reconnect_attempts": 2,
-    "fleet_slot_reconnect_backoff_seconds": 0.25,
-    "fleet_slot_manual_reset_after_failures": 3,
-    "memory_context": "ABCP agent harness: 使用浏览器原子能力完成用户任务；方法语义和参数以 System.getCapabilities 的 description 与 paramsSchema 为准。",
+    "workflow_execution_enabled": false,
+    "max_task_fleets": 3,
     "semantic_tree": "internal"
   }
 }

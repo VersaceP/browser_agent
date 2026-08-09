@@ -66,6 +66,9 @@ LEAD_FLEET_ROUTING_DECISION_CODES = (
     "session_manual_reset_required",
     "session_slot_busy",
     "fleet_owner_unavailable",
+    "fleet_reference_invalid",
+    "fleet_reference_not_found",
+    "ambiguous_fleet_reference",
     "reuse_fleet_lost",
     "reuse_session_conflict",
     "session_isolation_conflict",
@@ -73,6 +76,7 @@ LEAD_FLEET_ROUTING_DECISION_CODES = (
     "session_binding_conflict",
     "fleet_session_conflict",
     "released_fleet_conflict",
+    "task_fleet_limit_reached",
 )
 
 LEAD_FLEET_ROUTING_DECISION_GUIDANCE = """- session_fleet_lost: the named fleet disappeared from the owner inventory and is effectively terminal until explicit reset/re-authentication. Mark the auth session stale and follow the auth-interrupt/login recovery flow; never retry or silently rebind the same session_key.
@@ -86,11 +90,15 @@ Fleet routing rejection table for spawn_browser_agent:
 - session_manual_reset_required: repeated owner-socket recovery failed. Stop retrying. A host/operator must restore the transport or explicitly reset the exact fleet/generation; the Lead must never release or silently rebind it.
 - session_slot_busy: when multi-worker fleet reuse is disabled, wait for the worker using that named session; never route the session to another fleet.
 - fleet_owner_unavailable: wait for the owner slot to reconnect; do not replace the task/session fleet.
+- fleet_reference_invalid: copy an existing Fleet UUID or a hexadecimal UUID prefix of at least eight characters into fleet_id; never put it in session_key.
+- fleet_reference_not_found: refresh the authoritative Fleet inventory or ask the user for the current Fleet; never create a replacement.
+- ambiguous_fleet_reference: use a longer Fleet UUID prefix that uniquely identifies one existing Fleet.
 - reuse_fleet_lost: drop reuse_from_worker_id and request a fresh coordinator assignment.
 - reuse_session_conflict: keep the source worker's session_key, or start a fresh named session without inheriting that worker.
 - session_isolation_conflict: start a fresh fleet whose needs_isolated_session contract matches the request.
 - fleet_routing_conflict: session_key, preferred_slot_id, and reuse_from_worker_id disagree; remove the conflicting selectors instead of retrying them unchanged.
 - session_binding_conflict / fleet_session_conflict / released_fleet_conflict: fail closed and follow next_instruction; these protect an existing or released cookie jar from reassignment.
+- task_fleet_limit_reached: the task already occupies runtime_limits.max_task_fleets fleets and this spawn cannot be served from them — it demanded a separate identity (needs_isolated_session or a new session_key), or every task fleet is bound to a named session and none may be lent to a generic worker. An ordinary fleetless spawn is normally NOT rejected here; it silently reuses a task fleet. Waiting does not clear this rejection: the harness never closes a fleet, so a finished worker still holds its own, and a named session stays bound after its worker ends. Continue on a fleet the task already has (drop needs_isolated_session, or pass the exact session_key already bound to it), release a session binding through the auth-recovery flow, or ask the operator to raise harness.max_task_fleets. Never retry it as a fresh fleet.
 """
 
 GENERIC_TOOL_RESULT_KEEP_KEYS = (
@@ -141,7 +149,13 @@ PAGE_DEAD_OBSERVATION_MARKERS = RENDER_LOST_MARKERS + (
     "Renderer crashed",
 )
 RENDER_RECOVERY_WINDOW_SECONDS = 30.0
-RENDER_RECOVERY_METHODS = {"Page.getState", "Page.switchTo", "Page.navigate"}
+RENDER_RECOVERY_METHODS = {
+    "Page.getState",
+    "Page.switchTo",
+    "Page.navigate",
+    "Page.reload",
+    "Page.go",
+}
 READ_METHODS_RETRY_AFTER_NAVIGATE = {
     "Page.screenshot",
     "DOM.getAXTree",
@@ -152,12 +166,18 @@ READ_METHODS_RETRY_AFTER_NAVIGATE = {
 }
 ACTION_METHODS = {
     "Input.click",
+    "Input.select",
     "Input.type",
     "Input.press",
     "Input.scroll",
     "Input.drag",
 }
-ANCHOR_PARAM_KEYS = {"selector", "nodeId", "toSelector", "toNodeId"}
+ANCHOR_PARAM_KEYS = {"selector", "id", "nodeId", "toSelector", "toNodeId"}
+
+# Recoverable routing classification: the worker's immutable artifact contract
+# lacks the nested-array shape required by collect_items, so only Lead can fix
+# it by replanning. This is deliberately not a worker/phase terminal status.
+COLLECTION_CONTRACT_REPLAN_REQUIRED = "collection_contract_replan_required"
 
 # --- Worker status taxonomy (see harness/diagnostics.py) ---
 WORKER_STATUS_DONE = "done"
@@ -262,6 +282,7 @@ PAGE_CRASHED_FAIL_THRESHOLD = 3
 EXTRACTION_METHODS = frozenset({
     "Runtime.evaluate",
     "DOM.getAXTree",
+    "DOM.inspectSelect",
     "DOM.getText",
     "DOM.getSemanticTree",
 })
