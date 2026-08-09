@@ -20,23 +20,21 @@ tested: true
 
 ## 状态
 
-这是标准 `Workflow.execute` skill；没有新增 execution mode。当前版本已通过静态契约检查，
-但迁移后尚未完成 live canary，因此保持 `draft: true`、`tested: false`。运行：
+该 skill 已迁移为 hints-only。旧冻结流程依赖 `Runtime.evaluate` 在页面内维护跨滚动
+accumulator，无法满足当前“仅模型显式、isolated、read-only、trace-gated”的 Runtime
+边界，因此 `workflow.json` 已移除。运行时由 BrowserAgent 按以下已验证页面知识执行，
+并通过 artifact validators 验收。
 
-`/skill-create --recheck theresanaiforthat-com-collection-2`
-
-只有页面实跑、结构化输出解析及来源 phase 的 artifact validators 全部通过后，复检才会写入
-`.skill_health.json`，并自动改为 `draft: false`、`tested: true`。`--no-test` 只做静态检查，
-不会生成健康记录。
-
-## 冻结流程
+## 页面知识（hints）
 
 1. 从当前 phase 的 validator 派生 `targetUrl`、rank 下限/上限和精确行数。
 2. 导航到 weekly trending 页面并尝试用 Escape 关闭非认证遮罩。
-3. 按 DOM 顺序收集 `a.ai_link`，只保留本站、无 query/hash、路径为 `/ai/<slug>/` 的唯一链接。
-4. 如果候选数不足最大 rank，循环滚动并继续合并；不猜测历史产品 URL。
-5. 将候选数组 `JSON.stringify` 到标量变量 `structuredRowsJson`。
-6. harness 按 DOM 顺序生成 rank、截取 phase 的 rank window、补充 provenance，随后一次性
+3. 用 `DOM.getAXTree` 枚举当前可见的 canonical ids；相关字段分别通过一次批量
+   `DOM.getText` 和一次批量 `DOM.getAttribute` 读取，并按 targets 输入顺序重建行。
+4. 需要滚动累积时执行有界原生循环：刷新 AXTree、枚举 canonical ids、批量读取文本/属性、
+   本地去重、滚动或点击一次 load-more，再重复；不要用页面 JS accumulator。
+5. 只保留本站、无 query/hash、路径为 `/ai/<slug>/` 的唯一链接；不猜测历史产品 URL。
+6. 按 DOM 顺序生成 rank、截取 phase 的 rank window、补充 provenance，随后一次性
    `record_extraction`；行数、范围、URL pattern、唯一性或持久化契约任一不满足即回落。
 
 ## 健康记账边界

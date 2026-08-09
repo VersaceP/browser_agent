@@ -33,34 +33,6 @@
       "purpose": "Refresh DOM identity after navigation before challenge detection and extraction."
     },
     {
-      "action": "Runtime.evaluate",
-      "params": {
-        "expression": "function chl(){var t=(document.title||'').toLowerCase();var m=['just a moment','verify you are human','checking your browser','attention required'];var hit=m.some(function(s){return t.indexOf(s)>=0;});return {challenge:hit?'yes':''};}return chl();",
-        "returnByValue": true
-      },
-      "extract": {
-        "challengeFlag": "challenge"
-      },
-      "onError": "continue",
-      "purpose": "Detect a Cloudflare/CAPTCHA challenge by TITLE markers only (challengeFlag='yes' only when challenged). URL markers are deliberately absent: after auto-clearance the URL can retain a residual __cf_chl_rt_tk param while the page is already the real product page (live-observed 2026-07-04), so a URL check would false-positive into a 20-minute Hitl.resumed wait. Deliberately kept as Runtime.evaluate: this is the challenge BOUNDARY (control flow), not content extraction, and make_challenge_poller mirrors this exact JS on the second connection."
-    },
-    {
-      "type": "if",
-      "condition": {
-        "path": "$vars.challengeFlag",
-        "operator": "matches",
-        "value": "yes"
-      },
-      "then": [
-        {
-          "type": "listen",
-          "event": "Hitl.resumed",
-          "timeout": 1200000,
-          "onTimeout": "continue"
-        }
-      ]
-    },
-    {
       "action": "Input.press",
       "params": {
         "key": "Escape"

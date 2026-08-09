@@ -28,6 +28,12 @@ allow_auto_captcha: false
    （workflow.json 的最后一步只负责把字段读进 variables，不调 record_extraction——见 skills/README.md §4。）
 5. 按 fallback.yaml 的 `success_contract` 判定成功；不成立或带 error → 走兜底契约。
 
+## 内容完整性声明（按需）
+- 如果站点会出现“详情外壳正常、任务区块整体缺失”，在 workflow.json 顶层填写 `content_completeness`；否则删除该空模板字段。
+- `shell_markers` 描述可确认详情外壳已加载的文本/语义标记，`expected_regions` 描述任务必需区块。
+- 站点私有风险字段只放在 `suppression_signals`，不得写进 Harness 通用分类。
+- 此声明只驱动 BrowserAgent 的完整性门控与列表链接恢复，不会把内容抑制路由到 CAPTCHA/HITL。
+
 ## 成功判据（人读版，机器判定见 fallback.yaml）
 - browser_call 无 error（observation 前缀 "Workflow execution completed:"）。
 - workflow 写入了 `variables_required` 列出的全部变量。

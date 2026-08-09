@@ -169,10 +169,11 @@ DOM.axTreeUpdated
 4. 引擎 autoExtract（如从 AXTree 自动抽 exampleId）+ `pageId`/`fleetId` 自动注入每个 action step 的 params。
 
 **所有变量值都是 scalar（string|number|boolean）**（`types/index.ts:68`）。数组/对象不能直接成为
-variable，但可以由冻结 workflow `JSON.stringify` 成一个 string variable，再由 harness 按声明式
-`structured_output` 契约解码——见 §4。
+variable。历史上的 `structured_output/json_variable` 通道依赖冻结 workflow 内的
+`Runtime.evaluate`，现已不受支持；多行抽取应走 BrowserAgent 的 AXTree 枚举 + 原生批量
+`DOM.getText`/`DOM.getAttribute` + `record_extraction`。
 
-**`Runtime.evaluate` 契约（联机实测）**：`expression` 当**函数体**跑、**必须 `return`**（裸表达式如 `1+1`/`({a:1})` 返回 null）。一发返回一个 JSON 对象，配 `extract: {reviewsText:"reviews", ...}` 把多个字段拆进 scalar 变量——是"内容全在 DOM、CSS/AXTree 取不到单容器"时的拼装首选。`Runtime.evaluate` 已从 strategy_bank `avoid_tools` 解禁（仍 cautioned，勿滥用于 DOM 工具能干的活）。
+**`Runtime.evaluate` 不得出现在冻结 workflow 中**。运行期 BrowserAgent 也只能把它作为所有结构化原生读取均已失败后的只读末级手段，并显式使用 `world="isolated"`；只有 `non_dom_state` 的专用 blocker 可以由 harness 授权一次严格 main 重试，skill authoring 不得冻结这类表达式。
 
 ### 3.6 元素定位纪律（authoring 必守）
 - **运行期重解析**：`DOM.getAXTree → transform(find+regex 取 id) → if matches(id 形) → 操作`（守卫用 `matches` 非 `exists`，见 §7 校验清单）。**绝不**把 epoch 绑定的 AXTree id / pageId 冻进 workflow.json（导航后引擎自动清 `$cache`，旧 id 必失效）。
@@ -190,35 +191,12 @@ variable，但可以由冻结 workflow `JSON.stringify` 成一个 string variabl
 | 数据形态 | 通道 |
 |---------|------|
 | **定 schema 的单行**（如一个详情页的 reviews/pros/cons/qa） | workflow 用 `extract`/`transform` 把每个字段写进 **scalar variables** → workflow 返回 → **harness/agent 读 `result.variables` 拼行 → 调 `record_extraction` 落盘** |
-| **多行 / 结构化** | 普通 `Workflow.execute` 在末步把 `{rows:[...]}` `JSON.stringify` 到一个 scalar variable；`workflow.json.structured_output` 声明变量名、字段、rank 规则和 phase window → harness 解码、验证并一次性 `record_extraction` |
+| **多行 / 结构化** | 不走冻结 workflow 快路径；由 BrowserAgent 枚举 AXTree canonical ids，批量读取文本/属性，完成有界滚动或 load-more 后调用 `record_extraction` |
 
 > 一句话：**workflow 负责“拿到值”，harness 负责“落盘”**。workflow.json 的最后一步**不是** record_extraction，而是把字段读进 variables 的那一步。
 
-标准多行声明示例（仍是普通 workflow，不是新的 skill 类型或 execution mode）：
-
-```jsonc
-{
-  "variables": {"targetUrl": "", "minRank": 1, "maxRank": 10, "expectedRows": 10},
-  "structured_output": {
-    "version": 1,
-    "transport": "json_variable",
-    "variable": "structuredRowsJson",
-    "fields": ["rank", "productName", "productUrl"],
-    "rank": {"field": "rank", "source": "dom_order", "base": 1},
-    "window": {"source": "phase_validator", "field": "rank", "inclusive": true},
-    "runtime_variables": {
-      "target_url": "targetUrl",
-      "rank_min": "minRank",
-      "rank_max": "maxRank",
-      "expected_rows": "expectedRows"
-    }
-  }
-}
-```
-
-`structured_output.variable` 必须由 workflow step 的 `extract` 真实产出；JSON 必须是数组或
-`{"rows": [...]}`。registry、静态复检、live recheck 和 dispatch 都 fail-closed 校验该声明。
-rank window 与精确行数来自当前 phase validators，不能把来源任务的一次历史范围写死成路由逻辑。
+`workflow.json.structured_output` 现由 registry 与 skill-create fail-closed 拒绝，避免把一个
+必然被 frozen-workflow Runtime 策略拦截的能力继续暴露为可用契约。
 
 ---
 

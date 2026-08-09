@@ -1,5 +1,14 @@
 {
   "description": "<workflow 目标一句话>",
+  "content_completeness": {
+    "shell_markers": [],
+    "expected_regions": [],
+    "suppression_signals": [],
+    "recovery": {
+      "mode": "listing_link_click",
+      "max_attempts_per_item": 2
+    }
+  },
   "variables": {
     "targetUrl": "",
     "headingText": "<目标区块的可见标题文本，用于运行期重解析其 id>"
@@ -25,28 +34,6 @@
     {
       "action": "DOM.getAXTree",
       "purpose": "Refresh DOM identity after navigation before using page state."
-    },
-    {
-      "action": "Runtime.evaluate",
-      "params": {
-        "expression": "function chl(){var t=(document.title||'').toLowerCase();var u=(location.href||'').toLowerCase();var m=['just a moment','verify you are human','checking your browser','attention required','cloudflare','cf-chl','__cf_chl','challenge-platform'];return {challenge:m.some(function(s){return t.indexOf(s)>=0||u.indexOf(s)>=0;})?'yes':''};}return chl();",
-        "returnByValue": true
-      },
-      "extract": { "challengeFlag": "challenge" },
-      "onError": "continue",
-      "purpose": "P4 active-control boundary: detect a Cloudflare/CAPTCHA challenge by title/url (empty on the happy path → next step skipped, zero cost). Do NOT declare challengeFlag in variables (it is runtime-set; declaring it would make it a required input). AUTHORING RULE: this MUST stay a Runtime.evaluate whose extract fills the flag — skill_control.make_challenge_poller reverse-engineers exactly this pair (the `if $vars.<flag> matches → listen Hitl.resumed` boundary + the Runtime.evaluate that fills <flag>) to re-run the SAME JS on the 2nd connection for in-page polling; produce the flag with any OTHER action and in-page polling SILENTLY no-ops (only navigation-level onset still fires)."
-    },
-    {
-      "type": "if",
-      "condition": { "path": "$vars.challengeFlag", "operator": "matches", "value": "yes" },
-      "then": [
-        {
-          "type": "listen",
-          "event": "Hitl.resumed",
-          "timeout": 1200000,
-          "onTimeout": "continue"
-        }
-      ]
     },
     {
       "action": "DOM.getAXTree",

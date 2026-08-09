@@ -1,6 +1,6 @@
 {
-  "version": 1,
-  "description": "Read-only v1 strategy bank. Strategies are mode-level procedural defaults, not permissions and not task-specific scripts. Raw attempts belong in strategy_attempts.jsonl.",
+  "version": 2,
+  "description": "Read-only cross-site slow-path guidance. Strategies never change permissions, contracts, validators, budgets, route state, or terminal decisions.",
   "strategies": [
     {
       "id": "web_scrape.collection.repeated_dom",
@@ -22,13 +22,12 @@
         "DOM.getAttribute",
         "record_extraction"
       ],
-      "cautioned_tools": ["extract_dom_records"],
-      "avoid_tools": ["Runtime.evaluate"],
+      "cautioned_tools": [],
+      "discouraged_tools": ["Runtime.evaluate"],
       "procedure": [
         "Confirm page state, then use DOM.getAXTree to identify item boundaries, labels, controls, and stable anchors.",
         "Scroll only when more items must be materialized; refresh DOM.getAXTree after scrolls.",
-        "Use one native targets batch for related DOM.getText or DOM.getAttribute reads when the live schema supports it; inspect each response.data.items entry independently.",
-        "Use extract_dom_records only if the repeated structure is uniform and the preferred DOM path is insufficient.",
+        "Enumerate stable canonical ids from the current AXTree, then use one native targets batch for related DOM.getText or DOM.getAttribute reads; inspect each response.data.items entry independently and preserve target order when rebuilding rows.",
         "Persist rows with record_extraction using exact expected_artifact field names."
       ],
       "success_criteria": [
@@ -42,8 +41,7 @@
         "rows lack stable text or attributes",
         "critical fields are derived only from loop index or visual position",
         "record_extraction field names do not match expected_artifact"
-      ],
-      "stats": {"success_count": 0, "fail_count": 0}
+      ]
     },
     {
       "id": "web_scrape.collection.attribute_links",
@@ -63,8 +61,8 @@
         "DOM.getText",
         "record_extraction"
       ],
-      "cautioned_tools": ["extract_dom_records"],
-      "avoid_tools": ["Runtime.evaluate"],
+      "cautioned_tools": [],
+      "discouraged_tools": ["Runtime.evaluate"],
       "procedure": [
         "Use DOM.getAXTree to locate the item/control/anchor associated with each attribute.",
         "Use DOM.getAttribute for the target attribute value.",
@@ -83,8 +81,7 @@
         "label and attribute come from unrelated nodes",
         "relative/absolute URL handling is undocumented",
         "selector is too fuzzy to identify one source element"
-      ],
-      "stats": {"success_count": 0, "fail_count": 0}
+      ]
     },
     {
       "id": "web_scrape.detail_sections.reveal_then_text",
@@ -92,7 +89,7 @@
       "stage": "detail_sections",
       "applies_to_stages": ["detail_sections"],
       "fallback": false,
-      "phase_keywords": ["detail", "section", "heading", "tab", "accordion", "expand", "show more", "anchor", "body"],
+      "phase_keywords": ["detail", "section", "heading", "tab", "accordion", "expand", "show more", "anchor", "body", "suppressed", "shell", "listing", "card"],
       "applies_when": [
         "A page contains named sections or detail regions whose bodies may need reveal actions.",
         "Reveal mechanisms may include tabs, accordions, show-more buttons, anchor links, or scroll-triggered lazy loading.",
@@ -101,34 +98,48 @@
       "preferred_tools": [
         "Page.getState",
         "DOM.getAXTree",
+        "DOM.getSemanticTree",
         "Input.click",
         "Input.scroll",
+        "Page.list",
+        "Page.switchTo",
+        "Page.go",
         "DOM.getText",
         "DOM.getAttribute",
         "record_extraction"
       ],
       "cautioned_tools": ["visual_verify"],
-      "avoid_tools": ["Runtime.evaluate", "extract_dom_records"],
+      "discouraged_tools": ["Runtime.evaluate"],
       "procedure": [
         "Use DOM.getAXTree to locate headings, controls, tab labels, accordion buttons, show-more controls, anchor links, and section bodies.",
         "Reveal hidden or lazy content through Input.click or Input.scroll only when the AXTree shows an appropriate control or target.",
         "Refresh DOM.getAXTree after each reveal action and verify the intended state or subtree changed.",
-        "Use DOM.getText for final section text and DOM.getAttribute only for associated ids, hrefs, or state attributes.",
-        "If a section is absent or blocked, record an explicit empty/missing value with evidence rather than fabricating text."
+        "Use DOM.getSemanticTree when required section text is absent from AXTree but present in the semantic DOM; use DOM.getText for focused final text and DOM.getAttribute for ids, real hrefs, or state attributes.",
+        "If the page shell exists but multiple expected sections remain missing, treat content completeness as unresolved rather than recording empty values or target_absent.",
+        "When a search/listing source exists, save sourcePageId/sourceUrl and stable item identity, take a Page.list inventory snapshot, then click one freshly rebound real anchor and inspect Page.list plus Page.getState before the next action; classify NEW_TAB, SAME_TAB, IN_PAGE, or NO_EFFECT from returned page and DOM feedback.",
+        "When a tool result includes routeRecovery, follow its structured return method and requiredActions. Honor routePreference only inside its task-local source-template/cohort scope and discard it after challenge/auth change, selector drift, NO_EFFECT, or missing required-region markers.",
+        "For a new-tab detail, return with Page.switchTo(sourcePageId); for a same-tab detail, return with Page.go back one history entry and then refresh Page.getState plus DOM.getAXTree. Use Page.navigate(sourceUrl) only as fallback.",
+        "If listing-link recovery remains available, report route_sensitive_content_suppression; after its bounded attempts are exhausted, report blocked_content_suppression instead of target_absent.",
+        "For a uniform repeated collection, enumerate item/field canonical ids and batch DOM.getText/DOM.getAttribute. If records require scrolling or load-more materialization, repeat the same native AXTree + batch-read cycle after one bounded materialization action and deduplicate locally; do not use page JavaScript or local_fs as live state."
       ],
       "success_criteria": [
         "section presence or absence is explicit",
-        "final text comes from DOM.getText or cited AXTree text",
+        "final text or records come from the selected structured DOM tool with cited page evidence",
         "reveal actions are verified before extraction",
+        "navigation-click outcomes are classified from Page/DOM feedback",
+        "listing state is restored with switchTo or history back before the next item",
+        "explicit repeated-record targets meet their requested count inside the target subtree",
         "row keys match expected_artifact"
       ],
       "failure_signatures": [
         "text is only a form prompt or placeholder",
         "click did not change target state or subtree",
         "visible selector points to a container unrelated to the target section",
-        "section body was summarized without DOM text evidence"
-      ],
-      "stats": {"success_count": 0, "fail_count": 0}
+        "section body was summarized without DOM text evidence",
+        "page shell success was mistaken for content completeness",
+        "a drawer shell or loading skeleton was mistaken for materialized records",
+        "a same-tab detail returned by direct navigation instead of history without a recorded fallback reason"
+      ]
     },
     {
       "id": "web_scrape.computed_relationship.eval_js",
@@ -150,11 +161,11 @@
         "record_extraction"
       ],
       "cautioned_tools": [],
-      "avoid_tools": ["unverified generated values"],
+      "discouraged_tools": ["unverified generated values"],
       "procedure": [
-        "Call browser_call(method=Runtime.evaluate) only with runtime_policy containing intent, effect, a valid reason_kind, why_dom_primitives_insufficient, cross_check_plan, and result_mode.",
+        "Call browser_call(method=Runtime.evaluate) only with runtime_policy containing intent, effect, a valid reason_kind, why_structured_tools_insufficient, cross_check_plan, and result_mode, and set params.world=isolated. Never request auto or main directly.",
         "Keep JavaScript scoped to the computed relationship; do not use it for text or attributes native DOM tools can read.",
-        "Return JSON-serializable values only.",
+        "For result_mode=json, pass a JSON-serializable value expression or invoked IIFE, never a function body with top-level return or an uninvoked function. For non_dom_state only, throw ReferenceError('ABCP_MAIN_WORLD_REQUIRED:<global>') when the required page global is absent in isolated world; the harness may then run one explicit strict main retry and records both attempts. Ordinary errors, timeouts, and empty values never authorize main.",
         "Cross-check target fields with DOM.getText or DOM.getAttribute before record_extraction.",
         "If cross-check is impossible, finalize with an explicit blocker rather than handing off unverified target data."
       ],
@@ -169,8 +180,7 @@
         "JavaScript returns non-serializable objects",
         "target fields have no DOM cross-check",
         "Runtime.evaluate is used for ordinary text/attribute extraction"
-      ],
-      "stats": {"success_count": 0, "fail_count": 0}
+      ]
     },
     {
       "id": "browser_action.form_interaction.axtree_input",
@@ -194,7 +204,7 @@
         "record_extraction"
       ],
       "cautioned_tools": ["visual_verify"],
-      "avoid_tools": ["Runtime.evaluate"],
+      "discouraged_tools": ["Runtime.evaluate"],
       "procedure": [
         "Locate controls and labels with DOM.getAXTree.",
         "Fill values with Input.type/Input.press and toggle/select with Input.click using AXTree ids or stable selectors.",
@@ -213,8 +223,7 @@
         "entered value is not reflected in DOM state",
         "submission outcome is assumed without verification",
         "CAPTCHA/login/payment/permission wall blocks completion"
-      ],
-      "stats": {"success_count": 0, "fail_count": 0}
+      ]
     },
     {
       "id": "browser_action.overlay.dismiss_ladder",
@@ -246,25 +255,14 @@
         "DOM.getText or DOM.getAttribute returns a visibility, viewport, or occlusion warning.",
         "DOM.getAXTree shows a dialog, alertdialog, login prompt, banner, or overlay covering target content."
       ],
-      "preferred_tools": [
-        "Page.getState",
-        "DOM.getAXTree",
-        "Input.click",
-        "Input.press",
-        "DOM.getText",
-        "DOM.getAttribute",
-        "Runtime.evaluate"
-      ],
+      "preferred_tools": ["dismiss_overlay"],
       "cautioned_tools": ["visual_verify"],
-      "avoid_tools": ["repeating the same blocked click"],
+      "discouraged_tools": ["repeating the same blocked click"],
       "procedure": [
-        "Refresh DOM.getAXTree and identify the blocking overlay, modal, or dialog text before retrying the original action.",
-        "If a close, dismiss, not-now, skip, or X control is visible in the current AXTree, click it with its canonical id.",
-        "If no explicit close control is available, try Input.press with Escape and refresh DOM.getAXTree.",
-        "If Escape fails and the prompt appears dismissible, verify a backdrop/outside click target before clicking: use gated Runtime.evaluate with runtime_policy.reason_kind=computed_geometry to inspect document.elementFromPoint at a proposed outside point and confirm it maps to the overlay/backdrop/container, not a login, payment, provider, consent-submit, navigation, or content control.",
-        "Use Input.click with x/y only after that elementFromPoint verification; otherwise report the blocker.",
-        "After each dismiss attempt, verify the overlay text disappeared with DOM.getAXTree before retrying the original blocked action once.",
-        "If the overlay persists, report the blocker or switch to an auth/session strategy instead of looping."
+        "Call dismiss_overlay once with the blocked target id/selector and original method; the composite owns close-control and Escape through native actions, plus AXTree disappearance checks. Coordinate backdrop/VL clicks are unavailable without an independent native point hit-test.",
+        "Treat auth/login and paywall blocked results as terminal for automatic dismissal; do not click provider, payment, consent-submit, or login controls.",
+        "Retry the original action at most once and only when dismiss_overlay reports that retry is safe; otherwise follow its structured blocker/next-step result.",
+        "If the overlay persists after the bounded composite, report the blocker instead of hand-running or repeating the dismissal ladder."
       ],
       "success_criteria": [
         "overlay disappearance is verified",
@@ -275,8 +273,7 @@
         "overlay persists after Escape/backdrop/close attempts",
         "dismiss action caused navigation or clicked a sensitive submit control",
         "the same occluded click is repeated without refreshing DOM.getAXTree"
-      ],
-      "stats": {"success_count": 0, "fail_count": 0}
+      ]
     },
     {
       "id": "browser_action.overlay.auth_persist_fleet",
@@ -316,7 +313,7 @@
         "Memory.save"
       ],
       "cautioned_tools": ["Network.getCookies", "Network.setCookies"],
-      "avoid_tools": ["storing passwords", "storing private tokens", "clicking provider login buttons automatically"],
+      "discouraged_tools": ["storing passwords", "storing private tokens", "clicking provider login buttons automatically"],
       "procedure": [
         "Treat auth memory as an index only: use Memory scope auth_fleet_sessions_v1 with kind auth_fleet_session_index for origin/account label to fleetId and verification timestamps, never as a credential store.",
         "Before using a remembered fleetId, verify Fleet.status or Page.create can revive it, then open the origin and confirm the login prompt is gone.",
@@ -333,8 +330,7 @@
         "remembered fleet is archived, missing, or still shows the auth prompt",
         "Memory contains credentials instead of session metadata",
         "worker repeatedly asks for login without checking auth memory"
-      ],
-      "stats": {"success_count": 0, "fail_count": 0}
+      ]
     },
     {
       "id": "hitl.guard.before_request_pause",
@@ -357,27 +353,30 @@
       ],
       "preferred_tools": ["Page.getState", "DOM.getAXTree", "Hitl.requestPause"],
       "cautioned_tools": ["Hitl.resolvePause"],
-      "avoid_tools": ["calling Hitl.resolvePause from the worker after requestPause", "polling browser tools while paused"],
+      "discouraged_tools": ["calling Hitl.resolvePause from the worker after requestPause", "polling browser tools while paused"],
       "procedure": [
         "Before requesting HITL for ordinary overlays, first verify page state and run the overlay dismiss ladder when it is safe.",
         "Use Hitl.requestPause only for CAPTCHA, hard auth walls, sensitive approval, manual review, or overlays that cannot be safely dismissed.",
         "Treat an unpredicted login, QR/SMS/2FA prompt, CAPTCHA, or human-verification gate as a runtime interrupt of the current worker; do not finalize solely to hand it to a new auth or HITL worker.",
         "A generic sign-in header alone is insufficient. Once Page.getState plus DOM.getAXTree show an authentication or verification surface, concrete auth controls or methods, and protected content that is blocked or inaccessible, call Hitl.requestPause immediately.",
+        "Inspect every depth-zero rootwebarea in DOM.getAXTree, including embedded frames. A challenge-labelled frame with a slider, checkbox, or verification button is decisive structural evidence even when the main page looks normal; let the harness enter HITL without requiring whole-page VL confirmation.",
         "After decisive DOM evidence, do not reread the same offloaded AXTree, record a gate-only artifact, take screenshots, or call visual_verify unless the evidence is ambiguous, contradictory, or primarily graphical.",
         "After Hitl.requestPause succeeds, the harness owns wait, resolve, and confirmation; do not call Hitl.resolvePause yourself.",
-        "Continue the original worker contract only when hitl_wait.status is resumed, after Page.getState and a fresh DOM.getAXTree verify that the protected target is usable; otherwise finalize with a blocker."
+        "Continue the original worker contract only when hitl_wait.status is resumed, after Page.getState and a fresh DOM.getAXTree verify that the challenge frame is gone; then retry the interrupted reveal/materialization checkpoint and verify the requested target record count. Otherwise finalize with a blocker."
       ],
       "success_criteria": [
         "HITL is reserved for genuine user action requirements",
         "the worker does not self-resolve its own pause",
-        "post-HITL page state is re-synchronized before DOM/Input actions"
+        "post-HITL page state is re-synchronized before DOM/Input actions",
+        "post-HITL business content is revalidated instead of accepting the page shell"
       ],
       "failure_signatures": [
         "Hitl.requestPause is used for a dismissible overlay before trying safe dismissal",
         "Hitl.resolvePause is called by the worker after requestPause",
-        "worker continues DOM/Input calls while the page is paused"
-      ],
-      "stats": {"success_count": 0, "fail_count": 0}
+        "worker continues DOM/Input calls while the page is paused",
+        "whole-page VL normal_loading overrides a challenge iframe with an actionable verification control",
+        "worker resumes after HITL but accepts a skeleton or drawer shell without revalidating target records"
+      ]
     }
   ]
 }

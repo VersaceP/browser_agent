@@ -195,17 +195,25 @@ large row sets.
 ## JavaScript Fallback
 
 The only model-facing JavaScript path is
-`browser_call({method:"Runtime.evaluate", ...})`. It is a last resort for
+`browser_call({method:"Runtime.evaluate", ...})`. It is a trace-gated last resort for
 computed geometry, cross-node relationships, shadow DOM traversal, cross-frame
 aggregation, non-DOM state, or legacy cases with no DOM equivalent. Supply the
 harness-only `runtime_policy` with intent, effect, a valid `reason_kind`,
-`why_dom_primitives_insufficient`, `cross_check_plan`, and `result_mode`. The
-old `eval_js_json` name is a hidden compatibility alias, not an agent choice.
+`why_structured_tools_insufficient`, `cross_check_plan`, and `result_mode`. The
+current page epoch must contain actual attempts of every available structured
+alternative (`Page.getState`, AX/Semantic tree, batched text, and batched
+attributes); prose claims do not satisfy this gate.
 
-Expose `world` only when the live Runtime schema supports it. Use `main` for
-page-defined globals and `isolated` for pristine DOM APIs. Read-only probes may
-use `auto`; scripts with possible side effects must choose an explicit world,
-because auto retry cannot prove the first attempt had no effects.
+The live Runtime schema must advertise strict `isolated` and `main` worlds, while
+every model-authored call must explicitly request `world="isolated"`. Direct
+`main`, `auto`, implicit/legacy worlds, and all state-changing scripts are
+rejected. Only `non_dom_state` may authorize one harness-controlled strict main
+retry: throw `ReferenceError("ABCP_MAIN_WORLD_REQUIRED:<global>")` when the
+required page global is absent in isolated world. Ordinary JavaScript errors,
+timeouts, and empty successful results never authorize main. With
+`result_mode="json"`, pass a JSON-serializable value expression or an invoked
+IIFE, never a function body containing top-level `return` or an uninvoked
+function value.
 
 Do not use JavaScript for ordinary visible text or attributes that
 `DOM.getText`/`DOM.getAttribute` can read. Never use it to bypass permissions,
@@ -215,11 +223,9 @@ defense-in-depth heuristic, not a JavaScript parser or security sandbox;
 ABCP's structured interaction, file, permission, and platform boundaries remain
 authoritative.
 
-Frozen skills may declare an explicit Runtime `world` before every deployed
-ABCP server supports it. The harness keeps that declaration on upgraded
-servers and omits it only from the legacy execution copy. Read-only local
-declarations such as `const title = document.title` are not page mutations;
-DOM/global/property writes and mutator calls remain state-changing.
+Frozen skills and harness-internal helpers may not execute Runtime scripts.
+They must use native Page/DOM/Input operations so a workflow cannot bypass the
+model-facing last-resort evidence gate.
 
 ## File Operations
 
