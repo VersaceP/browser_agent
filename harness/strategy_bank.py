@@ -9,7 +9,19 @@ from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
 from harness.task_types import normalize_task_type
+from harness.tool_policy import task_type_capability_covers
 from harness.utils import JsonDict, trim_large_strings
+
+
+STRATEGY_PROTOCOL = (
+    "Strategy Bank entries are cross-site procedural guidance, not facts,"
+    " permissions, contracts, validators, budgets, route state, or terminal"
+    " authority. Verify applies_when against live evidence. Discard guidance"
+    " that conflicts with Harness receipts, explicit worker/task contracts,"
+    " validated Skill guidance, or runtime safety fences. Site-specific URLs,"
+    " selectors, headings, and markers must come from live page evidence or a"
+    " validated Skill, never from Strategy Bank."
+)
 
 
 def resolve_strategy_bank_path(raw_path: str) -> Path:
@@ -58,12 +70,10 @@ def compact_strategy_bank(bank: JsonDict, *, max_strategies: int = 8) -> JsonDic
             "applies_to_stages": item.get("applies_to_stages") or [],
             "fallback": bool(item.get("fallback", False)),
             "cross_cutting": bool(item.get("cross_cutting", False)),
-            "site_domains": item.get("site_domains") or [],
-            "site_entry_urls": item.get("site_entry_urls") or [],
             "applies_when": item.get("applies_when") or [],
             "preferred_tools": item.get("preferred_tools") or [],
             "cautioned_tools": item.get("cautioned_tools") or [],
-            "avoid_tools": item.get("avoid_tools") or [],
+            "discouraged_tools": item.get("discouraged_tools") or [],
             "procedure": item.get("procedure") or [],
             "success_criteria": item.get("success_criteria") or [],
             "failure_signatures": item.get("failure_signatures") or [],
@@ -85,20 +95,27 @@ def _keyword_hits(text: str, values: Any) -> int:
     return sum(1 for value in values if str(value or "").lower() in lowered)
 
 
-def _site_hits(text: str, item: JsonDict) -> int:
-    domains = item.get("site_domains")
-    if not isinstance(domains, list) or not domains:
-        return 0
-    lowered = text.lower()
-    return sum(1 for domain in domains if str(domain or "").lower() in lowered)
-
-
 def _task_type_matches(task_type: Optional[str], item: JsonDict) -> bool:
+    # cross_cutting is an explicit declaration that the strategy applies across
+    # task types. Previously it was consulted only after this filter, making the
+    # declaration ineffective for every newly added task type.
+    if bool(item.get("cross_cutting", False)):
+        return True
     task_types = item.get("task_types") if isinstance(item.get("task_types"), list) else []
     if not task_type or not task_types:
         return True
     normalized = normalize_task_type(task_type)
-    return normalized in {normalize_task_type(value) for value in task_types}
+    declared = {normalize_task_type(value) for value in task_types}
+    if normalized in declared:
+        return True
+    # Strategy compatibility follows execution capability, not label equality: a
+    # phase that can call everything a strategy's declared type can call can
+    # also follow that strategy. Derived from the policy tables rather than
+    # listed here, so moving a domain between task types cannot leave a stale
+    # containment claim behind.
+    return any(
+        task_type_capability_covers(normalized, value) for value in declared
+    )
 
 
 def _stage_matches(stage_hint: str, item: JsonDict) -> bool:
@@ -116,11 +133,10 @@ def _render_strategy(item: JsonDict) -> JsonDict:
         "applies_to_stages": item.get("applies_to_stages") or [],
         "fallback": bool(item.get("fallback", False)),
         "cross_cutting": bool(item.get("cross_cutting", False)),
-        "site_domains": item.get("site_domains") or [],
-        "site_entry_urls": item.get("site_entry_urls") or [],
+        "applies_when": item.get("applies_when") or [],
         "preferred_tools": item.get("preferred_tools") or [],
         "cautioned_tools": item.get("cautioned_tools") or [],
-        "avoid_tools": item.get("avoid_tools") or [],
+        "discouraged_tools": item.get("discouraged_tools") or [],
         "procedure": item.get("procedure") or [],
         "success_criteria": item.get("success_criteria") or [],
         "failure_signatures": item.get("failure_signatures") or [],
@@ -147,12 +163,11 @@ def select_strategies_for_phase(
             continue
         if not _task_type_matches(task_type, item):
             continue
-        site_score = _site_hits(phase_text, item)
         rendered = _render_strategy(item)
         stage_match = bool(stage_hint and _stage_matches(stage_hint, item))
         keyword_score = _keyword_hits(phase_text, item.get("phase_keywords"))
         failure_score = _keyword_hits(phase_text, item.get("failure_signatures"))
-        score = keyword_score + failure_score + (site_score * 3)
+        score = keyword_score + failure_score
         if bool(item.get("fallback", False)):
             item_stage = str(item.get("stage") or "").strip()
             cross_cutting = bool(item.get("cross_cutting", False))
@@ -203,7 +218,10 @@ def render_strategy_guidance(strategies: List[JsonDict]) -> str:
         )
         guidance.append(rendered)
     return (
-        "<strategy_bank_guidance>\n"
+        "<strategy_bank_protocol>\n"
+        + STRATEGY_PROTOCOL
+        + "\n</strategy_bank_protocol>\n"
+        + "<strategy_bank_guidance>\n"
         + json.dumps(guidance, ensure_ascii=False, indent=2, default=str)
         + "\n</strategy_bank_guidance>"
     )

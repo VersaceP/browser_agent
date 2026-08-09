@@ -9,9 +9,14 @@ forbidden_methods still wins, and progress/loop guards handle overuse.
 
 from __future__ import annotations
 
-from typing import Any, Dict, FrozenSet, Iterable, Optional, Set
+from typing import Any, Dict, FrozenSet, Iterable, Optional, Set, Tuple
 
-from harness.task_types import normalize_task_type
+from harness.task_types import (
+    TASK_TYPE_SCENARIOS,
+    TASK_TYPE_SELECTION_RULE,
+    VALID_TASK_TYPES,
+    resolve_task_type_fail_closed,
+)
 
 
 # Tool input fields that carry secrets when the call opts into masking
@@ -23,8 +28,8 @@ SENSITIVE_TOOL_INPUT_FIELDS: Dict[str, FrozenSet[str]] = {
 
 # Harness composite tools hidden from the model tool surface for task types
 # where they have no legitimate use — pure schema-token/choice-noise savings.
-# Mirrors the ABCP-method task_type policy: hide only where we are confident
-# (fail-open for general/unknown and for form-capable task types).
+# Mirrors the ABCP-method task_type policy: explicit general remains broad, but
+# missing/unknown values resolve to restricted web_scrape defense-in-depth.
 HARNESS_TOOLS_HIDDEN_BY_TASK_TYPE: Dict[str, FrozenSet[str]] = {
     "web_scrape": frozenset({"fill_field_verified"}),
     "web_search": frozenset({"fill_field_verified"}),
@@ -35,7 +40,9 @@ HARNESS_TOOLS_HIDDEN_BY_TASK_TYPE: Dict[str, FrozenSet[str]] = {
 
 def hidden_harness_tools_for_task_type(task_type: object) -> Set[str]:
     return set(
-        HARNESS_TOOLS_HIDDEN_BY_TASK_TYPE.get(normalize_task_type(task_type))
+        HARNESS_TOOLS_HIDDEN_BY_TASK_TYPE.get(
+            resolve_task_type_fail_closed(task_type)
+        )
         or frozenset()
     )
 
@@ -127,9 +134,9 @@ ALWAYS_FORBIDDEN_ABCP_METHODS: FrozenSet[str] = frozenset({
 # Network is disabled for every declared task_type: cookie read/write and
 # request interception are not part of any current business flow, and the
 # fleet shares one cookie jar — a single worker mutating it would silently
-# change every sibling worker's session. `general` is deliberately absent
-# here (fail-open for unknown/unclassified work), matching the rest of this
-# table's policy.
+# change every sibling worker's session. `general` is deliberately absent for
+# explicitly reviewed unclassified work; missing/unknown values are resolved
+# to web_scrape before this table is consulted.
 TASK_TYPE_DISABLED_DOMAINS = {
     "web_search": frozenset({"Bookmark", "Download", "File", "History", "Memory", "Network"}),
     "web_scrape": frozenset({"Bookmark", "Download", "File", "History", "Memory", "Network"}),
@@ -171,9 +178,104 @@ TASK_TYPE_ALLOWED_EXCEPTIONS = {
 }
 
 
+def describe_task_types() -> str:
+    """Render the task_type menu the planner picks from, deriving every
+    capability consequence from the tables above.
+
+    Hand-written capability prose in a tool schema goes stale the moment a
+    domain moves between task types, and a planner that trusts stale prose
+    silently loses a method domain worker-side. Generating it means the schema
+    the model reads and the policy the worker runs under are the same fact.
+    """
+    # Exceptions granted to EVERY task type (Memory.get/save today) carry no
+    # signal for choosing between them, and listing them on all seven lines
+    # buries the one exception that does discriminate. Computed, not hardcoded,
+    # so a future universally-granted method drops out on its own.
+    # Only task types that actually carry an exception list take part: a type
+    # that disables nothing (general) has no exceptions by construction, and
+    # counting its empty set would make the intersection empty every time.
+    exception_sets = [
+        set(exceptions)
+        for exceptions in TASK_TYPE_ALLOWED_EXCEPTIONS.values()
+        if exceptions
+    ]
+    universal = set.intersection(*exception_sets) if exception_sets else set()
+    lines = []
+    for task_type in sorted(VALID_TASK_TYPES):
+        scenario = TASK_TYPE_SCENARIOS.get(task_type, "")
+        disabled = sorted(TASK_TYPE_DISABLED_DOMAINS.get(task_type, frozenset()))
+        exceptions = sorted(
+            set(TASK_TYPE_ALLOWED_EXCEPTIONS.get(task_type) or frozenset()) - universal
+        )
+        detail = (
+            f"disabled: {', '.join(disabled)}"
+            if disabled else "disables nothing"
+        )
+        if exceptions:
+            detail += f", except {', '.join(exceptions)}"
+        lines.append(f"{task_type} — {scenario} [{detail}]")
+    return (
+        "Pick the value that matches what THIS phase does; a wrong pick removes"
+        " method domains from the worker and cannot be recovered without a"
+        " replan. "
+        + TASK_TYPE_SELECTION_RULE
+        + " Options: "
+        + " | ".join(lines)
+    )
+
+
 def method_domain(method: str) -> str:
     text = str(method or "").strip()
     return text.split(".", 1)[0] if "." in text else ""
+
+
+def _task_type_policy_profile(task_type: str) -> Tuple[FrozenSet[str], FrozenSet[str]]:
+    """(disabled domains, full-name exceptions) for one task type.
+
+    A type absent from both tables (general) disables nothing and therefore
+    needs no exceptions — the widest possible surface.
+    """
+    return (
+        frozenset(TASK_TYPE_DISABLED_DOMAINS.get(task_type) or frozenset()),
+        frozenset(TASK_TYPE_ALLOWED_EXCEPTIONS.get(task_type) or frozenset()),
+    )
+
+
+def task_type_capability_covers(task_type: str, other: str) -> bool:
+    """True when `task_type` can call everything `other` can.
+
+    Derived from the two policy tables above rather than declared, because a
+    hand-written containment table states a fact those tables own: move one
+    domain between task types and the hand-written copy silently keeps
+    promising the old shape. Inputs are alias-normalized and fail closed;
+    otherwise an unknown value absent from both tables would look identical to
+    the intentionally unrestricted ``general`` type.
+    """
+    task_type = resolve_task_type_fail_closed(task_type)
+    other = resolve_task_type_fail_closed(other)
+    disabled, exceptions = _task_type_policy_profile(task_type)
+    other_disabled, other_exceptions = _task_type_policy_profile(other)
+    if not disabled <= other_disabled:
+        return False
+    # An exception `other` holds only has to be matched where `task_type` still
+    # disables that whole domain. Where `task_type` leaves the domain enabled it
+    # already covers every method in it, exception or not.
+    still_gated = {
+        method for method in other_exceptions
+        if method_domain(method) in disabled
+    }
+    return still_gated <= exceptions
+
+
+def derive_task_type_capability_bases() -> Dict[str, FrozenSet[str]]:
+    """task_type -> every other type whose capability surface it fully covers."""
+    return {
+        task_type: frozenset(
+            other for other in VALID_TASK_TYPES
+            if other != task_type and task_type_capability_covers(task_type, other)
+        )
+        for task_type in VALID_TASK_TYPES
+    }
 
 
 def disabled_reason_for_method(method: str, task_type: object) -> str:
@@ -182,7 +284,7 @@ def disabled_reason_for_method(method: str, task_type: object) -> str:
         return ""
     if method in ALWAYS_FORBIDDEN_ABCP_METHODS:
         return f"{method} is globally disabled by harness policy"
-    normalized = normalize_task_type(task_type)
+    normalized = resolve_task_type_fail_closed(task_type)
     exceptions = TASK_TYPE_ALLOWED_EXCEPTIONS.get(normalized, frozenset())
     if method in exceptions:
         return ""

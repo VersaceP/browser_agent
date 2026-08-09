@@ -13,10 +13,32 @@ from harness.utils import JsonDict
 
 
 LOCAL_FS_TOOLS = {"local_fs_search", "local_fs_read"}
+NO_ARTIFACT_DIAGNOSTIC_TOOLS = frozenset({
+    "find_in_axtree",
+    "visual_verify",
+    "DOM.getAXTree",
+    "DOM.getSemanticTree",
+    "DOM.getText",
+    "DOM.getAttribute",
+    "Input.scroll",
+    "Input.press",
+    "Memory.get",
+    "Memory.save",
+    "Page.create",
+    "Page.getState",
+    "Page.list",
+    "Page.screenshot",
+    "Page.navigate",
+    "Page.reload",
+    "Page.switchTo",
+    "Page.go",
+    "System.describeAction",
+    "System.describeEvent",
+    "System.getCapabilities",
+})
+
 ARTIFACT_PROGRESS_TOOLS = {
     "record_extraction",
-    "extract_dom_records",
-    "eval_js_json",
     "navigate_verified",
     "local_fs_search",
     "local_fs_read",
@@ -27,6 +49,11 @@ ARTIFACT_PROGRESS_TOOLS = {
     "Memory.save",
     "Runtime.evaluate",
     "DOM.getAXTree",
+    # DOM.getImg is an output-producing primitive.  One call can export an
+    # arbitrary batch of declared targets, so a small call-count diagnostic
+    # budget would reject legitimate image-heavy pages.  Keep it behind the
+    # worker step/loop bounds, but never treat it as no-artifact diagnostics.
+    "DOM.getImg",
     "DOM.getText",
     "DOM.getAttribute",
     "Input.click",
@@ -34,6 +61,7 @@ ARTIFACT_PROGRESS_TOOLS = {
     "Input.press",
     "Input.scroll",
     "Page.getState",
+    *NO_ARTIFACT_DIAGNOSTIC_TOOLS,
 }
 
 PRODUCTIVE_PRIMITIVE_TOOLS = {
@@ -48,6 +76,30 @@ PRODUCTIVE_PRIMITIVE_TOOLS = {
 }
 
 PRODUCTIVE_WITHOUT_ARTIFACT_HARD_LIMIT = 30
+MIN_HISTORY_NAVIGATION_CREDITS = 4
+MAX_HISTORY_NAVIGATION_CREDITS = 12
+
+# These tools are valid pre-artifact diagnostics/recovery actions, but unlike
+# cheap state/DOM reads they must not receive an unlimited bypass.  Counts are
+# scoped to a page navigation epoch; a verified navigation resets that page.
+HEAVY_DIAGNOSTIC_LIMITS = {
+    # A review drawer can require several scroll -> SemanticTree rounds before
+    # the requested record count materializes.  Keep this bounded, but leave
+    # enough room for the verified 5-round flow plus re-perception.
+    "DOM.getSemanticTree": 12,
+    "Page.screenshot": 3,
+    "visual_verify": 3,
+    "Page.reload": 2,
+    # Page.create/Page.list do not carry a pageId.  They use a worker-scoped
+    # budget (see WORKER_SCOPED_HEAVY_DIAGNOSTICS) instead of pretending to
+    # belong to a navigation epoch.
+    "Page.create": 12,
+    "Page.navigate": 4,
+    "Page.go": 4,
+    "Page.list": 32,
+}
+
+WORKER_SCOPED_HEAVY_DIAGNOSTICS = frozenset({"Page.create", "Page.list"})
 
 DIAGNOSTIC_TOOLS_AFTER_INFRA_ERROR = {
     "System.register",
@@ -103,6 +155,45 @@ class ProgressAccountant:
     last_blocked_reason: Optional[str] = None
     last_blocked_step: Optional[int] = None
     repair_progress_signatures: Set[str] = field(default_factory=set)
+    navigation_epochs: Dict[str, int] = field(default_factory=dict)
+    heavy_diagnostic_counts: Dict[str, int] = field(default_factory=dict)
+    last_diagnostic_allowance: Optional[JsonDict] = None
+    history_navigation_credit_limit: int = MIN_HISTORY_NAVIGATION_CREDITS
+    history_navigation_credits_used: int = 0
+    mandatory_recovery_credits_used: Set[str] = field(default_factory=set)
+    last_mandatory_recovery_allowance: Optional[JsonDict] = None
+
+    def configure_history_navigation_credits(self, batch_size: int = 0) -> int:
+        """Size Page.go progress credit to the declared worker batch.
+
+        One history return per row is legitimate for same-tab detail batches.
+        Two recovery slots cover an initial probe and one corrective return,
+        while the hard ceiling ensures back/forward oscillation cannot mint an
+        unbounded sequence of fresh diagnostic epochs.
+        """
+        try:
+            declared = max(0, int(batch_size or 0))
+        except (TypeError, ValueError):
+            declared = 0
+        self.history_navigation_credit_limit = min(
+            MAX_HISTORY_NAVIGATION_CREDITS,
+            max(MIN_HISTORY_NAVIGATION_CREDITS, declared + 2),
+        )
+        return self.history_navigation_credit_limit
+
+    def _diagnostic_key(self, tool_name: str, page_id: str) -> str:
+        scope = (
+            "__worker__"
+            if tool_name in WORKER_SCOPED_HEAVY_DIAGNOSTICS
+            else (page_id or "__global__")
+        )
+        epoch = self.navigation_epochs.get(scope, 0)
+        return f"{scope}:{epoch}:{tool_name}"
+
+    def _diagnostic_scope(self, tool_name: str, page_id: str) -> str:
+        if tool_name in WORKER_SCOPED_HEAVY_DIAGNOSTICS:
+            return "__worker__"
+        return page_id or "__global__"
 
     def _emit_intervention(
         self, intervention: JsonDict, step: Optional[int] = None,
@@ -142,17 +233,84 @@ class ProgressAccountant:
         requires_artifact: bool,
         own_artifact_read: bool = False,
         step: Optional[int] = None,
+        page_id: str = "",
+        charge_heavy_diagnostic: bool = True,
+        mandatory_recovery_generation: Optional[int] = None,
     ) -> Optional[JsonDict]:
         self.extraction_artifact_count = max(
             self.extraction_artifact_count,
             artifact_count,
         )
+        self.last_diagnostic_allowance = None
+        self.last_mandatory_recovery_allowance = None
+        if (
+            requires_artifact
+            and artifact_count == 0
+            and tool_name in HEAVY_DIAGNOSTIC_LIMITS
+            and charge_heavy_diagnostic
+        ):
+            normalized_page_id = str(page_id or "")
+            scope = self._diagnostic_scope(tool_name, normalized_page_id)
+            key = self._diagnostic_key(tool_name, normalized_page_id)
+            used = self.heavy_diagnostic_counts.get(key, 0)
+            limit = HEAVY_DIAGNOSTIC_LIMITS[tool_name]
+            if used >= limit:
+                intervention = {
+                    "status": "progress_intervention",
+                    "reason": "diagnostic_budget_exhausted",
+                    "tool": tool_name,
+                    "pageId": str(page_id or "") or None,
+                    "diagnosticScope": scope,
+                    "navigationEpoch": self.navigation_epochs.get(scope, 0),
+                    "diagnosticUses": used,
+                    "diagnosticLimit": limit,
+                    "tool_was_executed": False,
+                    "next_instruction": (
+                        "The bounded diagnostic budget for this navigation"
+                        " epoch is exhausted. Use the evidence already"
+                        " collected, perform a justified materialization or"
+                        " navigation recovery, persist verified rows, or"
+                        " finalize with the blocker; do not repeat the same"
+                        " diagnostic surface."
+                    ),
+                }
+                return self._emit_intervention(intervention, step)
+            used += 1
+            self.heavy_diagnostic_counts[key] = used
+            self.last_diagnostic_allowance = {
+                "tool": tool_name,
+                "pageId": str(page_id or "") or None,
+                "diagnosticScope": scope,
+                "navigationEpoch": self.navigation_epochs.get(scope, 0),
+                "diagnosticUses": used,
+                "diagnosticLimit": limit,
+            }
         if (
             requires_artifact
             and artifact_count == 0
             and tool_name in PRODUCTIVE_PRIMITIVE_TOOLS
             and self.turns_since_artifact_progress >= PRODUCTIVE_WITHOUT_ARTIFACT_HARD_LIMIT
         ):
+            recovery_key = ""
+            if mandatory_recovery_generation is not None and tool_name in {
+                "Page.getState", "DOM.getAXTree",
+            }:
+                recovery_key = (
+                    f"{str(page_id or '') or '__global__'}:"
+                    f"{int(mandatory_recovery_generation)}:{tool_name}"
+                )
+            if recovery_key and recovery_key not in self.mandatory_recovery_credits_used:
+                # PageLifecycleTracker, not model input, authorizes this one-shot
+                # crossing.  Consume on dispatch (success or failure) so a broken
+                # page cannot turn the mandatory recovery into an infinite bypass.
+                self.mandatory_recovery_credits_used.add(recovery_key)
+                self.last_mandatory_recovery_allowance = {
+                    "tool": tool_name,
+                    "pageId": str(page_id or "") or None,
+                    "lifecycleGeneration": int(mandatory_recovery_generation),
+                    "turnsSinceArtifactProgress": self.turns_since_artifact_progress,
+                }
+                return None
             intervention = {
                 "status": "progress_intervention",
                 "reason": "productive_primitives_without_artifact",
@@ -290,10 +448,11 @@ class ProgressAccountant:
             self.local_fs_streak = 0
             self.repeated_local_result_count = 0
             self.pending_intervention = None
+            self.history_navigation_credits_used = 0
             return
         self.turns_since_artifact_progress += 1
-        if tool_name == "DOM.getAXTree" and _tool_result_success(result):
-            # A fresh AXTree snapshot (and its offload file) makes follow-up
+        if tool_name in {"DOM.getAXTree", "DOM.getSemanticTree"} and _tool_result_success(result):
+            # A fresh DOM snapshot (and its offload file) makes follow-up
             # local file reads legitimate perception work again. Without this
             # reset the counter is sticky until record_extraction, which
             # deadlocks offloaded pages: the model can fetch the tree but can
@@ -334,22 +493,74 @@ class ProgressAccountant:
         if tool_name not in LOCAL_FS_TOOLS:
             self.local_fs_streak = 0
 
-    def notify_navigation_success(self, page_id: str = "") -> JsonDict:
+    def notify_navigation_success(
+        self,
+        page_id: str = "",
+        *,
+        navigation_kind: str = "verified",
+    ) -> JsonDict:
         """Reset no-artifact stall after a verified navigation has landed.
 
         navigate_verified may perform many internal state probes before the
         model regains control. Once the target page is verified, the next tool
         should not be blocked by stale "no artifact yet" accounting.
         """
+        history_navigation = navigation_kind == "history"
+        if (
+            history_navigation
+            and self.history_navigation_credits_used
+            >= self.history_navigation_credit_limit
+        ):
+            return {
+                "status": "history_navigation_credit_exhausted",
+                "pageId": page_id,
+                "navigationKind": navigation_kind,
+                "historyNavigationCreditsUsed": (
+                    self.history_navigation_credits_used
+                ),
+                "historyNavigationCreditLimit": (
+                    self.history_navigation_credit_limit
+                ),
+                "turnsSinceArtifactProgress": self.turns_since_artifact_progress,
+                "toolCalls": self.tool_calls,
+                "creditApplied": False,
+                "next_instruction": (
+                    "Page.go changed the document, but this worker has exhausted"
+                    " its bounded history-navigation progress credits without"
+                    " producing a new extraction artifact. Persist verified"
+                    " rows or real repair progress before relying on another"
+                    " history return to refresh progress/diagnostic budgets."
+                ),
+            }
+        if history_navigation:
+            self.history_navigation_credits_used += 1
         self.turns_since_artifact_progress = 0
         self.local_fs_streak = 0
         self.pending_intervention = None
+        scope = str(page_id or "") or "__global__"
+        self.navigation_epochs[scope] = self.navigation_epochs.get(scope, 0) + 1
+        prefix = f"{scope}:"
+        self.heavy_diagnostic_counts = {
+            key: count
+            for key, count in self.heavy_diagnostic_counts.items()
+            if not key.startswith(prefix)
+        }
         return {
             "status": "navigation_success",
             "pageId": page_id,
+            "navigationKind": navigation_kind,
+            "creditApplied": True,
+            "historyNavigationCreditsUsed": self.history_navigation_credits_used,
+            "historyNavigationCreditLimit": self.history_navigation_credit_limit,
             "turnsSinceArtifactProgress": self.turns_since_artifact_progress,
             "toolCalls": self.tool_calls,
+            "navigationEpoch": self.navigation_epochs[scope],
         }
+
+    def consume_diagnostic_allowance(self) -> Optional[JsonDict]:
+        value = self.last_diagnostic_allowance
+        self.last_diagnostic_allowance = None
+        return value
 
     def notify_repair_progress(self, applied: Any) -> JsonDict:
         """Credit new manifest-authorized fields without crediting the artifact.
@@ -402,6 +613,7 @@ class ProgressAccountant:
             self.local_fs_streak = 0
             self.repeated_local_result_count = 0
             self.pending_intervention = None
+            self.history_navigation_credits_used = 0
         return {
             "status": "repair_progress" if new_items else "repair_progress_duplicate",
             "newRepairs": new_items,
@@ -421,6 +633,10 @@ class ProgressAccountant:
             "infraErrorStreak": self.infra_error_streak,
             "lastInfraError": self.last_infra_error,
             "infraDiagnosticBypassCount": self.infra_diagnostic_bypass_count,
+            "navigationEpochs": dict(sorted(self.navigation_epochs.items())),
+            "heavyDiagnosticCounts": dict(sorted(self.heavy_diagnostic_counts.items())),
+            "historyNavigationCreditsUsed": self.history_navigation_credits_used,
+            "historyNavigationCreditLimit": self.history_navigation_credit_limit,
             "repairProgressFieldCount": len(self.repair_progress_signatures),
             "distinctTools": dict(sorted(self.distinct_tools.items())),
             "interventionCount": len(self.interventions),

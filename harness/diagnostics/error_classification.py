@@ -12,6 +12,15 @@ from harness.constants import (
 from harness.utils import JsonDict
 
 
+SELECT_FAILURE_ACTIONS = {
+    "select-option-stale": "reinspect_then_retry_once_with_returned_fields",
+    "select-option-not-found": "reinspect_query_or_load_more_then_retry_once",
+    "select-option-disabled": "stop_and_report_requested_option_unavailable",
+    "select-popup-lost": "stop_repeating_and_report_platform_select_failure",
+    "select-navigation-stalled": "stop_repeating_and_report_platform_cascade_failure",
+}
+
+
 def classify_browser_error(
     error_text: Any,
     *,
@@ -27,6 +36,35 @@ def classify_browser_error(
     text = str(error_text or "")
     lower = text.lower()
     method_name = str(method or "")
+
+    if method_name == "DOM.inspectSelect":
+        if "select-control-not-visible" in lower:
+            return {
+                "type": "select_control_not_visible",
+                "errorCode": "select-control-not-visible",
+                "suggested_action": "refresh_ax_and_target_only_a_visible_select_control",
+                "method": method_name,
+            }
+        if (
+            "select control was not found" in lower
+            or "no supported accessibility semantics" in lower
+        ):
+            return {
+                "type": "select_control_unsupported",
+                "errorCode": "select-control-unsupported",
+                "suggested_action": "use_fresh_ax_guided_interaction_for_non_select_ui",
+                "method": method_name,
+            }
+
+    if method_name == "Input.select":
+        for error_code, suggested_action in SELECT_FAILURE_ACTIONS.items():
+            if error_code in lower:
+                return {
+                    "type": error_code.replace("-", "_"),
+                    "errorCode": error_code,
+                    "suggested_action": suggested_action,
+                    "method": method_name,
+                }
 
     if (
         method_name == "Page.create"
@@ -100,8 +138,14 @@ def attach_error_classification(result: JsonDict, *, method: str = "") -> JsonDi
 
 def _extract_error_message(result: JsonDict) -> Optional[str]:
     direct = result.get("error")
+    rpc_data = result.get("rpcData")
     if direct:
-        return _stringify_error(direct)
+        rendered = _stringify_error(direct)
+        if rpc_data is not None:
+            rendered = f"{rendered} {_stringify_error(rpc_data)}"
+        return rendered
+    if rpc_data is not None:
+        return _stringify_error(rpc_data)
     response = result.get("response")
     if isinstance(response, dict):
         if response.get("error"):

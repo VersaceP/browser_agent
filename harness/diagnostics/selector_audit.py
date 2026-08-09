@@ -41,12 +41,17 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 ELEMENT_TARGETED_METHODS = frozenset({
     "Input.click",
+    "Input.press",
+    "Input.select",
     "Input.type",
     "Input.drag",
+    "DOM.inspectSelect",
     "DOM.getText",
     "DOM.getAttribute",
 })
-INTERACTION_METHODS = frozenset({"Input.click", "Input.type", "Input.press"})
+INTERACTION_METHODS = frozenset({
+    "Input.click", "Input.select", "Input.type", "Input.press",
+})
 FIND_TOOLS = frozenset({"local_fs_search", "local_fs_read"})
 AXTREE_METHODS = frozenset({"DOM.getAXTree", "DOM.getSemanticTree"})
 RENDER_RECOVERY_EVENT_TYPES = frozenset({"browser.call.recovery_result"})

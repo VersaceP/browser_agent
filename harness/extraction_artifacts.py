@@ -67,6 +67,7 @@ def save_extraction_artifact(
     description: str = "",
     schema_warnings: Optional[List[JsonDict]] = None,
     source_artifacts: Optional[List[str]] = None,
+    evidence_context: Optional[JsonDict] = None,
     event_type: str = "tool.record_extraction",
 ) -> JsonDict:
     safe_name = (
@@ -92,6 +93,12 @@ def save_extraction_artifact(
     }
     if warnings:
         payload["schemaWarnings"] = warnings
+    if evidence_context:
+        # Persist the page/auth scope these rows were observed under. A later
+        # worker reading this artifact cannot otherwise tell whether the rows
+        # describe the page it is looking at now, and stamping the current scope
+        # onto an old file would silently relabel stale evidence as fresh.
+        payload["evidenceContext"] = dict(evidence_context)
     if source_artifacts:
         payload["sourceArtifacts"] = [str(path) for path in source_artifacts]
 
