@@ -148,10 +148,25 @@ def action_signature(tool_call: JsonDict) -> Tuple[str, str]:
 def normalize_action_params(label: str, params: Any) -> Any:
     params = params if isinstance(params, dict) else {}
     if label == "Input.scroll":
+        # Input.scroll's locators moved into nested `target`/`container`
+        # objects. Reading only the flat keys collapses every container scroll
+        # onto the same fingerprint, so distinct containers look like one
+        # repeated action and trip the loop nudge.
+        def _locator(value: Any) -> Any:
+            if not isinstance(value, dict):
+                return None
+            return value.get("id") or value.get("selector")
+
         return {
             "pageId": params.get("pageId"),
             "direction": params.get("direction"),
-            "containerId": params.get("id") or params.get("selector") or params.get("targetId"),
+            "containerId": (
+                _locator(params.get("container"))
+                or params.get("id")
+                or params.get("selector")
+                or params.get("targetId")
+            ),
+            "targetId": _locator(params.get("target")),
         }
     if label in {"Input.click", "Input.select", "Input.type", "Input.press", "Input.drag"}:
         return {

@@ -34,6 +34,7 @@ def build_worker_result_levels(
     diagnostics: JsonDict,
     task_dir: Optional[Path],
     extraction_attempt_artifacts: Optional[List[str]] = None,
+    row_ledger: Optional[List[JsonDict]] = None,
 ) -> JsonDict:
     """Return the stable worker handoff shape consumed by LeadAgent.
 
@@ -103,6 +104,11 @@ def build_worker_result_levels(
         "progress": progress_snapshot,
         "nextSteps": _next_steps_from_answer(answer_payload),
     }
+    if row_ledger:
+        # Per-row outcome and cause, derived from this worker's own receipts.
+        # A row missing because the budget ran out and a row blocked by an
+        # overlay look identical in prose; here they never do.
+        l2["rowLedger"] = row_ledger
 
     l3: JsonDict = {
         "tracePath": trace_path,

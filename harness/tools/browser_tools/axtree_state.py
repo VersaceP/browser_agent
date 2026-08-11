@@ -252,7 +252,37 @@ def _axtree_ids_from_params(params: JsonDict) -> Set[str]:
     if isinstance(targets, list):
         for target in targets:
             collect(target)
+    # Nested single locators (Input.scroll's `target`/`container` objects).
+    # Without this the stale-id guard sees no canonical id in a container
+    # scroll and both blocks nothing and passes nothing through to rematch.
+    for key in ("target", "container"):
+        collect(params.get(key))
     return ids
+
+
+def _observe_page_url(agent: Any, params: JsonDict, result: JsonDict) -> None:
+    """Remember the last URL each page reported.
+
+    Any browser result whose data carries a url is a free observation of where
+    that page currently is. Cached here so a consumer that needs the current
+    URL — the visual reality check, which must know WHICH assigned row it is
+    looking at — does not have to spend a Page.getState round trip to learn
+    something the harness already saw.
+    """
+    data = _response_data(result)
+    url = str(data.get("url") or "").strip()
+    if not url:
+        return
+    page_id = str(data.get("pageId") or "").strip()
+    if not page_id and isinstance(params, dict):
+        page_id = str(params.get("pageId") or "").strip()
+    if not page_id:
+        return
+    urls = getattr(agent, "page_urls", None)
+    if not isinstance(urls, dict):
+        urls = {}
+        agent.page_urls = urls
+    urls[page_id] = url
 
 
 def _observe_axtree_state_after(
@@ -266,6 +296,7 @@ def _observe_axtree_state_after(
     event_serial_before: Optional[int] = None,
     page_before: Optional[str] = None,
 ) -> None:
+    _observe_page_url(agent, params, result)
     if method == "DOM.getAXTree":
         snapshot = precomputed_snapshot if isinstance(precomputed_snapshot, dict) else {}
         raw_ids = snapshot.get("ids")

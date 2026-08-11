@@ -652,12 +652,16 @@ async def _collect_items_materialize(
 
     # default: scroll. A stale container id must still go through the seen-id
     # rematch guard (Phase 2), not bypass it -> allow_rematch=True.
+    # Input.scroll is a STRICT three-mode union (target / container / viewport).
+    # A container locator must be nested under `container`; a flat id/selector
+    # matches no variant and the platform rejects the whole call. Viewport mode
+    # must carry no locator at all, which is what the no-container branch emits.
     params = {"pageId": page_id, "direction": direction or "down",
               "amount": amount, "purpose": "collect_items: scroll"}
     if container_id:
-        params["id"] = container_id
+        params["container"] = {"id": container_id}
     elif container_selector:
-        params["selector"] = container_selector
+        params["container"] = {"selector": container_selector}
     result = await _invoke_browser_method(
         agent, "Input.scroll", params, step, count_progress=False,
         allow_rematch=bool(container_id),
@@ -703,11 +707,12 @@ async def _collect_overlay_recovery(
 
 def _collect_overlay_stop_reason(status: Any) -> Optional[str]:
     """Map a dismiss_overlay status to a terminal collect stopReason, or None to
-    keep going. Both an auth/paywall refusal (blocked) and a dismiss that ran
-    the ladder but could not clear the overlay (failed) must STOP the loop with
-    an explicit reason — otherwise an un-cleared overlay keeps getting clicked
-    through until max_rounds/stagnant, hiding the real blocker."""
-    if status == "blocked":
+    keep going. Both an auth/paywall refusal (policy_refused; `blocked` on the
+    pre-ladder receipt shape) and a dismiss that ran the ladder but could not
+    clear the overlay (failed) must STOP the loop with an explicit reason —
+    otherwise an un-cleared overlay keeps getting clicked through until
+    max_rounds/stagnant, hiding the real blocker."""
+    if status in {"policy_refused", "blocked"}:
         return "overlay_blocked"
     if status == "failed":
         return "overlay_unresolved"

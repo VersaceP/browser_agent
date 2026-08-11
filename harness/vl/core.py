@@ -84,6 +84,42 @@ def build_visual_verify_prompt(
             "- visible_evidence: short array of visible screenshot observations\n"
             "- reason: one short sentence\n"
         )
+    if mode == "region_reality":
+        return (
+            "Report what this screenshot shows about ONE region of ONE page.\n"
+            f"{question or '(no region described)'}\n\n"
+            "Judge ONLY the region described above, on THIS page. Do not judge"
+            " any other item, do not judge how many items the wider task needs,"
+            " and do not count anything outside the region.\n\n"
+            "Choose exactly one classification:\n"
+            "- content_present: the region is visible and holds at least one"
+            " content item.\n"
+            "- explicit_empty_state: the region is visible and THE PAGE ITSELF"
+            " says it is empty — a message like 'No reviews yet', 'Be the first"
+            " to comment', '0 results', or an empty-state illustration with"
+            " text. Blank space, whitespace, or a section you cannot find is"
+            " NOT this class.\n"
+            "- auth_overlay_present: a login, sign-up, subscribe, or paywall"
+            " overlay covers the content.\n"
+            "- region_not_in_capture: the region is not inside this screenshot"
+            " — cut off, below the fold, collapsed behind a tab/accordion,"
+            " still loading, or simply not findable here. Use this whenever"
+            " your honest answer is 'I cannot see it'.\n"
+            "- uncertain: the region is in frame but you cannot tell which of"
+            " the above applies.\n\n"
+            "The single most costly error is reporting emptiness for a region"
+            " you could not actually see. 'I don't see it' is"
+            " region_not_in_capture, never explicit_empty_state.\n"
+            "Return exactly one JSON object with keys:\n"
+            "- classification: one of the five values above\n"
+            "- item_count: integer count of items visible IN THE REGION (0 when"
+            " none are visible; omit or null when not countable)\n"
+            "- region_found: boolean, whether you located the region at all\n"
+            "- confidence: number from 0 to 1\n"
+            "- visible_evidence: short array of literal text you can read in"
+            " the region (quote the page, do not paraphrase)\n"
+            "- reason: one short sentence\n"
+        )
     if mode == "contract_verify":
         return (
             "Judge whether this browser screenshot SATISFIES the structured success"
@@ -303,6 +339,8 @@ async def visual_verify_image(
         return _finalize_contract_verify(parsed, usage)
     if mode == "repair_absence":
         return _finalize_repair_absence(parsed, usage)
+    if mode == "region_reality":
+        return _finalize_region_reality(parsed, usage)
     allowed_verdicts = (
         {"confirmed_challenge", "normal_loading", "unrelated_block", "uncertain"}
         if mode == "challenge_detection"
@@ -358,6 +396,64 @@ def _finalize_repair_absence(parsed: JsonDict, usage: JsonDict) -> JsonDict:
         "status": "done",
         "mode": "repair_absence",
         "verdict": verdict,
+        "confidence": confidence,
+        "visible_evidence": [str(item)[:300] for item in evidence[:8]],
+        "reason": str(parsed.get("reason") or "")[:500],
+        "usage": usage,
+    }
+
+
+def _finalize_region_reality(parsed: JsonDict, usage: JsonDict) -> JsonDict:
+    """Normalize a region_reality verdict into the scored class enum.
+
+    Two normalizations matter beyond clamping. An unknown class becomes
+    `uncertain` rather than being passed through, so the offline precision
+    evaluation and the runtime reconciliation always score the same five
+    values. And a content/empty claim from a model that also answered
+    `region_found: false` is demoted to `region_not_in_capture` — the model
+    contradicted itself, and the reading that keeps work going is the safe one.
+    """
+    from harness.vl.capture_geometry import (
+        CLASS_AUTH_OVERLAY,
+        CLASS_REGION_NOT_IN_CAPTURE,
+        CLASS_UNCERTAIN,
+        REGION_CLASSES,
+    )
+
+    classification = str(
+        parsed.get("classification") or parsed.get("verdict") or ""
+    ).strip().lower()
+    if classification not in REGION_CLASSES:
+        classification = CLASS_UNCERTAIN
+    region_found = parsed.get("region_found")
+    if (
+        region_found is False
+        and classification not in {CLASS_REGION_NOT_IN_CAPTURE, CLASS_AUTH_OVERLAY}
+    ):
+        classification = CLASS_REGION_NOT_IN_CAPTURE
+
+    item_count: Optional[int] = None
+    raw_count = parsed.get("item_count")
+    if not isinstance(raw_count, bool) and isinstance(raw_count, (int, float)):
+        item_count = max(0, int(raw_count))
+
+    try:
+        confidence = max(0.0, min(float(parsed.get("confidence", 0.0)), 1.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    evidence = parsed.get("visible_evidence")
+    if not isinstance(evidence, list):
+        evidence = []
+    return {
+        "status": "done",
+        "mode": "region_reality",
+        # `verdict` is kept as a mirror of the class so every consumer of a VL
+        # result (loggers, the reality-check row, the arbiter) keeps working
+        # without learning a second field name.
+        "verdict": classification,
+        "classification": classification,
+        "itemCount": item_count,
+        "regionFound": bool(region_found) if isinstance(region_found, bool) else None,
         "confidence": confidence,
         "visible_evidence": [str(item)[:300] for item in evidence[:8]],
         "reason": str(parsed.get("reason") or "")[:500],

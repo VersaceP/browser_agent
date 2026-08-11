@@ -44,7 +44,14 @@ from harness.fleet_runtime import (
     PageLeasedBrowserClient,
 )
 from harness.render_recovery import extract_page_id_from_values
+from harness.extraction_artifacts import field_names_from_specs
 from harness.fast_path import assess_fast_path_candidate
+from harness.row_ledger import (
+    identity_fields_from_contract,
+    row_identity,
+    derive_row_facts,
+    derive_row_ledger,
+)
 from runtime_config import RuntimeConfig
 from harness.lifecycle import LifecycleContext, default_lifecycle_manager
 from harness.model_config import browser_agent_model_config
@@ -4123,6 +4130,76 @@ class BrowserAgentSpawner:
             return None
         return outcome
 
+    def _record_row_ledger(
+        self,
+        harness: Any,
+        *,
+        trace_summary: JsonDict,
+        worker_contract: JsonDict,
+        phase: JsonDict,
+        validation: JsonDict,
+        worker_id: str,
+        phase_id: str,
+    ) -> List[JsonDict]:
+        """Persist what happened to each assigned row, per field, from receipts.
+
+        The Lead may narrate a run; it may not decide why a row came back
+        empty. Without this record one row's login modal explains three rows'
+        missing data and nothing in the system disagrees.
+        """
+        try:
+            expected = phase.get("expected_artifact")
+            expected = expected if isinstance(expected, dict) else {}
+            identity_fields = _cohort_identity_fields(worker_contract, phase)
+            fields = field_names_from_specs(
+                expected.get("required_fields") or expected.get("fields") or []
+            )
+            if not fields:
+                return []
+            rows = _validated_rows_for_ledger(validation)
+            row_keys = [
+                key for key in (
+                    row_identity(row, identity_fields) for row in rows
+                ) if key
+            ]
+            # The budget that ran out is the WORKER's, not the global default:
+            # a phase may override max_steps, and reading the default instead
+            # means a worker that stopped at its own 15-step cap is compared
+            # against 40, reports budgetExhausted=False, and every row it never
+            # opened loses the one cause that explains it. That substitution is
+            # the whole defect this ledger was built to prevent.
+            worker_harness = getattr(getattr(harness, "runtime", None), "harness", None)
+            max_steps = optional_int(
+                getattr(worker_harness, "max_steps", None),
+                0,
+            ) or int(self.runtime.harness.worker_max_steps or 0)
+            steps = int(trace_summary.get("steps") or 0)
+            ledger = derive_row_ledger(
+                rows,
+                fields=fields,
+                identity_fields=identity_fields,
+                allow_empty_with_outcome=_allowance_from_validators(
+                    phase.get("validators")
+                ),
+                row_facts=derive_row_facts(
+                    getattr(harness, "trace", []) or [],
+                    row_keys=row_keys,
+                    budget_exhausted=bool(max_steps and steps >= max_steps),
+                ),
+            )
+        except Exception as exc:  # a ledger defect must never fail a worker
+            self.logger.write("row_ledger.error", {
+                "workerId": worker_id, "phaseId": phase_id, "error": str(exc),
+            })
+            return []
+        if ledger:
+            self.logger.write("row_ledger.recorded", {
+                "workerId": worker_id,
+                "phaseId": phase_id,
+                "rows": ledger,
+            })
+        return ledger
+
     async def _maybe_autoheal_skill(
         self,
         harness: Any,
@@ -4620,6 +4697,15 @@ class BrowserAgentSpawner:
                 phase=phase or {},
                 validation=artifact_validation,
             )
+            row_ledger = self._record_row_ledger(
+                harness,
+                trace_summary=trace_summary,
+                worker_contract=worker_contract or {},
+                phase=phase or {},
+                validation=artifact_validation,
+                worker_id=worker_id,
+                phase_id=phase_id,
+            )
             # Self-heal loop: the fast path fell back (skill_answer is None) but the
             # slow path produced a validated result — distill its trace into a
             # candidate workflow and canary-promote it for the degraded skill.
@@ -4720,6 +4806,10 @@ class BrowserAgentSpawner:
                     getattr(harness, "download_operation_receipts", {}).values()
                 ),
                 "challengeReceipt": challenge_receipt,
+                # Per-row outcome and cause, derived from receipts. The Lead
+                # reads this instead of inferring one explanation for every row
+                # from the worker's prose.
+                "rowLedger": row_ledger,
             }
             receipt_candidate = fast_path_assessment.get("candidate")
             if isinstance(receipt_candidate, dict):
@@ -4949,6 +5039,11 @@ class BrowserAgentSpawner:
             artifacts=_safe_str_list(result.get("artifacts")),
             extraction_attempt_artifacts=_safe_str_list(
                 result.get("extractionAttemptArtifacts")
+            ),
+            row_ledger=(
+                result.get("rowLedger")
+                if isinstance(result.get("rowLedger"), list)
+                else None
             ),
             artifact_validation=(
                 result.get("artifactValidation")
@@ -5403,17 +5498,129 @@ def _blocker_evidence_paths(
     return [str(item).strip() for item in raw if str(item).strip()]
 
 
+def _cohort_identity_fields(
+    worker_contract: JsonDict, phase: Optional[JsonDict] = None,
+) -> List[str]:
+    """The field(s) that name a row, from whichever shape this contract uses.
+
+    Delegates to the single resolver in harness.row_ledger: this lookup had
+    already been re-implemented three times with a different set of shapes
+    each time, and a missed shape is silent — no identity, every rowKey None,
+    per-row attribution quietly gone.
+    """
+    return identity_fields_from_contract(worker_contract, phase)
+
+
+def _validated_rows_for_ledger(validation: JsonDict) -> List[JsonDict]:
+    paths = validation.get("validExtractionArtifacts")
+    if not isinstance(paths, list) or not paths:
+        paths = validation.get("allExtractionArtifacts")
+    rows: List[JsonDict] = []
+    for raw_path in paths if isinstance(paths, list) else []:
+        try:
+            payload = json.loads(Path(str(raw_path)).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        for row in (payload.get("rows") if isinstance(payload, dict) else None) or []:
+            if isinstance(row, dict):
+                rows.append(row)
+    return rows
+
+
+def _allowance_from_validators(validators: Any) -> JsonDict:
+    """Merge every emptiable-field declaration on the phase.
+
+    Dedup only merges validators that share a semantic signature (type+fields),
+    so two field_nonempty validators covering different fields both survive to
+    here. Returning the first one dropped the second's allowance and pinned the
+    phase on a field it had explicitly declared emptiable. Outcomes for a field
+    named twice are unioned rather than overwritten.
+    """
+    merged: JsonDict = {}
+    for validator in validators if isinstance(validators, list) else []:
+        if (
+            not isinstance(validator, dict)
+            or str(validator.get("type") or "") != "field_nonempty"
+            or not isinstance(validator.get("allow_empty_with_outcome"), dict)
+        ):
+            continue
+        for field, outcomes in validator["allow_empty_with_outcome"].items():
+            values = outcomes if isinstance(outcomes, list) else [outcomes]
+            existing = merged.setdefault(str(field), [])
+            for outcome in values:
+                text = str(outcome or "").strip()
+                if text and text not in existing:
+                    existing.append(text)
+    return merged
+
+
+def _scroll_receipt_data(result: JsonDict) -> Optional[JsonDict]:
+    response = result.get("response")
+    if not isinstance(response, dict):
+        return None
+    data = response.get("data")
+    return data if isinstance(data, dict) else None
+
+
+def _scroll_was_state_probe(result: JsonDict) -> bool:
+    """True when the receipt says no wheel input was dispatched at all.
+
+    `amount: 0` reads the scroll state without moving anything, so such a call
+    is neither a traversal nor a failed traversal — counting it either way
+    corrupts the ledger that guards `target_absent`.
+    """
+    data = _scroll_receipt_data(result)
+    if data is None:
+        return False
+    return str(data.get("completedReason") or "") == "amount-zero"
+
+
+def _axis_magnitude(value: Any) -> Optional[float]:
+    """Largest absolute axis component of a `{x, y}` delta, or None."""
+    if not isinstance(value, dict):
+        return None
+    magnitude: Optional[float] = None
+    for axis in ("x", "y"):
+        raw = value.get(axis)
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            continue
+        magnitude = max(magnitude or 0.0, abs(float(raw)))
+    return magnitude
+
+
 def _scroll_delta_applied(result: JsonDict) -> Optional[float]:
     """Pixels an `Input.scroll` actually moved, or None when unreported.
 
     None and 0 must stay distinct: None means this platform build ships no
     scroll receipt, while 0 is a positive report that the page did not move.
+
+    Two receipt shapes are accepted on purpose. Current builds return
+    `AbcpScrollActionResult` with a `totalDelta {x, y}` plus per-surface
+    `layers[].delta`; older builds returned a scalar `deltaApplied`. Reading
+    only one of them silently degrades `scrollEffectEvidence` to "unavailable"
+    on the other build, which is exactly how a wheel event that travelled zero
+    pixels gets to look like a real traversal.
     """
-    response = result.get("response")
-    if not isinstance(response, dict):
+    data = _scroll_receipt_data(result)
+    if data is None:
         return None
-    data = response.get("data")
-    if not isinstance(data, dict) or "deltaApplied" not in data:
+
+    total = _axis_magnitude(data.get("totalDelta"))
+    if total is not None:
+        return total
+
+    layers = data.get("layers")
+    if isinstance(layers, list):
+        magnitudes = [
+            magnitude
+            for layer in layers
+            if isinstance(layer, dict)
+            and (magnitude := _axis_magnitude(layer.get("delta"))) is not None
+        ]
+        if magnitudes:
+            return max(magnitudes)
+
+    if "deltaApplied" not in data:
         return None
     raw = data.get("deltaApplied")
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
@@ -5467,6 +5674,10 @@ def _page_traversal_evidence(trace: Optional[List[JsonDict]]) -> JsonDict:
             continue
         if str(item.get("method") or "") == "Input.scroll":
             if not classify_call_outcome(result).succeeded:
+                continue
+            if _scroll_was_state_probe(result):
+                # A zero-amount state read dispatched no input; it is neither
+                # traversal nor a failure to traverse.
                 continue
             delta = _scroll_delta_applied(result)
             if delta is None:
@@ -5543,7 +5754,22 @@ def _semantic_terminal_evidence_failure(
         for path in (persisted_artifacts or [])
         if str(path).strip()
     }
-    if any(os.path.normpath(path) in ledger for path in evidence_paths):
+    matched = [
+        path for path in evidence_paths if os.path.normpath(path) in ledger
+    ]
+    if matched:
+        if _only_visual_check_evidence(matched):
+            # The artifact is real and ledger-bound, and still proves nothing:
+            # it holds a model's reading of a screenshot. Letting it clear this
+            # gate is how task 5324506f turned one page's overlay into "the
+            # site requires login for reviews".
+            return (
+                "the only cited evidence is a visual reality check, which is a"
+                " model assertion about one screenshot and not a measurement —"
+                " cite what you actually observed (the persisted rows, the"
+                " enumeration, the receipt for the region you could not"
+                " materialize) alongside it"
+            )
         return None
     if category == "instruction_infeasible":
         # Infeasibility often has nothing extractable to persist (the site
@@ -5561,6 +5787,41 @@ def _semantic_terminal_evidence_failure(
         "no evidenceArtifacts entry matches a record_extraction savedPath"
         " from this run"
     )
+
+
+def _only_visual_check_evidence(paths: List[str]) -> bool:
+    """True when every cited artifact is a visual reality check and nothing else.
+
+    Deliberately does NOT read the row's own `evidenceGrade`. That field is
+    written into an artifact, and artifacts are written by record_extraction,
+    which a worker can call with any rows it likes — so trusting the grade let
+    a worker mint `{"kind": "vl_reality_check", "evidenceGrade":
+    "corroborating"}` and walk past this gate. The grade is not needed anyway:
+    `evidence_grade` returns mayTerminate=False in every mode, so a visual
+    verdict is never sufficient on its own regardless of how well the model
+    scores. Precision buys corroboration, not authority to end work.
+
+    Fails OPEN on an unreadable or unrecognized artifact: this function exists
+    to catch a specific, self-labelled artifact kind, and a file we cannot
+    parse must not become a reason to reject a blocker that may be perfectly
+    well evidenced.
+    """
+    if not paths:
+        return False
+    for raw_path in paths:
+        try:
+            payload = json.loads(Path(str(raw_path)).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            return False
+        rows = payload.get("rows") if isinstance(payload, dict) else None
+        if not isinstance(rows, list) or not rows:
+            return False
+        for row in rows:
+            if not isinstance(row, dict):
+                return False
+            if str(row.get("kind") or "") != "vl_reality_check":
+                return False
+    return True
 
 
 def _classification_from_final_answer(

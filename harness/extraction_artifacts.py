@@ -67,6 +67,7 @@ def save_extraction_artifact(
     description: str = "",
     schema_warnings: Optional[List[JsonDict]] = None,
     source_artifacts: Optional[List[str]] = None,
+    row_lineage: Optional[List[JsonDict]] = None,
     evidence_context: Optional[JsonDict] = None,
     event_type: str = "tool.record_extraction",
 ) -> JsonDict:
@@ -101,6 +102,12 @@ def save_extraction_artifact(
         payload["evidenceContext"] = dict(evidence_context)
     if source_artifacts:
         payload["sourceArtifacts"] = [str(path) for path in source_artifacts]
+    if row_lineage:
+        # Per-row provenance for a reference merge: which source artifact and
+        # which row index each row was copied from. Without it a consolidated
+        # artifact records only that some sources were cited, not that THIS row
+        # came from one of them unchanged.
+        payload["rowLineage"] = [dict(item) for item in row_lineage]
 
     file_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2, default=str),

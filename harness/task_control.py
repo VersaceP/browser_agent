@@ -46,6 +46,7 @@ from harness.artifact_evidence import (
 from harness.auth_fleet import normalize_auth_verification_contract
 from harness.fleet_coordinator import normalize_page_policy, normalize_reuse_scope
 from harness.file_evidence import saved_paths_from_value
+from harness.row_ledger import ROW_OUTCOMES, field_absence_accepted
 from harness.pacing import (
     MAX_PACING_INTERVAL_SECONDS,
     PACING_FIELDS,
@@ -601,15 +602,107 @@ def _validate_pacing(value: Any, errors: List[str], *, where: str) -> JsonDict:
     }
 
 
+_ROW_SELECTION_LIMITS = {"probe": 1, "validation": 2}
+
+
+def _adapt_cohort_row_selection(
+    worker_contract: JsonDict, errors: List[str], *, phase_id: str,
+) -> str:
+    """Accept `cohort_source` + `row_selection` and express it as a batch.
+
+    The two say what the older single `batch_source` conflated: which cohort
+    this phase belongs to, and which of its rows this worker takes. A probe
+    that owns one item can then still name its cohort, instead of having to
+    pose as a batch so a checkpoint can be recorded at all. Rows are read from
+    the validated artifact by index; the model never re-types row content.
+    """
+    cohort = worker_contract.get("cohort_source")
+    selection = worker_contract.get("row_selection")
+    if cohort is None and selection is None:
+        return ""
+    if not isinstance(cohort, dict):
+        errors.append(
+            f"phase {phase_id}: worker_contract.cohort_source must be an object"
+            " naming artifact_name and identity_field"
+        )
+        return ""
+    if not isinstance(selection, dict):
+        errors.append(
+            f"phase {phase_id}: worker_contract.row_selection must be an object"
+            " with mode and source_indices"
+        )
+        return ""
+    if worker_contract.get("batch_source") is not None:
+        errors.append(
+            f"phase {phase_id}: declare cohort_source or batch_source, not both"
+        )
+        return ""
+
+    artifact_name = str(cohort.get("artifact_name") or "").strip()
+    identity_field = str(cohort.get("identity_field") or "").strip()
+    if not artifact_name or not identity_field:
+        errors.append(
+            f"phase {phase_id}: cohort_source requires artifact_name and"
+            " identity_field"
+        )
+        return ""
+
+    mode = str(selection.get("mode") or "").strip()
+    if mode and mode not in EXECUTION_ROLES:
+        errors.append(
+            f"phase {phase_id}: row_selection.mode must be one of"
+            f" {sorted(EXECUTION_ROLES)}; got {mode!r}"
+        )
+        return ""
+    raw_indices = selection.get("source_indices")
+    indices = [
+        int(item) for item in raw_indices
+        if isinstance(item, int) and not isinstance(item, bool) and item >= 0
+    ] if isinstance(raw_indices, list) else []
+    if not indices:
+        errors.append(
+            f"phase {phase_id}: row_selection.source_indices must list at least"
+            " one non-negative index into the cohort artifact"
+        )
+        return ""
+    limit = _ROW_SELECTION_LIMITS.get(mode)
+    if limit is not None and len(indices) > limit:
+        errors.append(
+            f"phase {phase_id}: row_selection.mode={mode} may select at most"
+            f" {limit} row(s); a confidence stage that opens many pages is a"
+            " bulk run wearing its name"
+        )
+        return ""
+
+    worker_contract["batch_source"] = {
+        "artifact_name": artifact_name,
+        "identity_field": identity_field,
+        "selector": {"indices": sorted(set(indices))},
+    }
+    cohort_selector = cohort.get("cohort_selector")
+    if isinstance(cohort_selector, dict):
+        worker_contract["batch_source"]["cohort_selector"] = cohort_selector
+    if mode and not worker_contract.get("execution_role"):
+        worker_contract["execution_role"] = mode
+    return mode
+
+
 def _normalize_batch_contract(
     worker_contract: JsonDict,
     errors: List[str],
     *,
     phase_id: str,
     user_task: str = "",
-) -> None:
-    """Validate the declared source of auto-materialized worker batch rows."""
+) -> str:
+    """Validate the declared source of auto-materialized worker batch rows.
 
+    Returns the role declared by `row_selection.mode`, if any, so the caller
+    can raise it to the phase — where the plan-level role gates read it.
+    """
+
+    declared_role = _adapt_cohort_row_selection(
+        worker_contract, errors, phase_id=phase_id,
+    )
     raw_source = worker_contract.get("batch_source")
     if raw_source is not None and worker_contract.get("batch_rows") is not None:
         errors.append(
@@ -710,6 +803,7 @@ def _normalize_batch_contract(
                     errors.append(
                         f"phase {phase_id}: batch_policy.{key} must be a boolean"
                     )
+    return declared_role
 
 
 def _canonical_identity_url(value: Any) -> str:
@@ -874,6 +968,15 @@ def _declared_batch_size(phase: JsonDict) -> Optional[int]:
     source = source if isinstance(source, dict) else {}
     selector = source.get("selector")
     selector = selector if isinstance(selector, dict) else {}
+    indices = selector.get("indices")
+    if isinstance(indices, list):
+        # row_selection.source_indices, already adapted into the selector. A
+        # probe's one-row limit must bind on this shape too, or the rule holds
+        # only for the spelling it was written against.
+        return len({
+            int(item) for item in indices
+            if isinstance(item, int) and not isinstance(item, bool)
+        })
     values = selector.get("values")
     if isinstance(values, list):
         return len(values)
@@ -911,6 +1014,17 @@ def _validate_execution_role_dependencies(
                 " exactly one row input: worker_contract.batch_source for"
                 " artifact-derived rows, or batch_rows for targets explicitly"
                 " supplied by the user"
+            )
+        if role in _ROW_SELECTION_LIMITS and size is None:
+            # A confidence stage whose row count cannot be read off the contract
+            # is a whole-cohort run with a confidence stage's name: the selector
+            # says "everything the artifact holds". Require the count to be
+            # stated so the one/two-row limit below is enforceable at all.
+            errors.append(
+                f"phase {phase_id}: execution_role={role} must state which rows"
+                " it takes — use worker_contract.row_selection.source_indices"
+                " (preferred) or a bounded batch_source selector; an unbounded"
+                f" selector makes {role} a multi-page run under another name"
             )
         if role == "probe" and size is not None and size > 1:
             errors.append(
@@ -1368,12 +1482,28 @@ def validate_task_plan(
                             f"phase {phase_id}: worker_contract.content_completeness"
                             " requires at least one valid expected_regions entry"
                         )
-            _normalize_batch_contract(
+            declared_role = _normalize_batch_contract(
                 worker_contract,
                 errors,
                 phase_id=phase_id,
                 user_task=user_task,
             )
+            # The plan-level role gates — the ladder dependency check, the
+            # one-row-fanout detector, the checkpoint requiredNextRole match —
+            # all read phase.execution_role. Leaving row_selection.mode inside
+            # the contract would let a plan that uses only the newer cohort
+            # shape slip past every one of them, which is worse than the
+            # missing-role case those gates were written for.
+            if declared_role:
+                existing_role = str(raw_phase.get("execution_role") or "").strip()
+                if not existing_role:
+                    raw_phase["execution_role"] = declared_role
+                elif existing_role != declared_role:
+                    errors.append(
+                        f"phase {phase_id}: execution_role={existing_role!r}"
+                        f" contradicts row_selection.mode={declared_role!r};"
+                        " declare the role once"
+                    )
             if (
                 "replan_checkpoint_id" in worker_contract
                 and (
@@ -1723,7 +1853,15 @@ def phase_contract(
     # gate and spawn_browser_agent kept re-returning skill_selection_required
     # (an unbreakable loop for the Lead). Preserve them verbatim when present.
     for skill_key in (
-        "skill_id", "skill_variables", "skill_rows", "batch_rows", "batch_source",
+        "skill_id", "skill_variables", "skill_rows", "batch_rows",
+        # Must travel WITH batch_rows: the spawn gate rejects rows that arrive
+        # without their provenance, so dropping this key alone turned a legal
+        # plan into an unspawnable one. Observed live in task 1b219431, where
+        # every phase carrying user-supplied URLs was refused with
+        # invalid_batch_rows_provenance while the plan on disk declared it
+        # correctly. Same trap the skill_id comment above describes.
+        "batch_rows_provenance",
+        "batch_source",
         "batch_policy", "replan_checkpoint_id", "skill_selection", "domain",
         "needs_isolated_session", "reuse_scope", "session_key", "page_policy",
         "fleet_id",
@@ -2027,6 +2165,26 @@ def materialize_batch_rows_from_source(
             for _, row in selected
         }
         selector_missing = sorted(wanted - matched)
+    raw_indices = selector.get("indices")
+    if isinstance(raw_indices, list):
+        # row_selection.source_indices arrives here. Indices name positions in
+        # the cohort artifact, so an index the artifact no longer has must fail
+        # loudly: silently selecting fewer rows than the plan asked for is how
+        # a slice quietly shrinks between generations.
+        wanted_indices = [
+            int(item) for item in raw_indices
+            if isinstance(item, int) and not isinstance(item, bool) and item >= 0
+        ]
+        available = {index for index, _ in selected}
+        selected = [
+            (index, row) for index, row in selected if index in set(wanted_indices)
+        ]
+        missing_indices = sorted(set(wanted_indices) - available)
+        if missing_indices:
+            selector_missing = [
+                *selector_missing,
+                *(f"index:{index}" for index in missing_indices),
+            ]
     offset = selector.get("offset")
     if isinstance(offset, int) and not isinstance(offset, bool) and offset > 0:
         selected = selected[offset:]
@@ -2099,6 +2257,41 @@ def materialize_batch_rows_from_source(
         "selector": selector,
         "executionRole": role,
     }
+    # The one receipt above answers two unrelated questions at once — who the
+    # whole cohort is, and which rows THIS worker owns — and the checkpoint
+    # reads it as if both were the same fact. That coupling is why a probe
+    # cannot be a single item: it would have to pretend to be a batch to
+    # produce a receipt at all. Split them; the checkpoint binds the cohort,
+    # the slice records the assignment.
+    identity_field = str(
+        (source.get("identity_field") if isinstance(source, dict) else "")
+        or field
+        or cohort_field
+    ).strip()
+    worker_contract["_source_cohort_receipt"] = {
+        "receiptType": "source_cohort.v1",
+        "artifactName": artifact_name,
+        "artifactPath": str(path),
+        "artifactGeneration": source_artifact_generation,
+        "identityField": identity_field,
+        "cohortSourceIndices": cohort_source_indices,
+        "cohortRowKeys": _row_keys_for_indices(
+            source_rows, cohort_source_indices, identity_field,
+        ),
+        "sourceRowCount": len(source_rows),
+        "cohortSelector": cohort_selector,
+    }
+    worker_contract["_execution_slice_receipt"] = {
+        "receiptType": "execution_slice.v1",
+        "role": role,
+        "artifactPath": str(path),
+        "artifactGeneration": source_artifact_generation,
+        "selectedSourceIndices": selected_source_indices,
+        "selectedRowKeys": _row_keys_for_indices(
+            source_rows, selected_source_indices, identity_field,
+        ),
+        "selector": selector,
+    }
     logger.write(
         "batch_source.materialized",
         {
@@ -2107,6 +2300,29 @@ def materialize_batch_rows_from_source(
         },
     )
     return None
+
+
+def _row_keys_for_indices(
+    source_rows: List[JsonDict], indices: List[int], identity_field: str,
+) -> List[str]:
+    """Row keys for the given source indices, empty when there is no identity.
+
+    Indices are positions in a file that a replan may replace; a key is what
+    survives that. Both are recorded because neither alone is enough: indices
+    without keys cannot be checked against a new generation, and keys without
+    indices cannot be checked against the one that produced them.
+    """
+    if not identity_field:
+        return []
+    keys: List[str] = []
+    for index in indices:
+        if 0 <= index < len(source_rows):
+            value = source_rows[index].get(identity_field)
+            if value is not None and not isinstance(value, (dict, list, bool)):
+                text = str(value).strip()
+                if text:
+                    keys.append(text)
+    return keys
 
 
 def _canonical_cohort_selector(value: Any) -> JsonDict:
@@ -2340,7 +2556,9 @@ def _fast_path_cohort_key(
     payload = {
         "sourceArtifactPath": str(batch_receipt.get("artifactPath") or ""),
         "sourceArtifactGeneration": str(
-            batch_receipt.get("sourceArtifactGeneration") or ""
+            batch_receipt.get("sourceArtifactGeneration")
+            or batch_receipt.get("artifactGeneration")
+            or ""
         ),
         "cohortSourceIndices": sorted(
             int(item)
@@ -2530,6 +2748,26 @@ def reconcile_replan_checkpoints(logger: RunLogger) -> JsonDict:
     return state
 
 
+def _checkpoint_receipts(
+    contract: JsonDict,
+) -> Tuple[Optional[JsonDict], Optional[JsonDict]]:
+    """The cohort a checkpoint binds and the slice this worker completed.
+
+    A probe owns exactly one item and must not have to pose as a batch to be
+    recorded, so the cohort and the slice are separate receipts. Contracts
+    materialized before the split carry only `_batch_source_receipt`; it
+    answered both questions at once, so it can still be read as both.
+    """
+    cohort = contract.get("_source_cohort_receipt")
+    execution = contract.get("_execution_slice_receipt")
+    if isinstance(cohort, dict) and isinstance(execution, dict):
+        return cohort, execution
+    legacy = contract.get("_batch_source_receipt")
+    if not isinstance(legacy, dict):
+        return None, None
+    return legacy, legacy
+
+
 def record_replan_checkpoint(
     logger: RunLogger,
     *,
@@ -2545,20 +2783,20 @@ def record_replan_checkpoint(
     role = str(phase.get("execution_role") or contract.get("execution_role") or "")
     if role not in {"probe", "validation", "bulk", "continuation"}:
         return None
-    receipt = contract.get("_batch_source_receipt")
-    if not isinstance(receipt, dict):
+    cohort_receipt, slice_receipt = _checkpoint_receipts(contract)
+    if cohort_receipt is None or slice_receipt is None:
         return None
-    artifact_path = str(receipt.get("artifactPath") or "").strip()
-    artifact_name = str(receipt.get("artifactName") or "").strip()
+    artifact_path = str(cohort_receipt.get("artifactPath") or "").strip()
+    artifact_name = str(cohort_receipt.get("artifactName") or "").strip()
     selected = sorted({
         int(item)
-        for item in (receipt.get("selectedSourceIndices") or [])
+        for item in (slice_receipt.get("selectedSourceIndices") or [])
         if isinstance(item, int) and not isinstance(item, bool) and item >= 0
     })
-    source_count = int(receipt.get("sourceRowCount") or 0)
+    source_count = int(cohort_receipt.get("sourceRowCount") or 0)
     cohort_indices = sorted({
         int(item)
-        for item in (receipt.get("cohortSourceIndices") or [])
+        for item in (cohort_receipt.get("cohortSourceIndices") or [])
         if isinstance(item, int) and not isinstance(item, bool) and item >= 0
     })
     if not cohort_indices and source_count > 0:
@@ -2584,7 +2822,9 @@ def record_replan_checkpoint(
         return None
 
     source_generation = str(
-        receipt.get("sourceArtifactGeneration") or ""
+        cohort_receipt.get("sourceArtifactGeneration")
+        or cohort_receipt.get("artifactGeneration")
+        or ""
     ).strip()
     if not source_generation:
         # Compatibility for a contract materialized before Stage 6B-A.
@@ -2612,7 +2852,7 @@ def record_replan_checkpoint(
             "reason": "checkpoint_advancing_role_requires_active_predecessor",
         })
         return None
-    computed_cohort_key = _fast_path_cohort_key(phase, contract, receipt)
+    computed_cohort_key = _fast_path_cohort_key(phase, contract, cohort_receipt)
     if predecessor is not None:
         if (
             str(predecessor.get("sourceArtifactPath") or "") != artifact_path
@@ -2807,7 +3047,7 @@ def record_replan_checkpoint(
         "sourceRowCount": source_count,
         "cohortRowCount": len(cohort_indices),
         "cohortSourceIndices": cohort_indices,
-        "cohortSelector": copy.deepcopy(receipt.get("cohortSelector") or {}),
+        "cohortSelector": copy.deepcopy(cohort_receipt.get("cohortSelector") or {}),
         "validatedSourceIndices": sorted(completed),
         "remainingSourceIndices": remaining,
         "fastPathEligible": assessment.get("status") == "candidate",
@@ -5296,6 +5536,29 @@ def _run_validator(validator: JsonDict, rows: List[JsonDict]) -> List[JsonDict]:
                 field for field in fields
                 if field in row and _is_empty_value(row.get(field))
             ]
+            # A field the contract declares emptiable, whose row carries a
+            # complete absence proof, is a finding rather than a hole. Without
+            # this branch a product that genuinely has no reviews can never
+            # satisfy the contract, and the phase burns every attempt against a
+            # page that will not change.
+            allowance = validator.get("allow_empty_with_outcome")
+            incomplete_proofs: List[JsonDict] = []
+            if confirmed_empty and isinstance(allowance, dict):
+                remaining: List[str] = []
+                for field in confirmed_empty:
+                    verdict = field_absence_accepted(
+                        row, field, allowed_outcomes=allowance.get(field),
+                    )
+                    if verdict["accepted"]:
+                        continue
+                    remaining.append(field)
+                    if verdict.get("absenceProof"):
+                        incomplete_proofs.append({
+                            "field": field,
+                            "reason": verdict["reason"],
+                            "absenceProof": verdict["absenceProof"],
+                        })
+                confirmed_empty = remaining
             if confirmed_empty or unverified:
                 failure: JsonDict = {
                     "type": validator_type,
@@ -5306,6 +5569,8 @@ def _run_validator(validator: JsonDict, rows: List[JsonDict]) -> List[JsonDict]:
                     failure["confirmedEmpty"] = confirmed_empty
                 if unverified:
                     failure["unverified"] = unverified
+                if incomplete_proofs:
+                    failure["absenceProofs"] = incomplete_proofs
                 failures.append(failure)
         return failures
 
@@ -6057,10 +6322,24 @@ def _dedupe_and_check_validators(
         )
 
     out: List[JsonDict] = []
-    seen = set()
+    seen: Dict[str, JsonDict] = {}
     for validator in validators:
         signature = _validator_semantic_signature(validator)
-        if signature in seen:
+        kept = seen.get(signature)
+        if kept is not None:
+            # field_nonempty's semantic signature is type+fields, so a duplicate
+            # may still carry an emptiable-field declaration the kept copy lacks
+            # (expected_artifact and an explicit validator each derive one).
+            # Dropping it wholesale would silently reinstate the strict reading
+            # and pin the phase on a row that is legitimately empty.
+            allowance = validator.get("allow_empty_with_outcome")
+            if (
+                str(validator.get("type") or "") == "field_nonempty"
+                and isinstance(allowance, dict)
+            ):
+                merged = dict(kept.get("allow_empty_with_outcome") or {})
+                merged.update(allowance)
+                kept["allow_empty_with_outcome"] = merged
             if warnings is not None:
                 warnings.append({
                     "type": "duplicate_validator_dropped",
@@ -6068,7 +6347,7 @@ def _dedupe_and_check_validators(
                     "validatorType": str(validator.get("type") or ""),
                 })
             continue
-        seen.add(signature)
+        seen[signature] = validator
         out.append(validator)
     return out
 
@@ -6109,7 +6388,15 @@ def _normalize_validators(
         normalized.append({"type": "required_fields", "fields": field_names})
         nonempty_fields = _nonempty_fields_from_expected(expected_artifact, fields)
         if nonempty_fields:
-            normalized.append({"type": "field_nonempty", "fields": nonempty_fields})
+            nonempty_validator: JsonDict = {
+                "type": "field_nonempty", "fields": nonempty_fields,
+            }
+            allowance = _allow_empty_with_outcome_from_expected(
+                expected_artifact, fields, nonempty_fields,
+            )
+            if allowance:
+                nonempty_validator["allow_empty_with_outcome"] = allowance
+            normalized.append(nonempty_validator)
         provenance_fields = _provenance_required_fields(expected_artifact, field_names)
         if provenance_fields and not _has_field_provenance_validator(validators, provenance_fields):
             normalized.append({
@@ -6158,6 +6445,37 @@ def _normalize_validators(
                     f" {confirmation_field!r} must be declared in"
                     " expected_artifact.fields so the worker records page evidence"
                 )
+        if validator_type == "allowed_domain":
+            # Accept the singular spelling a plan naturally writes, then refuse
+            # a declaration that cannot pass. An empty allowlist is not "allow
+            # anything" — it is "allow nothing": every row's host is outside
+            # it, on every attempt, with nothing the worker can do. That is the
+            # unsatisfiable-contract shape this whole series exists to stop,
+            # and it happened live in task 3189c68b: two workers extracted
+            # their pages completely and were failed anyway, because the plan
+            # wrote `domain` while the check reads `domains`.
+            singular = str(normalized_validator.pop("domain", "") or "").strip()
+            domains = _string_list(normalized_validator.get("domains"))
+            if singular and singular not in domains:
+                domains = [*domains, singular]
+            normalized_validator["domains"] = domains
+            if not domains:
+                errors.append(
+                    f"phase {phase_id}: validators[{index}] allowed_domain"
+                    " declares no domain, so no row can ever pass it; list the"
+                    " allowed hosts in `domains`"
+                )
+            # The field defaults to "url", which most artifacts do not carry.
+            # A validator pointed at a field the artifact never declares fails
+            # every row for a reason the data cannot fix.
+            domain_field = str(normalized_validator.get("field") or "url").strip()
+            normalized_validator["field"] = domain_field
+            if field_names and domain_field not in field_names:
+                errors.append(
+                    f"phase {phase_id}: allowed_domain field {domain_field!r}"
+                    " is not declared in expected_artifact.fields; point it at"
+                    " the field that holds the URL"
+                )
         if validator_type == "field_provenance":
             normalized_validator["fields"] = _normalize_provenance_validator_fields(
                 normalized_validator
@@ -6170,6 +6488,45 @@ def _normalize_validators(
         phase_id=phase_id,
         warnings=warnings,
     )
+
+
+def _allow_empty_with_outcome_from_expected(
+    expected_artifact: JsonDict, fields: Any, nonempty_fields: List[str],
+) -> JsonDict:
+    """Which non-empty fields may still be empty when their absence is proven.
+
+    Declared per field, either on the field spec or as a top-level map, and
+    only meaningful for a field that is otherwise required non-empty. The plan
+    must say so explicitly: guessing which fields a site sometimes omits is the
+    kind of site knowledge the harness has no business inventing.
+    """
+    allowance: JsonDict = {}
+    wanted = set(nonempty_fields)
+
+    def _record(name: Any, raw: Any) -> None:
+        field = str(name or "").strip()
+        if not field or field not in wanted:
+            return
+        outcomes = [
+            str(item).strip()
+            for item in (raw if isinstance(raw, list) else [])
+            if str(item or "").strip() in ROW_OUTCOMES
+        ]
+        if outcomes:
+            allowance[field] = outcomes
+
+    declared = expected_artifact.get("allow_empty_with_outcome")
+    if isinstance(declared, dict):
+        for name, raw in declared.items():
+            _record(name, raw)
+    if isinstance(fields, list):
+        for spec in fields:
+            if isinstance(spec, dict):
+                _record(
+                    field_name_from_spec(spec),
+                    spec.get("allow_empty_with_outcome"),
+                )
+    return allowance
 
 
 def _nonempty_fields_from_expected(expected_artifact: JsonDict, fields: Any) -> List[str]:

@@ -25,15 +25,69 @@ def _finished_worker_results(spawner: Any) -> Iterable[JsonDict]:
             yield result
 
 
+def _resolved(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return str(Path(text).expanduser().resolve(strict=False))
+    except (OSError, ValueError):
+        return text
+
+
+def _apply_supersessions(state: JsonDict, paths: List[str]) -> List[str]:
+    """Swap absorbed sources for the artifact that consolidated them.
+
+    A Lead `reference_merge` that copies every row of its sources verbatim is
+    a new generation of the same data, not an addition to it. Until this ran,
+    the merged artifact was in no ledger at all: the completion receipt could
+    not count it and the numeric gate resolved claims about it against the
+    sources instead, so a merge that lost rows was checked against the very
+    data it had just dropped.
+
+    Only artifacts recorded as fully absorbed are retired, and only from this
+    view — `state["artifacts"]` keeps the whole history for the consumers that
+    need it (batch_source materialization, replan checkpoints, collect_items).
+    """
+    entries = state.get("artifact_supersessions")
+    if not isinstance(entries, list) or not entries:
+        return paths
+    absorbed: set = set()
+    deliverables: List[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        deliverable = str(entry.get("deliverable") or "").strip()
+        retired = [
+            _resolved(item) for item in (entry.get("absorbed") or [])
+            if str(item or "").strip()
+        ]
+        if not deliverable or not retired:
+            continue
+        absorbed.update(retired)
+        deliverables.append(deliverable)
+    if not absorbed:
+        return paths
+    # A deliverable absorbed by a later merge is itself retired, so filter the
+    # deliverables through the same set rather than assuming merge order.
+    kept = [path for path in paths if _resolved(path) not in absorbed]
+    for deliverable in deliverables:
+        if _resolved(deliverable) in absorbed:
+            continue
+        if all(_resolved(deliverable) != _resolved(path) for path in kept):
+            kept.append(deliverable)
+    return kept
+
+
 def _validated_artifacts(state: JsonDict) -> List[str]:
     active_ledger = state.get("artifacts")
     if isinstance(active_ledger, list) and active_ledger:
         # task_state.artifacts is the coordinator's active validated generation
         # ledger. Prefer it over historical per-phase paths so replacements are
         # not double-counted across replans/remediation.
-        return list(dict.fromkeys(
+        return _apply_supersessions(state, list(dict.fromkeys(
             str(value) for value in active_ledger if value
-        ))
+        )))
     paths: List[str] = []
     phases = state.get("phases") if isinstance(state.get("phases"), dict) else {}
     for phase in phases.values():
@@ -42,7 +96,7 @@ def _validated_artifacts(state: JsonDict) -> List[str]:
         values = phase.get("validated_artifacts")
         if isinstance(values, list):
             paths.extend(str(value) for value in values if value)
-    return list(dict.fromkeys(paths))
+    return _apply_supersessions(state, list(dict.fromkeys(paths)))
 
 
 def _artifact_row_count(paths: List[str]) -> int:

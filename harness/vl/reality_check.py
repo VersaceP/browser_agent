@@ -245,6 +245,115 @@ def synthesize_claim(worker_contract: Optional[JsonDict], task_text: str = "") -
     return " ".join(parts)
 
 
+def artifact_stall_turns(agent: Any) -> Optional[int]:
+    """Tool calls this worker has made without persisting anything.
+
+    Read from the ProgressAccountant rather than counted here: the harness
+    already maintains exactly this number (resetting it when an extraction
+    artifact lands) and already acts on it at
+    PRODUCTIVE_WITHOUT_ARTIFACT_HARD_LIMIT. A second counter with its own
+    notion of "stuck" would drift from that one and there would be no way to
+    say which was right.
+    """
+    tracker = getattr(agent, "progress", None)
+    turns = getattr(tracker, "turns_since_artifact_progress", None)
+    if isinstance(turns, bool) or not isinstance(turns, int):
+        return None
+    return turns
+
+
+def stall_armed(agent: Any, threshold: int) -> bool:
+    """Whether flailing alone should arm the visual check.
+
+    The target-shortfall streak only counts tools that report a row yield, so
+    a worker looping on DOM.getAXTree / DOM.getSemanticTree / local_fs_read
+    never arms it — observed live in task e3173b5b, where a worker spent 30+
+    steps on those three and the streak stayed at 0 the whole time. Perception
+    that produces nothing at all is the same predicament the shortfall streak
+    describes; it just leaves no yield to count.
+    """
+    if threshold <= 0:
+        return False
+    turns = artifact_stall_turns(agent)
+    return turns is not None and turns >= threshold
+
+
+def resolve_current_row(url: str, row_keys: Any) -> Optional[str]:
+    """Which assigned row the page now open belongs to, or None.
+
+    Delegates to the row ledger's URL matcher so a reality check and the ledger
+    it will be compared against can never disagree about which row a page is —
+    including its refusal to guess when two assigned rows both prefix the URL.
+    """
+    from harness.row_ledger import row_key_for_url
+
+    keys = [str(key) for key in (row_keys or []) if str(key or "").strip()]
+    return row_key_for_url(str(url or ""), keys)
+
+
+def assigned_row_keys(worker_contract: Any, phase: Any = None) -> List[str]:
+    """Row keys this worker owns, from whichever shape its contract carries.
+
+    Delegates to the row ledger's resolver so the visual check and the ledger
+    agree on which rows exist. Reading only the materializer's receipts missed
+    direct `batch_rows` entirely — a contract carrying user-supplied URLs got
+    no row keys, the claim silently stayed cohort-scoped, and a detail page was
+    asked whether all three products were on it (observed live in task
+    857616aa, the exact 5324506f shape this projection exists to prevent).
+    """
+    from harness.row_ledger import assigned_row_keys_from_contract
+
+    return assigned_row_keys_from_contract(worker_contract, phase)
+
+
+def build_row_scoped_claim(
+    *,
+    worker_contract: Any,
+    row_key: str,
+    fields: Any = None,
+    region_hint: str = "",
+) -> str:
+    """A claim about ONE item's region — never about the cohort's total.
+
+    The defect this closes: the generic claim carried the whole phase's
+    expectation ("about 16 matching items are expected") onto a detail page
+    showing one product. The model answered the question it was asked — no,
+    this page does not have 16 — and the worker read that as confirmation that
+    the content it wanted was missing. A screenshot can only answer a question
+    scoped to what it depicts, so the row count is dropped here by design; the
+    cohort-level expectation is checked against artifacts, not pixels.
+    """
+    from harness.extraction_artifacts import field_names_from_specs
+
+    contract = worker_contract if isinstance(worker_contract, dict) else {}
+    # `fields` may arrive as bare names or as the object specs a contract
+    # normally carries ({"name": "reviews", "type": "array"}). str() on a spec
+    # would put a Python dict repr in front of the model, so both shapes go
+    # through the one parser the rest of the harness uses.
+    field_names = field_names_from_specs(fields) if isinstance(fields, list) else []
+    if not field_names:
+        expected = contract.get("expected_artifact")
+        expected = expected if isinstance(expected, dict) else {}
+        field_names = field_names_from_specs(expected.get("fields"))[:8]
+
+    parts = [f"Item under inspection: {str(row_key)[:200]}."]
+    if region_hint:
+        parts.append(f"Region: {str(region_hint)[:200]}.")
+    elif field_names:
+        parts.append(
+            "Region: the section of this page that would carry "
+            + ", ".join(field_names[:8])
+            + "."
+        )
+    else:
+        parts.append("Region: the main content section of this page.")
+    parts.append(
+        "Question: for THIS item only, is that region present on the page, and"
+        " does it hold content?"
+    )
+    return " ".join(parts)
+
+
 def _nl_absence_claimed(text: str) -> bool:
     """Prose absence claim, minus recovery narratives that mention absence in
     passing while describing success."""
@@ -341,11 +450,27 @@ def build_reality_check_row(
     trigger_tool: str,
     shortfall_streak: int,
     page_id: str,
+    armed_by: str = "target_shortfall",
+    stall_turns: Any = None,
+    page_url: str = "",
+    row_key: str = "",
+    region: Any = None,
+    capture: Any = None,
+    coverage: Any = None,
+    reconciled: Any = None,
+    grading: Any = None,
 ) -> JsonDict:
     """Shape the persisted observation row (goes through record_extraction so
     the savedPath lands in the harness ledger and satisfies the evidence
-    gate's B3 check when cited in evidenceArtifacts)."""
-    return {
+    gate's B3 check when cited in evidenceArtifacts).
+
+    The row states its own standing. `originClass` and `evidenceGrade` travel
+    with the observation so anything that later reads this artifact — the Lead,
+    the auditor, a repair pass — sees a model assertion labelled as one, rather
+    than a harness-persisted file that looks like a measurement because of
+    where it lives.
+    """
+    row: JsonDict = {
         "kind": "vl_reality_check",
         "claim": claim[:500],
         "verdict": str(verdict.get("verdict") or verdict.get("status") or ""),
@@ -356,9 +481,50 @@ def build_reality_check_row(
             or ""
         )[:1000],
         "screenshotPath": str(verdict.get("screenshotPath") or ""),
+        "screenshotScope": str(verdict.get("screenshotScope") or ""),
         "triggerTool": trigger_tool,
         "targetShortfallStreak": shortfall_streak,
-        "pageUrl": str(verdict.get("pageUrl") or ""),
+        # Which predicament armed the check. A verdict reached because the
+        # worker was producing nothing at all is read differently from one
+        # reached because its rows kept missing the target.
+        "armedBy": armed_by or "target_shortfall",
+        "pageUrl": str(page_url or verdict.get("pageUrl") or ""),
         "pageId": page_id,
         "sourceTool": "visual_verify",
+        "originClass": "model_assertion",
+        "evidenceGrade": "advisory",
+        "mayTerminate": False,
     }
+    if isinstance(stall_turns, int) and not isinstance(stall_turns, bool):
+        row["turnsSinceArtifactProgress"] = stall_turns
+    if row_key:
+        row["rowKey"] = str(row_key)[:300]
+        row["claimScope"] = "row"
+    else:
+        row["claimScope"] = "page"
+    if isinstance(region, dict) and region:
+        row["region"] = region
+    if isinstance(verdict.get("itemCount"), int):
+        row["itemCount"] = verdict["itemCount"]
+    if isinstance(capture, dict) and capture:
+        row["regionInCapture"] = str(capture.get("state") or "")
+        row["regionInCaptureReason"] = str(capture.get("reason") or "")
+    if isinstance(coverage, dict) and coverage.get("available"):
+        row["scrollReceipt"] = {
+            key: coverage.get(key)
+            for key in (
+                "mode", "completedReason", "targetVisible",
+                "delta", "position", "extent", "steps",
+            )
+            if coverage.get(key) is not None
+        }
+    if isinstance(reconciled, dict) and reconciled:
+        row["verdictClass"] = str(reconciled.get("class") or "")
+        if reconciled.get("overridden"):
+            row["claimedClass"] = str(reconciled.get("claimedClass") or "")
+            row["overrideReason"] = str(reconciled.get("overrideReason") or "")
+    if isinstance(grading, dict) and grading:
+        row["evidenceGrade"] = str(grading.get("grade") or "advisory")
+        row["mayTerminate"] = bool(grading.get("mayTerminate"))
+        row["gradeReason"] = str(grading.get("reason") or "")
+    return row

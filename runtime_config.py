@@ -284,6 +284,30 @@ class PlanValidatorConfig:
 
 
 # ---------------------------------------------------------------------------
+# "claim_extractor" 段：独立观测模型（把散文里的数量绑定到可重算的指标）
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ClaimExtractorConfig(PlanValidatorConfig):
+    """Independent model that binds quantities in prose to checkable metrics.
+
+    Same shape as the plan validator on purpose: both are read-only auditors
+    that must not be the Lead model. Deciding whether a bound number is right
+    is code's job (harness.numeric_facts); this model only says which metric a
+    sentence is talking about. When this section is absent the LeadAgent falls
+    back to the plan_validator provider rather than adding a second key.
+    """
+
+    # One short entry per enumerated span. 51 spans on a dense report needs
+    # roughly 3k; the headroom is for reports with many more. Kept explicit
+    # because inheriting the plan validator's budget once let a truncated
+    # response return no tool call at all, which reads as "extractor
+    # unavailable" and silently fails the gate open (task 857616aa).
+    max_tokens: int = 16000
+
+
+# ---------------------------------------------------------------------------
 # "browser" 段：ABCPClientConfig（ABCP WebSocket 连接）
 # ---------------------------------------------------------------------------
 
@@ -342,6 +366,14 @@ def _clamped_unit(value: Any, default: float) -> float:
         return max(0.0, min(float(value), 1.0))
     except (TypeError, ValueError):
         return max(0.0, min(float(default), 1.0))
+
+
+def _one_of(value: Any, allowed: set, default: str) -> str:
+    """Coerce a config value to one of `allowed`; anything else keeps the
+    default, for the same reason as _clamped_unit — a typo must not decide a
+    safety setting."""
+    text = str(value if value is not None else default).strip().lower()
+    return text if text in allowed else default
 
 
 @dataclass
@@ -416,6 +448,23 @@ class VLConfig:
     # vl.enabled (the master switch).
     reality_check_enabled: bool = True
     reality_check_shortfall_threshold: int = 3
+    # Second, independent arming condition: tool calls made without persisting
+    # anything (ProgressAccountant.turns_since_artifact_progress). The
+    # shortfall streak only counts tools that report a row yield, so a worker
+    # looping on DOM.getAXTree / DOM.getSemanticTree / local_fs_read spends its
+    # whole budget with the streak at 0 and the check never arms — seen live in
+    # task e3173b5b. Kept below PRODUCTIVE_WITHOUT_ARTIFACT_HARD_LIMIT (30) so
+    # the visual second opinion arrives while the worker can still act on it,
+    # not after the harness has already forced it to finalize. 0 disables.
+    reality_check_stall_turns: int = 15
+    # How much a reality-check verdict counts. "advisory" (the default) means
+    # the VL may direct further work but never closes anything: an absence
+    # still has to discharge the mechanical obligations in harness.row_ledger,
+    # and a verdict alone is not a reason to stop. Raise to "corroborating"
+    # only after harness.vl.precision_eval reports the per-class thresholds
+    # met on a labelled fixture — an unmeasured model asserting "nothing here"
+    # is precisely how task 5324506f concluded that reviews needed a login.
+    reality_check_evidence_mode: str = "advisory"
     extra_params: Dict[str, Any] = field(default_factory=dict)
 
     def captcha_autosolve_allowed(self) -> bool:
@@ -501,6 +550,17 @@ class VLConfig:
                         cls.reality_check_shortfall_threshold,
                     ),
                 )
+            ),
+            reality_check_stall_turns=int(
+                data.get(
+                    "reality_check_stall_turns",
+                    cls.reality_check_stall_turns,
+                )
+            ),
+            reality_check_evidence_mode=_one_of(
+                data.get("reality_check_evidence_mode"),
+                {"advisory", "corroborating"},
+                cls.reality_check_evidence_mode,
             ),
             extra_params=(
                 data.get("extra_params")
@@ -1135,6 +1195,9 @@ class RuntimeConfig:
     plan_validator: PlanValidatorConfig = field(
         default_factory=PlanValidatorConfig
     )
+    claim_extractor: ClaimExtractorConfig = field(
+        default_factory=ClaimExtractorConfig
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1148,6 +1211,7 @@ _TOP_LEVEL_EXTRA_KEYS = {
     "agent_id",
     "vl",
     "plan_validator",
+    "claim_extractor",
     "browser",
     "harness",
 }
@@ -1190,6 +1254,11 @@ def audit_config_keys(raw: JsonDict) -> List[str]:
         raw.get("plan_validator"),
         _field_names(PlanValidatorConfig),
     )
+    check(
+        "claim_extractor",
+        raw.get("claim_extractor"),
+        _field_names(ClaimExtractorConfig),
+    )
 
     harness_raw = raw.get("harness")
     if isinstance(harness_raw, dict):
@@ -1229,5 +1298,8 @@ def load_runtime_config(config_path: str, *, warn: bool = True) -> RuntimeConfig
         harness=harness,
         plan_validator=PlanValidatorConfig.from_dict(
             raw.get("plan_validator", {})
+        ),
+        claim_extractor=ClaimExtractorConfig.from_dict(
+            raw.get("claim_extractor", {})
         ),
     )

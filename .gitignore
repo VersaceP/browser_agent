@@ -28,6 +28,7 @@ claude_code_scrape/
 *.py[cod]
 *$py.class
 node_modules/
+.pnpm-store/
 skills/.skill_health.json
 skills/.guidance_health.json
 skills/**/.heal_history.json

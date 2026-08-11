@@ -92,7 +92,16 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
 
     All browser calls go through _invoke_browser_method(count_progress=False),
     so the ladder costs no model step. Returns a digest; full attempt logs go
-    to agent.logger. Auth/paywall overlays return blocked with zero clicks."""
+    to agent.logger.
+
+    Auth/paywall overlays run the SAME safe ladder as any other overlay. The
+    policy that matters is which controls may be pressed — login/provider/
+    payment buttons never are, and `find_close_control` already excludes them —
+    not whether we are allowed to press Escape. Refusing the ladder outright
+    produced `attempts: []` receipts that downstream code read as proof the
+    content itself was gated, which is a conclusion zero attempts cannot
+    support. When the safe rungs do not clear it, the result says
+    `policy_refused` with `targetAccess: unverified`."""
     page_id = str(tool_input.get("pageId") or "").strip()
     if not page_id:
         return {"status": "failed", "error": "pageId is required"}
@@ -127,19 +136,12 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
     layers = _layers_from_result(inspect)
     occluded_frames = visible_layers_occluded(layers)
 
-    if isinstance(overlay, dict) and overlay.get("subtype") in {"auth_prompt", "paywall"}:
-        _log_dismiss_overlay(agent, page_id, "blocked", overlay, attempts)
-        return {
-            "status": "blocked",
-            "subtype": overlay.get("subtype"),
-            "overlay": overlay,
-            "attempts": attempts,
-            "next_instruction": (
-                "An auth/login or paywall overlay was detected and is never"
-                " auto-dismissed. Check for an existing session, request HITL,"
-                " or report a blocker via final_answer."
-            ),
-        }
+    policy_subtype = (
+        str(overlay.get("subtype"))
+        if isinstance(overlay, dict)
+        and overlay.get("subtype") in {"auth_prompt", "paywall"}
+        else ""
+    )
 
     def _interrupt_return(interrupt: JsonDict) -> JsonDict:
         # A HITL/challenge interrupt fired on a dismiss action: stop the ladder and
@@ -218,10 +220,48 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
             success = True
 
     if not success:
+        safe_rungs = sum(
+            1 for item in attempts
+            if str(item.get("rung") or "") in {"close_control", "escape"}
+        )
+        if policy_subtype:
+            _log_dismiss_overlay(agent, page_id, "policy_refused", overlay, attempts)
+            return {
+                "status": "policy_refused",
+                "subtype": policy_subtype,
+                "overlay": overlay,
+                "overlayPresent": True,
+                "dismissAttempted": bool(safe_rungs),
+                "dismissOutcome": (
+                    "blocked_after_ladder" if safe_rungs else "not_attempted"
+                ),
+                "targetAccess": "unverified",
+                "reason": "auth_or_paywall_auto_dismiss_disallowed",
+                "occludedFrameCount": len(occluded_frames),
+                "attempts": attempts[-3:],
+                "vlArbiter": vl_arbiter_meta,
+                "next_instruction": (
+                    "Safe non-submit rungs (close control, Escape) ran and did"
+                    " not clear this auth/paywall overlay; login, provider and"
+                    " payment controls are never auto-clicked. This establishes"
+                    " only that THIS interaction on THIS page epoch is"
+                    " obstructed. It is NOT evidence that the target content"
+                    " requires a login, and NOT evidence that the content is"
+                    " absent — re-observe the target region after a fresh"
+                    " navigation before reporting any blocker, and never carry"
+                    " this finding over to another item."
+                ),
+            }
         _log_dismiss_overlay(agent, page_id, "failed", overlay, attempts)
         return {
             "status": "failed",
             "overlay": overlay,
+            "overlayPresent": True,
+            "dismissAttempted": bool(safe_rungs),
+            "dismissOutcome": (
+                "blocked_after_ladder" if safe_rungs else "not_attempted"
+            ),
+            "targetAccess": "unverified",
             "occludedFrameCount": len(occluded_frames),
             "attempts": attempts[-3:],
             "vlArbiter": vl_arbiter_meta,

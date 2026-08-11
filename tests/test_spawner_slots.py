@@ -5054,6 +5054,77 @@ class FastPathCheckpointTests(unittest.TestCase):
         )
         self.assertEqual(historical["status"], "not_compilable")
 
+    def test_checkpoint_originates_from_the_split_cohort_and_slice_receipts(self) -> None:
+        """A probe owns one item; the cohort it belongs to is a separate fact.
+
+        While both lived in one receipt, a probe could only be recorded by
+        pretending to be a batch — which is why `execution_role` stayed unset
+        in task 5324506f and the ladder never started.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            logger = RunLogger(temp, task_id="cohort-slice-checkpoint")
+            phase = {
+                "id": "probe",
+                "execution_role": "probe",
+                "stage_hint": "detail_sections",
+            }
+            initialize_task_state(
+                logger, {"goal": "checkpoint", "phases": [phase]},
+            )
+            mark_phase_result(
+                logger,
+                phase_id="probe",
+                worker_id="browser-probe",
+                validation={"status": "done", "artifacts": []},
+                result_status="validated_done",
+                phase=phase,
+                worker_contract={},
+            )
+            artifact_path = f"{temp}/artifacts/extractions/listing.json"
+            contract = {
+                "task_type": "web_scrape",
+                "expected_artifact": {"fields": ["detailUrl"]},
+                "validators": [
+                    {"type": "required_fields", "fields": ["detailUrl"]},
+                ],
+                "_source_cohort_receipt": {
+                    "receiptType": "source_cohort.v1",
+                    "artifactName": "listing",
+                    "artifactPath": artifact_path,
+                    "artifactGeneration": "generation-a",
+                    "identityField": "detailUrl",
+                    "cohortSourceIndices": [0, 1, 2, 3],
+                    "cohortRowKeys": ["u0", "u1", "u2", "u3"],
+                    "sourceRowCount": 4,
+                    "cohortSelector": {},
+                },
+                "_execution_slice_receipt": {
+                    "receiptType": "execution_slice.v1",
+                    "role": "probe",
+                    "artifactPath": artifact_path,
+                    "selectedSourceIndices": [0],
+                    "selectedRowKeys": ["u0"],
+                    "selector": {"indices": [0]},
+                },
+            }
+
+            checkpoint = record_replan_checkpoint(
+                logger,
+                phase=phase,
+                worker_contract=contract,
+                worker_id="browser-probe",
+                fast_path_assessment={"status": "not_compilable"},
+            )
+
+            self.assertIsNotNone(checkpoint)
+            # The cohort is bound whole even though the slice was one row.
+            self.assertEqual(checkpoint["cohortSourceIndices"], [0, 1, 2, 3])
+            self.assertEqual(checkpoint["validatedSourceIndices"], [0])
+            self.assertEqual(checkpoint["remainingSourceIndices"], [1, 2, 3])
+            # No reusable candidate: the remaining rows continue on the slow
+            # path rather than being authorized as a bulk run.
+            self.assertEqual(checkpoint["requiredNextRole"], "continuation")
+
     def test_checkpoint_advances_roles_and_fences_source_rows(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             logger = RunLogger(temp, task_id="fast-path-checkpoint")

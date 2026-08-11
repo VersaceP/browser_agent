@@ -2,9 +2,10 @@
 harness.tools.lead_tools - LeadAgent tool schemas and dispatch factory.
 """
 
+import copy
 import json
 from pathlib import Path
-from typing import Any, Awaitable, Callable, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from harness.extraction_artifacts import (
     save_extraction_artifact,
@@ -22,8 +23,14 @@ from harness.task_control import (
     materialize_batch_rows_from_source,
     replan_checkpoint_spawn_rejection,
     load_task_state,
+    write_task_state,
 )
 from harness.completion_receipt import build_completion_receipt
+from harness.numeric_facts import (
+    build_numeric_fact_index,
+    extract_numeric_claims,
+    reconcile_numeric_claims,
+)
 from harness.task_types import (
     VALID_TASK_TYPES,
     normalize_task_type,
@@ -838,10 +845,48 @@ def _lead_save_artifact_schema(_: Any = None) -> JsonDict:
                 "type": "string",
                 "description": "Short dataset name, matching expected_artifact.name when applicable.",
             },
+            "mode": {
+                "type": "string",
+                "enum": ["reference_merge", "rows"],
+                "description": (
+                    "reference_merge (preferred for consolidating worker"
+                    " artifacts): name the sources and row keys and the harness"
+                    " copies each row verbatim, so row content never passes"
+                    " through your context and cannot lose fields. rows: submit"
+                    " row content yourself; only for rows that no source"
+                    " artifact already holds."
+                ),
+            },
+            "sources": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "artifactPath": {"type": "string"},
+                        "rowKeys": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["artifactPath", "rowKeys"],
+                    "additionalProperties": False,
+                },
+                "description": (
+                    "reference_merge only: which rows to copy from which"
+                    " artifact. A row key claimed by two sources is rejected —"
+                    " name the one source you mean."
+                ),
+            },
+            "identity_fields": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Field(s) whose value identifies a row (e.g. detailUrl)."
+                    " Required for reference_merge; in rows mode it enables the"
+                    " regression check that catches silently shrunk arrays."
+                ),
+            },
             "rows": {
                 "type": "array",
                 "items": {"type": "object", "additionalProperties": True},
-                "description": "Structured rows using the exact expected field names.",
+                "description": "rows mode only: structured rows using the exact expected field names.",
             },
             "schema": {
                 "type": "object",
@@ -855,10 +900,10 @@ def _lead_save_artifact_schema(_: Any = None) -> JsonDict:
             "source_artifacts": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Extraction artifact paths used as evidence for this reshape.",
+                "description": "rows mode only: extraction artifact paths used as evidence for this reshape.",
             },
         },
-        "required": ["name", "rows", "schema", "description", "source_artifacts"],
+        "required": ["name", "schema", "description"],
         "additionalProperties": False,
     }
 
@@ -928,7 +973,18 @@ async def execute_lead_tool(agent: Any, tool_call: JsonDict) -> Tuple[JsonDict, 
             step=getattr(agent, "_current_step", 0),
         )
     )
-    return result, action.terminal
+    # A terminal handler may soft-reject its call (tool_was_executed False) to
+    # bounce it back to the model with guidance instead of terminating — the
+    # same contract the worker dispatcher has always honoured. Without it a
+    # rejected final_answer still ended the run, so the numeric gate could
+    # catch a wrong count, write out exactly how to fix it, and then stop the
+    # task before anyone could act on it (observed in runs 636d591d and
+    # cd6718ea). Rejecting an answer has to mean sending it back, not killing
+    # the task.
+    soft_rejected = (
+        isinstance(result, dict) and result.get("tool_was_executed") is False
+    )
+    return result, (action.terminal and not soft_rejected)
 
 
 @LEAD_TOOLS.register(
@@ -1629,9 +1685,14 @@ async def _lead_local_fs_read(ctx: ToolContext) -> JsonDict:
 @LEAD_TOOLS.register(
     name="lead_save_artifact",
     description=(
-        "Persist structured rows prepared by LeadAgent as a standard"
-        " extraction artifact under the current task worktree. Use this after"
-        " schema_mismatch reshape from trusted evidence instead of re-scraping."
+        "Persist rows as a standard extraction artifact under the current task"
+        " worktree, instead of re-scraping. To consolidate rows that worker"
+        " artifacts already hold, use mode=\"reference_merge\": name the source"
+        " artifact and row keys and the harness copies each row verbatim."
+        " Re-typing row content through your own context is how verified data"
+        " loses fields, so mode=\"rows\" is only for rows no source holds, and"
+        " it is rejected when a row shrinks an array its cited source has in"
+        " full."
     ),
     input_schema=_lead_save_artifact_schema,
 )
@@ -1641,15 +1702,76 @@ async def _lead_save_artifact(ctx: ToolContext) -> JsonDict:
     raw_name = str(tool_input.get("name") or "").strip()
     if not raw_name:
         return {"status": "rejected", "error": "name required"}
+
+    identity_fields = [
+        str(field).strip()
+        for field in (tool_input.get("identity_fields") or [])
+        if isinstance(field, str) and str(field).strip()
+    ]
+    mode = str(tool_input.get("mode") or "").strip()
+    if not mode:
+        mode = "reference_merge" if tool_input.get("sources") else "rows"
+
+    if mode == "reference_merge":
+        merged, merge_error = _reference_merge_rows(
+            agent, tool_input.get("sources"), identity_fields,
+        )
+        if merge_error is not None:
+            return merge_error
+        saved = save_extraction_artifact(
+            logger=agent.logger,
+            runtime=agent.runtime,
+            artifacts=None,
+            name=raw_name,
+            rows=merged["rows"],
+            schema=tool_input.get("schema"),
+            description=str(tool_input.get("description") or ""),
+            source_artifacts=merged["sourceArtifacts"],
+            row_lineage=merged["rowLineage"],
+            event_type="tool.lead_save_artifact",
+        )
+        if not isinstance(saved, dict):
+            return saved
+        supersession = _record_artifact_supersession(
+            agent,
+            deliverable=str(saved.get("savedPath") or ""),
+            cited=list(merged.get("sourceArtifacts") or []),
+            absorbed=list(merged.get("absorbedSources") or []),
+        )
+        if supersession:
+            saved = {**saved, "supersedes": supersession}
+        return saved
+
     rows, error = validate_extraction_rows(tool_input.get("rows"))
     if error is not None:
         return error
     raw_sources = tool_input.get("source_artifacts") or []
     if isinstance(raw_sources, str):
         raw_sources = [raw_sources]
-    source_artifacts, source_error = _validate_lead_save_sources(agent, raw_sources)
+    source_artifacts, payloads, source_error = _validate_lead_save_sources(
+        agent, raw_sources,
+    )
     if source_error is not None:
         return source_error
+
+    regressions = _array_cardinality_regressions(
+        rows or [], payloads, identity_fields,
+    )
+    if regressions:
+        return {
+            "status": "rejected",
+            "error": "array_cardinality_regression",
+            "regressions": regressions,
+            "next_instruction": (
+                "These rows carry FEWER array items than the source artifact"
+                " you cited for the same row. Retyping row content through the"
+                " Lead context is how verified data gets truncated. Re-issue"
+                " this call with mode=\"reference_merge\" and name the source"
+                " artifact plus row keys; the harness will copy each row"
+                " verbatim. Submit rows yourself only for rows no source holds."
+            ),
+        }
+
     return save_extraction_artifact(
         logger=agent.logger,
         runtime=agent.runtime,
@@ -1663,9 +1785,351 @@ async def _lead_save_artifact(ctx: ToolContext) -> JsonDict:
     )
 
 
-def _validate_lead_save_sources(agent: Any, raw_sources: Any) -> Tuple[List[str], Optional[JsonDict]]:
+def _row_identity(row: Any, identity_fields: List[str]) -> Optional[str]:
+    """Identity string for a row, or None when a declared field is missing."""
+    if not isinstance(row, dict) or not identity_fields:
+        return None
+    parts: List[str] = []
+    for field in identity_fields:
+        value = row.get(field)
+        if value is None or isinstance(value, (dict, list)):
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        parts.append(text)
+    return " | ".join(parts)
+
+
+def _array_lengths(row: Any) -> Dict[str, int]:
+    if not isinstance(row, dict):
+        return {}
+    return {
+        str(field): len(value)
+        for field, value in row.items()
+        if isinstance(value, list)
+    }
+
+
+def _array_cardinality_regressions(
+    rows: List[JsonDict],
+    payloads: Dict[str, JsonDict],
+    identity_fields: List[str],
+) -> List[JsonDict]:
+    """Rows that shrink an array a cited source already holds in full.
+
+    This is the CodeDesign failure: a source artifact held 18 reviews, the
+    consolidated artifact kept 3, and the final answer still said 18. Verbatim
+    reference_merge makes that structurally impossible; this check covers the
+    rows path that remains available.
+    """
+    if not identity_fields:
+        return []
+    # Per rowKey, per FIELD, the longest array any cited source holds — not the
+    # single richest source row. Choosing one row by its total array length
+    # lets a source with reviews=3 but images=20 outrank a source with
+    # reviews=18, and the 18 goes unnoticed: exactly the loss this guards.
+    source_max: Dict[str, Dict[str, Tuple[int, str]]] = {}
+    for path, payload in payloads.items():
+        for candidate in payload.get("rows") or []:
+            key = _row_identity(candidate, identity_fields)
+            if key is None:
+                continue
+            per_field = source_max.setdefault(key, {})
+            for field, count in _array_lengths(candidate).items():
+                best = per_field.get(field)
+                if best is None or count > best[0]:
+                    per_field[field] = (count, path)
+
+    regressions: List[JsonDict] = []
+    for row in rows:
+        key = _row_identity(row, identity_fields)
+        if key is None:
+            continue
+        per_field = source_max.get(key)
+        if not per_field:
+            continue
+        submitted = _array_lengths(row)
+        for field, (source_count, source_path) in per_field.items():
+            # A field that vanished entirely is maximal shrinkage, so it counts
+            # as 0 rather than being skipped. Treating "absent" as "unknown"
+            # let the worst case through the check aimed at it.
+            submitted_count = submitted.get(field, 0)
+            if submitted_count >= source_count:
+                continue
+            regressions.append({
+                "rowKey": key,
+                "field": field,
+                "before": source_count,
+                "after": submitted_count,
+                "sourceArtifact": source_path,
+            })
+    return regressions
+
+
+def _reference_merge_rows(
+    agent: Any,
+    raw_sources: Any,
+    identity_fields: List[str],
+) -> Tuple[JsonDict, Optional[JsonDict]]:
+    """Copy the named rows out of the named artifacts, verbatim.
+
+    The Lead names sources and row keys; row CONTENT never passes through its
+    context, so a consolidation cannot quietly drop fields it did not re-type.
+    """
+    if not identity_fields:
+        return {}, {
+            "status": "rejected",
+            "error": "identity_fields is required for mode=reference_merge",
+            "next_instruction": (
+                "Declare the field(s) that identify a row (e.g."
+                " [\"detailUrl\"]) so the harness can find each row key in its"
+                " source artifact."
+            ),
+        }
+    if not isinstance(raw_sources, list) or not raw_sources:
+        return {}, {
+            "status": "rejected",
+            "error": "mode=reference_merge requires a non-empty sources array",
+        }
+
+    paths: List[str] = []
+    requested: List[Tuple[str, List[str]]] = []
+    for entry in raw_sources:
+        if not isinstance(entry, dict):
+            return {}, {
+                "status": "rejected",
+                "error": "each sources entry must be an object with artifactPath and rowKeys",
+            }
+        path_text = str(entry.get("artifactPath") or "").strip()
+        row_keys = [
+            str(key).strip()
+            for key in (entry.get("rowKeys") or [])
+            if isinstance(key, str) and str(key).strip()
+        ]
+        if not path_text or not row_keys:
+            return {}, {
+                "status": "rejected",
+                "error": "each sources entry needs artifactPath and at least one rowKey",
+                "sourceArtifact": path_text or None,
+            }
+        paths.append(path_text)
+        requested.append((path_text, row_keys))
+
+    validated, payloads, source_error = _validate_lead_save_sources(agent, paths)
+    if source_error is not None:
+        return {}, source_error
+    # Resolve each entry's own path rather than zipping against `validated`:
+    # that list is deduplicated, so two entries naming the same artifact (a
+    # legitimate way to split row keys) would shift every later pairing by one.
+    # The security checks stay in the validator; this only maps entry -> key.
+    resolved_paths: Dict[str, str] = {}
+    for path_text in paths:
+        resolved = str(Path(path_text).expanduser().resolve(strict=False))
+        if resolved not in payloads:
+            return {}, {
+                "status": "rejected",
+                "error": "source_artifact could not be resolved",
+                "sourceArtifact": path_text,
+            }
+        resolved_paths[path_text] = resolved
+
+    claimed: Dict[str, List[str]] = {}
+    for path_text, row_keys in requested:
+        for key in row_keys:
+            claimed.setdefault(key, []).append(resolved_paths[path_text])
+    conflicts = [
+        {"rowKey": key, "claimedBy": sources}
+        for key, sources in claimed.items()
+        if len(sources) > 1
+    ]
+    if conflicts:
+        return {}, {
+            "status": "rejected",
+            "error": "row_key_claimed_by_multiple_sources",
+            "conflicts": conflicts,
+            "next_instruction": (
+                "Pick ONE source artifact per row key. Choosing between two"
+                " versions of a row is a decision about evidence, not something"
+                " the harness may guess."
+            ),
+        }
+
+    rows: List[JsonDict] = []
+    lineage: List[JsonDict] = []
+    missing: List[JsonDict] = []
+    for path_text, row_keys in requested:
+        resolved = resolved_paths[path_text]
+        index: Dict[str, Tuple[int, JsonDict]] = {}
+        for position, candidate in enumerate(payloads[resolved].get("rows") or []):
+            key = _row_identity(candidate, identity_fields)
+            if key is not None and key not in index:
+                index[key] = (position, candidate)
+        for key in row_keys:
+            found = index.get(key)
+            if found is None:
+                missing.append({"rowKey": key, "sourceArtifact": resolved})
+                continue
+            position, candidate = found
+            rows.append(copy.deepcopy(candidate))
+            lineage.append({
+                "rowKey": key,
+                "sourceArtifact": resolved,
+                "sourceRowIndex": position,
+            })
+
+    if missing:
+        return {}, {
+            "status": "rejected",
+            "error": "row_key_not_found_in_source",
+            "missing": missing,
+            "identityFields": identity_fields,
+            "next_instruction": (
+                "Each rowKey must match an identity_fields value in the named"
+                " artifact. Read the source artifact and copy the exact value,"
+                " or point at the artifact that actually holds that row."
+            ),
+        }
+
+    return {
+        "rows": rows,
+        "rowLineage": lineage,
+        "sourceArtifacts": validated,
+        "absorbedSources": _fully_absorbed_sources(
+            rows, payloads, identity_fields,
+        ),
+    }, None
+
+
+def _resolved_path_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return str(Path(text).expanduser().resolve(strict=False))
+    except (OSError, ValueError):
+        return text
+
+
+def _record_artifact_supersession(
+    agent: Any,
+    *,
+    deliverable: str,
+    cited: List[str],
+    absorbed: List[str],
+) -> List[str]:
+    """Make a fully-absorbing merge the delivered generation.
+
+    `task_state["artifacts"]` is the ledger the numeric gate and the completion
+    receipt read as "what this task delivers". A consolidated artifact was
+    never in it, so the deliverable itself was the one thing no number could be
+    checked against — and worse, it landed in the superseded bucket, where a
+    merge that dropped rows read as *verified* against the sources it had just
+    damaged (task d32a810d).
+
+    The supersession is recorded as its own entry rather than by editing
+    `artifacts` in place, because that list is also the input ledger for
+    downstream batch_source materialization, replan checkpoints, collect_items
+    and skill dispatch. Those consumers want the full history; only
+    `_validated_artifacts` wants the delivered view, and it is the only reader
+    that applies this.
+
+    All-or-nothing across the cited sources that are in the ledger: a merge
+    that absorbs two artifacts and half of a third would leave the third's
+    absorbed rows in two active artifacts at once, which is the double-count
+    this design exists to avoid. Returns the paths retired, empty if none.
+    """
+    if not deliverable:
+        return []
+    state = _lead_task_state(agent)
+    ledger_entries = {
+        _resolved_path_text(path)
+        for path in (state.get("artifacts") or [])
+        if str(path or "").strip()
+    }
+    absorbed_resolved = {_resolved_path_text(path) for path in absorbed}
+    cited_in_ledger = [
+        resolved for resolved in (
+            _resolved_path_text(path) for path in cited
+        ) if resolved in ledger_entries
+    ]
+    if not cited_in_ledger:
+        return []
+    if any(resolved not in absorbed_resolved for resolved in cited_in_ledger):
+        return []
+
+    supersessions = state.get("artifact_supersessions")
+    if not isinstance(supersessions, list):
+        supersessions = []
+    supersessions.append({
+        "deliverable": _resolved_path_text(deliverable),
+        "absorbed": cited_in_ledger,
+        "mode": "reference_merge",
+    })
+    state["artifact_supersessions"] = supersessions
+    write_task_state(agent.logger, state)
+    logger = getattr(agent, "logger", None)
+    if logger is not None and hasattr(logger, "write"):
+        logger.write("lead.artifact_supersession", {
+            "deliverable": _resolved_path_text(deliverable),
+            "absorbed": cited_in_ledger,
+        })
+    return cited_in_ledger
+
+
+def _lead_task_state(agent: Any) -> JsonDict:
+    state = load_task_state(getattr(agent, "logger", None))
+    return state if isinstance(state, dict) else {}
+
+
+def _fully_absorbed_sources(
+    merged_rows: List[JsonDict],
+    payloads: Dict[str, JsonDict],
+    identity_fields: List[str],
+) -> List[str]:
+    """Source artifacts whose every row survived into the merged output.
+
+    "Fully absorbed" is the licence to call the merged artifact the delivered
+    generation and retire the source into history. It has to be per-artifact
+    and total: a source that kept nine of ten rows is not superseded by the
+    merge, it was partially copied, and treating it as history would delete
+    that tenth row from the delivered set with nothing recording the loss.
+
+    A row whose identity cannot be computed (a declared identity field is
+    missing or non-scalar) can never be shown to have survived, so it blocks
+    absorption. That is the conservative direction: the cost is a merge that
+    does not get to supersede, against a row that quietly stops being
+    delivered.
+    """
+    merged_identities = {
+        identity for identity in (
+            _row_identity(row, identity_fields) for row in merged_rows
+        ) if identity is not None
+    }
+    absorbed: List[str] = []
+    for path_text, payload in payloads.items():
+        source_rows = payload.get("rows")
+        if not isinstance(source_rows, list) or not source_rows:
+            continue
+        identities = [_row_identity(row, identity_fields) for row in source_rows]
+        if any(identity is None for identity in identities):
+            continue
+        if all(identity in merged_identities for identity in identities):
+            absorbed.append(path_text)
+    return absorbed
+
+
+def _validate_lead_save_sources(
+    agent: Any, raw_sources: Any,
+) -> Tuple[List[str], Dict[str, JsonDict], Optional[JsonDict]]:
+    """Validate cited source artifacts and return their parsed payloads.
+
+    The payloads are returned rather than discarded because both the reference
+    merge and the regression check need the source rows, and re-reading the
+    files after validating them invites the two reads to disagree.
+    """
     if not isinstance(raw_sources, list):
-        return [], {
+        return [], {}, {
             "status": "rejected",
             "error": "source_artifacts must be a non-empty array of extraction artifact paths",
         }
@@ -1675,7 +2139,7 @@ def _validate_lead_save_sources(agent: Any, raw_sources: Any) -> Tuple[List[str]
         if isinstance(path, str) and str(path).strip()
     ]
     if not source_texts:
-        return [], {
+        return [], {}, {
             "status": "rejected",
             "error": "lead_save_artifact requires at least one source extraction artifact",
             "next_instruction": (
@@ -1691,11 +2155,12 @@ def _validate_lead_save_sources(agent: Any, raw_sources: Any) -> Tuple[List[str]
         task_root = task_dir.absolute()
 
     validated: List[str] = []
+    payloads: Dict[str, JsonDict] = {}
     for source in source_texts:
         try:
             path = Path(source).expanduser().resolve(strict=False)
         except (OSError, ValueError) as exc:
-            return [], {
+            return [], {}, {
                 "status": "rejected",
                 "error": f"invalid source_artifact path: {source}",
                 "details": str(exc),
@@ -1703,7 +2168,7 @@ def _validate_lead_save_sources(agent: Any, raw_sources: Any) -> Tuple[List[str]
         try:
             path.relative_to(task_root)
         except ValueError:
-            return [], {
+            return [], {}, {
                 "status": "rejected",
                 "error": "source_artifact must stay inside the current task worktree",
                 "sourceArtifact": str(path),
@@ -1711,13 +2176,13 @@ def _validate_lead_save_sources(agent: Any, raw_sources: Any) -> Tuple[List[str]
             }
         normalized = str(path).replace("\\", "/")
         if "/artifacts/extractions/" not in normalized:
-            return [], {
+            return [], {}, {
                 "status": "rejected",
                 "error": "source_artifact must be an extraction artifact path",
                 "sourceArtifact": str(path),
             }
         if not path.exists() or not path.is_file():
-            return [], {
+            return [], {}, {
                 "status": "rejected",
                 "error": "source_artifact does not exist",
                 "sourceArtifact": str(path),
@@ -1725,14 +2190,14 @@ def _validate_lead_save_sources(agent: Any, raw_sources: Any) -> Tuple[List[str]
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            return [], {
+            return [], {}, {
                 "status": "rejected",
                 "error": "source_artifact must be readable JSON",
                 "sourceArtifact": str(path),
                 "details": str(exc),
             }
         if not isinstance(payload, dict) or not isinstance(payload.get("rows"), list):
-            return [], {
+            return [], {}, {
                 "status": "rejected",
                 "error": "source_artifact must contain a rows array",
                 "sourceArtifact": str(path),
@@ -1740,7 +2205,8 @@ def _validate_lead_save_sources(agent: Any, raw_sources: Any) -> Tuple[List[str]
         text = str(path)
         if text not in validated:
             validated.append(text)
-    return validated, None
+        payloads[text] = payload
+    return validated, payloads, None
 
 
 @LEAD_TOOLS.register(
@@ -1751,16 +2217,203 @@ def _validate_lead_save_sources(agent: Any, raw_sources: Any) -> Tuple[List[str]
     loop_guard=False,
 )
 async def _lead_final_answer(ctx: ToolContext) -> JsonDict:
+    state = load_task_state(ctx.agent.logger)
     receipt = build_completion_receipt(
-        state=load_task_state(ctx.agent.logger),
+        state=state,
         spawner=getattr(ctx.agent, "spawner", None),
     )
+    answer = str(ctx.tool_input.get("answer", "")).strip()
+    reconciliation = await _reconcile_final_answer_numbers(ctx.agent, answer, state)
+    rejection = _numeric_reconciliation_rejection(reconciliation)
+    if rejection is not None:
+        return rejection
     ctx.agent.logger.write("lead.completion_receipt", receipt)
-    return {
+    result: JsonDict = {
         "status": ctx.tool_input.get("status", "done"),
-        "answer": str(ctx.tool_input.get("answer", "")).strip(),
+        "answer": answer,
         "trigger": "lead_decided",
         "completionReceipt": receipt,
+    }
+    if reconciliation:
+        result["numericReconciliation"] = {
+            key: value for key, value in reconciliation.items()
+            if key != "claims"
+        }
+    return result
+
+
+async def _reconcile_final_answer_numbers(
+    agent: Any, answer: str, state: Any,
+) -> JsonDict:
+    """Recompute the quantities the answer asserts, from the ledgers.
+
+    Extraction is a model call because binding "18 条" to a review count needs
+    the sentence around it; the comparison that follows is pure lookup. An
+    unreachable extractor is reported, not treated as a verdict — but a claim
+    it cannot anchor in the answer verbatim fails the whole report, because
+    skipping the number we could not parse is how the wrong one gets through.
+    """
+    provider = getattr(agent, "claim_extractor_provider", None)
+    logger = getattr(agent, "logger", None)
+    if provider is None or not answer:
+        return {}
+    try:
+        index = build_numeric_fact_index(
+            state, task_dir=getattr(logger, "task_dir", None),
+        )
+        extracted = await extract_numeric_claims(
+            provider,
+            answer=answer,
+            index=index,
+            logger=logger,
+            provider_name=str(getattr(agent, "claim_extractor_provider_name", "")),
+            model_id=str(getattr(agent, "claim_extractor_model", "")),
+        )
+        if str(extracted.get("status")) != "ok":
+            # Carry the extractor's own distinction through: `unavailable`
+            # (could not reach it) is not a finding about the answer, while
+            # `extractor_unusable` (reached it, got nothing usable back) means
+            # this answer went unchecked.
+            report = {
+                "status": str(extracted.get("status") or "unavailable"),
+                "error": str(extracted.get("error") or "")[:300],
+            }
+        else:
+            report = reconcile_numeric_claims(
+                list(extracted.get("claims") or []),
+                answer=answer,
+                index=index,
+                spans=extracted.get("spans"),
+            )
+    except Exception as exc:  # never block termination on a checker defect
+        report = {"status": "unavailable", "error": f"{type(exc).__name__}: {exc}"}
+    if logger is not None and hasattr(logger, "write"):
+        # `claims` is too large to log, but dropping it wholesale made a
+        # `passed` unreadable: twelve numbers confirmed against the ledger and
+        # twelve nobody could find both logged as "checked: 12, contradicted:
+        # 0". The histogram is small and is the difference between a gate that
+        # held and a gate that had nothing to hold on to.
+        logger.write("lead.numeric_reconciliation", {
+            **{key: value for key, value in report.items() if key != "claims"},
+            **(
+                {"verdicts": _verdict_histogram(report.get("claims"))}
+                if isinstance(report.get("claims"), list) else {}
+            ),
+        })
+    return report
+
+
+def _verdict_histogram(claims: Any) -> JsonDict:
+    """Counts per verdict, so `passed` says which kind of pass it was."""
+    histogram: Dict[str, int] = {}
+    for claim in claims if isinstance(claims, list) else []:
+        verdict = str((claim or {}).get("verdict") or "unknown")
+        histogram[verdict] = histogram.get(verdict, 0) + 1
+    return dict(sorted(histogram.items()))
+
+
+def _numeric_reconciliation_rejection(report: JsonDict) -> Optional[JsonDict]:
+    """Turn a reconciliation report into a rejection that says what is wrong.
+
+    Three failures, three different things to do about them, so they are never
+    collapsed into one message: a number nobody accounted for, a quote that is
+    not in the answer, and a number that disagrees with the artifacts are not
+    the same problem and do not have the same fix.
+    """
+    status = str((report or {}).get("status") or "")
+    if status == "span_validation_failed":
+        return {
+            "status": "rejected",
+            "error": "numeric_claim_span_unverifiable",
+            # Send the answer back for repair; do not end the task on it.
+            "tool_was_executed": False,
+            "cause": "a quoted number is not in the answer verbatim",
+            "unverifiableClaims": report.get("unverifiableClaims"),
+            "next_instruction": (
+                "NOT a data problem: the checker quoted these numbers back and"
+                " they do not appear in your answer as written, so it could not"
+                " bind any of them and no number was checked. This happens when"
+                " a quantity is split by formatting (a table cell, a bolded"
+                " digit, a thousands separator). Re-issue final_answer with"
+                " each quantity written as plain digits next to the item it"
+                " describes."
+            ),
+        }
+    if status == "extractor_unusable":
+        return {
+            "status": "rejected",
+            "error": "numeric_claim_check_did_not_run",
+            # Send the answer back for repair; do not end the task on it.
+            "tool_was_executed": False,
+            "cause": (
+                "the checker was reached but returned nothing usable, so no"
+                " number in this answer was verified"
+            ),
+            "checkerError": report.get("error"),
+            "next_instruction": (
+                "NOT a finding about your data — no number was checked at all,"
+                " so this answer carries no verification. The checker returns"
+                " one entry per number and tends to fail on long, number-dense"
+                " prose. Re-issue final_answer more plainly: put each quantity"
+                " next to the item it counts, drop numbers that are not results"
+                " of this task, and prefer a short list over a wide table."
+            ),
+        }
+    if status == "coverage_failed":
+        # Not degraded to a pass. A gate that reports success for numbers it
+        # never checked is the shape that shipped three wrong counts in
+        # 857616aa; the answer waits until every number is accounted for.
+        uncovered = report.get("uncoveredSpans")
+        uncovered = uncovered if isinstance(uncovered, list) else []
+        return {
+            "status": "rejected",
+            "error": "numeric_claim_coverage_incomplete",
+            # Send the answer back for repair; do not end the task on it.
+            "tool_was_executed": False,
+            "cause": (
+                f"{len(uncovered)} number(s) in the answer were not accounted"
+                " for by the checker, so they were never verified"
+            ),
+            "uncoveredNumbers": uncovered[:20],
+            "uncoveredCount": len(uncovered),
+            "next_instruction": (
+                "NOT a data mismatch — nothing here says a number is wrong."
+                " Every number in a final answer has to be either checked"
+                " against the delivered artifacts or explicitly dismissed, and"
+                " these were neither. `context` shows each one in its own"
+                " sentence. Re-issue final_answer and, for each number listed:"
+                " state it plainly next to the item it counts (\"CodeDesign:"
+                " 18 reviews\") so it can be bound to an artifact field, or"
+                " remove it if it is decorative and not a result of this task."
+                " Numbers quoted from the pages you scraped (a site rating, a"
+                " price, a date) are fine to keep — just keep them next to the"
+                " thing they describe."
+            ),
+        }
+    if status != "failed":
+        return None
+    return {
+        "status": "rejected",
+        "error": "numeric_claim_mismatch",
+        # Send the answer back for repair; do not end the task on it.
+        "tool_was_executed": False,
+        "cause": (
+            "a number disagrees with the artifacts this task delivers"
+        ),
+        "contradicted": report.get("contradicted"),
+        "dataConflicts": report.get("dataConflicts"),
+        "next_instruction": (
+            "A DATA problem, unlike a coverage rejection: each entry below was"
+            " recomputed and came out different. "
+            "These numbers disagree with the artifacts this task actually"
+            " delivers. `actualValue` is recomputed from the active validated"
+            " generation; a dataConflict means a superseded artifact holds MORE"
+            " than the delivered one, so the data regressed and calling it"
+            " complete would be wrong. Correct the numbers to match the"
+            " delivered artifacts — or, for a dataConflict, restore the missing"
+            " rows with lead_save_artifact mode=\"reference_merge\" — then"
+            " re-issue final_answer."
+        ),
     }
 
 
