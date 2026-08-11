@@ -559,6 +559,45 @@ _NUMBER_SPAN_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
 _SPAN_LEFT_SKIP = "#v-/.:@=_%$¥€£"
 _SPAN_RIGHT_SKIP = "-/.:%°"
 
+# Scripts that write numbers flush against words. In English a digit touching a
+# letter means the digit is part of an identifier ("v2", "3rd", "COVID19"), so
+# adjacency disqualifies it. In Chinese, Japanese and Korean the same adjacency
+# is how every ordinary quantity is written — 第8名, 18条评论, 3个商品 — and the
+# blanket `isalnum()` guard therefore found ZERO numbers in an entire Chinese
+# answer, leaving the gate inert for exactly the tasks this project runs most
+# (observed in task dbcabfb6: 33 numbers stated, 0 checked, reported "passed").
+_CJK_RANGES = (
+    (0x2E80, 0x2FDF),    # CJK radicals / Kangxi
+    (0x3000, 0x303F),    # CJK symbols and punctuation
+    (0x3040, 0x30FF),    # Hiragana, Katakana
+    (0x3130, 0x318F),    # Hangul compatibility jamo
+    (0x31C0, 0x31EF),    # CJK strokes
+    (0x3400, 0x4DBF),    # CJK extension A
+    (0x4E00, 0x9FFF),    # CJK unified ideographs
+    (0xA960, 0xA97F),    # Hangul jamo extended-A
+    (0xAC00, 0xD7AF),    # Hangul syllables
+    (0xF900, 0xFAFF),    # CJK compatibility ideographs
+    (0xFF00, 0xFFEF),    # Halfwidth and fullwidth forms
+    (0x20000, 0x2FA1F),  # CJK extensions B-F and compatibility supplement
+)
+
+
+def _is_cjk(char: str) -> bool:
+    if not char:
+        return False
+    code = ord(char)
+    return any(low <= code <= high for low, high in _CJK_RANGES)
+
+
+def _glues_digit_into_a_word(char: str) -> bool:
+    """Does this neighbouring character make the digit part of a word?
+
+    Only for scripts that separate words with spaces. A CJK neighbour says
+    nothing — it is the normal way to write a quantity — so it never
+    disqualifies a span.
+    """
+    return bool(char) and char.isalnum() and not _is_cjk(char)
+
 
 def numeric_spans(answer: str) -> List[JsonDict]:
     """Every quantity-shaped number in the answer, with its offset.
@@ -574,7 +613,11 @@ def numeric_spans(answer: str) -> List[JsonDict]:
         left = text[start - 1] if start else ""
         right = text[end] if end < len(text) else ""
         after_right = text[end + 1] if end + 1 < len(text) else ""
-        if left in _SPAN_LEFT_SKIP:
+        # `and left`: an empty string is a substring of everything, so without
+        # it a number that opens the answer ("18 reviews collected") was always
+        # skipped — the one position a headline quantity is most likely to sit
+        # in. The right-hand check has always carried this guard.
+        if left and left in _SPAN_LEFT_SKIP:
             continue
         # A trailing "." is a version/date separator only when a digit follows;
         # otherwise it just ends the sentence, and skipping those would drop
@@ -583,7 +626,7 @@ def numeric_spans(answer: str) -> List[JsonDict]:
             right = ""
         if right in _SPAN_RIGHT_SKIP and right:
             continue
-        if left.isalnum() or right.isalnum():
+        if _glues_digit_into_a_word(left) or _glues_digit_into_a_word(right):
             continue
         spans.append({"text": match.group(0), "start": start, "end": end})
     return spans
