@@ -39,6 +39,59 @@ FAILED = "failed"
 NOT_DISPATCHED = "not_dispatched"
 
 
+# ABCP attaches `ActionRuntimeErrorInfo` to a failed action: which stage the
+# failure happened in, and — decisively — whether the browser had already begun
+# dispatching input. Only these four bounded scalars are carried; the rest of
+# the provider payload stays out.
+_ACTION_RUNTIME_FIELDS = ("code", "phase", "sideEffectStarted", "actionKind")
+
+
+def action_runtime_info(value: Any) -> Optional[JsonDict]:
+    """The platform's structured account of a failure, wherever it is carried.
+
+    Accepts a raw JSON-RPC error `data`, a tool result, or an already-extracted
+    metadata dict, because the same block reaches different call sites through
+    different envelopes.
+    """
+    for candidate in _runtime_candidates(value):
+        if not isinstance(candidate, dict):
+            continue
+        info = {
+            key: candidate[key]
+            for key in _ACTION_RUNTIME_FIELDS
+            if key in candidate
+        }
+        if info.get("code") or info.get("phase"):
+            return info
+    return None
+
+
+def _runtime_candidates(value: Any) -> Tuple[Any, ...]:
+    if not isinstance(value, dict):
+        return ()
+    nested = []
+    for key in ("runtime", "actionRuntime"):
+        if isinstance(value.get(key), dict):
+            nested.append(value[key])
+    for container_key in ("data", "response", "rpcData", "errorClassification"):
+        container = value.get(container_key)
+        if isinstance(container, dict):
+            nested.extend(_runtime_candidates(container))
+    return tuple(nested)
+
+
+def replay_forbidden(result: Any) -> bool:
+    """True when the platform says input dispatch had already started.
+
+    A failed action that already moved the page is not a free retry: re-issuing
+    it can submit a form twice or double-click a control. The platform states
+    this per failure, so a composite that retries must ask rather than infer it
+    from an error string.
+    """
+    info = action_runtime_info(result)
+    return bool(info and info.get("sideEffectStarted") is True)
+
+
 @dataclass(frozen=True)
 class CallOutcome:
     """What a browser call is known to have done."""
@@ -187,12 +240,15 @@ def page_state_evidence_ok(page_id: str, result: Any) -> bool:
     echoed = str(data.get("pageId") or data.get("page_id") or "").strip()
     if echoed and echoed != str(page_id or "").strip():
         return False
-    for key in ("url", "currentUrl", "title", "status", "navigationId"):
+    # `navigationId` is gone from the agent-facing page state; `failure` is the
+    # field that replaced the old error pair and is itself proof the browser
+    # answered about this page.
+    for key in ("url", "currentUrl", "title", "status"):
         if str(data.get(key) or "").strip():
             return True
     return any(
         isinstance(data.get(key), dict) and bool(data.get(key))
-        for key in ("hitl", "blockingInteractions")
+        for key in ("hitl", "blockingInteractions", "failure")
     )
 
 
@@ -229,7 +285,10 @@ def route_recovery_claim_evidence_ok(page_id: str, result: Any) -> bool:
 _STRUCTURED_READ_EVIDENCE_KEYS = {
     "DOM.getText": {"items", "text", "textContent"},
     "DOM.getAttribute": {"items", "attributes", "value", "values"},
-    "DOM.getSemanticTree": {"nodeCount", "nodes", "outline", "tree"},
+    # getSemanticTree returns a frame graph: the payload lives in `frames`,
+    # the count in `summary`. Neither `tree` nor a top-level `nodeCount`
+    # appears, so scoring this read by those keys marks every success empty.
+    "DOM.getSemanticTree": {"frames", "rootFrameId", "summary"},
     "DOM.getAXTree": {"lines", "nodeCount", "nodes", "outline", "tree"},
 }
 

@@ -117,14 +117,17 @@ HARNESS_TOOL_NAMES: FrozenSet[str] = frozenset({
 # (it is now a known capability method). HARNESS-INTERNAL auto-digest use stays
 # separately gated by HarnessConfig.semantic_tree.
 #
-# The three entries below no longer appear in System.getCapabilities as of ABCP
-# v1.1.5, so they are inert today. They are KEPT ON PURPOSE rather than cleaned
-# up: unlike a stale TASK_TYPE_ALLOWED_EXCEPTIONS entry (which silently disables
-# a live method), a stale entry here costs nothing, and each still encodes a
-# policy we would want the moment the platform reintroduces the method —
-# Hitl.* wait/resume is owned by harness/hitl.py, and Memory.delete would let a
-# worker destroy another phase's memory. Re-verify against the capability
-# surface before removing any of them.
+# Keeping these entries after the methods vanished from System.getCapabilities
+# has now paid for itself: `Memory.delete` is BACK in the live capability
+# surface (verified against the running dispatcher, 61 capabilities), so this
+# block is load-bearing again rather than inert — a worker could otherwise
+# destroy another phase's memory. `Hitl.getTaskSummary` / `Hitl.resumeEvent`
+# remain absent and stay listed on the same reasoning: unlike a stale
+# TASK_TYPE_ALLOWED_EXCEPTIONS entry (which silently disables a live method), a
+# stale entry here costs nothing, and each encodes the policy we would want the
+# moment the platform reintroduces the method — Hitl.* wait/resume is owned by
+# harness/hitl.py. Re-verify against the capability surface before removing any
+# of them.
 ALWAYS_FORBIDDEN_ABCP_METHODS: FrozenSet[str] = frozenset({
     "Hitl.getTaskSummary",
     "Hitl.resumeEvent",

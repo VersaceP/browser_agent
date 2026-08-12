@@ -1,6 +1,6 @@
 {
   "method": "Fleet.close",
-  "description": "Closes and destroys the specified browser instance, stops its Client process, and cleans up all resources.",
+  "description": "Closes and destroys the specified browser instance, waits for orderly Client resource cleanup, and reports whether process termination was graceful or forced.",
   "params": {
     "fleetId": {
       "type": "string",

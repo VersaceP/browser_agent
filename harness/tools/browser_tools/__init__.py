@@ -37,10 +37,12 @@ from harness.extraction_artifacts import (
 )
 from harness.artifact_evidence import detect_blocker_data_rows
 from harness.call_outcome import (
+    action_runtime_info,
     auto_hitl_is_actionable,
     classify_call_outcome,
     evaluate_grant,
     page_state_evidence_ok,
+    replay_forbidden,
 )
 from harness.fleet_runtime import FleetClickGateTimeout
 from harness.hitl import wait_for_hitl_resume
@@ -61,7 +63,10 @@ from harness.observation.overlay_detector import (
     title_looks_like_auth_page,
 )
 from harness.observation.semantic_index import discover_selector_candidates
-from harness.observation.page_lifecycle import PageLifecycleTracker
+from harness.observation.page_lifecycle import (
+    AUTOMATION_UNAVAILABLE_FAILURE,
+    PageLifecycleTracker,
+)
 from harness.observation.event_observer import unwrap_notification
 from harness.observation.verifiers import (
     build_collection_oracle,
@@ -110,6 +115,7 @@ from .schemas import EVAL_JS_REASON_KINDS, _browser_input_schemas
 from .axtree_state import (
     AXTREE_INVALIDATING_METHODS,
     _apply_recovered_target,
+    AXTREE_ID_RE,
     _axtree_ids_from_params,
     _axtree_ids_from_value,
     _axtree_lines_from_value,
@@ -4835,16 +4841,33 @@ async def _navigate_dispatch_failure_result(
     }
 
     if lifecycle_reported_failure:
+        # ABCP states WHY the page is unusable in `failure.kind`; carry it
+        # instead of leaving the caller to re-derive it from prose. An
+        # `automation-unavailable` page is not a navigation the browser lost —
+        # re-navigating cannot fix it.
+        failure_kind = str(getattr(lifecycle_state, "failure_kind", "") or "")
+        automation_unavailable = failure_kind == AUTOMATION_UNAVAILABLE_FAILURE
         return {
             **common,
             "status": "navigation_load_failed",
             "tool_was_executed": True,
             "navigationCommitted": False,
+            "pageFailure": {
+                "kind": failure_kind,
+                "message": str(getattr(lifecycle_state, "failure_message", "") or "") or None,
+                "retryableByNavigation": not automation_unavailable,
+            } if failure_kind else None,
             "next_instruction": (
                 "The browser reported Page.loadFailed for this navigation."
                 " observedUrl/observedTitle are where the page actually sits."
-                " Decide from those whether a fresh navigation is warranted;"
-                " this composite will not re-dispatch it for you."
+                + (
+                    " pageFailure.kind=automation-unavailable: the document may"
+                    " be fine while automation cannot attach, so navigating"
+                    " again will not change it — report the blocker instead."
+                    if automation_unavailable else
+                    " Decide from those whether a fresh navigation is warranted;"
+                    " this composite will not re-dispatch it for you."
+                )
             ),
         }
 
@@ -5183,6 +5206,12 @@ def _transport_error_metadata(
     rpc_data = getattr(exc, "rpc_data", None)
     if method in {"DOM.inspectSelect", "Input.select"} and rpc_data is not None:
         metadata["rpcData"] = trim_large_strings(rpc_data, 4000)
+    runtime = action_runtime_info(rpc_data)
+    if runtime:
+        # Four bounded scalars, no provider payload: whether the failure landed
+        # before or after dispatch is the one fact a retry decision needs, and
+        # inferring it from prose is guessing at something the platform states.
+        metadata["actionRuntime"] = runtime
     return metadata
 
 
@@ -8048,7 +8077,15 @@ async def _maybe_auto_intercept_overlay(
     blocked_target = _blocked_target_id(params)
     # Only Input.click is auto-retry-safe; dismiss_overlay re-checks the target's
     # sensitivity before any retry and returns dismissed_pending_action otherwise.
-    target_method = method if method == "Input.click" else ""
+    # A click whose failure reports `sideEffectStarted` is NOT auto-retry-safe no
+    # matter how safe the target looks: input dispatch had already begun, so the
+    # click may have landed under the overlay and the retry would be a second
+    # one. Clear the overlay anyway — that is useful and side-effect-free — but
+    # hand back an unretried action for the caller to judge.
+    side_effect_started = replay_forbidden(result)
+    target_method = (
+        method if method == "Input.click" and not side_effect_started else ""
+    )
     dismiss = await _dismiss_overlay(
         agent,
         {"pageId": page_id, "targetId": blocked_target, "targetMethod": target_method},
@@ -8132,6 +8169,10 @@ async def _maybe_auto_intercept_overlay(
         "treeRefreshed": tree_refreshed,
         "overlay": dismiss.get("overlay"),
         "vlArbiter": dismiss.get("vlArbiter"),
+        **(
+            {"replayForbidden": True, "retrySuppressed": "side_effect_started"}
+            if side_effect_started else {}
+        ),
     }
     stale_tree_note = ""
     if cleared and method == "DOM.getAXTree" and not tree_refreshed:
@@ -8152,6 +8193,15 @@ async def _maybe_auto_intercept_overlay(
                 " response.data.lines was refreshed to the post-dismiss tree. Use"
                 " these ids."
             )
+        elif side_effect_started:
+            instruction = (
+                "Occlusion auto-intercept: the overlay was dismissed, but your"
+                " action was NOT retried because the platform reported that"
+                " input dispatch had already started — it may have taken effect"
+                " under the overlay. Read the page (Page.getState plus a fresh"
+                " DOM.getAXTree, or the field/row you were changing) and decide"
+                " from what you see; do not re-issue it blind."
+            ) + stale_tree_note
         else:
             instruction = (
                 "Occlusion auto-intercept: the overlay was dismissed but your action"
@@ -8196,9 +8246,15 @@ def _check_select_param_requirements(
 ) -> Optional[JsonDict]:
     """Fail early on malformed Input.select selection envelopes.
 
-    The live schema intentionally permits id/value/label metadata to coexist,
-    so the harness requires at least one usable identity field rather than
-    imposing an artificial oneOf. Cascading paths are validated recursively.
+    The live schema now requires EXACTLY ONE locator per item — id, value,
+    label, or path — with `path` exclusive and every path segment following the
+    same rule. An earlier revision of this guard deliberately accepted several
+    coexisting fields because the schema of the day allowed it; that is now the
+    opposite of the contract, and combining them is rejected by the platform.
+
+    Multiple direct choices mean "this is the final selection set", not "append
+    one more", and are only valid on a confirmed multi-select control — which
+    the harness cannot know before dispatch, so that stays the platform's call.
     """
 
     if method != "Input.select":
@@ -8233,12 +8289,27 @@ def _check_select_param_requirements(
             "invalidParam": path,
             "tool_was_executed": False,
             "next_instruction": (
-                "Copy only option descriptor fields returned by"
-                " DOM.inspectSelect: id, exact value, exact label, or a complete"
-                " cascade path. Do not synthesize identifiers or operate the"
-                " popup manually."
+                "Every selections item must carry EXACTLY ONE locator: id,"
+                " exact value, exact label, or path. path is exclusive, and"
+                " each path segment follows the same one-locator rule. Copy"
+                " only option descriptor fields returned by DOM.inspectSelect;"
+                " do not synthesize identifiers or operate the popup manually."
             ),
         }
+
+    def present_locators(choice: JsonDict, *, allow_path: bool) -> List[str]:
+        names = ["id", "value", "label"] + (["path"] if allow_path else [])
+        present: List[str] = []
+        for name in names:
+            value = choice.get(name)
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip() and name != "value":
+                # An empty value IS a legitimate option value; an empty
+                # id/label is just an unfilled field.
+                continue
+            present.append(name)
+        return present
 
     def validate_choice(choice: Any, path: str, *, allow_path: bool) -> Optional[JsonDict]:
         if not isinstance(choice, dict):
@@ -8248,17 +8319,23 @@ def _check_select_param_requirements(
             not isinstance(raw_id, str) or canonical_id.fullmatch(raw_id.strip()) is None
         ):
             return invalid(f"{path}.id", f"Input.select {path}.id is not a canonical option id.")
-        direct_identity = (
-            isinstance(choice.get("id"), str)
-            and bool(choice.get("id").strip())
-        ) or isinstance(choice.get("value"), str) or (
-            isinstance(choice.get("label"), str)
-            and bool(choice.get("label").strip())
-        )
+        if not allow_path and choice.get("path") is not None:
+            return invalid(f"{path}.path", "Nested Input.select cascade paths are not supported.")
+        locators = present_locators(choice, allow_path=allow_path)
+        if not locators:
+            return invalid(
+                path,
+                f"Input.select {path} requires exactly one of id, value, label"
+                + (", or path." if allow_path else "."),
+            )
+        if len(locators) > 1:
+            return invalid(
+                path,
+                f"Input.select {path} carries {len(locators)} locators"
+                f" ({', '.join(locators)}); the schema accepts exactly one.",
+            )
         cascade = choice.get("path")
         if cascade is not None:
-            if not allow_path:
-                return invalid(f"{path}.path", "Nested Input.select cascade paths are not supported.")
             if not isinstance(cascade, list) or len(cascade) < 2:
                 return invalid(
                     f"{path}.path",
@@ -8268,17 +8345,51 @@ def _check_select_param_requirements(
                 error = validate_choice(step, f"{path}.path[{index}]", allow_path=False)
                 if error is not None:
                     return error
-        elif not direct_identity:
-            return invalid(
-                path,
-                f"Input.select {path} requires id, value, label, or a cascade path.",
-            )
         return None
 
     for index, selection in enumerate(selections):
         error = validate_choice(selection, f"selections[{index}]", allow_path=True)
         if error is not None:
             return error
+    return None
+
+
+def _check_nested_id_format(method: str, params: JsonDict) -> Optional[JsonDict]:
+    """Same canonical-id check for locators that do not sit at the top level.
+
+    Input.scroll's `target`/`container` and Input.drag's destination carry ids
+    the describeAction schema describes inline, so the top-level `params.id`
+    lookup below finds no spec and validates nothing. A truncated id there
+    still reaches the browser as an opaque -32602.
+    """
+    for path, locator, key in (
+        ("target", params.get("target"), "id"),
+        ("container", params.get("container"), "id"),
+        ("", params, "toId"),
+    ):
+        if not isinstance(locator, dict):
+            continue
+        raw = locator.get(key)
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        if AXTREE_ID_RE.match(raw.strip()):
+            continue
+        param_path = f"{path}.{key}" if path else key
+        return {
+            "method": method,
+            "params": params,
+            "status": "invalid_params",
+            "error": (
+                f"{method} params.{param_path} is not a valid canonical element"
+                " id (expected frameId:axNodeId:domNodeId)."
+            ),
+            "tool_was_executed": False,
+            "invalidParam": param_path,
+            "next_instruction": (
+                "Re-read the active page with DOM.getAXTree and copy a current"
+                " canonical id verbatim, or drop the id and locate by selector."
+            ),
+        }
     return None
 
 
@@ -8296,6 +8407,9 @@ def _check_id_param_format(
     (nothing to validate against) so this never over-rejects."""
     if not isinstance(params, dict) or not isinstance(method_schemas, dict):
         return None
+    nested = _check_nested_id_format(method, params)
+    if nested is not None:
+        return nested
     raw_id = params.get("id")
     if not isinstance(raw_id, str) or not raw_id.strip():
         return None
@@ -8337,6 +8451,92 @@ def _check_id_param_format(
     }
 
 
+# Platform cap on one DOM.getImg batch (schema: targets maxItems).
+DOM_GET_IMG_MAX_TARGETS = 32
+
+
+_SCROLL_MODE_INSTRUCTION = (
+    "Input.scroll has three modes and no top-level locator. Target mode:"
+    " target={id?,selector?} (plus optional container) with amount as the"
+    " per-step cap and NO direction — the browser derives it and success means"
+    " targetVisible=true. Container mode: container={id?,selector?} with"
+    " direction and amount, for a container that is already visible. Viewport"
+    " mode: neither locator, just direction and amount. Read layers[].delta for"
+    " the real movement, and do not repeat the same direction after"
+    " completedReason=boundary-reached."
+)
+
+
+def _check_scroll_param_requirements(
+    method: str,
+    params: JsonDict,
+) -> Optional[JsonDict]:
+    """Reject Input.scroll shapes the platform's three-mode union will refuse.
+
+    The union is strict, so a flat `id`/`selector` — the pre-frame-graph shape
+    and the one most models reach for — matches no variant and comes back as a
+    bare -32602 with nothing to act on. Catching it here costs one round trip
+    less and says which mode was meant.
+    """
+    if method != "Input.scroll":
+        return None
+
+    def invalid(detail: str, invalid_param: str) -> JsonDict:
+        return {
+            "method": method,
+            "params": params,
+            "status": "invalid_params",
+            "error": detail,
+            "invalidParam": invalid_param,
+            "tool_was_executed": False,
+            "next_instruction": _SCROLL_MODE_INSTRUCTION,
+        }
+
+    for key in ("id", "selector", "nodeId", "targetId"):
+        if _non_empty_param(params, key):
+            return invalid(
+                f"Input.scroll does not accept a top-level {key}; put the"
+                " locator in target={id?,selector?} or container={id?,selector?}.",
+                key,
+            )
+
+    target = params.get("target")
+    container = params.get("container")
+    for key, locator in (("target", target), ("container", container)):
+        if locator is None:
+            continue
+        if not isinstance(locator, dict):
+            return invalid(f"Input.scroll params.{key} must be an object.", key)
+        if not (_non_empty_param(locator, "id") or _non_empty_param(locator, "selector")):
+            return invalid(
+                f"Input.scroll params.{key} requires id or selector.", key
+            )
+
+    amount = params.get("amount")
+    numeric_amount = (
+        float(amount)
+        if isinstance(amount, (int, float)) and not isinstance(amount, bool)
+        else None
+    )
+    if target is not None:
+        if _non_empty_param(params, "direction"):
+            return invalid(
+                "Input.scroll target mode derives its own direction; drop"
+                " params.direction or switch to container/viewport mode.",
+                "direction",
+            )
+        if numeric_amount is not None and numeric_amount <= 0:
+            return invalid(
+                "Input.scroll target mode needs a positive amount (the cap on"
+                " each smooth-scroll step). amount=0 reads state and is valid"
+                " only for container or viewport mode.",
+                "amount",
+            )
+    if numeric_amount is not None and numeric_amount < 0:
+        return invalid("Input.scroll amount must not be negative.", "amount")
+    return None
+
+
 def _check_target_param_requirements(
     method: str,
     params: JsonDict,
@@ -8344,6 +8544,9 @@ def _check_target_param_requirements(
 ) -> Optional[JsonDict]:
     if not isinstance(params, dict):
         return None
+    scroll_error = _check_scroll_param_requirements(method, params)
+    if scroll_error is not None:
+        return scroll_error
     has_selector_or_id = _non_empty_param(params, "selector") or _non_empty_param(params, "id")
     batch_methods = {"DOM.getText", "DOM.getAttribute", "DOM.getImg"}
     raw_targets = params.get("targets")
@@ -8380,6 +8583,24 @@ def _check_target_param_requirements(
                 id_error["invalidParam"] = f"targets[{index}].id"
                 return id_error
         if method == "DOM.getImg":
+            if len(raw_targets) > DOM_GET_IMG_MAX_TARGETS:
+                return {
+                    "method": method,
+                    "params": params,
+                    "status": "invalid_params",
+                    "error": (
+                        f"DOM.getImg accepts at most {DOM_GET_IMG_MAX_TARGETS}"
+                        f" targets per call; {len(raw_targets)} were supplied."
+                    ),
+                    "invalidParam": "targets",
+                    "tool_was_executed": False,
+                    "next_instruction": (
+                        "Split the export into batches of"
+                        f" {DOM_GET_IMG_MAX_TARGETS} or fewer targets, keeping"
+                        " each batch on one page, and read every batch's"
+                        " response.data.items independently."
+                    ),
+                }
             options = params.get("options")
             path = options.get("path") if isinstance(options, dict) else None
             if not isinstance(path, str) or not path.strip():

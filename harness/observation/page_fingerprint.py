@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Deque, List, Optional, Tuple
 
 from harness.observation.overlay_detector import detect_overlay_from_result
+from harness.semantic_frames import response_node_count
 from harness.utils import JsonDict
 
 
@@ -276,7 +277,7 @@ def page_fingerprint_from_result(
     ids: set[str] = set()
     role_counts: Counter[str] = Counter()
     semantic_counts: Counter[str] = Counter()
-    total_nodes = optional_int(data.get("nodeCount"), 0) or 0
+    total_nodes = response_node_count(data) or 0
     _collect_from_any(
         result,
         ids=ids,
@@ -543,15 +544,6 @@ def normalize_role(value: str) -> str:
 
 def normalize_accessible_name(value: str) -> str:
     return " ".join(str(value or "").lower().split())
-
-
-def optional_int(value: Any, default: int = 0) -> int:
-    try:
-        if value is None:
-            return default
-        return int(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def stable_hash(value: Any) -> str:

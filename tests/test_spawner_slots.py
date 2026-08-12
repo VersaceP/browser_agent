@@ -900,7 +900,7 @@ class BrowserAgentSlotTests(unittest.TestCase):
         )
         self.assertIn(
             "keep the export in the page-owning phase and instruct one batched"
-            " DOM.getImg call before leaving the page",
+            " DOM.getImg call (up to 32 targets) before leaving the page",
             prompt,
         )
         self.assertIn(

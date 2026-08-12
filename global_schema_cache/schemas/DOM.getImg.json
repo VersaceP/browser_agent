@@ -1,6 +1,6 @@
 {
   "method": "DOM.getImg",
-  "description": "Exports rendered image assets from one or more <img> elements by canonical id or selector.",
+  "description": "Exports img, picture, SVG image, inline SVG, canvas, or screenshot-backed visual targets by canonical id or deep selector.",
   "params": {
     "pageId": {
       "type": "string",
@@ -11,47 +11,26 @@
     },
     "targets": {
       "minItems": 1,
+      "maxItems": 32,
       "type": "array",
       "items": {
-        "anyOf": [
-          {
-            "type": "object",
-            "properties": {
-              "id": {
-                "type": "string",
-                "pattern": "^\\d+:\\d+:\\d+$",
-                "description": "Canonical element ID from DOM.getAXTree."
-              },
-              "selector": {
-                "not": {}
-              }
-            },
-            "required": [
-              "id"
-            ],
-            "additionalProperties": false
+        "type": "object",
+        "properties": {
+          "id": {
+            "description": "Preferred canonical element ID from DOM.getAXTree.",
+            "type": "string",
+            "pattern": "^\\d+:\\d+:\\d+$"
           },
-          {
-            "type": "object",
-            "properties": {
-              "selector": {
-                "type": "string",
-                "minLength": 1,
-                "description": "CSS selector for a target element in the main frame."
-              },
-              "id": {
-                "not": {}
-              }
-            },
-            "required": [
-              "selector"
-            ],
-            "additionalProperties": false
+          "selector": {
+            "description": "Fallback CSS selector resolved in the main document and all nested author Shadow DOM trees.",
+            "type": "string",
+            "minLength": 1
           }
-        ],
-        "description": "DOM query target identified by either canonical id or selector."
+        },
+        "additionalProperties": false,
+        "description": "DOM query target identified by id, selector, or both."
       },
-      "description": "Targets to export, preserving input order in response.data.items.",
+      "description": "One to 32 targets to export, preserving input order in response.data.items.",
       "required": true
     },
     "options": {
@@ -74,7 +53,7 @@
         },
         "imageFormat": {
           "default": "auto",
-          "description": "Preferred image encoding. auto keeps PNG/JPEG/WebP sources in the same encoding when possible and encodes other source formats as PNG.",
+          "description": "Preferred image encoding. auto preserves safe self-contained inline SVG, keeps supported raster sources when possible, and otherwise encodes PNG.",
           "type": "string",
           "enum": [
             "auto",
@@ -103,9 +82,10 @@
       "description": "Required output options. path is an output directory, not a file path."
     },
     "purpose": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "string",
       "minLength": 1,
-      "description": "Why this image export is needed.",
+      "description": "Describe why these image files are needed, e.g., saving product thumbnails, collecting visual assets, or preserving image evidence",
       "required": true
     }
   },

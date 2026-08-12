@@ -1,6 +1,6 @@
 {
   "method": "Input.select",
-  "description": "Selects one or more direct choices or complete cascading paths in a native or custom select-like control, automatically bringing the control into view and opening custom controls as needed.",
+  "description": "Sets the final selection set of a native or custom select-like control to the requested choices. Automatically handles searchable controls, virtual scrolling, and pagination associated with the control. Each selection item must use exactly one locator: id, value, label, or path.",
   "params": {
     "pageId": {
       "type": "string",
@@ -16,7 +16,7 @@
       "required": false
     },
     "selector": {
-      "description": "CSS selector that must resolve to exactly one select-like control. Use a narrower selector or a canonical id when it matches multiple controls.",
+      "description": "CSS selector for a select-like control. It must resolve to one control; use DOM.inspectSelect or DOM.getAXTree when the target contains multiple controls.",
       "type": "string",
       "minLength": 1,
       "required": false
@@ -29,21 +29,21 @@
         "type": "object",
         "properties": {
           "id": {
-            "description": "Opaque canonical option ID returned by DOM.inspectSelect or DOM.getAXTree.",
+            "description": "Opaque canonical option ID returned by DOM.inspectSelect or DOM.getAXTree. Use id only when this is the only locator field in the item.",
             "type": "string",
             "pattern": "^\\d+:\\d+:\\d+$"
           },
           "value": {
-            "description": "Exact option value, only when DOM.inspectSelect returned a value for that option.",
+            "description": "One direct option locator. Use the exact value returned by DOM.inspectSelect, and do not combine it with id or label.",
             "type": "string"
           },
           "label": {
-            "description": "Visible option label returned by DOM.inspectSelect.",
+            "description": "One direct option locator. Use the exact visible label returned by DOM.inspectSelect, and do not combine it with id or value.",
             "type": "string",
             "minLength": 1
           },
           "path": {
-            "description": "Ordered cascade path from the root menu item to the final leaf option.",
+            "description": "Exclusive cascading locator. Do not provide id, value, or label alongside path; each path segment must contain exactly one of id, value, or label.",
             "minItems": 2,
             "maxItems": 32,
             "type": "array",
@@ -51,16 +51,16 @@
               "type": "object",
               "properties": {
                 "id": {
-                  "description": "Opaque canonical option ID returned by DOM.inspectSelect or DOM.getAXTree.",
+                  "description": "Opaque canonical option ID returned by DOM.inspectSelect or DOM.getAXTree. Use id only when this is the only locator field in the item.",
                   "type": "string",
                   "pattern": "^\\d+:\\d+:\\d+$"
                 },
                 "value": {
-                  "description": "Exact option value, only when DOM.inspectSelect returned a value for that option.",
+                  "description": "One possible option locator. Use the exact value returned by DOM.inspectSelect, and do not combine it with id or label.",
                   "type": "string"
                 },
                 "label": {
-                  "description": "Visible option label returned by DOM.inspectSelect.",
+                  "description": "One possible option locator. Use the exact visible label returned by DOM.inspectSelect, and do not combine it with id or value.",
                   "type": "string",
                   "minLength": 1
                 }
@@ -69,7 +69,7 @@
           }
         }
       },
-      "description": "Direct choices or complete cascading paths using fields actually returned by DOM.inspectSelect. A one-item array requests a single selection; multiple direct choices request multi-selection.",
+      "description": "Each item must contain exactly one locator: id, value, label, or path. path is exclusive and each path segment must contain exactly one of id, value, or label. Multiple direct choices define the final multi-select set, not an append operation, and are valid only for a confirmed multi-select control.",
       "required": true
     },
     "timeout": {
@@ -80,12 +80,13 @@
       "required": false
     },
     "purpose": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "string",
       "minLength": 1,
-      "description": "Describe the intended selected values, such as choosing a country, date, color, tags, or a root-to-leaf cascading location path.",
+      "description": "Describe the intended selected values, such as choosing a country, date, color, tags, or a root-to-leaf cascading location path. Each selections item must contain exactly one of id, value, label, or path; path is exclusive and each path segment must contain exactly one of id, value, or label. Use exact fields returned by DOM.inspectSelect. Multiple direct choices require a multi-select control; multiple cascading paths are unsupported. Use DOM.inspectSelect when choices are unknown or when target resolution is ambiguous or fails.",
       "required": true
     }
   },
   "requiresPurpose": true,
-  "purposeHint": "Describe the intended selected values, such as choosing a country, date, color, tags, or a root-to-leaf cascading location path."
+  "purposeHint": "Describe the intended selected values, such as choosing a country, date, color, tags, or a root-to-leaf cascading location path. Each selections item must contain exactly one of id, value, label, or path; path is exclusive and each path segment must contain exactly one of id, value, or label. Use exact fields returned by DOM.inspectSelect. Multiple direct choices require a multi-select control; multiple cascading paths are unsupported. Use DOM.inspectSelect when choices are unknown or when target resolution is ambiguous or fails."
 }

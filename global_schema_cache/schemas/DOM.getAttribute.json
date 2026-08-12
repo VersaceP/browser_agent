@@ -13,43 +13,21 @@
       "minItems": 1,
       "type": "array",
       "items": {
-        "anyOf": [
-          {
-            "type": "object",
-            "properties": {
-              "id": {
-                "type": "string",
-                "pattern": "^\\d+:\\d+:\\d+$",
-                "description": "Canonical element ID from DOM.getAXTree."
-              },
-              "selector": {
-                "not": {}
-              }
-            },
-            "required": [
-              "id"
-            ],
-            "additionalProperties": false
+        "type": "object",
+        "properties": {
+          "id": {
+            "description": "Preferred canonical element ID from DOM.getAXTree.",
+            "type": "string",
+            "pattern": "^\\d+:\\d+:\\d+$"
           },
-          {
-            "type": "object",
-            "properties": {
-              "selector": {
-                "type": "string",
-                "minLength": 1,
-                "description": "CSS selector for a target element in the main frame."
-              },
-              "id": {
-                "not": {}
-              }
-            },
-            "required": [
-              "selector"
-            ],
-            "additionalProperties": false
+          "selector": {
+            "description": "Fallback CSS selector for the target element in the main frame.",
+            "type": "string",
+            "minLength": 1
           }
-        ],
-        "description": "DOM query target identified by either canonical id or selector."
+        },
+        "additionalProperties": false,
+        "description": "DOM query target identified by id, selector, or both."
       },
       "description": "Targets to read, preserving input order in response.data.items.",
       "required": true
@@ -75,9 +53,10 @@
       "required": true
     },
     "purpose": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "string",
       "minLength": 1,
-      "description": "Why this attribute read is needed.",
+      "description": "Describe why these attributes are needed, e.g., checking a link href, validating aria state, reading an input value, or debugging selector stability",
       "required": true
     }
   },

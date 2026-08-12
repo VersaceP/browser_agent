@@ -1,51 +1,139 @@
 {
   "method": "Input.scroll",
-  "description": "Scrolls the viewport or a known scrollable element to reveal more content; prefer canonical ids or stable selectors for nested containers, and omit both for viewport scrolling.",
+  "description": "Uses the browser's native smooth scrolling to bring target into the root viewport, sends real wheel input to a visible container by direction and amount, or sends real wheel input to the page viewport when neither locator is provided. target mode derives direction automatically; container and viewport modes use direction and amount.",
   "params": {
     "pageId": {
       "type": "string",
       "format": "uuid",
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Page ID whose viewport or element should be scrolled.",
+      "description": "Page ID whose content should be scrolled.",
       "required": true
     },
-    "selector": {
-      "description": "Fallback CSS selector for the scroll container.",
-      "type": "string",
+    "target": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "pattern": "^\\d+:\\d+:\\d+$"
+            },
+            "selector": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false,
+          "description": "Element that must be brought into the root viewport. The id is preferred and selector is its fallback."
+        },
+        {
+          "not": {}
+        },
+        {
+          "not": {}
+        }
+      ],
       "required": false
     },
-    "id": {
-      "description": "Preferred canonical element ID for the scroll container.",
-      "type": "string",
-      "pattern": "^\\d+:\\d+:\\d+$",
+    "container": {
+      "anyOf": [
+        {
+          "description": "Optional scroll container that must control target exposure. Necessary outer containers may also move.",
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "pattern": "^\\d+:\\d+:\\d+$"
+            },
+            "selector": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "pattern": "^\\d+:\\d+:\\d+$"
+            },
+            "selector": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false,
+          "description": "Visible scrollable container that receives the requested wheel input."
+        },
+        {
+          "not": {}
+        }
+      ],
       "required": false
     },
-    "direction": {
-      "default": "down",
-      "description": "Scroll direction.",
-      "type": "string",
-      "enum": [
-        "up",
-        "down",
-        "left",
-        "right"
+    "amount": {
+      "anyOf": [
+        {
+          "default": 300,
+          "description": "Maximum CSS-pixel distance of each bounded native smooth-scroll command while revealing target.",
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        {
+          "default": 300,
+          "description": "Requested wheel distance in CSS pixels. Zero reads scroll state without dispatching input.",
+          "type": "number",
+          "minimum": 0
+        },
+        {
+          "default": 300,
+          "description": "Requested viewport wheel distance in CSS pixels. Zero reads scroll state without dispatching input.",
+          "type": "number",
+          "minimum": 0
+        }
       ],
       "required": true
     },
-    "amount": {
-      "default": 300,
-      "description": "Scroll distance in CSS pixels.",
-      "type": "number",
-      "minimum": 0,
-      "required": true
+    "direction": {
+      "anyOf": [
+        {
+          "not": {}
+        },
+        {
+          "default": "down",
+          "description": "Direction of the wheel input within container.",
+          "type": "string",
+          "enum": [
+            "up",
+            "down",
+            "left",
+            "right"
+          ]
+        },
+        {
+          "default": "down",
+          "description": "Direction of the wheel input in the page viewport.",
+          "type": "string",
+          "enum": [
+            "up",
+            "down",
+            "left",
+            "right"
+          ]
+        }
+      ],
+      "required": false
     },
     "purpose": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "string",
       "minLength": 1,
-      "description": "Describe why scrolling is needed, e.g., loading more results, revealing a target section, or moving inside a nested scroll container",
+      "description": "Describe whether this scroll should reveal a target, move content inside a known container, or browse farther in the page viewport. For target mode, explain the interaction that will follow after the target becomes visible.",
       "required": true
     }
   },
   "requiresPurpose": true,
-  "purposeHint": "Describe why scrolling is needed, e.g., loading more results, revealing a target section, or moving inside a nested scroll container"
+  "purposeHint": "Describe whether this scroll should reveal a target, move content inside a known container, or browse farther in the page viewport. For target mode, explain the interaction that will follow after the target becomes visible."
 }

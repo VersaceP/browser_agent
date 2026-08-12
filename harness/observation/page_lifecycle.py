@@ -17,6 +17,35 @@ from harness.utils import JsonDict
 
 LOADING_STATUSES = frozenset({"loading", "navigating", "startedloading"})
 FAILED_STATUSES = frozenset({"failed", "loadfailed", "error"})
+READY_STATUSES = frozenset({"ready"})
+
+# `Page.getState.failure.kind` and the `failure` block on Page.loadFailed.
+# `automation-unavailable` is the one that must not be treated as a transient
+# network hiccup: the document may be sitting there perfectly readable to a
+# human while automation cannot attach, so retrying the navigation changes
+# nothing. Kept as a named set rather than a string test at each call site.
+AUTOMATION_UNAVAILABLE_FAILURE = "automation-unavailable"
+PAGE_FAILURE_KINDS = frozenset(
+    {"network", AUTOMATION_UNAVAILABLE_FAILURE, "renderer-lost"}
+)
+
+
+def page_failure(payload: Any) -> Optional[Dict[str, str]]:
+    """Normalize the `{kind, message}` block ABCP now reports for a dead page.
+
+    It replaced the old `errorCode`/`errorDescription` pair, and it is the only
+    machine-readable statement of WHY a page is unusable — a reader that skips
+    it is back to classifying prose.
+    """
+    if not isinstance(payload, dict):
+        return None
+    failure = payload.get("failure")
+    if not isinstance(failure, dict):
+        return None
+    kind = str(failure.get("kind") or "").strip()
+    if not kind:
+        return None
+    return {"kind": kind, "message": str(failure.get("message") or "").strip()}
 
 
 @dataclass
@@ -27,6 +56,8 @@ class PageLifecycleState:
     requires_state_resync: bool = False
     requires_ax_refresh: bool = False
     last_event: str = ""
+    failure_kind: str = ""
+    failure_message: str = ""
     # asyncio.Event binds to the current loop on Python 3.9. Lifecycle state
     # may be created synchronously during registration/tests, so allocate it
     # lazily inside wait_for_settlement where a running loop is guaranteed.
@@ -86,22 +117,45 @@ class PageLifecycleTracker:
         if state is None:
             return None
         state.last_event = str(name or "")
-        if name == "Page.startedLoading":
+        if name == "Page.open":
+            # A newly registered page is `lifecycle="loading"`: it exists and
+            # has a pageId, but its document is not ready for DOM or Input.
+            # Without this the state stayed "unknown" and the DOM-probe gate
+            # let a read run against a page that had not rendered yet.
+            if str(payload.get("lifecycle") or "loading").strip().lower() == "loading":
+                self._mark_loading(state, name)
+                state.requires_state_resync = True
+                state.requires_ax_refresh = True
+        elif name == "Page.startedLoading":
+            # A new load generation supersedes the previous document's verdict.
+            # Without this a page that failed once keeps reporting that failure
+            # through its recovery, and a healthy `Page.loaded` still hands the
+            # caller an `automation-unavailable` blocker for a page that is now
+            # perfectly usable.
+            self._record_failure(state, None)
             self._mark_loading(state, name)
         elif name == "Page.loaded":
             state.status = "settled"
+            self._record_failure(state, None)
             self._set_settled_event(state)
         elif name == "Page.loadFailed":
             state.status = "failed"
+            self._record_failure(state, page_failure(payload))
             self._set_settled_event(state)
         elif name == "Page.crashed":
             state.status = "crashed"
+            self._record_failure(
+                state,
+                {"kind": "renderer-lost",
+                 "message": str(payload.get("reason") or "").strip()},
+            )
             state.requires_state_resync = True
             state.requires_ax_refresh = True
             self._set_settled_event(state)
         elif name in {"Page.navigate", "Page.recovered"}:
             state.generation += 1
             state.status = "loading" if name == "Page.navigate" else "unknown"
+            self._record_failure(state, None)
             state.requires_state_resync = True
             state.requires_ax_refresh = True
             self._clear_settled_event(state)
@@ -135,22 +189,48 @@ class PageLifecycleTracker:
             return
         status = str(data.get("status") or "").strip().lower().replace("_", "")
         state.requires_state_resync = False
+        failure = page_failure(data)
         if status in LOADING_STATUSES:
             state.status = "loading"
             self._clear_settled_event(state)
         elif status in FAILED_STATUSES:
             state.status = "failed"
+            self._record_failure(state, failure)
             self._set_settled_event(state)
         elif status == "crashed":
             state.status = "crashed"
             state.requires_ax_refresh = True
+            self._record_failure(
+                state, failure or {"kind": "renderer-lost", "message": ""}
+            )
             self._set_settled_event(state)
         else:
-            # Page.getState is the documented one-shot resynchronization when a
-            # settlement event was missed.  A successful response without an
-            # explicit loading status is treated as the synchronized snapshot.
+            # `ready` is the settled state; anything else here is a status this
+            # harness does not know. Page.getState is the documented one-shot
+            # resynchronization when a settlement event was missed, so a
+            # successful response that is not loading/failed/crashed is treated
+            # as the synchronized snapshot either way — but an unrecognized
+            # value is recorded so a contract drift shows up in the ledger
+            # instead of quietly passing as ready.
+            if status and status not in READY_STATUSES:
+                state.last_event = f"Page.getState.unknown_status:{status[:32]}"
             state.status = "settled"
+            self._record_failure(state, None)
             self._set_settled_event(state)
+
+    @staticmethod
+    def _record_failure(
+        state: PageLifecycleState,
+        failure: Optional[Dict[str, str]],
+    ) -> None:
+        """Attach or clear the structured reason a page is unusable.
+
+        Cleared on every healthy transition so a stale `automation-unavailable`
+        from two navigations ago cannot keep answering for a page that has
+        since recovered.
+        """
+        state.failure_kind = (failure or {}).get("kind", "")
+        state.failure_message = (failure or {}).get("message", "")
 
     def observe_ax_refresh(self, page_id: Any) -> None:
         state = self.ensure(page_id)
@@ -189,7 +269,7 @@ class PageLifecycleTracker:
         state = self.state(page_id)
         if state is None:
             return {"pageId": str(page_id or "") or None, "status": "unknown"}
-        return {
+        receipt = {
             "pageId": state.page_id,
             "status": state.status,
             "generation": state.generation,
@@ -197,6 +277,16 @@ class PageLifecycleTracker:
             "requiresStateResync": state.requires_state_resync,
             "requiresAXTreeRefresh": state.requires_ax_refresh,
         }
+        if state.failure_kind:
+            receipt["failure"] = {
+                "kind": state.failure_kind,
+                "message": state.failure_message or None,
+                # A page automation cannot attach to will not fix itself by
+                # navigating again; the caller needs that distinction to choose
+                # between retry and escalation.
+                "retryableByNavigation": state.failure_kind != AUTOMATION_UNAVAILABLE_FAILURE,
+            }
+        return receipt
 
     @staticmethod
     def _mark_loading(state: PageLifecycleState, event: str) -> None:

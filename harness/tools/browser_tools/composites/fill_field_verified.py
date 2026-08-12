@@ -119,7 +119,15 @@ async def _fill_field_verified(agent: Any, tool_input: JsonDict, step: int) -> J
         return {"status": "failed", "error": "id or selector is required"}
     mask = bool(tool_input.get("mask", False))
     max_retries = max(0, min(optional_int(tool_input.get("maxRetries"), 1) or 1, 3))
-    target: JsonDict = {"id": target_id} if target_id else {"selector": selector}
+    # Both locators travel together when the caller has both: ABCP takes the id
+    # as primary and the selector as its fallback, so a field whose id went
+    # stale between the AXTree read and the type still gets filled instead of
+    # costing a failed attempt.
+    target: JsonDict = {}
+    if target_id:
+        target["id"] = target_id
+    if selector:
+        target["selector"] = selector
 
     # Force a layout viewport (fresh tab) and refresh nodes so we can read the
     # target's accessible name for the verify keywords.

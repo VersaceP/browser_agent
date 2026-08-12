@@ -15,6 +15,7 @@ reports/
 dist/
 artifacts/
 config.json
+probe/
 probe_tests/
 .pytest_cache/
 strategy_attempts.jsonl
@@ -34,3 +35,4 @@ skills/.guidance_health.json
 skills/**/.heal_history.json
 skills/**/workflow.v*.json
 skills/**/.create_report.json
+tests/test_spawner_slots.py

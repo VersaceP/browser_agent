@@ -1,6 +1,6 @@
 {
   "method": "Input.drag",
-  "description": "Drag a source to a target, coordinate, or relative offset. Use toOffset when the target's drop subregion affects the result.",
+  "description": "Drag a source to an element, coordinate, or relative offset. Relative offsets stop at the edge of the source document’s visible interaction area. Cross-frame dragging is not supported.",
   "params": {
     "pageId": {
       "type": "string",
@@ -72,22 +72,23 @@
       "additionalProperties": false
     },
     "dx": {
-      "description": "Relative horizontal drag offset when not using an explicit destination.",
+      "description": "Relative horizontal drag offset when not using an explicit destination. If omitted while dy is provided, defaults to 0.",
       "type": "number",
       "required": false
     },
     "dy": {
-      "description": "Relative vertical drag offset when not using an explicit destination.",
+      "description": "Relative vertical drag offset when not using an explicit destination. If omitted while dx is provided, defaults to 0.",
       "type": "number",
       "required": false
     },
     "purpose": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "string",
       "minLength": 1,
-      "description": "Describe the drag effect, such as moving a slider, reordering an item, or dropping onto a target.",
+      "description": "Describe the intended drag effect. Keep source and destination in the same document, and prefer canonical element IDs when targeting an element.",
       "required": true
     }
   },
   "requiresPurpose": true,
-  "purposeHint": "Describe the drag effect, such as moving a slider, reordering an item, or dropping onto a target."
+  "purposeHint": "Describe the intended drag effect. Keep source and destination in the same document, and prefer canonical element IDs when targeting an element."
 }

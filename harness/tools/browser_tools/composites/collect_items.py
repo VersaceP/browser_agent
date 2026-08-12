@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from harness.call_outcome import replay_forbidden
 from harness.constants import COLLECTION_CONTRACT_REPLAN_REQUIRED
 from harness.observation.overlay_detector import detect_overlay_from_result
 from harness.observation.verifiers import probe_collection_state
@@ -616,39 +617,32 @@ async def _collect_items_materialize(
     if mode == "click_load_more":
         if not load_more_id and not load_more_selector:
             return {"ok": False, "exhausted": False, "detail": "no load-more target"}
-        # Try the id first; if it is stale/gone OR the click fails, fall back to
-        # the selector before declaring the button exhausted. An occlusion_blocked
-        # failure is NOT exhaustion — the button is just covered by an overlay,
-        # so signal occlusion and let the caller dismiss + retry.
+        # ONE click carrying both locators. ABCP resolves the id first and falls
+        # back to the selector inside the same dispatch, so the old shape — click
+        # by id, and on failure click again by selector — bought nothing and cost
+        # a second real click whenever the first one landed but its receipt came
+        # back failed. An occlusion_blocked failure is NOT exhaustion: the button
+        # is covered, so signal occlusion and let the caller dismiss + retry.
+        params: JsonDict = {"pageId": page_id, "purpose": "collect_items: load more"}
         if load_more_id:
-            result = await _invoke_browser_method(
-                agent, "Input.click",
-                {"pageId": page_id, "id": load_more_id, "purpose": "collect_items: load more"},
-                step, count_progress=False, allow_rematch=True,
-            )
-            interrupt = _loop_interrupt_from_result(result)
-            if interrupt:
-                return {"ok": False, "exhausted": False, "interrupt": interrupt}
-            if not _invoke_result_failed(result):
-                return {"ok": True, "exhausted": False, "detail": "clicked load-more (id)"}
-            if _result_occlusion_blocked(result):
-                return {"ok": False, "exhausted": False, "occlusion": True, "detail": "load-more occluded (id)"}
-            if not load_more_selector:
-                return {"ok": False, "exhausted": False, "detail": "load_more id gone/failed"}
-            # id failed but a selector fallback exists -> try it below.
+            params["id"] = load_more_id
+        if load_more_selector:
+            params["selector"] = load_more_selector
         result = await _invoke_browser_method(
-            agent, "Input.click",
-            {"pageId": page_id, "selector": load_more_selector, "purpose": "collect_items: load more"},
-            step, count_progress=False,
+            agent, "Input.click", params, step, count_progress=False,
+            allow_rematch=bool(load_more_id),
         )
         interrupt = _loop_interrupt_from_result(result)
         if interrupt:
             return {"ok": False, "exhausted": False, "interrupt": interrupt}
         if _result_occlusion_blocked(result):
-            return {"ok": False, "exhausted": False, "occlusion": True, "detail": "load-more occluded (selector)"}
+            return {"ok": False, "exhausted": False, "occlusion": True,
+                    "detail": "load-more occluded",
+                    "replayForbidden": replay_forbidden(result)}
         if _invoke_result_failed(result):
-            return {"ok": False, "exhausted": False, "detail": "load-more click failed"}
-        return {"ok": True, "exhausted": False, "detail": "clicked load-more (selector)"}
+            return {"ok": False, "exhausted": False, "detail": "load-more click failed",
+                    "replayForbidden": replay_forbidden(result)}
+        return {"ok": True, "exhausted": False, "detail": "clicked load-more"}
 
     # default: scroll. A stale container id must still go through the seen-id
     # rematch guard (Phase 2), not bypass it -> allow_rematch=True.
@@ -658,10 +652,13 @@ async def _collect_items_materialize(
     # must carry no locator at all, which is what the no-container branch emits.
     params = {"pageId": page_id, "direction": direction or "down",
               "amount": amount, "purpose": "collect_items: scroll"}
+    container: JsonDict = {}
     if container_id:
-        params["container"] = {"id": container_id}
-    elif container_selector:
-        params["container"] = {"selector": container_selector}
+        container["id"] = container_id
+    if container_selector:
+        container["selector"] = container_selector
+    if container:
+        params["container"] = container
     result = await _invoke_browser_method(
         agent, "Input.scroll", params, step, count_progress=False,
         allow_rematch=bool(container_id),
@@ -669,7 +666,13 @@ async def _collect_items_materialize(
     interrupt = _loop_interrupt_from_result(result)
     if interrupt:
         return {"ok": False, "exhausted": False, "interrupt": interrupt}
-    return {"ok": not _invoke_result_failed(result), "exhausted": False, "detail": "scrolled"}
+    failed = _invoke_result_failed(result)
+    return {
+        "ok": not failed,
+        "exhausted": False,
+        "detail": "scrolled",
+        "replayForbidden": failed and replay_forbidden(result),
+    }
 
 
 async def _collect_overlay_recovery(
@@ -966,6 +969,17 @@ async def _collect_items(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
         if action.get("occlusion"):
             # The expansion control is covered by an overlay — recover rather
             # than mistaking it for exhaustion, then retry on the next round.
+            # Unless the platform reported that input dispatch had already
+            # started: the click may have landed under the overlay, and the
+            # next round would issue a second one.
+            if action.get("replayForbidden"):
+                stop_reason = "materialization_side_effect_uncertain"
+                rounds_log.append({
+                    "round": round_index, "action": action.get("detail"),
+                    "occlusion": True, "replayForbidden": True,
+                    "durationMs": _collection_duration_ms(round_started_at),
+                })
+                break
             recovery = await _bt()._collect_overlay_recovery(agent, page_id, None, step, force=True)
             if recovery.get("interrupt"):
                 return _collect_interrupt_result(

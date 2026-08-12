@@ -5893,7 +5893,10 @@ def _run_file_validator(
 
     if validator_type == "image_exported":
         min_files = max(1, int(validator.get("min_files") or 1))
-        image_exts = {"png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff"}
+        # `svg` belongs here: DOM.getImg with imageFormat="auto" preserves a
+        # safe self-contained inline SVG instead of rasterizing it, so a real
+        # exported asset can legitimately arrive with that extension.
+        image_exts = {"png", "jpg", "jpeg", "webp", "gif", "bmp", "tiff", "svg"}
         exported = [
             path for path in file_paths
             if Path(path).suffix.lower().lstrip(".") in image_exts

@@ -22,6 +22,7 @@
       "required": true
     },
     "purpose": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "string",
       "minLength": 1,
       "description": "Describe why you are renaming this bookmark or folder, e.g., better reflecting its purpose",

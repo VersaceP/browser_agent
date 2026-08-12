@@ -3,6 +3,7 @@
 import asyncio
 from typing import Any, List, Optional, Tuple
 
+from harness.call_outcome import replay_forbidden
 from harness.observation.overlay_actions import (
     find_close_control,
     is_sensitive_method,
@@ -184,6 +185,13 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
             last_verdict = await _verify_overlay_gone_native(agent, page_id, step)
             if last_verdict.ok:
                 success = True
+                break
+            if replay_forbidden(close_result):
+                # The click failed AFTER input dispatch began: it may already
+                # have activated the control. Another lap of the ladder would
+                # click the same target again, so stop and let the caller look
+                # at the page.
+                attempts[-1]["replayForbidden"] = True
                 break
 
         escape_result = await _invoke_browser_method(

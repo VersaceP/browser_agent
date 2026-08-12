@@ -34,8 +34,9 @@ TASK_TYPE_SCENARIOS: Dict[str, str] = {
     "web_search": "query a search engine and read its result listings",
     "web_scrape": (
         "read-only extraction of page content — text, attributes, links,"
-        " structured rows; may export a rendered page <img> with DOM.getImg,"
-        " but cannot use Download.* for videos/PDFs/arbitrary URL files"
+        " structured rows; may export rendered page visuals (img/picture/SVG/"
+        "canvas) with DOM.getImg, but cannot use Download.* for"
+        " videos/PDFs/arbitrary URL files"
     ),
     "form_filling": (
         "fill, select, or submit page controls, including attaching a local"
@@ -58,8 +59,9 @@ TASK_TYPE_SCENARIOS: Dict[str, str] = {
 # and download a non-image asset, file_download retains the DOM read surface.
 TASK_TYPE_SELECTION_RULE = (
     "Saving a video, PDF, archive, export, or arbitrary URL file requires"
-    " file_download; exporting an actual rendered <img> with DOM.getImg may"
-    " remain web_scrape. Split other mixed work into phase-specific types, and"
+    " file_download; exporting a page-rendered visual (img/picture/SVG/canvas)"
+    " with DOM.getImg may remain web_scrape. Split other mixed work into"
+    " phase-specific types, and"
     " never use general as a permission bypass."
 )
 

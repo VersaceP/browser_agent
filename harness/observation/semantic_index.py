@@ -25,6 +25,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from harness.render_recovery import build_render_recovery_runner
+from harness.semantic_frames import graph_digest, root_tree
 from harness.utils import JsonDict
 
 # A real list/card row has non-trivial geometry; utility/leaf groups (inline
@@ -197,8 +198,14 @@ def digest_subtree(tree: Any, *, max_repeated: int = 5) -> JsonDict:
 
 
 async def _call_semantic_tree(agent: Any, params: JsonDict) -> Optional[JsonDict]:
-    """One render_recovery-wrapped getSemanticTree call. Returns the raw tree or
-    None (failed / recovery exhausted). Never raises into the caller."""
+    """One render_recovery-wrapped getSemanticTree call. Returns the ANCHORED
+    frame's local tree or None (failed / recovery exhausted / no tree). Never
+    raises into the caller.
+
+    The action returns a frame graph; only the root frame's tree is digested,
+    because a selector mined from an iframe cannot be handed back to a DOM read
+    (see harness.semantic_frames). Frames left unread are logged rather than
+    dropped silently, so a later "no candidates" has an explanation."""
     runner = getattr(agent, "render_recovery_runner", None)
     if runner is None:
         runner = build_render_recovery_runner(
@@ -215,8 +222,16 @@ async def _call_semantic_tree(agent: Any, params: JsonDict) -> Optional[JsonDict
             logger.write("semantic_index.error", {"error": str(exc)[:300]})
         return None
     data = response.get("data") if isinstance(response, dict) else None
-    tree = data.get("tree") if isinstance(data, dict) else None
-    return tree if isinstance(tree, dict) else None
+    digest = graph_digest(data)
+    logger = getattr(agent, "logger", None)
+    if logger is not None and (
+        digest.get("otherFrameCount") or digest.get("unavailableFrames")
+    ):
+        logger.write("semantic_index.frame_graph", {
+            "pageId": str(params.get("pageId") or ""),
+            **digest,
+        })
+    return root_tree(data)
 
 
 async def discover_selector_candidates(

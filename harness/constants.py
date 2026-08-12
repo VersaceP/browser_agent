@@ -42,6 +42,10 @@ OFFLOAD_METHODS = {
 }
 OFFLOAD_FIELDS_AS_TEXT = {"lines"}
 OFFLOAD_FIELDS_AS_JSON = {
+    # getSemanticTree's payload moved from `tree` into `frames[].tree`, and
+    # offload only reaches top-level fields. Without `frames` the heaviest read
+    # on the surface travels into model context whole.
+    "frames",
     "tree",
     "nodes",
     "ax",

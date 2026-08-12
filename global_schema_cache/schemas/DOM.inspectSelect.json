@@ -1,6 +1,6 @@
 {
   "method": "DOM.inspectSelect",
-  "description": "Inspects a select-like control, automatically bringing it into view, temporarily opening custom controls to discover options, and restoring the original open state.",
+  "description": "Read-only inspection of a select-like control. Custom controls are opened only as needed, explored within a bounded budget, then restored to their original open, selection, and scroll state. query filters discovered options locally; it never types into the control or triggers remote search.",
   "params": {
     "id": {
       "description": "Preferred canonical select control ID from DOM.getAXTree.",
@@ -9,7 +9,7 @@
       "required": false
     },
     "selector": {
-      "description": "CSS selector for the select control. It must resolve to exactly one control; narrow broad selectors when the page contains multiple selects.",
+      "description": "CSS selector for a select-like control. It must resolve to one control; narrow broad selectors when the page contains multiple controls.",
       "type": "string",
       "minLength": 1,
       "required": false
@@ -22,14 +22,14 @@
       "required": true
     },
     "query": {
-      "description": "Filters currently discovered option labels; it does not enter text into the control.",
+      "description": "Case-insensitive filter over options already discovered by this inspection; it does not enter search text or load server-side results.",
       "type": "string",
       "minLength": 1,
       "required": false
     },
     "maxOptions": {
       "default": 100,
-      "description": "Maximum number of currently discovered options to return.",
+      "description": "Maximum number of discovered options to return. If the result is truncated or diagnostics.incomplete is true, the returned options are only a partial view.",
       "type": "integer",
       "minimum": 1,
       "maximum": 500,
@@ -37,7 +37,7 @@
     },
     "includeDisabled": {
       "default": false,
-      "description": "Include disabled options when true.",
+      "description": "Include disabled options when true; disabled options cannot be selected.",
       "type": "boolean",
       "required": false
     },
@@ -49,12 +49,13 @@
       "required": false
     },
     "purpose": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "string",
       "minLength": 1,
-      "description": "Describe which control choices must be understood, such as enumerating options, checking search, loading more results, or inspecting a cascading picker",
+      "description": "Describe which control choices must be understood, such as enumerating options, checking whether search is exposed, exploring virtual scrolling, or inspecting a cascading picker. query only filters options discovered by this read-only inspection. A successful response includes resolvedControlId for later Input.select calls.",
       "required": true
     }
   },
   "requiresPurpose": true,
-  "purposeHint": "Describe which control choices must be understood, such as enumerating options, checking search, loading more results, or inspecting a cascading picker"
+  "purposeHint": "Describe which control choices must be understood, such as enumerating options, checking whether search is exposed, exploring virtual scrolling, or inspecting a cascading picker. query only filters options discovered by this read-only inspection. A successful response includes resolvedControlId for later Input.select calls."
 }

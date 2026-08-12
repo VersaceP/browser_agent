@@ -9,18 +9,6 @@
       "description": "Page ID that should receive the key press.",
       "required": true
     },
-    "id": {
-      "description": "Optional canonical element ID to focus before pressing the key.",
-      "type": "string",
-      "pattern": "^\\d+:\\d+:\\d+$",
-      "required": false
-    },
-    "selector": {
-      "description": "Optional CSS selector to focus before pressing the key.",
-      "type": "string",
-      "minLength": 1,
-      "required": false
-    },
     "key": {
       "type": "string",
       "minLength": 1,
@@ -41,7 +29,20 @@
       },
       "required": false
     },
+    "selector": {
+      "description": "Optional CSS selector to focus before pressing the key.",
+      "type": "string",
+      "minLength": 1,
+      "required": false
+    },
+    "id": {
+      "description": "Optional canonical element ID to focus before pressing the key.",
+      "type": "string",
+      "pattern": "^\\d+:\\d+:\\d+$",
+      "required": false
+    },
     "purpose": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "string",
       "minLength": 1,
       "description": "Describe why this key is needed, e.g., pressing Enter to submit, Escape to close an overlay, Tab to move focus, or a shortcut with modifiers",

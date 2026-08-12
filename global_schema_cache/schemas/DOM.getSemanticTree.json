@@ -1,6 +1,6 @@
 {
   "method": "DOM.getSemanticTree",
-  "description": "Retrieves a local native semantic DOM tree for diagnostics such as tag hierarchy, bounds, Shadow DOM, and selector debugging; use DOM.getAXTree as the default page map first.",
+  "description": "Retrieves a bounded native semantic DOM frame graph, including accessible iframe documents, for tag hierarchy, bounds, Shadow DOM, and selector diagnostics; use DOM.getAXTree as the default page map first.",
   "params": {
     "pageId": {
       "type": "string",
@@ -16,14 +16,9 @@
       "required": false
     },
     "selector": {
-      "description": "CSS selector used to anchor the semantic tree lookup to the first matching element.",
+      "description": "Unique CSS selector used to resolve the semantic tree root.",
       "type": "string",
       "minLength": 1,
-      "required": false
-    },
-    "elementId": {
-      "description": "Raw DOM element ID to anchor the semantic tree lookup.",
-      "type": "string",
       "required": false
     },
     "includeShadowDom": {
@@ -37,6 +32,7 @@
       "required": false
     },
     "purpose": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "string",
       "minLength": 1,
       "description": "Describe why raw local DOM structure is needed, e.g., diagnosing a selector, inspecting Shadow DOM, bounds, or nested layout after DOM.getAXTree was insufficient",

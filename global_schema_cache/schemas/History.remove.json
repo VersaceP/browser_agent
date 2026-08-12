@@ -32,6 +32,7 @@
       "required": false
     },
     "purpose": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "string",
       "minLength": 1,
       "description": "Describe why you are removing browsing history, e.g., cleaning up sensitive records",

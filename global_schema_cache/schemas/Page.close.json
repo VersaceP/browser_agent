@@ -10,6 +10,7 @@
       "required": true
     },
     "purpose": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "string",
       "minLength": 1,
       "description": "Describe why closing this tab is safe and useful, e.g., cleanup after completing a workflow",

@@ -1,6 +1,6 @@
 {
   "method": "Page.getState",
-  "description": "Synchronizes page state, including URL, title, load status, HITL pause status, and blocking dialogs or file choosers.",
+  "description": "Returns the current page automation state, including URL, title, ready/loading/failed/crashed status, HITL pause status, and blocking dialogs or file choosers.",
   "params": {
     "pageId": {
       "type": "string",
@@ -10,12 +10,13 @@
       "required": true
     },
     "purpose": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "string",
       "minLength": 1,
-      "description": "Describe why you need state synchronization, e.g., checking load completion, verifying no blocking dialog, or resuming after HITL",
+      "description": "Describe why you need the current state, e.g., checking whether a page is ready, verifying no blocking dialog, or resuming after HITL",
       "required": true
     }
   },
   "requiresPurpose": true,
-  "purposeHint": "Describe why you need state synchronization, e.g., checking load completion, verifying no blocking dialog, or resuming after HITL"
+  "purposeHint": "Describe why you need the current state, e.g., checking whether a page is ready, verifying no blocking dialog, or resuming after HITL"
 }

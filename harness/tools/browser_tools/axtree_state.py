@@ -184,37 +184,71 @@ def _check_stale_axtree_target(
     invalidated = bool(getattr(agent, "axtree_invalidated", True))
     current_page_id = str(getattr(agent, "axtree_page_id", "") or "")
     page_id = str(params.get("pageId") or "")
-    missing = sorted(target_ids - current_ids)
 
-    if allow_rematch and _browser_side_rematch_mode(agent) != "off":
-        # Pass stale-but-previously-seen ids through so the browser-side
-        # auto-rematch can fire. Page mismatches and never-seen ids stay
-        # blocked; the rematch outcome is validated in
-        # _apply_recovered_target and by the caller's verifier.
-        page_mismatch = bool(
-            page_id and current_page_id and page_id != current_page_id
-        )
-        seen = _axtree_seen_ids(agent, page_id or current_page_id)
-        if not page_mismatch and target_ids and target_ids <= seen:
-            logger = getattr(agent, "logger", None)
-            if logger is not None:
-                logger.write(
-                    "axtree.stale_guard.rematch_passthrough",
-                    {
-                        "method": method,
-                        "targetIds": sorted(target_ids),
-                        "pageId": page_id or current_page_id or None,
-                        "epoch": epoch,
-                    },
-                )
-            return None
+    # An id paired with its own selector deserves to reach the browser: ABCP
+    # tries the id, falls back to that selector, and the receipt says which one
+    # answered — a fact that beats our pre-hoc guess about staleness.
+    #
+    # But the pairing is NOT a licence to skip page scope. Resolution is
+    # id-FIRST, and canonical ids are per-page counters: `1:2:3` almost
+    # certainly names some live node on the other page too. So an id from a
+    # different page does not politely fail into the selector — it can resolve
+    # to an unrelated element and win. A never-seen id can collide the same way.
+    # Both stay blocked; what the selector buys is the case that actually
+    # matters, an id seen on THIS page whose epoch has since moved on.
+    # The two classes are judged SEPARATELY. One call can carry both, and each
+    # id's licence comes only from its own locator: a live bare id says nothing
+    # about a paired id this page never produced, and a selector says nothing
+    # about the bare id sitting next to it. Judging the call as a whole let
+    # either class launder the other.
+    backed_ids = _selector_backed_ids(params)
+    unbacked_ids = _bare_ids(params)
+    page_mismatch = bool(page_id and current_page_id and page_id != current_page_id)
+    seen = _axtree_seen_ids(agent, page_id or current_page_id)
+    # Backed: the selector is a real fallback, so the snapshot's epoch does not
+    # matter — but the id must be one THIS page produced.
+    unsafe_backed = sorted(backed_ids - seen)
+    # Unbacked: nothing recovers a bad id, so the live snapshot must hold it.
+    missing_unbacked = sorted(unbacked_ids - current_ids)
 
-    if not current_ids or invalidated:
-        reason = "axtree_snapshot_invalidated" if invalidated else "no_current_axtree_snapshot"
-    elif page_id and current_page_id and page_id != current_page_id:
+    def passthrough(event: str) -> None:
+        logger = getattr(agent, "logger", None)
+        if logger is not None:
+            logger.write(
+                event,
+                {
+                    "method": method,
+                    "targetIds": sorted(target_ids),
+                    "pageId": page_id or current_page_id or None,
+                    "epoch": epoch,
+                },
+            )
+
+    if page_mismatch:
         reason = "axtree_page_mismatch"
-    elif missing:
+        missing = sorted(target_ids - current_ids)
+    elif unsafe_backed:
+        reason = "axtree_id_never_seen_on_page"
+        missing = unsafe_backed
+    elif not unbacked_ids:
+        passthrough("axtree.stale_guard.selector_backed_passthrough")
+        return None
+    elif (
+        allow_rematch
+        and _browser_side_rematch_mode(agent) != "off"
+        and unbacked_ids <= seen
+    ):
+        # Pass stale-but-previously-seen ids through so the browser-side
+        # auto-rematch can fire. The rematch outcome is validated in
+        # _apply_recovered_target and by the caller's verifier.
+        passthrough("axtree.stale_guard.rematch_passthrough")
+        return None
+    elif not current_ids or invalidated:
+        reason = "axtree_snapshot_invalidated" if invalidated else "no_current_axtree_snapshot"
+        missing = missing_unbacked
+    elif missing_unbacked:
         reason = "axtree_id_not_in_current_snapshot"
+        missing = missing_unbacked
     else:
         return None
 
@@ -231,21 +265,56 @@ def _check_stale_axtree_target(
         "next_instruction": (
             "DOM changed or the target id is not from the current AXTree epoch."
             " Call Page.getState if lifecycle is uncertain, then DOM.getAXTree"
-            " for this page and derive a fresh id/selector before retrying."
+            " for this page and derive a fresh id before retrying. Pairing a"
+            " stable selector with an id that this page HAS shown before lets"
+            " the call through (ABCP resolves the id first and falls back to"
+            " the selector), but a selector never licenses an id from another"
+            " page or one this page never had: resolution is id-first and a"
+            " foreign id can match an unrelated live node."
         ),
     }
 
 
-def _axtree_ids_from_params(params: JsonDict) -> Set[str]:
-    ids: Set[str] = set()
+# One locator slot: the id keys ABCP accepts and the selector key that acts as
+# THAT id's fallback. Drag carries a second, independently-locatable endpoint.
+_LOCATOR_SLOTS = (
+    (("id", "nodeId", "targetId"), "selector"),
+    (("toId",), "toSelector"),
+)
+
+
+def _param_locator_units(params: JsonDict) -> List[JsonDict]:
+    """Every locator the params carry, as separate {ids, hasSelector} units.
+
+    The PAIRING is the point. ABCP resolves id-first and falls back to the
+    selector sitting in the same locator object, so "these params contain a
+    selector somewhere" is not the same statement as "this id has a fallback":
+    a batch read whose targets[3] is a bare id gets nothing from targets[0]'s
+    selector. Collapsing the two is how a phantom target slips through.
+
+    A canonical id typed into the selector slot counts as an id and NOT as a
+    fallback — it is the same unusable reference wearing another key's name.
+    """
+    units: List[JsonDict] = []
 
     def collect(value: Any) -> None:
         if not isinstance(value, dict):
             return
-        for key in ("id", "nodeId", "targetId", "selector"):
-            candidate = value.get(key)
-            if isinstance(candidate, str) and AXTREE_ID_RE.match(candidate.strip()):
-                ids.add(candidate.strip())
+        for id_keys, selector_key in _LOCATOR_SLOTS:
+            ids: Set[str] = set()
+            for key in (*id_keys, selector_key):
+                candidate = value.get(key)
+                if isinstance(candidate, str) and AXTREE_ID_RE.match(candidate.strip()):
+                    ids.add(candidate.strip())
+            if not ids:
+                continue
+            selector = value.get(selector_key)
+            has_selector = bool(
+                isinstance(selector, str)
+                and selector.strip()
+                and not AXTREE_ID_RE.match(selector.strip())
+            )
+            units.append({"ids": ids, "hasSelector": has_selector})
 
     collect(params)
     targets = params.get("targets")
@@ -257,7 +326,41 @@ def _axtree_ids_from_params(params: JsonDict) -> Set[str]:
     # scroll and both blocks nothing and passes nothing through to rematch.
     for key in ("target", "container"):
         collect(params.get(key))
-    return ids
+    return units
+
+
+def _axtree_ids_from_params(params: JsonDict) -> Set[str]:
+    return {
+        node_id
+        for unit in _param_locator_units(params)
+        for node_id in unit["ids"]
+    }
+
+
+def _selector_backed_ids(params: JsonDict) -> Set[str]:
+    """Ids carried by a locator that also supplies its own selector fallback."""
+    return {
+        node_id
+        for unit in _param_locator_units(params)
+        if unit["hasSelector"]
+        for node_id in unit["ids"]
+    }
+
+
+def _bare_ids(params: JsonDict) -> Set[str]:
+    """Ids carried by a locator with NO selector beside them.
+
+    Deliberately not `target_ids - backed_ids`: the same id can appear in two
+    locators, one paired and one bare, and set arithmetic would let the paired
+    occurrence's fallback vouch for the bare one. Each occurrence earns its own
+    licence, so an id may legitimately be in both sets.
+    """
+    return {
+        node_id
+        for unit in _param_locator_units(params)
+        if not unit["hasSelector"]
+        for node_id in unit["ids"]
+    }
 
 
 def _observe_page_url(agent: Any, params: JsonDict, result: JsonDict) -> None:
@@ -330,9 +433,9 @@ def _observe_axtree_state_after(
                 )
         return
 
-    recovered = _recovered_target_from_result(result)
-    if recovered is not None:
+    for recovered in _recovered_targets_from_result(result):
         _apply_recovered_target(agent, method, params, result, recovered)
+    _observe_target_resolution(agent, method, params, result)
 
     if method in AXTREE_INVALIDATING_METHODS and not (
         method == "Runtime.evaluate" and read_only_eval
@@ -442,10 +545,136 @@ def _axtree_seen_signature(
     return None
 
 
-def _recovered_target_from_result(result: JsonDict) -> Optional[JsonDict]:
+def _recovered_targets_from_result(result: JsonDict) -> List[JsonDict]:
+    """Every browser-side rematch this call reported.
+
+    A scroll can recover BOTH endpoints in one call (a stale `target` id and a
+    stale `container` id), and a batch read can recover several items. Stopping
+    at the first one silently drops the rest, leaving stale ids in the snapshot
+    that the very same response already corrected.
+    """
     data = _response_data(result)
-    recovered = data.get("recoveredTarget")
-    return recovered if isinstance(recovered, dict) else None
+    recovered: List[JsonDict] = []
+    flat = data.get("recoveredTarget")
+    if isinstance(flat, dict):
+        recovered.append(flat)
+    resolution = data.get("resolution")
+    if isinstance(resolution, dict):
+        for key in ("target", "container"):
+            endpoint = resolution.get(key)
+            if isinstance(endpoint, dict) and isinstance(
+                endpoint.get("recoveredTarget"), dict
+            ):
+                recovered.append(endpoint["recoveredTarget"])
+    items = data.get("items")
+    if isinstance(items, list):
+        for item in items:
+            if isinstance(item, dict) and isinstance(item.get("recoveredTarget"), dict):
+                recovered.append(item["recoveredTarget"])
+    return recovered
+
+
+# What actually answered the locator. Anything other than `id` means the id we
+# sent did not resolve on its own.
+_ID_RESOLUTION_SOURCES = frozenset({"id"})
+_FALLBACK_RESOLUTION_SOURCES = frozenset(
+    {"selector", "selector-fallback", "snapshot-recovery"}
+)
+
+
+def _resolution_pairs(params: JsonDict, result: JsonDict) -> List[Tuple[Set[str], str]]:
+    """Pair each reported `resolvedBy` with the ids THAT locator actually sent.
+
+    Pairing is the whole point. A batch whose targets[0] is selector-only and
+    whose targets[1] is an id reports both `selector` and `id`; aggregating them
+    into two flat sets says "a fallback fired and these ids were sent", which
+    convicts the perfectly live id in targets[1]. The three envelopes are
+    matched to their own locators: a flat field to the top-level locator, each
+    item to its positional target, and `resolution.<endpoint>` to the scroll
+    locator of the same name.
+    """
+    data = _response_data(result)
+    pairs: List[Tuple[Set[str], str]] = []
+
+    def ids_of(locator: Any) -> Set[str]:
+        return _axtree_ids_from_params(locator) if isinstance(locator, dict) else set()
+
+    def add(locator: Any, source: Any) -> None:
+        if not isinstance(source, str) or not source.strip():
+            return
+        sent = ids_of(locator)
+        if sent:
+            pairs.append((sent, source.strip()))
+
+    add(params, data.get("resolvedBy"))
+    items = data.get("items")
+    targets = params.get("targets") if isinstance(params, dict) else None
+    if isinstance(items, list):
+        for position, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            index = item.get("index")
+            index = index if isinstance(index, int) and not isinstance(index, bool) else position
+            locator = item.get("target")
+            if not isinstance(locator, dict) and isinstance(targets, list):
+                locator = targets[index] if 0 <= index < len(targets) else None
+            add(locator, item.get("resolvedBy"))
+    resolution = data.get("resolution")
+    if isinstance(resolution, dict) and isinstance(params, dict):
+        for key in ("target", "container"):
+            endpoint = resolution.get(key)
+            if isinstance(endpoint, dict):
+                add(params.get(key), endpoint.get("source"))
+    return pairs
+
+
+def _observe_target_resolution(
+    agent: Any,
+    method: str,
+    params: JsonDict,
+    result: JsonDict,
+) -> None:
+    """Record that a sent id did not resolve, using the platform's own receipt.
+
+    This is the other half of the selector-backed passthrough. The guard stops
+    predicting whether an id is still live; the answer arrives with the
+    response instead. When a fallback answered, the snapshot is PROVABLY behind
+    the page — stronger evidence than the epoch bookkeeping that produced the
+    prediction — so it is marked dirty and the next id-only call has to refresh
+    first. A selector-only call reports `selector` too and must not be read as
+    a stale id, so this only fires when the caller actually sent one.
+    """
+    if not isinstance(result, dict) or not isinstance(params, dict):
+        return
+    pairs = _resolution_pairs(params, result)
+    if not pairs:
+        return
+    stale_ids: Set[str] = set()
+    fallbacks: Set[str] = set()
+    id_resolved = False
+    for sent, source in pairs:
+        if source in _FALLBACK_RESOLUTION_SOURCES:
+            stale_ids |= sent
+            fallbacks.add(source)
+        elif source in _ID_RESOLUTION_SOURCES:
+            id_resolved = True
+    if not stale_ids:
+        return
+    receipt = {
+        "method": method,
+        "resolvedBy": sorted(fallbacks),
+        "sentIds": sorted(stale_ids),
+        "idResolved": id_resolved,
+    }
+    result["targetResolution"] = receipt
+    agent.axtree_invalidated = True
+    logger = getattr(agent, "logger", None)
+    if logger is not None:
+        logger.write("axtree.target_resolution_fallback", {
+            **receipt,
+            "pageId": str(params.get("pageId") or "") if isinstance(params, dict) else "",
+            "epoch": int(getattr(agent, "axtree_epoch", 0) or 0),
+        })
 
 
 def _apply_recovered_target(
@@ -493,7 +722,12 @@ def _apply_recovered_target(
     if logger is not None:
         logger.write("axtree.rematch_observed", digest)
     if isinstance(result, dict):
-        result["axtreeRematch"] = digest
+        # One call can rematch several ids (scroll's target AND container, or
+        # multiple batch items). `axtreeRematch` keeps naming the first for
+        # existing readers; the full set lives beside it so none is dropped.
+        if "axtreeRematch" not in result:
+            result["axtreeRematch"] = digest
+        result.setdefault("axtreeRematches", []).append(digest)
 
 
 def _validate_rematch(

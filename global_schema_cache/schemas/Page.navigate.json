@@ -23,6 +23,7 @@
       "required": false
     },
     "purpose": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "string",
       "minLength": 1,
       "description": "Describe why this URL is needed for the task, e.g., opening a product detail page or returning to search results",

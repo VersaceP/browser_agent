@@ -85,6 +85,7 @@
       "additionalProperties": false
     },
     "purpose": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "string",
       "minLength": 1,
       "description": "Describe the visual condition to verify, e.g., canvas output, layout overlap, CAPTCHA state, or proof-of-work screen",

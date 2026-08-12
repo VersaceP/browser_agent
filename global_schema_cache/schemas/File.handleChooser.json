@@ -28,16 +28,18 @@
       "required": false
     },
     "id": {
-      "description": "Canonical upload target id. Mutually exclusive with selector.",
+      "description": "Preferred canonical upload target id.",
       "type": "string",
+      "pattern": "^\\d+:\\d+:\\d+$",
       "required": false
     },
     "selector": {
-      "description": "CSS selector for a file input or upload component. Mutually exclusive with id.",
+      "description": "Fallback CSS selector for the upload target.",
       "type": "string",
       "required": false
     },
     "purpose": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "string",
       "minLength": 1,
       "description": "Describe your intent for handling this file chooser or upload component, e.g., uploading a document",

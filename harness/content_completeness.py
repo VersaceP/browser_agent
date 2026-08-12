@@ -14,6 +14,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 from urllib.parse import urlsplit, urlunsplit
 
 from harness.call_outcome import evaluate_grant
+from harness.semantic_frames import response_node_count
 from harness.utils import JsonDict
 
 
@@ -114,10 +115,7 @@ def _dom_snapshot(result: Any) -> tuple[str, int]:
         if total_length >= 50000:
             break
     data = _response_data(result)
-    try:
-        node_count = max(0, int(data.get("nodeCount") or 0))
-    except (TypeError, ValueError):
-        node_count = 0
+    node_count = response_node_count(data) or 0
     return "\n".join(normalized)[:50000], node_count
 
 
@@ -1759,10 +1757,7 @@ class ContentCompletenessTracker:
             )
         else:
             data = _response_data(result)
-            try:
-                node_count = int(data.get("nodeCount") or 0)
-            except (TypeError, ValueError):
-                node_count = 0
+            node_count = response_node_count(data) or 0
             state.shell_present = state.shell_present or (
                 bool(state.title or state.url)
                 and (node_count >= 30 or len(haystack) >= 500)

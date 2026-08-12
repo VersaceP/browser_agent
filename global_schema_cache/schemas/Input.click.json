@@ -31,6 +31,12 @@
       "type": "number",
       "required": false
     },
+    "force": {
+      "default": false,
+      "description": "Dispatch even when the resolved element is occluded. Normal browser hit testing still applies, so an overlay may receive the input. Ignored for coordinate-based clicks.",
+      "type": "boolean",
+      "required": true
+    },
     "clickCount": {
       "default": 1,
       "description": "Number of clicks to dispatch: 1 or 2.",
@@ -39,13 +45,8 @@
       "maximum": 2,
       "required": true
     },
-    "force": {
-      "default": false,
-      "description": "Dispatch even when the resolved element is occluded. Normal browser hit testing still applies, so an overlay may receive the input. Ignored for coordinate-based clicks.",
-      "type": "boolean",
-      "required": true
-    },
     "purpose": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "string",
       "minLength": 1,
       "description": "Describe the intended effect of this click, e.g., opening a menu, selecting a result, or submitting a form",

@@ -51,6 +51,7 @@ from harness.constants import (
     WORKER_STATUS_STEP_BUDGET,
     WORKER_STATUS_UNKNOWN,
 )
+from harness.semantic_frames import response_node_count
 
 
 @dataclass
@@ -446,6 +447,6 @@ def _is_extraction_failure(observation: Optional[str], result: Any) -> bool:
         return True
     if isinstance(data, (list, dict)) and len(data) == 0:
         return True
-    if isinstance(data, dict) and data.get("nodeCount") == 0:
+    if response_node_count(data) == 0:
         return True
     return False

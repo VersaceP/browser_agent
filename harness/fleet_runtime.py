@@ -635,77 +635,22 @@ def _notification_event(message: Any) -> tuple[str, Dict[str, Any]]:
     return name, normalized
 
 
-def _execution_id(value: Any) -> str:
-    """Extract one ABCP action execution id from a response envelope."""
-
-    if isinstance(value, dict):
-        candidate = value.get("executionId") or value.get("execution_id")
-        if candidate:
-            return str(candidate).strip()
-        for nested in value.values():
-            found = _execution_id(nested)
-            if found:
-                return found
-    elif isinstance(value, list):
-        for nested in value:
-            found = _execution_id(nested)
-            if found:
-                return found
-    return ""
-
-
-def _execution_attributed_popup_receipt(
-    *,
-    source_page_id: str,
-    event_name: str,
-    event_payload: Any,
-    action_result: Any,
-) -> Optional[Dict[str, Any]]:
-    """Build a strong popup receipt from ABCP's execution-linked Page.open.
-
-    Current ABCP attaches the initiating Input.click executionId to an
-    action-owned Page.open and targets that event only to the caller. A
-    Page.open without action execution identity is not attributable: it may be
-    an unsolicited site popup and must not be promoted into click success by
-    opener/time proximity. Inventory reconciliation remains useful for
-    same-page state comparison; legacy popup attribution is separately gated.
-    """
-
-    if event_name != "Page.open" or not isinstance(event_payload, dict):
-        return None
-    action_execution_id = _execution_id(action_result)
-    event_execution_id = str(event_payload.get("executionId") or "").strip()
-    source = str(source_page_id or "").strip()
-    opener = str(event_payload.get("openerPageId") or "").strip()
-    landing = str(event_payload.get("pageId") or "").strip()
-    if not (
-        action_execution_id
-        and event_execution_id == action_execution_id
-        and source
-        and opener == source
-        and landing
-        and str(event_payload.get("openedBy") or "") == "popup"
-    ):
-        return None
-    return {
-        "outcome": "new_page",
-        "attribution": "confirmed",
-        "attributionSource": "abcp_execution_event",
-        "executionId": action_execution_id,
-        "sourcePageId": source,
-        "sourceUrl": event_payload.get("sourceUrl") or None,
-        "landingPageId": landing,
-        "landingUrl": (
-            event_payload.get("currentUrl")
-            or event_payload.get("url")
-            or None
-        ),
-        "openedBy": event_payload.get("openedBy"),
-        "openerPageId": opener,
-        "eventName": event_name,
-        "quarantinedPageIds": [],
-        "popupAttributionPolicy": "execution_only",
-    }
+# NOTE (2026-08-11): `_execution_attributed_popup_receipt` lived here and built
+# a `attribution: "confirmed"` popup receipt from ABCP's execution-linked
+# Page.open. It is GONE, not disabled, because the platform removed both of its
+# inputs: agent event envelopes no longer carry `executionId`, and Page.open's
+# agent projection is a strict whitelist of pageId/url/title/lifecycle — so
+# `openedBy`, `openerPageId` and `popupCauseId` never reach us. Every condition
+# it required is now unsatisfiable; keeping it would have left a function that
+# looks like the strong path while silently never firing.
+#
+# Do not rebuild it out of Page.list provenance. Those rows DO still carry
+# openedBy/openerPageId/sourceUrl, and `FleetClickGate.classify` already reads
+# them — deliberately capping at `attribution: "unknown"`, because a page that
+# pops an ad on a timer satisfies opener + sourceUrl + window + single-candidate
+# just as well as a real click target does. Correlation there is not causation,
+# and naming it "confirmed" would only relabel the inference. Discovery goes
+# through Page.list plus an atomic claim, which is a fact rather than a guess.
 
 
 def _page_rows(value: Any) -> list[Dict[str, Any]]:
@@ -1124,9 +1069,12 @@ class FleetClickGate:
         if entry is None:
             return
         outcome = str(receipt.get("outcome") or "")
-        if outcome == "dispatch_failed" or (
-            receipt.get("attributionSource") == "abcp_execution_event"
-        ):
+        # The former second arm skipped the late guard for an
+        # `attributionSource == "abcp_execution_event"` receipt. Nothing builds
+        # that receipt any more (see the note above `_page_rows`), so the arm
+        # was unreachable; a click whose outcome is merely unattributed still
+        # needs the late guard.
+        if outcome == "dispatch_failed":
             return
         method = lease.method if lease is not None else ""
         guard_seconds = (
@@ -1969,22 +1917,7 @@ class PageLeasedBrowserClient:
                     },
                 )
             workflow_hitl_receipt = await settle_workflow_hitl()
-            execution_receipt = None
-            if method == "Input.click":
-                for candidate_name, candidate_payload in reversed(
-                    settlement_events
-                ):
-                    execution_receipt = _execution_attributed_popup_receipt(
-                        source_page_id=page_id,
-                        event_name=candidate_name,
-                        event_payload=candidate_payload,
-                        action_result=result,
-                    )
-                    if execution_receipt is not None:
-                        break
-            if execution_receipt is not None:
-                receipt = execution_receipt
-            elif baseline_rows and final_rows:
+            if baseline_rows and final_rows:
                 receipt = gate.classify(
                     fleet_id=fleet_id,
                     source_page_id=page_id,

@@ -4,6 +4,7 @@ harness.diagnostics.error_classification - Structured browser/tool error hints.
 
 from typing import Any, Optional
 
+from harness.call_outcome import action_runtime_info
 from harness.constants import (
     API_CONTRACT_ERROR_MARKERS,
     PAGE_DEAD_OBSERVATION_MARKERS,
@@ -19,6 +20,119 @@ SELECT_FAILURE_ACTIONS = {
     "select-popup-lost": "stop_repeating_and_report_platform_select_failure",
     "select-navigation-stalled": "stop_repeating_and_report_platform_cascade_failure",
 }
+
+
+# --- Structured runtime classification -------------------------------------
+#
+# ABCP attaches `runtime: {code, phase, sideEffectStarted, actionKind}` to a
+# failed action. The prose matching further down predates that block and is
+# kept only as the fallback for envelopes that carry no runtime — a message is
+# a rendering, and classifying a rendering means re-deriving something the
+# platform already decided.
+#
+# The code enum is ~70 entries and grows with the platform, so it is NOT
+# transcribed here. Only codes that change what the harness DOES get an entry;
+# everything else is classified by its family (prefix/suffix), which is a
+# property of the naming contract rather than of any one code. An unrecognized
+# code still produces a structured classification carrying the code verbatim,
+# which is strictly more actionable than the "unknown" prose matching returns.
+
+_RUNTIME_CODE_TYPES = {
+    "occluded": ("occlusion_blocked", "refresh_dom_dismiss_overlay_then_retry_once"),
+    "select-option-occluded": ("occlusion_blocked", "refresh_dom_dismiss_overlay_then_retry_once"),
+    "renderer-lost": ("render_lost", "retry_with_render_recovery_or_rebuild_page"),
+    "input-host-destroyed": ("render_lost", "retry_with_render_recovery_or_rebuild_page"),
+    "stale-target": ("stale_target", "refresh_ax_tree_then_retarget_once"),
+    "target-not-found": ("target_not_found", "refresh_ax_tree_then_retarget_once"),
+    "scroll-target-not-found": ("target_not_found", "refresh_ax_tree_then_retarget_once"),
+    "scroll-container-not-found": ("target_not_found", "refresh_ax_tree_then_retarget_once"),
+    "target-frame-not-found": ("target_frame_not_found", "refresh_ax_tree_then_retarget_once"),
+    "invalid-input": ("contract_error", "switch_method_or_report_platform_contract_bug"),
+    "invalid-selector": ("contract_error", "switch_method_or_report_platform_contract_bug"),
+    "selector-ambiguous": ("target_ambiguous", "narrow_the_selector_or_use_a_canonical_id"),
+    "coordinate-conversion-failed": (
+        "coordinate_unavailable", "stop_using_coordinates_and_target_by_id_or_selector",
+    ),
+    # Not every drag-* code is a same-document mistake. These two describe an
+    # endpoint that went away or a destination that cannot be pinned down, and
+    # "keep both endpoints in one document" would be useless advice for them.
+    "drag-source-frame-unavailable": (
+        "drag_endpoint_lost", "refresh_ax_tree_then_retarget_once",
+    ),
+    "drag-destination-frame-ambiguous": (
+        "drag_endpoint_ambiguous",
+        "name_the_destination_with_a_canonical_id_from_the_source_frame",
+    ),
+}
+
+# Family rules, applied in order when no exact entry matched. Each is a
+# statement about the naming contract: drag endpoint errors are unsupported
+# geometry rather than transient, a scroll code means the scroll request itself
+# was wrong, and anything ending in -timeout timed out.
+_RUNTIME_CODE_FAMILIES = (
+    ("cross-frame-drag", "drag_unsupported", "stop_and_keep_both_endpoints_in_one_document"),
+    ("cross-document-drag", "drag_unsupported", "stop_and_keep_both_endpoints_in_one_document"),
+    ("drag-", "drag_unsupported", "stop_and_keep_both_endpoints_in_one_document"),
+    ("select-", "select_failure", "reinspect_select_then_retry_once_with_returned_fields"),
+    ("scroll-", "scroll_failed", "inspect_viewport_then_correct_the_scroll_request"),
+    ("input-", "input_surface_unavailable", "inspect_page_state_before_retrying_input"),
+    ("semantic-tree-", "contract_error", "switch_method_or_report_platform_contract_bug"),
+)
+
+_TIMEOUT_SUFFIX = "-timeout"
+
+# When the browser had already begun dispatching input, no classification may
+# recommend a retry: the action may have taken effect and the receipt simply
+# never arrived.
+_SIDE_EFFECT_ACTION = "inspect_page_state_and_do_not_replay"
+
+
+def classify_runtime_error(runtime: Any, *, method: str = "") -> Optional[JsonDict]:
+    """Classify a failure from the platform's structured runtime block.
+
+    Returns None when there is no usable code, so the caller can fall back to
+    prose rather than manufacturing a verdict from an empty block.
+    """
+    if not isinstance(runtime, dict):
+        return None
+    code = str(runtime.get("code") or "").strip()
+    if not code or code == "unknown":
+        return None
+    phase = str(runtime.get("phase") or "").strip()
+    side_effect_started = runtime.get("sideEffectStarted") is True
+
+    mapped = _RUNTIME_CODE_TYPES.get(code)
+    if mapped is None and code in SELECT_FAILURE_ACTIONS:
+        mapped = ("select_failure", SELECT_FAILURE_ACTIONS[code])
+    if mapped is None:
+        for prefix, error_type, action in _RUNTIME_CODE_FAMILIES:
+            if code.startswith(prefix):
+                mapped = (error_type, action)
+                break
+    if mapped is None and code.endswith(_TIMEOUT_SUFFIX):
+        mapped = ("timeout", "retry_with_backoff_or_reduce_surface")
+    if mapped is None:
+        mapped = ("action_runtime_error", "inspect_page_state_then_choose_another_approach")
+
+    error_type, suggested_action = mapped
+    if code.endswith(_TIMEOUT_SUFFIX) and error_type == "action_runtime_error":
+        error_type = "timeout"
+    classification: JsonDict = {
+        "type": error_type,
+        "errorCode": code,
+        "suggested_action": (
+            _SIDE_EFFECT_ACTION if side_effect_started else suggested_action
+        ),
+        "method": str(method or ""),
+        "source": "action_runtime",
+        "sideEffectStarted": side_effect_started,
+    }
+    if phase:
+        classification["phase"] = phase
+    action_kind = str(runtime.get("actionKind") or "").strip()
+    if action_kind:
+        classification["actionKind"] = action_kind
+    return classification
 
 
 def classify_browser_error(
@@ -126,10 +240,27 @@ def classify_browser_error(
 
 
 def attach_error_classification(result: JsonDict, *, method: str = "") -> JsonDict:
-    """Mutate and return result with `errorClassification` when an error exists."""
+    """Mutate and return result with `errorClassification` when an error exists.
+
+    Structured first: when the platform stated a runtime code, that is the
+    verdict. HITL/pause is the one exception that still wins over it — a paused
+    page blocks every further action regardless of which code the interrupted
+    one reported, and treating it as an ordinary action failure would send the
+    worker back to clicking a gated page.
+    """
     if isinstance(result.get("errorClassification"), dict):
         return result
     message = _extract_error_message(result)
+    runtime = action_runtime_info(result)
+    if message and _contains(
+        message.lower(), "err_page_paused", "paused for human intervention"
+    ):
+        result["errorClassification"] = classify_browser_error(message, method=method)
+        return result
+    structured = classify_runtime_error(runtime, method=method)
+    if structured is not None:
+        result["errorClassification"] = structured
+        return result
     if not message:
         return result
     result["errorClassification"] = classify_browser_error(message, method=method)

@@ -115,7 +115,14 @@ states, controls, and canonical element ids. Use `DOM.getSemanticTree` only for
 local diagnostics when AXTree is insufficient and you need tag hierarchy,
 complete local bounds, Shadow DOM, or selector debugging; it is heavy (~3.65x
 AXTree) and its results are offloaded, so prefer AXTree + focused
-`DOM.getText`/`DOM.getAttribute` for routine perception. Both
+`DOM.getText`/`DOM.getAttribute` for routine perception. `DOM.getSemanticTree`
+returns a bounded FRAME GRAPH — `{rootFrameId, frames[], summary}` — where each
+frame carries its own local `tree`, `nodeCount`, `status` and truncation
+reason, and accessible iframe documents appear as sibling frames. There is no
+top-level `tree` or `nodeCount`. A selector mined from one frame cannot be used
+against another (ABCP resolves selectors in the main document plus its shadow
+trees, never across a frame boundary), so work from the frame named by
+`rootFrameId` and treat the other frames as context, not as a target pool. Both
 `DOM.getAXTree` and `DOM.getSemanticTree` return canonical ids of the form
 `frameId:axNodeId:domNodeId` (three segments) — copy them verbatim and never
 truncate to two segments.
@@ -131,7 +138,17 @@ blocker first) and `scroll` as a scrollable container. (The pixel space of
 `@x,y,w,h` is a pending live probe — see the maintainer note below.)
 
 Selector priority: canonical AXTree id > semantic attributes (`aria-label`,
-`name`) > stable CSS selector. Avoid dynamic hash classes.
+`name`) > stable CSS selector. Avoid dynamic hash classes. When you hold BOTH an
+id and a stable selector for the same element, send both in the same locator —
+ABCP resolves the id first and falls back to the selector inside one dispatch,
+and the receipt's `resolvedBy` (`id` / `selector` / `selector-fallback` /
+`snapshot-recovery`) says which answered. Never invent a selector to complete
+the pair, never pair an id with a selector for a different element, and never
+re-issue the action with the other locator: that is a second real action, not a
+fallback. When you sent an id and the receipt says `selector-fallback` or
+`snapshot-recovery`, that id was stale — refresh `DOM.getAXTree` before reusing
+ids from that snapshot. A selector-only call reports `selector` and says nothing
+about any id.
 
 AXTree ids are physical anchors returned by the live page. Use the actual id
 returned by the current AXTree with the parameter accepted by the live
@@ -153,12 +170,29 @@ is `""`; failures use `item.error`. A failed item does not invalidate its
 successful siblings. Fall back to single-target reads on older servers whose
 schema does not expose `targets`.
 
-Use `DOM.getImg` only for actual `<img>` assets and only when the live
-capability exists. It requires a `targets` batch and `options.path` output
-directory. Prefer `imageFormat:"auto"`; successful items return
-`item.info.savedPath`. Preserve `fallback-screenshot` receipts, and treat
-`not-img-element` as an item error rather than converting arbitrary elements
-into screenshots.
+Use `DOM.getImg` to export visual assets when the live capability exists:
+`<img>`, `<picture>`, SVG `<image>`, inline SVG, `<canvas>`, and other visual
+nodes the platform captures by screenshot. Its `selector` resolves in the main
+document AND every nested author Shadow DOM (verified live: a plain
+`#shadow-img` selector matched inside a shadow root). It takes a `targets` batch
+of up to 32 entries — each may carry `id` and `selector` together — plus an
+`options.path` output directory. Prefer `imageFormat:"auto"`: it keeps a safe
+self-contained inline SVG as `.svg`, keeps supported raster sources as-is, and
+otherwise encodes PNG.
+
+Read each `response.data.items` entry on its own terms. `info.savedPath` is the
+artifact; `info.mimeType`/`info.extension` state what was actually written;
+`info.method` separates `native-image` from `fallback-screenshot`, and a
+fallback is a real citable artifact with `info.fallbackReason` explaining why.
+Failed items carry `error.code` plus `error.fallbackContext`, which distinguishes
+a resolution failure from load/decode/native-export/screenshot/output failures.
+
+Two measured behaviours worth designing around (canary, 2026-08-11): a native
+export returns the SOURCE asset at its natural size, not the rendered box — a
+1x1 source rendered at 120x80 exports as 1x1 — and a plain container that merely
+WRAPS an image is not a native target: it succeeds as a screenshot of the whole
+container with `fallbackReason.code="unsupported-image-target"`. There is no
+container-to-descendant drill-down, so point at the visual node itself.
 
 After text extraction, reject empty or obvious placeholder-only content in any
 language. Examples include loading prompts, sign-in prompts, first-comment
@@ -174,6 +208,20 @@ original action on the safe path. Prefer canonical AXTree ids. Use stable
 selectors as fallback and raw coordinates only when no semantic target exists.
 Do not add manual scroll/wait before standard interactions; manually scroll only
 nested scroll containers or lazy-loading flows.
+
+`Input.scroll` is a strict three-mode union with NO top-level `id`/`selector`:
+`target:{id?,selector?}` brings an element into the root viewport (direction is
+derived, `amount` caps each step, success means `targetVisible=true`, and an
+optional `container` constrains which ancestor may expose it); `container` plus
+`direction`/`amount` moves an ALREADY-visible container; neither locator scrolls
+the page viewport. `amount:0` reads scroll state without dispatching input and
+is valid only for container/viewport mode. In the receipt, `layers[].delta` is
+the per-surface truth and `totalDelta` only a summary; after
+`completedReason="boundary-reached"` do not repeat the same direction.
+
+`Input.drag` needs both endpoints in the same document. Cross-frame and
+cross-document drags are unsupported, and an iframe source cannot use a
+coordinate or `dx`/`dy` destination.
 
 After click, type, press, or scroll, verify effects through the cheapest
 reliable signal: read `ActionFeedback`; if navigation/loading/page-identity

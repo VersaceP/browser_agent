@@ -23,6 +23,7 @@ from harness.constants import (
     OFFLOAD_METHODS,
     SCREENSHOT_METHODS,
 )
+from harness.semantic_frames import response_node_count
 from harness.utils import (
     JsonDict,
     RunLogger,
@@ -350,11 +351,9 @@ def offload_large_response_fields(
         ) if part]
         path = observations_dir / ("-".join(filename_parts) + f".{suffix}")
         output_format, query_with, outline = write_offloaded_blob(path, field, blob)
-        node_count = (
-            data.get("nodeCount")
-            if isinstance(data, dict) and data.get("nodeCount") is not None
-            else count_json_nodes(blob)
-        )
+        node_count = response_node_count(data)
+        if node_count is None:
+            node_count = count_json_nodes(blob)
         data[field] = {
             "_offloaded": True,
             "savedPath": str(path.resolve()),
