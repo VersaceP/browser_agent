@@ -16,6 +16,11 @@ from typing import Any, Optional
 
 from runtime_config import VLConfig
 from harness.utils import JsonDict
+from llm.thinking import (
+    anthropic_thinking_request,
+    openai_thinking_request,
+    resolve_thinking_intent,
+)
 # Single source of truth for "which challenge types may be driven, with which
 # action" — the harness solve loop imports the same table.
 from harness.vl.captcha import TYPE_ACTIONS as _TYPE_ACTIONS
@@ -717,6 +722,40 @@ def _finalize_captcha_solve(parsed: JsonDict, usage: JsonDict) -> JsonDict:
     return out
 
 
+# extra_params keys that llm.thinking owns: they are controls, not kwargs, and
+# splatting them into the SDK call would raise TypeError.
+_THINKING_CONTROL_KEYS = ("thinking", "reasoning_effort", "effort")
+
+
+def _merged_vl_extra_params(
+    config: VLConfig,
+    role_extra_params: JsonDict,
+) -> JsonDict:
+    """vl.extra_params for every VL role, overlaid by the role's own section.
+
+    Symmetric across both wire formats on purpose: before this, the Anthropic
+    path silently ignored vl.extra_params, so "configure thinking per role"
+    was only half true.
+    """
+    merged: JsonDict = dict(config.extra_params or {})
+    merged.update(role_extra_params or {})
+    return merged
+
+
+def _passthrough_extra_params(merged: JsonDict) -> JsonDict:
+    return {k: v for k, v in merged.items() if k not in _THINKING_CONTROL_KEYS}
+
+
+def _merge_extra_body(params: JsonDict, extra_body: JsonDict) -> None:
+    if not extra_body:
+        return
+    existing = params.get("extra_body")
+    params["extra_body"] = {
+        **(existing if isinstance(existing, dict) else {}),
+        **extra_body,
+    }
+
+
 async def _call_openai_compatible(
     *,
     config: VLConfig,
@@ -762,17 +801,27 @@ async def _call_openai_compatible(
         "temperature": 0,
         "max_tokens": 800,
     }
-    params.update(config.extra_params or {})
-    params.update(role_extra_params or {})
+    merged = _merged_vl_extra_params(config, role_extra_params)
+    intent = resolve_thinking_intent(merged)
+    thinking_top, thinking_extra_body, thinking_warnings = openai_thinking_request(
+        intent
+    )
+    params.update(_passthrough_extra_params(merged))
+    params.update(thinking_top)
+    _merge_extra_body(params, thinking_extra_body)
     response = await client.chat.completions.create(**params)
     text = response.choices[0].message.content or ""
     usage = getattr(response, "usage", None)
-    return text, {
+    meta: JsonDict = {
         "provider": "openai",
         "model": config.model_id,
         "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0,
         "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0) if usage else 0,
     }
+    warnings = (*intent.warnings, *thinking_warnings)
+    if warnings:
+        meta["thinking_warnings"] = list(warnings)
+    return text, meta
 
 
 async def _call_anthropic_compatible(
@@ -819,21 +868,32 @@ async def _call_anthropic_compatible(
             }
         ],
     }
-    # Symmetric with the OpenAI-compatible path, but still role-scoped: these
-    # parameters are never present for an ordinary visual_verify call.
-    params.update(role_extra_params or {})
+    # Symmetric with the OpenAI-compatible path: vl.extra_params applies to
+    # every VL role, and the role's own section overlays it.
+    merged = _merged_vl_extra_params(config, role_extra_params)
+    intent = resolve_thinking_intent(merged)
+    thinking_native, thinking_warnings = anthropic_thinking_request(
+        intent,
+        merged.get("max_tokens", params["max_tokens"]),
+    )
+    params.update(_passthrough_extra_params(merged))
+    params.update(thinking_native)
     response = await client.messages.create(**params)
     text = ""
     for block in response.content:
         if getattr(block, "type", None) == "text":
             text += getattr(block, "text", "") or ""
     usage = getattr(response, "usage", None)
-    return text, {
+    meta: JsonDict = {
         "provider": "anthropic",
         "model": config.model_id,
         "input_tokens": int(getattr(usage, "input_tokens", 0) or 0) if usage else 0,
         "output_tokens": int(getattr(usage, "output_tokens", 0) or 0) if usage else 0,
     }
+    warnings = (*intent.warnings, *thinking_warnings)
+    if warnings:
+        meta["thinking_warnings"] = list(warnings)
+    return text, meta
 
 
 def _vl_provider_error_type(exc: BaseException) -> str:

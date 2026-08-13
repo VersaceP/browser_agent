@@ -75,6 +75,8 @@ from harness.task_control import (
     spawn_acquisition_fingerprint,
     spawn_acquisition_rejection,
     validate_worker_artifacts,
+    load_task_state,
+    write_task_state,
 )
 from harness.strategy_telemetry import append_strategy_attempt
 from harness.tool_policy import ALWAYS_FORBIDDEN_ABCP_METHODS
@@ -413,6 +415,80 @@ class PinnedBrowserContext:
         }
 
 
+@dataclass(frozen=True)
+class ResumeBrowserHint:
+    """Best-effort browser target recovered from this task's prior state.
+
+    Unlike :class:`PinnedBrowserContext`, this is not a routing constraint. A
+    missing or conflicting hint is ignored, and ordinary assignment continues.
+    """
+
+    fleet_id: str
+    page_id: str = ""
+    phase_id: str = ""
+    source: str = "task_state"
+
+    @classmethod
+    def from_value(cls, value: Any) -> Optional["ResumeBrowserHint"]:
+        if value in (None, {}, ""):
+            return None
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, dict):
+            raise ValueError("resume_browser_hint must be an object")
+        fleet_id = str(
+            value.get("fleet_id") or value.get("fleetId") or ""
+        ).strip()
+        page_id = str(
+            value.get("page_id") or value.get("pageId") or ""
+        ).strip()
+        phase_id = str(
+            value.get("phase_id") or value.get("phaseId") or ""
+        ).strip()
+        source = str(value.get("source") or "task_state").strip() or "task_state"
+        if not fleet_id:
+            raise ValueError("resume_browser_hint.fleet_id is required")
+        for label, raw in (("fleet_id", fleet_id), ("page_id", page_id)):
+            if not raw:
+                continue
+            try:
+                uuid.UUID(raw)
+            except (ValueError, AttributeError) as exc:
+                raise ValueError(
+                    f"resume_browser_hint.{label} must be a UUID"
+                ) from exc
+        return cls(
+            fleet_id=fleet_id,
+            page_id=page_id,
+            phase_id=phase_id,
+            source=source,
+        )
+
+    def to_dict(self) -> JsonDict:
+        return {
+            "fleetId": self.fleet_id,
+            "pageId": self.page_id or None,
+            "phaseId": self.phase_id or None,
+            "source": self.source,
+            "mode": "best_effort",
+        }
+
+
+class _TaskContextTrackingBrowserClient(PageLeasedBrowserClient):
+    """Observe successful browser calls before control returns to the worker."""
+
+    def __init__(self, *args: Any, after_call: Optional[Callable[..., None]] = None,
+                 **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._after_call = after_call
+
+    async def call(self, method: str, params: Any = None) -> Any:
+        result = await super().call(method, params)
+        if self._after_call is not None:
+            self._after_call(method, params, result)
+        return result
+
+
 @dataclass
 class _SessionStartLock:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -432,6 +508,7 @@ class BrowserAgentSpawner:
         logger: RunLogger,
         browser_agent_factory: BrowserAgentFactory,
         pinned_browser_context: Any = None,
+        resume_browser_hint: Any = None,
     ):
         self.runtime = runtime
         self.browser_agent_factory = browser_agent_factory
@@ -452,6 +529,9 @@ class BrowserAgentSpawner:
                 " runtime.harness.fleet_reuse_enabled=true"
             )
         self.pinned_browser_context = pinned_browser_context
+        self.resume_browser_hint = ResumeBrowserHint.from_value(
+            resume_browser_hint
+        )
         self._handles: Dict[str, BrowserAgentHandle] = {}
         self._slots: Dict[str, BrowserAgentSlot] = {}
         self._counter = 0
@@ -556,6 +636,391 @@ class BrowserAgentSpawner:
         self._fleet_readiness_tasks: Dict[
             tuple[str, str], "asyncio.Task[JsonDict]"
         ] = {}
+        self._browser_context_fingerprints: Dict[str, str] = {}
+        # Page inventory is slot-global, while resume state is task-local.
+        # Record only pages this task actually addressed; sharing a Fleet does
+        # not make every tab returned by Page.list part of this task.
+        self._task_browser_page_ids: Dict[str, Set[str]] = {}
+
+    def _resume_hint_for_worker(
+        self,
+        *,
+        phase_id: str = "",
+        worker_contract: JsonDict,
+        session_key: str,
+        fleet_reference: str,
+        preferred_slot_id: Optional[str],
+        reuse_from_worker_id: Optional[str],
+    ) -> Optional[ResumeBrowserHint]:
+        """Return the weak resume candidate only for an unconstrained worker."""
+
+        hint = self.resume_browser_hint
+        if hint is None:
+            return None
+        reason = ""
+        if self.pinned_browser_context is not None:
+            reason = "explicit_pin"
+        elif hint.phase_id and hint.phase_id != str(phase_id or "").strip():
+            reason = "different_phase"
+        elif str(session_key or "").strip():
+            reason = "session_key"
+        elif str(fleet_reference or "").strip():
+            reason = "explicit_fleet"
+        elif worker_contract.get("needs_isolated_session") is True:
+            reason = "needs_isolated_session"
+        elif str(preferred_slot_id or "").strip():
+            reason = "preferred_slot"
+        elif str(reuse_from_worker_id or "").strip():
+            reason = "reuse_from_worker"
+        if not reason:
+            return hint
+        self.logger.write(
+            "spawner.resume_browser_hint.ignored",
+            {
+                "reason": reason,
+                "resumeBrowserHint": hint.to_dict(),
+            },
+        )
+        return None
+
+    @staticmethod
+    def _browser_context_page_record(page: JsonDict, fleet_id: str) -> JsonDict:
+        record: JsonDict = {
+            "pageId": str(page.get("pageId") or ""),
+            "fleetId": fleet_id,
+        }
+        for key in ("url", "title", "origin", "status"):
+            value = page.get(key)
+            if isinstance(value, (str, int, float, bool)) and value != "":
+                record[key] = value
+        return record
+
+    def _persist_task_browser_context(
+        self,
+        slot: BrowserAgentSlot,
+        assignment: FleetAssignment,
+        *,
+        phase_id: Optional[str] = None,
+        primary_page_id: str = "",
+        replace_pages: bool = False,
+        removed_page_ids: Optional[Set[str]] = None,
+    ) -> bool:
+        """Persist only the FleetAssignment that this task actually received."""
+
+        state_path = self.logger.task_dir / "task_state.json"
+        if not state_path.exists():
+            self.logger.write(
+                "spawner.browser_context.persist_skipped",
+                {
+                    "reason": "task_state_missing",
+                    "workerId": assignment.worker_id,
+                    "fleetId": assignment.fleet_id,
+                },
+            )
+            return False
+        state = load_task_state(self.logger)
+        if not state:
+            self.logger.write(
+                "spawner.browser_context.persist_skipped",
+                {
+                    "reason": "task_state_unreadable",
+                    "workerId": assignment.worker_id,
+                    "fleetId": assignment.fleet_id,
+                },
+            )
+            return False
+
+        browser_context = state.get("browser_context")
+        browser_context = (
+            dict(browser_context) if isinstance(browser_context, dict) else {}
+        )
+        fleets = browser_context.get("fleets")
+        fleets = dict(fleets) if isinstance(fleets, dict) else {}
+        fleet_id = assignment.fleet_id
+        previous = fleets.get(fleet_id)
+        previous = dict(previous) if isinstance(previous, dict) else {}
+        touched_page_ids = self._task_browser_page_ids.setdefault(fleet_id, set())
+        requested_primary_page_id = str(primary_page_id or "").strip()
+        requested_primary = slot.page_registry.get(requested_primary_page_id)
+        if (
+            requested_primary_page_id
+            and isinstance(requested_primary, dict)
+            and str(requested_primary.get("fleetId") or "") == fleet_id
+        ):
+            touched_page_ids.add(requested_primary_page_id)
+
+        pages_by_id: Dict[str, JsonDict] = {}
+        for page in previous.get("pages") or []:
+            if not isinstance(page, dict):
+                continue
+            page_id = str(page.get("pageId") or "").strip()
+            if not page_id:
+                continue
+            current_page = slot.page_registry.get(page_id)
+            if replace_pages and not (
+                isinstance(current_page, dict)
+                and str(current_page.get("fleetId") or "") == fleet_id
+            ):
+                continue
+            pages_by_id[page_id] = dict(page)
+        for page_id, page in slot.page_registry.items():
+            if not isinstance(page, dict):
+                continue
+            if str(page.get("fleetId") or "").strip() != fleet_id:
+                continue
+            normalized_id = str(page.get("pageId") or page_id or "").strip()
+            if not normalized_id or normalized_id not in touched_page_ids:
+                continue
+            normalized = dict(page)
+            normalized["pageId"] = normalized_id
+            pages_by_id[normalized_id] = self._browser_context_page_record(
+                normalized, fleet_id
+            )
+        for page_id in removed_page_ids or set():
+            normalized_id = str(page_id or "").strip()
+            pages_by_id.pop(normalized_id, None)
+            touched_page_ids.discard(normalized_id)
+
+        now = time.time()
+        pages = [pages_by_id[key] for key in sorted(pages_by_id)]
+        fleets[fleet_id] = {
+            **previous,
+            "ownerSlotId": assignment.owner_slot_id or assignment.slot_id,
+            "slotId": assignment.slot_id,
+            "ownerAgentId": assignment.owner_agent_id,
+            "sessionKey": assignment.session_key or None,
+            "isIsolated": bool(assignment.is_isolated),
+            "assignmentReason": assignment.assignment_reason,
+            "pages": pages,
+            "lastSeenAt": now,
+        }
+        browser_context["fleets"] = fleets
+
+        candidate_page_id = requested_primary_page_id
+        previous_primary = browser_context.get("last_primary")
+        previous_primary = (
+            dict(previous_primary)
+            if isinstance(previous_primary, dict)
+            else {}
+        )
+        if candidate_page_id not in pages_by_id:
+            candidate_page_id = ""
+        if (
+            not candidate_page_id
+            and str(previous_primary.get("fleetId") or "") == fleet_id
+            and str(previous_primary.get("pageId") or "") in pages_by_id
+        ):
+            candidate_page_id = str(previous_primary.get("pageId") or "")
+        browser_context["last_primary"] = {
+            "fleetId": fleet_id,
+            "pageId": candidate_page_id or None,
+            "lastSeenAt": now,
+        }
+        resolved_phase_id = str(phase_id or "").strip()
+        if not resolved_phase_id:
+            handle = self._handles.get(assignment.worker_id)
+            resolved_phase_id = str(
+                handle.phase_id if handle is not None else ""
+            ).strip()
+        phase_primary: JsonDict = {}
+        if resolved_phase_id:
+            phase_primaries = browser_context.get("phase_primaries")
+            phase_primaries = (
+                dict(phase_primaries)
+                if isinstance(phase_primaries, dict)
+                else {}
+            )
+            previous_phase_primary = phase_primaries.get(resolved_phase_id)
+            previous_phase_primary = (
+                dict(previous_phase_primary)
+                if isinstance(previous_phase_primary, dict)
+                else {}
+            )
+            # A new phase must not inherit the task-wide last_primary merely
+            # because it shares that Fleet. Only an explicitly observed page,
+            # or this same phase's still-live prior page, is a phase candidate.
+            phase_page_id = (
+                requested_primary_page_id
+                if requested_primary_page_id in pages_by_id
+                else ""
+            )
+            if (
+                not phase_page_id
+                and str(previous_phase_primary.get("fleetId") or "") == fleet_id
+                and str(previous_phase_primary.get("pageId") or "") in pages_by_id
+            ):
+                phase_page_id = str(previous_phase_primary.get("pageId") or "")
+            phase_primary = {
+                "fleetId": fleet_id,
+                "pageId": phase_page_id or None,
+                "lastSeenAt": now,
+            }
+            phase_primaries[resolved_phase_id] = phase_primary
+            browser_context["phase_primaries"] = phase_primaries
+        fingerprint_payload = {
+            "fleetId": fleet_id,
+            "ownerSlotId": assignment.owner_slot_id or assignment.slot_id,
+            "slotId": assignment.slot_id,
+            "ownerAgentId": assignment.owner_agent_id,
+            "sessionKey": assignment.session_key or None,
+            "isIsolated": bool(assignment.is_isolated),
+            "assignmentReason": assignment.assignment_reason,
+            "pages": pages,
+            "primaryPageId": candidate_page_id or None,
+            "phaseId": resolved_phase_id or None,
+            "phasePrimary": {
+                "fleetId": phase_primary.get("fleetId"),
+                "pageId": phase_primary.get("pageId"),
+            } if phase_primary else None,
+        }
+        fingerprint = json.dumps(
+            fingerprint_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        fingerprint_key = f"{fleet_id}:{resolved_phase_id}"
+        if self._browser_context_fingerprints.get(fingerprint_key) == fingerprint:
+            return False
+        state["browser_context"] = browser_context
+        write_task_state(self.logger, state)
+        self._browser_context_fingerprints[fingerprint_key] = fingerprint
+        self.logger.write(
+            "spawner.browser_context.persisted",
+            {
+                "workerId": assignment.worker_id,
+                "fleetId": fleet_id,
+                "phaseId": resolved_phase_id or None,
+                "pageCount": len(pages),
+                "primaryPageId": candidate_page_id or None,
+                "replacePages": bool(replace_pages),
+            },
+        )
+        return True
+
+    def _observe_task_browser_call(
+        self,
+        slot: BrowserAgentSlot,
+        assignment: FleetAssignment,
+        method: str,
+        params: Any,
+        result: Any,
+        *,
+        phase_id: Optional[str] = None,
+    ) -> None:
+        """Checkpoint live page handles before a worker can be interrupted."""
+
+        try:
+            payload = params if isinstance(params, dict) else {}
+            explicit_page_id = str(
+                payload.get("pageId") or payload.get("page_id") or ""
+            ).strip()
+            result_page_ids = {
+                str(item.get("pageId") or item.get("page_id") or "").strip()
+                for item in handle_records_from_value(result)
+                if isinstance(
+                    item.get("pageId") or item.get("page_id"), str
+                )
+                and str(
+                    item.get("pageId") or item.get("page_id") or ""
+                ).strip()
+            }
+            result_page_id = str(
+                extract_page_id_from_values(result) or ""
+            ).strip()
+            first_seen_page = any(
+                page_id not in slot.page_registry
+                for page_id in result_page_ids
+            )
+            task_page_ids = self._task_browser_page_ids.setdefault(
+                assignment.fleet_id, set()
+            )
+            newly_touched_page = False
+            addressed_page_ids = set()
+            if explicit_page_id and method != "Page.close":
+                addressed_page_ids.add(explicit_page_id)
+            if method == "Page.create":
+                addressed_page_ids.update(result_page_ids)
+                if result_page_id:
+                    addressed_page_ids.add(result_page_id)
+            for page_id in addressed_page_ids:
+                if page_id and page_id not in task_page_ids:
+                    task_page_ids.add(page_id)
+                    newly_touched_page = True
+            checkpoint_methods = {
+                "Page.create",
+                "Page.list",
+                "Page.switchTo",
+                "Page.navigate",
+                "Page.reload",
+                "Page.go",
+                "Page.close",
+            }
+            if (
+                method not in checkpoint_methods
+                and not first_seen_page
+                and not newly_touched_page
+            ):
+                return
+            if method == "Page.list":
+                self._replace_fleet_pages_from_list(
+                    slot,
+                    fleet_id=assignment.fleet_id,
+                    pages_response=result,
+                )
+            if method == "Page.close":
+                closed_page_id = str(
+                    payload.get("pageId") or payload.get("page_id") or ""
+                ).strip()
+                if closed_page_id:
+                    task_page_ids.discard(closed_page_id)
+                    slot.page_registry.pop(closed_page_id, None)
+                    slot.page_quarantine.pop(closed_page_id, None)
+            else:
+                self._update_slot_registry_from_value(slot, payload)
+                self._update_slot_registry_from_value(slot, result)
+
+            removed_page_ids: Set[str] = set()
+            if method == "Page.close" and explicit_page_id:
+                removed_page_ids.add(explicit_page_id)
+                primary_page_id = ""
+            else:
+                primary_page_id = explicit_page_id
+                if method == "Page.create":
+                    primary_page_id = result_page_id
+
+            observed_page_ids: Set[str] = set()
+            if method != "Page.close":
+                observed_page_ids.update(result_page_ids)
+            if explicit_page_id and method != "Page.close":
+                observed_page_ids.add(explicit_page_id)
+            for page_id in observed_page_ids:
+                page = dict(slot.page_registry.get(page_id) or {})
+                page["pageId"] = page_id
+                page.setdefault("fleetId", assignment.fleet_id)
+                slot.page_registry[page_id] = page
+
+            self._persist_task_browser_context(
+                slot,
+                assignment,
+                phase_id=phase_id,
+                primary_page_id=primary_page_id,
+                replace_pages=method == "Page.list",
+                removed_page_ids=removed_page_ids,
+            )
+        except Exception as exc:
+            # Context checkpointing is advisory. A successful browser action
+            # must never be turned into a failed action by local persistence.
+            self.logger.write(
+                "spawner.browser_context.persist_failed",
+                {
+                    "workerId": assignment.worker_id,
+                    "fleetId": assignment.fleet_id,
+                    "method": method,
+                    "error": str(exc)[:500],
+                },
+            )
 
     async def spawn_browser_agent(
         self,
@@ -654,6 +1119,11 @@ class BrowserAgentSpawner:
         )
         requested_page_policy = str(
             page_policy or effective_contract.get("page_policy") or ""
+        )
+        resume_hint_may_select_page = not bool(
+            requested_reuse_scope
+            or requested_page_policy
+            or explicit_continuation
         )
         if pinned is not None and pinned.page_id:
             requested_reuse_scope = "page"
@@ -841,6 +1311,14 @@ class BrowserAgentSpawner:
             and isinstance(effective_contract, dict)
             and effective_contract.get("needs_isolated_session") is True
         )
+        resume_hint = self._resume_hint_for_worker(
+            phase_id=str(phase_id or ""),
+            worker_contract=effective_contract,
+            session_key=effective_session_key,
+            fleet_reference=effective_fleet_reference,
+            preferred_slot_id=preferred_slot_id,
+            reuse_from_worker_id=reuse_from_worker_id,
+        )
 
         worker_id = self._next_id("browser")
         agent_name = name or worker_id
@@ -855,6 +1333,7 @@ class BrowserAgentSpawner:
         registration: JsonDict = {}
         assignment: Optional[FleetAssignment] = None
         readiness_receipt: JsonDict = {}
+        resume_page_inventory_refreshed = False
         try:
             fleet_group_key = self._fleet_group_key(
                 session_key=effective_session_key,
@@ -887,7 +1366,10 @@ class BrowserAgentSpawner:
                         preferred_slot_id=preferred_slot_id,
                         reuse_from_worker_id=reuse_from_worker_id,
                         session_key=effective_session_key,
-                        fleet_id=effective_fleet_reference,
+                        fleet_id=(
+                            effective_fleet_reference
+                            or (resume_hint.fleet_id if resume_hint else "")
+                        ),
                     )
                 if not isinstance(slot, dict):
                     await self._initialize_reserved_slot(slot)
@@ -898,6 +1380,7 @@ class BrowserAgentSpawner:
                         "expose_reusable_pages": (
                             expose_reusable_pages
                             or bool(effective_fleet_reference)
+                            or bool(resume_hint)
                         ),
                     }
                     if effective_fleet_reference:
@@ -907,6 +1390,66 @@ class BrowserAgentSpawner:
                     registration = await self._prepare_slot_for_worker(
                         slot, worker_id, **prepare_kwargs
                     )
+                    if (
+                        resume_hint is not None
+                        and resume_hint.page_id
+                        and resume_hint.fleet_id in slot.fleet_ids
+                    ):
+                        try:
+                            await self._sync_slot_registry(
+                                slot,
+                                worker_id=worker_id,
+                                required_fleet_id=resume_hint.fleet_id,
+                                include_page_details=True,
+                            )
+                            hinted_page = slot.page_registry.get(
+                                resume_hint.page_id
+                            )
+                            if (
+                                not isinstance(hinted_page, dict)
+                                or str(hinted_page.get("fleetId") or "")
+                                != resume_hint.fleet_id
+                                or _page_hidden_from_reuse(slot, hinted_page)
+                            ):
+                                raise LookupError(
+                                    "hinted page is not a live reusable page"
+                                )
+                            if slot.client is None:
+                                raise ABCPTransportError(
+                                    "resume page probe has no browser client"
+                                )
+                            state_response = await slot.client.call(
+                                "Page.getState",
+                                {
+                                    "pageId": resume_hint.page_id,
+                                    "purpose": (
+                                        "Verify a best-effort resume page before"
+                                        f" assigning worker {worker_id}."
+                                    ),
+                                },
+                            )
+                            self._update_slot_registry_from_value(
+                                slot,
+                                {
+                                    "pageId": resume_hint.page_id,
+                                    "fleetId": resume_hint.fleet_id,
+                                    "state": state_response,
+                                },
+                            )
+                            resume_page_inventory_refreshed = True
+                        except Exception as exc:
+                            self.logger.write(
+                                "spawner.resume_browser_hint.page_probe_failed",
+                                {
+                                    "resumeBrowserHint": resume_hint.to_dict(),
+                                    "error": str(exc)[:500],
+                                },
+                            )
+                            resume_hint = ResumeBrowserHint(
+                                fleet_id=resume_hint.fleet_id,
+                                phase_id=resume_hint.phase_id,
+                                source=resume_hint.source,
+                            )
                     assignment = await self._assign_fleet_for_worker(
                         slot,
                         worker_id=worker_id,
@@ -920,6 +1463,10 @@ class BrowserAgentSpawner:
                         ).strip(),
                         fleet_group_key=fleet_group_key,
                         isolation_auto_applied=isolation_auto_applied,
+                        resume_browser_hint=resume_hint,
+                        resume_hint_may_select_page=(
+                            resume_hint_may_select_page
+                        ),
                     )
                     self._ensure_notification_relay(slot, assignment)
                     readiness_receipt = await self._ensure_assigned_fleet_ready(
@@ -938,6 +1485,51 @@ class BrowserAgentSpawner:
                             slot,
                             assignment,
                             worker_id=worker_id,
+                        )
+                    if (
+                        assignment is not None
+                        and resume_hint is not None
+                        and assignment.assignment_reason
+                        == "resume_browser_hint"
+                        and assignment.page_policy == "existing"
+                    ):
+                        hinted_page = slot.page_registry.get(
+                            resume_hint.page_id
+                        )
+                        expose_reusable_pages = bool(
+                            isinstance(hinted_page, dict)
+                            and str(hinted_page.get("fleetId") or "")
+                            == assignment.fleet_id
+                        )
+                    if assignment is not None:
+                        self._persist_task_browser_context(
+                            slot,
+                            assignment,
+                            phase_id=phase_id,
+                            primary_page_id=(
+                                resume_hint.page_id
+                                if (
+                                    resume_hint is not None
+                                    and expose_reusable_pages
+                                    and assignment.assignment_reason
+                                    == "resume_browser_hint"
+                                )
+                                else self.pinned_browser_context.page_id
+                                if (
+                                    self.pinned_browser_context is not None
+                                    and assignment.fleet_id
+                                    == self.pinned_browser_context.fleet_id
+                                )
+                                else ""
+                            ),
+                            replace_pages=bool(
+                                resume_page_inventory_refreshed
+                                or expose_reusable_pages
+                                or (
+                                    self.pinned_browser_context
+                                    and self.pinned_browser_context.page_id
+                                )
+                            ),
                         )
         except asyncio.CancelledError:
             cancel_phase_running_reservation(
@@ -1160,6 +1752,19 @@ class BrowserAgentSpawner:
             or str(fleet_reference or "").strip()
             or str(reuse_from_worker_id or "").strip()
             or self.pinned_browser_context is not None
+            # A task-owned resume hint is an explicit request to continue the
+            # prior cookie/storage partition when it still exists.  Deployment
+            # default isolation is only a preference and must not manufacture
+            # a fresh Fleet before the hint is probed.  A phase that explicitly
+            # declared needs_isolated_session returned above and still wins.
+            or (
+                getattr(self, "resume_browser_hint", None) is not None
+                and (
+                    not self.resume_browser_hint.phase_id
+                    or self.resume_browser_hint.phase_id
+                    == str(phase_id or "").strip()
+                )
+            )
         )
         if shared_intent:
             return worker_contract
@@ -2217,6 +2822,8 @@ class BrowserAgentSpawner:
         fleet_id: str = "",
         fleet_group_key: str = "",
         isolation_auto_applied: bool = False,
+        resume_browser_hint: Optional[ResumeBrowserHint] = None,
+        resume_hint_may_select_page: bool = True,
     ) -> Optional[FleetAssignment]:
         lock_key = str(
             fleet_group_key
@@ -2244,6 +2851,8 @@ class BrowserAgentSpawner:
                 reuse_from_worker_id=reuse_from_worker_id,
                 fleet_group_key=fleet_group_key,
                 isolation_auto_applied=isolation_auto_applied,
+                resume_browser_hint=resume_browser_hint,
+                resume_hint_may_select_page=resume_hint_may_select_page,
             )
 
     async def _assign_fleet_for_worker_locked(
@@ -2259,6 +2868,8 @@ class BrowserAgentSpawner:
         fleet_id: str = "",
         fleet_group_key: str = "",
         isolation_auto_applied: bool = False,
+        resume_browser_hint: Optional[ResumeBrowserHint] = None,
+        resume_hint_may_select_page: bool = True,
     ) -> Optional[FleetAssignment]:
         """Select or create the one fleet the worker is allowed to address.
 
@@ -2376,25 +2987,114 @@ class BrowserAgentSpawner:
                 fleet_group_key=fleet_group_key,
                 delegated=stable_owner_slot_id != slot.slot_id,
             )
-        assignment = self.fleet_coordinator.choose_existing(
-            worker_id=worker_id,
-            slot_id=slot.slot_id,
-            owner_agent_id=slot.agent_id,
-            candidate_fleet_ids=slot.fleet_ids,
-            reuse_scope=reuse_scope,
-            page_policy=page_policy,
-            session_key=session_key,
-            reuse_from_worker_id=reuse_from_worker_id,
-            needs_isolated_session=needs_isolated_session,
-            fleet_group_key=fleet_group_key,
-            allow_cross_slot_delegate=bool(
-                getattr(
-                    self.runtime.harness,
-                    "same_fleet_multiworker_enabled",
-                    False,
+        assignment: Optional[FleetAssignment] = None
+        if resume_browser_hint is not None:
+            hint_fleet_id = resume_browser_hint.fleet_id
+            inventory_failed = any(
+                str(error).startswith("Fleet.list")
+                for error in slot.sync_errors
+            )
+            if hint_fleet_id in slot.fleet_ids and not inventory_failed:
+                hinted_page = slot.page_registry.get(
+                    resume_browser_hint.page_id
                 )
-            ),
-        )
+                page_is_live = bool(
+                    resume_browser_hint.page_id
+                    and isinstance(hinted_page, dict)
+                    and str(hinted_page.get("fleetId") or "")
+                    == hint_fleet_id
+                )
+                hint_scope = (
+                    "page"
+                    if page_is_live and resume_hint_may_select_page
+                    else reuse_scope
+                )
+                hint_policy = (
+                    "existing"
+                    if page_is_live and resume_hint_may_select_page
+                    else page_policy
+                )
+                hint_owner_slot_id = (
+                    self.fleet_coordinator.owner_slot_for_fleet(
+                        hint_fleet_id,
+                        admitted_only=False,
+                    )
+                    or slot.slot_id
+                )
+                try:
+                    assignment = self.fleet_coordinator.bind_assignment(
+                        worker_id=worker_id,
+                        slot_id=slot.slot_id,
+                        owner_agent_id=slot.agent_id,
+                        fleet_id=hint_fleet_id,
+                        assignment_reason="resume_browser_hint",
+                        reuse_scope=hint_scope,
+                        page_policy=hint_policy,
+                        allowed_fleet_ids=[hint_fleet_id],
+                        created_for_worker=False,
+                        owner_slot_id=hint_owner_slot_id,
+                        fleet_group_key=fleet_group_key,
+                        delegated=hint_owner_slot_id != slot.slot_id,
+                    )
+                except FleetRoutingError as exc:
+                    self.logger.write(
+                        "spawner.resume_browser_hint.ignored",
+                        {
+                            "reason": exc.code,
+                            "resumeBrowserHint": resume_browser_hint.to_dict(),
+                        },
+                    )
+                    assignment = None
+                else:
+                    self.logger.write(
+                        "spawner.resume_browser_hint.used",
+                        {
+                            "workerId": worker_id,
+                            "slotId": slot.slot_id,
+                            "fleetId": hint_fleet_id,
+                            "pageId": (
+                                resume_browser_hint.page_id
+                                if page_is_live
+                                and resume_hint_may_select_page
+                                else None
+                            ),
+                            "pageRecovered": bool(
+                                page_is_live and resume_hint_may_select_page
+                            ),
+                        },
+                    )
+            else:
+                self.logger.write(
+                    "spawner.resume_browser_hint.ignored",
+                    {
+                        "reason": (
+                            "fleet_inventory_unavailable"
+                            if inventory_failed
+                            else "fleet_not_found"
+                        ),
+                        "resumeBrowserHint": resume_browser_hint.to_dict(),
+                    },
+                )
+        if assignment is None:
+            assignment = self.fleet_coordinator.choose_existing(
+                worker_id=worker_id,
+                slot_id=slot.slot_id,
+                owner_agent_id=slot.agent_id,
+                candidate_fleet_ids=slot.fleet_ids,
+                reuse_scope=reuse_scope,
+                page_policy=page_policy,
+                session_key=session_key,
+                reuse_from_worker_id=reuse_from_worker_id,
+                needs_isolated_session=needs_isolated_session,
+                fleet_group_key=fleet_group_key,
+                allow_cross_slot_delegate=bool(
+                    getattr(
+                        self.runtime.harness,
+                        "same_fleet_multiworker_enabled",
+                        False,
+                    )
+                ),
+            )
         if assignment is None:
             assignment = await self._assign_within_task_fleet_cap(
                 slot,
@@ -3330,6 +4030,15 @@ class BrowserAgentSpawner:
             if self.pinned_browser_context is not None
             else ""
         )
+        resume_page_id = (
+            self.resume_browser_hint.page_id
+            if (
+                self.resume_browser_hint is not None
+                and assignment.assignment_reason == "resume_browser_hint"
+                and assignment.page_policy == "existing"
+            )
+            else ""
+        )
         return {
             str(page_id): str(page.get("fleetId") or "")
             for page_id, page in slot.page_registry.items()
@@ -3337,6 +4046,7 @@ class BrowserAgentSpawner:
                 str(page_id).strip()
                 and str(page.get("fleetId") or "") in allowed_fleets
                 and (not pinned_page_id or str(page_id) == pinned_page_id)
+                and (not resume_page_id or str(page_id) == resume_page_id)
                 and not _page_hidden_from_reuse(slot, page)
                 and not self.page_lease_manager.owner_for(str(page_id))
             )
@@ -3728,6 +4438,48 @@ class BrowserAgentSpawner:
         )
         self._observe_slot_fleets(slot)
         self.fleet_coordinator.touch_worker(worker_id)
+        assignment = self.fleet_coordinator.assignment_for_worker(worker_id)
+        if assignment is not None:
+            try:
+                task_pages = self._task_browser_page_ids.setdefault(
+                    assignment.fleet_id, set()
+                )
+                for item in trace or []:
+                    if not isinstance(item, dict) or item.get("type") != "browser_call":
+                        continue
+                    method = str(item.get("method") or "")
+                    page_id = str(extract_page_id_from_values(
+                        item.get("params"), item.get("result")
+                    ) or "").strip()
+                    if not page_id:
+                        continue
+                    if method == "Page.close":
+                        task_pages.discard(page_id)
+                        continue
+                    if method == "Page.list":
+                        continue
+                    page = slot.page_registry.get(page_id)
+                    if (
+                        isinstance(page, dict)
+                        and str(page.get("fleetId") or "")
+                        == assignment.fleet_id
+                    ):
+                        task_pages.add(page_id)
+                self._persist_task_browser_context(
+                    slot,
+                    assignment,
+                    phase_id=phase_id,
+                )
+            except Exception as exc:
+                self.logger.write(
+                    "spawner.browser_context.persist_failed",
+                    {
+                        "workerId": worker_id,
+                        "fleetId": assignment.fleet_id,
+                        "stage": "worker_result",
+                        "error": str(exc)[:500],
+                    },
+                )
 
     def _quarantine_deadlock_page_from_result(
         self,
@@ -4316,7 +5068,7 @@ class BrowserAgentSpawner:
             ),
         )
         provider = LLMFactory.create_provider(
-            browser_agent_model_config(worker_runtime.model)
+            browser_agent_model_config(worker_runtime.model, worker_runtime.worker)
         )
         event_logger = make_browser_event_logger(
             self.logger,
@@ -4373,7 +5125,7 @@ class BrowserAgentSpawner:
             if assignment is not None and assignment.delegated:
                 owner_slot = self._slots.get(assignment.owner_slot_id)
                 owner_client = owner_slot.client if owner_slot is not None else None
-            worker_browser = PageLeasedBrowserClient(
+            worker_browser = _TaskContextTrackingBrowserClient(
                 slot.client,
                 self.page_lease_manager,
                 fleet_owner_client=owner_client,
@@ -4390,6 +5142,22 @@ class BrowserAgentSpawner:
                 assigned_fleet_id=assignment.fleet_id if assignment else "",
                 registered_agent_id=slot.agent_id,
                 worker_id=worker_id,
+                after_call=(
+                    (
+                        lambda method, params, result: (
+                            self._observe_task_browser_call(
+                                slot,
+                                assignment,
+                                method,
+                                params,
+                                result,
+                                phase_id=phase_id,
+                            )
+                        )
+                    )
+                    if assignment is not None
+                    else None
+                ),
             )
             worker_logger = self.logger.bind_context(
                 workerId=worker_id,

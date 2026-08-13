@@ -104,6 +104,69 @@ Anthropic example:
 
 The legacy `enable_cache_control` boolean is still accepted when `cache_control_mode` is not set.
 
+### Thinking / reasoning mode
+
+Three `extra_params` keys control model thinking/reasoning. They work for
+**both** the OpenAI-format and the Anthropic-format providers, and can be set
+**per role** (see below):
+
+- `thinking` — the on/off switch. Accepts `bool`, the strings
+  `"enabled"`/`"disabled"`/`"on"`/`"off"`/`"true"`/`"false"`, or a `dict`
+  forwarded verbatim (`{"type": "enabled"}` for Ark/DeepSeek,
+  `{"type": "enabled", "budget_tokens": 8192}` for Claude extended thinking,
+  `{"type": "auto"}` / `{"type": "adaptive"}` where the vendor supports it).
+- `reasoning_effort` — thinking depth: `"none"`, `"minimal"`, `"low"`,
+  `"medium"`, `"high"`, `"xhigh"`, `"max"`. Values a model does not support are
+  documented as no-ops rather than errors, so the full set is forwarded as-is.
+- `effort` — short alias for `reasoning_effort` (loses to it).
+
+Wire translation:
+
+| Config | OpenAI format | Anthropic format |
+|---|---|---|
+| `thinking` on/off | `extra_body={"thinking":{"type":"enabled/disabled"}}` (vendor extension, no SDK kwarg) | native `thinking=` kwarg; `true` becomes `{"type":"enabled","budget_tokens":N}` because the SDK marks the budget required |
+| `reasoning_effort` / `effort` | top-level `reasoning_effort` | native `output_config={"effort":<level>}`; `none`/`minimal` are expressed by the switch instead |
+
+Nothing is synthesised: a key you did not set produces no wire field. An
+explicit "off" plus a thinking-on effort level drops the effort with a warning
+(Ark documents that pair as an error).
+
+Notes:
+
+- The chain of thought comes back as `reasoning_content` (+ `encrypted_content`
+  on Ark's summary-mode models) in OpenAI format, or `thinking` blocks in
+  Anthropic format. Both providers capture it and feed it back on the next turn
+  via the assistant prefix blocks. DeepSeek returns `400` if `reasoning_content`
+  is not round-tripped on tool-call turns; Ark does not error but does let the
+  chain participate in later turns (and `encrypted_content` takes precedence
+  over the summary).
+- Vendor extensions this harness does not model — DeepSeek's Anthropic-format
+  `{"reasoning": {"effort": ...}}`, for one — go in `extra_params.extra_body`,
+  which both providers forward verbatim. They are not guessed from the config.
+- Measured on Ark's Anthropic-compatible `/api/coding` endpoint (glm-5.2,
+  2026-08-13): `thinking.type` is the only lever that has any effect there —
+  `output_config`, `reasoning` and `reasoning_effort` are all accepted and
+  silently ignored. Use the OpenAI-format endpoint if you need effort control
+  on Ark.
+
+Per-role configuration — the top-level `extra_params` is the default for the
+lead and worker agents, and the optional `lead` / `worker` sections shallow-merge
+over it. Each auxiliary role owns its own section:
+
+```json
+{
+  "extra_params": { "thinking": true, "reasoning_effort": "max", "max_tokens": 24000 },
+  "lead":   { "extra_params": { "reasoning_effort": "max" } },
+  "worker": { "extra_params": { "reasoning_effort": "high" } },
+  "vl": {
+    "extra_params": { "thinking": false },
+    "captcha_solve_extra_params": { "thinking": true, "reasoning_effort": "low" }
+  },
+  "plan_validator":  { "extra_params": { "reasoning_effort": "low" } },
+  "claim_extractor": { "extra_params": { "thinking": false } }
+}
+```
+
 ### Browser
 
 Default browser request shape is `flat`:
@@ -193,6 +256,25 @@ Override agent id or step count:
 ```bash
 python main.py --agent-id demo-agent --max-steps 20 --task "Check the current fleet list."
 ```
+
+Resume an interrupted task at phase granularity:
+
+```bash
+python main.py --resume worktree/<task_id> --task "Additional instruction"
+```
+
+At the interactive prompt, the equivalent form is `/resume <task-directory>
+[additional instruction]`. Validated phases and their active artifacts are
+preserved; an unfinished phase is restarted as a whole. A phase that was live
+when the process stopped requires confirmation before it is replayed. For
+unattended use, pass `--resume-retry-interrupted` explicitly. Live Fleet/page
+handles are reused only as best-effort task-owned hints and are revalidated
+against the browser inventory; stale hints fall back to normal routing.
+
+Resume fails closed if the task directory, `task_plan.json`, or
+`task_state.json` was deleted or is malformed. Validation happens before a
+`RunLogger` is created, so a deleted worktree is never silently recreated as
+an empty task.
 
 ## Tests and Acceptance
 

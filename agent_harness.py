@@ -12,7 +12,7 @@ import re
 import shutil
 import os
 import uuid
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -99,6 +99,7 @@ from harness.task_control import (
     next_pending_phase,
     phase_contract,
     phase_start_rejection,
+    prepare_resume_state,
     reconcile_replan_checkpoints,
     replan_checkpoint_plan_errors,
     validate_task_plan,
@@ -109,7 +110,10 @@ from harness.plan_validator import (
     review_plan_revision,
     write_plan_review_audit,
 )
-from harness.completion_receipt import build_completion_receipt
+from harness.completion_receipt import (
+    build_completion_receipt,
+    persist_completion_receipt,
+)
 from harness.task_types import normalize_task_type, resolve_task_type_fail_closed
 from harness.tool_policy import (
     ALWAYS_FORBIDDEN_ABCP_METHODS,
@@ -170,6 +174,35 @@ TRUNCATION_STREAK_LIMIT = 3
 # re-sending the same prompt earns the same refusal.
 INFRA_STREAK_INCIDENTS = frozenset({"connection", "timeout", "protocol"})
 INFRA_STREAK_LIMIT = 5
+
+
+@dataclass
+class ResumeContext:
+    """Durable task state injected into a fresh LeadAgent process.
+
+    Resume deliberately restores orchestration at phase granularity.  It does
+    not pretend that a worker coroutine or a model conversation survived the
+    previous process.
+    """
+
+    original_user_task: str
+    current_plan: JsonDict
+    initial_plan: JsonDict
+    initial_plan_recovered: bool = True
+    instruction: str = ""
+    report: JsonDict = field(default_factory=dict)
+    run_id: str = ""
+    browser_hint: JsonDict = field(default_factory=dict)
+    task_dir: str = ""
+
+    def prompt_payload(self) -> JsonDict:
+        return {
+            "taskDir": self.task_dir,
+            "runId": self.run_id,
+            "instruction": self.instruction or None,
+            "initialPlanRecovered": self.initial_plan_recovered,
+            **dict(self.report or {}),
+        }
 
 
 def _effective_streak_limit(streak_kinds: List[str]) -> int:
@@ -1269,7 +1302,13 @@ class BrowserAgent:
                 write_context_snapshot(
                     self.logger,
                     actor="browser_agent",
-                    name=self.runtime.agent_id,
+                    name=(
+                        f"{self.runtime.agent_id}-{self.worker_id}"
+                        if str(
+                            getattr(self.logger, "context_run_id", "") or ""
+                        )
+                        else self.runtime.agent_id
+                    ),
                     system_prompt=system_prompt or "(not initialized)",
                     messages=messages,
                     tools=tools,
@@ -1284,6 +1323,9 @@ class BrowserAgent:
                         "final_answer": final_answer,
                         "artifacts": self.artifacts,
                     },
+                    run_id=str(
+                        getattr(self.logger, "context_run_id", "") or ""
+                    ) or None,
                 )
             except Exception as exc:
                 self.logger.write(
@@ -1922,15 +1964,20 @@ class LeadAgent:
         logger: RunLogger,
         pinned_browser_context: Any = None,
         plan_validator_provider: Optional[BaseLLMProvider] = None,
+        resume: Optional[ResumeContext] = None,
     ):
         self.provider = provider
         self.runtime = runtime
         self.logger = logger
+        self.resume = resume
         self.spawner = BrowserAgentSpawner(
             runtime,
             logger,
             browser_agent_factory=BrowserAgent,
             pinned_browser_context=pinned_browser_context,
+            resume_browser_hint=(
+                resume.browser_hint if resume is not None else None
+            ),
         )
         self.pinned_browser_context = PinnedBrowserContext.from_value(
             pinned_browser_context
@@ -1939,9 +1986,16 @@ class LeadAgent:
             self.runtime.harness.context_file
         )
         self.lifecycle = default_lifecycle_manager()
-        self.task_plan: Optional[JsonDict] = None
-        self.initial_task_plan: Optional[JsonDict] = None
+        self.task_plan: Optional[JsonDict] = (
+            dict(resume.current_plan) if resume is not None else None
+        )
+        self.initial_task_plan: Optional[JsonDict] = (
+            dict(resume.initial_plan) if resume is not None else None
+        )
         self.original_user_task: str = ""
+        self._resume_instruction_pending = bool(
+            resume is not None and str(resume.instruction or "").strip()
+        )
         validator_config = self.runtime.plan_validator
         self.plan_validator_provider: Optional[BaseLLMProvider] = None
         if validator_config.enabled:
@@ -2008,6 +2062,21 @@ class LeadAgent:
     async def review_task_plan_candidate(self, raw_plan: Any) -> JsonDict:
         """Run the optional independent semantic audit without mutating state."""
 
+        if (
+            self.resume is not None
+            and self.task_plan is not None
+            and not self.resume.initial_plan_recovered
+            and self.runtime.plan_validator.enabled
+        ):
+            return {
+                "status": "error",
+                "errors": [
+                    "The original accepted plan history is missing, so an"
+                    " independently audited replan cannot establish its"
+                    " immutable baseline. Keep the current plan or start a new"
+                    " task."
+                ],
+            }
         config = self.runtime.plan_validator
         if not config.enabled:
             return {"status": "disabled"}
@@ -2246,6 +2315,47 @@ class LeadAgent:
                     }
                     self.logger.write("task_plan.rejected", result)
                     return result
+        resume_replan_report: Optional[JsonDict] = None
+        if replan_reason and self.resume is not None:
+            try:
+                resume_replan_report = prepare_resume_state(
+                    self.logger,
+                    old_plan=self.task_plan or {},
+                    new_plan=plan,
+                    instruction=self.resume.instruction,
+                    persist=False,
+                    record_audit=False,
+                )
+            except Exception as exc:
+                result = {
+                    "status": "failed",
+                    "error": "resume state reconciliation failed",
+                    "detail": str(exc),
+                    "next_instruction": (
+                        "Do not write or spawn against a plan whose prior"
+                        " evidence generation cannot be reconciled. Report the"
+                        " blocker to the user."
+                    ),
+                }
+                self.logger.write("task_plan.rejected", result)
+                return result
+            preserve_from = resume_replan_report["state"]
+            resumes = preserve_from.get("resumes")
+            if isinstance(resumes, list) and resumes:
+                last_resume = resumes[-1]
+                if isinstance(last_resume, dict):
+                    last_resume["replanDecision"] = {
+                        key: resume_replan_report.get(key)
+                        for key in (
+                            "resetPhases",
+                            "invalidatedArtifacts",
+                            "missingArtifacts",
+                            "changedEvidencePhases",
+                            "changedExecutionPhases",
+                            "removedPhases",
+                        )
+                    }
+
         previous_plan = self.task_plan
         validator_record = None
         if isinstance(plan_validator_review, dict):
@@ -2352,6 +2462,28 @@ class LeadAgent:
                     method_policy["note"] = " ".join(
                         item for item in (existing_note, advisory_note) if item
                     )
+        if self.resume is not None and replan_reason:
+            self._resume_instruction_pending = False
+            self.logger.write(
+                "resume.instruction.reviewed",
+                {
+                    "decision": "replan",
+                    "reason": replan_reason,
+                    "runId": self.resume.run_id or None,
+                },
+            )
+            if isinstance(resume_replan_report, dict):
+                result["resumeReconciliation"] = {
+                    key: resume_replan_report.get(key)
+                    for key in (
+                        "resetPhases",
+                        "invalidatedArtifacts",
+                        "missingArtifacts",
+                        "changedEvidencePhases",
+                        "changedExecutionPhases",
+                        "removedPhases",
+                    )
+                }
         return result
 
     def _cached_abcp_methods(self) -> Set[str]:
@@ -2663,7 +2795,22 @@ class LeadAgent:
         final_completion_receipt: JsonDict = {}
         should_finish = False
         completed = False
-        self.original_user_task = str(task or "")
+        if self.resume is not None:
+            base_task = str(self.resume.original_user_task or task or "").strip()
+            resume_instruction = str(self.resume.instruction or "").strip()
+            self.original_user_task = (
+                base_task
+                + (
+                    "\n\n<resume_instruction>\n"
+                    + resume_instruction
+                    + "\n</resume_instruction>"
+                    if resume_instruction else ""
+                )
+            )
+        else:
+            base_task = str(task or "")
+            resume_instruction = ""
+            self.original_user_task = base_task
 
         await self._bootstrap_schema_cache()
         runtime_limits = json.dumps(
@@ -2690,12 +2837,42 @@ class LeadAgent:
             if self.pinned_browser_context is not None
             else ""
         )
+        resumed_block = ""
+        if self.resume is not None:
+            resumed_block = (
+                "<resumed_state>\n"
+                + json.dumps(
+                    self.resume.prompt_payload(),
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                )
+                + "\n</resumed_state>\n"
+                "This is a phase-level resume in a fresh process. Preserve"
+                " validated phases and artifacts listed above. Never assume"
+                " that a prior worker coroutine, AXTree id, page observation,"
+                " or model conversation is still live. Re-perceive any reused"
+                " browser page before acting."
+                + (
+                    " Before spawning, either emit one complete revised plan"
+                    " with replan_reason if the resume instruction changes the"
+                    " contract, or call resume_keep_plan with a concrete reason."
+                    if resume_instruction else ""
+                )
+                + "\n\n"
+            )
         messages = [
             {
                 "role": "user",
                 "content": (
-                    f"<user_task>\n{task}\n</user_task>\n\n"
-                    f"<runtime_limits>\n{runtime_limits}\n</runtime_limits>\n\n"
+                    f"<user_task>\n{base_task}\n</user_task>\n\n"
+                    + (
+                        f"<resume_instruction>\n{resume_instruction}\n"
+                        "</resume_instruction>\n\n"
+                        if resume_instruction else ""
+                    )
+                    + resumed_block
+                    + f"<runtime_limits>\n{runtime_limits}\n</runtime_limits>\n\n"
                     + (
                         "<pinned_browser_context>\n"
                         f"{pinned_context}\n"
@@ -2715,7 +2892,9 @@ class LeadAgent:
                 ),
             }
         ]
-        tools = build_lead_agent_tool_specs()
+        tools = build_lead_agent_tool_specs(
+            include_resume=self.resume is not None,
+        )
         dispatch_tool = build_lead_tool_dispatcher(self)
         system_prompt = self._build_system_prompt()
         try:
@@ -3197,27 +3376,49 @@ class LeadAgent:
             )
             raise
         finally:
-            if not final_completion_receipt:
-                try:
+            try:
+                receipt_state = load_task_state(self.logger)
+                receipt_run_id = str(
+                    getattr(self.logger, "run_id", "") or ""
+                ).strip()
+                if receipt_run_id:
+                    persisted_receipt = persist_completion_receipt(
+                        logger=self.logger,
+                        state=receipt_state,
+                        spawner=self.spawner,
+                        run_id=receipt_run_id,
+                    )
+                    # New CLI runs also persist a run-scoped receipt so a later
+                    # resume can accumulate downloads/HITL, but keep their
+                    # long-standing public receipt shape.  Only an actual
+                    # resumed run exposes currentRun/cumulative at the surface.
+                    final_completion_receipt = (
+                        persisted_receipt
+                        if str(
+                            getattr(self.logger, "resumed_from", "") or ""
+                        ).strip()
+                        else persisted_receipt["currentRun"]
+                    )
+                elif not final_completion_receipt:
                     final_completion_receipt = build_completion_receipt(
-                        state=load_task_state(self.logger),
+                        state=receipt_state,
                         spawner=self.spawner,
                     )
-                    self.logger.write(
-                        "lead.completion_receipt",
-                        {
-                            **final_completion_receipt,
-                            "generatedForTrigger": (
-                                final_trigger or
-                                ("interrupted" if not completed else "no_completion")
-                            ),
-                        },
-                    )
-                except Exception as receipt_exc:
-                    self.logger.write(
-                        "lead.completion_receipt_failed",
-                        exception_payload(receipt_exc, last_step=step),
-                    )
+                self.logger.write(
+                    "lead.completion_receipt",
+                    {
+                        **final_completion_receipt,
+                        "generatedForTrigger": (
+                            final_trigger or
+                            ("interrupted" if not completed else "no_completion")
+                        ),
+                    },
+                )
+            except Exception as receipt_exc:
+                self.logger.write(
+                    "lead.completion_receipt_failed",
+                    exception_payload(receipt_exc, last_step=step),
+                )
             try:
                 # Normal completion normalized final_answer/final_trigger above;
                 # on exception paths final_answer may legitimately be empty and
@@ -3239,6 +3440,9 @@ class LeadAgent:
                         "completion_receipt": final_completion_receipt,
                         "has_task_plan": self.task_plan is not None,
                     },
+                    run_id=str(
+                        getattr(self.logger, "context_run_id", "") or ""
+                    ) or None,
                 )
             except Exception as exc:
                 self.logger.write(
@@ -3526,6 +3730,7 @@ __all__ = [
     "LeadAgent",
     "ModelConfig",
     "RenderRecoveryOutcome",
+    "ResumeContext",
     "RuntimeConfig",
     "RunLogger",
     "VLConfig",

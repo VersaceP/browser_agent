@@ -24,6 +24,10 @@ from llm.cache_control import (
     _resolve_cache_control_decision,
     _with_cache_control_diagnostics,
 )
+from llm.thinking import (
+    anthropic_thinking_request,
+    resolve_thinking_intent,
+)
 from runtime_config import ModelConfig
 
 
@@ -119,6 +123,20 @@ class AnthropicProvider(BaseLLMProvider):
     ) -> Tuple[str, List[Dict], str, Dict[str, Any]]:
         strict_tools = bool(self.config.extra_params.get("strict_tools", False))
         cache_decision = _resolve_cache_control_decision("anthropic", self.config)
+        thinking_intent = resolve_thinking_intent(self.config.extra_params)
+        thinking_native, thinking_warnings = anthropic_thinking_request(
+            thinking_intent,
+            self.config.extra_params.get("max_tokens", 4096),
+        )
+        for _warning in (*thinking_intent.warnings, *thinking_warnings):
+            _emit_cache_log(f"[Anthropic Thinking] {_warning}")
+        # 厂商私有字段（如 DeepSeek Anthropic 格式的 reasoning）没有 SDK 参数位，
+        # 由用户在 extra_params.extra_body 里自己写，这里原样透传——不在通用层
+        # 猜厂商方言。
+        user_extra_body = self.config.extra_params.get("extra_body")
+        user_extra_body = (
+            dict(user_extra_body) if isinstance(user_extra_body, dict) else {}
+        )
 
         def build_kwargs(cache_enabled: bool) -> Dict[str, Any]:
             if cache_enabled:
@@ -192,6 +210,13 @@ class AnthropicProvider(BaseLLMProvider):
                 )
                 if tool_choice:
                     request_kwargs["tool_choice"] = tool_choice
+
+            # 思考模式：thinking（开关）与 output_config（effort）都是 SDK 原生
+            # 参数，直接进 kwargs。放在 build_kwargs 里而不是外面，确保
+            # cache_control 失败的回退路径也带上思考参数。
+            request_kwargs.update(thinking_native)
+            if user_extra_body:
+                request_kwargs["extra_body"] = dict(user_extra_body)
             return request_kwargs
 
         effective_cache_enabled = (

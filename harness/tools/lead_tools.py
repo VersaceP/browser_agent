@@ -3,6 +3,7 @@ harness.tools.lead_tools - LeadAgent tool schemas and dispatch factory.
 """
 
 import copy
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -1020,6 +1021,105 @@ async def _lead_emit_task_plan(ctx: ToolContext) -> JsonDict:
 
 
 @LEAD_TOOLS.register(
+    name="resume_keep_plan",
+    description=(
+        "Acknowledge that the user's resume instruction changes execution"
+        " guidance only and does not change the accepted plan's sources,"
+        " artifact schema, validators, phases, or dependencies. Available only"
+        " while a resumed run is waiting for instruction review."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "reason": {"type": "string", "minLength": 1},
+        },
+        "required": ["reason"],
+        "additionalProperties": False,
+    },
+    loop_guard=False,
+)
+async def _lead_resume_keep_plan(ctx: ToolContext) -> JsonDict:
+    agent = ctx.agent
+    resume = getattr(agent, "resume", None)
+    reason = str(ctx.tool_input.get("reason") or "").strip()
+    if resume is None:
+        return {
+            "status": "not_resumed",
+            "error": "resume_keep_plan is only valid during a resumed run",
+            "tool_was_executed": False,
+        }
+    if not getattr(agent, "_resume_instruction_pending", False):
+        return {
+            "status": "done",
+            "decision": "already_reviewed",
+            "tool_was_executed": False,
+        }
+    if not reason:
+        return {
+            "status": "invalid_resume_review",
+            "error": "reason must be non-empty",
+            "tool_was_executed": False,
+        }
+    decision = {
+        "decision": "keep_plan",
+        "reason": reason,
+        "runId": getattr(resume, "run_id", "") or None,
+    }
+    try:
+        state = load_task_state(agent.logger)
+        resumes = state.get("resumes") if isinstance(state, dict) else None
+        if (
+            not isinstance(resumes, list)
+            or not resumes
+            or not isinstance(resumes[-1], dict)
+        ):
+            raise ValueError("current resume audit entry is unavailable")
+        resumes[-1]["instructionDecision"] = decision
+        write_task_state(agent.logger, state)
+    except Exception as exc:
+        # The orchestration gate is process-local and must remain usable even
+        # when an old worktree lacks the new audit shape or audit I/O fails.
+        # Surface the durability gap explicitly instead of pretending it wrote.
+        agent.logger.write(
+            "resume.instruction.audit_failed",
+            {
+                **decision,
+                "error": str(exc)[:500],
+            },
+        )
+    agent._resume_instruction_pending = False
+    agent.logger.write(
+        "resume.instruction.reviewed",
+        decision,
+    )
+    return {
+        "status": "done",
+        "decision": "keep_plan",
+        "reason": reason,
+        "next_instruction": "Continue from the next pending phase.",
+    }
+
+
+def _resume_instruction_gate_rejection(agent: Any) -> Optional[JsonDict]:
+    if not getattr(agent, "_resume_instruction_pending", False):
+        return None
+    return {
+        "status": "resume_instruction_review_required",
+        "error": (
+            "The new resume instruction has not been reconciled with the"
+            " accepted task plan."
+        ),
+        "tool_was_executed": False,
+        "next_instruction": (
+            "Call resume_keep_plan with a concrete reason if the plan's"
+            " sources/artifacts/validators/phases/dependencies are still"
+            " correct, or emit a complete revised task_plan with"
+            " replan_reason before spawning or finishing."
+        ),
+    }
+
+
+@LEAD_TOOLS.register(
     name="spawn_browser_agent",
     description=(
         "Asynchronously run a BrowserAgent worker in a pooled browser slot."
@@ -1043,6 +1143,9 @@ async def _lead_emit_task_plan(ctx: ToolContext) -> JsonDict:
 async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
     agent = ctx.agent
     tool_input = ctx.tool_input
+    resume_rejection = _resume_instruction_gate_rejection(agent)
+    if resume_rejection is not None:
+        return resume_rejection
     if getattr(agent, "task_plan", None) is None:
         return {
             "status": "plan_required",
@@ -2067,6 +2170,19 @@ def _record_artifact_supersession(
         "mode": "reference_merge",
     })
     state["artifact_supersessions"] = supersessions
+    # Integrity metadata covers delivered generations too.  The merge output
+    # deliberately stays out of the raw source ledger, so mark_phase_result
+    # cannot be relied on to hash it later.
+    try:
+        deliverable_path = Path(_resolved_path_text(deliverable))
+        digest = hashlib.sha256(deliverable_path.read_bytes()).hexdigest()
+    except (OSError, ValueError):
+        digest = ""
+    if digest:
+        digests = state.get("artifact_digests")
+        digests = dict(digests) if isinstance(digests, dict) else {}
+        digests[str(deliverable_path)] = digest
+        state["artifact_digests"] = digests
     write_task_state(agent.logger, state)
     logger = getattr(agent, "logger", None)
     if logger is not None and hasattr(logger, "write"):
@@ -2217,6 +2333,9 @@ def _validate_lead_save_sources(
     loop_guard=False,
 )
 async def _lead_final_answer(ctx: ToolContext) -> JsonDict:
+    resume_rejection = _resume_instruction_gate_rejection(ctx.agent)
+    if resume_rejection is not None:
+        return resume_rejection
     state = load_task_state(ctx.agent.logger)
     receipt = build_completion_receipt(
         state=state,
@@ -2429,5 +2548,8 @@ def _matching_exhaustion(exhausted: List[JsonDict], phase_id: Any) -> Any:
     return exhausted[-1]
 
 
-def build_lead_agent_tool_specs() -> List[JsonDict]:
-    return LEAD_TOOLS.tool_specs()
+def build_lead_agent_tool_specs(*, include_resume: bool = False) -> List[JsonDict]:
+    specs = LEAD_TOOLS.tool_specs()
+    if include_resume:
+        return specs
+    return [spec for spec in specs if spec.get("name") != "resume_keep_plan"]

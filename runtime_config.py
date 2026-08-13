@@ -4,6 +4,7 @@ runtime_config.py - 全项目统一配置表（single source of truth）。
 config.json 的四张配置表全部定义在这一个文件里：
 
     顶层             -> ModelConfig       （LLM 连接：provider/model_id/api_key/超时重试/extra_params）
+    "lead"/"worker"         -> RoleOverrideConfig  （角色级 extra_params 覆盖，浅合并顶层）
     "vl": {...}             -> VLConfig            （视觉模型连接 + 各 VL 角色开关）
     "plan_validator": {...} -> PlanValidatorConfig （独立计划审计模型）
     "browser": {...}        -> ABCPClientConfig    （ABCP WebSocket 连接）
@@ -179,6 +180,43 @@ class ModelConfig:
         if not key:
             return None
         return os.environ.get(key)
+
+
+# ---------------------------------------------------------------------------
+# "lead" / "worker" 段：角色级 extra_params 覆盖
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RoleOverrideConfig:
+    """Per-role overlay on the top-level model's ``extra_params``.
+
+    Lead and worker share one LLM connection (provider/model_id/api_key), so
+    the only thing worth splitting is the per-call knobs: thinking mode,
+    temperature, max_tokens. Anything absent here falls back to the top-level
+    ``extra_params`` — a shallow merge, so writing one key does not wipe the
+    rest. Deliberately no provider/model_id fields: a second model is a second
+    connection and belongs in its own section, not in an overlay.
+    """
+
+    extra_params: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "RoleOverrideConfig":
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            extra_params=(
+                dict(data.get("extra_params"))
+                if isinstance(data.get("extra_params"), dict)
+                else {}
+            )
+        )
+
+    def apply_to(self, extra_params: Dict[str, Any]) -> Dict[str, Any]:
+        """Shallow-merge this role's overrides over the given extra_params."""
+        merged = dict(extra_params or {})
+        merged.update(self.extra_params)
+        return merged
 
 
 # ---------------------------------------------------------------------------
@@ -1198,6 +1236,8 @@ class RuntimeConfig:
     claim_extractor: ClaimExtractorConfig = field(
         default_factory=ClaimExtractorConfig
     )
+    lead: RoleOverrideConfig = field(default_factory=RoleOverrideConfig)
+    worker: RoleOverrideConfig = field(default_factory=RoleOverrideConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -1212,6 +1252,8 @@ _TOP_LEVEL_EXTRA_KEYS = {
     "vl",
     "plan_validator",
     "claim_extractor",
+    "lead",
+    "worker",
     "browser",
     "harness",
 }
@@ -1259,6 +1301,8 @@ def audit_config_keys(raw: JsonDict) -> List[str]:
         raw.get("claim_extractor"),
         _field_names(ClaimExtractorConfig),
     )
+    for _role in ("lead", "worker"):
+        check(_role, raw.get(_role), _field_names(RoleOverrideConfig))
 
     harness_raw = raw.get("harness")
     if isinstance(harness_raw, dict):
@@ -1302,4 +1346,6 @@ def load_runtime_config(config_path: str, *, warn: bool = True) -> RuntimeConfig
         claim_extractor=ClaimExtractorConfig.from_dict(
             raw.get("claim_extractor", {})
         ),
+        lead=RoleOverrideConfig.from_dict(raw.get("lead", {})),
+        worker=RoleOverrideConfig.from_dict(raw.get("worker", {})),
     )

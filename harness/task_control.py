@@ -6,9 +6,14 @@ from __future__ import annotations
 
 import json
 import copy
+import csv
 import hashlib
+import os
 import re
+import tempfile
+import threading
 import time
+from collections import Counter
 from difflib import SequenceMatcher
 from datetime import datetime, timezone
 from pathlib import Path
@@ -74,6 +79,16 @@ from harness.utils import (
 
 TASK_PLAN_FILE = "task_plan.json"
 TASK_STATE_FILE = "task_state.json"
+_TASK_STATE_WRITE_LOCK = threading.RLock()
+
+
+class _TaskStateSnapshot(dict):
+    """A dict carrying its read baseline for optimistic three-way writes."""
+
+    def __init__(self, value: Optional[JsonDict] = None) -> None:
+        super().__init__(value or {})
+        self._task_state_base = copy.deepcopy(dict(self))
+        self._task_state_replace = False
 REPEAT_GUARD_REJECTION_LOCK_THRESHOLD = 3
 SEMANTIC_TERMINAL_CLASSIFICATIONS = frozenset({
     "target_absent",
@@ -2017,6 +2032,21 @@ def initialize_task_state(
         "replan_checkpoints": copy.deepcopy(
             _replan_checkpoint_map(preserve_from or {})
         ),
+        # Resume/runtime audit ledgers are task-scoped and must survive the
+        # state reconstruction performed by every accepted replan.
+        "resumes": copy.deepcopy((preserve_from or {}).get("resumes") or []),
+        "browser_context": copy.deepcopy(
+            (preserve_from or {}).get("browser_context") or {}
+        ),
+        "completion_receipts": copy.deepcopy(
+            (preserve_from or {}).get("completion_receipts") or {}
+        ),
+        "artifact_digests": copy.deepcopy(
+            (preserve_from or {}).get("artifact_digests") or {}
+        ),
+        "artifact_supersessions": copy.deepcopy(
+            (preserve_from or {}).get("artifact_supersessions") or []
+        ),
     }
     if preserve_from is not None:
         state["replans"] = list((preserve_from or {}).get("replans") or [])
@@ -2031,7 +2061,9 @@ def initialize_task_state(
         if replan_audit is not None:
             replan_audit["planVersion"] = state["plan_version"]
             replan_audit["planHash"] = state["plan_hash"]
-    write_task_state(logger, state)
+    # A plan acceptance deliberately reconstructs the complete state shape.
+    # It must not three-way merge removed phases back from an older snapshot.
+    write_task_state(logger, state, replace=True)
     logger.write(
         "task_state.initialized",
         {
@@ -2045,13 +2077,14 @@ def initialize_task_state(
 
 def load_task_state(logger: RunLogger) -> JsonDict:
     path = _state_path(logger)
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    with _TASK_STATE_WRITE_LOCK:
+        if not path.exists():
+            return _TaskStateSnapshot()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return _TaskStateSnapshot()
+        return _TaskStateSnapshot(data if isinstance(data, dict) else {})
 
 
 def materialize_batch_rows_from_source(
@@ -3554,10 +3587,184 @@ def _first_active_phase_id(plan: JsonDict, phases_state: JsonDict) -> Optional[s
     return _first_phase_id(plan)
 
 
-def write_task_state(logger: RunLogger, state: JsonDict) -> str:
-    state["updated_at"] = utc_now_iso()
+_TASK_STATE_MISSING = object()
+
+
+def _state_value_token(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+        separators=(",", ":"),
+    )
+
+
+def _merge_state_lists(base: List[Any], current: List[Any], proposed: List[Any]) -> List[Any]:
+    """Merge concurrent list additions/removals while retaining stable order."""
+
+    base_tokens = [_state_value_token(item) for item in base]
+    current_tokens = [_state_value_token(item) for item in current]
+    proposed_tokens = [_state_value_token(item) for item in proposed]
+    base_counts = Counter(base_tokens)
+    current_counts = Counter(current_tokens)
+    proposed_counts = Counter(proposed_tokens)
+
+    keep_counts = {
+        token: min(count, current_counts[token], proposed_counts[token])
+        for token, count in base_counts.items()
+    }
+    result: List[Any] = []
+    emitted = Counter()
+    for item, token in zip(base, base_tokens):
+        if emitted[token] < keep_counts.get(token, 0):
+            result.append(copy.deepcopy(item))
+            emitted[token] += 1
+
+    # Concurrent appenders frequently touch artifacts, attempts, resumes, and
+    # supersessions.  Add the maximum occurrence count seen on either branch,
+    # rather than dropping one branch or duplicating the same append twice.
+    target_additions = {
+        token: max(
+            0,
+            current_counts[token] - base_counts[token],
+            proposed_counts[token] - base_counts[token],
+        )
+        for token in set(current_tokens) | set(proposed_tokens)
+    }
+    added = Counter()
+    for values, tokens in ((current, current_tokens), (proposed, proposed_tokens)):
+        skipped_base = Counter()
+        for item, token in zip(values, tokens):
+            if skipped_base[token] < base_counts[token]:
+                skipped_base[token] += 1
+                continue
+            if added[token] < target_additions.get(token, 0):
+                result.append(copy.deepcopy(item))
+                added[token] += 1
+    return result
+
+
+def _three_way_merge_task_state(base: Any, current: Any, proposed: Any) -> Any:
+    """Apply only local changes from ``base`` onto the latest disk value."""
+
+    if proposed == base:
+        return copy.deepcopy(current)
+    if current == base:
+        return copy.deepcopy(proposed)
+    if isinstance(base, dict) and isinstance(current, dict) and isinstance(proposed, dict):
+        merged: JsonDict = {}
+        keys = set(base) | set(current) | set(proposed)
+        for key in keys:
+            base_value = base.get(key, _TASK_STATE_MISSING)
+            current_value = current.get(key, _TASK_STATE_MISSING)
+            proposed_value = proposed.get(key, _TASK_STATE_MISSING)
+            if proposed_value is _TASK_STATE_MISSING:
+                if base_value is _TASK_STATE_MISSING:
+                    if current_value is not _TASK_STATE_MISSING:
+                        merged[key] = copy.deepcopy(current_value)
+                # Local deletion wins over a concurrent edit of the same key.
+                continue
+            if current_value is _TASK_STATE_MISSING:
+                if base_value is _TASK_STATE_MISSING:
+                    merged[key] = copy.deepcopy(proposed_value)
+                elif proposed_value != base_value:
+                    # Local edit wins over a concurrent deletion.
+                    merged[key] = copy.deepcopy(proposed_value)
+                continue
+            if base_value is _TASK_STATE_MISSING:
+                if current_value == proposed_value:
+                    merged[key] = copy.deepcopy(current_value)
+                elif isinstance(current_value, dict) and isinstance(proposed_value, dict):
+                    merged[key] = _three_way_merge_task_state(
+                        {}, current_value, proposed_value,
+                    )
+                elif isinstance(current_value, list) and isinstance(proposed_value, list):
+                    merged[key] = _merge_state_lists([], current_value, proposed_value)
+                else:
+                    merged[key] = copy.deepcopy(proposed_value)
+                continue
+            merged[key] = _three_way_merge_task_state(
+                base_value, current_value, proposed_value,
+            )
+        return merged
+    if isinstance(base, list) and isinstance(current, list) and isinstance(proposed, list):
+        return _merge_state_lists(base, current, proposed)
+    # Both branches changed the same scalar/type. The caller's explicit local
+    # mutation wins; unrelated nested changes were already merged above.
+    return copy.deepcopy(proposed)
+
+
+def _read_task_state_for_merge(path: Path) -> JsonDict:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _atomic_replace_task_state(path: Path, state: JsonDict) -> None:
+    temporary_name = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(path.parent),
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_name = temporary.name
+            json.dump(state, temporary, ensure_ascii=False, indent=2, default=str)
+            temporary.write("\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_name, path)
+    finally:
+        if temporary_name:
+            try:
+                Path(temporary_name).unlink()
+            except FileNotFoundError:
+                pass
+
+
+def write_task_state(
+    logger: RunLogger,
+    state: JsonDict,
+    *,
+    replace: bool = False,
+) -> str:
+    """Atomically persist state, merging changes made from stale snapshots.
+
+    ``load_task_state`` returns a dict subclass carrying its baseline. Writers
+    from two concurrent BrowserAgent callbacks can therefore preserve changes
+    to different phases/ledgers. Plan initialization and resume bootstrap use
+    ``replace=True`` (or a snapshot marked for replacement) for intentional
+    whole-state reconstruction.
+    """
+
     path = _state_path(logger)
-    path.write_text(json.dumps(state, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    proposed = copy.deepcopy(dict(state))
+    proposed["updated_at"] = utc_now_iso()
+    force_replace = bool(
+        replace or getattr(state, "_task_state_replace", False)
+    )
+    base = getattr(state, "_task_state_base", None)
+    with _TASK_STATE_WRITE_LOCK:
+        if not force_replace and isinstance(base, dict):
+            current = _read_task_state_for_merge(path)
+            persisted = _three_way_merge_task_state(base, current, proposed)
+        else:
+            persisted = proposed
+        _atomic_replace_task_state(path, persisted)
+
+    state.clear()
+    state.update(copy.deepcopy(persisted))
+    if isinstance(state, _TaskStateSnapshot):
+        state._task_state_base = copy.deepcopy(persisted)
+        state._task_state_replace = False
     return str(path.resolve())
 
 
@@ -3635,6 +3842,166 @@ def _normalized_source_urls(*texts: Any) -> List[str]:
             path = str(parsed.path or "").rstrip("/")
             urls.add(f"{host}{path}")
     return sorted(urls)[:3]
+
+
+def _normalized_evidence_source_urls(*texts: Any) -> List[str]:
+    """Canonical source URLs for resume evidence, retaining query identity.
+
+    Objective-attempt budgeting intentionally ignores query strings, but a
+    query often identifies the actual record/page (``?id=...``). Reusing that
+    looser key for resume would incorrectly bless an artifact from a different
+    source. Query ordering is normalized; fragments and scheme/www noise are
+    ignored.
+    """
+
+    urls: Set[str] = set()
+    for text in texts:
+        for raw in _SOURCE_URL_RE.findall(str(text or "")):
+            parsed = urlsplit(raw.rstrip(".,;:!?)"))
+            host = str(parsed.netloc or "").lower()
+            if host.startswith("www."):
+                host = host[4:]
+            if not host:
+                continue
+            path = str(parsed.path or "").rstrip("/")
+            query_pairs = sorted(parse_qsl(parsed.query, keep_blank_values=True))
+            query = urlencode(query_pairs, doseq=True)
+            urls.add(f"{host}{path}" + (f"?{query}" if query else ""))
+    return sorted(urls)[:20]
+
+
+def _primary_evidence_source_url(*texts: Any) -> str:
+    """Return the first URL mentioned by the first prose field that has one."""
+
+    for text in texts:
+        matches = _SOURCE_URL_RE.findall(str(text or ""))
+        if not matches:
+            continue
+        normalized = _normalized_evidence_source_urls(matches[0])
+        if normalized:
+            return normalized[0]
+    return ""
+
+
+def _canonical_resume_contract_value(value: Any) -> Any:
+    """Canonicalize declarative evidence shapes without preserving list order."""
+
+    if isinstance(value, dict):
+        return {
+            str(key): _canonical_resume_contract_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        normalized = [_canonical_resume_contract_value(item) for item in value]
+        return sorted(
+            normalized,
+            key=lambda item: json.dumps(
+                item,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+                separators=(",", ":"),
+            ),
+        )
+    return value
+
+
+def evidence_contract_fingerprint(phase: Optional[JsonDict]) -> str:
+    """Stable identity of evidence that can mechanically validate a phase.
+
+    Natural-language objectives are deliberately excluded.  Source URLs are
+    extracted separately so changing only prose does not invalidate evidence,
+    while changing the actual page cannot silently preserve an old artifact.
+    """
+
+    if not isinstance(phase, dict):
+        return ""
+    expected = (
+        phase.get("expected_artifact")
+        if isinstance(phase.get("expected_artifact"), dict)
+        else {}
+    )
+    raw_validators = (
+        phase.get("validators") if isinstance(phase.get("validators"), list) else []
+    )
+    validators = [
+        _canonical_validator_params(item)
+        for item in raw_validators
+        if isinstance(item, dict)
+    ]
+    declared_source_blob = json.dumps(
+        {
+            "source_url": phase.get("source_url"),
+            "source_urls": phase.get("source_urls"),
+            "input_artifacts": phase.get("input_artifacts"),
+            "worker_contract": phase.get("worker_contract"),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    declared_source_urls = _normalized_evidence_source_urls(
+        declared_source_blob
+    )
+    if declared_source_urls:
+        source_urls = declared_source_urls
+    else:
+        # Existing plans do not generally declare source_url (historical plans
+        # put the target in prose). Use one primary URL by field precedence so
+        # changing the real target invalidates evidence, while appending an
+        # explanatory/example URL does not retire hours of validated work.
+        primary_source = _primary_evidence_source_url(
+            phase.get("worker_task"),
+            phase.get("objective"),
+            phase.get("context"),
+        )
+        source_urls = [primary_source] if primary_source else []
+    payload = {
+        "taskType": normalize_task_type(phase.get("task_type")),
+        "sourceUrls": source_urls,
+        "inputArtifacts": _canonical_resume_contract_value(
+            phase.get("input_artifacts")
+        ),
+        "expectedArtifact": _canonical_resume_contract_value(expected),
+        "validators": _canonical_resume_contract_value(validators),
+        # A phase whose producer set changes no longer proves the same output,
+        # even if its row schema is unchanged. None (implicit serial) stays
+        # distinct from [] (explicitly independent).
+        "dependsOn": _canonical_resume_contract_value(
+            _normalized_depends_on(phase.get("depends_on"))
+        ),
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def execution_contract_fingerprint(phase: Optional[JsonDict]) -> str:
+    """Report-only identity of execution strategy; it never retires evidence."""
+
+    if not isinstance(phase, dict):
+        return ""
+    payload = {
+        "taskType": phase.get("task_type"),
+        "objective": phase.get("objective"),
+        "workerTask": phase.get("worker_task"),
+        "stageHint": phase.get("stage_hint"),
+        "stageHintReason": phase.get("stage_hint_reason"),
+        "workerContract": phase.get("worker_contract"),
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
 def _fingerprint_num(value: Any) -> Any:
@@ -4478,6 +4845,15 @@ def mark_phase_result(
         phase_state["last_failure"] = None
         phase_state["last_failure_classification"] = None
         _append_unique(state.setdefault("artifacts", []), artifacts)
+        artifact_digests = state.setdefault("artifact_digests", {})
+        if not isinstance(artifact_digests, dict):
+            artifact_digests = {}
+            state["artifact_digests"] = artifact_digests
+        for artifact in artifacts:
+            path = _resume_artifact_path(logger, artifact)
+            digest = _artifact_sha256(path)
+            if digest:
+                artifact_digests[str(path)] = digest
         _record_objective_attempt(
             state, phase, str(phase_id),
             succeeded=True, worker_contract=worker_contract,
@@ -4598,6 +4974,500 @@ def _phase_dependency_ids(phase: JsonDict) -> Optional[List[str]]:
         for item in values
         if str(item).strip()
     ]
+
+
+def _resume_plan_phase_map(plan: Optional[JsonDict]) -> JsonDict:
+    phases = plan.get("phases") if isinstance(plan, dict) else None
+    return {
+        str(phase.get("id") or ""): phase
+        for phase in phases if isinstance(phase, dict) and str(phase.get("id") or "")
+    } if isinstance(phases, list) else {}
+
+
+def _resume_downstream_map(plan: Optional[JsonDict]) -> Dict[str, Set[str]]:
+    phases = plan.get("phases") if isinstance(plan, dict) else None
+    downstream: Dict[str, Set[str]] = {}
+    prior_ids: List[str] = []
+    for phase in phases if isinstance(phases, list) else []:
+        if not isinstance(phase, dict):
+            continue
+        phase_id = str(phase.get("id") or "")
+        if not phase_id:
+            continue
+        dependencies = _phase_dependency_ids(phase)
+        if dependencies is None:
+            dependencies = list(prior_ids)
+        for dependency in dependencies:
+            downstream.setdefault(dependency, set()).add(phase_id)
+        prior_ids.append(phase_id)
+    return downstream
+
+
+def _resume_artifact_path(logger: RunLogger, value: Any) -> Path:
+    path = Path(str(value or "")).expanduser()
+    if not path.is_absolute():
+        path = logger.task_dir / path
+    return path.resolve(strict=False)
+
+
+def _resume_artifact_is_readable(logger: RunLogger, value: Any) -> bool:
+    if not str(value or "").strip():
+        return False
+    path = _resume_artifact_path(logger, value)
+    if not path.is_file():
+        return False
+    try:
+        with path.open("rb") as artifact_file:
+            artifact_file.read(1)
+    except OSError:
+        return False
+    return True
+
+
+def _artifact_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as artifact_file:
+            for chunk in iter(lambda: artifact_file.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return ""
+    return digest.hexdigest()
+
+
+def _legacy_artifact_syntax_error(path: Path) -> str:
+    """Return a terse integrity error for legacy artifacts without a digest."""
+
+    suffix = path.suffix.lower()
+    try:
+        if suffix == ".json":
+            json.loads(path.read_text(encoding="utf-8"))
+        elif suffix == ".jsonl":
+            saw_record = False
+            with path.open("r", encoding="utf-8") as artifact_file:
+                for line_number, line in enumerate(artifact_file, start=1):
+                    if not line.strip():
+                        continue
+                    saw_record = True
+                    try:
+                        json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        return f"invalid_jsonl_line:{line_number}:{exc.msg}"
+            if not saw_record:
+                return "empty_jsonl"
+        elif suffix == ".csv":
+            with path.open("r", encoding="utf-8", newline="") as artifact_file:
+                rows = list(csv.reader(artifact_file, strict=True))
+            if not rows or not rows[0]:
+                return "empty_csv"
+            width = len(rows[0])
+            if any(len(row) != width for row in rows[1:]):
+                return "inconsistent_csv_columns"
+    except (OSError, UnicodeError, json.JSONDecodeError, csv.Error) as exc:
+        return f"invalid_{suffix.lstrip('.') or 'artifact'}:{exc}"
+    return ""
+
+
+def _artifact_recorded_digest(
+    logger: RunLogger,
+    artifact_digests: JsonDict,
+    artifact: Any,
+) -> str:
+    resolved = str(_resume_artifact_path(logger, artifact))
+    return str(
+        artifact_digests.get(resolved)
+        or artifact_digests.get(str(artifact or ""))
+        or ""
+    ).strip().lower()
+
+
+def _resume_artifact_integrity_error(
+    logger: RunLogger,
+    artifact_digests: JsonDict,
+    artifact: Any,
+) -> str:
+    path = _resume_artifact_path(logger, artifact)
+    if not _resume_artifact_is_readable(logger, artifact):
+        return "missing_or_unreadable"
+    expected_digest = _artifact_recorded_digest(logger, artifact_digests, artifact)
+    if expected_digest:
+        actual_digest = _artifact_sha256(path)
+        if not actual_digest:
+            return "unreadable"
+        if actual_digest != expected_digest:
+            return "sha256_mismatch"
+        return ""
+    return _legacy_artifact_syntax_error(path)
+
+
+def _legacy_extraction_validation_error(
+    logger: RunLogger,
+    phase: Optional[JsonDict],
+    artifacts: List[Any],
+    artifact_digests: JsonDict,
+) -> str:
+    """Re-run existing validators for digest-less extraction artifacts."""
+
+    if not isinstance(phase, dict):
+        return ""
+    all_extractions = [
+        str(artifact)
+        for artifact in artifacts
+        if "/artifacts/extractions/" in str(_resume_artifact_path(logger, artifact))
+    ]
+    if not any(
+        not _artifact_recorded_digest(logger, artifact_digests, artifact)
+        for artifact in all_extractions
+    ):
+        return ""
+    try:
+        contract = phase_contract(phase)
+        # File/download receipts are independent runtime evidence. Resume is
+        # re-validating the extraction payload here, so do not manufacture a
+        # file-evidence failure merely because old worker handles are gone.
+        contract["validators"] = [
+            validator
+            for validator in contract.get("validators") or []
+            if isinstance(validator, dict)
+            and str(validator.get("type") or "") not in FILE_VALIDATOR_TYPES
+        ]
+        validation = validate_worker_artifacts(
+            contract=contract,
+            artifacts=all_extractions,
+            task_dir=logger.task_dir,
+        )
+    except Exception as exc:
+        return f"validator_error:{type(exc).__name__}:{exc}"
+    if str(validation.get("status") or "") != "done":
+        failures = validation.get("failures")
+        first_type = ""
+        if isinstance(failures, list) and failures and isinstance(failures[0], dict):
+            first_type = str(failures[0].get("type") or "")
+        return f"validator_failed:{first_type or 'unknown'}"
+    return ""
+
+
+def prepare_resume_state(
+    logger: RunLogger,
+    *,
+    old_plan: JsonDict,
+    new_plan: Optional[JsonDict] = None,
+    instruction: str = "",
+    persist: bool = True,
+    record_audit: bool = True,
+) -> JsonDict:
+    """Reconcile interrupted state and retire mechanically stale evidence.
+
+    The returned ``state`` is a deep-copied, reconciled ``preserve_from`` value.
+    Replan callers use ``persist=False, record_audit=False`` and pass that value
+    directly to :func:`initialize_task_state`, avoiding an inconsistent
+    intermediate write.  Resume bootstrap uses the defaults and persists once.
+    """
+
+    state = copy.deepcopy(load_task_state(logger))
+    if not state:
+        raise ValueError("task_state.json is missing or unreadable")
+    phases_state = state.get("phases")
+    if not isinstance(phases_state, dict):
+        raise ValueError("task_state.json has no phases object")
+
+    interrupted_attempts: List[JsonDict] = []
+    reset_running_phases: List[str] = []
+    for phase_id, raw_phase_state in phases_state.items():
+        if not isinstance(raw_phase_state, dict):
+            continue
+        attempts = raw_phase_state.get("attempts")
+        for attempt in attempts if isinstance(attempts, list) else []:
+            if not isinstance(attempt, dict) or attempt.get("status") != "running":
+                continue
+            attempt["status"] = "interrupted"
+            attempt["finished_at"] = utc_now_iso()
+            attempt["interruptionReason"] = "process_terminated_before_result"
+            interrupted_attempts.append({
+                "phaseId": str(phase_id),
+                "workerId": str(attempt.get("workerId") or ""),
+                "started_at": attempt.get("started_at"),
+            })
+        if str(raw_phase_state.get("status") or "") == "running":
+            raw_phase_state["status"] = "pending"
+            raw_phase_state["resume_reset_from"] = "running"
+            reset_running_phases.append(str(phase_id))
+
+    effective_plan = new_plan if isinstance(new_plan, dict) else old_plan
+    old_phases = _resume_plan_phase_map(old_plan)
+    new_phases = _resume_plan_phase_map(effective_plan)
+    removed_phases = sorted(set(old_phases) - set(new_phases))
+    changed_evidence_phases = sorted(
+        phase_id
+        for phase_id in set(old_phases) & set(new_phases)
+        if evidence_contract_fingerprint(old_phases[phase_id])
+        != evidence_contract_fingerprint(new_phases[phase_id])
+    )
+    changed_execution_phases = sorted(
+        phase_id
+        for phase_id in set(old_phases) & set(new_phases)
+        if phase_id not in changed_evidence_phases
+        and execution_contract_fingerprint(old_phases[phase_id])
+        != execution_contract_fingerprint(new_phases[phase_id])
+    )
+
+    invalidated: Set[str] = set(removed_phases) | set(changed_evidence_phases)
+    direct_invalidation_reasons: Dict[str, str] = {
+        phase_id: "phase_removed" for phase_id in removed_phases
+    }
+    direct_invalidation_reasons.update({
+        phase_id: "evidence_contract_changed"
+        for phase_id in changed_evidence_phases
+    })
+    raw_digests = state.get("artifact_digests")
+    artifact_digests: JsonDict = raw_digests if isinstance(raw_digests, dict) else {}
+    missing_artifacts: List[str] = []
+    corrupt_artifacts: List[JsonDict] = []
+    for phase_id, raw_phase_state in phases_state.items():
+        if not isinstance(raw_phase_state, dict):
+            continue
+        artifacts = raw_phase_state.get("validated_artifacts")
+        artifacts = artifacts if isinstance(artifacts, list) else []
+        for artifact in artifacts if isinstance(artifacts, list) else []:
+            integrity_error = _resume_artifact_integrity_error(
+                logger, artifact_digests, artifact,
+            )
+            if not integrity_error:
+                continue
+            artifact_text = str(artifact)
+            if integrity_error == "missing_or_unreadable":
+                if artifact_text not in missing_artifacts:
+                    missing_artifacts.append(artifact_text)
+                direct_invalidation_reasons[str(phase_id)] = (
+                    "validated_artifact_missing"
+                )
+            else:
+                corrupt_artifacts.append({
+                    "path": artifact_text,
+                    "reason": integrity_error,
+                })
+                direct_invalidation_reasons[str(phase_id)] = (
+                    "validated_artifact_corrupt"
+                )
+            invalidated.add(str(phase_id))
+        if str(phase_id) not in invalidated:
+            validator_error = _legacy_extraction_validation_error(
+                logger,
+                new_phases.get(str(phase_id)) or old_phases.get(str(phase_id)),
+                artifacts,
+                artifact_digests,
+            )
+            if validator_error:
+                corrupt_artifacts.append({
+                    "path": ",".join(str(item) for item in artifacts),
+                    "reason": validator_error,
+                })
+                invalidated.add(str(phase_id))
+                direct_invalidation_reasons[str(phase_id)] = (
+                    "validated_artifact_corrupt"
+                )
+            else:
+                # The first safe resume of a digest-less legacy artifact
+                # establishes an integrity baseline for every later resume.
+                for artifact in artifacts:
+                    if _artifact_recorded_digest(
+                        logger, artifact_digests, artifact,
+                    ):
+                        continue
+                    path = _resume_artifact_path(logger, artifact)
+                    digest = _artifact_sha256(path)
+                    if digest:
+                        artifact_digests[str(path)] = digest
+
+    active_artifacts = state.get("artifacts")
+    active_artifacts = active_artifacts if isinstance(active_artifacts, list) else []
+    unattributed_missing: Set[str] = set()
+    for artifact in active_artifacts:
+        integrity_error = _resume_artifact_integrity_error(
+            logger, artifact_digests, artifact,
+        )
+        if not integrity_error:
+            path = _resume_artifact_path(logger, artifact)
+            if not _artifact_recorded_digest(
+                logger, artifact_digests, artifact,
+            ):
+                digest = _artifact_sha256(path)
+                if digest:
+                    artifact_digests[str(path)] = digest
+            continue
+        identity = str(_resume_artifact_path(logger, artifact))
+        unattributed_missing.add(identity)
+        artifact_text = str(artifact)
+        if integrity_error == "missing_or_unreadable":
+            if artifact_text not in missing_artifacts:
+                missing_artifacts.append(artifact_text)
+        elif not any(
+            str(item.get("path") or "") == artifact_text
+            for item in corrupt_artifacts
+            if isinstance(item, dict)
+        ):
+            corrupt_artifacts.append({
+                "path": artifact_text,
+                "reason": integrity_error,
+            })
+
+    raw_supersessions = state.get("artifact_supersessions")
+    if isinstance(raw_supersessions, list):
+        for entry in raw_supersessions:
+            if not isinstance(entry, dict):
+                continue
+            absorbed = entry.get("absorbed")
+            referenced = [entry.get("deliverable")]
+            if isinstance(absorbed, list):
+                referenced.extend(absorbed)
+            for artifact in referenced:
+                if not str(artifact or "").strip():
+                    continue
+                integrity_error = _resume_artifact_integrity_error(
+                    logger, artifact_digests, artifact,
+                )
+                if not integrity_error:
+                    if not _artifact_recorded_digest(
+                        logger, artifact_digests, artifact,
+                    ):
+                        path = _resume_artifact_path(logger, artifact)
+                        digest = _artifact_sha256(path)
+                        if digest:
+                            artifact_digests[str(path)] = digest
+                    continue
+                identity = str(_resume_artifact_path(logger, artifact))
+                unattributed_missing.add(identity)
+                artifact_text = str(artifact)
+                if integrity_error == "missing_or_unreadable":
+                    if artifact_text not in missing_artifacts:
+                        missing_artifacts.append(artifact_text)
+                elif not any(
+                    str(item.get("path") or "") == artifact_text
+                    for item in corrupt_artifacts
+                    if isinstance(item, dict)
+                ):
+                    corrupt_artifacts.append({
+                        "path": artifact_text,
+                        "reason": integrity_error,
+                    })
+
+    downstream: Dict[str, Set[str]] = {}
+    for plan in (old_plan, effective_plan):
+        for producer, consumers in _resume_downstream_map(plan).items():
+            downstream.setdefault(producer, set()).update(consumers)
+    queue = list(invalidated)
+    while queue:
+        producer = queue.pop(0)
+        for consumer in downstream.get(producer, set()):
+            if consumer not in invalidated:
+                invalidated.add(consumer)
+                queue.append(consumer)
+
+    phase_order: List[str] = []
+    for plan_map in (old_phases, new_phases):
+        for phase_id in plan_map:
+            if phase_id not in phase_order:
+                phase_order.append(phase_id)
+    reset_phases = [phase_id for phase_id in phase_order if phase_id in invalidated]
+    reset_phases.extend(sorted(invalidated - set(reset_phases)))
+
+    invalidated_artifacts: List[str] = []
+    retired_identities: Set[str] = set(unattributed_missing)
+    for phase_id in reset_phases:
+        phase_state = phases_state.get(phase_id)
+        if not isinstance(phase_state, dict):
+            continue
+        artifacts = phase_state.get("validated_artifacts")
+        for artifact in artifacts if isinstance(artifacts, list) else []:
+            artifact_text = str(artifact)
+            if artifact_text not in invalidated_artifacts:
+                invalidated_artifacts.append(artifact_text)
+            retired_identities.add(str(_resume_artifact_path(logger, artifact)))
+        phases_state[phase_id] = {
+            **_empty_phase_state(),
+            "resume_reset_reason": direct_invalidation_reasons.get(
+                phase_id, "upstream_evidence_invalidated",
+            ),
+        }
+
+    # A shared path remains active when another non-invalidated validated phase
+    # still owns it.  Missing files are always removed regardless of ownership.
+    remaining_identities: Set[str] = set()
+    for phase_id, phase_state in phases_state.items():
+        if phase_id in invalidated or not isinstance(phase_state, dict):
+            continue
+        for artifact in phase_state.get("validated_artifacts") or []:
+            remaining_identities.add(str(_resume_artifact_path(logger, artifact)))
+    state["artifacts"] = [
+        artifact
+        for artifact in active_artifacts
+        if (
+            str(_resume_artifact_path(logger, artifact)) not in unattributed_missing
+            and (
+                str(_resume_artifact_path(logger, artifact)) not in retired_identities
+                or str(_resume_artifact_path(logger, artifact)) in remaining_identities
+            )
+        )
+    ]
+
+    # Keep integrity/supersession metadata aligned with the active generation.
+    removed_identities = (
+        retired_identities | unattributed_missing
+    ) - remaining_identities
+    state["artifact_digests"] = {
+        str(path): digest
+        for path, digest in artifact_digests.items()
+        if str(_resume_artifact_path(logger, path)) not in removed_identities
+    }
+    supersessions = state.get("artifact_supersessions")
+    state["artifact_supersessions"] = [
+        copy.deepcopy(entry)
+        for entry in supersessions if isinstance(entry, dict)
+        and str(_resume_artifact_path(logger, entry.get("deliverable")))
+        not in removed_identities
+        and not any(
+            str(_resume_artifact_path(logger, absorbed)) in removed_identities
+            for absorbed in entry.get("absorbed") or []
+        )
+    ] if isinstance(supersessions, list) else []
+
+    state["current_phase"] = _first_active_phase_id(effective_plan, phases_state)
+    audited_reset_phases = list(reset_phases)
+    audited_reset_phases.extend(
+        phase_id
+        for phase_id in sorted(set(reset_running_phases))
+        if phase_id not in audited_reset_phases
+    )
+    audit: JsonDict = {
+        "at": utc_now_iso(),
+        "instruction": str(instruction or ""),
+        "resetPhases": audited_reset_phases,
+        "invalidatedArtifacts": invalidated_artifacts,
+        "missingArtifacts": missing_artifacts,
+        "corruptArtifacts": corrupt_artifacts,
+        "interruptedAttempts": interrupted_attempts,
+        "resetRunningPhases": sorted(set(reset_running_phases)),
+        "changedEvidencePhases": changed_evidence_phases,
+        "changedExecutionPhases": changed_execution_phases,
+        "removedPhases": removed_phases,
+    }
+    if record_audit:
+        resumes = state.setdefault("resumes", [])
+        if not isinstance(resumes, list):
+            resumes = []
+            state["resumes"] = resumes
+        resumes.append(copy.deepcopy(audit))
+    if isinstance(state, _TaskStateSnapshot):
+        # Resume is a deliberate one-shot reconciliation of the whole task.
+        # The CLI may persist the returned state after a replay confirmation,
+        # so carry replacement intent out-of-band rather than adding a field.
+        state._task_state_replace = True
+    if persist:
+        write_task_state(logger, state, replace=True)
+        logger.write("task_state.resume_prepared", {
+            key: value for key, value in audit.items() if key != "instruction"
+        })
+    return {**audit, "state": state}
 
 
 def phase_pacing_remaining_seconds(
@@ -4747,6 +5617,25 @@ def _mark_phase_blocked_by_dependency(
     }
 
 
+def _count_budgeted_phase_attempts(attempts: Any) -> int:
+    """Count attempts that consume ``max_attempts``.
+
+    A process interruption has no worker result and is retained only for
+    auditability; resume must not turn that reservation into a failed business
+    attempt.  Keep this predicate centralized because all three mechanical
+    scheduling fences must agree.
+    """
+
+    if not isinstance(attempts, list):
+        return 0
+    return sum(
+        1
+        for attempt in attempts
+        if isinstance(attempt, dict)
+        and str(attempt.get("status") or "") != "interrupted"
+    )
+
+
 def phase_start_rejection(
     plan: Optional[JsonDict],
     logger: RunLogger,
@@ -4799,7 +5688,7 @@ def phase_start_rejection(
             ),
         }
     attempts = phase_state.get("attempts") if isinstance(phase_state, dict) else []
-    attempts_count = len(attempts) if isinstance(attempts, list) else 0
+    attempts_count = _count_budgeted_phase_attempts(attempts)
     max_attempts = _positive_int(target_phase.get("max_attempts"), default=3)
     if (
         attempts_count >= max_attempts
@@ -4918,7 +5807,7 @@ def mark_phase_exhausted_if_needed(
         if status in TERMINAL_PHASE_STATUSES:
             continue
         attempts = phase_state.get("attempts") if isinstance(phase_state, dict) else []
-        attempts_count = len(attempts) if isinstance(attempts, list) else 0
+        attempts_count = _count_budgeted_phase_attempts(attempts)
         max_attempts = _positive_int(phase.get("max_attempts"), default=3)
         if (
             attempts_count < max_attempts
@@ -4987,7 +5876,7 @@ def next_pending_phase(plan: Optional[JsonDict], logger: RunLogger) -> Optional[
             prior_ids.append(phase_id)
             continue
         attempts = phase_state.get("attempts") if isinstance(phase_state, dict) else []
-        attempts_count = len(attempts) if isinstance(attempts, list) else 0
+        attempts_count = _count_budgeted_phase_attempts(attempts)
         max_attempts = _positive_int(phase.get("max_attempts"), default=3)
         if (
             attempts_count >= max_attempts

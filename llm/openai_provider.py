@@ -25,6 +25,11 @@ from llm.cache_control import (
     _resolve_cache_control_decision,
     _with_cache_control_diagnostics,
 )
+from llm.thinking import (
+    openai_thinking_request,
+    resolve_thinking_intent,
+    thinking_block_from_reasoning,
+)
 from runtime_config import ModelConfig
 
 
@@ -79,12 +84,16 @@ def _degenerate_response_problem(response: Any) -> Optional[Dict[str, Any]]:
         }
     if getattr(response, "usage", None) is None:
         # Payload wins (same policy as the Anthropic detector): a message
-        # carrying real content or tool_calls is the model's answer even when
-        # the gateway omitted the usage meter — retrying it would throw away a
-        # good response. Only "no usage AND no payload" is degenerate.
+        # carrying real content, tool_calls, or reasoning_content (thinking
+        # mode emits the chain here, sibling to content) is the
+        # model's answer even when the gateway omitted the usage meter -
+        # retrying it would throw away a good response. Only "no usage AND
+        # no payload" is degenerate.
         has_payload = bool(
             str(getattr(message, "content", "") or "").strip()
-        ) or bool(getattr(message, "tool_calls", None))
+        ) or bool(getattr(message, "tool_calls", None)) or bool(
+            str(getattr(message, "reasoning_content", "") or "").strip()
+        )
         if not has_payload:
             return {
                 "provider": "openai",
@@ -210,6 +219,8 @@ class OpenAIProvider(BaseLLMProvider):
             elif isinstance(content, list):
                 text_parts = []
                 tool_calls = []
+                reasoning_parts = []
+                encrypted_parts = []
                 has_user_content = False
                 
                 for block in content:
@@ -227,6 +238,25 @@ class OpenAIProvider(BaseLLMProvider):
                                     "arguments": json.dumps(block.get("input", {}))
                                 }
                             })
+                        elif b_type == "thinking":
+                            # 思考内容统一用 thinking 块承载，这里转回 OpenAI 格式
+                            # 的同级字段。OpenAI SDK 会把消息里的未知字段原样透传
+                            # 到请求体（已实测）。
+                            #   - DeepSeek：工具调用轮次必须回传 reasoning_content，
+                            #     否则 400。
+                            #   - 方舟：不回传不报错，但 1.8 及之后的模型回传后思维链
+                            #     可参与后续推理；encrypted_content 优先级高于
+                            #     reasoning_content，两者同时回传时前者生效。
+                            reasoning = block.get("thinking", "")
+                            if reasoning:
+                                reasoning_parts.append(str(reasoning))
+                            encrypted = block.get("encrypted_content", "")
+                            if encrypted:
+                                encrypted_parts.append(str(encrypted))
+                        elif b_type == "redacted_thinking":
+                            # OpenAI/DeepSeek 格式无等价字段；丢弃以避免泄露
+                            # 被模型显式遮蔽的内容。
+                            pass
                         elif b_type == "tool_result":
                             # Anthropic 的 tool_result 转为 OpenAI 的 tool 消息
                             raw_content = block.get("content", "")
@@ -250,11 +280,17 @@ class OpenAIProvider(BaseLLMProvider):
                                 "content": content_str
                             })
                 
-                # 根据原本的 role 重构消息
+                # 根据原本的 role 重构消息。思维链只是回答的附属物：没有正文也
+                # 没有工具调用时不单独成一条消息，否则会造出缺 content 的
+                # assistant 消息，多数 OpenAI 兼容服务端会拒。
                 if role == "assistant" and (text_parts or tool_calls):
                     msg_dict: Dict[str, Any] = {"role": "assistant"}
                     if text_parts:
                         msg_dict["content"] = "\n".join(text_parts)
+                    if reasoning_parts:
+                        msg_dict["reasoning_content"] = "\n".join(reasoning_parts)
+                    if encrypted_parts:
+                        msg_dict["encrypted_content"] = "\n".join(encrypted_parts)
                     if tool_calls:
                         msg_dict["tool_calls"] = tool_calls
                     openai_messages.append(msg_dict)
@@ -290,6 +326,12 @@ class OpenAIProvider(BaseLLMProvider):
         """
         cache_decision = _resolve_cache_control_decision("openai", self.config)
         strict_tools = bool(self.config.extra_params.get("strict_tools", False))
+        thinking_intent = resolve_thinking_intent(self.config.extra_params)
+        thinking_top, thinking_extra_body, thinking_warnings = (
+            openai_thinking_request(thinking_intent)
+        )
+        for _warning in (*thinking_intent.warnings, *thinking_warnings):
+            _emit_cache_log(f"[OpenAI Thinking] {_warning}")
 
         def build_request_params(cache_enabled: bool) -> Dict[str, Any]:
             # 转换消息格式
@@ -370,10 +412,30 @@ class OpenAIProvider(BaseLLMProvider):
                 # prevents a user-supplied stream=False from conflicting with
                 # the transport contract below.
                 "stream",
+                # Thinking/reasoning controls are translated by llm.thinking
+                # into the right wire shape (reasoning_effort top-level +
+                # thinking via extra_body); reserving them here avoids a raw
+                # pass-through that the OpenAI SDK would reject (`thinking`
+                # is not a chat.completions kwarg).
+                "thinking",
+                "reasoning_effort",
+                "effort",
             }
             for key, value in self.config.extra_params.items():
                 if key not in reserved_extra_keys:
                     params[key] = value
+
+            # 思考模式参数：reasoning_effort 是原生 kwarg（顶级），
+            # thinking 必须走 extra_body（OpenAI SDK 不接受其为 kwarg）。
+            params.update(thinking_top)
+            if thinking_extra_body:
+                existing_extra_body = params.get("extra_body")
+                if isinstance(existing_extra_body, dict):
+                    merged = dict(existing_extra_body)
+                    merged.update(thinking_extra_body)
+                    params["extra_body"] = merged
+                else:
+                    params["extra_body"] = dict(thinking_extra_body)
 
             # 只有在有工具时才添加 tools 参数
             if openai_tools:
@@ -442,6 +504,8 @@ class OpenAIProvider(BaseLLMProvider):
                 )
                 self._stream_options_disabled_after_reject = True
             content_parts: List[str] = []
+            reasoning_parts: List[str] = []
+            encrypted_parts: List[str] = []
             tool_call_parts: Dict[int, Dict[str, str]] = {}
             finish_reason = None
             usage = None
@@ -467,6 +531,16 @@ class OpenAIProvider(BaseLLMProvider):
                         content = getattr(delta, "content", None)
                         if content:
                             content_parts.append(content)
+                        # 思考模式把思维链放在 delta.reasoning_content（与 content
+                        # 同级），必须捕获以便工具调用轮次回传。方舟摘要类模型另有
+                        # encrypted_content：流式下会在思维链输出完成、正文开始前
+                        # 单独发一包，回传时它的优先级高于 reasoning_content。
+                        reasoning = getattr(delta, "reasoning_content", None)
+                        if reasoning:
+                            reasoning_parts.append(reasoning)
+                        encrypted = getattr(delta, "encrypted_content", None)
+                        if encrypted:
+                            encrypted_parts.append(encrypted)
 
                         for tool_delta in (getattr(delta, "tool_calls", None) or []):
                             index = int(getattr(tool_delta, "index", 0) or 0)
@@ -503,6 +577,8 @@ class OpenAIProvider(BaseLLMProvider):
                     SimpleNamespace(
                         message=SimpleNamespace(
                             content="".join(content_parts) or None,
+                            reasoning_content="".join(reasoning_parts) or None,
+                            encrypted_content="".join(encrypted_parts) or None,
                             tool_calls=assembled_tool_calls or None,
                         ),
                         finish_reason=finish_reason,
@@ -583,6 +659,8 @@ class OpenAIProvider(BaseLLMProvider):
         # 解析响应
         message = response.choices[0].message
         response_text = message.content or ""
+        reasoning_content = str(getattr(message, "reasoning_content", "") or "")
+        encrypted_content = str(getattr(message, "encrypted_content", "") or "")
         tool_calls = []
         
         # 解析工具调用（转换回 Anthropic 格式）
@@ -611,6 +689,18 @@ class OpenAIProvider(BaseLLMProvider):
             "content_filter": "end_turn",
         }
         stop_reason = stop_reason_map.get(finish_reason, finish_reason)
+
+        # 思维链通过 reasoning_content（+ 方舟摘要类模型的 encrypted_content）
+        # 返回。统一包装成 thinking 块存入 _assistant_prefix_blocks，与 Anthropic
+        # provider 一致，由 harness 在下一轮原样回传：DeepSeek 的工具调用轮次不
+        # 回传会报 400，方舟不报错但回传后思维链可参与后续推理。
+        assistant_prefix_blocks: List[Dict[str, Any]] = []
+        reasoning_block = thinking_block_from_reasoning(
+            reasoning_content,
+            encrypted_content,
+        )
+        if reasoning_block is not None:
+            assistant_prefix_blocks.append(reasoning_block)
 
         return response_text, tool_calls, stop_reason, {
             "cache_read": cache_read,
@@ -642,4 +732,5 @@ class OpenAIProvider(BaseLLMProvider):
             "timeout_seconds": self._llm_timeout_seconds(),
             "timeout_max_retries": self._llm_timeout_max_retries(),
             "timeout_retry_interval_seconds": self._llm_timeout_retry_interval_seconds(),
+            "_assistant_prefix_blocks": assistant_prefix_blocks,
         }

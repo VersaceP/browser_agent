@@ -9,7 +9,7 @@ import re
 import shlex
 import sys
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -20,10 +20,29 @@ except ImportError:
 
 from agent_harness import (
     LeadAgent,
+    ResumeContext,
     exception_payload,
     lead_agent_model_config,
 )
 from harness.utils import RunLogger
+from harness.resume_state import (
+    ResumeStateError,
+    RunLock,
+    RunLockError,
+    acquire_run_lock,
+    load_task_manifest,
+    load_task_plan_strict,
+    load_task_state_strict,
+    recover_legacy_user_task,
+    reconcile_torn_plan_alias,
+    release_run_lock,
+    write_task_manifest,
+)
+from harness.task_control import (
+    TERMINAL_PHASE_STATUSES,
+    prepare_resume_state,
+    write_task_state,
+)
 from llm import LLMFactory
 from runtime_config import RuntimeConfig, load_runtime_config
 
@@ -106,6 +125,25 @@ class ConsoleProgressReporter:
             return self._format_task_plan_rejected(payload)
         if event_type == "task_state.initialized":
             return f"[TaskState] 已初始化: {payload.get('path')}"
+        if event_type == "spawner.resume_browser_hint.used":
+            page = payload.get("pageId")
+            suffix = f"，页面 {page}" if page else ""
+            return (
+                "[Resume] 原浏览器 Fleet 仍可用，已继续复用 "
+                f"{payload.get('fleetId')}{suffix}。"
+            )
+        if event_type == "spawner.resume_browser_hint.page_probe_failed":
+            return (
+                "[Resume] 原页面已不可用；将尝试保留 Fleet 登录态，"
+                "并从新页面重跑当前 phase。"
+            )
+        if event_type == "spawner.resume_browser_hint.ignored":
+            reason = str(payload.get("reason") or "unavailable")
+            return (
+                "[Resume] 原浏览器上下文未恢复"
+                f"（{reason}）；将按普通分配从 phase 开头重跑，"
+                "如需登录将重新获取。"
+            )
         if event_type == "progress.intervention":
             return (
                 f"[Progress] 干预 {payload.get('tool') or '?'}: "
@@ -715,7 +753,9 @@ def _build_objective_judge(config_path: Optional[str]):
     def judge(objective: str, existing: Dict[str, Any]) -> Dict[str, str]:
         async def _call() -> Dict[str, str]:
             runtime = load_runtime_config(config_path or "config.json")
-            provider = LLMFactory.create_provider(lead_agent_model_config(runtime.model))
+            provider = LLMFactory.create_provider(
+                lead_agent_model_config(runtime.model, runtime.lead)
+            )
             system_prompt = (
                 "你是浏览器自动化技能库的守门人。判断【新任务目标】与【已有技能】是否是"
                 "同一个业务任务（同一站点上抓取/操作同一类页面的同一类产出，字段命名差异、"
@@ -1189,10 +1229,13 @@ def read_task(args: argparse.Namespace) -> str:
         return args.task_option
     if args.task:
         return args.task
+    if str(getattr(args, "resume", "") or "").strip():
+        return str(getattr(args, "resume_instruction", "") or "").strip()
     if not sys.stdin.isatty():
         return sys.stdin.read().strip()
     while True:
-        line = input("请输入浏览器任务（可先用 /skill <id|suite> 指定技能，/skill 列出，"
+        line = input("请输入浏览器任务（/resume <任务目录> [新指令] 恢复任务；"
+                     "可先用 /skill <id|suite> 指定技能，/skill 列出，"
                      "/skill-create-workflow|-guidance <任务目录> 蒸馏新技能）: ").strip()
         # /skill-create* must route BEFORE /skill (shared prefix)
         if _is_skill_create_command(line):
@@ -1203,12 +1246,237 @@ def read_task(args: argparse.Namespace) -> str:
             if inline_task:
                 return inline_task
             continue
+        if line == "/resume" or line.startswith("/resume "):
+            resumed = _handle_resume_command(line, args)
+            if resumed is not None:
+                return resumed
+            continue
         return line
+
+
+def _handle_resume_command(
+    line: str,
+    args: argparse.Namespace,
+) -> Optional[str]:
+    """Parse an interactive phase-level resume request without touching disk."""
+
+    try:
+        tokens = shlex.split(line)
+    except ValueError as exc:
+        print(f"/resume 参数错误: {exc}")
+        return None
+    if len(tokens) < 2:
+        print("用法: /resume <worktree任务目录> [用户新指令]")
+        return None
+    path, rest = _recover_task_path(tokens[1:])
+    args.resume = path
+    instruction = " ".join(rest).strip()
+    args.resume_instruction = instruction
+    return instruction
+
+
+def _resolve_resume_directory(raw_path: str) -> Path:
+    """Resolve an existing task directory without ever creating it."""
+
+    raw = str(raw_path or "").strip()
+    if not raw:
+        raise ValueError("缺少 worktree 任务目录")
+    candidate = Path(raw).expanduser()
+    candidates = [candidate]
+    if not candidate.is_absolute():
+        candidates.append(Path(__file__).resolve().parent / candidate)
+    for item in candidates:
+        try:
+            resolved = item.resolve(strict=True)
+        except (FileNotFoundError, OSError):
+            continue
+        if resolved.is_dir():
+            return resolved
+    raise ValueError(
+        "worktree 目录不存在或已被删除；无法恢复，也不会自动重建空任务目录"
+    )
+
+
+def _load_initial_plan(
+    task_dir: Path,
+    current_plan: Dict[str, Any],
+) -> "tuple[Dict[str, Any], bool]":
+    path = task_dir / "task_plan_history" / "plan.0001.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return dict(current_plan), False
+    plan = payload.get("plan") if isinstance(payload, dict) else None
+    if not isinstance(plan, dict) or not isinstance(plan.get("phases"), list):
+        return dict(current_plan), False
+    return plan, True
+
+
+def _resume_browser_hint(
+    state: Dict[str, Any],
+    *,
+    preferred_phase_ids: Sequence[str] = (),
+) -> Dict[str, str]:
+    browser = state.get("browser_context")
+    browser = browser if isinstance(browser, dict) else {}
+    phase_primaries = browser.get("phase_primaries")
+    phase_primaries = (
+        phase_primaries if isinstance(phase_primaries, dict) else {}
+    )
+    phase_order = [str(item or "").strip() for item in preferred_phase_ids]
+    current_phase = str(state.get("current_phase") or "").strip()
+    if current_phase and current_phase not in phase_order:
+        phase_order.append(current_phase)
+    candidates = []
+    for phase_id in phase_order:
+        primary = phase_primaries.get(phase_id)
+        if isinstance(primary, dict):
+            candidates.append((primary, f"resume_phase:{phase_id}", phase_id))
+    primary = browser.get("last_primary")
+    if isinstance(primary, dict):
+        candidates.append((primary, "resume_task_state", current_phase))
+
+    for primary, source, phase_id in candidates:
+        fleet_id = str(
+            primary.get("fleetId") or primary.get("fleet_id") or ""
+        ).strip()
+        page_id = str(
+            primary.get("pageId") or primary.get("page_id") or ""
+        ).strip()
+        if not fleet_id:
+            continue
+        try:
+            uuid.UUID(fleet_id)
+            if page_id:
+                uuid.UUID(page_id)
+        except (ValueError, AttributeError):
+            # This is a weak historical hint.  Skip malformed hand-edited
+            # candidates and keep looking; never convert it into a hard pin.
+            continue
+        return {
+            "fleet_id": fleet_id,
+            "page_id": page_id,
+            "phase_id": phase_id,
+            "source": source,
+        }
+    return {}
+
+
+def _new_run_id(*, resumed: bool) -> str:
+    prefix = "resume" if resumed else "run"
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    return f"{prefix}-{timestamp}-{uuid.uuid4().hex[:8]}"
+
+
+def _artifact_row_count(path: Path) -> Optional[int]:
+    """Small, bounded summary for the Lead resume bootstrap."""
+
+    try:
+        suffix = path.suffix.lower()
+        if suffix in {".jsonl", ".ndjson"}:
+            with path.open("r", encoding="utf-8") as stream:
+                return sum(1 for line in stream if line.strip())
+        if suffix == ".csv":
+            with path.open("r", encoding="utf-8") as stream:
+                lines = sum(1 for line in stream if line.strip())
+            return max(0, lines - 1)
+        if suffix == ".json":
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, list):
+                return len(payload)
+            if isinstance(payload, dict):
+                for key in ("rows", "items", "records", "results", "data"):
+                    value = payload.get(key)
+                    if isinstance(value, list):
+                        return len(value)
+                return 1
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return None
+
+
+def _resume_phase_summary(
+    task_dir: Path,
+    plan: Dict[str, Any],
+    state: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    phase_states = state.get("phases")
+    phase_states = phase_states if isinstance(phase_states, dict) else {}
+    summary: List[Dict[str, Any]] = []
+    for phase in plan.get("phases") or []:
+        if not isinstance(phase, dict):
+            continue
+        phase_id = str(phase.get("id") or "")
+        raw_state = phase_states.get(phase_id)
+        raw_state = raw_state if isinstance(raw_state, dict) else {}
+        artifacts: List[Dict[str, Any]] = []
+        for raw_path in raw_state.get("validated_artifacts") or []:
+            artifact_path = Path(str(raw_path or "")).expanduser()
+            if not artifact_path.is_absolute():
+                artifact_path = task_dir / artifact_path
+            resolved = artifact_path.resolve(strict=False)
+            artifacts.append({
+                "path": str(resolved),
+                "rows": _artifact_row_count(resolved) if resolved.is_file() else None,
+            })
+        item: Dict[str, Any] = {
+            "phaseId": phase_id,
+            "status": str(raw_state.get("status") or "pending"),
+            "validatedArtifacts": artifacts,
+        }
+        if raw_state.get("resume_reset_reason"):
+            item["resumeResetReason"] = raw_state.get("resume_reset_reason")
+        if raw_state.get("resume_reset_from"):
+            item["resumeResetFrom"] = raw_state.get("resume_reset_from")
+        summary.append(item)
+    return summary
+
+
+def _interrupted_phase_ids(report: Dict[str, Any]) -> List[str]:
+    phase_ids = {
+        str(item.get("phaseId") or "")
+        for item in report.get("interruptedAttempts") or []
+        if isinstance(item, dict) and str(item.get("phaseId") or "")
+    }
+    phase_ids.update(
+        str(item)
+        for item in report.get("resetRunningPhases") or []
+        if str(item)
+    )
+    return sorted(phase_ids)
+
+
+def _confirm_interrupted_replay(
+    report: Dict[str, Any],
+    *,
+    explicitly_allowed: bool,
+) -> bool:
+    phase_ids = _interrupted_phase_ids(report)
+    if not phase_ids or explicitly_allowed:
+        return True
+    joined = ", ".join(phase_ids)
+    warning = (
+        f"上次进程中断时 phase [{joined}] 仍在运行。"
+        "Worker 的 step/messages 不会恢复；继续将从 phase 开头重跑，"
+        "而上次操作可能已产生外部副作用。"
+    )
+    print(warning, flush=True)
+    if not sys.stdin.isatty():
+        print(
+            "非交互模式默认拒绝重放；确认后请加 "
+            "--resume-retry-interrupted。",
+            flush=True,
+        )
+        return False
+    answer = input("是否允许完整重跑这些 phase？ [y/N]: ").strip().lower()
+    return answer in {"y", "yes"}
 
 
 async def run_cli(args: argparse.Namespace) -> int:
     global _CANCELLED_LOGGED, _LAST_LOGGER
 
+    _CANCELLED_LOGGED = False
+    _LAST_LOGGER = None
     runtime = load_runtime_config(args.config)
     if args.agent_id:
         runtime.agent_id = args.agent_id
@@ -1216,7 +1484,8 @@ async def run_cli(args: argparse.Namespace) -> int:
         runtime.harness.max_steps = args.max_steps
         runtime.harness.worker_max_steps = args.max_steps
     task = read_task(args)
-    if not task:
+    resume_requested = bool(str(getattr(args, "resume", "") or "").strip())
+    if not task and not resume_requested:
         print("没有收到任务。")
         return 2
     if _is_skill_create_command(task):
@@ -1250,49 +1519,264 @@ async def run_cli(args: argparse.Namespace) -> int:
         forced_skill = ",".join(final)
         runtime.harness.forced_skill_id = forced_skill
         print(f"技能强制: {forced_skill}", flush=True)
-    else:
+    elif not resume_requested:
         _hint_matching_skills(task)
 
-    logger = RunLogger(
-        runtime.harness.worktree_dir,
-        on_event=ConsoleProgressReporter(),
-    )
-    _LAST_LOGGER = logger
-    runtime.harness.runs_dir = str(logger.task_dir)
-    print(f"任务已创建: {logger.task_id}", flush=True)
-    print("模式: lead", flush=True)
-    print(f"任务目录: {logger.task_dir}", flush=True)
-    print(f"运行日志: {logger.path}", flush=True)
-    print("开始执行，关键进度会在这里显示。", flush=True)
-
+    logger: Optional[RunLogger] = None
+    run_lock: Optional[RunLock] = None
+    resume_context: Optional[ResumeContext] = None
+    task_for_agent = task
+    run_started = False
     try:
+        if resume_requested:
+            try:
+                task_dir = _resolve_resume_directory(args.resume)
+                # The lock is acquired before reading the generation so a live
+                # process cannot change plan/state between validation and use.
+                run_lock = acquire_run_lock(task_dir)
+                current_plan = load_task_plan_strict(task_dir)
+                prior_state = load_task_state_strict(task_dir)
+                current_plan, plan_alias_recovery = reconcile_torn_plan_alias(
+                    task_dir,
+                    current_plan=current_plan,
+                    state=prior_state,
+                )
+
+                manifest = load_task_manifest(task_dir)
+                if manifest is not None:
+                    original_user_task = str(
+                        manifest.get("original_user_task") or ""
+                    ).strip()
+                    if not original_user_task:
+                        raise ResumeStateError(
+                            "task_manifest.json 缺少 original_user_task"
+                        )
+                else:
+                    original_user_task = recover_legacy_user_task(task_dir)
+                    if not original_user_task and sys.stdin.isatty():
+                        print(
+                            "这是旧版 worktree，未找到可恢复的原始用户任务。",
+                            flush=True,
+                        )
+                        original_user_task = input(
+                            "请完整重述原始任务（不是本次新指令）: "
+                        ).strip()
+                    if not original_user_task:
+                        raise ResumeStateError(
+                            "旧 worktree 无 manifest，也无法从历史 context "
+                            "恢复原始任务；请在交互模式下重述原始任务"
+                        )
+
+                initial_plan, initial_plan_recovered = _load_initial_plan(
+                    task_dir, current_plan,
+                )
+                runtime.harness.worktree_dir = str(task_dir.parent)
+                logger = RunLogger(
+                    str(task_dir.parent),
+                    task_id=task_dir.name,
+                    on_event=ConsoleProgressReporter(),
+                )
+                logger.run_id = _new_run_id(resumed=True)
+                logger.context_run_id = logger.run_id
+                logger.resumed_from = str(task_dir.resolve())
+
+                report = prepare_resume_state(
+                    logger,
+                    old_plan=current_plan,
+                    instruction=task,
+                    persist=False,
+                )
+                if not _confirm_interrupted_replay(
+                    report,
+                    explicitly_allowed=bool(
+                        getattr(args, "resume_retry_interrupted", False)
+                    ),
+                ):
+                    return 2
+
+                reconciled_state = report["state"]
+                write_task_state(logger, reconciled_state)
+                if manifest is None:
+                    write_task_manifest(
+                        logger,
+                        original_user_task=original_user_task,
+                        task_id=logger.task_id,
+                        config_path=args.config,
+                        forced_skill_id=forced_skill or None,
+                        agent_id=runtime.agent_id,
+                    )
+
+                fleet_reuse_enabled = bool(
+                    getattr(runtime.harness, "fleet_reuse_enabled", True)
+                )
+                browser_hint = (
+                    _resume_browser_hint(
+                        reconciled_state,
+                        preferred_phase_ids=_interrupted_phase_ids(report),
+                    )
+                    if fleet_reuse_enabled else {}
+                )
+                prompt_report = {
+                    key: value
+                    for key, value in report.items()
+                    if key not in {"state", "instruction"}
+                }
+                prompt_report["phaseStates"] = _resume_phase_summary(
+                    task_dir, current_plan, reconciled_state,
+                )
+                prompt_report["browserRecovery"] = {
+                    "candidateRecorded": bool(browser_hint),
+                    "status": (
+                        "pending_live_probe_on_next_worker"
+                        if browser_hint
+                        else "disabled_by_config"
+                        if not fleet_reuse_enabled
+                        else "no_task_owned_candidate"
+                    ),
+                    "fallback": "ordinary_assignment_and_phase_replay",
+                }
+                if plan_alias_recovery is not None:
+                    prompt_report["planAliasRecovery"] = plan_alias_recovery
+                resume_context = ResumeContext(
+                    original_user_task=original_user_task,
+                    current_plan=current_plan,
+                    initial_plan=initial_plan,
+                    initial_plan_recovered=initial_plan_recovered,
+                    instruction=task,
+                    report=prompt_report,
+                    run_id=logger.run_id,
+                    browser_hint=browser_hint,
+                    task_dir=str(task_dir),
+                )
+                task_for_agent = original_user_task
+                runtime.harness.runs_dir = str(task_dir)
+                logger.write(
+                    "resume.started",
+                    {
+                        "runId": logger.run_id,
+                        "taskDir": str(task_dir),
+                        "instruction": task or None,
+                        "resetPhases": report.get("resetPhases") or [],
+                        "interruptedPhases": _interrupted_phase_ids(report),
+                        "browserCandidateRecorded": bool(browser_hint),
+                        "initialPlanRecovered": initial_plan_recovered,
+                        "planAliasRecovery": plan_alias_recovery,
+                    },
+                )
+            except (ResumeStateError, RunLockError, ValueError, OSError) as exc:
+                print(f"无法恢复任务: {exc}", flush=True)
+                return 2
+        else:
+            logger = RunLogger(
+                runtime.harness.worktree_dir,
+                on_event=ConsoleProgressReporter(),
+            )
+            logger.run_id = _new_run_id(resumed=False)
+            run_lock = acquire_run_lock(logger.task_dir)
+            write_task_manifest(
+                logger,
+                original_user_task=task,
+                task_id=logger.task_id,
+                config_path=args.config,
+                forced_skill_id=forced_skill or None,
+                agent_id=runtime.agent_id,
+                startup_args={
+                    "max_steps": getattr(args, "max_steps", None),
+                    "has_explicit_browser_pin": bool(pinned_browser_context),
+                },
+            )
+            runtime.harness.runs_dir = str(logger.task_dir)
+
+        if logger is None:  # defensive; both setup branches assign it
+            print("无法初始化任务日志。", flush=True)
+            return 2
+        _LAST_LOGGER = logger
+        run_started = True
+        if resume_context is not None:
+            phase_states = resume_context.report.get("phaseStates") or []
+            kept = sum(
+                1 for item in phase_states
+                if isinstance(item, dict)
+                and item.get("status") == "validated_done"
+            )
+            pending_ids = [
+                str(item.get("phaseId") or "")
+                for item in phase_states
+                if isinstance(item, dict)
+                and item.get("status") not in TERMINAL_PHASE_STATUSES
+                and str(item.get("phaseId") or "")
+            ]
+            reset = resume_context.report.get("resetPhases") or []
+            print(f"任务已恢复: {logger.task_id}", flush=True)
+            print(
+                f"恢复摘要: 保留 {kept} 个已验证 phase；"
+                f"待继续/重试 {len(pending_ids)} 个: "
+                f"{', '.join(pending_ids) or '(无)'}；"
+                f"其中因中断/产物失效重置 {len(reset)} 个: "
+                f"{', '.join(map(str, reset)) or '(无)'}",
+                flush=True,
+            )
+            browser_status = resume_context.report.get("browserRecovery") or {}
+            if browser_status.get("candidateRecorded"):
+                print(
+                    "浏览器恢复: 已找到本任务的 Fleet/Page 候选，"
+                    "下一个 worker 启动时会用平台 inventory 探活；"
+                    "不可用时自动重开。",
+                    flush=True,
+                )
+            elif browser_status.get("status") == "disabled_by_config":
+                print(
+                    "浏览器恢复: fleet_reuse_enabled=false，"
+                    "不会尝试恢复原 Fleet，将从新浏览器上下文执行。",
+                    flush=True,
+                )
+            else:
+                print(
+                    "浏览器恢复: 无本任务专属候选，将重新分配；"
+                    "需要时会重新登录。",
+                    flush=True,
+                )
+        else:
+            print(f"任务已创建: {logger.task_id}", flush=True)
+        print("模式: lead", flush=True)
+        print(f"任务目录: {logger.task_dir}", flush=True)
+        print(f"运行日志: {logger.path}", flush=True)
+        print("开始执行，关键进度会在这里显示。", flush=True)
+
         provider = LLMFactory.create_provider(
-            lead_agent_model_config(runtime.model)
+            lead_agent_model_config(runtime.model, runtime.lead)
         )
         harness = LeadAgent(
             provider,
             runtime,
             logger,
             pinned_browser_context=pinned_browser_context,
+            resume=resume_context,
         )
-        answer = await harness.run(task)
+        answer = await harness.run(task_for_agent)
     except asyncio.CancelledError as exc:
         _CANCELLED_LOGGED = True
-        logger.write(
-            "run.cancelled",
-            exception_payload(exc, mode="lead", task=task),
-        )
+        if logger is not None:
+            logger.write(
+                "run.cancelled",
+                exception_payload(exc, mode="lead", task=task_for_agent),
+            )
         raise
     except Exception as exc:
-        logger.write(
-            "run.error",
-            exception_payload(exc, mode="lead", task=task),
-        )
+        if logger is not None:
+            logger.write(
+                "run.error",
+                exception_payload(exc, mode="lead", task=task_for_agent),
+            )
         raise
     finally:
-        logger.write_usage_summary()
+        if logger is not None and run_started:
+            logger.write_usage_summary()
+        if run_lock is not None:
+            release_run_lock(run_lock)
 
     print(answer)
+    assert logger is not None
     print(f"\n任务ID: {logger.task_id}")
     print(f"\n任务目录: {logger.task_dir}")
     print(f"\n运行日志: {logger.path}")
@@ -1317,6 +1801,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-steps", type=int, help="覆盖最大 agent 编排步数")
     parser.add_argument(
+        "--resume",
+        default="",
+        metavar="WORKTREE",
+        help="从已有 worktree 目录按 phase 粒度恢复任务",
+    )
+    parser.add_argument(
+        "--resume-retry-interrupted",
+        action="store_true",
+        help="非交互模式下明确允许完整重跑上次被中断的 phase",
+    )
+    parser.add_argument(
         "--skill",
         dest="skill",
         default="",
@@ -1337,6 +1832,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if raw_argv and raw_argv[0] in _SKILL_CREATE_COMMANDS:
         line = " ".join(shlex.quote(part) for part in raw_argv)
         return _handle_skill_create_command(line)
+    if raw_argv and raw_argv[0] == "/resume":
+        if len(raw_argv) < 2:
+            print("用法: /resume <worktree任务目录> [用户新指令]")
+            return 2
+        path, rest = _recover_task_path(raw_argv[1:])
+        raw_argv = ["--resume", path]
+        if rest:
+            raw_argv.extend(["--task", " ".join(rest)])
+        argv = raw_argv
 
     parser = build_arg_parser()
     args = parser.parse_args(argv)

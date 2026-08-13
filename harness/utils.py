@@ -422,6 +422,9 @@ class RunLogger:
             "type": event_type,
             "payload": payload,
         }
+        run_id = str(getattr(self, "run_id", "") or "").strip()
+        if run_id:
+            event["runId"] = run_id
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
         if self.on_event:
@@ -655,10 +658,23 @@ def write_context_snapshot(
     messages: List[JsonDict],
     tools: List[JsonDict],
     metadata: Optional[JsonDict] = None,
+    run_id: Optional[str] = None,
 ) -> str:
-    """Persist the compacted model context currently held by an agent."""
+    """Persist the compacted model context currently held by an agent.
+
+    Existing callers retain the historical ``<name>-final-context.json``
+    filename.  Resume-aware callers can provide ``run_id`` to retain one
+    snapshot per harness run instead of overwriting the previous run's audit
+    record.
+    """
     safe_name = safe_path_component(name, fallback=actor)
-    path = task_subdir(logger, "contexts") / f"{safe_name}-final-context.json"
+    safe_run_id = safe_path_component(run_id, fallback="run") if run_id else ""
+    filename = (
+        f"{safe_name}-{safe_run_id}-final-context.json"
+        if safe_run_id
+        else f"{safe_name}-final-context.json"
+    )
+    path = task_subdir(logger, "contexts") / filename
     payload = {
         "actor": actor,
         "name": name,
@@ -674,16 +690,16 @@ def write_context_snapshot(
         json.dumps(payload, ensure_ascii=False, indent=2, default=str),
         encoding="utf-8",
     )
-    logger.write(
-        "context.snapshot.saved",
-        {
-            "actor": actor,
-            "name": name,
-            "path": str(path.resolve()),
-            "messageCount": len(messages),
-            "toolCount": len(tools),
-        },
-    )
+    event = {
+        "actor": actor,
+        "name": name,
+        "path": str(path.resolve()),
+        "messageCount": len(messages),
+        "toolCount": len(tools),
+    }
+    if run_id:
+        event["runId"] = str(run_id)
+    logger.write("context.snapshot.saved", event)
     return str(path.resolve())
 
 

@@ -100,6 +100,56 @@ Anthropic 示例：
 
 旧配置 `enable_cache_control` 仍兼容，但仅在未设置 `cache_control_mode` 时生效。
 
+### 思考 / 推理模式
+
+`extra_params` 的三个键控制模型思考/推理，**同时支持 OpenAI 格式和 Anthropic 格式**
+provider，并且**每个角色都能单独配**（见下）：
+
+- `thinking` - 思考开关。接受 `bool`、字符串 `"enabled"`/`"disabled"`/`"on"`/`"off"`/`"true"`/`"false"`，
+  或原样透传的 `dict`（方舟/DeepSeek 的 `{"type": "enabled"}`、Claude 扩展思考的
+  `{"type": "enabled", "budget_tokens": 8192}`、厂商支持时的 `{"type": "auto"}`／`{"type": "adaptive"}`）。
+- `reasoning_effort` - 思考强度：`"none"`、`"minimal"`、`"low"`、`"medium"`、`"high"`、`"xhigh"`、`"max"`。
+  模型不支持的取值文档明确是「不生效」而非报错，所以整套枚举原样转发，不按模型裁剪。
+- `effort` - `reasoning_effort` 的简写别名（同时写时前者赢）。
+
+线路翻译：
+
+| 配置 | OpenAI 格式 | Anthropic 格式 |
+|---|---|---|
+| `thinking` 开/关 | `extra_body={"thinking":{"type":"enabled/disabled"}}`（厂商扩展，SDK 无此 kwarg） | 原生 `thinking=` kwarg；`true` 翻成 `{"type":"enabled","budget_tokens":N}`，因为官方 SDK 把 budget 标为必填 |
+| `reasoning_effort` / `effort` | 顶级 `reasoning_effort` | 原生 `output_config={"effort":<级别>}`；`none`/`minimal` 改用开关表达 |
+
+不无中生有：没写的键不会产生任何线路字段。显式关闭 + 又给了思考级别时，丢弃级别并告警
+（方舟文档明确这一组合报错）。
+
+说明：
+
+- 思维链在 OpenAI 格式里通过 `reasoning_content`（方舟摘要类模型另加 `encrypted_content`）返回，
+  在 Anthropic 格式里是 `thinking` 块。两个 provider 都会捕获并在下一轮通过 assistant prefix 块回传：
+  DeepSeek 的工具调用轮次不回传 `reasoning_content` 会 400；方舟不报错，但回传后思维链可参与后续推理，
+  且 `encrypted_content` 的优先级高于摘要。
+- 本项目不建模的厂商私有字段（例如 DeepSeek Anthropic 格式的 `{"reasoning": {"effort": ...}}`）
+  写在 `extra_params.extra_body` 里，两个 provider 都原样透传——不在通用层猜方言。
+- 对方舟 Anthropic 兼容端点 `/api/coding` 实测（glm-5.2，2026-08-13）：**只有 `thinking.type` 生效**，
+  `output_config`、`reasoning`、`reasoning_effort` 都被接受但静默忽略。需要调 effort 请走 OpenAI 格式端点。
+
+按角色配置——顶层 `extra_params` 是 lead 与 worker 的默认值，可选的 `lead` / `worker` 段浅合并覆盖它；
+其余角色各有自己的段：
+
+```json
+{
+  "extra_params": { "thinking": true, "reasoning_effort": "max", "max_tokens": 24000 },
+  "lead":   { "extra_params": { "reasoning_effort": "max" } },
+  "worker": { "extra_params": { "reasoning_effort": "high" } },
+  "vl": {
+    "extra_params": { "thinking": false },
+    "captcha_solve_extra_params": { "thinking": true, "reasoning_effort": "low" }
+  },
+  "plan_validator":  { "extra_params": { "reasoning_effort": "low" } },
+  "claim_extractor": { "extra_params": { "thinking": false } }
+}
+```
+
 ### 浏览器
 
 默认浏览器请求格式是 `flat`：
@@ -189,6 +239,23 @@ echo "打开 https://example.com 并总结页面。" | python main.py
 ```bash
 python main.py --agent-id demo-agent --max-steps 20 --task "检查当前 Fleet 列表。"
 ```
+
+按 phase 粒度恢复中断任务：
+
+```bash
+python main.py --resume worktree/<task_id> --task "补充指令"
+```
+
+交互提示符中的等价写法是 `/resume <任务目录> [补充指令]`。已经
+`validated_done` 的 phase 及其当前有效 artifact 会保留；未完成 phase
+会整段重跑。若进程停止时某个 phase 正在运行，重跑前必须由用户确认；
+非交互模式需显式传入 `--resume-retry-interrupted`。历史 Fleet/page 仅作为
+当前任务拥有的弱恢复候选，必须重新通过浏览器 inventory 验证；失效时回落
+到普通路由。
+
+任务目录、`task_plan.json` 或 `task_state.json` 被删除或损坏时，resume
+会严格失败。校验发生在创建 `RunLogger` 之前，因此不会把已删除的 worktree
+静默重建成一个空任务。
 
 ## 日志与 Artifacts
 
