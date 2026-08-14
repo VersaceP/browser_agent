@@ -1,0 +1,232 @@
+{
+  "protocol": "v4.1-replay-baseline-v2",
+  "mode": "historical-observation-only",
+  "behavioralConclusion": null,
+  "limitation": "Historical traces contain only enforced outcomes. Blocking events identify replay candidates but cannot reveal the bypassed browser receipt or the model's subsequent action. A model-backed replay is required before removing production enforcement.",
+  "runs": {
+    "06fc0bb4b6c74146ad86c34b6626eb5f": {
+      "purpose": "active early final and numeric-gate friction",
+      "sourceSegment": "events with no runId (original run only)",
+      "acceptedPlanVersions": 3,
+      "rejectedPlanEmits": 5,
+      "reviewerCalls": 4,
+      "leadFinalToolCalls": 4,
+      "leadContextBytes": 441189,
+      "contextSnapshots": 4,
+      "workerGateShadow": {
+        "workerTraceCount": 3,
+        "observedGateEvents": 13,
+        "observedBlockingEvents": 13,
+        "byType": {
+          "progress_intervention": 13
+        },
+        "byReason": {
+          "local_fs_without_extraction": 4,
+          "productive_primitives_without_artifact": 9
+        },
+        "counterfactualCandidates": 13,
+        "sources": {
+          "progressAndLoop": "original run.jsonl events without runId",
+          "extractionProgressGate": "worker trace (not logged at run level)",
+          "traceMayContainResume": false
+        }
+      },
+      "leadGateShadow": {
+        "observedGateEvents": 0,
+        "byEvent": {},
+        "byTool": {},
+        "counterfactualCandidates": 0
+      }
+    },
+    "0f75b23c391c4665852ae1160544eeeb": {
+      "purpose": "zero completion receipt followed by a false completion claim",
+      "sourceSegment": "events with no runId (original run only)",
+      "acceptedPlanVersions": 2,
+      "rejectedPlanEmits": 6,
+      "reviewerCalls": 2,
+      "leadFinalToolCalls": 1,
+      "leadContextBytes": 415087,
+      "contextSnapshots": 2,
+      "workerGateShadow": {
+        "workerTraceCount": 1,
+        "observedGateEvents": 4,
+        "observedBlockingEvents": 4,
+        "byType": {
+          "progress_gate": 2,
+          "progress_intervention": 2
+        },
+        "byReason": {
+          "local_fs_without_extraction": 1,
+          "productive_primitives_without_artifact": 1,
+          "unrecorded_structured_rows": 2
+        },
+        "counterfactualCandidates": 4,
+        "sources": {
+          "progressAndLoop": "original run.jsonl events without runId",
+          "extractionProgressGate": "worker trace (not logged at run level)",
+          "traceMayContainResume": false
+        }
+      },
+      "leadGateShadow": {
+        "observedGateEvents": 0,
+        "byEvent": {},
+        "byTool": {},
+        "counterfactualCandidates": 0
+      }
+    },
+    "5e614adacc7048c7b3b1307c5c48c20c": {
+      "purpose": "plan ceremony, partial continuation, then provider quota interruption",
+      "sourceSegment": "events with no runId (original run only)",
+      "acceptedPlanVersions": 3,
+      "rejectedPlanEmits": 3,
+      "reviewerCalls": 3,
+      "leadFinalToolCalls": 0,
+      "leadContextBytes": 336964,
+      "contextSnapshots": 4,
+      "workerGateShadow": {
+        "workerTraceCount": 2,
+        "observedGateEvents": 7,
+        "observedBlockingEvents": 7,
+        "byType": {
+          "progress_intervention": 7
+        },
+        "byReason": {
+          "local_fs_without_extraction": 2,
+          "no_artifact_progress": 1,
+          "productive_primitives_without_artifact": 4
+        },
+        "counterfactualCandidates": 7,
+        "sources": {
+          "progressAndLoop": "original run.jsonl events without runId",
+          "extractionProgressGate": "worker trace (not logged at run level)",
+          "traceMayContainResume": true
+        }
+      },
+      "leadGateShadow": {
+        "observedGateEvents": 0,
+        "byEvent": {},
+        "byTool": {},
+        "counterfactualCandidates": 0
+      }
+    },
+    "a5a9bc2bb31a4eee82f3cf16f6d6ac45": {
+      "purpose": "Yingdao worker duplicate Input.click plus Lead wait repetition",
+      "sourceSegment": "events with no runId (original run only)",
+      "acceptedPlanVersions": 3,
+      "rejectedPlanEmits": 4,
+      "reviewerCalls": 0,
+      "leadFinalToolCalls": 1,
+      "leadContextBytes": 618587,
+      "contextSnapshots": 4,
+      "workerGateShadow": {
+        "workerTraceCount": 3,
+        "observedGateEvents": 8,
+        "observedBlockingEvents": 8,
+        "byType": {
+          "loop_guard": 1,
+          "progress_intervention": 7
+        },
+        "byReason": {
+          "local_fs_without_extraction": 1,
+          "loop_guard.warn": 1,
+          "productive_primitives_without_artifact": 6
+        },
+        "counterfactualCandidates": 8,
+        "sources": {
+          "progressAndLoop": "original run.jsonl events without runId",
+          "extractionProgressGate": "worker trace (not logged at run level)",
+          "traceMayContainResume": false
+        }
+      },
+      "leadGateShadow": {
+        "observedGateEvents": 2,
+        "byEvent": {
+          "loop_guard.warn": 2
+        },
+        "byTool": {
+          "wait_browser_agents": 2
+        },
+        "counterfactualCandidates": 2
+      }
+    },
+    "48b4d7d71e62405a87db6fa7f1fc1404": {
+      "purpose": "1688 product/media collection with progress interventions",
+      "sourceSegment": "events with no runId (original run only)",
+      "acceptedPlanVersions": 1,
+      "rejectedPlanEmits": 2,
+      "reviewerCalls": 1,
+      "leadFinalToolCalls": 1,
+      "leadContextBytes": 621827,
+      "contextSnapshots": 6,
+      "workerGateShadow": {
+        "workerTraceCount": 3,
+        "observedGateEvents": 4,
+        "observedBlockingEvents": 4,
+        "byType": {
+          "progress_intervention": 4
+        },
+        "byReason": {
+          "local_fs_without_extraction": 3,
+          "productive_primitives_without_artifact": 1
+        },
+        "counterfactualCandidates": 4,
+        "sources": {
+          "progressAndLoop": "original run.jsonl events without runId",
+          "extractionProgressGate": "worker trace (not logged at run level)",
+          "traceMayContainResume": false
+        }
+      },
+      "leadGateShadow": {
+        "observedGateEvents": 1,
+        "byEvent": {
+          "loop_guard.warn": 1
+        },
+        "byTool": {
+          "wait_browser_agents": 1
+        },
+        "counterfactualCandidates": 1
+      }
+    },
+    "7c90ee49e4b34f67b6c59454c7a81a28": {
+      "purpose": "Toolify listing/detail collection with broad progress interventions",
+      "sourceSegment": "events with no runId (original run only)",
+      "acceptedPlanVersions": 3,
+      "rejectedPlanEmits": 2,
+      "reviewerCalls": 0,
+      "leadFinalToolCalls": 1,
+      "leadContextBytes": 502806,
+      "contextSnapshots": 6,
+      "workerGateShadow": {
+        "workerTraceCount": 4,
+        "observedGateEvents": 19,
+        "observedBlockingEvents": 19,
+        "byType": {
+          "progress_gate": 4,
+          "progress_intervention": 15
+        },
+        "byReason": {
+          "local_fs_without_extraction": 1,
+          "no_artifact_progress": 9,
+          "productive_primitives_without_artifact": 5,
+          "unrecorded_structured_rows": 4
+        },
+        "counterfactualCandidates": 19,
+        "sources": {
+          "progressAndLoop": "original run.jsonl events without runId",
+          "extractionProgressGate": "worker trace (not logged at run level)",
+          "traceMayContainResume": false
+        }
+      },
+      "leadGateShadow": {
+        "observedGateEvents": 1,
+        "byEvent": {
+          "loop_guard.warn": 1
+        },
+        "byTool": {
+          "wait_browser_agents": 1
+        },
+        "counterfactualCandidates": 1
+      }
+    }
+  }
+}
