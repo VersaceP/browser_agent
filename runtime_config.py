@@ -4,7 +4,7 @@ runtime_config.py - 全项目统一配置表（single source of truth）。
 config.json 的四张配置表全部定义在这一个文件里：
 
     顶层             -> ModelConfig       （LLM 连接：provider/model_id/api_key/超时重试/extra_params）
-    "lead"/"worker"         -> RoleOverrideConfig  （角色级 extra_params 覆盖，浅合并顶层）
+    "lead"/"worker"         -> RoleModelConfig     （角色级模型覆盖：可换厂商/模型，extra_params 浅合并）
     "vl": {...}             -> VLConfig            （视觉模型连接 + 各 VL 角色开关）
     "plan_validator": {...} -> PlanValidatorConfig （独立计划审计模型）
     "browser": {...}        -> ABCPClientConfig    （ABCP WebSocket 连接）
@@ -20,7 +20,7 @@ config.json 里不认识的字段打印告警，不再静默吞掉写了也不�
 import json
 import os
 import sys
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -183,40 +183,111 @@ class ModelConfig:
 
 
 # ---------------------------------------------------------------------------
-# "lead" / "worker" 段：角色级 extra_params 覆盖
+# "lead" / "worker" 段：角色级模型覆盖
 # ---------------------------------------------------------------------------
 
 @dataclass
-class RoleOverrideConfig:
-    """Per-role overlay on the top-level model's ``extra_params``.
+class RoleModelConfig:
+    """Per-role override of the top-level model, for the lead and the workers.
 
-    Lead and worker share one LLM connection (provider/model_id/api_key), so
-    the only thing worth splitting is the per-call knobs: thinking mode,
-    temperature, max_tokens. Anything absent here falls back to the top-level
-    ``extra_params`` — a shallow merge, so writing one key does not wipe the
-    rest. Deliberately no provider/model_id fields: a second model is a second
-    connection and belongs in its own section, not in an overlay.
+    Every field is optional and falls back to the top-level ModelConfig, so a
+    section can be as small as one key. Two different merge rules, on purpose:
+
+      - scalars (provider/model_id/api_key/base_url/timeouts) *replace* —
+        a role can run on an entirely different vendor;
+      - ``extra_params`` *shallow-merges*, so setting one knob (thinking,
+        temperature, ...) does not wipe the rest of the top-level params.
+
+    Switching ``provider`` without also giving that vendor's ``base_url`` /
+    ``api_key`` inherits the other vendor's credentials, which fails at call
+    time; audit_config_keys warns about exactly that.
     """
 
+    provider: Optional[str] = None
+    model_id: Optional[str] = None
+    api_key: Optional[str] = None
+    api_key_env: Optional[str] = None
+    base_url: Optional[str] = None
+    base_url_env: Optional[str] = None
+    llm_api_timeout_seconds: Optional[float] = None
+    llm_timeout_max_retries: Optional[int] = None
+    llm_timeout_backoff_seconds: Optional[float] = None
+    llm_timeout_retry_interval_seconds: Optional[float] = None
     extra_params: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_dict(cls, data: Any) -> "RoleOverrideConfig":
+    def from_dict(cls, data: Any) -> "RoleModelConfig":
         if not isinstance(data, dict):
             return cls()
+        api_key_env = str(data.get("api_key_env") or "").strip() or None
+        base_url_env = str(data.get("base_url_env") or "").strip() or None
+        provider = data.get("provider")
+        if isinstance(provider, str) and provider.strip():
+            provider = provider.strip().lower()
+            if provider not in {"anthropic", "openai"}:
+                raise ValueError(
+                    "角色段 provider 仅支持 'anthropic' 或 'openai'，"
+                    f"当前值: {data.get('provider')!r}"
+                )
+        else:
+            provider = None
         return cls(
+            provider=provider,
+            model_id=(str(data["model_id"]).strip() if data.get("model_id") else None),
+            api_key=(
+                data.get("api_key")
+                or (os.environ.get(api_key_env) if api_key_env else None)
+            ),
+            api_key_env=api_key_env,
+            base_url=(
+                data.get("base_url")
+                or (os.environ.get(base_url_env) if base_url_env else None)
+            ),
+            base_url_env=base_url_env,
+            llm_api_timeout_seconds=_optional_float_config(
+                data.get("llm_api_timeout_seconds"), minimum=1.0
+            ),
+            llm_timeout_max_retries=(
+                _int_config(data.get("llm_timeout_max_retries"), 0, minimum=0, maximum=10)
+                if data.get("llm_timeout_max_retries") is not None
+                else None
+            ),
+            llm_timeout_backoff_seconds=_optional_float_config(
+                data.get("llm_timeout_backoff_seconds"), minimum=0.0
+            ),
+            llm_timeout_retry_interval_seconds=_optional_float_config(
+                data.get("llm_timeout_retry_interval_seconds"), minimum=0.0
+            ),
             extra_params=(
                 dict(data.get("extra_params"))
                 if isinstance(data.get("extra_params"), dict)
                 else {}
-            )
+            ),
         )
 
-    def apply_to(self, extra_params: Dict[str, Any]) -> Dict[str, Any]:
-        """Shallow-merge this role's overrides over the given extra_params."""
-        merged = dict(extra_params or {})
-        merged.update(self.extra_params)
-        return merged
+    def apply_to(self, model: ModelConfig) -> ModelConfig:
+        """Resolve this role's effective connection against the top-level model."""
+        merged_extra_params = dict(model.extra_params or {})
+        merged_extra_params.update(self.extra_params)
+        overrides: Dict[str, Any] = {"extra_params": merged_extra_params}
+        for name in (
+            "provider",
+            "model_id",
+            "api_key",
+            "base_url",
+            "llm_api_timeout_seconds",
+            "llm_timeout_max_retries",
+            "llm_timeout_backoff_seconds",
+            "llm_timeout_retry_interval_seconds",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                overrides[name] = value
+        return replace(model, **overrides)
+
+
+# 历史名（只覆盖 extra_params 时的旧叫法），保持旧 import 可用。
+RoleOverrideConfig = RoleModelConfig
 
 
 # ---------------------------------------------------------------------------
@@ -1236,8 +1307,8 @@ class RuntimeConfig:
     claim_extractor: ClaimExtractorConfig = field(
         default_factory=ClaimExtractorConfig
     )
-    lead: RoleOverrideConfig = field(default_factory=RoleOverrideConfig)
-    worker: RoleOverrideConfig = field(default_factory=RoleOverrideConfig)
+    lead: RoleModelConfig = field(default_factory=RoleModelConfig)
+    worker: RoleModelConfig = field(default_factory=RoleModelConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -1301,8 +1372,27 @@ def audit_config_keys(raw: JsonDict) -> List[str]:
         raw.get("claim_extractor"),
         _field_names(ClaimExtractorConfig),
     )
+    top_provider = str(raw.get("provider") or "").strip().lower()
     for _role in ("lead", "worker"):
-        check(_role, raw.get(_role), _field_names(RoleOverrideConfig))
+        section = raw.get(_role)
+        check(_role, section, _field_names(RoleModelConfig))
+        if not isinstance(section, dict):
+            continue
+        role_provider = str(section.get("provider") or "").strip().lower()
+        if role_provider and top_provider and role_provider != top_provider:
+            # Inheriting the other vendor's endpoint/key is never what anyone
+            # means; it fails at call time with an opaque auth error.
+            missing = [
+                key
+                for key in ("base_url", "api_key")
+                if not section.get(key) and not section.get(f"{key}_env")
+            ]
+            if missing:
+                warnings.append(
+                    f"{_role}.provider 是 {role_provider}，与顶层 {top_provider} 不同，"
+                    f"但没配 {'、'.join(f'{_role}.{k}' for k in missing)}，"
+                    "会沿用顶层另一家厂商的连接（调用时才报错）"
+                )
 
     harness_raw = raw.get("harness")
     if isinstance(harness_raw, dict):
@@ -1346,6 +1436,6 @@ def load_runtime_config(config_path: str, *, warn: bool = True) -> RuntimeConfig
         claim_extractor=ClaimExtractorConfig.from_dict(
             raw.get("claim_extractor", {})
         ),
-        lead=RoleOverrideConfig.from_dict(raw.get("lead", {})),
-        worker=RoleOverrideConfig.from_dict(raw.get("worker", {})),
+        lead=RoleModelConfig.from_dict(raw.get("lead", {})),
+        worker=RoleModelConfig.from_dict(raw.get("worker", {})),
     )

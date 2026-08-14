@@ -1,41 +1,39 @@
 """
 harness.model_config - Model config helpers for harness-controlled agents.
 
-Lead and worker share one LLM connection but not necessarily the same
-per-call knobs: config.json's optional "lead" / "worker" sections carry an
-``extra_params`` overlay (thinking mode, temperature, max_tokens) that is
-shallow-merged over the top-level ``extra_params`` here — the single place
-each role's effective parameters are assembled.
+The lead and the workers default to the top-level model, and config.json's
+optional "lead" / "worker" sections override it: scalars (provider, model_id,
+api_key, base_url, timeouts) replace outright, so a role can run on a
+different vendor entirely, while ``extra_params`` shallow-merges so setting
+one knob does not wipe the rest. This is the single place each role's
+effective model config is assembled.
 """
 
 from dataclasses import replace
 from typing import Optional
 
-from runtime_config import ModelConfig, RoleOverrideConfig
+from runtime_config import ModelConfig, RoleModelConfig
 
 
 def _role_model_config(
     model: ModelConfig,
-    override: Optional[RoleOverrideConfig],
+    override: Optional[RoleModelConfig],
 ) -> ModelConfig:
-    extra_params = (
-        override.apply_to(model.extra_params)
-        if override is not None
-        else dict(model.extra_params)
-    )
+    resolved = override.apply_to(model) if override is not None else model
+    extra_params = dict(resolved.extra_params)
     extra_params.setdefault("tool_choice", "required")
-    return replace(model, extra_params=extra_params)
+    return replace(resolved, extra_params=extra_params)
 
 
 def browser_agent_model_config(
     model: ModelConfig,
-    override: Optional[RoleOverrideConfig] = None,
+    override: Optional[RoleModelConfig] = None,
 ) -> ModelConfig:
     return _role_model_config(model, override)
 
 
 def lead_agent_model_config(
     model: ModelConfig,
-    override: Optional[RoleOverrideConfig] = None,
+    override: Optional[RoleModelConfig] = None,
 ) -> ModelConfig:
     return _role_model_config(model, override)

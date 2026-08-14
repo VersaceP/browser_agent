@@ -109,7 +109,9 @@ provider，并且**每个角色都能单独配**（见下）：
   或原样透传的 `dict`（方舟/DeepSeek 的 `{"type": "enabled"}`、Claude 扩展思考的
   `{"type": "enabled", "budget_tokens": 8192}`、厂商支持时的 `{"type": "auto"}`／`{"type": "adaptive"}`）。
 - `reasoning_effort` - 思考强度：`"none"`、`"minimal"`、`"low"`、`"medium"`、`"high"`、`"xhigh"`、`"max"`。
-  模型不支持的取值文档明确是「不生效」而非报错，所以整套枚举原样转发，不按模型裁剪。
+  整套枚举原样转发、不按模型裁剪，但**越界取值各家反应不同**：方舟文档说「不生效」（静默忽略），
+  DashScope 则校验后返回 400（实测传 `max` 报 `'reasoning_effort' must be one of: 'none',
+  'minimal', 'low', 'medium', 'high', 'xhigh'`）。传出 OpenAI SDK 取值集之外的值时会打告警。
 - `effort` - `reasoning_effort` 的简写别名（同时写时前者赢）。
 
 线路翻译：
@@ -133,22 +135,48 @@ provider，并且**每个角色都能单独配**（见下）：
 - 对方舟 Anthropic 兼容端点 `/api/coding` 实测（glm-5.2，2026-08-13）：**只有 `thinking.type` 生效**，
   `output_config`、`reasoning`、`reasoning_effort` 都被接受但静默忽略。需要调 effort 请走 OpenAI 格式端点。
 
-按角色配置——顶层 `extra_params` 是 lead 与 worker 的默认值，可选的 `lead` / `worker` 段浅合并覆盖它；
-其余角色各有自己的段：
+### 按角色配置模型
+
+六个角色都能单独配：**lead**、**worker**、**vl**（visual_verify / locate / arbiter /
+reality_check 共用）、**vl_captcha**（验证码自解）、**plan_validator**、**claim_extractor**。
+
+lead 与 worker 默认用顶层那份模型，可选的 `lead` / `worker` 段覆盖它——**两种合并规则**：
+
+- 标量（`provider` / `model_id` / `api_key` / `base_url` / 超时重试）**整体替换**，
+  所以某个角色可以整个换到另一家厂商；
+- `extra_params` **浅合并**，改一个旋钮不会把顶层其它参数冲掉。
+
+换了 `provider` 却没给那家的 `base_url` / `api_key` 时，会沿用顶层另一家的连接并在调用时报错，
+config 装载会提前告警。其余角色各有自己的段（都带 `provider` / `model_id` / `api_key`）。
 
 ```json
 {
-  "extra_params": { "thinking": true, "reasoning_effort": "max", "max_tokens": 24000 },
-  "lead":   { "extra_params": { "reasoning_effort": "max" } },
-  "worker": { "extra_params": { "reasoning_effort": "high" } },
-  "vl": {
-    "extra_params": { "thinking": false },
-    "captcha_solve_extra_params": { "thinking": true, "reasoning_effort": "low" }
+  "provider": "anthropic",
+  "model_id": "glm-5.2",
+  "base_url": "https://ark.cn-beijing.volces.com/api/coding",
+  "extra_params": { "thinking": { "type": "enabled" }, "max_tokens": 24000 },
+
+  "lead":   { "extra_params": { "thinking": { "type": "enabled" } } },
+  "worker": {
+    "provider": "openai",
+    "model_id": "glm-5.2",
+    "base_url": "https://ark.cn-beijing.volces.com/api/coding/v3",
+    "api_key": "<另一把 key>",
+    "extra_params": { "thinking": { "type": "disabled" } }
   },
-  "plan_validator":  { "extra_params": { "reasoning_effort": "low" } },
-  "claim_extractor": { "extra_params": { "thinking": false } }
+
+  "vl": {
+    "extra_params": { "thinking": { "type": "enabled" } },
+    "captcha_solve_extra_params": { "max_tokens": 2500 }
+  },
+  "plan_validator":  { "extra_params": { "thinking": { "type": "enabled" } } },
+  "claim_extractor": { "extra_params": { "thinking": { "type": "disabled" } } }
 }
 ```
+
+`{"type": "enabled"}` 这种 dict 写法在两种 wire 格式上都实测可用（方舟 `/api/coding`、
+DashScope compatible-mode），且不会像 `true` 那样在 Anthropic 路上额外合成 `budget_tokens`——
+需要 Claude 扩展思考时再显式写 `budget_tokens`。
 
 ### 浏览器
 

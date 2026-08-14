@@ -116,8 +116,12 @@ Three `extra_params` keys control model thinking/reasoning. They work for
   `{"type": "enabled", "budget_tokens": 8192}` for Claude extended thinking,
   `{"type": "auto"}` / `{"type": "adaptive"}` where the vendor supports it).
 - `reasoning_effort` — thinking depth: `"none"`, `"minimal"`, `"low"`,
-  `"medium"`, `"high"`, `"xhigh"`, `"max"`. Values a model does not support are
-  documented as no-ops rather than errors, so the full set is forwarded as-is.
+  `"medium"`, `"high"`, `"xhigh"`, `"max"`. The full set is forwarded as-is with
+  no per-model whitelist, but **out-of-range values are handled differently per
+  vendor**: Ark documents them as no-ops, while DashScope returns 400 (measured:
+  `max` → `'reasoning_effort' must be one of: 'none', 'minimal', 'low',
+  'medium', 'high', 'xhigh'`). Anything outside the OpenAI SDK's own Literal is
+  forwarded with a warning.
 - `effort` — short alias for `reasoning_effort` (loses to it).
 
 Wire translation:
@@ -149,23 +153,53 @@ Notes:
   silently ignored. Use the OpenAI-format endpoint if you need effort control
   on Ark.
 
-Per-role configuration — the top-level `extra_params` is the default for the
-lead and worker agents, and the optional `lead` / `worker` sections shallow-merge
-over it. Each auxiliary role owns its own section:
+### Per-role model configuration
+
+Six roles are configured independently: **lead**, **worker**, **vl**
+(visual_verify / locate / arbiter / reality_check), **vl_captcha** (CAPTCHA
+auto-solve), **plan_validator**, **claim_extractor**.
+
+The lead and workers default to the top-level model; the optional `lead` /
+`worker` sections override it with **two merge rules**:
+
+- scalars (`provider`, `model_id`, `api_key`, `base_url`, timeouts) **replace**,
+  so a role can run on an entirely different vendor;
+- `extra_params` **shallow-merges**, so setting one knob does not wipe the rest.
+
+Overriding `provider` without that vendor's `base_url` / `api_key` inherits the
+other vendor's connection and fails at call time; config loading warns about it
+up front. Every other role owns a full section (`provider` / `model_id` /
+`api_key` included).
 
 ```json
 {
-  "extra_params": { "thinking": true, "reasoning_effort": "max", "max_tokens": 24000 },
-  "lead":   { "extra_params": { "reasoning_effort": "max" } },
-  "worker": { "extra_params": { "reasoning_effort": "high" } },
-  "vl": {
-    "extra_params": { "thinking": false },
-    "captcha_solve_extra_params": { "thinking": true, "reasoning_effort": "low" }
+  "provider": "anthropic",
+  "model_id": "glm-5.2",
+  "base_url": "https://ark.cn-beijing.volces.com/api/coding",
+  "extra_params": { "thinking": { "type": "enabled" }, "max_tokens": 24000 },
+
+  "lead":   { "extra_params": { "thinking": { "type": "enabled" } } },
+  "worker": {
+    "provider": "openai",
+    "model_id": "glm-5.2",
+    "base_url": "https://ark.cn-beijing.volces.com/api/coding/v3",
+    "api_key": "<the other key>",
+    "extra_params": { "thinking": { "type": "disabled" } }
   },
-  "plan_validator":  { "extra_params": { "reasoning_effort": "low" } },
-  "claim_extractor": { "extra_params": { "thinking": false } }
+
+  "vl": {
+    "extra_params": { "thinking": { "type": "enabled" } },
+    "captcha_solve_extra_params": { "max_tokens": 2500 }
+  },
+  "plan_validator":  { "extra_params": { "thinking": { "type": "enabled" } } },
+  "claim_extractor": { "extra_params": { "thinking": { "type": "disabled" } } }
 }
 ```
+
+The `{"type": "enabled"}` dict form is measured working on both wire formats
+(Ark `/api/coding` and DashScope compatible-mode) and, unlike `true`, does not
+synthesise a `budget_tokens` on the Anthropic path — write `budget_tokens`
+explicitly when you want Claude extended thinking.
 
 ### Browser
 

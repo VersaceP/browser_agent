@@ -73,11 +73,17 @@ _THINKING_DISABLED_TOKENS = (
     "disabled", "disable", "off", "false", "no", "0",
 )
 
-# Ark/DeepSeek accept none|minimal|low|medium|high|xhigh|max; OpenAI's SDK
-# Literal is none|minimal|low|medium|high|xhigh (no max). Both are unvalidated
-# at runtime and a level the model does not support is documented as "不生效",
-# so the union is accepted and forwarded verbatim - no per-model whitelist.
+# Ark/DeepSeek accept none|minimal|low|medium|high|xhigh|max, so the union is
+# what this module accepts and forwards verbatim - no per-model whitelist.
 _VALID_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+
+# openai.types.shared.ReasoningEffort, i.e. what the OpenAI SDK's own Literal
+# admits (`max` is not a member). Whether a value outside it is tolerated is
+# the server's call and it differs sharply: Ark documents unsupported levels as
+# "不生效", while DashScope replies 400 "'reasoning_effort' must be one of:
+# 'none', 'minimal', 'low', 'medium', 'high', 'xhigh'" (measured 2026-08-13).
+# Forward it either way - the user asked for it - but say so out loud.
+_OPENAI_SDK_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh")
 
 # Effort levels that MEAN "no thinking" rather than "how much thinking".
 _OFF_EFFORTS = ("none", "minimal")
@@ -253,6 +259,12 @@ def openai_thinking_request(
 
     effort = _resolve_effort(intent, warnings)
     if effort is not None:
+        if effort not in _OPENAI_SDK_EFFORTS:
+            warnings.append(
+                f"reasoning_effort={effort!r} 不在 OpenAI SDK 的取值集"
+                f"（{'/'.join(_OPENAI_SDK_EFFORTS)}）内：方舟会忽略，"
+                "DashScope 之类会校验后返回 400"
+            )
         top["reasoning_effort"] = effort
     return top, extra_body, tuple(warnings)
 
