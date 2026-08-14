@@ -2098,14 +2098,26 @@ class LeadAgent:
         )
         return self.strategy_bank
 
-    async def review_task_plan_candidate(self, raw_plan: Any) -> JsonDict:
+    async def review_task_plan_candidate(
+        self,
+        raw_plan: Any,
+        *,
+        extension: bool = False,
+    ) -> JsonDict:
         """Run the optional independent semantic audit without mutating state."""
 
+        # An extension carries the accepted plan forward phase for phase, so the
+        # currently accepted plan IS its immutable baseline.  A missing plan.0001
+        # only costs the reviewer the original generation; it cannot hide a
+        # rewrite that an extension is structurally unable to perform.  A general
+        # replan still fails closed, because there the baseline is what bounds
+        # how far the model may move the contract.
         if (
             self.resume is not None
             and self.task_plan is not None
             and not self.resume.initial_plan_recovered
             and self.runtime.plan_validator.enabled
+            and not extension
         ):
             return {
                 "status": "error",
@@ -2235,6 +2247,7 @@ class LeadAgent:
         raw_plan: Any,
         *,
         plan_validator_review: Optional[JsonDict] = None,
+        resume_decision: str = "replan",
     ) -> JsonDict:
         replan_reason = ""
         if self.task_plan is not None:
@@ -2292,6 +2305,37 @@ class LeadAgent:
             }
             self.logger.write("task_plan.rejected", result)
             return result
+
+        if resume_decision == "extend":
+            # Normalization runs again over the copied phases, and a worktree
+            # accepted by an older normalizer can come back shaped differently.
+            # Phase identity and order are checked here because the evidence
+            # fingerprints below are compared per id and would not notice a
+            # reordering, which silently rewrites every omitted depends_on.
+            accepted_ids = [
+                str(phase.get("id") or "")
+                for phase in (self.task_plan or {}).get("phases", [])
+                if isinstance(phase, dict)
+            ]
+            candidate_ids = [
+                str(phase.get("id") or "")
+                for phase in plan.get("phases", [])
+                if isinstance(phase, dict)
+            ]
+            if candidate_ids[: len(accepted_ids)] != accepted_ids:
+                result = {
+                    "status": "failed",
+                    "error": "extension did not preserve the accepted phase order",
+                    "acceptedPhaseIds": accepted_ids,
+                    "candidatePhaseIds": candidate_ids,
+                    "next_instruction": (
+                        "The accepted phases must remain the unchanged prefix of"
+                        " an extended plan. Emit one complete revised plan with"
+                        " replan_reason if they genuinely have to change."
+                    ),
+                }
+                self.logger.write("task_plan.rejected", result)
+                return result
 
         if self.runtime.plan_validator.enabled:
             operational_continuation = (
@@ -2436,6 +2480,34 @@ class LeadAgent:
                 }
                 self.logger.write("task_plan.rejected", result)
                 return result
+            if resume_decision == "extend":
+                # This is the reconciliation the invalidation logic itself will
+                # use, computed before anything is written, so it is the exact
+                # place to prove an extension retired nothing.  Artifact-level
+                # findings are deliberately excluded: a file that disappeared
+                # from disk between runs is an environmental fact that a general
+                # replan would face identically, and reporting it is more useful
+                # than blaming the extension for it.
+                contract_damage = {
+                    key: resume_replan_report.get(key) or []
+                    for key in ("removedPhases", "changedEvidencePhases")
+                    if resume_replan_report.get(key)
+                }
+                if contract_damage:
+                    result = {
+                        "status": "failed",
+                        "error": "extension would retire accepted phase evidence",
+                        **contract_damage,
+                        "next_instruction": (
+                            "An extension may only append phases. These accepted"
+                            " phases would lose their validated evidence, so"
+                            " nothing was written. Emit one complete revised plan"
+                            " with replan_reason if that is genuinely intended."
+                        ),
+                    }
+                    self.logger.write("task_plan.rejected", result)
+                    return result
+
             preserve_from = resume_replan_report["state"]
             resumes = preserve_from.get("resumes")
             if isinstance(resumes, list) and resumes:
@@ -2470,6 +2542,28 @@ class LeadAgent:
             user_task=self.original_user_task,
             validator_review=validator_record,
         )
+        if resume_decision == "extend" and isinstance(preserve_from, dict):
+            # resume_keep_plan records its decision in the resume audit, so a
+            # reader of task_state.json alone must also be able to tell a
+            # protected extension from a general replan.  Appended rather than
+            # assigned: one resume may extend more than once.
+            audit_resumes = preserve_from.get("resumes")
+            if (
+                isinstance(audit_resumes, list)
+                and audit_resumes
+                and isinstance(audit_resumes[-1], dict)
+            ):
+                decisions = audit_resumes[-1].setdefault("extensionDecisions", [])
+                if isinstance(decisions, list):
+                    decisions.append({
+                        "reason": replan_reason,
+                        "planVersion": plan_version.get("planVersion"),
+                        "baselineKind": "current_plan_immutable_prefix",
+                        "initialPlanRecovered": (
+                            bool(self.resume.initial_plan_recovered)
+                            if self.resume is not None else None
+                        ),
+                    })
         plan_warnings = (
             plan.get("warnings") if isinstance(plan.get("warnings"), list) else []
         )
@@ -2561,14 +2655,17 @@ class LeadAgent:
                     )
         if self.resume is not None and replan_reason:
             self._resume_instruction_pending = False
-            self.logger.write(
-                "resume.instruction.reviewed",
-                {
-                    "decision": "replan",
-                    "reason": replan_reason,
-                    "runId": self.resume.run_id or None,
-                },
-            )
+            decision_record: JsonDict = {
+                "decision": resume_decision,
+                "reason": replan_reason,
+                "runId": self.resume.run_id or None,
+            }
+            if resume_decision == "extend":
+                decision_record["baselineKind"] = "current_plan_immutable_prefix"
+                decision_record["initialPlanRecovered"] = bool(
+                    self.resume.initial_plan_recovered
+                )
+            self.logger.write("resume.instruction.reviewed", decision_record)
             if isinstance(resume_replan_report, dict):
                 result["resumeReconciliation"] = {
                     key: resume_replan_report.get(key)
@@ -2582,6 +2679,136 @@ class LeadAgent:
                     )
                 }
         return result
+
+    async def extend_task_plan(
+        self,
+        new_phases: Any,
+        replan_reason: str,
+    ) -> JsonDict:
+        """Append phases a resume instruction authorized.
+
+        The accepted phases are copied here rather than restated by the caller.
+        That is the whole point: a model asked to reproduce a plan it did not
+        write will eventually reword an objective whose prose carries the only
+        declared source URL, or drop a validator, and the harness would
+        correctly but uselessly retire hours of validated evidence.
+
+        What is guaranteed is that accepted phases keep their status, evidence
+        and artifacts, not that their text survives byte for byte.  Validation
+        normalizes the copied phases again, so a worktree written by an older
+        normalizer can come back with different execution prose; that is
+        reported, and only a change to the evidence contract is refused.
+        """
+
+        reason = str(replan_reason or "").strip()
+        if self.resume is None or not str(self.resume.instruction or "").strip():
+            return {
+                "status": "not_resumed",
+                "error": (
+                    "extend_task_plan requires a resumed run carrying a user"
+                    " instruction"
+                ),
+                "tool_was_executed": False,
+                "next_instruction": (
+                    "Only a user instruction authorizes new phases. Continue the"
+                    " pending phases of the accepted plan."
+                ),
+            }
+        if self.task_plan is None:
+            return {
+                "status": "plan_required",
+                "error": "there is no accepted plan to extend",
+                "tool_was_executed": False,
+                "next_instruction": "Call emit_task_plan with the complete plan.",
+            }
+        if not reason:
+            return {
+                "status": "invalid_extension",
+                "error": "replan_reason must be non-empty",
+                "tool_was_executed": False,
+            }
+        phases = new_phases if isinstance(new_phases, list) else []
+        phases = [phase for phase in phases if isinstance(phase, dict)]
+        if not phases:
+            return {
+                "status": "invalid_extension",
+                "error": "new_phases must contain at least one phase object",
+                "tool_was_executed": False,
+            }
+
+        accepted_phases = [
+            phase for phase in self.task_plan.get("phases", [])
+            if isinstance(phase, dict)
+        ]
+        accepted_ids = {str(phase.get("id") or "") for phase in accepted_phases}
+        conflicting = sorted(
+            str(phase.get("id") or "")
+            for phase in phases
+            if str(phase.get("id") or "") in accepted_ids
+        )
+        if conflicting:
+            return {
+                "status": "invalid_extension",
+                "error": "new phase ids collide with accepted phases",
+                "conflictingPhaseIds": conflicting,
+                "tool_was_executed": False,
+                "next_instruction": (
+                    "Give each new phase its own id. Reusing an accepted id to"
+                    " redo its work is a replan, not an extension."
+                ),
+            }
+
+        candidate = copy.deepcopy(self.task_plan)
+        # warnings are acceptance receipts produced by the previous validation,
+        # not plan input; resubmitting them would echo stale advice forward.
+        candidate.pop("warnings", None)
+        candidate["phases"] = copy.deepcopy(accepted_phases) + copy.deepcopy(phases)
+        candidate["replan_reason"] = reason
+
+        review = await self.review_task_plan_candidate(candidate, extension=True)
+        review_status = str(review.get("status") or "")
+        if self.runtime.plan_validator.enabled and review_status != "approved":
+            # Acceptance would otherwise let a mechanically valid candidate
+            # through when the reviewer is merely unavailable.  Whether a new
+            # target is one the user actually authorized has no mechanical
+            # answer, so an unreviewed extension has nothing checking it.
+            # Note that a general replan is NOT the fallback here: acceptance
+            # still admits one unreviewed in this state, which is why the
+            # guidance below refuses to point at it.
+            result = {
+                "status": "failed",
+                "error": (
+                    "extension requires an approving independent plan review"
+                ),
+                "planValidator": review,
+                "tool_was_executed": False,
+                "next_instruction": (
+                    # Never route an unavailable reviewer toward a general
+                    # replan: acceptance lets a mechanically valid replacement
+                    # plan through unreviewed in exactly this state, so the
+                    # suggestion would hand the model a way to rewrite the very
+                    # phases this refusal is protecting.
+                    "The independent reviewer was unavailable or broke its"
+                    " response protocol. This says nothing about the phases you"
+                    " proposed. The accepted plan and its results are untouched:"
+                    " continue its pending phases, retry this extension later,"
+                    " or report the reviewer outage to the user as a blocker."
+                    " Replacing the plan wholesale is not a way around this."
+                    if review_status == "error" else
+                    "The reviewer rejected these added phases on the merits."
+                    " Correct the reported findings and extend again. Emit a"
+                    " complete revised plan with replan_reason only if the user"
+                    " actually asked to change the existing phases."
+                ),
+            }
+            self.logger.write("task_plan.rejected", result)
+            return result
+
+        return self.accept_task_plan(
+            candidate,
+            plan_validator_review=review,
+            resume_decision="extend",
+        )
 
     def _cached_abcp_methods(self) -> Set[str]:
         return read_schema_methods_from_dirs([
@@ -2951,9 +3178,20 @@ class LeadAgent:
                 " or model conversation is still live. Re-perceive any reused"
                 " browser page before acting."
                 + (
-                    " Before spawning, either emit one complete revised plan"
-                    " with replan_reason if the resume instruction changes the"
-                    " contract, or call resume_keep_plan with a concrete reason."
+                    " Before spawning, decide what the resume instruction does"
+                    " to the accepted plan. It adds targets and changes nothing"
+                    " about the existing ones: call extend_task_plan with only"
+                    " the new phases. It revisits existing targets —"
+                    " recollecting them, or changing their fields, sources,"
+                    " validators, or acceptance criteria: emit one complete"
+                    " revised plan with replan_reason. It changes only how to"
+                    " execute the plan already accepted: call resume_keep_plan"
+                    " with a concrete reason. Prefer extend_task_plan when it"
+                    " applies; restating phases you did not author risks"
+                    " retiring their validated evidence. If the instruction also"
+                    " asks for one combined deliverable over old and new"
+                    " results, that is not a phase: collect first, then call"
+                    " lead_save_artifact with mode=\"reference_merge\"."
                     if resume_instruction else ""
                 )
                 + "\n\n"

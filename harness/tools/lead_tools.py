@@ -690,6 +690,39 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
     return schema
 
 
+def _extend_task_plan_schema(_: Any = None) -> JsonDict:
+    plan_schema = _emit_task_plan_schema()["properties"]["plan"]["properties"]
+    return {
+        "type": "object",
+        "properties": {
+            "new_phases": {
+                "type": "array",
+                "minItems": 1,
+                "description": (
+                    "ONLY the phases being added. The accepted phases are"
+                    " carried forward by the harness and must not appear here."
+                    " Each new phase follows the same shape as an emit_task_plan"
+                    " phase and needs an id no accepted phase already uses."
+                    " depends_on may reference accepted phase ids when a new"
+                    " phase has to wait for one of them or read its artifact."
+                    " Every phase here is browser work: do not add one whose job"
+                    " is to merge or reshape artifacts that already exist."
+                ),
+                "items": plan_schema["phases"]["items"],
+            },
+            "replan_reason": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "Why the user's resume instruction authorizes these phases."
+                ),
+            },
+        },
+        "required": ["new_phases", "replan_reason"],
+        "additionalProperties": False,
+    }
+
+
 def _spawn_browser_agent_schema(_: Any = None) -> JsonDict:
     return {
         "type": "object",
@@ -1185,6 +1218,33 @@ async def _lead_resume_keep_plan(ctx: ToolContext) -> JsonDict:
     }
 
 
+@LEAD_TOOLS.register(
+    name="extend_task_plan",
+    description=(
+        "Append new phases the user's resume instruction asks for. Every"
+        " accepted phase keeps its validated status, evidence and artifacts."
+        " Use this when the instruction adds targets and changes nothing about"
+        " the existing ones — typically more URLs of the same kind."
+        " Use emit_task_plan with replan_reason instead when the instruction"
+        " revisits existing targets: re-collecting them, changing their fields,"
+        " sources, validators, or acceptance criteria."
+        " To deliver one combined table over old and new results, do NOT add a"
+        " phase for it: every plan phase runs in a browser, and merging"
+        " artifacts is not browser work. Append only the collection phases, and"
+        " once they are validated call lead_save_artifact with"
+        " mode=\"reference_merge\" citing the old and new artifacts."
+        " Available only while resuming a run that carries a user instruction."
+    ),
+    input_schema=_extend_task_plan_schema,
+    loop_guard=False,
+)
+async def _lead_extend_task_plan(ctx: ToolContext) -> JsonDict:
+    return await ctx.agent.extend_task_plan(
+        ctx.tool_input.get("new_phases"),
+        str(ctx.tool_input.get("replan_reason") or ""),
+    )
+
+
 def _resume_instruction_gate_rejection(agent: Any) -> Optional[JsonDict]:
     if not getattr(agent, "_resume_instruction_pending", False):
         return None
@@ -1198,8 +1258,9 @@ def _resume_instruction_gate_rejection(agent: Any) -> Optional[JsonDict]:
         "next_instruction": (
             "Call resume_keep_plan with a concrete reason if the plan's"
             " sources/artifacts/validators/phases/dependencies are still"
-            " correct, or emit a complete revised task_plan with"
-            " replan_reason before spawning or finishing."
+            " correct, call extend_task_plan if the instruction only adds new"
+            " targets or deliverables on top of them, or emit a complete revised"
+            " task_plan with replan_reason before spawning or finishing."
         ),
     }
 
@@ -2676,8 +2737,14 @@ def _matching_exhaustion(exhausted: List[JsonDict], phase_id: Any) -> Any:
     return exhausted[-1]
 
 
+RESUME_ONLY_LEAD_TOOLS = frozenset({"resume_keep_plan", "extend_task_plan"})
+
+
 def build_lead_agent_tool_specs(*, include_resume: bool = False) -> List[JsonDict]:
     specs = LEAD_TOOLS.tool_specs()
     if include_resume:
         return specs
-    return [spec for spec in specs if spec.get("name") != "resume_keep_plan"]
+    return [
+        spec for spec in specs
+        if spec.get("name") not in RESUME_ONLY_LEAD_TOOLS
+    ]
