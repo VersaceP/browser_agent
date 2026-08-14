@@ -457,6 +457,8 @@ def _semantic_trace_summary(trace_summary: JsonDict) -> JsonDict:
         "pageIds": trace_summary.get("pageIds", []),
         "errors": trace_summary.get("errors", []),
         "progressInterventionCount": trace_summary.get("progressInterventionCount", 0),
+        "progressObservations": trace_summary.get("progressObservations", []),
+        "progressObservationCount": trace_summary.get("progressObservationCount", 0),
         "loopNudgeCount": trace_summary.get("loopNudgeCount", 0),
         "stallReplanRecommended": trace_summary.get("stallReplanRecommended"),
         "latestPageStats": trace_summary.get("latestPageStats"),

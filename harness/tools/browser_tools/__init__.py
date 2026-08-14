@@ -508,6 +508,34 @@ def _contains_truncated_receipt(value: Any) -> bool:
 
 
 async def execute_browser_tool(agent: Any, tool_call: JsonDict, step: int) -> Tuple[JsonDict, bool]:
+    """Execute one worker tool and attach non-blocking progress observations.
+
+    ProgressAccountant still computes exactly the same arithmetic facts, but
+    production execution no longer treats its interpretation as permission to
+    run the tool.  Mutating the returned dict in place also updates the trace
+    entry that the implementation has already appended, so replay/audit sees
+    the same receipt the model saw.
+    """
+    agent._pending_progress_observations = []
+    result, should_stop = await _execute_browser_tool_impl(agent, tool_call, step)
+    observations = list(
+        getattr(agent, "_pending_progress_observations", None) or []
+    )
+    if observations and isinstance(result, dict):
+        result["progressObservations"] = observations
+        result["progressObservationNotice"] = (
+            "These are attributed arithmetic observations from the progress"
+            " accountant. The requested tool was executed; use its real"
+            " receipt and these facts to choose the next action."
+        )
+    return result, should_stop
+
+
+async def _execute_browser_tool_impl(
+    agent: Any,
+    tool_call: JsonDict,
+    step: int,
+) -> Tuple[JsonDict, bool]:
     name = str(tool_call.get("name") or "")
     raw_tool_input = tool_call.get("input") or {}
     tool_input = (
@@ -594,10 +622,7 @@ async def execute_browser_tool(agent: Any, tool_call: JsonDict, step: int) -> Tu
             return contract_result, False
 
     if action.progress_check:
-        progress_result = _check_progress_before(agent, name, tool_input, step)
-        if progress_result is not None:
-            agent.trace.append({"type": "progress_intervention", "result": progress_result})
-            return progress_result, False
+        _observe_progress_before(agent, name, tool_input, step)
 
     result = await action.handler(ctx)
     if action.trace_type:
@@ -2166,16 +2191,13 @@ async def _execute_browser_capability_tool(
         attach_method_schema(result, method, agent.method_schemas)
         agent.logger.write("browser.call.params_error", result)
         _observe_progress_after(agent, method or "browser_call.params_error", result)
-        progress_result = _check_progress_before(
+        _observe_progress_before(
             agent,
             method or "browser_call",
             params if isinstance(params, dict) else tool_input,
             step,
             charge_diagnostic=False,
         )
-        if progress_result is not None:
-            agent.trace.append({"type": "progress_intervention", "result": progress_result})
-            return progress_result, False
         agent.trace.append({"type": "browser_call_params_error", "result": result})
         return result, False
 
@@ -2188,13 +2210,10 @@ async def _execute_browser_capability_tool(
         attach_method_schema(result, method, agent.method_schemas)
         agent.logger.write("browser.call.rejected", result)
         _observe_progress_after(agent, method or "browser_call_rejected", result)
-        progress_result = _check_progress_before(
+        _observe_progress_before(
             agent, method or "browser_call", params, step,
             charge_diagnostic=False,
         )
-        if progress_result is not None:
-            agent.trace.append({"type": "progress_intervention", "result": progress_result})
-            return progress_result, False
         agent.trace.append({"type": "browser_call_rejected", "result": result})
         return result, False
 
@@ -2311,13 +2330,10 @@ async def _execute_browser_capability_tool(
         attach_method_schema(contract_result, method, agent.method_schemas)
         agent.logger.write("browser.call.contract_violation", contract_result)
         _observe_progress_after(agent, method or "browser_call.contract_violation", contract_result)
-        progress_result = _check_progress_before(
+        _observe_progress_before(
             agent, method or "browser_call", params, step,
             charge_diagnostic=False,
         )
-        if progress_result is not None:
-            agent.trace.append({"type": "progress_intervention", "result": progress_result})
-            return progress_result, False
         agent.trace.append({"type": "contract_violation", "result": contract_result})
         return contract_result, False
 
@@ -2403,13 +2419,10 @@ async def _execute_browser_capability_tool(
         attach_method_schema(target_param_guard, method, agent.method_schemas)
         agent.logger.write("browser.call.params_error", target_param_guard)
         _observe_progress_after(agent, method or "browser_call.params_error", target_param_guard)
-        progress_result = _check_progress_before(
+        _observe_progress_before(
             agent, method or "browser_call", params, step,
             charge_diagnostic=False,
         )
-        if progress_result is not None:
-            agent.trace.append({"type": "progress_intervention", "result": progress_result})
-            return progress_result, False
         agent.trace.append({"type": "browser_call_params_error", "result": target_param_guard})
         return target_param_guard, False
 
@@ -2426,10 +2439,7 @@ async def _execute_browser_capability_tool(
         agent.trace.append({"type": "stale_axtree_target", "result": stale_target})
         return stale_target, False
 
-    progress_result = _check_progress_before(agent, method, params, step)
-    if progress_result is not None:
-        agent.trace.append({"type": "progress_intervention", "result": progress_result})
-        return progress_result, False
+    _observe_progress_before(agent, method, params, step)
 
     if ensure_required_purpose(
         agent.methods_requiring_purpose,
@@ -10302,6 +10312,69 @@ def _check_progress_before(
             }
         agent.logger.write("progress.intervention", result)
     return result
+
+
+_PROGRESS_OBSERVATION_FACT_KEYS = {
+    "tool",
+    "pageId",
+    "localFsWithoutExtraction",
+    "localFsStreak",
+    "repeatedLocalResultCount",
+    "resultSignature",
+    "turnsSinceArtifactProgress",
+    "toolCalls",
+    "diagnosticScope",
+    "navigationEpoch",
+    "diagnosticUses",
+    "diagnosticLimit",
+    "rowCount",
+    "uncreditedArtifacts",
+    "duplicate_of_previous",
+}
+
+
+def _progress_observation_fact(intervention: JsonDict) -> JsonDict:
+    """Project detector output to facts, excluding action instructions."""
+    fact: JsonDict = {
+        "source": "progress_accountant",
+        "reasonObserved": str(intervention.get("reason") or ""),
+    }
+    for key in _PROGRESS_OBSERVATION_FACT_KEYS:
+        if key in intervention:
+            fact[key] = intervention[key]
+    return fact
+
+
+def _observe_progress_before(
+    agent: Any,
+    tool_name: str,
+    tool_input: Optional[JsonDict] = None,
+    step: Optional[int] = None,
+    *,
+    charge_diagnostic: bool = True,
+) -> None:
+    """Record the detector's arithmetic observation without blocking a tool."""
+    intervention = _check_progress_before(
+        agent,
+        tool_name,
+        tool_input,
+        step,
+        charge_diagnostic=charge_diagnostic,
+    )
+    if intervention is None:
+        return
+    fact = _progress_observation_fact(intervention)
+    pending = getattr(agent, "_pending_progress_observations", None)
+    if not isinstance(pending, list):
+        pending = []
+        agent._pending_progress_observations = pending
+    pending.append(fact)
+    agent.logger.write("progress.observed", fact)
+    agent.trace.append({
+        "type": "progress_observation",
+        "step": step,
+        "result": fact,
+    })
 
 
 def _observe_progress_after(agent: Any, tool_name: str, result: Optional[JsonDict] = None) -> None:

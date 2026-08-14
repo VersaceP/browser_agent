@@ -56,6 +56,56 @@ LeadToolDispatcher = Callable[[JsonDict], Awaitable[Tuple[JsonDict, bool]]]
 LEAD_TOOLS = ToolRegistry("lead_agent")
 
 
+_OPTIONAL_IDENTIFIER_FIELDS = {
+    "spawn_browser_agent": {
+        "name",
+        "phase_id",
+        "preferred_slot_id",
+        "reuse_from_worker_id",
+        "session_key",
+        "fleet_id",
+    },
+}
+_OPTIONAL_WORKER_CONTRACT_IDENTIFIER_FIELDS = {"session_key", "fleet_id"}
+
+
+def _normalize_optional_identifiers(
+    tool_name: str,
+    tool_input: JsonDict,
+) -> Tuple[JsonDict, List[str]]:
+    """Treat model null spellings as absence only for declared identifiers."""
+    fields = _OPTIONAL_IDENTIFIER_FIELDS.get(tool_name, set())
+    if not fields:
+        return tool_input, []
+    normalized = dict(tool_input)
+    changed: List[str] = []
+    for field in fields:
+        if field not in normalized:
+            continue
+        value = normalized.get(field)
+        if value is None or (
+            isinstance(value, str)
+            and value.strip().lower() in {"", "null"}
+        ):
+            normalized.pop(field, None)
+            changed.append(field)
+    contract = normalized.get("worker_contract")
+    if isinstance(contract, dict):
+        normalized_contract = dict(contract)
+        for field in _OPTIONAL_WORKER_CONTRACT_IDENTIFIER_FIELDS:
+            if field not in normalized_contract:
+                continue
+            value = normalized_contract.get(field)
+            if value is None or (
+                isinstance(value, str)
+                and value.strip().lower() in {"", "null"}
+            ):
+                normalized_contract.pop(field, None)
+                changed.append(f"worker_contract.{field}")
+        normalized["worker_contract"] = normalized_contract
+    return normalized, sorted(changed)
+
+
 def _nullable(type_name: str) -> JsonDict:
     return {"type": [type_name, "null"]}
 
@@ -956,6 +1006,10 @@ async def execute_lead_tool(agent: Any, tool_call: JsonDict) -> Tuple[JsonDict, 
     name = str(tool_call.get("name") or "")
     raw_tool_input = tool_call.get("input") or {}
     tool_input = raw_tool_input if isinstance(raw_tool_input, dict) else {"value": raw_tool_input}
+    tool_input, normalized_fields = _normalize_optional_identifiers(
+        name,
+        tool_input,
+    )
     action = LEAD_TOOLS.get(name)
     if action is None:
         result = {
@@ -983,6 +1037,8 @@ async def execute_lead_tool(agent: Any, tool_call: JsonDict) -> Tuple[JsonDict, 
             step=getattr(agent, "_current_step", 0),
         )
     )
+    if normalized_fields and isinstance(result, dict):
+        result["normalizedFields"] = normalized_fields
     # A terminal handler may soft-reject its call (tool_was_executed False) to
     # bounce it back to the model with guidance instead of terminating — the
     # same contract the worker dispatcher has always honoured. Without it a
@@ -1009,7 +1065,25 @@ async def execute_lead_tool(agent: Any, tool_call: JsonDict) -> Tuple[JsonDict, 
 async def _lead_emit_task_plan(ctx: ToolContext) -> JsonDict:
     raw_plan = ctx.tool_input.get("plan")
     review = await ctx.agent.review_task_plan_candidate(raw_plan)
-    if review.get("status") in {"rejected", "error"}:
+    if review.get("status") == "error":
+        result = {
+            "status": "failed",
+            "error": (
+                "independent PlanValidator was unavailable or violated its"
+                " response protocol"
+            ),
+            "planValidator": review,
+            "next_instruction": (
+                "This is not a semantic rejection of the candidate. Keep the"
+                " currently accepted plan unchanged. Do not resubmit the same"
+                " candidate against the same evidence snapshot; revise the"
+                " candidate, continue the accepted plan, or report the"
+                " validator infrastructure failure if no plan exists."
+            ),
+        }
+        ctx.agent.logger.write("task_plan.rejected", result)
+        return result
+    if review.get("status") == "rejected":
         result = {
             "status": "failed",
             "error": "independent PlanValidator rejected the candidate plan",
@@ -2462,6 +2536,8 @@ async def _reconcile_final_answer_numbers(
             report = {
                 "status": str(extracted.get("status") or "unavailable"),
                 "error": str(extracted.get("error") or "")[:300],
+                "checked": 0,
+                "verifiedClaimCount": 0,
             }
         else:
             report = reconcile_numeric_claims(
@@ -2525,25 +2601,11 @@ def _numeric_reconciliation_rejection(report: JsonDict) -> Optional[JsonDict]:
             ),
         }
     if status == "extractor_unusable":
-        return {
-            "status": "rejected",
-            "error": "numeric_claim_check_did_not_run",
-            # Send the answer back for repair; do not end the task on it.
-            "tool_was_executed": False,
-            "cause": (
-                "the checker was reached but returned nothing usable, so no"
-                " number in this answer was verified"
-            ),
-            "checkerError": report.get("error"),
-            "next_instruction": (
-                "NOT a finding about your data — no number was checked at all,"
-                " so this answer carries no verification. The checker returns"
-                " one entry per number and tends to fail on long, number-dense"
-                " prose. Re-issue final_answer more plainly: put each quantity"
-                " next to the item it counts, drop numbers that are not results"
-                " of this task, and prefer a short list over a wide table."
-            ),
-        }
+        # A checker protocol failure is evidence about the checker, not about
+        # the answer. Keep the zero-verification receipt visible on the final
+        # result, but do not force the Lead to rewrite the deliverable merely
+        # to accommodate an unavailable extractor.
+        return None
     if status == "coverage_failed":
         # Not degraded to a pass. A gate that reports success for numbers it
         # never checked is the shape that shipped three wrong counts in

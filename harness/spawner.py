@@ -5814,6 +5814,7 @@ class BrowserAgentSpawner:
         page_ids: Set[str] = set()
         offloaded: List[str] = []
         progress_interventions: List[JsonDict] = []
+        progress_observations: List[JsonDict] = []
         loop_nudges: List[JsonDict] = []
         page_stats_events: List[JsonDict] = []
         snapshot_diffs: List[JsonDict] = []
@@ -5853,6 +5854,28 @@ class BrowserAgentSpawner:
                         "type": item.get("type"),
                         "reason": str(result.get("reason") or "")[:120],
                         "tool": str(result.get("tool") or result.get("method") or "")[:120],
+                    })
+            elif item.get("type") == "progress_observation":
+                result = item.get("result")
+                if isinstance(result, dict):
+                    progress_observations.append({
+                        "source": str(result.get("source") or "")[:120],
+                        "reasonObserved": str(
+                            result.get("reasonObserved") or ""
+                        )[:120],
+                        "tool": str(result.get("tool") or "")[:120],
+                        **{
+                            key: result[key]
+                            for key in (
+                                "turnsSinceArtifactProgress",
+                                "toolCalls",
+                                "localFsWithoutExtraction",
+                                "localFsStreak",
+                                "diagnosticUses",
+                                "diagnosticLimit",
+                            )
+                            if key in result
+                        },
                     })
             elif item.get("type") == "loop_nudge":
                 result = item.get("result")
@@ -5919,6 +5942,8 @@ class BrowserAgentSpawner:
             "errors": errors[:10],
             "progressInterventions": progress_interventions[-5:],
             "progressInterventionCount": progress_intervention_count,
+            "progressObservations": progress_observations[-5:],
+            "progressObservationCount": len(progress_observations),
             "loopNudges": loop_nudges[-5:],
             "loopNudgeCount": loop_nudge_count,
             "latestPageStats": page_stats_events[-1] if page_stats_events else None,

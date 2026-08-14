@@ -7,6 +7,7 @@ main.py and tests.
 """
 
 import asyncio
+import copy
 import hashlib
 import json
 import re
@@ -2154,13 +2155,45 @@ class LeadAgent:
             if isinstance(raw_plan, dict)
             else ""
         )
+        candidate_hash = plan_candidate_hash(candidate, replan_reason)
+        task_state = load_task_state(self.logger)
+        evidence_snapshot_hash = hashlib.sha256(
+            json.dumps(
+                task_state,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        review_request_key = f"{candidate_hash}:{evidence_snapshot_hash}"
+        review_error_cache = getattr(
+            self,
+            "_plan_validator_error_cache",
+            None,
+        )
+        if not isinstance(review_error_cache, dict):
+            review_error_cache = {}
+            self._plan_validator_error_cache = review_error_cache
+        cached_error = review_error_cache.get(review_request_key)
+        if isinstance(cached_error, dict):
+            review = {
+                **cached_error,
+                "deduplicated": True,
+                "providerCalled": False,
+            }
+            self.logger.write("plan_validator.error_deduplicated", {
+                "status": review.get("status"),
+                "candidateHash": candidate_hash,
+                "evidenceSnapshotHash": evidence_snapshot_hash,
+                "auditPath": review.get("auditPath"),
+                "errors": review.get("errors"),
+            })
+            return review
         if provider is None:
             review = {
                 "status": "error",
-                "candidateHash": plan_candidate_hash(
-                    candidate,
-                    replan_reason,
-                ),
+                "candidateHash": candidate_hash,
                 "errors": ["plan validator provider is unavailable"],
             }
         else:
@@ -2171,7 +2204,7 @@ class LeadAgent:
                 initial_plan=self.initial_task_plan,
                 previous_plan=self.task_plan,
                 candidate_plan=candidate,
-                task_state=load_task_state(self.logger),
+                task_state=task_state,
                 replan_reason=replan_reason,
                 provider_name=config.provider,
                 model_id=config.model_id,
@@ -2183,6 +2216,8 @@ class LeadAgent:
             review=review,
         )
         review["auditPath"] = audit_path
+        if str(review.get("status") or "") == "error":
+            review_error_cache[review_request_key] = copy.deepcopy(review)
         event = {
             "approved": "plan_validator.approved",
             "rejected": "plan_validator.rejected",
