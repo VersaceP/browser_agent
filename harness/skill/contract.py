@@ -711,7 +711,7 @@ def build_known_skills_digest(
     max_skills: int = 12,
     workflow_enabled: bool = True,
 ) -> str:
-    """Planning-time digest of reusable skills for the LeadAgent system prompt.
+    """Planning-time digest of reusable skills for Lead task context.
 
     The granularity mismatch (batch phases vs single-detail skills) is decided at
     PLAN time — by spawn time the phases are already shaped and the Lead can only

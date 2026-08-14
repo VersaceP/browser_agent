@@ -26,7 +26,10 @@ from harness.task_control import (
     load_task_state,
     write_task_state,
 )
-from harness.completion_receipt import build_completion_receipt
+from harness.completion_receipt import (
+    build_completion_receipt,
+    terminal_consistency_contradictions,
+)
 from harness.numeric_facts import (
     build_numeric_fact_index,
     extract_numeric_claims,
@@ -341,16 +344,18 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
         },
         "additionalProperties": False,
     }
-    return {
+    schema = {
         "type": "object",
         "properties": {
             "plan": {
                 "type": "object",
                 "description": (
-                    "Plan object with goal, task_type, and a phases array."
+                    "Plan object with a goal and phases array. Overall"
+                    " task_type is optional and derived from phase types."
                     " Each phase needs id, type='browser_worker', task_type,"
-                    " objective, worker_task, stage_hint, stage_hint_reason,"
-                    " expected_artifact, validators, and max_attempts."
+                    " objective, worker_task, stage_hint,"
+                    " expected_artifact and validators. max_attempts is an"
+                    " optional explicit resource budget."
                     " Every phase declares its OWN task_type — it is not"
                     " inherited from the plan, because that is what decides"
                     " which method domains the phase's worker can call."
@@ -454,9 +459,10 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                 "validators": {
                                     "type": "array",
                                     "description": (
-                                        "MUST be an array of typed objects"
-                                        " (never a dict keyed by validator"
-                                        " name)."
+                                        "Optional array of special validators"
+                                        " that cannot be derived from"
+                                        " expected_artifact. Common field and"
+                                        " row validators are derived."
                                     ),
                                     "items": _validator_item_schema(),
                                 },
@@ -597,7 +603,7 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                     },
                                     "additionalProperties": True,
                                 },
-                                "max_attempts": {"type": "integer"},
+                                "max_attempts": {"type": "integer", "minimum": 1},
                             },
                             "required": [
                                 "id",
@@ -605,21 +611,33 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                 "objective",
                                 "worker_task",
                                 "stage_hint",
-                                "stage_hint_reason",
                                 "expected_artifact",
-                                "validators",
                             ],
                             "additionalProperties": True,
                         },
                     },
                 },
-                "required": ["goal", "task_type", "phases"],
+                "required": ["goal", "phases"],
                 "additionalProperties": True,
             },
         },
         "required": ["plan"],
         "additionalProperties": False,
     }
+    phase_properties = schema["properties"]["plan"]["properties"]["phases"][
+        "items"
+    ]["properties"]
+    phase_properties["worker_contract"] = {
+        "type": "object",
+        "description": (
+            "Optional exceptional execution overrides only (session/auth,"
+            " pacing, batch source, explicit method policy, or content"
+            " observation markers). Ordinary task, artifact, validator, and"
+            " tactic fields are derived from the phase and prior handoff."
+        ),
+        "additionalProperties": True,
+    }
+    return schema
 
 
 def _spawn_browser_agent_schema(_: Any = None) -> JsonDict:
@@ -752,15 +770,6 @@ def _spawn_browser_agent_schema(_: Any = None) -> JsonDict:
                 ),
             },
         },
-        "required": [
-            "name",
-            "phase_id",
-            "task",
-            "context",
-            "result_contract",
-            "max_steps",
-            "worker_contract",
-        ],
         "additionalProperties": False,
     }
 
@@ -1015,7 +1024,9 @@ async def _lead_emit_task_plan(ctx: ToolContext) -> JsonDict:
     return ctx.agent.accept_task_plan(
         raw_plan,
         plan_validator_review=(
-            review if review.get("status") == "approved" else None
+            review
+            if review.get("status") in {"approved", "operational_continuation"}
+            else None
         ),
     )
 
@@ -1209,7 +1220,7 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
     if phase is None:
         # Pass the structured rejection through verbatim: it carries the real
         # status (dependency_not_ready / blocked_by_dependency /
-        # phase_already_running / objective_exhausted / ...) plus a
+        # phase_already_running / explicit resource exhaustion / ...) plus a
         # next_instruction. Task 2ed5a466 collapsed these into a generic
         # "phase not found" and the Lead blind-retried a dependency-gated
         # phase twice.
@@ -1225,9 +1236,11 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
                 "last_failure": exhausted_match.get("last_failure"),
                 "classification": exhausted_match.get("classification"),
                 "next_instruction": (
-                    "Emit a revised task_plan with replan_reason that changes"
-                    " strategy, contract, task_type, decomposition, or stop with"
-                    " final_answer if no recovery path remains."
+                    "The phase's explicitly declared worker-attempt resource"
+                    " budget is used. If more global budget should be allocated,"
+                    " update max_attempts without changing the objective;"
+                    " otherwise report the raw blocker. This receipt does not"
+                    " imply the target is absent or infeasible."
                 ),
             }
         return {
@@ -1238,6 +1251,29 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
         phase,
         raw_contract if isinstance(raw_contract, dict) else None,
     )
+    state = load_task_state(agent.logger)
+    phase_state = (
+        (state.get("phases") or {}).get(str(phase.get("id") or ""))
+        if isinstance(state.get("phases"), dict)
+        else None
+    )
+    prior_attempts = (
+        phase_state.get("attempts")
+        if isinstance(phase_state, dict)
+        and isinstance(phase_state.get("attempts"), list)
+        else []
+    )
+    prior_handoff = None
+    for prior_attempt in reversed(prior_attempts):
+        digest = (
+            prior_attempt.get("attemptDigest")
+            if isinstance(prior_attempt, dict)
+            and isinstance(prior_attempt.get("attemptDigest"), dict)
+            else None
+        )
+        if isinstance(digest, dict) and isinstance(digest.get("handoff"), dict):
+            prior_handoff = digest["handoff"]
+            break
     direct_batch_errors = direct_batch_rows_provenance_errors(
         worker_contract,
         user_task=str(getattr(agent, "original_user_task", "") or ""),
@@ -1274,6 +1310,17 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
     ]
     base_task = str(tool_input.get("task") or phase.get("worker_task") or "")
     base_context = str(tool_input.get("context") or phase.get("context") or "")
+    if isinstance(prior_handoff, dict):
+        base_context = (
+            f"{base_context}\n\nPREVIOUS WORKER HANDOFF (receipts and claims"
+            " retain their stated ownership):\n"
+            + json.dumps(
+                prior_handoff,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            )
+        ).strip()
     batch_receipt = worker_contract.get("_batch_source_receipt")
     if isinstance(batch_receipt, dict):
         base_context = (
@@ -2337,10 +2384,29 @@ async def _lead_final_answer(ctx: ToolContext) -> JsonDict:
     if resume_rejection is not None:
         return resume_rejection
     state = load_task_state(ctx.agent.logger)
+    final_status = str(ctx.tool_input.get("status", "done"))
     receipt = build_completion_receipt(
         state=state,
         spawner=getattr(ctx.agent, "spawner", None),
     )
+    contradictions = terminal_consistency_contradictions(
+        state=state,
+        plan=getattr(ctx.agent, "task_plan", None),
+        final_status=final_status,
+    )
+    if contradictions:
+        return {
+            "status": "rejected_terminal_inconsistency",
+            "tool_was_executed": False,
+            "completionReceipt": receipt,
+            "contradictions": contradictions,
+            "next_instruction": (
+                "The proposed done status contradicts raw worker receipts for"
+                " required artifact phases. Continue those phases or return a"
+                " non-done final status; this receipt does not claim the task"
+                " is otherwise complete."
+            ),
+        }
     answer = str(ctx.tool_input.get("answer", "")).strip()
     reconciliation = await _reconcile_final_answer_numbers(ctx.agent, answer, state)
     rejection = _numeric_reconciliation_rejection(reconciliation)
@@ -2348,7 +2414,7 @@ async def _lead_final_answer(ctx: ToolContext) -> JsonDict:
         return rejection
     ctx.agent.logger.write("lead.completion_receipt", receipt)
     result: JsonDict = {
-        "status": ctx.tool_input.get("status", "done"),
+        "status": final_status,
         "answer": answer,
         "trigger": "lead_decided",
         "completionReceipt": receipt,

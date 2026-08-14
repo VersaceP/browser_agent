@@ -155,7 +155,7 @@ def summarize_messages_for_compaction(
     artifacts: List[str] = []
     worker_results: List[JsonDict] = []
     blockers: List[JsonDict] = []
-    verified_data: List[JsonDict] = []
+    persisted_rows: List[JsonDict] = []
     page_ids: Dict[str, JsonDict] = {}
     fleet_ids: Dict[str, JsonDict] = {}
     recent_page_states: List[JsonDict] = []
@@ -193,6 +193,11 @@ def summarize_messages_for_compaction(
                     parsed = raw
                 offloaded.extend(extract_offloaded_paths(parsed))
                 if isinstance(parsed, dict):
+                    handoffs = parsed.get("workerHandoffs")
+                    if isinstance(handoffs, list):
+                        worker_results.extend(
+                            item for item in handoffs if isinstance(item, dict)
+                        )
                     artifacts.extend(_collect_artifact_paths(parsed))
                     for candidate in _result_candidates(parsed):
                         worker_result = _summarize_worker_result(candidate)
@@ -203,7 +208,7 @@ def summarize_messages_for_compaction(
                             blockers.append(blocker)
                         verified = _summarize_verified_data(candidate)
                         if verified:
-                            verified_data.append(verified)
+                            persisted_rows.append(verified)
                     _collect_runtime_handles(
                         parsed,
                         source=str(parsed.get("method") or "tool_result"),
@@ -233,7 +238,9 @@ def summarize_messages_for_compaction(
         "offloadedFiles": sorted(set(offloaded))[:100],
         "artifacts": sorted(set(artifacts))[:100],
         "workerResults": worker_results[-20:],
-        "verifiedData": verified_data[-20:],
+        # Persisted rows are not necessarily phase-complete or globally
+        # validated; preserve the narrower provenance in the field name.
+        "persistedRows": persisted_rows[-20:],
         "blockers": blockers[-20:],
         "runtimeHandles": {
             "pageIds": list(page_ids.values())[-20:],
@@ -280,6 +287,11 @@ def _result_candidates(value: JsonDict) -> List[JsonDict]:
 
 
 def _summarize_worker_result(value: JsonDict) -> Optional[JsonDict]:
+    from harness.worker_result import build_worker_handoff_projection
+
+    projection = build_worker_handoff_projection(value)
+    if projection is not None:
+        return projection
     result_levels = value.get("resultLevels")
     if isinstance(result_levels, dict):
         l1 = result_levels.get("l1")
@@ -289,7 +301,6 @@ def _summarize_worker_result(value: JsonDict) -> Optional[JsonDict]:
                 "workerId": l1.get("workerId"),
                 "phaseId": l1.get("phaseId"),
                 "status": l1.get("status"),
-                "statusCategory": l1.get("statusCategory"),
                 "validatedStatus": l1.get("validatedStatus"),
                 "artifactCount": l1.get("artifactCount"),
                 "errorCount": l1.get("errorCount"),
@@ -301,7 +312,6 @@ def _summarize_worker_result(value: JsonDict) -> Optional[JsonDict]:
             "workerId": value.get("workerId"),
             "phaseId": value.get("phaseId"),
             "status": value.get("status"),
-            "statusCategory": value.get("statusCategory"),
             "validatedStatus": value.get("validatedStatus"),
             "tracePath": value.get("tracePath"),
         }

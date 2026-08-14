@@ -28,6 +28,7 @@ from harness.challenge_detector import (
 )
 from harness.content_completeness import (
     ContentCompletenessTracker,
+    content_completeness_observation_facts,
 )
 from harness.diagnostics.error_classification import attach_error_classification
 from harness.extraction_artifacts import (
@@ -480,10 +481,30 @@ def build_browser_tool_dispatcher(agent: Any) -> BrowserToolDispatcher:
             effective_call,
             result,
         )
+        if _contains_truncated_receipt(result):
+            result.setdefault(
+                "truncationNotice",
+                (
+                    "This receipt is truncated. It proves only the returned"
+                    " matches were observed; it does not prove an unreturned"
+                    " item or control is absent. Query the fuller observation"
+                    " surface separately when absence matters."
+                ),
+            )
         result = await _maybe_reality_check(agent, effective_call, result, step)
         return result, should_stop
 
     return dispatch
+
+
+def _contains_truncated_receipt(value: Any) -> bool:
+    if isinstance(value, dict):
+        if value.get("truncated") is True:
+            return True
+        return any(_contains_truncated_receipt(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_truncated_receipt(item) for item in value)
+    return False
 
 
 async def execute_browser_tool(agent: Any, tool_call: JsonDict, step: int) -> Tuple[JsonDict, bool]:
@@ -1061,30 +1082,6 @@ async def _browser_visual_verify(ctx: ToolContext) -> JsonDict:
 )
 async def _browser_final_answer(ctx: ToolContext) -> JsonDict:
     answer = str(ctx.tool_input.get("answer", "")).strip()
-    rejection = _final_answer_content_completeness_rejection(
-        ctx.agent,
-        answer,
-        status=str(ctx.tool_input.get("status") or "done"),
-    )
-    if rejection is not None:
-        ctx.agent.logger.write(
-            "final_answer.content_completeness_rejected", rejection
-        )
-        ctx.agent.trace.append({
-            "type": "final_answer_rejected",
-            "result": rejection,
-        })
-        return rejection
-    rejection = _final_answer_reality_check_rejection(ctx.agent, answer)
-    if rejection is not None:
-        ctx.agent.logger.write("final_answer.reality_check_rejected", {
-            "status": ctx.tool_input.get("status"),
-        })
-        ctx.agent.trace.append({
-            "type": "final_answer_rejected",
-            "result": rejection,
-        })
-        return rejection
     result = {
         "status": ctx.tool_input.get("status", "done"),
         "answer": answer,
@@ -4268,7 +4265,9 @@ def _observe_content_completeness_after(
     if not isinstance(summary, dict):
         return result
     enriched = dict(result)
-    enriched["contentCompleteness"] = summary
+    enriched["contentCompleteness"] = content_completeness_observation_facts(
+        summary
+    )
     if isinstance(binding_receipt, dict):
         enriched["contentBinding"] = binding_receipt
         if binding_receipt.get("status") == "rejected":
@@ -4278,46 +4277,19 @@ def _observe_content_completeness_after(
                 "Use content_binding.regionId from the declared"
                 " content_completeness expected regions, or omit the binding.",
             ) if value)
-    page_id = str(summary.get("pageId") or "")
-    recovery_receipt = (
-        tracker.recovery_receipt(page_id)
-        if hasattr(tracker, "recovery_receipt") else None
-    )
-    if isinstance(recovery_receipt, dict):
-        enriched["routeRecovery"] = recovery_receipt
-    route_preference = (
-        tracker.route_preference_for_page(page_id)
-        if hasattr(tracker, "route_preference_for_page") else None
-    )
-    if isinstance(route_preference, dict):
-        enriched["routePreference"] = route_preference
     binding_instruction = str(
         summary.get("collectionBindingNextInstruction") or ""
     ).strip()
-    recovery_instruction = str(
-        (recovery_receipt or {}).get("next_instruction")
-        if isinstance(recovery_receipt, dict) else ""
-    ).strip()
-    decision_instruction = str(
-        summary.get("decisionNextInstruction") or ""
-    ).strip()
-    if binding_instruction or recovery_instruction or decision_instruction:
+    if binding_instruction:
         existing_next_step = str(enriched.get("next_step") or "").strip()
         enriched["next_step"] = " ".join(
             value for value in (
                 existing_next_step,
                 binding_instruction,
-                recovery_instruction,
-                decision_instruction,
             ) if value
         )
     if logger is not None and hasattr(logger, "write"):
         logger.write("content_completeness.observed", summary)
-        if (
-            summary.get("decision") != "inconclusive"
-            or summary.get("contentState") != "absent"
-        ):
-            logger.write("content_completeness.decision", summary)
     return enriched
 
 
@@ -6897,127 +6869,6 @@ async def _maybe_reality_check(
         if logger is not None and hasattr(logger, "write"):
             logger.write("vl.reality_check.error", {"error": str(exc)[:300]})
         return result
-
-
-def _final_answer_reality_check_rejection(
-    agent: Any,
-    answer: str,
-) -> Optional[JsonDict]:
-    """Layer-3 gate: a final_answer that declares target_absent /
-    instruction_infeasible with NO visual reality check on record is bounced
-    back once, telling the worker to verify visually and cite the persisted
-    observation. One bounce only — the spawner-side evidence gate remains the
-    last line of defense, so a second attempt always goes through."""
-    vl_config = getattr(
-        getattr(getattr(agent, "runtime", None), "harness", None), "vl", None
-    )
-    if (
-        vl_config is None
-        or not getattr(vl_config, "enabled", False)
-        or not getattr(vl_config, "reality_check_enabled", True)
-    ):
-        return None
-    if getattr(agent, "final_answer_reality_nudged", False):
-        return None
-    try:
-        from harness.vl.reality_check import (
-            cites_ledger_evidence,
-            semantic_terminal_claimed,
-        )
-        if not semantic_terminal_claimed(answer):
-            return None
-        # "Any VL check happened" is too weak a pass — an overlay/CAPTCHA
-        # check says nothing about the target's absence. Accept only:
-        # (a) the layer-2 auto reality check ran (its target-specific
-        #     observation was handed back to the worker), or
-        # (b) the worker did its own visual check AND cites ledger-backed
-        #     evidence in the answer (so the B3 gate can verify it).
-        if getattr(agent, "reality_check_count", 0) > 0:
-            return None
-        vl_checks = (
-            (getattr(agent, "vl_check_count", 0) or 0)
-            + (getattr(agent, "vl_force_check_count", 0) or 0)
-        )
-        if vl_checks > 0:
-            ledger = [
-                *list(getattr(agent, "artifacts", []) or []),
-                *list(getattr(agent, "extraction_attempt_artifacts", []) or []),
-            ]
-            if cites_ledger_evidence(answer, ledger):
-                return None
-    except Exception:
-        return None
-    agent.final_answer_reality_nudged = True
-    return {
-        "status": "rejected_needs_reality_check",
-        "tool_was_executed": False,
-        "next_instruction": (
-            "You are declaring the target absent/infeasible, but no visual"
-            " reality check ran this session — DOM probing alone is not"
-            " sufficient evidence of absence. Scroll to the relevant region,"
-            " call visual_verify with a claim describing the expected content,"
-            " persist the observation via record_extraction, cite its"
-            " savedPath in evidenceArtifacts, then call final_answer again."
-            " If visual verification is impossible (e.g. page dead), re-issue"
-            " this final_answer unchanged and it will be accepted."
-        ),
-    }
-
-
-def _final_answer_content_completeness_rejection(
-    agent: Any,
-    answer: str,
-    *,
-    status: str = "",
-) -> Optional[JsonDict]:
-    """Reject semantic absence or false success while content is incomplete."""
-    tracker = getattr(agent, "content_completeness_tracker", None)
-    veto = tracker.terminal_veto() if tracker is not None else None
-    if not isinstance(veto, dict):
-        return None
-    payload: JsonDict = {}
-    try:
-        parsed = json.loads(str(answer or ""))
-        payload = parsed if isinstance(parsed, dict) else {}
-    except Exception:
-        payload = {}
-    claimed_statuses = {
-        str(status or "").strip().casefold(),
-        str(payload.get("status") or "").strip().casefold(),
-        str(payload.get("outcome") or "").strip().casefold(),
-    }
-    claims_success = bool(
-        claimed_statuses
-        & {"done", "success", "completed", "complete", "validated_done"}
-    )
-    claims_semantic_terminal = False
-    try:
-        blockers = payload.get("blockers") if isinstance(payload, dict) else None
-        for blocker in blockers if isinstance(blockers, list) else []:
-            if not isinstance(blocker, dict):
-                continue
-            raw = blocker.get("classification")
-            category = (
-                str(raw.get("category") or "").strip()
-                if isinstance(raw, dict)
-                else str(
-                    raw or blocker.get("category") or blocker.get("type") or ""
-                ).strip()
-            )
-            if category in {"target_absent", "instruction_infeasible"}:
-                claims_semantic_terminal = True
-                break
-    except Exception:
-        claims_semantic_terminal = False
-    if not (claims_success or claims_semantic_terminal):
-        return None
-    return {
-        "status": "rejected_content_incomplete",
-        "classification": veto,
-        "claimedSuccess": claims_success,
-        "tool_was_executed": False,
-        "next_instruction": str(veto.get("next_instruction") or ""),
-    }
 
 
 async def _promote_visual_locate(

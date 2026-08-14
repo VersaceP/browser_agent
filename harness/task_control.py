@@ -28,6 +28,8 @@ from harness.constants import (
     WORKER_STATUS_HITL_WAITING,
     WORKER_STATUS_PAGE_CRASHED,
     WORKER_STATUS_PAGE_SETTLED_AFTER_HITL,
+    WORKER_STATUS_DONE,
+    WORKER_STATUS_PARTIAL,
 )
 from harness.content_completeness import (
     content_completeness_config_errors,
@@ -89,11 +91,7 @@ class _TaskStateSnapshot(dict):
         super().__init__(value or {})
         self._task_state_base = copy.deepcopy(dict(self))
         self._task_state_replace = False
-REPEAT_GUARD_REJECTION_LOCK_THRESHOLD = 3
 SEMANTIC_TERMINAL_CLASSIFICATIONS = frozenset({
-    "target_absent",
-    "instruction_infeasible",
-    "blocked_content_suppression",
 })
 TERMINAL_PHASE_STATUSES = frozenset({
     "validated_done",
@@ -103,9 +101,6 @@ TERMINAL_PHASE_STATUSES = frozenset({
     "hitl_timeout",
     "page_settled_after_hitl",
     "stale_pause_deadlock",
-    "target_absent",
-    "instruction_infeasible",
-    "blocked_content_suppression",
     "blocked_by_dependency",
     "session_fleet_lost",
 })
@@ -126,14 +121,6 @@ BLOCKING_DEPENDENCY_STATUSES = TERMINAL_PHASE_STATUSES - {"validated_done"}
 # skips terminal statuses and never re-derives them). Reset it and let the
 # new plan re-derive blocking from the (possibly fixed) dependency.
 REPLAN_RESET_STATUSES = frozenset({"phase_failed", "blocked_by_dependency"})
-# Cross-replan failure budget for one OBJECTIVE (see objective_fingerprint):
-# per-phase max_attempts is escapable by replanning under a fresh phase id
-# (attempts reset with the new id — the 2cb616 v1→v2→v3 loop), so failures
-# are also accumulated per objective fingerprint, which survives replans.
-# The budget counts ATTEMPTS, not phase ids: after 6 same-objective failures
-# no new phase id gets more budget (how many ids that spans depends on when
-# the Lead replans).
-OBJECTIVE_MAX_ATTEMPTS = 6
 # Slot/connection startup failures happen before a BrowserAgent exists, so
 # they cannot legitimately consume either phase attempts or the business
 # objective budget.  They still need a durable bound: otherwise a Lead can
@@ -1258,13 +1245,7 @@ def validate_task_plan(
         errors.append("goal is required")
 
     task_type = str(raw_plan.get("task_type") or "").strip()
-    if not task_type:
-        errors.append(
-            "task_type is required; use an explicit value such as web_scrape,"
-            " form_filling, file_download, file_upload, web_search, or general"
-        )
-        task_type = "web_scrape"
-    else:
+    if task_type:
         task_type = _validated_task_type(
             task_type, errors=errors, warnings=warnings, where="task_type",
         )
@@ -1339,11 +1320,6 @@ def validate_task_plan(
                 f" {sorted(VALID_STAGE_HINTS)}; got {stage_hint!r}"
             )
         stage_hint_reason = str(raw_phase.get("stage_hint_reason") or "").strip()
-        if len(stage_hint_reason) < 40:
-            errors.append(
-                f"phase {phase_id}: stage_hint_reason must explain the stage choice"
-                " in at least 40 characters"
-            )
 
         expected_artifact = raw_phase.get("expected_artifact") or {}
         if expected_artifact is not None and not isinstance(expected_artifact, dict):
@@ -1620,7 +1596,13 @@ def validate_task_plan(
             "validators": validators,
             "validators_normalized": True,
             "worker_contract": worker_contract or {},
-            "max_attempts": _positive_int(raw_phase.get("max_attempts"), default=3),
+            # Optional, explicitly-declared resource budget.  The harness must
+            # not invent a default phase retry wall.
+            "max_attempts": (
+                _positive_int(raw_phase.get("max_attempts"), default=1)
+                if raw_phase.get("max_attempts") is not None
+                else None
+            ),
         })
 
     # depends_on must reference declared phase ids: an unknown id resolves to
@@ -1642,6 +1624,17 @@ def validate_task_plan(
     _validate_execution_role_dependencies(phases, errors)
     _reject_singleton_phase_fragmentation(phases, errors, warnings)
     _reject_serial_auth_handoff(phases, errors)
+
+    if not task_type:
+        phase_task_types = {
+            str(phase.get("task_type") or "") for phase in phases
+            if str(phase.get("task_type") or "")
+        }
+        task_type = (
+            next(iter(phase_task_types))
+            if len(phase_task_types) == 1
+            else "general"
+        )
 
     normalized = {
         "version": "v1",
@@ -2007,7 +2000,6 @@ def initialize_task_state(
         "completed_items": list((preserve_from or {}).get("completed_items") or []),
         "pending_items": list((preserve_from or {}).get("pending_items") or []),
         "failed_items": list((preserve_from or {}).get("failed_items") or []),
-        "banned_strategies": list((preserve_from or {}).get("banned_strategies") or []),
         "quality": dict((preserve_from or {}).get("quality") or {}),
         # Survives replans BY DESIGN: this is the whole point of the
         # objective-level budget — a fresh phase id must not reset it.
@@ -2712,14 +2704,7 @@ def reconcile_replan_checkpoints(logger: RunLogger) -> JsonDict:
             if isinstance(objective_entry, dict)
             else 0
         )
-        if objective and objective_count >= OBJECTIVE_MAX_ATTEMPTS:
-            reason = "objective_exhausted"
-            next_instruction = (
-                "The same objective exhausted its mechanical retry budget."
-                " Preserve validated rows and finish incomplete, or change the"
-                " actual target rather than renaming the phase."
-            )
-        elif checkpoint.get("sourceLedgerBound") is True:
+        if checkpoint.get("sourceLedgerBound") is True:
             source_path = str(checkpoint.get("sourceArtifactPath") or "").strip()
             resolved = str(Path(source_path).expanduser().resolve()) if source_path else ""
             if not resolved or resolved not in ledger_paths or not Path(resolved).is_file():
@@ -4386,121 +4371,6 @@ def failure_signature_from_result(worker_result: JsonDict) -> List[Any]:
     ]
 
 
-def repeated_phase_attempt_guard(
-    logger: RunLogger,
-    *,
-    phase_id: Optional[str],
-    contract_hash: str,
-) -> Optional[JsonDict]:
-    if not phase_id or not contract_hash:
-        return None
-    state = load_task_state(logger)
-    phase_state = _phase_state(state, str(phase_id))
-    if phase_state is None:
-        return None
-    block = should_block_repeated_phase_attempt(
-        phase_state,
-        contract_hash=contract_hash,
-    )
-    if block is None:
-        if phase_state.pop("repeat_guard", None) is not None:
-            write_task_state(logger, state)
-        return None
-
-    guard_key = json.dumps(
-        {
-            "contractHash": contract_hash,
-            "signature": block.get("lockedSignature"),
-        },
-        sort_keys=True,
-        default=str,
-    )
-    previous = phase_state.get("repeat_guard")
-    previous_key = previous.get("key") if isinstance(previous, dict) else ""
-    rejection_count = (
-        int(previous.get("rejectionCount") or 0) + 1
-        if isinstance(previous, dict) and previous_key == guard_key
-        else 1
-    )
-    phase_state["repeat_guard"] = {
-        "key": guard_key,
-        "rejectionCount": rejection_count,
-        "lockedSignature": block.get("lockedSignature"),
-        "contractHash": contract_hash,
-        "updated_at": utc_now_iso(),
-    }
-    write_task_state(logger, state)
-
-    status = (
-        "phase_locked_must_finalize"
-        if rejection_count >= REPEAT_GUARD_REJECTION_LOCK_THRESHOLD
-        else "phase_classification_repeated"
-    )
-    result = {
-        "status": status,
-        "phaseId": str(phase_id),
-        "lockedSignature": block.get("lockedSignature"),
-        "contractHash": contract_hash,
-        "consecutiveSameSignatureCount": block.get("consecutiveSameSignatureCount"),
-        "repeatSpawnRejectionCount": rejection_count,
-        "recentDigests": block.get("recentDigests"),
-        "tool_was_executed": False,
-        "next_instruction": (
-            "Emit a revised task_plan with replan_reason that changes objective,"
-            " worker_task, worker_contract, expected_artifact, validators, or"
-            " task_type; or call final_answer with the blocker."
-            if status == "phase_classification_repeated" else
-            "This phase has repeatedly hit the same failure signature under the"
-            " same contract. Do not spawn another worker for this phase; call"
-            " final_answer with the blocker or emit a substantially revised"
-            " task_plan before continuing."
-        ),
-    }
-    return _strip_volatile_handles(result)
-
-
-def should_block_repeated_phase_attempt(
-    phase_state: JsonDict,
-    *,
-    contract_hash: str,
-) -> Optional[JsonDict]:
-    attempts = phase_state.get("attempts") if isinstance(phase_state, dict) else []
-    if not isinstance(attempts, list):
-        return None
-    digests = [
-        item.get("attemptDigest")
-        for item in attempts
-        if isinstance(item, dict) and isinstance(item.get("attemptDigest"), dict)
-    ]
-    if len(digests) < 2:
-        return None
-    recent = digests[-2:]
-    if not all(_attempt_digest_is_failure(item) for item in recent):
-        return None
-    if not all(str(item.get("contractHash") or "") == contract_hash for item in recent):
-        return None
-    signatures = [item.get("failureSignature") for item in recent]
-    if not all(isinstance(signature, list) and any(signature) for signature in signatures):
-        return None
-    if signatures[0] != signatures[1]:
-        return None
-    consecutive_count = 0
-    for digest in reversed(digests):
-        if (
-            _attempt_digest_is_failure(digest)
-            and str(digest.get("contractHash") or "") == contract_hash
-            and digest.get("failureSignature") == signatures[0]
-        ):
-            consecutive_count += 1
-            continue
-        break
-    return {
-        "lockedSignature": signatures[0],
-        "consecutiveSameSignatureCount": consecutive_count,
-        "recentDigests": [_strip_volatile_handles(item) for item in recent],
-    }
-
-
 def _classification_from_worker_result(worker_result: JsonDict) -> JsonDict:
     artifact_validation = (
         worker_result.get("artifactValidation")
@@ -4836,7 +4706,11 @@ def mark_phase_result(
         write_task_state(logger, state)
         return
 
-    if validation and validation.get("status") == "done":
+    if (
+        result_status == WORKER_STATUS_DONE
+        and validation
+        and validation.get("status") == "done"
+    ):
         phase_state["status"] = "validated_done"
         artifacts = validation.get("artifacts") or []
         validated_artifacts = list(phase_state.get("validated_artifacts") or [])
@@ -4859,6 +4733,39 @@ def mark_phase_result(
             succeeded=True, worker_contract=worker_contract,
         )
     else:
+        # A shape-valid artifact proves only that the persisted rows satisfy
+        # their declared schema.  It does not override the worker's raw
+        # negative outcome.  In particular, partial artifacts stay attached
+        # to this attempt for continuation, but must not enter the global
+        # validated-artifact ledger consumed by completion receipts and plan
+        # review.
+        if validation and validation.get("status") == "done":
+            phase_state["status"] = result_status or "unknown"
+            phase_state["last_failure"] = [{
+                "type": "worker_not_done",
+                "status": result_status or "unknown",
+                "message": (
+                    "Artifact schema validation passed, but the worker did not"
+                    " report raw status=done. Persisted rows remain attempt"
+                    " evidence only; continue or reassess this phase."
+                ),
+            }]
+            phase_state["last_failure_classification"] = (
+                validation.get("classification")
+                if isinstance(validation.get("classification"), dict)
+                else None
+            )
+            if result_status != WORKER_STATUS_PARTIAL:
+                # Objective counters are observation-only after retirement of
+                # objective_exhausted. A failed worker whose rows happen to be
+                # schema-valid is still a failed attempt; a partial worker is
+                # ongoing continuation evidence and is deliberately excluded.
+                _record_objective_attempt(
+                    state, phase, str(phase_id),
+                    succeeded=False, worker_contract=worker_contract,
+                )
+            write_task_state(logger, state)
+            return
         classification = (
             validation.get("classification")
             if isinstance(validation, dict)
@@ -5632,7 +5539,8 @@ def _count_budgeted_phase_attempts(attempts: Any) -> int:
         1
         for attempt in attempts
         if isinstance(attempt, dict)
-        and str(attempt.get("status") or "") != "interrupted"
+        and str(attempt.get("status") or "")
+        not in {"interrupted", WORKER_STATUS_PARTIAL}
     )
 
 
@@ -5689,9 +5597,14 @@ def phase_start_rejection(
         }
     attempts = phase_state.get("attempts") if isinstance(phase_state, dict) else []
     attempts_count = _count_budgeted_phase_attempts(attempts)
-    max_attempts = _positive_int(target_phase.get("max_attempts"), default=3)
+    max_attempts = (
+        _positive_int(target_phase.get("max_attempts"), default=1)
+        if target_phase.get("max_attempts") is not None
+        else None
+    )
     if (
-        attempts_count >= max_attempts
+        max_attempts is not None
+        and attempts_count >= max_attempts
         and status in RETRYABLE_PHASE_FAILURE_STATUSES
     ):
         return {
@@ -5701,44 +5614,11 @@ def phase_start_rejection(
             "max_attempts": max_attempts,
             "tool_was_executed": False,
             "next_instruction": (
-                "This phase has reached max_attempts. Replan with a changed"
-                " contract/objective or stop with final_answer."
+                "This phase has used its explicitly declared worker-attempt"
+                " resource budget. The receipt does not imply that the"
+                " objective is infeasible."
             ),
         }
-    fingerprint = objective_fingerprint(target_phase, worker_contract)
-    if fingerprint:
-        objective_attempts = (
-            state.get("objective_attempts")
-            if isinstance(state.get("objective_attempts"), dict)
-            else {}
-        )
-        entry = objective_attempts.get(fingerprint)
-        objective_count = (
-            int(entry.get("count") or 0) if isinstance(entry, dict) else 0
-        )
-        if objective_count >= OBJECTIVE_MAX_ATTEMPTS:
-            return {
-                "status": "objective_exhausted",
-                "phaseId": str(phase_id),
-                "objectiveFingerprint": fingerprint,
-                "objectiveAttempts": objective_count,
-                "objectiveMaxAttempts": OBJECTIVE_MAX_ATTEMPTS,
-                "priorPhaseIds": (
-                    list(entry.get("phaseIds") or [])
-                    if isinstance(entry, dict) else []
-                ),
-                "tool_was_executed": False,
-                "next_instruction": (
-                    "This OBJECTIVE (same target range/row count/artifact,"
-                    " regardless of phase id) has already failed"
-                    f" {objective_count} times across replans. Re-issuing it"
-                    " under a fresh phase id is not allowed. Either genuinely"
-                    " change the target (different source URL, different"
-                    " range, different artifact), or final_answer reporting"
-                    " target_absent/instruction_infeasible with the collected"
-                    " evidence so the user can revise the instruction."
-                ),
-            }
     blocker = _dependency_blocker(target_phase, phases, prior_ids)
     if blocker is not None:
         if blocker.get("blocking"):
@@ -5808,9 +5688,14 @@ def mark_phase_exhausted_if_needed(
             continue
         attempts = phase_state.get("attempts") if isinstance(phase_state, dict) else []
         attempts_count = _count_budgeted_phase_attempts(attempts)
-        max_attempts = _positive_int(phase.get("max_attempts"), default=3)
+        max_attempts = (
+            _positive_int(phase.get("max_attempts"), default=1)
+            if phase.get("max_attempts") is not None
+            else None
+        )
         if (
-            attempts_count < max_attempts
+            max_attempts is None
+            or attempts_count < max_attempts
             or status not in RETRYABLE_PHASE_FAILURE_STATUSES
         ):
             continue
@@ -5877,9 +5762,14 @@ def next_pending_phase(plan: Optional[JsonDict], logger: RunLogger) -> Optional[
             continue
         attempts = phase_state.get("attempts") if isinstance(phase_state, dict) else []
         attempts_count = _count_budgeted_phase_attempts(attempts)
-        max_attempts = _positive_int(phase.get("max_attempts"), default=3)
+        max_attempts = (
+            _positive_int(phase.get("max_attempts"), default=1)
+            if phase.get("max_attempts") is not None
+            else None
+        )
         if (
-            attempts_count >= max_attempts
+            max_attempts is not None
+            and attempts_count >= max_attempts
             and status in RETRYABLE_PHASE_FAILURE_STATUSES
         ):
             prior_ids.append(phase_id)

@@ -4,6 +4,7 @@
   "strategies": [
     {
       "id": "web_scrape.collection.repeated_dom",
+      "description": "Collect repeated list, table, grid, card, or row-shaped records with native DOM evidence.",
       "task_types": ["web_scrape"],
       "stage": "collection",
       "applies_to_stages": ["collection"],
@@ -45,6 +46,7 @@
     },
     {
       "id": "web_scrape.collection.attribute_links",
+      "description": "Extract href, src, id, aria, data, or value attributes and bind them to their visible item.",
       "task_types": ["web_scrape"],
       "stage": "attribute_links",
       "applies_to_stages": ["attribute_links", "collection"],
@@ -85,6 +87,7 @@
     },
     {
       "id": "web_scrape.detail_sections.reveal_then_text",
+      "description": "Reveal named detail regions and verify the changed DOM before reading their text.",
       "task_types": ["web_scrape"],
       "stage": "detail_sections",
       "applies_to_stages": ["detail_sections"],
@@ -143,6 +146,7 @@
     },
     {
       "id": "web_scrape.computed_relationship.eval_js",
+      "description": "Use isolated JavaScript only for computed relationships native DOM reads cannot express.",
       "task_types": ["web_scrape"],
       "stage": "computed_relationship",
       "applies_to_stages": ["computed_relationship"],
@@ -184,6 +188,7 @@
     },
     {
       "id": "browser_action.form_interaction.axtree_input",
+      "description": "Operate labeled form controls through AXTree-backed input actions and verify the result.",
       "task_types": ["form_filling"],
       "stage": "form_interaction",
       "applies_to_stages": ["form_interaction"],
@@ -227,6 +232,7 @@
     },
     {
       "id": "browser_action.overlay.dismiss_ladder",
+      "description": "Recover from an occluding overlay with one bounded native dismissal sequence.",
       "task_types": ["general", "web_search", "web_scrape", "form_filling"],
       "stage": "overlay_recovery",
       "applies_to_stages": [
@@ -277,6 +283,7 @@
     },
     {
       "id": "browser_action.overlay.auth_persist_fleet",
+      "description": "Reuse a verified authenticated fleet or pause for login without storing credentials.",
       "task_types": ["general", "web_search", "web_scrape", "form_filling"],
       "stage": "overlay_recovery",
       "applies_to_stages": [
@@ -334,6 +341,7 @@
     },
     {
       "id": "hitl.guard.before_request_pause",
+      "description": "Collect evidence before requesting human intervention and resynchronize after resume.",
       "task_types": ["general", "web_search", "web_scrape", "form_filling"],
       "stage": "hitl_guard",
       "applies_to_stages": [

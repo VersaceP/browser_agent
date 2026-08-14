@@ -88,11 +88,28 @@ def compact_strategy_bank(bank: JsonDict, *, max_strategies: int = 8) -> JsonDic
     return trim_large_strings(payload, 2000)
 
 
-def _keyword_hits(text: str, values: Any) -> int:
-    if not isinstance(values, list):
-        return 0
-    lowered = text.lower()
-    return sum(1 for value in values if str(value or "").lower() in lowered)
+def strategy_bank_index(bank: JsonDict, *, max_strategies: int = 50) -> JsonDict:
+    """Small pull-oriented index; strategy bodies remain on disk."""
+    strategies = bank.get("strategies") if isinstance(bank.get("strategies"), list) else []
+    items: List[JsonDict] = []
+    for item in strategies[:max_strategies]:
+        if not isinstance(item, dict):
+            continue
+        description = str(item.get("description") or "").strip()
+        if not description:
+            applies = item.get("applies_when")
+            if isinstance(applies, list) and applies:
+                description = str(applies[0])[:240]
+        items.append({
+            "id": item.get("id"),
+            "description": description,
+            "task_types": item.get("task_types") or [],
+            "stages": item.get("applies_to_stages") or [item.get("stage")],
+        })
+    return {
+        "path": bank.get("path"),
+        "strategies": items,
+    }
 
 
 def _task_type_matches(task_type: Optional[str], item: JsonDict) -> bool:
@@ -152,12 +169,7 @@ def select_strategies_for_phase(
 ) -> List[JsonDict]:
     strategies = bank.get("strategies") if isinstance(bank.get("strategies"), list) else []
     stage_hint = str(phase.get("stage_hint") or "").strip()
-    phase_text = " ".join(
-        str(phase.get(key) or "")
-        for key in ("id", "objective", "worker_task", "type", "stage_hint_reason")
-    )
-    selected: List[Tuple[int, JsonDict]] = []
-    fallback: List[Tuple[int, JsonDict]] = []
+    selected: List[JsonDict] = []
     for item in strategies:
         if not isinstance(item, dict):
             continue
@@ -165,40 +177,13 @@ def select_strategies_for_phase(
             continue
         rendered = _render_strategy(item)
         stage_match = bool(stage_hint and _stage_matches(stage_hint, item))
-        keyword_score = _keyword_hits(phase_text, item.get("phase_keywords"))
-        failure_score = _keyword_hits(phase_text, item.get("failure_signatures"))
-        score = keyword_score + failure_score
         if bool(item.get("fallback", False)):
-            item_stage = str(item.get("stage") or "").strip()
-            cross_cutting = bool(item.get("cross_cutting", False))
-            include_fallback = (
-                score > 0
-                or (bool(stage_hint) and stage_hint == item_stage)
-                or (stage_match and not cross_cutting)
-            )
-            if include_fallback:
-                fallback.append((score, rendered))
+            # Fallback/cross-cutting guidance is no longer guessed from prose.
+            # It remains available through the pull-oriented index.
             continue
         if stage_match:
-            selected.append((score, rendered))
-    if not selected:
-        fallback.sort(key=lambda item: item[0], reverse=True)
-        return [rendered for _score, rendered in fallback[:limit]]
-    selected.sort(key=lambda item: item[0], reverse=True)
-    positive = [(score, rendered) for score, rendered in selected if score > 0]
-    if positive:
-        max_score = positive[0][0]
-        close_matches = [
-            rendered for score, rendered in positive
-            if score >= max_score - 1
-        ]
-    else:
-        close_matches = [rendered for _score, rendered in selected[:limit]]
-    remaining = max(0, limit - len(close_matches))
-    if remaining:
-        fallback.sort(key=lambda item: item[0], reverse=True)
-        close_matches.extend(rendered for _score, rendered in fallback[:remaining])
-    return close_matches[:limit]
+            selected.append(rendered)
+    return selected[:limit]
 
 
 def render_strategy_guidance(strategies: List[JsonDict]) -> str:

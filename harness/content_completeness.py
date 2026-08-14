@@ -1,9 +1,8 @@
-"""Route-sensitive page-content completeness tracking.
+"""Page-region observations for trace evidence and model reflection.
 
-This module deliberately does not participate in CAPTCHA/HITL scoring.  It
-tracks whether a successfully loaded page contains the task-declared regions
-and, when the shell is present but those regions are suppressed, recommends a
-navigation-source pivot instead of allowing a false ``target_absent`` verdict.
+This module deliberately does not participate in CAPTCHA/HITL scoring or own a
+business completion verdict. Historical decision labels remain internal
+telemetry; model-facing consumers receive only attributed observation facts.
 """
 
 from __future__ import annotations
@@ -38,6 +37,51 @@ STRUCTURED_BINDING_AGING_METHODS = frozenset({
 })
 
 _CONFIRMATORY_SIGNAL_STRENGTHS = frozenset({"confirmatory"})
+
+_MODEL_OBSERVATION_FACT_KEYS = (
+    "scope",
+    "pageId",
+    "url",
+    "title",
+    "epoch",
+    "observationOrder",
+    "navigationKind",
+    "navigationOutcome",
+    "sourcePageId",
+    "sourceUrl",
+    "shellPresent",
+    "observedRegions",
+    "missingRegions",
+    "materializationAttempts",
+    "matchedSignals",
+    "matchedConfirmatorySignals",
+    "recoveryAttempts",
+    "recoveryAttemptsByItem",
+    "upstreamBlocker",
+    "regionRecordCounts",
+    "regionCollectionStates",
+    "regionExhaustionEvidence",
+    "collectionBinding",
+    "collectionBindingStatus",
+    "structuredObservedRegions",
+    "isRecoverySource",
+    "validatedArtifactRegionsByPageUrl",
+    "receipts",
+)
+
+
+def content_completeness_observation_facts(value: Any) -> JsonDict:
+    """Return model-facing facts while omitting tracker verdict vocabulary."""
+    if not isinstance(value, dict):
+        return {}
+    facts = {
+        key: value.get(key)
+        for key in _MODEL_OBSERVATION_FACT_KEYS
+        if value.get(key) not in (None, "", [], {})
+        or key in {"shellPresent", "recoveryAttempts", "isRecoverySource"}
+    }
+    facts["source"] = "content_completeness_tracker_observation"
+    return facts
 
 
 def _field_tokens(value: Any) -> Set[str]:
@@ -570,7 +614,7 @@ class PageContentState:
 
 
 class ContentCompletenessTracker:
-    """Observe normal browser results and expose a target-absence veto."""
+    """Observe page-region evidence for model-visible handoff and telemetry."""
 
     def __init__(self, config: Any = None, *, config_source: str = "explicit"):
         self.config = normalize_content_completeness_config(config)
@@ -2107,7 +2151,14 @@ class ContentCompletenessTracker:
         state.decision = "inconclusive"
         self._refresh_route_recovery_pending()
 
-    def terminal_veto(self) -> Optional[JsonDict]:
+    def unresolved_observation(self) -> Optional[JsonDict]:
+        """Return the latest unresolved tracker interpretation for diagnostics.
+
+        This is not a terminal decision, validation veto, scheduling status, or
+        completion receipt. Production handoff uses ``summaries()`` and strips
+        these historical decision labels down to their underlying facts. The
+        method remains a test/diagnostic observation API only.
+        """
         blocked_candidates = [
             state for state in self.pages.values()
             if state.decision == BLOCKED_CONTENT_SUPPRESSION
@@ -2144,9 +2195,6 @@ class ContentCompletenessTracker:
                 set(state.missing_regions) - self._validated_regions_for_page(state)
             )
         ]
-        # A page whose markers are in doubt is the strongest reason of all to
-        # refuse a semantic-terminal claim: we cannot say the target is absent
-        # while we cannot say we searched for the right thing.
         marker_suspect = [
             state for state in self.pages.values()
             if state.decision == MARKER_DECLARATION_SUSPECT

@@ -34,6 +34,7 @@ from harness.utils import (
     safe_path_component,
     task_subdir,
 )
+from harness.worker_result import worker_handoff_projections
 
 
 def write_offloaded_blob(path: Path, field: str, blob: Any) -> Tuple[str, str, Any]:
@@ -209,6 +210,7 @@ def offload_large_tool_result(
     threshold_bytes: int = DEFAULT_TOOL_RESULT_OFFLOAD_THRESHOLD_BYTES,
 ) -> Any:
     result = compact_model_facing_tool_result(result)
+    semantic_handoffs = worker_handoff_projections(result)
     byte_size = json_size_bytes(result)
     if byte_size <= threshold_bytes:
         return result
@@ -239,6 +241,10 @@ def offload_large_tool_result(
         "byteSize": byte_size,
         "outline": outline_value(result),
     }
+    if semantic_handoffs:
+        # Preserve the semantic handoff inline while the bulky fleet inventory,
+        # samples and traces move to disk.
+        stub["workerHandoffs"] = semantic_handoffs
     if isinstance(result, dict):
         for key in GENERIC_TOOL_RESULT_KEEP_KEYS:
             if key in result:

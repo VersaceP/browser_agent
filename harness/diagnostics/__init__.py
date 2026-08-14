@@ -35,6 +35,7 @@ from harness.constants import (
     PAGE_CRASHED_LOOKBACK,
     PAGE_DEAD_OBSERVATION_MARKERS,
     WORKER_STATUS_API_CONTRACT_ERROR,
+    WORKER_STATUS_BLOCKED_BY_CHALLENGE,
     WORKER_STATUS_CATEGORIES,
     WORKER_STATUS_CATEGORY_UNKNOWN,
     WORKER_STATUS_CONTEXT_LIMIT,
@@ -42,10 +43,12 @@ from harness.constants import (
     WORKER_STATUS_EXTRACTION_INCONCLUSIVE,
     WORKER_STATUS_FLEET_ASSIGNMENT_LOST,
     WORKER_STATUS_HITL_TIMEOUT,
+    WORKER_STATUS_HITL_REQUIRED,
     WORKER_STATUS_HITL_WAITING,
     WORKER_STATUS_PAGE_SETTLED_AFTER_HITL,
     WORKER_STATUS_PAGE_CRASHED,
     WORKER_STATUS_PARTIAL,
+    WORKER_STATUS_INCOMPLETE,
     WORKER_STATUS_SESSION_FLEET_LOST,
     WORKER_STATUS_STALE_PAUSE_DEADLOCK,
     WORKER_STATUS_STEP_BUDGET,
@@ -203,6 +206,16 @@ def classify_terminal_status(
             return hard, (
                 f"hard-signal override: model reported {model_reported_status!r}"
                 f" but harness detected {hard!r}"
+            )
+        if soft == WORKER_STATUS_UNKNOWN and model_reported_status in {
+            WORKER_STATUS_BLOCKED_BY_CHALLENGE,
+            WORKER_STATUS_HITL_REQUIRED,
+            WORKER_STATUS_PAGE_SETTLED_AFTER_HITL,
+            WORKER_STATUS_STALE_PAUSE_DEADLOCK,
+        }:
+            return WORKER_STATUS_INCOMPLETE, (
+                "model-reported challenge/HITL status had no matching pause"
+                " lifecycle receipt; preserving it as an unverified claim"
             )
         if soft == WORKER_STATUS_UNKNOWN:
             return WORKER_STATUS_UNKNOWN, (

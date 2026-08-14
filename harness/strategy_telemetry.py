@@ -38,7 +38,6 @@ def append_strategy_attempt(
         "workerId": result.get("workerId"),
         "strategy_ids": _strategy_ids(worker_contract),
         "status": result.get("status"),
-        "statusCategory": result.get("statusCategory"),
         "validatedStatus": result.get("validatedStatus"),
         "failureClassification": (
             classification.get("category") if isinstance(classification, dict) else None

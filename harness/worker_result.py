@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any, List, Optional
 
+from harness.content_completeness import content_completeness_observation_facts
 from harness.utils import JsonDict, json_size_bytes, trim_large_strings
 
 
@@ -13,6 +14,10 @@ MAX_INLINE_ANSWER_CHARS = 4000
 MAX_INLINE_ARTIFACTS = 50
 MAX_SAMPLE_ROWS = 3
 MAX_SAMPLE_FIELDS = 40
+# Leave headroom for coordinator-added arithmetic facts (attempt count/delta
+# and the strategy-attempt ledger path) while keeping the final handoff <=4KB.
+MAX_HANDOFF_BYTES = 3500
+MAX_HANDOFF_SECTION_CHARS = 900
 
 
 def build_worker_result_levels(
@@ -126,6 +131,172 @@ def build_worker_result_levels(
         "l2": trim_large_strings(l2, 20000),
         "l3": trim_large_strings(l3, 20000),
     }
+
+
+def build_worker_handoff_projection(
+    result: Any,
+    *,
+    original_goal: str = "",
+) -> Optional[JsonDict]:
+    """Build the single model-facing semantic handoff for a worker result.
+
+    The projection preserves provenance: receipts remain receipts, model prose
+    remains a claim, and unresolved evidence is never silently promoted to
+    completion.  Large row payloads stay behind evidence paths.
+    """
+    if not isinstance(result, dict):
+        return None
+    levels = result.get("resultLevels")
+    if not isinstance(levels, dict):
+        return None
+    l1 = levels.get("l1") if isinstance(levels.get("l1"), dict) else {}
+    l2 = levels.get("l2") if isinstance(levels.get("l2"), dict) else {}
+    data = l2.get("data") if isinstance(l2.get("data"), dict) else {}
+    evidence = l2.get("evidence") if isinstance(l2.get("evidence"), dict) else {}
+    answer = l2.get("answer") if isinstance(l2.get("answer"), dict) else {}
+    artifacts = data.get("extractionArtifacts")
+    artifacts = artifacts if isinstance(artifacts, list) else []
+    attempts = data.get("extractionAttemptArtifacts")
+    attempts = attempts if isinstance(attempts, list) else []
+    blockers = l2.get("blockers") if isinstance(l2.get("blockers"), list) else []
+    next_steps = l2.get("nextSteps") if isinstance(l2.get("nextSteps"), list) else []
+    trace_summary = (
+        l2.get("traceSummary") if isinstance(l2.get("traceSummary"), dict) else {}
+    )
+    completeness_observations = _content_completeness_observations(trace_summary)
+    if completeness_observations:
+        unresolved_pages = [
+            item for item in completeness_observations
+            if item.get("missingRegions")
+            or any(
+                str(value or "") not in {"", "target_reached", "explicitly_exhausted"}
+                for value in (item.get("regionCollectionStates") or {}).values()
+            )
+        ]
+        if unresolved_pages:
+            blockers = [
+                *blockers,
+                {
+                    "type": "content_completeness_observations",
+                    "source": "tracker_observation_not_verdict",
+                    "observations": unresolved_pages,
+                },
+            ]
+    claim: JsonDict = {
+        "source": "worker_claim_unverified",
+        "answer": answer.get("parsed") if answer.get("format") == "json" else answer.get("raw"),
+        "failureClassification": l1.get("failureClassification"),
+    }
+    projection: JsonDict = {
+        "workerId": l1.get("workerId") or result.get("workerId"),
+        "phaseId": l1.get("phaseId") or result.get("phaseId"),
+        "originalGoal": str(original_goal or result.get("phaseObjective") or ""),
+        "rawReceipts": {
+            "status": l1.get("status") or result.get("status"),
+            "validatedStatus": l1.get("validatedStatus") or result.get("validatedStatus"),
+            "artifactValidationStatus": (
+                (levels.get("l3") or {}).get("artifactValidation", {}).get("status")
+                if isinstance(levels.get("l3"), dict)
+                and isinstance((levels.get("l3") or {}).get("artifactValidation"), dict)
+                else None
+            ),
+            "artifacts": [
+                {
+                    "savedPath": item.get("savedPath"),
+                    "rowCount": item.get("rowCount"),
+                    "schemaStatus": item.get("status"),
+                }
+                for item in [*artifacts, *attempts]
+                if isinstance(item, dict)
+            ][:10],
+            "totalExtractedRows": data.get("totalExtractedRows"),
+            "methods": trace_summary.get("methods", {}),
+            "latestPageStats": trace_summary.get("latestPageStats"),
+            "contentCompletenessObservations": completeness_observations,
+        },
+        "workerClaims": trim_large_strings(claim, MAX_HANDOFF_SECTION_CHARS),
+        "unresolvedCounterevidence": trim_large_strings(
+            blockers, MAX_HANDOFF_SECTION_CHARS
+        ),
+        "suggestedNextExperiment": trim_large_strings(
+            next_steps, MAX_HANDOFF_SECTION_CHARS
+        ),
+        "evidencePaths": {
+            "tracePath": evidence.get("tracePath"),
+            "artifacts": (evidence.get("artifacts") or [])[:10],
+            "offloadedFiles": (evidence.get("offloadedFiles") or [])[:10],
+        },
+    }
+    if json_size_bytes(projection) <= MAX_HANDOFF_BYTES:
+        return projection
+
+    # Keep the six-section ownership shape, but make the exceptional oversized
+    # handoff fit the model-facing budget. Full data remains reachable through
+    # evidence paths and the offloaded original result.
+    projection["rawReceipts"]["artifacts"] = projection["rawReceipts"][
+        "artifacts"
+    ][:5]
+    methods = projection["rawReceipts"].get("methods")
+    if isinstance(methods, dict):
+        projection["rawReceipts"]["methods"] = dict(list(methods.items())[:10])
+    projection["workerClaims"] = trim_large_strings(
+        projection["workerClaims"], 400
+    )
+    unresolved = projection["unresolvedCounterevidence"]
+    if isinstance(unresolved, list):
+        unresolved = unresolved[:5]
+    projection["unresolvedCounterevidence"] = trim_large_strings(unresolved, 400)
+    experiments = projection["suggestedNextExperiment"]
+    if isinstance(experiments, list):
+        experiments = experiments[:5]
+    projection["suggestedNextExperiment"] = trim_large_strings(experiments, 400)
+    projection["evidencePaths"]["artifacts"] = projection["evidencePaths"][
+        "artifacts"
+    ][:5]
+    projection["evidencePaths"]["offloadedFiles"] = projection[
+        "evidencePaths"
+    ]["offloadedFiles"][:5]
+    fitted = trim_large_strings(projection, 400)
+    if json_size_bytes(fitted) <= MAX_HANDOFF_BYTES:
+        return fitted
+    unresolved = fitted["unresolvedCounterevidence"]
+    experiments = fitted["suggestedNextExperiment"]
+    fitted["unresolvedCounterevidence"] = trim_large_strings(
+        unresolved[:2] if isinstance(unresolved, list) else unresolved,
+        200,
+    )
+    fitted["suggestedNextExperiment"] = trim_large_strings(
+        experiments[:2] if isinstance(experiments, list) else experiments,
+        200,
+    )
+    fitted["evidencePaths"]["artifacts"] = fitted["evidencePaths"]["artifacts"][:2]
+    fitted["evidencePaths"]["offloadedFiles"] = fitted["evidencePaths"][
+        "offloadedFiles"
+    ][:2]
+    fitted["rawReceipts"]["artifacts"] = fitted["rawReceipts"]["artifacts"][:2]
+    fitted["rawReceipts"]["latestPageStats"] = {
+        "offloaded": True,
+        "reason": "handoff_size_budget",
+    }
+    fitted["originalGoal"] = trim_large_strings(fitted["originalGoal"], 200)
+    return trim_large_strings(fitted, 200)
+
+
+def worker_handoff_projections(value: Any) -> List[JsonDict]:
+    """Project direct results and wait_browser_agents completed entries."""
+    if not isinstance(value, dict):
+        return []
+    candidates = [value]
+    for key in ("completed", "results"):
+        nested = value.get(key)
+        if isinstance(nested, list):
+            candidates.extend(item for item in nested if isinstance(item, dict))
+    projections: List[JsonDict] = []
+    for candidate in candidates:
+        projection = build_worker_handoff_projection(candidate)
+        if projection is not None:
+            projections.append(projection)
+    return projections
 
 
 def parse_worker_answer(answer: str) -> JsonDict:
@@ -292,7 +463,27 @@ def _semantic_trace_summary(trace_summary: JsonDict) -> JsonDict:
         "snapshotDiffs": trace_summary.get("snapshotDiffs", []),
         "snapshotDiffCount": trace_summary.get("snapshotDiffCount", 0),
         "suspectedChallengePages": trace_summary.get("suspectedChallengePages", []),
+        "contentCompletenessPages": trace_summary.get("contentCompletenessPages", []),
     }
+
+
+def _content_completeness_observations(trace_summary: JsonDict) -> List[JsonDict]:
+    """Project tracker output as attributed facts, never as a verdict.
+
+    The tracker may internally retain historical decision labels for telemetry
+    compatibility. They are intentionally omitted here. The model receives
+    observable markers, missing regions, counts, collection/action receipts and
+    evidence paths, then performs the semantic interpretation itself.
+    """
+    pages = trace_summary.get("contentCompletenessPages")
+    if not isinstance(pages, list):
+        return []
+    observations: List[JsonDict] = []
+    for page in pages[:10]:
+        facts = content_completeness_observation_facts(page)
+        if facts:
+            observations.append(trim_large_strings(facts, 500))
+    return observations
 
 
 def _next_steps_from_answer(answer_payload: JsonDict) -> List[Any]:

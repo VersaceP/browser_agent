@@ -6440,11 +6440,13 @@ class FastPathCheckpointTests(unittest.TestCase):
                 reconciled["replan_checkpoints"]["missing"]["terminalReason"],
                 "source_artifact_missing",
             )
-            self.assertEqual(
-                reconciled["replan_checkpoints"]["exhausted"]["terminalReason"],
-                "objective_exhausted",
+            self.assertNotIn(
+                "terminalReason", reconciled["replan_checkpoints"]["exhausted"]
             )
-            self.assertEqual(active_replan_checkpoints(reconciled), [])
+            self.assertEqual(
+                [item["checkpointId"] for item in active_replan_checkpoints(reconciled)],
+                ["exhausted-id"],
+            )
 
     def test_legacy_single_checkpoint_migrates_to_cohort_map(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

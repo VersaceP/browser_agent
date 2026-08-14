@@ -71,7 +71,6 @@ from harness.task_control import (
     phase_start_rejection,
     record_replan_checkpoint,
     record_spawn_acquisition_failure,
-    repeated_phase_attempt_guard,
     spawn_acquisition_fingerprint,
     spawn_acquisition_rejection,
     validate_worker_artifacts,
@@ -93,7 +92,10 @@ from harness.utils import (
     task_subdir,
     trim_large_strings,
 )
-from harness.worker_result import build_worker_result_levels
+from harness.worker_result import (
+    build_worker_handoff_projection,
+    build_worker_result_levels,
+)
 from harness.workflow_runtime import workflow_execution_enabled
 from llm import LLMFactory
 
@@ -229,40 +231,6 @@ def _effective_worker_status(current_status: str, skill_answer: Any) -> str:
     # transition normally changes the constructor default from running -> done.
     # Validation remains a separate dimension in validatedStatus.
     return WORKER_STATUS_DONE if skill_answer is not None else current_status
-
-
-def _apply_content_completeness_validation_veto(
-    artifact_validation: JsonDict,
-    completeness_tracker: Any,
-) -> Optional[JsonDict]:
-    """Prevent shape-valid artifacts from becoming false validated success."""
-    if artifact_validation.get("status") != "done":
-        return None
-    if completeness_tracker is None or not hasattr(
-        completeness_tracker, "terminal_veto"
-    ):
-        return None
-    veto = completeness_tracker.terminal_veto()
-    if not isinstance(veto, dict):
-        return None
-    artifact_validation["status"] = "failed"
-    failures = artifact_validation.get("failures")
-    if not isinstance(failures, list):
-        failures = []
-        artifact_validation["failures"] = failures
-    failures.append({
-        "type": "content_completeness_incomplete",
-        "message": (
-            "artifact fields passed shape validation while a task-declared"
-            " content region remained incomplete"
-        ),
-        "classification": dict(veto),
-    })
-    artifact_validation["classification"] = {
-        **dict(veto),
-        "source": "content_completeness.validated_done_veto",
-    }
-    return dict(veto)
 
 
 def _finalize_skill_execution_metadata(
@@ -1254,21 +1222,14 @@ class BrowserAgentSpawner:
             if start_rejection is not None:
                 self.logger.write("spawner.browser.start_rejected", start_rejection)
                 return start_rejection
+        # Retained as an observation/provenance key for acquisition and
+        # attempt receipts; it no longer authorizes a repeated-phase lock.
         current_contract_hash = contract_hash_for_phase(
             phase,
             effective_contract,
             task=task,
             result_contract=result_contract,
         )
-        repeated_guard = repeated_phase_attempt_guard(
-            self.logger,
-            phase_id=phase_id,
-            contract_hash=current_contract_hash,
-        )
-        if repeated_guard is not None:
-            self.logger.write("spawner.browser.repeated_guard", repeated_guard)
-            return repeated_guard
-
         acquisition_fingerprint = spawn_acquisition_fingerprint(
             phase,
             effective_contract,
@@ -5392,26 +5353,6 @@ class BrowserAgentSpawner:
                     ],
                 )
                 if feedback_classification is not None:
-                    if (
-                        feedback_classification.get("category")
-                        in {"target_absent", "instruction_infeasible"}
-                        and completeness_tracker is not None
-                        and hasattr(completeness_tracker, "terminal_veto")
-                    ):
-                        completeness_veto = completeness_tracker.terminal_veto()
-                        if isinstance(completeness_veto, dict):
-                            feedback_classification = dict(completeness_veto)
-                            feedback_classification["source"] = (
-                                "content_completeness.semantic_terminal_veto"
-                            )
-                            self.logger.write(
-                                "content_completeness.semantic_terminal_veto",
-                                {
-                                    "workerId": worker_id,
-                                    "phaseId": phase_id,
-                                    "classification": feedback_classification,
-                                },
-                            )
                     artifact_validation["classification"] = feedback_classification
                     if feedback_classification.get("evidenceGate"):
                         self.logger.write("semantic_terminal.evidence_gate", {
@@ -5425,32 +5366,13 @@ class BrowserAgentSpawner:
                                 "evidenceGate"
                             ),
                         })
-            # Artifact shape validation alone cannot certify a task-declared
-            # repeated region: an 8-row array may satisfy required_fields while
-            # the completeness tracker still has shell_seen/stalled evidence.
-            # Fail closed here as a second boundary even if the model bypassed
-            # BrowserAgent final_answer or a skill supplied the terminal result.
+            # Completeness observations remain model-visible evidence, but do
+            # not override the artifact contract mechanically.
             contract_validation = json.loads(json.dumps(artifact_validation))
-            completeness_veto = _apply_content_completeness_validation_veto(
-                artifact_validation,
-                completeness_tracker,
-            )
             content_completeness_validation: JsonDict = {
-                "status": "failed" if isinstance(completeness_veto, dict) else "done",
-                "classification": (
-                    dict(completeness_veto)
-                    if isinstance(completeness_veto, dict) else None
-                ),
+                "status": "observed",
+                "classification": None,
             }
-            if isinstance(completeness_veto, dict):
-                self.logger.write(
-                    "content_completeness.validated_done_veto",
-                    {
-                        "workerId": worker_id,
-                        "phaseId": phase_id,
-                        "classification": completeness_veto,
-                    },
-                )
             validated_status = (
                 "validated_done"
                 if artifact_validation.get("status") == "done"
@@ -5697,14 +5619,51 @@ class BrowserAgentSpawner:
             task=task,
             result_contract=result_contract,
         )
+        handoff = build_worker_handoff_projection(
+            result,
+            original_goal=str((phase or {}).get("objective") or ""),
+        )
+        if isinstance(handoff, dict):
+            state_before_result = load_task_state(self.logger)
+            phase_state = (
+                (state_before_result.get("phases") or {}).get(str(phase_id or ""))
+                if isinstance(state_before_result.get("phases"), dict)
+                else None
+            )
+            prior_attempts = (
+                phase_state.get("attempts")
+                if isinstance(phase_state, dict)
+                and isinstance(phase_state.get("attempts"), list)
+                else []
+            )
+            prior_rows = [
+                int((item.get("attemptDigest") or {}).get("rowCount") or 0)
+                for item in prior_attempts
+                if isinstance(item, dict)
+                and item.get("workerId") != worker_id
+                and isinstance(item.get("attemptDigest"), dict)
+            ]
+            current_rows = int(attempt_digest.get("rowCount") or 0)
+            receipts = handoff.setdefault("rawReceipts", {})
+            receipts["attemptCount"] = len(prior_attempts)
+            receipts["previousRowCount"] = prior_rows[-1] if prior_rows else None
+            receipts["rowCountDelta"] = (
+                current_rows - prior_rows[-1] if prior_rows else current_rows
+            )
+            handoff.setdefault("evidencePaths", {})[
+                "strategyAttempts"
+            ] = str(self.logger.task_dir / "strategy_attempts.jsonl")
+            attempt_digest["handoff"] = handoff
         result["attemptDigest"] = attempt_digest
-        phase_result_status = phase_result_status_for(result)
         mark_phase_result(
             self.logger,
             phase_id=phase_id,
             worker_id=worker_id,
             validation=result.get("artifactValidation"),
-            result_status=phase_result_status,
+            # Lifecycle truth must use the worker's raw outcome.  The derived
+            # validatedStatus is a separate artifact dimension and must never
+            # turn a partial worker into a completed phase.
+            result_status=str(result.get("status") or "unknown"),
             attempt_digest=attempt_digest,
             phase=phase,
             worker_contract=worker_contract,

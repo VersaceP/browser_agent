@@ -1076,6 +1076,29 @@ async def review_plan_revision(
         candidate_plan=candidate_plan,
     )
     evidence = evidence_catalog(task_state)
+    worker_handoffs = []
+    state_phases = (
+        task_state.get("phases")
+        if isinstance(task_state, dict)
+        and isinstance(task_state.get("phases"), dict)
+        else {}
+    )
+    for phase_state in state_phases.values():
+        attempts = (
+            phase_state.get("attempts")
+            if isinstance(phase_state, dict)
+            and isinstance(phase_state.get("attempts"), list)
+            else []
+        )
+        for attempt in attempts:
+            digest = (
+                attempt.get("attemptDigest")
+                if isinstance(attempt, dict)
+                and isinstance(attempt.get("attemptDigest"), dict)
+                else None
+            )
+            if isinstance(digest, dict) and isinstance(digest.get("handoff"), dict):
+                worker_handoffs.append(digest["handoff"])
     diff = structural_plan_diff(previous_plan or {}, candidate_plan)
     relaxations, lineage_ambiguities = _quantity_change_analysis(
         previous_plan,
@@ -1110,6 +1133,10 @@ async def review_plan_revision(
             " objectiveChecks entry assessed as weakened or removed. Do not"
             " list a preserved or strengthened objective as overridden.",
             "replanReason is Lead-authored context, never user authorization.",
+            "Worker claims and semantic classifications in workerHandoffs are"
+            " unverified. Do not upgrade 'not found', 'appears', or a"
+            " single-surface miss into a confirmed absence when Raw receipts"
+            " or Unresolved/counterevidence do not establish it.",
             "Resolve every quantityLineageAmbiguity explicitly. An ambiguous"
             " assessment cannot be approved. If it is a quantity relaxation,"
             " submit a quantityDecision using that ambiguityId.",
@@ -1145,6 +1172,7 @@ async def review_plan_revision(
         "diff": diff,
         "objectiveCatalog": objectives,
         "evidenceCatalog": evidence,
+        "workerHandoffs": worker_handoffs[-10:],
         "quantityRelaxations": relaxations,
         "quantityLineageAmbiguities": lineage_ambiguities,
     }
