@@ -80,6 +80,30 @@ HITL_ATTENDED = "attended"
 HITL_UNATTENDED = "unattended"
 
 
+def _validated_storage_backend(value: Any) -> str:
+    backend = str(value or "").strip().lower()
+    if backend not in {"file", "dual", "db"}:
+        raise ValueError(
+            f"harness.storage_backend must be 'file', 'dual' or 'db'; got {value!r}"
+        )
+    return backend
+
+
+def _validated_resource_compression(value: Any) -> str:
+    """Fail-fast like the backend switch: "none" is the rollback path.
+
+    A typo silently falling through to either value changes what every
+    future row looks like, so it must be rejected rather than guessed.
+    """
+
+    mode = str(value or "").strip().lower()
+    if mode not in {"none", "zlib"}:
+        raise ValueError(
+            f"harness.resource_compression must be 'none' or 'zlib'; got {value!r}"
+        )
+    return mode
+
+
 def _normalize_hitl_attendance(value: Any) -> str:
     """Unknown spellings fall back to `attended`.
 
@@ -934,6 +958,35 @@ class HarnessConfig:
     # NOTE: shadow-host mapping is NOT supported (getSemanticTree does not
     # traverse shadow roots on this build — see abcp-panel-quirks #8).
     semantic_tree: str = "off"
+
+    # Where task process data (events, traces, state, offloaded resources) is
+    # written.
+    #   "file" -> the historical per-task JSONL/JSON layout
+    #   "dual" -> both, files authoritative, backends compared on demand
+    #   "db"   -> SQLite only
+    # "db" writes no process files at all. The model-facing readers cover that:
+    # local_fs_read/search present run_events, worker_trace_events and
+    # task_resources under the same paths those files used, and resume falls
+    # back to the database when a file is absent. Files still win wherever both
+    # exist, which is what keeps a pre-database worktree resumable unchanged.
+    storage_backend: str = "db"
+    # Relative to worktree_dir, so it follows a relocated worktree.
+    storage_sqlite_path: str = "harness.db"
+    storage_dual_verify: bool = True
+    storage_busy_timeout_ms: int = 5000
+
+    # Physical-layer compression for the four harness-internal bulk resource
+    # types (event_payload / observation / tool_result / context_compaction).
+    # Purely physical: byte_size and sha256 stay logical, extraction and
+    # every operator-facing table stays readable in place, and "none" writes
+    # rows byte-identical to the pre-compression shape - the rollback switch.
+    resource_compression: str = "zlib"
+    # Logical bytes below this stay uncompressed: measured on live data the
+    # threshold costs 0.7 MB of the 71 MB saved while keeping 82 small rows
+    # readable in place.
+    resource_compression_min_bytes: int = 16384
+    resource_compression_level: int = 6
+
     vl: VLConfig = field(default_factory=VLConfig)
 
     @classmethod
@@ -1291,6 +1344,48 @@ class HarnessConfig:
                 if str(data.get("semantic_tree", cls.semantic_tree))
                 in {"off", "internal"}
                 else cls.semantic_tree
+            ),
+            # Deliberately fail-fast, unlike most options here: this one
+            # decides where a task's only copy of its data goes. Falling back
+            # on a typo would send "duel" to the db backend and quietly stop
+            # writing the files the operator thought they still had.
+            storage_backend=_validated_storage_backend(
+                data.get("storage_backend", cls.storage_backend)
+            ),
+            storage_sqlite_path=str(
+                data.get("storage_sqlite_path", cls.storage_sqlite_path)
+                or cls.storage_sqlite_path
+            ),
+            storage_dual_verify=bool(
+                data.get("storage_dual_verify", cls.storage_dual_verify)
+            ),
+            storage_busy_timeout_ms=max(
+                100,
+                int(data.get("storage_busy_timeout_ms", cls.storage_busy_timeout_ms)),
+            ),
+            resource_compression=_validated_resource_compression(
+                data.get("resource_compression", cls.resource_compression)
+            ),
+            resource_compression_min_bytes=max(
+                0,
+                int(
+                    data.get(
+                        "resource_compression_min_bytes",
+                        cls.resource_compression_min_bytes,
+                    )
+                ),
+            ),
+            resource_compression_level=max(
+                0,
+                min(
+                    9,
+                    int(
+                        data.get(
+                            "resource_compression_level",
+                            cls.resource_compression_level,
+                        )
+                    ),
+                ),
             ),
         )
 

@@ -89,6 +89,7 @@ from harness.utils import (
     optional_float,
     optional_int,
     safe_path_component,
+    storage_for_logger,
     task_subdir,
     trim_large_strings,
 )
@@ -5795,25 +5796,37 @@ class BrowserAgentSpawner:
                 else {}
             ),
             task_dir=getattr(self.logger, "task_dir", None),
+            logger=self.logger,
         )
         result["resultLevels"] = levels
         result["workerResultProtocol"] = "L1/L2/L3"
         return result
 
     def _write_worker_trace(self, worker_id: str, trace: List[JsonDict]) -> str:
-        traces_dir = task_subdir(self.logger, "traces")
-        path = traces_dir / f"{safe_path_component(worker_id)}.jsonl"
-        with path.open("w", encoding="utf-8") as handle:
-            for item in trace:
-                handle.write(json.dumps(item, ensure_ascii=False, default=str) + "\n")
-        return str(path.resolve())
+        """Persist one worker's trace and return where a reader can find it.
+
+        This used to truncate the file, which silently destroyed the earlier
+        trace whenever a resumed run reissued the same worker id - the ids come
+        from a per-run counter, so browser-001 recurs on every resume. Writes
+        now append, and the database backend scopes them by run so the two
+        attempts stay separable rather than one overwriting the other.
+        """
+
+        safe_worker = safe_path_component(worker_id)
+        storage, task_id = storage_for_logger(self.logger)
+        storage.append_worker_trace(
+            task_id=task_id,
+            run_id=str(getattr(self.logger, "run_id", "") or ""),
+            worker_id=safe_worker,
+            entries=trace,
+        )
+        return str((task_subdir(self.logger, "traces") / f"{safe_worker}.jsonl").resolve())
 
     def _summarize_worker_trace(self, trace: List[JsonDict]) -> JsonDict:
         method_counts: Dict[str, int] = {}
         errors: List[str] = []
         page_ids: Set[str] = set()
         offloaded: List[str] = []
-        progress_interventions: List[JsonDict] = []
         progress_observations: List[JsonDict] = []
         loop_nudges: List[JsonDict] = []
         page_stats_events: List[JsonDict] = []
@@ -6221,21 +6234,17 @@ def _classification_from_contract_violation(
         if category != "blocked_cross_task_type_required":
             continue
         recovered = dict(classification)
-        recovered.setdefault("hint", "LeadAgent should replan with a task_type that permits the required method.")
         recovered["source"] = "contract_violation"
         return recovered
     return None
 
 
-# Evidence gate (A + B3) for semantic-terminal blockers. A: the blocker must
-# carry reason text. B3: evidenceArtifacts must name at least one savedPath
-# the harness itself recorded via record_extraction this run — we trust the
-# harness ledger, never the filesystem or the model's claim, so a fabricated
-# path can not mint a terminal verdict. Failure costs are asymmetric: a false
-# terminal silently blocks dependents and tells the user their instruction is
-# wrong, while a false downgrade just spends another attempt — so the gate
-# fails closed toward "not terminal".
-_SEMANTIC_TERMINAL_MIN_REASON_CHARS = 40
+# Counterevidence for semantic-terminal blockers reads two things the claim
+# cannot vouch for itself: whether the blocker carries reason text, and whether
+# its evidenceArtifacts name a savedPath the harness itself recorded via
+# record_extraction this run. The ledger is the source — never the filesystem
+# and never the model's claim — so a fabricated path is visible as one. None of
+# it changes the claim; it travels beside it.
 
 
 def _blocker_evidence_paths(
@@ -6512,33 +6521,48 @@ def _semantic_terminal_evidence_failure(
     if matched:
         if _only_visual_check_evidence(matched):
             # The artifact is real and ledger-bound, and still proves nothing:
-            # it holds a model's reading of a screenshot. Letting it clear this
-            # gate is how task 5324506f turned one page's overlay into "the
-            # site requires login for reviews".
-            return (
-                "the only cited evidence is a visual reality check, which is a"
-                " model assertion about one screenshot and not a measurement —"
-                " cite what you actually observed (the persisted rows, the"
-                " enumeration, the receipt for the region you could not"
-                " materialize) alongside it"
-            )
+            # it holds a model's reading of a screenshot. Task 5324506f turned
+            # one page's overlay into "the site requires login for reviews"
+            # on exactly this evidence.
+            return {
+                **facts,
+                "findings": [
+                    "every cited artifact is a visual reality check, which"
+                    " records a model's reading of one screenshot rather than"
+                    " a measurement"
+                ],
+                "citedEvidenceArtifacts": list(evidence_paths),
+                "ledgerMatchedArtifacts": list(matched),
+            }
         return None
     if category == "instruction_infeasible":
-        # Infeasibility often has nothing extractable to persist (the site
-        # lacks the requested concept entirely), so a substantive reason is
-        # acceptable evidence on its own.
-        if len(reason_text) >= _SEMANTIC_TERMINAL_MIN_REASON_CHARS:
-            return None
-        return (
-            "no evidenceArtifacts entry matches a record_extraction savedPath"
-            " from this run, and the reason text is too thin to stand alone"
-        )
-    if not evidence_paths:
-        return "no evidenceArtifacts listed"
-    return (
-        "no evidenceArtifacts entry matches a record_extraction savedPath"
-        " from this run"
-    )
+        # Infeasibility often has nothing extractable to persist — the site can
+        # lack the requested concept entirely — which makes a missing artifact
+        # unremarkable rather than damning. That is a reading of the claim, and
+        # it used to be made here by measuring the reason text against a
+        # 40-character floor: 40 characters "stood on its own" and 39 did not.
+        # The length is a fact and travels as one; what it is worth is not this
+        # function's call.
+        return {
+            **facts,
+            "findings": [
+                "no evidenceArtifacts entry matches a record_extraction"
+                " savedPath from this run"
+            ],
+            "citedEvidenceArtifacts": list(evidence_paths),
+        }
+    return {
+        **facts,
+        "findings": [
+            "no evidenceArtifacts listed"
+            if not evidence_paths
+            else (
+                "no evidenceArtifacts entry matches a record_extraction"
+                " savedPath from this run"
+            )
+        ],
+        "citedEvidenceArtifacts": list(evidence_paths),
+    }
 
 
 def _only_visual_check_evidence(paths: List[str]) -> bool:
@@ -6619,93 +6643,43 @@ def _classification_from_final_answer(
         }:
             continue
         if category in {"target_absent", "instruction_infeasible"}:
-            gate_failure = _semantic_terminal_evidence_failure(
+            counterevidence = _semantic_terminal_counterevidence(
                 category,
                 blocker,
                 classification,
                 persisted_artifacts,
                 traversal=traversal,
             )
-            if gate_failure is not None:
+            if counterevidence is not None:
                 if isinstance(traversal, dict):
                     classification["pageTraversal"] = dict(traversal)
-                # Downgrade, never drop silently: keep the claim visible so
-                # the Lead/next worker can persist evidence and re-declare,
-                # but do not let it mint a terminal phase status.
-                classification["category"] = f"{category}_unverified"
-                classification["claimedCategory"] = category
-                classification["evidenceGate"] = gate_failure
-                untraversed = (
-                    isinstance(traversal, dict)
-                    and not traversal.get("traversed")
-                    and category == "target_absent"
+                # The claim stays the worker's own. Our receipts are appended
+                # beside it so the Lead reads both and decides; rewriting the
+                # category here would be this harness judging a page's
+                # behaviour, which is the model's call to make.
+                classification["counterevidence"] = counterevidence
+                findings = "; ".join(
+                    str(item) for item in counterevidence.get("findings") or []
                 )
-                scroll_ignored = untraversed and bool(
-                    isinstance(traversal, dict)
-                    and traversal.get("scrollsWithoutEffect")
-                )
-                if scroll_ignored:
-                    # Repeating a scroll the page already swallowed just burns
-                    # steps, so point at the container instead of the viewport.
-                    remedy = (
-                        "Do not repeat the same viewport scroll: it was"
-                        " dispatched and the page did not move. Scroll the"
-                        " scrollable container itself (pass its canonical id or"
-                        " selector to Input.scroll), or enumerate that container"
-                        " to exhaustion, and re-check before declaring absence."
-                    )
-                elif untraversed:
-                    remedy = (
-                        "Scroll the page (or enumerate the target container to"
-                        " exhaustion) and re-check before declaring absence;"
-                        " a screenshot of the first screenful cannot settle it."
-                    )
-                else:
-                    remedy = (
-                        "Persist the observed evidence via record_extraction"
-                        " and re-declare with its savedPath in"
-                        " evidenceArtifacts, or keep working the phase."
-                    )
                 classification.setdefault("hint", (
-                    f"Worker claimed {category} but the evidence gate failed:"
-                    f" {gate_failure}. {remedy}"
+                    f"Worker claimed {category}. Counterevidence from this"
+                    f" run's own receipts: {findings}."
                 )[:500])
                 classification["source"] = "final_answer.blockers"
                 return classification
+        # The worker's own words are its claim and travel verbatim. Where it
+        # gave none, this used to substitute a per-category directive
+        # ("LeadAgent should stop retrying…", "…should replan…"); that is the
+        # harness picking the next move from a category name, with none of the
+        # run's evidence in front of it. The category and the receipts beside
+        # it are the record; reading them is the Lead's job.
         hint = (
             blocker.get("hint")
             or blocker.get("message")
             or blocker.get("reason")
-            or (
-                "Browser infrastructure failed; reconnect/rebuild the Browser"
-                " Client before retrying."
-                if category == "blocked_infrastructure"
-                else (
-                    "LeadAgent should preserve a search/listing page and enter"
-                    " the target through its real anchor instead of retrying"
-                    " the same direct detail URL."
-                    if category == "route_sensitive_content_suppression"
-                    else (
-                        "The bounded listing-link recovery was exhausted;"
-                        " preserve this blocker and do not mark dependent"
-                        " phases successful."
-                        if category == "blocked_content_suppression"
-                        else (
-                            "LeadAgent should stop retrying the same target and ask the"
-                            " user to revise the range/source."
-                            if category in {"target_absent", "instruction_infeasible"}
-                            else (
-                                "LeadAgent should replan expected_artifact with"
-                                " the nested array shape carried in expectedShape."
-                                if category == COLLECTION_CONTRACT_REPLAN_REQUIRED
-                                else "LeadAgent should replan with a task_type that permits the required method."
-                            )
-                        )
-                    )
-                )
-            )
         )
-        classification.setdefault("hint", str(hint)[:500])
+        if hint:
+            classification.setdefault("hint", str(hint)[:500])
         if blocker.get("method"):
             classification.setdefault("method", blocker.get("method"))
         if blocker.get("task_type"):

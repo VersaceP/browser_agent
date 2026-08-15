@@ -7,7 +7,27 @@ from pathlib import Path
 from typing import Any, List, Optional
 
 from harness.content_completeness import content_completeness_observation_facts
-from harness.utils import JsonDict, json_size_bytes, trim_large_strings
+from harness.utils import (
+    JsonDict,
+    json_size_bytes,
+    read_task_file_text,
+    trim_large_strings,
+)
+
+
+class _ArtifactReaderLogger:
+    """Last-resort shim for callers that only have a task directory.
+
+    Resolves to the file backend, which is the right answer when there is no
+    logger to inherit a connection from - but a caller that HAS one must pass
+    it: this shim cannot see the database, and a summary built through it
+    reports every db-mode artifact as missing while the artifact gate, reading
+    the same path with a real logger, passes it.
+    """
+
+    def __init__(self, task_dir) -> None:
+        self.task_dir = task_dir
+        self.task_id = task_dir.name
 
 
 MAX_INLINE_ANSWER_CHARS = 4000
@@ -40,6 +60,7 @@ def build_worker_result_levels(
     task_dir: Optional[Path],
     extraction_attempt_artifacts: Optional[List[str]] = None,
     row_ledger: Optional[List[JsonDict]] = None,
+    logger: Optional[Any] = None,
 ) -> JsonDict:
     """Return the stable worker handoff shape consumed by LeadAgent.
 
@@ -48,13 +69,18 @@ def build_worker_result_levels(
     on the spawner result for compatibility.
     """
     answer_payload = parse_worker_answer(answer)
+    # The summary the Lead reads must agree with the artifact gate. Built from
+    # a task_dir alone it cannot see the database, and every db-mode artifact
+    # comes back "missing" with rowCount 0 while the gate passes the same file.
     extraction_artifacts = summarize_extraction_artifacts(
         artifacts,
         task_dir=task_dir,
+        logger=logger,
     )
     attempt_artifacts = summarize_extraction_artifacts(
         extraction_attempt_artifacts or [],
         task_dir=task_dir,
+        logger=logger,
     )
     error_count = len(trace_summary.get("errors", [])) if isinstance(trace_summary, dict) else 0
     artifact_count = len(artifacts) if isinstance(artifacts, list) else 0
@@ -319,18 +345,26 @@ def summarize_extraction_artifacts(
     artifacts: List[str],
     *,
     task_dir: Optional[Path],
+    logger: Optional[Any] = None,
 ) -> List[JsonDict]:
     summaries: List[JsonDict] = []
     for raw_path in artifacts or []:
         path_text = str(raw_path)
         if "/artifacts/extractions/" not in path_text.replace("\\", "/"):
             continue
-        summary = _summarize_extraction_artifact(path_text, task_dir=task_dir)
+        summary = _summarize_extraction_artifact(
+            path_text, task_dir=task_dir, logger=logger
+        )
         summaries.append(summary)
     return summaries
 
 
-def _summarize_extraction_artifact(path_text: str, *, task_dir: Optional[Path]) -> JsonDict:
+def _summarize_extraction_artifact(
+    path_text: str,
+    *,
+    task_dir: Optional[Path],
+    logger: Optional[Any] = None,
+) -> JsonDict:
     summary: JsonDict = {"savedPath": path_text, "status": "unknown"}
     try:
         path = Path(path_text).resolve(strict=False)
@@ -348,13 +382,24 @@ def _summarize_extraction_artifact(path_text: str, *, task_dir: Optional[Path]) 
             })
             return summary
 
-    if not path.exists() or not path.is_file():
-        summary.update({"status": "missing"})
-        return summary
-
+    # The summary the Lead reads must agree with the artifact gate: both go
+    # through the same reader so a db-mode artifact is never reported missing.
+    reader = logger if logger is not None else (
+        _ArtifactReaderLogger(task_dir) if task_dir else None
+    )
+    text = read_task_file_text(reader, str(path)) if reader is not None else None
+    if text is None:
+        if not path.exists() or not path.is_file():
+            summary.update({"status": "missing"})
+            return summary
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            summary.update({"status": "unreadable", "error": str(exc)})
+            return summary
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        payload = json.loads(text)
+    except (TypeError, ValueError) as exc:
         summary.update({"status": "unreadable", "error": str(exc)})
         return summary
 

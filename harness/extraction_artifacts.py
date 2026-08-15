@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Any, List, Optional
 
+from harness.offload import store_offloaded
 from harness.utils import JsonDict
 
 
@@ -109,10 +110,10 @@ def save_extraction_artifact(
         # came from one of them unchanged.
         payload["rowLineage"] = [dict(item) for item in row_lineage]
 
-    file_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
-    )
+    # Extraction artifacts are cited by path across phases (batch_source, the
+    # validated-artifact ledger), so the address stays a path either way and
+    # only the backend behind it changes.
+    store_offloaded(logger, file_path, resource_type="extraction", content=payload)
     absolute_path = str(file_path.resolve())
     if artifacts is not None and absolute_path not in artifacts:
         artifacts.append(absolute_path)

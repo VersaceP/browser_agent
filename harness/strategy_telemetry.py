@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, List
 
 from harness.task_control import utc_now_iso
-from harness.utils import JsonDict
+from harness.utils import JsonDict, storage_for_logger
 
 
 ROOT_STRATEGY_ATTEMPTS_FILE = "strategy_attempts.jsonl"
@@ -52,26 +52,50 @@ def append_strategy_attempt(
     if task_dir:
         paths = _unique_paths(paths + [Path(task_dir) / ROOT_STRATEGY_ATTEMPTS_FILE])
 
-    written: List[str] = []
-    line = json.dumps(payload, ensure_ascii=False, default=str)
-    for path in paths:
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
-            written.append(str(path.resolve()))
-        except OSError as exc:
-            if logger is not None and hasattr(logger, "write"):
-                logger.write(
-                    "strategy_attempts.write_failed",
-                    {"path": str(path), "error": str(exc)},
-                )
+    # What a file backend would write. It is not a claim that anything was
+    # written: the receipt below reports only what this call can actually
+    # observe. Before the storage layer this function appended path by path and
+    # listed the ones that succeeded; afterwards it listed the same paths
+    # unconditionally, which reads as a write confirmation in db mode where no
+    # such file exists, and in file mode too - FileStore swallows a per-path
+    # OSError and continues. `append_strategy_attempt` returns None, so the
+    # only fact available here is whether it raised.
+    targets = [str(path) for path in paths]
+
+    recorded = False
+    backend = ""
+    try:
+        storage, task_id = storage_for_logger(logger)
+        backend = type(storage).__name__
+        storage.append_strategy_attempt(
+            task_id=task_id,
+            run_id=str(getattr(logger, "run_id", "") or ""),
+            payload=payload,
+        )
+        recorded = True
+    except Exception as exc:  # noqa: BLE001 - telemetry must never fail a phase
+        if logger is not None and hasattr(logger, "write"):
+            logger.write(
+                "strategy_attempts.write_failed",
+                {"fileTargets": targets, "backend": backend, "error": str(exc)},
+            )
     if logger is not None and hasattr(logger, "write"):
         logger.write(
             "strategy_attempts.appended",
-            {"paths": written, "payload": payload},
+            {
+                "accepted": recorded,
+                "backend": backend,
+                "fileTargets": targets,
+                "payload": payload,
+            },
         )
-    return {"status": "done" if written else "failed", "paths": written, "payload": payload}
+    return {
+        "status": "done" if recorded else "failed",
+        "accepted": recorded,
+        "backend": backend,
+        "fileTargets": targets,
+        "payload": payload,
+    }
 
 
 def _strategy_ids(worker_contract: JsonDict) -> List[str]:

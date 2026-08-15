@@ -4,6 +4,7 @@ harness.offload - Artifact capture and large result offload helpers.
 
 import base64
 import copy
+import hashlib
 import json
 import uuid
 from datetime import datetime
@@ -32,25 +33,179 @@ from harness.utils import (
     json_size_bytes,
     outline_value,
     safe_path_component,
+    storage_for_logger,
     task_subdir,
 )
 from harness.worker_result import worker_handoff_projections
 
 
-def write_offloaded_blob(path: Path, field: str, blob: Any) -> Tuple[str, str, Any]:
+def store_offloaded(
+    logger: RunLogger,
+    path: Path,
+    *,
+    resource_type: str,
+    content: Any,
+    media_type: str = "application/json",
+) -> None:
+    """Hand an offloaded payload to the configured backend.
+
+    ``path`` stays the address the model is given, because it is also the key
+    the backend stores it under: local_fs_read turns an absolute path back into
+    the same task-relative logical path, so one identifier serves a file on
+    disk and a row in task_resources without the tool contract changing.
+    """
+
+    storage, task_id = storage_for_logger(logger)
+    try:
+        logical_path = str(path.resolve().relative_to(logger.task_dir.resolve()))
+    except (OSError, ValueError):
+        logical_path = path.name
+    storage.save_resource(
+        task_id=task_id,
+        run_id=str(getattr(logger, "run_id", "") or ""),
+        resource_type=resource_type,
+        logical_path=logical_path,
+        content=content,
+        media_type=media_type,
+    )
+
+
+def serialized_offload_text(content: Any) -> str:
+    """The exact text `local_fs_read` will page through.
+
+    Mirrors the backend's own serialization so a reported line count is the
+    line count the model will actually see, not an estimate of one.
+    """
+    if isinstance(content, bytes):
+        return content.decode("utf-8", errors="replace")
+    if isinstance(content, str):
+        return content
+    return json.dumps(content, ensure_ascii=False, indent=2, default=str)
+
+
+def store_offloaded_payload(
+    logger: RunLogger,
+    path: Path,
+    *,
+    resource_type: str,
+    content: Any,
+    media_type: str = "application/json",
+) -> JsonDict:
+    """Persist an offloaded payload and return what is needed to page it.
+
+    Two facts travel back that the caller could not compute for itself:
+
+    `lineCount`, because `local_fs_read` pages by line and previously reported
+    only `nextLineOffset`. Knowing there is more but never how much, a worker
+    walks the file blindly — task a608b5e7 spent one whole model turn reading
+    a single line, and seven turns paging one file.
+
+    `sameContentAs`, because identical content is worth addressing rather than
+    rewriting. `Input.scroll` bumps the AX epoch, the worker correctly re-reads,
+    and the page hands back byte-identical bytes; that run stored one AXTree six
+    times under six names. The new epoch is still a real observation and is
+    still reported — pointed at the payload the model already has.
+    """
+    text = serialized_offload_text(content)
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    facts: JsonDict = {
+        "lineCount": text.count("\n") + 1 if text else 0,
+        "contentHash": digest[:16],
+    }
+    index = getattr(logger, "_offload_content_index", None)
+    if not isinstance(index, dict):
+        index = {}
+        try:
+            logger._offload_content_index = index
+        except Exception:
+            index = {}
+    existing = index.get(digest)
+    if existing:
+        facts["savedPath"] = existing
+        facts["sameContentAs"] = existing
+        return facts
+    store_offloaded(
+        logger,
+        path,
+        resource_type=resource_type,
+        content=content,
+        media_type=media_type,
+    )
+    resolved = str(path.resolve())
+    index[digest] = resolved
+    facts["savedPath"] = resolved
+    return facts
+
+
+def write_offloaded_blob(
+    logger: RunLogger,
+    path: Path,
+    field: str,
+    blob: Any,
+) -> Tuple[str, str, Any, JsonDict]:
     if field in OFFLOAD_FIELDS_AS_TEXT:
         if isinstance(blob, list):
             content = "\n".join(str(item) for item in blob)
         else:
             content = str(blob)
-        path.write_text(content, encoding="utf-8")
-        return "text_lines", "local_fs_search", outline_value(content)
+        facts = store_offloaded_payload(
+            logger, path, resource_type="observation",
+            content=content, media_type="text/plain",
+        )
+        return "text_lines", "local_fs_search", outline_value(content), facts
 
-    path.write_text(
-        json.dumps(blob, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
+    facts = store_offloaded_payload(
+        logger, path, resource_type="observation", content=blob,
     )
-    return "json_tree", "local_fs_read", outline_value(blob)
+    return "json_tree", "local_fs_read", outline_value(blob), facts
+
+
+# Keys that echo what was asked rather than what came back. A Runtime.evaluate
+# result carries the whole submitted expression, and outlining the result as a
+# whole spent the entire outline budget reciting it: task a608b5e7 showed the
+# model an outline of its own JavaScript with the payload cut off at
+# `{"value":{"flo`. The model wrote the request; it needs the response.
+_REQUEST_ECHO_KEYS = frozenset({
+    "params",
+    "expression",
+    "arguments",
+    "input",
+    "suggested_prompt",
+})
+
+
+def payload_outline(result: Any) -> Any:
+    """Describe what a call returned, not what it was asked to do."""
+    if not isinstance(result, dict):
+        return outline_value(result)
+    # Runtime.evaluate arrives twice: as `response.data`, a JSON string the
+    # transport may have cut mid-token, and as `runtimeValue`, which the
+    # harness already parsed. Outline the parsed one — on the a608b5e7 payload
+    # the string is truncated at 24,000 characters and will not parse at all,
+    # while `runtimeValue` cleanly reports {floorCount, floors}.
+    runtime_value = result.get("runtimeValue")
+    if runtime_value is not None:
+        return outline_value(runtime_value)
+    response = result.get("response")
+    target = response if isinstance(response, dict) else result
+    data = target.get("data") if isinstance(target, dict) else None
+    if isinstance(data, str):
+        # Runtime.evaluate hands its value back as a JSON string. Outlining the
+        # string yields its first few hundred characters, which is where the
+        # blind paging started; outlining the parsed value yields its shape.
+        try:
+            data = json.loads(data)
+        except (TypeError, ValueError):
+            pass
+    if data is not None:
+        return outline_value(data)
+    if isinstance(target, dict):
+        return outline_value({
+            key: value
+            for key, value in target.items()
+            if key not in _REQUEST_ECHO_KEYS
+        })
+    return outline_value(target)
 
 
 def outline_large_field(value: Any, max_bytes: int = GENERIC_TOOL_RESULT_KEEP_FIELD_BYTES) -> Any:
@@ -227,19 +382,18 @@ def offload_large_tool_result(
         ) if part
     ]
     path = tool_results_dir / ("-".join(filename_parts) + ".json")
-    path.write_text(
-        json.dumps(result, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
+    facts = store_offloaded_payload(
+        logger, path, resource_type="tool_result", content=result,
     )
 
     stub: JsonDict = {
         "_offloaded": True,
-        "savedPath": str(path.resolve()),
         "format": "json_response",
         "query_with": "local_fs_read",
         "originalBytes": byte_size,
         "byteSize": byte_size,
-        "outline": outline_value(result),
+        "outline": payload_outline(result),
+        **facts,
     }
     if semantic_handoffs:
         # Preserve the semantic handoff inline while the bulky fleet inventory,
@@ -260,19 +414,23 @@ def offload_large_tool_result(
         nested_offloaded = extract_offloaded_paths(result)
         if nested_offloaded:
             stub["nestedOffloadedFiles"] = nested_offloaded[:100]
+    saved_path = Path(str(facts.get("savedPath") or path.resolve()))
     try:
-        relative_path = str(path.resolve().relative_to(logger.task_dir.resolve()))
+        relative_path = str(saved_path.resolve().relative_to(logger.task_dir.resolve()))
     except ValueError:
-        relative_path = str(path.resolve())
+        relative_path = str(saved_path)
     logger.write(
         "tool_result.offloaded",
         {
             "tool": tool_name,
             "step": step,
             "prefix": prefix,
-            "savedPath": str(path.resolve()),
+            "savedPath": str(saved_path),
             "relativePath": relative_path,
             "byteSize": byte_size,
+            "lineCount": facts.get("lineCount"),
+            "contentHash": facts.get("contentHash"),
+            "sameContentAs": facts.get("sameContentAs"),
             "queryWith": "local_fs_read",
         },
     )
@@ -309,13 +467,11 @@ def offload_large_response_fields(
             uuid.uuid4().hex[:8],
         ) if part]
         path = observations_dir / ("-".join(filename_parts) + ".json")
-        path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2, default=str),
-            encoding="utf-8",
+        facts = store_offloaded_payload(
+            logger, path, resource_type="observation", content=data,
         )
         copied["data"] = {
             "_offloaded": True,
-            "savedPath": str(path.resolve()),
             "format": "json_tree",
             "query_with": "local_fs_read",
             "originalBytes": byte_size,
@@ -323,6 +479,7 @@ def offload_large_response_fields(
             "nodeCount": count_json_nodes(data),
             "outline": outline_value(data),
             "summary": outline_value(data),
+            **facts,
         }
         return copied
 
@@ -356,13 +513,14 @@ def offload_large_response_fields(
             uuid.uuid4().hex[:8],
         ) if part]
         path = observations_dir / ("-".join(filename_parts) + f".{suffix}")
-        output_format, query_with, outline = write_offloaded_blob(path, field, blob)
+        output_format, query_with, outline, facts = write_offloaded_blob(
+            logger, path, field, blob,
+        )
         node_count = response_node_count(data)
         if node_count is None:
             node_count = count_json_nodes(blob)
         data[field] = {
             "_offloaded": True,
-            "savedPath": str(path.resolve()),
             "format": output_format,
             "query_with": query_with,
             "originalBytes": byte_size,
@@ -370,6 +528,7 @@ def offload_large_response_fields(
             "nodeCount": node_count,
             "outline": outline,
             "summary": outline,
+            **facts,
         }
     return copied if copied is not None else response
 

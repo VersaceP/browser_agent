@@ -24,18 +24,23 @@ from agent_harness import (
     exception_payload,
     lead_agent_model_config,
 )
-from harness.utils import RunLogger
+from harness.storage import create_storage_from_config
+from harness.storage.factory import resolve_sqlite_path
+from harness.utils import JsonDict, RunLogger
+from harness.version import HARNESS_VERSION
 from harness.resume_state import (
     ResumeStateError,
     RunLock,
     RunLockError,
     acquire_run_lock,
+    configure_resume_storage,
     load_task_manifest,
     load_task_plan_strict,
     load_task_state_strict,
     recover_legacy_user_task,
     reconcile_torn_plan_alias,
     release_run_lock,
+    load_initial_task_plan_strict,
     write_task_manifest,
 )
 from harness.task_control import (
@@ -1301,15 +1306,17 @@ def _load_initial_plan(
     task_dir: Path,
     current_plan: Dict[str, Any],
 ) -> "tuple[Dict[str, Any], bool]":
-    path = task_dir / "task_plan_history" / "plan.0001.json"
+    """Recover the first accepted plan, from files or the database.
+
+    Falling back to the current plan silently weakens resume: the immutable
+    contract a replan is checked against becomes whatever the plan happens to
+    be now. Reading it file-only meant every db-mode task took that fallback.
+    """
+
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        return load_initial_task_plan_strict(task_dir), True
+    except ResumeStateError:
         return dict(current_plan), False
-    plan = payload.get("plan") if isinstance(payload, dict) else None
-    if not isinstance(plan, dict) or not isinstance(plan.get("phases"), list):
-        return dict(current_plan), False
-    return plan, True
 
 
 def _resume_browser_hint(
@@ -1366,6 +1373,68 @@ def _new_run_id(*, resumed: bool) -> str:
     prefix = "resume" if resumed else "run"
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     return f"{prefix}-{timestamp}-{uuid.uuid4().hex[:8]}"
+
+
+def _open_task_storage(logger, runtime) -> None:
+    """Attach the configured backend and open this launch's run row.
+
+    Must run after ``logger.run_id`` is assigned: the run id is a relational
+    field on every event and a foreign key in the database, so it has to exist
+    before the first write rather than being backfilled.
+    """
+
+    def _report_revision_conflict(detail: JsonDict) -> None:
+        # Raised outside the failed transaction. With .run.lock holding other
+        # processes off, this normally means two callbacks inside this process
+        # raced - worth seeing, not worth failing over.
+        logger.write("storage.revision_conflict", detail)
+
+    def _report_verification(report: JsonDict) -> None:
+        logger.write("storage.dual_verify", report)
+
+    storage = create_storage_from_config(
+        runtime.harness,
+        worktree_dir=runtime.harness.worktree_dir,
+        on_revision_conflict=_report_revision_conflict,
+        on_verify=_report_verification,
+    )
+    logger.attach_storage(storage)
+    storage.create_task(task_id=logger.task_id, harness_version=HARNESS_VERSION)
+    storage.start_run(
+        task_id=logger.task_id,
+        harness_version=HARNESS_VERSION,
+        run_id=logger.run_id,
+    )
+
+
+def _close_task_storage(logger, *, status: str) -> None:
+    """Close the run row and, in dual mode, report whether the backends agree.
+
+    Verification runs before the handles are released, and its findings go to
+    the event log rather than being raised: a storage bookkeeping problem must
+    not change the exit status of a task that otherwise finished.
+    """
+
+    if not getattr(logger, "storage_attached", False):
+        return
+    storage = logger.storage
+    try:
+        storage.finish_run(
+            task_id=logger.task_id, run_id=logger.run_id, status=status
+        )
+        verify = getattr(storage, "verify", None)
+        if callable(verify):
+            verify(task_id=logger.task_id, run_id=logger.run_id)
+    except Exception as exc:  # noqa: BLE001 - never fail a run over bookkeeping
+        try:
+            logger.write("storage.close_failed", {"error": str(exc)})
+        except Exception:
+            pass
+    finally:
+        try:
+            storage.close()
+        except Exception:
+            pass
 
 
 def _artifact_row_count(path: Path) -> Optional[int]:
@@ -1478,6 +1547,14 @@ async def run_cli(args: argparse.Namespace) -> int:
     _CANCELLED_LOGGED = False
     _LAST_LOGGER = None
     runtime = load_runtime_config(args.config)
+    # Resume helpers run before a logger exists; hand them the configuration
+    # that was actually parsed rather than letting them re-guess it.
+    configure_resume_storage(
+        backend=runtime.harness.storage_backend,
+        sqlite_path=resolve_sqlite_path(
+            runtime.harness.storage_sqlite_path, runtime.harness.worktree_dir
+        ),
+    )
     if args.agent_id:
         runtime.agent_id = args.agent_id
     if args.max_steps:
@@ -1527,6 +1604,7 @@ async def run_cli(args: argparse.Namespace) -> int:
     resume_context: Optional[ResumeContext] = None
     task_for_agent = task
     run_started = False
+    run_status = "interrupted"
     try:
         if resume_requested:
             try:
@@ -1579,6 +1657,7 @@ async def run_cli(args: argparse.Namespace) -> int:
                 logger.run_id = _new_run_id(resumed=True)
                 logger.context_run_id = logger.run_id
                 logger.resumed_from = str(task_dir.resolve())
+                _open_task_storage(logger, runtime)
 
                 report = prepare_resume_state(
                     logger,
@@ -1673,6 +1752,7 @@ async def run_cli(args: argparse.Namespace) -> int:
             )
             logger.run_id = _new_run_id(resumed=False)
             run_lock = acquire_run_lock(logger.task_dir)
+            _open_task_storage(logger, runtime)
             write_task_manifest(
                 logger,
                 original_user_task=task,
@@ -1754,7 +1834,9 @@ async def run_cli(args: argparse.Namespace) -> int:
             resume=resume_context,
         )
         answer = await harness.run(task_for_agent)
+        run_status = "completed"
     except asyncio.CancelledError as exc:
+        run_status = "cancelled"
         _CANCELLED_LOGGED = True
         if logger is not None:
             logger.write(
@@ -1763,6 +1845,7 @@ async def run_cli(args: argparse.Namespace) -> int:
             )
         raise
     except Exception as exc:
+        run_status = "failed"
         if logger is not None:
             logger.write(
                 "run.error",
@@ -1772,6 +1855,7 @@ async def run_cli(args: argparse.Namespace) -> int:
     finally:
         if logger is not None and run_started:
             logger.write_usage_summary()
+            _close_task_storage(logger, status=run_status)
         if run_lock is not None:
             release_run_lock(run_lock)
 

@@ -53,6 +53,12 @@ from harness.artifact_evidence import (
 from harness.auth_fleet import normalize_auth_verification_contract
 from harness.fleet_coordinator import normalize_page_policy, normalize_reuse_scope
 from harness.file_evidence import saved_paths_from_value
+# Import the leaf module rather than the package: harness.storage.__init__
+# pulls in the SQLite factory, which file mode must never need to load.
+from harness.storage.base import (
+    SNAPSHOT_KEY_CURRENT_PLAN,
+    SNAPSHOT_KEY_TASK_STATE,
+)
 from harness.row_ledger import ROW_OUTCOMES, field_absence_accepted
 from harness.pacing import (
     MAX_PACING_INTERVAL_SECONDS,
@@ -74,7 +80,11 @@ from harness.utils import (
     RunLogger,
     contains_affirmative_semantic_marker,
     contains_semantic_marker,
+    load_task_json,
+    read_task_file_text,
     safe_path_component,
+    storage_for_logger,
+    task_file_exists,
     trim_large_strings,
 )
 
@@ -84,6 +94,18 @@ TASK_STATE_FILE = "task_state.json"
 _TASK_STATE_WRITE_LOCK = threading.RLock()
 
 
+class _PathOnlyLogger:
+    """Minimal stand-in for callers that only have a task directory.
+
+    Resolves to the file backend, which is the correct answer when there is no
+    logger to inherit a database connection from.
+    """
+
+    def __init__(self, task_dir: Path) -> None:
+        self.task_dir = task_dir
+        self.task_id = task_dir.name
+
+
 class _TaskStateSnapshot(dict):
     """A dict carrying its read baseline for optimistic three-way writes."""
 
@@ -91,6 +113,9 @@ class _TaskStateSnapshot(dict):
         super().__init__(value or {})
         self._task_state_base = copy.deepcopy(dict(self))
         self._task_state_replace = False
+        # Revision the value was read at; 0 means "no row/file yet", which the
+        # backend treats as an insert rather than a lost compare-and-swap.
+        self._task_state_revision = 0
 SEMANTIC_TERMINAL_CLASSIFICATIONS = frozenset({
 })
 TERMINAL_PHASE_STATUSES = frozenset({
@@ -1884,18 +1909,28 @@ def phase_contract(
 
 
 def write_task_plan(logger: RunLogger, plan: JsonDict) -> str:
+    """Publish the current plan.
+
+    Accepting a plan always rebuilds the whole document, so this is a replace
+    rather than a merge: three-way merging here would resurrect phases that a
+    replan deliberately removed.
+    """
+
     path = logger.task_dir / TASK_PLAN_FILE
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(plan, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
+    storage, task_id = storage_for_logger(logger)
+    storage.save_snapshot(
+        task_id=task_id,
+        snapshot_key=SNAPSHOT_KEY_CURRENT_PLAN,
+        base=None,
+        proposed=plan,
+        updated_run_id=str(getattr(logger, "run_id", "") or ""),
+        replace=True,
     )
-    temporary.replace(path)
     logger.write("task_plan.accepted", {"path": str(path.resolve()), "phaseCount": len(plan.get("phases", []))})
     return str(path.resolve())
 
 
-def write_versioned_task_plan(
+def accept_task_plan(
     logger: RunLogger,
     plan: JsonDict,
     *,
@@ -1903,22 +1938,78 @@ def write_versioned_task_plan(
     replan_reason: str,
     user_task: str,
     validator_review: Optional[JsonDict],
-) -> Tuple[str, JsonDict]:
-    """Persist an immutable accepted revision plus the latest-plan alias."""
+    preserve_from: Optional[JsonDict] = None,
+    extension_decision: Optional[JsonDict] = None,
+) -> Tuple[str, JsonDict, JsonDict]:
+    """Publish one plan generation: version record, alias and reset state.
 
-    from harness.plan_validator import write_plan_version
+    These three were written as three independent transactions, so a crash
+    between them left a plan and a state disagreeing about which phases exist.
+    The state is computed first and handed to the backend, which commits the
+    whole generation at once where it can.
+    """
 
-    version = write_plan_version(
-        logger,
+    from harness.plan_validator import build_plan_version_record
+
+    record = build_plan_version_record(
         plan=plan,
         previous_plan=previous_plan,
         replan_reason=replan_reason,
         user_task=user_task,
         validator_review=validator_review,
     )
-    path = write_task_plan(logger, plan)
-    logger.write("task_plan.versioned", version)
-    return path, version
+    if extension_decision is not None and isinstance(preserve_from, dict):
+        # Recorded before the state is built so it lands inside the same
+        # generation; the version number it cites is stamped at commit time.
+        audit_resumes = preserve_from.get("resumes")
+        if (
+            isinstance(audit_resumes, list)
+            and audit_resumes
+            and isinstance(audit_resumes[-1], dict)
+        ):
+            decisions = audit_resumes[-1].setdefault("extensionDecisions", [])
+            if isinstance(decisions, list):
+                decisions.append(dict(extension_decision))
+    state = initialize_task_state(
+        logger,
+        plan,
+        preserve_from=preserve_from,
+        replan_reason=replan_reason,
+        plan_version=record,
+        persist=False,
+    )
+    storage, task_id = storage_for_logger(logger)
+    stored, persisted = storage.commit_accepted_plan(
+        task_id=task_id,
+        run_id=str(getattr(logger, "run_id", "") or ""),
+        plan_record=record,
+        current_plan=plan,
+        task_state=dict(state),
+        # The listing summary is refreshed on every state write; accepting a
+        # plan writes state through the aggregate instead, so it is refreshed
+        # here - inside the same transaction, because a summary quoting a plan
+        # version that rolled back would be worse than a stale one.
+        summarize=task_state_summary,
+    )
+    state.clear()
+    state.update(copy.deepcopy(persisted))
+    if isinstance(state, _TaskStateSnapshot):
+        state._task_state_base = copy.deepcopy(persisted)
+        state._task_state_replace = False
+    path = str((logger.task_dir / TASK_PLAN_FILE).resolve())
+    version_summary = {
+        "planVersion": stored["planVersion"],
+        "path": str(stored.get("path") or ""),
+        "planHash": stored["planHash"],
+        "previousVersion": stored["previousVersion"],
+        "replanReason": stored["replanReason"],
+        "diffCount": len(stored.get("diff") or []),
+    }
+    logger.write("task_plan.accepted", {
+        "path": path, "phaseCount": len(plan.get("phases", [])),
+    })
+    logger.write("task_plan.versioned", version_summary)
+    return path, version_summary, state
 
 
 def initialize_task_state(
@@ -1928,6 +2019,7 @@ def initialize_task_state(
     preserve_from: Optional[JsonDict] = None,
     replan_reason: str = "",
     plan_version: Optional[JsonDict] = None,
+    persist: bool = True,
 ) -> JsonDict:
     previous_phases_raw = preserve_from.get("phases") if isinstance(preserve_from, dict) else None
     previous_phases: JsonDict = previous_phases_raw if isinstance(previous_phases_raw, dict) else {}
@@ -2055,7 +2147,8 @@ def initialize_task_state(
             replan_audit["planHash"] = state["plan_hash"]
     # A plan acceptance deliberately reconstructs the complete state shape.
     # It must not three-way merge removed phases back from an older snapshot.
-    write_task_state(logger, state, replace=True)
+    if persist:
+        write_task_state(logger, state, replace=True)
     logger.write(
         "task_state.initialized",
         {
@@ -2068,15 +2161,22 @@ def initialize_task_state(
 
 
 def load_task_state(logger: RunLogger) -> JsonDict:
-    path = _state_path(logger)
+    """Read current state, remembering the baseline it was read at.
+
+    "Never written" and "written empty" stay indistinguishable here, exactly
+    as when this read a file directly: every caller downstream is written
+    against that assumption.
+    """
+
+    storage, task_id = storage_for_logger(logger)
     with _TASK_STATE_WRITE_LOCK:
-        if not path.exists():
-            return _TaskStateSnapshot()
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return _TaskStateSnapshot()
-        return _TaskStateSnapshot(data if isinstance(data, dict) else {})
+        value, revision = storage.load_snapshot(
+            task_id=task_id,
+            snapshot_key=SNAPSHOT_KEY_TASK_STATE,
+        )
+        snapshot = _TaskStateSnapshot(value if isinstance(value, dict) else {})
+        snapshot._task_state_revision = int(revision or 0)
+        return snapshot
 
 
 def materialize_batch_rows_from_source(
@@ -2108,9 +2208,8 @@ def materialize_batch_rows_from_source(
             path.relative_to(extraction_root)
         except ValueError:
             continue
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        payload = load_task_json(logger, str(path))
+        if payload is None:
             continue
         if (
             isinstance(payload, dict)
@@ -2707,7 +2806,11 @@ def reconcile_replan_checkpoints(logger: RunLogger) -> JsonDict:
         if checkpoint.get("sourceLedgerBound") is True:
             source_path = str(checkpoint.get("sourceArtifactPath") or "").strip()
             resolved = str(Path(source_path).expanduser().resolve()) if source_path else ""
-            if not resolved or resolved not in ledger_paths or not Path(resolved).is_file():
+            if (
+                not resolved
+                or resolved not in ledger_paths
+                or not task_file_exists(logger, resolved)
+            ):
                 reason = "source_artifact_missing"
                 next_instruction = (
                     "The validated source artifact disappeared from the ledger."
@@ -2715,7 +2818,7 @@ def reconcile_replan_checkpoints(logger: RunLogger) -> JsonDict:
                 )
             else:
                 try:
-                    payload = json.loads(Path(resolved).read_text(encoding="utf-8"))
+                    payload = load_task_json(logger, resolved) or {}
                     blob = json.dumps(
                         payload,
                         sort_keys=True,
@@ -3737,20 +3840,60 @@ def write_task_state(
         replace or getattr(state, "_task_state_replace", False)
     )
     base = getattr(state, "_task_state_base", None)
+    # The lock still spans read, merge and commit. It only serialises threads
+    # inside this process; the backend adds a compare-and-swap for anything
+    # that crossed a connection, and the three-way merge remains what actually
+    # preserves two callers editing different phases.
+    storage, task_id = storage_for_logger(logger)
     with _TASK_STATE_WRITE_LOCK:
-        if not force_replace and isinstance(base, dict):
-            current = _read_task_state_for_merge(path)
-            persisted = _three_way_merge_task_state(base, current, proposed)
-        else:
-            persisted = proposed
-        _atomic_replace_task_state(path, persisted)
+        persisted, revision = storage.save_snapshot(
+            task_id=task_id,
+            snapshot_key=SNAPSHOT_KEY_TASK_STATE,
+            base=base if isinstance(base, dict) else None,
+            proposed=proposed,
+            updated_run_id=str(getattr(logger, "run_id", "") or ""),
+            merge=_three_way_merge_task_state,
+            replace=force_replace,
+        )
 
     state.clear()
     state.update(copy.deepcopy(persisted))
     if isinstance(state, _TaskStateSnapshot):
         state._task_state_base = copy.deepcopy(persisted)
         state._task_state_replace = False
+        state._task_state_revision = int(revision or 0)
+    # Keep the task listing readable without opening the full state document.
+    try:
+        storage.update_task_snapshot(task_id, task_state_summary(persisted))
+    except Exception:  # noqa: BLE001 - a summary must never fail a state write
+        pass
     return str(path.resolve())
+
+
+def task_state_summary(state: JsonDict) -> JsonDict:
+    """Small, bounded digest of a task for listings and operator tooling."""
+
+    phases = state.get("phases") if isinstance(state.get("phases"), dict) else {}
+    counts: Dict[str, int] = {}
+    current_phase = ""
+    for phase_id, phase_state in phases.items():
+        status = str((phase_state or {}).get("status") or "pending")
+        counts[status] = counts.get(status, 0) + 1
+        if not current_phase and status not in TERMINAL_PHASE_STATUSES:
+            current_phase = str(phase_id)
+    last_failure = None
+    for phase_state in phases.values():
+        failure = (phase_state or {}).get("last_failure")
+        if failure:
+            last_failure = trim_large_strings(failure, max_chars=300)
+    return {
+        "goal": str(state.get("goal") or "")[:200],
+        "currentPhase": current_phase or None,
+        "phaseCounts": counts,
+        "planVersion": state.get("plan_version"),
+        "lastError": last_failure,
+        "updatedAt": state.get("updated_at"),
+    }
 
 
 def contract_hash_for_phase(
@@ -4725,7 +4868,7 @@ def mark_phase_result(
             state["artifact_digests"] = artifact_digests
         for artifact in artifacts:
             path = _resume_artifact_path(logger, artifact)
-            digest = _artifact_sha256(path)
+            digest = _artifact_sha256(path, logger)
             if digest:
                 artifact_digests[str(path)] = digest
         _record_objective_attempt(
@@ -4921,17 +5064,24 @@ def _resume_artifact_is_readable(logger: RunLogger, value: Any) -> bool:
     if not str(value or "").strip():
         return False
     path = _resume_artifact_path(logger, value)
-    if not path.is_file():
-        return False
-    try:
-        with path.open("rb") as artifact_file:
-            artifact_file.read(1)
-    except OSError:
-        return False
-    return True
+    if path.is_file():
+        try:
+            with path.open("rb") as artifact_file:
+                artifact_file.read(1)
+        except OSError:
+            return False
+        return True
+    return task_file_exists(logger, str(path))
 
 
-def _artifact_sha256(path: Path) -> str:
+def _artifact_sha256(path: Path, logger: Optional[RunLogger] = None) -> str:
+    """Digest an artifact's bytes from whichever backend holds them."""
+
+    if logger is not None and not path.is_file():
+        text = read_task_file_text(logger, str(path))
+        if text is None:
+            return ""
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
     digest = hashlib.sha256()
     try:
         with path.open("rb") as artifact_file:
@@ -4942,13 +5092,18 @@ def _artifact_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _legacy_artifact_syntax_error(path: Path) -> str:
+def _legacy_artifact_syntax_error(path: Path, logger: Optional[RunLogger] = None) -> str:
     """Return a terse integrity error for legacy artifacts without a digest."""
 
     suffix = path.suffix.lower()
+    text: Optional[str] = None
+    if logger is not None and not path.is_file():
+        text = read_task_file_text(logger, str(path))
+        if text is None:
+            return "missing_or_unreadable"
     try:
         if suffix == ".json":
-            json.loads(path.read_text(encoding="utf-8"))
+            json.loads(text if text is not None else path.read_text(encoding="utf-8"))
         elif suffix == ".jsonl":
             saw_record = False
             with path.open("r", encoding="utf-8") as artifact_file:
@@ -4998,13 +5153,13 @@ def _resume_artifact_integrity_error(
         return "missing_or_unreadable"
     expected_digest = _artifact_recorded_digest(logger, artifact_digests, artifact)
     if expected_digest:
-        actual_digest = _artifact_sha256(path)
+        actual_digest = _artifact_sha256(path, logger)
         if not actual_digest:
             return "unreadable"
         if actual_digest != expected_digest:
             return "sha256_mismatch"
         return ""
-    return _legacy_artifact_syntax_error(path)
+    return _legacy_artifact_syntax_error(path, logger)
 
 
 def _legacy_extraction_validation_error(
@@ -5042,6 +5197,7 @@ def _legacy_extraction_validation_error(
             contract=contract,
             artifacts=all_extractions,
             task_dir=logger.task_dir,
+            logger=logger,
         )
     except Exception as exc:
         return f"validator_error:{type(exc).__name__}:{exc}"
@@ -5182,7 +5338,7 @@ def prepare_resume_state(
                     ):
                         continue
                     path = _resume_artifact_path(logger, artifact)
-                    digest = _artifact_sha256(path)
+                    digest = _artifact_sha256(path, logger)
                     if digest:
                         artifact_digests[str(path)] = digest
 
@@ -5198,7 +5354,7 @@ def prepare_resume_state(
             if not _artifact_recorded_digest(
                 logger, artifact_digests, artifact,
             ):
-                digest = _artifact_sha256(path)
+                digest = _artifact_sha256(path, logger)
                 if digest:
                     artifact_digests[str(path)] = digest
             continue
@@ -5238,7 +5394,7 @@ def prepare_resume_state(
                         logger, artifact_digests, artifact,
                     ):
                         path = _resume_artifact_path(logger, artifact)
-                        digest = _artifact_sha256(path)
+                        digest = _artifact_sha256(path, logger)
                         if digest:
                             artifact_digests[str(path)] = digest
                     continue
@@ -5804,6 +5960,7 @@ def validate_worker_artifacts(
     prior_artifacts: Optional[List[str]] = None,
     file_evidence: Optional[List[JsonDict]] = None,
     evidence_sink: Optional[Any] = None,
+    logger: Optional[RunLogger] = None,
 ) -> JsonDict:
     """Validate a worker's artifacts against its contract.
 
@@ -5862,13 +6019,14 @@ def validate_worker_artifacts(
         *prior_extraction_artifacts,
     ])
     failures: List[JsonDict] = []
-    loaded = _load_extraction_artifacts(extraction_artifacts, task_dir)
+    loaded = _load_extraction_artifacts(extraction_artifacts, task_dir, logger)
     loaded_attempts = _load_extraction_artifacts(
         [
             path for path in extraction_attempt_artifacts
             if path not in extraction_artifacts
         ],
         task_dir,
+        logger,
     )
     loaded_prior = _load_extraction_artifacts(
         [
@@ -7566,9 +7724,21 @@ def _cumulative_row_quality(
     )
 
 
-def _load_extraction_artifacts(paths: List[str], task_dir: Path) -> List[JsonDict]:
+def _load_extraction_artifacts(
+    paths: List[str],
+    task_dir: Path,
+    logger: Optional[RunLogger] = None,
+) -> List[JsonDict]:
+    """Load cited extraction artifacts, wherever the backend put them.
+
+    This feeds the artifact gate that decides whether a phase completed. Left
+    reading the filesystem directly, a db-mode artifact that the agent could
+    read perfectly well was still judged missing here.
+    """
+
     loaded: List[JsonDict] = []
     root = task_dir.resolve(strict=False)
+    reader = logger if logger is not None else _PathOnlyLogger(root)
     for raw_path in paths:
         try:
             path = Path(raw_path)
@@ -7576,9 +7746,9 @@ def _load_extraction_artifacts(paths: List[str], task_dir: Path) -> List[JsonDic
                 path = root / path
             resolved = path.resolve(strict=False)
             resolved.relative_to(root)
-            payload = json.loads(resolved.read_text(encoding="utf-8"))
-        except (OSError, ValueError, json.JSONDecodeError):
+        except (OSError, ValueError):
             continue
+        payload = load_task_json(reader, str(resolved))
         if isinstance(payload, dict):
             loaded.append({"path": str(resolved), "payload": payload})
     return loaded

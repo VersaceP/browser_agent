@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from contextlib import contextmanager
 import socket
 import tempfile
 import time
@@ -83,7 +84,9 @@ def load_task_plan_strict(value: TaskDirLike) -> JsonDict:
     """Load an existing current plan, raising on every unsafe fallback case."""
 
     task_dir = _require_task_dir(value)
-    plan = _load_json_object_strict(task_dir / TASK_PLAN_FILE, label="task plan")
+    plan = _read_state_or_snapshot(
+        task_dir, TASK_PLAN_FILE, "current_task_plan", "task plan"
+    )
     if not isinstance(plan.get("phases"), list):
         raise ResumeStateError(f"task plan has no phases list: {task_dir / TASK_PLAN_FILE}")
     return plan
@@ -93,10 +96,27 @@ def load_initial_task_plan_strict(value: TaskDirLike) -> JsonDict:
     """Load the immutable first accepted plan rather than the current alias."""
 
     task_dir = _require_task_dir(value)
-    record = _load_json_object_strict(
-        task_dir / "task_plan_history" / "plan.0001.json",
-        label="initial task plan",
-    )
+    history_path = task_dir / "task_plan_history" / "plan.0001.json"
+    record = None
+    authoritative = _database_is_authoritative(task_dir)
+    if authoritative or not history_path.exists():
+        with _worktree_database(task_dir) as store:
+            if store is not None and _database_owns_task(store, task_dir.name):
+                record = store.load_plan_version(task_id=task_dir.name, version=1)
+                if record is None and authoritative:
+                    # Same rule as the state loader: when the database owns the
+                    # task, a missing record is a fault to report, not a reason
+                    # to resume from a file the authoritative store never wrote.
+                    raise ResumeStateError(
+                        f"initial task plan is missing from the task database for"
+                        f" {task_dir.name}; db mode makes the database"
+                        f" authoritative, so {history_path} is not used as a"
+                        f" fallback"
+                    )
+    if record is None:
+        if not history_path.exists():
+            raise ResumeStateError(f"initial task plan is missing: {history_path}")
+        record = _load_json_object_strict(history_path, label="initial task plan")
     # Plan history files are immutable audit records whose executable plan is
     # nested under ``plan``.  Accept a direct-plan shape only for older runs.
     plan = record.get("plan") if isinstance(record.get("plan"), dict) else record
@@ -112,12 +132,159 @@ def load_task_state_strict(value: TaskDirLike) -> JsonDict:
     """Load existing state without the legacy fail-open ``{}`` behaviour."""
 
     task_dir = _require_task_dir(value)
-    state = _load_json_object_strict(task_dir / TASK_STATE_FILE, label="task state")
+    state = _read_state_or_snapshot(task_dir, TASK_STATE_FILE, "task_state", "task state")
     if not isinstance(state.get("phases"), dict):
         raise ResumeStateError(
             f"task state has no phases object: {task_dir / TASK_STATE_FILE}"
         )
     return state
+
+
+# Set once at startup by main, which has already parsed --config and built the
+# runtime. Resume runs before a logger exists, so without this it would have to
+# re-guess the configuration - and guessing "config.json in the cwd" ignores
+# --config entirely.
+_RESUME_STORAGE: Dict[str, Any] = {"backend": None, "sqlite_path": None}
+
+
+def configure_resume_storage(*, backend: str, sqlite_path: Any) -> None:
+    """Tell the resume loaders which backend and database the run is using."""
+
+    _RESUME_STORAGE["backend"] = str(backend or "") or None
+    _RESUME_STORAGE["sqlite_path"] = Path(sqlite_path) if sqlite_path else None
+
+
+def resume_storage_backend() -> Optional[str]:
+    return _RESUME_STORAGE.get("backend")
+
+
+def resume_sqlite_path(task_dir: Path) -> Path:
+    """Where this worktree's database lives.
+
+    Prefers the path main resolved from the active config; falls back to the
+    conventional location beside the task directories only when nothing has
+    been configured (a bare CLI call into these helpers).
+    """
+
+    configured = _RESUME_STORAGE.get("sqlite_path")
+    if configured is not None:
+        return Path(configured)
+    from harness.storage.factory import DEFAULT_SQLITE_PATH, resolve_sqlite_path
+
+    return resolve_sqlite_path(DEFAULT_SQLITE_PATH, str(task_dir.parent))
+
+
+@contextmanager
+def _worktree_database(task_dir: Path):
+    """Open this worktree's database, or yield None when there is not one.
+
+    A missing file means "no database", which is normal. Anything else - a
+    corrupt file, a failed migration - is raised: in db mode that is the only
+    copy of the task, and quietly reporting it as absent would present a
+    damaged task as an unrecoverable one.
+    """
+
+    store = None
+    database_path = resume_sqlite_path(task_dir)
+    if not database_path.is_file():
+        yield None
+        return
+    try:
+        from harness.storage.sqlite_store import SqliteStore
+
+        store = SqliteStore(database_path, worktree_dir=str(task_dir.parent))
+    except Exception as exc:  # noqa: BLE001 - surfaced, not swallowed
+        raise ResumeStateError(
+            f"cannot open the task database at {database_path}: {exc}"
+        ) from exc
+    try:
+        yield store
+    finally:
+        try:
+            store.close()
+        except Exception:
+            pass
+
+
+def _database_owns_task(store: Any, task_id: str) -> bool:
+    """True when this task was registered in the database.
+
+    Registration - not file presence - is what separates a db-mode task from a
+    legacy one. A task that ran in dual mode and later switched to db still has
+    its old files on disk, so "a file exists" would keep resuming stale state
+    forever.
+    """
+
+    try:
+        return store.get_task(task_id, include_deleted=True) is not None
+    except Exception as exc:  # noqa: BLE001 - surfaced, not swallowed
+        # Answering "no" here would silently resume whatever stale files are
+        # lying around, presenting a broken database as a healthy task.
+        raise ResumeStateError(
+            f"cannot read task {task_id} from the task database: {exc}"
+        ) from exc
+
+
+def _database_is_authoritative(task_dir: Path) -> bool:
+    """Whether the database, not the files, decides this task's state.
+
+    Only ``db`` mode makes it authoritative. In ``dual`` the files are the
+    copy the harness actually ran on - the database is the one under
+    evaluation - so preferring it there would resume from a mirror that may
+    have silently failed to write.
+    """
+
+    backend = _RESUME_STORAGE.get("backend")
+    if backend == "db":
+        return True
+    if backend in ("file", "dual"):
+        return False
+    # Unknown configuration: files first. That is the historical behaviour and
+    # the safe one; a db-mode task simply has no files to find.
+    return False
+
+
+def _read_state_or_snapshot(
+    task_dir: Path,
+    filename: str,
+    snapshot_key: str,
+    label: str,
+) -> JsonDict:
+    """Pick the source by configured backend, then by what actually exists."""
+
+    path = task_dir / filename
+    prefer_database = _database_is_authoritative(task_dir)
+    if prefer_database:
+        with _worktree_database(task_dir) as store:
+            if store is not None and _database_owns_task(store, task_dir.name):
+                value, _revision = store.load_snapshot(
+                    task_id=task_dir.name, snapshot_key=snapshot_key
+                )
+                if value:
+                    return value
+                # The database owns this task and does not have the record.
+                # Falling back to a file now would resume from state the
+                # authoritative store never wrote - a lost write or a corrupt
+                # database would look like a clean recovery. Refuse instead.
+                raise ResumeStateError(
+                    f"{label} is missing from the task database for {task_dir.name}"
+                    f" (snapshot '{snapshot_key}'); db mode makes the database"
+                    f" authoritative, so {path} is not used as a fallback"
+                )
+    if path.exists():
+        return _load_json_object_strict(path, label=label)
+    if not prefer_database:
+        # No file. A legacy worktree has none either way, so the database is
+        # the only remaining source - reading it here does not override
+        # anything, it just avoids declaring a recoverable task unrecoverable.
+        with _worktree_database(task_dir) as store:
+            if store is not None and _database_owns_task(store, task_dir.name):
+                value, _revision = store.load_snapshot(
+                    task_id=task_dir.name, snapshot_key=snapshot_key
+                )
+                if value:
+                    return value
+    raise ResumeStateError(f"{label} is missing: {path}")
 
 
 def _atomic_write_json(path: Path, payload: JsonDict) -> None:

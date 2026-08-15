@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from harness.utils import storage_for_logger
+
 
 JsonDict = Dict[str, Any]
 PLAN_HISTORY_DIR = "task_plan_history"
@@ -1298,18 +1300,46 @@ def write_plan_review_audit(
     replan_reason: str,
     review: JsonDict,
 ) -> str:
-    directory = Path(logger.task_dir) / PLAN_REVIEW_DIR
-    sequence = _next_sequence(directory, "review")
-    path = directory / f"review.{sequence:04d}.json"
-    _atomic_json_write(path, {
-        "reviewSequence": sequence,
-        "reviewedAt": _utc_now_iso(),
-        "candidateHash": plan_candidate_hash(candidate_plan, replan_reason),
+    storage, task_id = storage_for_logger(logger)
+    stored = storage.save_plan_review(
+        task_id=task_id,
+        run_id=str(getattr(logger, "run_id", "") or ""),
+        record={
+            "reviewedAt": _utc_now_iso(),
+            "candidateHash": plan_candidate_hash(candidate_plan, replan_reason),
+            "replanReason": replan_reason or None,
+            "candidatePlan": candidate_plan,
+            "review": review,
+        },
+    )
+    return str(stored.get("path") or "")
+
+
+def build_plan_version_record(
+    *,
+    plan: JsonDict,
+    previous_plan: Optional[JsonDict],
+    replan_reason: str,
+    user_task: str,
+    validator_review: Optional[JsonDict],
+) -> JsonDict:
+    """Everything about an accepted plan except its version number.
+
+    Separated so the atomic commit can allocate the number inside the same
+    transaction that writes the record and the state referencing it.
+    """
+
+    return {
+        "acceptedAt": _utc_now_iso(),
+        "planHash": plan_hash(plan),
+        "originalUserTaskHash": hashlib.sha256(
+            str(user_task or "").encode("utf-8")
+        ).hexdigest(),
         "replanReason": replan_reason or None,
-        "candidatePlan": candidate_plan,
-        "review": review,
-    })
-    return str(path.resolve())
+        "diff": structural_plan_diff(previous_plan or {}, plan),
+        "validatorReview": validator_review,
+        "plan": plan,
+    }
 
 
 def write_plan_version(
@@ -1321,26 +1351,24 @@ def write_plan_version(
     user_task: str,
     validator_review: Optional[JsonDict],
 ) -> JsonDict:
-    directory = Path(logger.task_dir) / PLAN_HISTORY_DIR
-    version = _next_sequence(directory, "plan")
-    path = directory / f"plan.{version:04d}.json"
-    record = {
-        "planVersion": version,
-        "acceptedAt": _utc_now_iso(),
-        "planHash": plan_hash(plan),
-        "originalUserTaskHash": hashlib.sha256(
-            str(user_task or "").encode("utf-8")
-        ).hexdigest(),
-        "replanReason": replan_reason or None,
-        "previousVersion": version - 1 if version > 1 else None,
-        "diff": structural_plan_diff(previous_plan or {}, plan),
-        "validatorReview": validator_review,
-        "plan": plan,
-    }
-    _atomic_json_write(path, record)
+    storage, task_id = storage_for_logger(logger)
+    # planVersion / previousVersion are assigned by the backend: it owns the
+    # sequence and, in dual mode, propagates the number it chose so both
+    # ledgers agree.
+    record = storage.save_plan_version(
+        task_id=task_id,
+        run_id=str(getattr(logger, "run_id", "") or ""),
+        record=build_plan_version_record(
+            plan=plan,
+            previous_plan=previous_plan,
+            replan_reason=replan_reason,
+            user_task=user_task,
+            validator_review=validator_review,
+        ),
+    )
     return {
-        "planVersion": version,
-        "path": str(path.resolve()),
+        "planVersion": record["planVersion"],
+        "path": str(record.get("path") or ""),
         "planHash": record["planHash"],
         "previousVersion": record["previousVersion"],
         "replanReason": record["replanReason"],

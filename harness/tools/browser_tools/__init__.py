@@ -107,7 +107,14 @@ from harness.tools.parsers import (
     parse_direct_capability_params,
 )
 from harness.tools.registry import ToolContext, ToolRegistry
-from harness.utils import JsonDict, exception_payload, optional_int, trim_large_strings
+from harness.storage.base import normalize_external_path
+from harness.utils import (
+    JsonDict,
+    exception_payload,
+    optional_int,
+    storage_for_logger,
+    trim_large_strings,
+)
 from harness.workflow_runtime import (
     workflow_execution_disabled_result,
     workflow_execution_enabled,
@@ -5364,6 +5371,104 @@ def _download_receipt_store(agent: Any) -> Dict[str, JsonDict]:
     return store
 
 
+def _download_resource_registration_store(agent: Any) -> Dict[str, str]:
+    """Per-run dedupe for download receipts already handed to Storage."""
+
+    store = getattr(agent, "download_resource_registrations", None)
+    if not isinstance(store, dict):
+        store = {}
+        agent.download_resource_registrations = store
+    return store
+
+
+def _register_download_resource(
+    agent: Any,
+    receipt: JsonDict,
+    *,
+    operation_key: str,
+) -> Optional[JsonDict]:
+    """Record one proven browser download without changing action semantics.
+
+    Electron owns the bytes, so Storage keeps only the canonical path plus the
+    receipt and the size/hash observable at registration time. Active receipts
+    are useful even before the file becomes readable; a later Download.list
+    call registers a new version when the state or file stat changes.
+
+    A bookkeeping failure must not turn a browser-side success into a tool
+    failure: retrying Download.start after its side effect already happened can
+    create a duplicate download. Dual verification still exposes secondary
+    write failures through its own writeErrors channel.
+    """
+
+    state = str(receipt.get("state") or "").strip().lower()
+    save_path = str(receipt.get("savePath") or "").strip()
+    logger = getattr(agent, "logger", None)
+    if state not in {"downloading", "paused", "completed"} or not save_path or logger is None:
+        return None
+
+    task_dir = Path(getattr(logger, "task_dir", "") or ".")
+    normalized, unmanaged, resolved = normalize_external_path(task_dir, save_path)
+    if unmanaged:
+        basename = re.sub(r"[^A-Za-z0-9._-]+", "_", resolved.name).strip("._")
+        basename = basename or "download"
+        path_tag = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+        logical_path = f"external/downloads/{path_tag}-{basename}"
+    else:
+        logical_path = normalized
+    if not logical_path:
+        return None
+
+    try:
+        stat = resolved.stat() if resolved.is_file() else None
+    except OSError:
+        stat = None
+    signature = json.dumps(
+        [
+            str(receipt.get("downloadId") or ""),
+            str(receipt.get("url") or ""),
+            normalized,
+            state,
+            int(receipt.get("totalBytes") or 0),
+            int(receipt.get("receivedBytes") or 0),
+            int(stat.st_size) if stat is not None else None,
+            int(stat.st_mtime_ns) if stat is not None else None,
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    registration_key = operation_key or normalized
+    registrations = _download_resource_registration_store(agent)
+    if registrations.get(registration_key) == signature:
+        return None
+
+    try:
+        storage, task_id = storage_for_logger(logger)
+        stored = storage.save_resource(
+            task_id=task_id,
+            run_id=str(getattr(logger, "run_id", "") or ""),
+            resource_type="download",
+            logical_path=logical_path,
+            external_path=str(resolved),
+            metadata={
+                "download": dict(receipt),
+                "operationKey": operation_key,
+                "external_unmanaged": unmanaged,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - never invite a duplicate side effect
+        try:
+            logger.write("storage.download_registration_failed", {
+                "savePath": save_path,
+                "state": state,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+        except Exception:
+            pass
+        return None
+    registrations[registration_key] = signature
+    return stored
+
+
 DOWNLOAD_TIMEOUT_RECONCILIATION_DELAY_SECONDS = 4.0
 
 
@@ -5376,10 +5481,11 @@ def _remember_download_record(agent: Any, record: JsonDict) -> JsonDict:
         "state": str(record.get("state") or ""),
         "totalBytes": int(record.get("totalBytes") or 0),
         "receivedBytes": int(record.get("receivedBytes") or 0),
-        "source": "Download.list",
+        "source": str(record.get("source") or "Download.list"),
     }
     if key:
         _download_receipt_store(agent)[key] = receipt
+    _register_download_resource(agent, receipt, operation_key=key)
     return receipt
 
 
@@ -7715,9 +7821,9 @@ async def _recover_page_create_32005(
             probe=probe,
         ),
         "next_instruction": (
-            "Stop this worker. The browser backend has no usable page after"
-            " Page.create -32005; LeadAgent should retry only after the Browser"
-            " Client/playground backend is connected or rebuilt."
+            "Stop this worker: the browser backend has no usable page after"
+            " Page.create -32005, so no further browser action can be"
+            " dispatched from it."
         ),
     }
     return terminal, True

@@ -105,7 +105,7 @@ from harness.task_control import (
     reconcile_replan_checkpoints,
     replan_checkpoint_plan_errors,
     validate_task_plan,
-    write_versioned_task_plan,
+    accept_task_plan,
 )
 from harness.plan_validator import (
     plan_candidate_hash,
@@ -1770,6 +1770,12 @@ L6. Termination
         for saved_path in _saved_paths_from_value(response):
             if saved_path not in self.artifacts:
                 self.artifacts.append(saved_path)
+            # Register the file the platform wrote. The harness never holds
+            # these bytes - Download.start hands the path to ABCP, which does
+            # the writing - so only a reference plus an integrity snapshot can
+            # be recorded, and a later read reports drift rather than claiming
+            # the content is immutable.
+            self._register_external_file(method, saved_path)
         self.file_action_evidence.append({
             "method": method,
             "params": trim_large_strings(dict(params or {}), max_chars=2000),
@@ -1780,6 +1786,42 @@ L6. Termination
         # image-export batches from growing worker memory without limit.
         if len(self.file_action_evidence) > 200:
             del self.file_action_evidence[:-200]
+
+    def _register_external_file(self, method: str, saved_path: str) -> None:
+        """Record a platform-written file as an external resource."""
+
+        logger = getattr(self, "logger", None)
+        if logger is None or getattr(logger, "task_dir", None) is None:
+            return
+        from harness.utils import storage_for_logger
+
+        try:
+            storage, task_id = storage_for_logger(logger)
+            task_root = Path(logger.task_dir).resolve(strict=False)
+            resolved = Path(saved_path).expanduser().resolve(strict=False)
+            try:
+                logical_path = str(resolved.relative_to(task_root))
+            except ValueError:
+                # Outside the worktree: still worth a record, but it must be
+                # marked so a purge never deletes a file it does not own.
+                logical_path = resolved.name
+            storage.save_resource(
+                task_id=task_id,
+                run_id=str(getattr(logger, "run_id", "") or ""),
+                resource_type="download" if method.startswith("Download.") else "file_evidence",
+                logical_path=logical_path,
+                external_path=str(resolved),
+                media_type="application/octet-stream",
+                metadata={"method": method},
+            )
+        except Exception as exc:  # noqa: BLE001 - bookkeeping must not fail a call
+            try:
+                logger.write(
+                    "storage.external_file_unregistered",
+                    {"method": method, "savedPath": saved_path, "error": str(exc)},
+                )
+            except Exception:
+                pass
 
     def _offload_response(
         self,
@@ -1835,17 +1877,11 @@ L6. Termination
         reminder = (
             "[HARNESS-CHECKPOINT-REMINDER]\n"
             "This reminder applies to the immediately following assistant turn only.\n"
-            f"You have {remaining} step(s) left before this worker is hard-stopped.\n"
-            "If the task is not finished, call final_answer immediately:\n"
-            "  - status=\"partial\" if you have any usable evidence to hand off,\n"
-            "  - status=\"extraction_inconclusive\" if repeated JS/AXTree calls"
-            " returned null/empty,\n"
-            "  - status=\"incomplete\" otherwise.\n"
-            "Set the `reason` field to one short sentence describing the blocker."
-            " Use `answer` to include savedPath references for any extraction"
-            " artifacts you already recorded. Do NOT issue further browser_call"
-            " or record_extraction in the next turn unless you are certain it"
-            " unblocks completion."
+            f"currentStep={next_step}\n"
+            f"maxSteps={max_steps}\n"
+            f"remainingSteps={remaining}\n"
+            "These are arithmetic budget facts only. Choose the next action"
+            " from the original goal and current evidence."
         )
         self._write_agent_event(
             "agent.step_cap.reminder",
@@ -2534,36 +2570,32 @@ class LeadAgent:
                 "verdict": plan_validator_review.get("verdict"),
                 "auditPath": plan_validator_review.get("auditPath"),
             }
-        plan_path, plan_version = write_versioned_task_plan(
+        extension_decision = None
+        if resume_decision == "extend" and isinstance(preserve_from, dict):
+            # resume_keep_plan records its decision in the resume audit, so a
+            # reader of task_state alone must also be able to tell a protected
+            # extension from a general replan.  Appended rather than assigned:
+            # one resume may extend more than once.
+            extension_decision = {
+                "reason": replan_reason,
+                "baselineKind": "current_plan_immutable_prefix",
+                "initialPlanRecovered": (
+                    bool(self.resume.initial_plan_recovered)
+                    if self.resume is not None else None
+                ),
+            }
+        # One call: the version record, the current-plan alias and the reset
+        # task state are a single generation and are committed together.
+        plan_path, plan_version, state = accept_task_plan(
             self.logger,
             plan,
             previous_plan=previous_plan,
             replan_reason=replan_reason,
             user_task=self.original_user_task,
             validator_review=validator_record,
+            preserve_from=preserve_from,
+            extension_decision=extension_decision,
         )
-        if resume_decision == "extend" and isinstance(preserve_from, dict):
-            # resume_keep_plan records its decision in the resume audit, so a
-            # reader of task_state.json alone must also be able to tell a
-            # protected extension from a general replan.  Appended rather than
-            # assigned: one resume may extend more than once.
-            audit_resumes = preserve_from.get("resumes")
-            if (
-                isinstance(audit_resumes, list)
-                and audit_resumes
-                and isinstance(audit_resumes[-1], dict)
-            ):
-                decisions = audit_resumes[-1].setdefault("extensionDecisions", [])
-                if isinstance(decisions, list):
-                    decisions.append({
-                        "reason": replan_reason,
-                        "planVersion": plan_version.get("planVersion"),
-                        "baselineKind": "current_plan_immutable_prefix",
-                        "initialPlanRecovered": (
-                            bool(self.resume.initial_plan_recovered)
-                            if self.resume is not None else None
-                        ),
-                    })
         plan_warnings = (
             plan.get("warnings") if isinstance(plan.get("warnings"), list) else []
         )
@@ -2571,13 +2603,6 @@ class LeadAgent:
             self.logger.write("task_plan.accepted_with_warnings", {
                 "warnings": plan_warnings,
             })
-        state = initialize_task_state(
-            self.logger,
-            plan,
-            preserve_from=preserve_from,
-            replan_reason=replan_reason,
-            plan_version=plan_version,
-        )
         self.task_plan = plan
         if self.initial_task_plan is None:
             self.initial_task_plan = plan

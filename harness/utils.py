@@ -398,14 +398,107 @@ class UsageAggregator:
         return summary
 
 
+def read_task_file_text(logger: Any, raw_path: Any) -> Optional[str]:
+    """Read a task-scoped file's text from disk or from the backend.
+
+    Every internal reader must go through here rather than ``Path.read_text``.
+    ``local_fs_read`` alone is not enough: it only serves the model, while the
+    gates that decide whether a phase completed - artifact validation, resume
+    integrity, worker result summaries - read the same paths themselves. When
+    those kept reading the filesystem directly, a db-mode extraction artifact
+    existed, was readable by the agent, and was still judged missing.
+    """
+
+    resolved, error = resolve_task_file(logger, raw_path)
+    if error or resolved is None:
+        return None
+    if resolved.is_file():
+        try:
+            return resolved.read_text(encoding="utf-8")
+        except OSError:
+            return None
+    from harness.storage.virtual_fs import virtual_fs_for
+
+    view = virtual_fs_for(logger)
+    if view is None:
+        return None
+    try:
+        relative = str(resolved.relative_to(Path(logger.task_dir).resolve()))
+    except (OSError, ValueError):
+        return None
+    lines = view.iter_lines(relative)
+    if lines is None:
+        return None
+    # The view's lines carry their terminators, so concatenating reproduces
+    # the file byte for byte - including whether it ends in a newline, which
+    # "\n".join would have silently dropped.
+    return "".join(lines)
+
+
+def task_file_exists(logger: Any, raw_path: Any) -> bool:
+    """True when a task path resolves to bytes, wherever they are stored."""
+
+    resolved, error = resolve_task_file(logger, raw_path)
+    if error or resolved is None:
+        return False
+    if resolved.is_file():
+        return True
+    from harness.storage.virtual_fs import virtual_fs_for
+
+    view = virtual_fs_for(logger)
+    if view is None:
+        return False
+    try:
+        relative = str(resolved.relative_to(Path(logger.task_dir).resolve()))
+    except (OSError, ValueError):
+        return False
+    return view.exists(relative)
+
+
+def load_task_json(logger: Any, raw_path: Any) -> Optional[Any]:
+    """Parse a task-scoped JSON document from whichever backend holds it."""
+
+    text = read_task_file_text(logger, raw_path)
+    if text is None:
+        return None
+    try:
+        return json.loads(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def storage_for_logger(logger: Any) -> Tuple[Any, str]:
+    """Resolve ``(storage, task_id)`` from anything logger-shaped.
+
+    ``task_dir`` is the anchor the rest of this codebase already treats as
+    authoritative, and plenty of callers pass a lightweight object carrying
+    only that. Deriving the task id and a file backend from it keeps those
+    callers working; a real RunLogger hands over its own backend instead,
+    which may be the database.
+    """
+
+    task_dir = Path(getattr(logger, "task_dir", "") or ".")
+    task_id = str(getattr(logger, "task_id", "") or "") or task_dir.name
+    storage = getattr(logger, "storage", None)
+    if storage is None:
+        # Imported lazily: harness.storage.file_store depends on this module.
+        from harness.storage.file_store import FileStore
+
+        storage = FileStore(worktree_dir=str(task_dir.parent))
+    return storage, task_id
+
+
 class RunLogger:
     def __init__(
         self,
         worktree_dir: str,
         task_id: Optional[str] = None,
         on_event: Optional[EventSink] = None,
+        run_id: str = "",
+        storage: Optional[Any] = None,
     ):
         self.task_id = task_id or uuid.uuid4().hex
+        self.worktree_dir = str(worktree_dir)
         self.task_dir = Path(worktree_dir) / self.task_id
         self.artifacts_dir = self.task_dir / "artifacts"
         self.task_dir.mkdir(parents=True, exist_ok=True)
@@ -414,19 +507,54 @@ class RunLogger:
         self.usage_aggregator = UsageAggregator()
         self._usage_summary_written = False
         self.on_event = on_event
+        # run_id is a relational field, not payload context: it identifies
+        # which launch or resume produced an event and is a foreign key in the
+        # database backend. bind_context must never be used to carry it.
+        self.run_id = str(run_id or "")
+        self._storage = storage
+
+    @property
+    def storage(self) -> Any:
+        """The configured backend, defaulting to the historical file layout.
+
+        Constructed lazily so the 100+ existing RunLogger call sites - tests
+        included - keep writing exactly the files they always did without
+        passing anything new.
+        """
+
+        if self._storage is None:
+            from harness.storage.file_store import FileStore
+
+            self._storage = FileStore(worktree_dir=self.worktree_dir)
+        return self._storage
+
+    @property
+    def storage_attached(self) -> bool:
+        """True once a backend was attached, without lazily creating one."""
+
+        return self._storage is not None
+
+    def attach_storage(self, storage: Any) -> None:
+        """Swap in a configured backend after construction.
+
+        main.py builds the logger before it knows the run id, so the backend
+        arrives in the same late-binding step.
+        """
+
+        self._storage = storage
 
     def write(self, event_type: str, payload: JsonDict) -> None:
-        event = {
-            "ts": datetime.now().isoformat(timespec="seconds"),
-            "taskId": self.task_id,
-            "type": event_type,
-            "payload": payload,
-        }
-        run_id = str(getattr(self, "run_id", "") or "").strip()
-        if run_id:
-            event["runId"] = run_id
-        with self.path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+        self.storage.append_event(
+            task_id=self.task_id,
+            run_id=str(self.run_id or ""),
+            event_type=event_type,
+            payload=payload,
+            worker_id=(
+                str(payload.get("workerId") or "") or None
+                if isinstance(payload, dict)
+                else None
+            ),
+        )
         if self.on_event:
             try:
                 self.on_event(event_type, payload)
