@@ -497,22 +497,6 @@ def normalize_content_completeness_config(value: Any) -> JsonDict:
     } if expected else {}
 
 
-# Decisions the worker cannot act on from the status word alone. Kept beside
-# the decision that produces them so the tool boundary stays generic.
-_DECISION_INSTRUCTIONS: Dict[str, str] = {
-    MARKER_DECLARATION_SUSPECT: (
-        "The page loaded but none of the declared content_completeness markers"
-        " were found anywhere on it. Before treating the content as absent or"
-        " suppressed, read the page and check whether the markers match text"
-        " that is actually rendered — a marker copied from a field name (for"
-        " example an English identifier on a Chinese page) never matches. If"
-        " the markers are wrong, report the corrected marker text as a blocker"
-        " so the plan can be fixed; if they are right, continue working the"
-        " page and the ordinary recovery ladder resumes."
-    ),
-}
-
-
 @dataclass
 class PageContentState:
     page_id: str
@@ -588,7 +572,6 @@ class PageContentState:
             "recoveryAttempts": self.recovery_attempts,
             "recoveryAttemptsByItem": dict(self.recovery_attempts_by_item),
             "decision": self.decision,
-            "decisionNextInstruction": _DECISION_INSTRUCTIONS.get(self.decision),
             "evidenceStrength": self.evidence_strength,
             "upstreamBlocker": self.upstream_blocker or None,
             "contentState": self.content_state,
@@ -824,96 +807,6 @@ class ContentCompletenessTracker:
             cohortKey=cohort_key,
             routePreference="listing_link_click",
         )
-
-    def recovery_receipt(self, page_id: str) -> Optional[JsonDict]:
-        state = self.pages.get(str(page_id or ""))
-        if state is None:
-            return None
-        max_attempts = int(
-            (self.config.get("recovery") or {}).get("max_attempts_per_item", 2)
-        )
-        remaining = max(0, max_attempts - int(state.recovery_attempts or 0))
-        if state.decision == ROUTE_RECOVERY_REQUIRED:
-            if state.source_page_id and state.source_page_id != state.page_id:
-                return_method = "Page.switchTo"
-            elif state.source_url:
-                return_method = "Page.go"
-            else:
-                return_method = "listing_source_required"
-            return {
-                "status": "route_recovery_required",
-                "mode": "listing_link_click",
-                "pageId": state.page_id,
-                "sourcePageId": state.source_page_id or None,
-                "sourceUrl": state.source_url or None,
-                "itemIdentity": state.item_key or None,
-                "remainingAttempts": remaining,
-                "returnMethod": return_method,
-                "requiredActions": [
-                    "restore_listing_source",
-                    "refresh_accessibility_tree",
-                    "rebind_item_anchor",
-                    "click_anchor",
-                    "inspect_click_gate_receipt_and_state",
-                    "verify_required_regions",
-                ],
-                "next_instruction": (
-                    "The loaded shell is incomplete after bounded local"
-                    " materialization. Restore the listing source, refresh the"
-                    " accessibility tree, rebind the real item anchor, and"
-                    " click it once. The Fleet click gate takes its own raw"
-                    " Page.list baseline/final inventory; inspect its receipt"
-                    " plus Page.getState, then verify the required regions."
-                    " Do not reuse a stale AX id."
-                ),
-            }
-        if (
-            state.decision == "inconclusive"
-            and state.shell_present
-            and state.missing_regions
-        ):
-            return {
-                "status": "materialization_required",
-                "mode": "local_reveal_then_probe",
-                "pageId": state.page_id,
-                "itemIdentity": state.item_key or None,
-                "remainingAttempts": remaining,
-                "requiredActions": [
-                    "reveal_or_scroll_target_region",
-                    "probe_semantic_tree",
-                    "run_bounded_collection_if_repeated",
-                ],
-                "next_instruction": (
-                    "The page shell is present but required regions are not yet"
-                    " materialized. Reveal or scroll the target region, refresh"
-                    " DOM.getSemanticTree with includeShadowDom=true when the"
-                    " connected schema supports it (custom-element hosts can"
-                    " otherwise appear as empty children), and use the bounded"
-                    " collection tool for repeated records before escalating"
-                    " navigation."
-                ),
-            }
-        return None
-
-    def route_preference_for_page(self, page_id: str) -> Optional[JsonDict]:
-        state = self.pages.get(str(page_id or ""))
-        if state is None:
-            return None
-        templates = {
-            _source_template(state.url),
-            _source_template(state.source_url),
-        } - {""}
-        if state.route_preference:
-            preferred_template = str(
-                state.route_preference.get("sourceTemplate") or ""
-            )
-            if preferred_template in templates:
-                return dict(state.route_preference)
-            state.route_preference.clear()
-        for receipt in self.route_preferences.values():
-            if str(receipt.get("sourceTemplate") or "") in templates:
-                return dict(receipt)
-        return None
 
     @property
     def enabled(self) -> bool:
@@ -2151,132 +2044,6 @@ class ContentCompletenessTracker:
         state.decision = "inconclusive"
         self._refresh_route_recovery_pending()
 
-    def unresolved_observation(self) -> Optional[JsonDict]:
-        """Return the latest unresolved tracker interpretation for diagnostics.
-
-        This is not a terminal decision, validation veto, scheduling status, or
-        completion receipt. Production handoff uses ``summaries()`` and strips
-        these historical decision labels down to their underlying facts. The
-        method remains a test/diagnostic observation API only.
-        """
-        blocked_candidates = [
-            state for state in self.pages.values()
-            if state.decision == BLOCKED_CONTENT_SUPPRESSION
-            and not state.upstream_blocker
-            and not state.is_recovery_source
-        ]
-        route_candidates = [
-            state for state in self.pages.values()
-            if state.decision == ROUTE_RECOVERY_REQUIRED
-            and not state.upstream_blocker
-            and not state.is_recovery_source
-        ]
-        pending_materialization = [
-            state for state in self.pages.values()
-            if (
-                state.decision == "inconclusive"
-                and not state.upstream_blocker
-                and not state.is_recovery_source
-                and state.shell_present
-                and bool(state.missing_regions)
-                and (
-                    state.content_state == CONTENT_SHELL_SEEN
-                    or bool(state.matched_confirmatory_signals)
-                    or not self._materialization_ready(state)
-                )
-            )
-        ]
-        pending_record_extraction = [
-            state for state in self.pages.values()
-            if state.decision == "record_extraction_required"
-            and not state.upstream_blocker
-            and not state.is_recovery_source
-            and bool(
-                set(state.missing_regions) - self._validated_regions_for_page(state)
-            )
-        ]
-        marker_suspect = [
-            state for state in self.pages.values()
-            if state.decision == MARKER_DECLARATION_SUSPECT
-            and not state.upstream_blocker
-            and not state.is_recovery_source
-            and bool(
-                set(state.missing_regions) - self._validated_regions_for_page(state)
-            )
-        ]
-        blocked_candidates = [
-            state for state in blocked_candidates
-            if set(state.missing_regions) - self._validated_regions_for_page(state)
-        ]
-        route_candidates = [
-            state for state in route_candidates
-            if set(state.missing_regions) - self._validated_regions_for_page(state)
-        ]
-        pending_materialization = [
-            state for state in pending_materialization
-            if set(state.missing_regions) - self._validated_regions_for_page(state)
-        ]
-        candidates = [
-            *blocked_candidates,
-            *route_candidates,
-            *pending_materialization,
-            *pending_record_extraction,
-            *marker_suspect,
-        ]
-        if not candidates:
-            return None
-        latest = max(candidates, key=lambda item: item.observation_order)
-        blocked = latest.decision == BLOCKED_CONTENT_SUPPRESSION
-        materialization_only = latest.decision == "inconclusive"
-        extraction_only = latest.decision == "record_extraction_required"
-        marker_suspect_only = latest.decision == MARKER_DECLARATION_SUSPECT
-        return {
-            "category": (
-                BLOCKED_CONTENT_SUPPRESSION
-                if blocked else "route_sensitive_content_suppression"
-            ),
-            "decision": (
-                "record_extraction_required"
-                if extraction_only else
-                "materialization_required"
-                if materialization_only else latest.decision
-            ),
-            "evidenceStrength": latest.evidence_strength,
-            "configSource": self.config_source,
-            "page": latest.summary(),
-            "next_instruction": (
-                _DECISION_INSTRUCTIONS[MARKER_DECLARATION_SUSPECT]
-                if marker_suspect_only else
-                (
-                    "Structured values for a declared region were observed but"
-                    " have not yet earned contract-valid artifact credit. Call"
-                    " record_extraction now; do not route-recover first. This"
-                    " provisional evidence expires after two later observations."
-                )
-                if extraction_only else
-                (
-                    "The page shell exists and task-required regions are still"
-                    " missing, but bounded materialization is not exhausted."
-                    " Scroll/reveal the target region and run"
-                    " DOM.getSemanticTree before declaring semantic absence."
-                )
-                if materialization_only else (
-                    (
-                        "The bounded listing-link recovery budget for this item"
-                        " is exhausted while required content remains suppressed."
-                        " Finalize with blocked_content_suppression; do not"
-                        " relabel this outcome as target_absent or"
-                        " instruction_infeasible."
-                    )
-                    if blocked else
-                    "The current navigation epoch has a complete page shell but"
-                    " task-required regions are missing. Do not declare"
-                    " target_absent or instruction_infeasible. Return to a"
-                    " search/listing source, click the real item anchor, then"
-                    " re-run Page.getState and DOM probes."
-                )
-            ),
-        }
 
     def summaries(self) -> List[JsonDict]:
         summaries = [state.summary() for state in self.pages.values()]

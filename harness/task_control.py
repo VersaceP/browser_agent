@@ -1329,17 +1329,16 @@ def validate_task_plan(
             )
 
         objective = str(raw_phase.get("objective") or "").strip()
-        worker_task = str(raw_phase.get("worker_task") or raw_phase.get("task") or "").strip()
+        worker_task = str(
+            raw_phase.get("worker_task")
+            or raw_phase.get("task")
+            or objective
+        ).strip()
         if not objective:
             errors.append(f"phase {phase_id}: objective is required")
-        if not worker_task:
-            errors.append(f"phase {phase_id}: worker_task is required")
 
-        stage_hint = str(raw_phase.get("stage_hint") or "").strip()
-        if not stage_hint:
-            errors.append(f"phase {phase_id}: stage_hint is required")
-            stage_hint = "generic"
-        elif stage_hint not in VALID_STAGE_HINTS:
+        stage_hint = str(raw_phase.get("stage_hint") or "generic").strip()
+        if stage_hint not in VALID_STAGE_HINTS:
             errors.append(
                 f"phase {phase_id}: stage_hint must be one of"
                 f" {sorted(VALID_STAGE_HINTS)}; got {stage_hint!r}"
@@ -4504,7 +4503,7 @@ def failure_signature_from_result(worker_result: JsonDict) -> List[Any]:
         if isinstance(classification, dict)
         else ""
     )
-    progress_reason = _progress_intervention_reason(worker_result)
+    progress_reason = _stall_signal_reason(worker_result)
     return [
         category or None,
         validation_failure_type or None,
@@ -4626,19 +4625,12 @@ def _classification_hint_key(classification: JsonDict) -> str:
     return ""
 
 
-def _progress_intervention_reason(worker_result: JsonDict) -> str:
+def _stall_signal_reason(worker_result: JsonDict) -> str:
     trace_summary = (
         worker_result.get("traceSummary")
         if isinstance(worker_result.get("traceSummary"), dict)
         else {}
     )
-    interventions = trace_summary.get("progressInterventions")
-    if isinstance(interventions, list):
-        for item in reversed(interventions):
-            if isinstance(item, dict):
-                reason = str(item.get("reason") or "").strip()
-                if reason:
-                    return reason
     loop_nudges = trace_summary.get("loopNudges")
     if isinstance(loop_nudges, list):
         for item in reversed(loop_nudges):
@@ -5951,6 +5943,30 @@ def find_phase(plan: Optional[JsonDict], phase_id: Optional[str]) -> Optional[Js
     return None
 
 
+def _empty_array_observations(
+    rows: List[JsonDict],
+    expected: JsonDict,
+) -> List[JsonDict]:
+    """Report rows whose declared array fields came back empty, as facts.
+
+    These used to fail phase validation. Two problems with that: the detector
+    never consulted `allow_empty`, so it overrode the very contract the plan
+    declared; and where no `field_nonempty` validator existed it invented a
+    requirement out of a threshold ("two or more empty arrays looks like a
+    stub"). In task a608b5e7 a worker spent steps reading the run log to work
+    out how to satisfy it, which is the shape of a harness the model has to
+    reverse-engineer rather than a task it can do.
+
+    The contract still decides: `field_nonempty` rejects mechanically and
+    `allow_empty` accepts. What is left over — an empty array nobody declared
+    either way — is counterevidence the model reads, not a verdict.
+    """
+    return [
+        *detect_stub_rows(rows, expected),
+        *detect_near_stub_rows(rows, expected),
+    ]
+
+
 def validate_worker_artifacts(
     *,
     contract: Optional[JsonDict],
@@ -6112,7 +6128,6 @@ def validate_worker_artifacts(
             cand_failures.extend(_run_validator(validator, cand_rows))
         cand_failures.extend(detect_placeholder_rows(cand_rows))
         cand_failures.extend(detect_blocker_data_rows(cand_rows, expected))
-        cand_failures.extend(detect_stub_rows(cand_rows, expected))
         return cand_failures, cand_rows
 
     if expected_name:
@@ -6129,7 +6144,7 @@ def validate_worker_artifacts(
                 selected, selected_failures, rows = item, alt_failures, alt_rows
                 break
     failures.extend(selected_failures)
-    warnings = detect_near_stub_rows(rows, expected)
+    warnings = _empty_array_observations(rows, expected)
 
     cumulative = False
     cumulative_sources: List[str] = []
@@ -6158,7 +6173,7 @@ def validate_worker_artifacts(
         if failures and cumulative_rows and not cumulative_failures:
             rows = cumulative_rows
             failures = []
-            warnings = detect_near_stub_rows(rows, expected)
+            warnings = _empty_array_observations(rows, expected)
             cumulative = True
 
     file_failures: List[JsonDict] = []
@@ -6353,7 +6368,7 @@ def classify_artifact_validation_failures(
         for item in failures
         if isinstance(item, dict)
     }
-    if failure_types & {"data_placeholder", "data_stub"}:
+    if "data_placeholder" in failure_types:
         category = "data_placeholder"
         hint = "Observed rows look like placeholder or stub content; reveal/load the real content or report absence."
     elif "artifact_required" in failure_types:
@@ -7644,7 +7659,6 @@ def _validate_cumulative_artifacts(
         failures.extend(_run_validator(validator, rows))
     failures.extend(detect_placeholder_rows(rows))
     failures.extend(detect_blocker_data_rows(rows, expected))
-    failures.extend(detect_stub_rows(rows, expected))
     return rows, source_paths, [*schema_failures, *failures], provenance
 
 
@@ -7687,6 +7701,14 @@ def _cumulative_row_quality(
     validators: List[JsonDict],
     expected: JsonDict,
 ) -> tuple:
+    """Rank two candidates for the same slot. Never rejects either of them.
+
+    `detect_stub_rows` used to contribute here too, and it is the last place
+    its invented threshold (`len(empty) >= max(2, len(present))`) decided
+    anything. It is redundant rather than wrong: `nonempty_expected` and
+    `nonempty_total` below already prefer the row that carries content, and
+    they do it by counting fields instead of by a cutoff nobody declared.
+    """
     row_failures: List[JsonDict] = []
     for validator in validators:
         validator_type = str(validator.get("type") or "").strip()
@@ -7695,7 +7717,6 @@ def _cumulative_row_quality(
         row_failures.extend(_run_validator(validator, [row]))
     row_failures.extend(detect_placeholder_rows([row]))
     row_failures.extend(detect_blocker_data_rows([row], expected))
-    row_failures.extend(detect_stub_rows([row], expected))
 
     expected_fields = field_names_from_specs(
         expected.get("required_fields") or expected.get("fields") or []

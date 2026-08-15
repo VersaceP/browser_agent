@@ -1139,6 +1139,13 @@ async def review_plan_revision(
             " unverified. Do not upgrade 'not found', 'appears', or a"
             " single-surface miss into a confirmed absence when Raw receipts"
             " or Unresolved/counterevidence do not establish it.",
+            "Check that every user-requested quantity, range, or concrete"
+            " identity cohort is represented in expected_artifact/validators,"
+            " not only in objective or worker_task prose. exact_rows proves"
+            " only cardinality; a named cohort such as ranks 11-20 also needs"
+            " set_equals (or an equivalent declared identity constraint) and"
+            " uniqueness. Judge whether the Lead translated the user meaning;"
+            " do not invent values or silently add validators yourself.",
             "Resolve every quantityLineageAmbiguity explicitly. An ambiguous"
             " assessment cannot be approved. If it is a quantity relaxation,"
             " submit a quantityDecision using that ambiguityId.",
@@ -1228,6 +1235,8 @@ async def review_plan_revision(
     except Exception as exc:
         return {
             "status": "error",
+            # The critic never answered: nothing semantic was decided here.
+            "errorKind": "transport",
             "candidateHash": candidate_digest,
             "errors": [f"{type(exc).__name__}: {exc}"],
         }
@@ -1239,6 +1248,9 @@ async def review_plan_revision(
     if len(matching) != 1 or len(tool_calls) != 1:
         return {
             "status": "error",
+            # The critic ran but produced no usable verdict (commonly a
+            # max_tokens truncation), so again nothing semantic was decided.
+            "errorKind": "protocol",
             "candidateHash": candidate_digest,
             "stopReason": stop_reason,
             "text": str(text or "")[:1000],
@@ -1255,8 +1267,15 @@ async def review_plan_revision(
         lineage_ambiguities=lineage_ambiguities,
     )
     if verdict is None:
+        # The critic DID answer and its answer was rejected by the guards in
+        # `_validate_verdict` — most consequentially, an approval that weakened
+        # an objective without citing harness evidence. This is a finding about
+        # the candidate, not an absent reviewer, and it must never be read as
+        # one: task a608b5e7 laundered exactly this into "review unavailable"
+        # and accepted a replan that dropped the image-download objective.
         return {
             "status": "error",
+            "errorKind": "verdict_invalid",
             "candidateHash": candidate_digest,
             "errors": errors,
         }

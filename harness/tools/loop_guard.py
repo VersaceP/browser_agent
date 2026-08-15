@@ -1,21 +1,17 @@
-"""
-harness.tools.loop_guard - Detect and break "same tool, same args" loops.
+"""Observe exact duplicate tool calls without deciding whether they are useful.
 
-A model can lock into calling the same tool with the same arguments many times
-in a row even when the previous tool_result already contained the answer (we
-have observed this with kimi-2.6 against local_fs_search: 23 identical calls
-in 23 steps despite the first call returning 45 hits). The dispatcher cannot
-fix the model's reasoning, but it can refuse to execute obviously-degenerate
-work and steer the agent toward a pivot or a clean termination.
+An identical request is an arithmetic fact.  It is not proof of an identical
+world state: waits, page reads and searches can legitimately return new data,
+and production runs showed that blocking a repeated ``wait_browser_agents``
+sent the Lead into several steps of irrelevant file archaeology.  Global run
+budgets bound ordinary repetition; irreversible side effects retain their own
+idempotency, confirmation and uncertain-side-effect protections.
 
-Behavior:
-- Exact duplicate calls are tracked as a consecutive streak.
-- Thresholds are bucketed by tool/method. `local_fs_*` and LeadAgent control
-  tools stay strict; repetitive browser probes and scrolls get more room so
-  advisory loop nudges can steer the model before the hard fuse blows.
-- At warn threshold the tool is NOT re-executed; the dispatcher returns a
-  directive telling the model to pivot or finalize. At force threshold the
-  agent is hard-stopped with status=extraction_inconclusive.
+One spend limit survives that, and it is deliberately far above anything a
+working agent does.  Repetition here is judged by nobody: every call up to the
+limit is dispatched, and the limit itself makes no claim about whether the
+work was useful, only about how much of a run one byte-identical request may
+consume.  See ``docs/tau-informed-simplification-plan.md`` for the decision.
 """
 
 from __future__ import annotations
@@ -27,38 +23,25 @@ from typing import Any, List, Optional, Tuple
 from harness.utils import JsonDict
 
 
-DEFAULT_WARN_AT = 4
-DEFAULT_FORCE_STOP_AT = 8
-STRICT_WARN_AT = 3
-STRICT_FORCE_STOP_AT = 5
 HISTORY_WINDOW = 24
-
-STRICT_TOOL_PREFIXES = ("local_fs_",)
-STRICT_TOOL_NAMES = {
-    "emit_task_plan",
-    "spawn_browser_agent",
-    "wait_browser_agents",
-    "list_browser_agents",
-    "lead_save_artifact",
-}
-METHOD_THRESHOLDS = {
-    "Input.scroll": (10, 20),
-    "DOM.getAXTree": (6, 12),
-    "Page.getState": (6, 12),
-    "DOM.getText": (6, 12),
-    "DOM.getAttribute": (6, 12),
-    "Input.click": (5, 10),
-    "Input.type": (5, 10),
-    "Input.press": (5, 10),
-    "Runtime.evaluate": (4, 8),
-}
+# One number for every tool.  The per-tool table this replaced encoded guesses
+# about which repetitions were suspicious - ``local_fs_*`` stopped at 5,
+# ``Runtime.evaluate`` at 8 - and those guesses were the overfitting: in task
+# a608b5e7 the longest identical streak across ten workers was five consecutive
+# ``Input.scroll`` calls, which is what reading a feed looks like.  The
+# pathology this bounds is the one seen with kimi-2.6, which issued the same
+# ``local_fs_search`` 23 times in 23 steps.  Keep it below HISTORY_WINDOW or
+# the streak can never be observed to reach it.
+DUPLICATE_CALL_STOP_AT = 20
 
 
 def tool_call_signature(name: str, tool_input: Any) -> str:
-    """Stable hash over (tool_name, normalized_input). Sort keys so semantically
-    identical dicts hash the same regardless of key order."""
+    """Stable hash over ``(tool name, normalized input)``."""
     payload = json.dumps(
-        {"name": str(name or ""), "input": tool_input if tool_input is not None else {}},
+        {
+            "name": str(name or ""),
+            "input": tool_input if tool_input is not None else {},
+        },
         sort_keys=True,
         ensure_ascii=False,
         default=str,
@@ -67,35 +50,13 @@ def tool_call_signature(name: str, tool_input: Any) -> str:
 
 
 def trailing_streak(history: List[str], signature: str) -> int:
-    """Count how many of the most recent history entries equal `signature`
-    (including the current one once it is appended)."""
+    """Count consecutive occurrences, including the call being observed."""
     streak = 1
     for prior in reversed(history):
-        if prior == signature:
-            streak += 1
-        else:
+        if prior != signature:
             break
+        streak += 1
     return streak
-
-
-def loop_guard_thresholds(name: str, tool_input: Any) -> Tuple[int, int, str]:
-    """Return warn/force thresholds and a human-readable bucket label."""
-    tool_name = str(name or "")
-    if tool_name in STRICT_TOOL_NAMES or tool_name.startswith(STRICT_TOOL_PREFIXES):
-        return STRICT_WARN_AT, STRICT_FORCE_STOP_AT, tool_name
-
-    method = ""
-    if tool_name == "browser_call" and isinstance(tool_input, dict):
-        method = str(tool_input.get("method") or "")
-    elif "." in tool_name:
-        # Direct ABCP capability tools land here as top-level names.
-        method = tool_name
-
-    if method in METHOD_THRESHOLDS:
-        warn_at, force_stop_at = METHOD_THRESHOLDS[method]
-        return warn_at, force_stop_at, method
-
-    return DEFAULT_WARN_AT, DEFAULT_FORCE_STOP_AT, method or tool_name
 
 
 def check_tool_call_loop(
@@ -107,96 +68,80 @@ def check_tool_call_loop(
     warn_at: Optional[int] = None,
     force_stop_at: Optional[int] = None,
 ) -> Optional[Tuple[JsonDict, bool]]:
-    """Return None to proceed with normal dispatch, or a (result, should_stop)
-    tuple when the loop guard wants to short-circuit.
+    """Record repetition, allow dispatch, and stop past the spend limit.
 
-    The caller is responsible for storing `recent_tool_signatures: List[str]`
-    on `agent` (and ideally initialising it to []). We update the list in
-    place to keep the bookkeeping next to the decision.
+    ``warn_at`` is accepted for replay compatibility and ignored: there is no
+    warn tier, because refusing to execute a call is where the old guard did
+    its damage.  ``force_stop_at`` overrides ``DUPLICATE_CALL_STOP_AT``.
     """
+    del warn_at
+    stop_at = int(
+        DUPLICATE_CALL_STOP_AT if force_stop_at is None else force_stop_at
+    )
     history: List[str] = getattr(agent, "recent_tool_signatures", None) or []
     signature = tool_call_signature(name, tool_input)
     streak = trailing_streak(history, signature)
-    bucket_warn_at, bucket_force_stop_at, threshold_bucket = loop_guard_thresholds(
-        name,
-        tool_input,
-    )
-    warn_at = bucket_warn_at if warn_at is None else warn_at
-    force_stop_at = (
-        bucket_force_stop_at if force_stop_at is None else force_stop_at
-    )
-
-    # Maintain the rolling window. We always append the new signature so the
-    # *next* call can see the just-issued one.
     history.append(signature)
     if len(history) > HISTORY_WINDOW:
         del history[: len(history) - HISTORY_WINDOW]
     agent.recent_tool_signatures = history
+    if streak < 2:
+        return None
 
-    if streak >= force_stop_at:
-        logger = getattr(agent, "logger", None)
-        if logger is not None:
-            logger.write(
-                "loop_guard.force_stop",
-                {
-                    "step": step,
-                    "tool": name,
-                    "thresholdBucket": threshold_bucket,
-                    "streak": streak,
-                    "warnAt": warn_at,
-                    "forceStopAt": force_stop_at,
-                    "signature": signature[:12],
-                },
-            )
-        result: JsonDict = {
+    if stop_at > 0 and streak > stop_at:
+        # Every one of the previous calls ran. This one does not, and the
+        # worker ends here so the decision goes up rather than being made
+        # about the model's reasoning down here.
+        stop_result: JsonDict = {
             "status": "extraction_inconclusive",
+            "reason": "duplicate_call_spend_limit",
+            "tool": str(name or ""),
+            "consecutiveIdenticalCalls": streak,
+            "spendLimit": stop_at,
             "answer": (
-                f"Loop guard force-stopped: the same {name} call with identical "
-                f"arguments was issued {streak} times in a row. The earlier "
-                "tool_result already contained whatever this call would return; "
-                "the model did not act on it. Aborting this worker so the "
-                "LeadAgent can pivot strategy or escalate."
+                f"This worker issued {streak - 1} byte-identical {name} calls in"
+                f" a row, all of which were dispatched, and stopped at the"
+                f" harness spend limit of {stop_at}. No judgement is made here"
+                " about whether the repetition was productive: the trace and"
+                " the artifacts hold the evidence for that."
             ),
-            "reason": "duplicate_tool_call_loop",
         }
-        return result, True
-
-    if streak >= warn_at:
         logger = getattr(agent, "logger", None)
         if logger is not None:
-            logger.write(
-                "loop_guard.warn",
-                {
-                    "step": step,
-                    "tool": name,
-                    "thresholdBucket": threshold_bucket,
-                    "streak": streak,
-                    "warnAt": warn_at,
-                    "forceStopAt": force_stop_at,
-                    "signature": signature[:12],
-                },
-            )
-        # The tool is NOT executed this turn. We send back an explicit
-        # directive so the model is forced to either pivot or finalize.
-        next_stop = max(1, force_stop_at - streak)
-        result = {
-            "status": "loop_guard_intercepted",
-            "warning": (
-                f"Duplicate-call guard: this is identical call #{streak} to "
-                f"{name} with the same arguments. The previous tool_result "
-                "is still in your context — re-read it before retrying. "
-                "If you have already inspected it, PIVOT NOW: "
-                "(a) change pattern/glob/path significantly; "
-                "(b) call browser_call with a different ABCP method "
-                "(e.g. DOM.getText on a known selector, Runtime.evaluate with "
-                "`return X;`, Input.scroll); "
-                "(c) call final_answer with status=\"extraction_inconclusive\" "
-                "if the data is genuinely unreachable. "
-                f"Another {next_stop} identical call(s) will hard-stop this worker."
-            ),
-            "echoed_call": {"name": name, "input": tool_input},
-            "tool_was_executed": False,
-        }
-        return result, False
+            logger.write("loop_guard.spend_limit", {
+                "step": step,
+                "tool": str(name or ""),
+                "consecutiveIdenticalCalls": streak,
+                "spendLimit": stop_at,
+                "signature": signature[:12],
+            })
+        return stop_result, True
 
+    observation: JsonDict = {
+        "source": "duplicate_call_observer",
+        "tool": str(name or ""),
+        "consecutiveIdenticalCalls": streak,
+        "signature": signature[:12],
+        "step": step,
+        "note": (
+            "This is an attributed repetition fact, not a verdict. It is"
+            " recorded before dispatch and does not report whether the call"
+            " ran; the receipt beside it is authoritative."
+        ),
+    }
+    pending = getattr(agent, "_pending_loop_observations", None)
+    if not isinstance(pending, list):
+        pending = []
+        agent._pending_loop_observations = pending
+    pending.append(observation)
+    logger = getattr(agent, "logger", None)
+    if logger is not None:
+        logger.write("loop_guard.observed", observation)
+    trace = getattr(agent, "trace", None)
+    if isinstance(trace, list):
+        trace.append({
+            "type": "loop_observation",
+            "step": step,
+            "result": observation,
+        })
     return None

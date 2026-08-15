@@ -189,7 +189,18 @@ def compact_trace_event(
             "physicalChanged": result.get("physicalChanged"),
         }
         return compact_none_values(base)
-    if event_type in {"record_extraction", "final_answer", "loop_guard", "loop_nudge", "progress_intervention", "progress_gate"}:
+    # progress_intervention/progress_gate are historical: production emits the
+    # observation types now. Both are read so archived traces still render.
+    if event_type in {
+        "record_extraction",
+        "final_answer",
+        "loop_guard",
+        "loop_nudge",
+        "progress_observation",
+        "loop_observation",
+        "progress_intervention",
+        "progress_gate",
+    }:
         result = event.get("result") if isinstance(event.get("result"), dict) else {}
         collect_saved_paths(result, saved_paths)
         base["result"] = compact_result(result, max_text=max_text)

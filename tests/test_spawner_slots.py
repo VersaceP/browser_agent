@@ -884,6 +884,36 @@ class BrowserAgentSlotTests(unittest.TestCase):
             prompt,
         )
 
+    def test_lead_prompt_declares_identity_coverage_and_route_pivot(self) -> None:
+        from agent_harness import LeadAgent
+
+        agent = object.__new__(LeadAgent)
+        agent.strategy_bank = {}
+        agent.static_context_block = ""
+        prompt = agent._build_system_prompt()
+
+        self.assertIn('"type":"set_equals","field":"rank","values":[11,12', prompt)
+        self.assertIn("Count alone does not prove identity coverage", prompt)
+        self.assertIn("default to source-card traversal", prompt)
+        self.assertIn("Use direct Page.navigate(detailUrl) only", prompt)
+        self.assertIn(
+            "Do not put a route mode, recovery policy, or retry count in"
+            " content_completeness",
+            prompt,
+        )
+
+        from harness.tools.lead_tools import build_lead_agent_tool_specs
+
+        emit = next(
+            item for item in build_lead_agent_tool_specs()
+            if item["name"] == "emit_task_plan"
+        )
+        worker_task = emit["input_schema"]["properties"]["plan"][
+            "properties"
+        ]["phases"]["items"]["properties"]["worker_task"]
+        self.assertIn("source-card clicks the normal first", worker_task["description"])
+        self.assertIn("Direct URL navigation is a", worker_task["description"])
+
     def test_lead_prompt_prefers_live_batched_dom_get_img_in_page_phase(self) -> None:
         from agent_harness import LeadAgent
         from harness.tool_policy import filter_capability_methods_for_task_type
@@ -942,6 +972,12 @@ class BrowserAgentSlotTests(unittest.TestCase):
             "refresh DOM.getSemanticTree after each bounded container scroll",
             prompt,
         )
+        self.assertIn(
+            "details discovered on a live listing",
+            prompt,
+        )
+        self.assertIn("enter through a freshly rebound card", prompt)
+        self.assertIn("Use direct Page.navigate(detailUrl) only", prompt)
 
     def test_new_session_bootstraps_fresh_and_lost_binding_is_retained(self) -> None:
         coordinator = FleetCoordinator()

@@ -1,10 +1,11 @@
 """
-harness.observation.loop_nudge - Soft loop nudges based on action and page fingerprints.
+harness.observation.loop_nudge - Repetition facts from action and page fingerprints.
 
-This detector is deliberately advisory. It never blocks tool execution; it
-produces a small structured nudge that BrowserAgent can inject into the next
+This detector is deliberately an observer. It never blocks tool execution; it
+produces a small structured observation that BrowserAgent injects into the next
 model turn when the same action keeps repeating while the observed page
-fingerprint is not changing.
+fingerprint is not changing. It reports the repetition and the unchanged
+fingerprint; it does not prescribe what to do about them.
 """
 
 from __future__ import annotations
@@ -117,12 +118,13 @@ class ActionLoopNudge:
             "pageStalledFor": STAGNANT_PAGE_COUNT,
             "pageFingerprint": page.to_log_payload() if page else None,
             "tool_was_executed": True,
-            "next_instruction": (
-                "The same action pattern is repeating while the observed page"
-                " fingerprint is unchanged. If this was intentional polling,"
-                " state the fresh evidence you expect next. Otherwise pivot:"
-                " refresh DOM.getAXTree, target a different current AXTree id,"
-                " change extraction strategy, or finalize with the blocker."
+            "note": (
+                "Attributed observation, not a verdict: the same action pattern"
+                " repeated while the observed page fingerprint stayed"
+                " unchanged. Whether that means the page is genuinely static,"
+                " the action is not reaching it, or this is intentional"
+                " polling is a reading of the goal, not something these counts"
+                " settle. The call executed; its receipt is authoritative."
             ),
         }
 

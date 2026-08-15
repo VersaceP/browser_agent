@@ -57,9 +57,17 @@ provenance and counterevidence.
 - Artifact validation no longer calls a content-completeness veto.
 - Worker semantic classifications are no longer rewritten by completeness
   tracking; BrowserAgent final-answer dispatch no longer rejects on that
-  semantic decision. `unresolved_observation()` is retained only as a
-  test/diagnostic observation API; production has no caller. Model-facing paths
-  use the fact-only projection and never receive its action-oriented labels.
+  semantic decision. `unresolved_observation()` — the renamed `terminal_veto()`
+  — has been deleted along with `recovery_receipt()` and
+  `route_preference_for_page()`: production had no caller for any of them.
+  Model-facing paths use the fact-only projection and never receive
+  action-oriented labels.
+- A worker's `target_absent` / `instruction_infeasible` claim keeps the category
+  the worker declared. Where this run's receipts say something against it
+  (never scrolled, no exhaustion proof, cited artifacts absent from the ledger,
+  visual-check-only evidence), those facts ride along as
+  `classification.counterevidence`; the harness neither rewrites the category
+  nor prescribes the next move.
 - Model-facing tool results and handoffs strip tracker `decision`, route policy,
   and next-instruction labels. They retain only attributed observation facts.
 

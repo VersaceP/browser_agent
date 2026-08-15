@@ -187,10 +187,10 @@ def _content_completeness_schema() -> JsonDict:
     return {
         "type": "object",
         "description": (
-            "Optional route-sensitive content gate. It distinguishes a loaded"
-            " page shell from task-required detail regions and routes missing"
-            " content through a real listing-link click instead of"
-            " target_absent/HITL."
+            "Optional observation declaration for task-required regions. It"
+            " reports shell, marker, region, and suppression-signal facts to"
+            " the model; it does not choose a route, prove absence, or decide"
+            " completion."
         ),
         "properties": {
             "shell_markers": {"type": "array", "items": marker},
@@ -216,21 +216,6 @@ def _content_completeness_schema() -> JsonDict:
                     "required": ["name"],
                     "additionalProperties": True,
                 },
-            },
-            "recovery": {
-                "type": "object",
-                "properties": {
-                    "mode": {
-                        "type": "string",
-                        "enum": ["listing_link_click"],
-                    },
-                    "max_attempts_per_item": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 5,
-                    },
-                },
-                "additionalProperties": False,
             },
         },
         "required": ["expected_regions"],
@@ -278,8 +263,9 @@ def _validator_item_schema() -> JsonDict:
                 "type": "array",
                 "items": {},
                 "description": (
-                    "Exact allowed value set for set_equals; use this for"
-                    " non-contiguous targets such as ranks [38, 40]."
+                    "Exact required value set for set_equals; use it for any"
+                    " concrete identity cohort, including contiguous ranks"
+                    " 11-20 and non-contiguous ranks [38, 40]."
                 ),
             },
             "min_files": {
@@ -352,7 +338,9 @@ def _expected_artifact_schema() -> JsonDict:
         "description": (
             "Structured output contract. Declare name, fields and row-count"
             " constraints here; equivalent explicit validators are accepted"
-            " but normalized/deduplicated by the harness."
+            " but normalized/deduplicated by the harness. Row count alone does"
+            " not prove a named cohort: pair exact_rows with set_equals and"
+            " unique validators when the user specifies concrete identities."
         ),
         "properties": {
             "name": {"type": "string"},
@@ -403,8 +391,10 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                     "Plan object with a goal and phases array. Overall"
                     " task_type is optional and derived from phase types."
                     " Each phase needs id, type='browser_worker', task_type,"
-                    " objective, worker_task, stage_hint,"
-                    " expected_artifact and validators. max_attempts is an"
+                    " objective,"
+                    " expected_artifact. Validators are derived from that"
+                    " contract; explicit special validators are optional."
+                    " max_attempts is an"
                     " optional explicit resource budget."
                     " Every phase declares its OWN task_type — it is not"
                     " inherited from the plan, because that is what decides"
@@ -469,7 +459,20 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                     ),
                                 },
                                 "objective": {"type": "string"},
-                                "worker_task": {"type": "string"},
+                                "worker_task": {
+                                    "type": "string",
+                                    "description": (
+                                        "Stable phase goal and observable"
+                                        " obligations, not a single tactical"
+                                        " script. For listing-derived detail"
+                                        " work preserve the source page and"
+                                        " identity, and make freshly rebound"
+                                        " source-card clicks the normal first"
+                                        " route. Direct URL navigation is a"
+                                        " fallback when source traversal is"
+                                        " unavailable or cannot be verified."
+                                    ),
+                                },
                                 "stage_hint": {"type": "string"},
                                 "stage_hint_reason": {"type": "string"},
                                 "execution_role": {
@@ -659,8 +662,6 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                 "id",
                                 "task_type",
                                 "objective",
-                                "worker_task",
-                                "stage_hint",
                                 "expected_artifact",
                             ],
                             "additionalProperties": True,
@@ -764,7 +765,11 @@ def _spawn_browser_agent_schema(_: Any = None) -> JsonDict:
                 "description": (
                     "Optional previous workerId whose idle slot should be reused"
                     " for an explicit related continuation. Passing it allows"
-                    " reusable page candidates from that slot to be exposed."
+                    " reusable page candidates from that slot to be exposed only"
+                    " when reuse_scope=page and page_policy=existing; with"
+                    " page_policy=new it reuses slot/fleet context but not the"
+                    " previous page. For a detail cohort discovered on a live"
+                    " listing, point this to the source-list worker."
                 ),
             },
             "reuse_scope": {
@@ -803,7 +808,9 @@ def _spawn_browser_agent_schema(_: Any = None) -> JsonDict:
                 "enum": [*sorted(VALID_PAGE_POLICIES), None],
                 "description": (
                     "Use new for a fresh page in assignedFleetId. existing is"
-                    " valid only with reuse_scope=page."
+                    " valid only with reuse_scope=page. Use existing with the"
+                    " source-list worker when details should be entered by"
+                    " clicking freshly rebound source cards."
                 ),
             },
             "worker_contract": {
@@ -1052,6 +1059,7 @@ async def execute_lead_tool(agent: Any, tool_call: JsonDict) -> Tuple[JsonDict, 
         agent.logger.write("lead.tool.error", result)
         return result, False
 
+    agent._pending_loop_observations = []
     if action.loop_guard:
         short_circuit = check_tool_call_loop(
             agent,
@@ -1072,6 +1080,15 @@ async def execute_lead_tool(agent: Any, tool_call: JsonDict) -> Tuple[JsonDict, 
     )
     if normalized_fields and isinstance(result, dict):
         result["normalizedFields"] = normalized_fields
+    loop_observations = list(
+        getattr(agent, "_pending_loop_observations", None) or []
+    )
+    if loop_observations and isinstance(result, dict):
+        result["loopObservations"] = loop_observations
+        result["loopObservationNotice"] = (
+            "The requested tool was executed. These repetition facts are"
+            " evidence for your next ReAct decision, not a stop directive."
+        )
     # A terminal handler may soft-reject its call (tool_was_executed False) to
     # bounce it back to the model with guidance instead of terminating — the
     # same contract the worker dispatcher has always honoured. Without it a
@@ -1098,24 +1115,6 @@ async def execute_lead_tool(agent: Any, tool_call: JsonDict) -> Tuple[JsonDict, 
 async def _lead_emit_task_plan(ctx: ToolContext) -> JsonDict:
     raw_plan = ctx.tool_input.get("plan")
     review = await ctx.agent.review_task_plan_candidate(raw_plan)
-    if review.get("status") == "error":
-        result = {
-            "status": "failed",
-            "error": (
-                "independent PlanValidator was unavailable or violated its"
-                " response protocol"
-            ),
-            "planValidator": review,
-            "next_instruction": (
-                "This is not a semantic rejection of the candidate. Keep the"
-                " currently accepted plan unchanged. Do not resubmit the same"
-                " candidate against the same evidence snapshot; revise the"
-                " candidate, continue the accepted plan, or report the"
-                " validator infrastructure failure if no plan exists."
-            ),
-        }
-        ctx.agent.logger.write("task_plan.rejected", result)
-        return result
     if review.get("status") == "rejected":
         result = {
             "status": "failed",
@@ -1132,7 +1131,8 @@ async def _lead_emit_task_plan(ctx: ToolContext) -> JsonDict:
         raw_plan,
         plan_validator_review=(
             review
-            if review.get("status") in {"approved", "operational_continuation"}
+            if review.get("status")
+            in {"approved", "operational_continuation", "error"}
             else None
         ),
     )
@@ -2635,69 +2635,21 @@ def _verdict_histogram(claims: Any) -> JsonDict:
 
 
 def _numeric_reconciliation_rejection(report: JsonDict) -> Optional[JsonDict]:
-    """Turn a reconciliation report into a rejection that says what is wrong.
+    """Reject only an exact, mechanically bound ledger contradiction.
 
-    Three failures, three different things to do about them, so they are never
-    collapsed into one message: a number nobody accounted for, a quote that is
-    not in the answer, and a number that disagrees with the artifacts are not
-    the same problem and do not have the same fix.
+    Extractor, span and coverage failures remain visible in the final receipt,
+    but are observations about what the checker could not establish.  They are
+    not evidence that the model's statement is false.
     """
     status = str((report or {}).get("status") or "")
-    if status == "span_validation_failed":
-        return {
-            "status": "rejected",
-            "error": "numeric_claim_span_unverifiable",
-            # Send the answer back for repair; do not end the task on it.
-            "tool_was_executed": False,
-            "cause": "a quoted number is not in the answer verbatim",
-            "unverifiableClaims": report.get("unverifiableClaims"),
-            "next_instruction": (
-                "NOT a data problem: the checker quoted these numbers back and"
-                " they do not appear in your answer as written, so it could not"
-                " bind any of them and no number was checked. This happens when"
-                " a quantity is split by formatting (a table cell, a bolded"
-                " digit, a thousands separator). Re-issue final_answer with"
-                " each quantity written as plain digits next to the item it"
-                " describes."
-            ),
-        }
-    if status == "extractor_unusable":
-        # A checker protocol failure is evidence about the checker, not about
-        # the answer. Keep the zero-verification receipt visible on the final
-        # result, but do not force the Lead to rewrite the deliverable merely
-        # to accommodate an unavailable extractor.
+    if status in {
+        "span_validation_failed",
+        "extractor_unusable",
+        "coverage_failed",
+        "inconclusive",
+        "unavailable",
+    }:
         return None
-    if status == "coverage_failed":
-        # Not degraded to a pass. A gate that reports success for numbers it
-        # never checked is the shape that shipped three wrong counts in
-        # 857616aa; the answer waits until every number is accounted for.
-        uncovered = report.get("uncoveredSpans")
-        uncovered = uncovered if isinstance(uncovered, list) else []
-        return {
-            "status": "rejected",
-            "error": "numeric_claim_coverage_incomplete",
-            # Send the answer back for repair; do not end the task on it.
-            "tool_was_executed": False,
-            "cause": (
-                f"{len(uncovered)} number(s) in the answer were not accounted"
-                " for by the checker, so they were never verified"
-            ),
-            "uncoveredNumbers": uncovered[:20],
-            "uncoveredCount": len(uncovered),
-            "next_instruction": (
-                "NOT a data mismatch — nothing here says a number is wrong."
-                " Every number in a final answer has to be either checked"
-                " against the delivered artifacts or explicitly dismissed, and"
-                " these were neither. `context` shows each one in its own"
-                " sentence. Re-issue final_answer and, for each number listed:"
-                " state it plainly next to the item it counts (\"CodeDesign:"
-                " 18 reviews\") so it can be bound to an artifact field, or"
-                " remove it if it is decorative and not a result of this task."
-                " Numbers quoted from the pages you scraped (a site rating, a"
-                " price, a date) are fine to keep — just keep them next to the"
-                " thing they describe."
-            ),
-        }
     if status != "failed":
         return None
     return {

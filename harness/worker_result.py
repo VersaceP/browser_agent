@@ -219,8 +219,11 @@ def build_worker_handoff_projection(
         "originalGoal": str(original_goal or result.get("phaseObjective") or ""),
         "rawReceipts": {
             "status": l1.get("status") or result.get("status"),
-            "validatedStatus": l1.get("validatedStatus") or result.get("validatedStatus"),
-            "artifactValidationStatus": (
+            # A worker execution outcome and an artifact's schema result are
+            # separate facts.  Do not expose the coordinator's legacy
+            # ``validatedStatus`` label here: partial workers with shape-valid
+            # rows were repeatedly misread as completed objectives.
+            "artifactSchemaStatus": (
                 (levels.get("l3") or {}).get("artifactValidation", {}).get("status")
                 if isinstance(levels.get("l3"), dict)
                 and isinstance((levels.get("l3") or {}).get("artifactValidation"), dict)
@@ -237,6 +240,13 @@ def build_worker_handoff_projection(
             ][:10],
             "totalExtractedRows": data.get("totalExtractedRows"),
             "methods": trace_summary.get("methods", {}),
+            "advertisedMethodsNeverCalled": trace_summary.get(
+                "advertisedMethodsNeverCalled", []
+            ),
+            "progressObservations": trace_summary.get("progressObservations", []),
+            "progressObservationCount": trace_summary.get(
+                "progressObservationCount", 0
+            ),
             "latestPageStats": trace_summary.get("latestPageStats"),
             "contentCompletenessObservations": completeness_observations,
         },
@@ -465,23 +475,6 @@ def _worker_blockers(
             "type": "artifact_validation_failed",
             "message": str(artifact_validation.get("error") or artifact_validation)[:500],
         })
-    stall_replan = (
-        trace_summary.get("stallReplanRecommended")
-        if isinstance(trace_summary, dict)
-        and isinstance(trace_summary.get("stallReplanRecommended"), dict)
-        else None
-    )
-    if isinstance(stall_replan, dict) and status != "done":
-        blockers.append({
-            "type": "stall_replan_recommended",
-            "message": str(
-                stall_replan.get("next_instruction")
-                or "Repeated stall signals were observed inside one worker attempt."
-            )[:500],
-            "signalCount": stall_replan.get("signalCount"),
-            "progressInterventionCount": stall_replan.get("progressInterventionCount"),
-            "loopNudgeCount": stall_replan.get("loopNudgeCount"),
-        })
     if status not in {"done", "partial"}:
         blockers.append({
             "type": "terminal_status",
@@ -499,13 +492,14 @@ def _semantic_trace_summary(trace_summary: JsonDict) -> JsonDict:
         "traceEvents": trace_summary.get("traceEvents"),
         "toolCalls": trace_summary.get("toolCalls"),
         "methods": trace_summary.get("methods", {}),
+        "advertisedMethodsNeverCalled": trace_summary.get(
+            "advertisedMethodsNeverCalled", []
+        ),
         "pageIds": trace_summary.get("pageIds", []),
         "errors": trace_summary.get("errors", []),
-        "progressInterventionCount": trace_summary.get("progressInterventionCount", 0),
         "progressObservations": trace_summary.get("progressObservations", []),
         "progressObservationCount": trace_summary.get("progressObservationCount", 0),
         "loopNudgeCount": trace_summary.get("loopNudgeCount", 0),
-        "stallReplanRecommended": trace_summary.get("stallReplanRecommended"),
         "latestPageStats": trace_summary.get("latestPageStats"),
         "snapshotDiffs": trace_summary.get("snapshotDiffs", []),
         "snapshotDiffCount": trace_summary.get("snapshotDiffCount", 0),

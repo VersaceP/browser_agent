@@ -166,6 +166,7 @@ config 装载会提前告警。其余角色各有自己的段（都带 `provider
   },
 
   "vl": {
+    "max_encoded_image_bytes": 20971520,
     "extra_params": { "thinking": { "type": "enabled" } },
     "captcha_solve_extra_params": { "max_tokens": 2500 }
   },
@@ -177,6 +178,9 @@ config 装载会提前告警。其余角色各有自己的段（都带 `provider
 `{"type": "enabled"}` 这种 dict 写法在两种 wire 格式上都实测可用（方舟 `/api/coding`、
 DashScope compatible-mode），且不会像 `true` 那样在 Anthropic 路上额外合成 `budget_tokens`——
 需要 Claude 扩展思考时再显式写 `budget_tokens`。
+`vl.max_encoded_image_bytes` 是端点接受的单张 data-URI 上限；普通视觉核验不会继承
+全局 `vl.extra_params` 中的 thinking，验证码求解仍会继承并可由
+`captcha_solve_extra_params` 覆盖。
 
 ### 浏览器
 

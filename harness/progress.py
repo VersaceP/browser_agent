@@ -146,14 +146,14 @@ class ProgressAccountant:
     tool_calls: int = 0
     extraction_artifact_count: int = 0
     distinct_tools: Dict[str, int] = field(default_factory=dict)
-    interventions: List[JsonDict] = field(default_factory=list)
+    observations: List[JsonDict] = field(default_factory=list)
     last_local_result_signature: Optional[str] = None
-    pending_intervention: Optional[JsonDict] = None
+    pending_observation: Optional[JsonDict] = None
     infra_error_streak: int = 0
     last_infra_error: Optional[JsonDict] = None
     infra_diagnostic_bypass_count: int = 0
-    last_blocked_reason: Optional[str] = None
-    last_blocked_step: Optional[int] = None
+    last_observation_reason: Optional[str] = None
+    last_observation_step: Optional[int] = None
     repair_progress_signatures: Set[str] = field(default_factory=set)
     navigation_epochs: Dict[str, int] = field(default_factory=dict)
     heavy_diagnostic_counts: Dict[str, int] = field(default_factory=dict)
@@ -195,35 +195,29 @@ class ProgressAccountant:
             return "__worker__"
         return page_id or "__global__"
 
-    def _emit_intervention(
-        self, intervention: JsonDict, step: Optional[int] = None,
+    def _record_observation(
+        self, observation: JsonDict, step: Optional[int] = None,
     ) -> JsonDict:
-        """Record + return an intervention, deduplicating within one parallel
-        batch: a SAME-STEP consecutive block with the same reason (two parallel
-        calls in one step each hitting the same gate) keeps the accounting but
-        collapses the repeated instruction text — task 9d5655d3 step 29
-        injected the same directive twice. Cross-step blocks are never
-        deduplicated (each model turn deserves the full instruction), and a
-        caller that does not pass step opts out entirely."""
-        reason = str(intervention.get("reason") or "")
+        """Record + return one arithmetic observation.
+
+        Two parallel calls in the same step can produce the same reason twice;
+        that repetition is itself a fact, so it is flagged rather than dropped.
+        A caller that does not pass step opts out of the flag entirely.
+        """
+        reason = str(observation.get("reasonObserved") or "")
         if (
             reason
-            and reason == self.last_blocked_reason
+            and reason == self.last_observation_reason
             and step is not None
-            and step == self.last_blocked_step
+            and step == self.last_observation_step
         ):
-            intervention["duplicate_of_previous"] = True
-            intervention["next_instruction"] = (
-                "Duplicate of the previous intervention in this same step"
-                " (parallel tool call blocked by the same rule); follow that"
-                " instruction."
-            )
-        self.last_blocked_reason = reason
-        self.last_blocked_step = step
-        self.interventions.append(intervention)
-        return intervention
+            observation["duplicateOfPrevious"] = True
+        self.last_observation_reason = reason
+        self.last_observation_step = step
+        self.observations.append(observation)
+        return observation
 
-    def before_tool(
+    def observe_before(
         self,
         *,
         tool_name: str,
@@ -255,26 +249,16 @@ class ProgressAccountant:
             used = self.heavy_diagnostic_counts.get(key, 0)
             limit = HEAVY_DIAGNOSTIC_LIMITS[tool_name]
             if used >= limit:
-                intervention = {
-                    "status": "progress_intervention",
-                    "reason": "diagnostic_budget_exhausted",
+                return self._record_observation({
+                    "source": "progress_accountant",
+                    "reasonObserved": "diagnostic_budget_exhausted",
                     "tool": tool_name,
                     "pageId": str(page_id or "") or None,
                     "diagnosticScope": scope,
                     "navigationEpoch": self.navigation_epochs.get(scope, 0),
                     "diagnosticUses": used,
                     "diagnosticLimit": limit,
-                    "tool_was_executed": False,
-                    "next_instruction": (
-                        "The bounded diagnostic budget for this navigation"
-                        " epoch is exhausted. Use the evidence already"
-                        " collected, perform a justified materialization or"
-                        " navigation recovery, persist verified rows, or"
-                        " finalize with the blocker; do not repeat the same"
-                        " diagnostic surface."
-                    ),
-                }
-                return self._emit_intervention(intervention, step)
+                }, step)
             used += 1
             self.heavy_diagnostic_counts[key] = used
             self.last_diagnostic_allowance = {
@@ -311,21 +295,13 @@ class ProgressAccountant:
                     "turnsSinceArtifactProgress": self.turns_since_artifact_progress,
                 }
                 return None
-            intervention = {
-                "status": "progress_intervention",
-                "reason": "productive_primitives_without_artifact",
+            return self._record_observation({
+                "source": "progress_accountant",
+                "reasonObserved": "productive_primitives_without_artifact",
                 "tool": tool_name,
                 "turnsSinceArtifactProgress": self.turns_since_artifact_progress,
                 "toolCalls": self.tool_calls,
-                "tool_was_executed": False,
-                "next_instruction": (
-                    "This worker has spent many productive browser steps without"
-                    " producing record_extraction. Persist verified rows now,"
-                    " narrow the target using params derived from the latest"
-                    " DOM/response feedback, or finalize with the blocker."
-                ),
-            }
-            return self._emit_intervention(intervention, step)
+            }, step)
         if (
             requires_artifact
             and artifact_count == 0
@@ -340,22 +316,13 @@ class ProgressAccountant:
             and tool_name not in ARTIFACT_PROGRESS_TOOLS
             and self.turns_since_artifact_progress >= no_artifact_limit
         ):
-            intervention = {
-                "status": "progress_intervention",
-                "reason": "no_artifact_progress",
+            return self._record_observation({
+                "source": "progress_accountant",
+                "reasonObserved": "no_artifact_progress",
                 "tool": tool_name,
                 "turnsSinceArtifactProgress": self.turns_since_artifact_progress,
                 "toolCalls": self.tool_calls,
-                "tool_was_executed": False,
-                "next_instruction": (
-                    "This worker has not produced any record_extraction artifact"
-                    " after several tool calls. Stop repeating the current surface:"
-                    " call record_extraction with verified rows, pivot with fresh"
-                    " params from DOM.getAXTree/DOM.getText/DOM.getAttribute,"
-                    " or finalize with the blocker."
-                ),
-            }
-            return self._emit_intervention(intervention, step)
+            }, step)
         if tool_name in LOCAL_FS_TOOLS and own_artifact_read:
             # Reading an artifact THIS RUN persisted (e.g. analyzing why its
             # own save came back needs_fix) is ledger analysis, not offload
@@ -364,51 +331,32 @@ class ProgressAccountant:
             # attempt paths, so the "trust the ledger" guard semantics from
             # the 07-08 deadlock fixes stay intact for everything else.
             return None
-        if tool_name in LOCAL_FS_TOOLS and self.pending_intervention:
-            intervention = dict(self.pending_intervention)
-            intervention["tool_was_executed"] = False
-            self.pending_intervention = None
-            return self._emit_intervention(intervention, step)
+        if tool_name in LOCAL_FS_TOOLS and self.pending_observation:
+            observation = dict(self.pending_observation)
+            self.pending_observation = None
+            return self._record_observation(observation, step)
         if (
             tool_name in LOCAL_FS_TOOLS
             and artifact_count == 0
             and self.local_fs_without_extraction >= local_fs_limit
         ):
-            intervention = {
-                "status": "progress_intervention",
-                "reason": "local_fs_without_extraction",
+            return self._record_observation({
+                "source": "progress_accountant",
+                "reasonObserved": "local_fs_without_extraction",
                 "tool": tool_name,
                 "localFsWithoutExtraction": self.local_fs_without_extraction,
-                "tool_was_executed": False,
-                "next_instruction": (
-                    "Local file searches have not produced any record_extraction"
-                    " artifact. Return to browser extraction: call DOM.getAXTree"
-                    " for a fresh snapshot (this re-enables local file reads),"
-                    " call record_extraction with verified rows, or finalize with"
-                    " a blocker. Do not reuse stale AXTree ids or selectors from"
-                    " old offload files."
-                ),
-            }
-            return self._emit_intervention(intervention, step)
+            }, step)
         if (
             tool_name in LOCAL_FS_TOOLS
             and artifact_count == 0
             and self.local_fs_streak >= local_fs_limit
         ):
-            intervention = {
-                "status": "progress_intervention",
-                "reason": "local_fs_without_browser_action",
+            return self._record_observation({
+                "source": "progress_accountant",
+                "reasonObserved": "local_fs_without_browser_action",
                 "tool": tool_name,
                 "localFsStreak": self.local_fs_streak,
-                "tool_was_executed": False,
-                "next_instruction": (
-                    "This worker has only searched/read local files recently."
-                    " Use browser primitives such as DOM.getAXTree,"
-                    " DOM.getText/DOM.getAttribute, Input.*, or"
-                    " finalize with a blocker."
-                ),
-            }
-            return self._emit_intervention(intervention, step)
+            }, step)
         return None
 
     def after_tool(
@@ -420,10 +368,10 @@ class ProgressAccountant:
         own_artifact_read: bool = False,
     ) -> None:
         self.tool_calls += 1
-        # An executed tool separates intervention batches: the next block is a
-        # fresh intervention, not a duplicate of the previous one.
-        self.last_blocked_reason = None
-        self.last_blocked_step = None
+        # An executed tool separates observation batches: the next one is a
+        # fresh observation, not a duplicate of the previous.
+        self.last_observation_reason = None
+        self.last_observation_step = None
         self.distinct_tools[tool_name] = self.distinct_tools.get(tool_name, 0) + 1
         infra_error = _infra_error_summary(result)
         if infra_error:
@@ -447,7 +395,7 @@ class ProgressAccountant:
             self.local_fs_without_extraction = 0
             self.local_fs_streak = 0
             self.repeated_local_result_count = 0
-            self.pending_intervention = None
+            self.pending_observation = None
             self.history_navigation_credits_used = 0
             return
         self.turns_since_artifact_progress += 1
@@ -460,7 +408,7 @@ class ProgressAccountant:
             self.local_fs_without_extraction = 0
             self.repeated_local_result_count = 0
             self.last_local_result_signature = None
-            self.pending_intervention = None
+            self.pending_observation = None
         if tool_name in LOCAL_FS_TOOLS and own_artifact_read:
             # Neutral: reading this run's own persisted artifacts neither
             # feeds nor resets the offload-spinning counters.
@@ -475,18 +423,12 @@ class ProgressAccountant:
                 self.repeated_local_result_count = 1 if signature else 0
             self.last_local_result_signature = signature
             if self.repeated_local_result_count >= 2 and signature:
-                self.pending_intervention = {
-                    "status": "progress_intervention",
-                    "reason": "repeated_local_search_result",
+                self.pending_observation = {
+                    "source": "progress_accountant",
+                    "reasonObserved": "repeated_local_search_result",
                     "tool": tool_name,
                     "repeatedLocalResultCount": self.repeated_local_result_count,
                     "resultSignature": signature[:500],
-                    "next_instruction": (
-                        "The last local search/read returned the same file/line"
-                        " evidence again. Do not keep searching the same offload;"
-                        " pivot to DOM/Page/Input browser action with fresh params"
-                        " from the current page, or finalize."
-                    ),
                 }
             return
 
@@ -524,19 +466,18 @@ class ProgressAccountant:
                 "turnsSinceArtifactProgress": self.turns_since_artifact_progress,
                 "toolCalls": self.tool_calls,
                 "creditApplied": False,
-                "next_instruction": (
-                    "Page.go changed the document, but this worker has exhausted"
-                    " its bounded history-navigation progress credits without"
-                    " producing a new extraction artifact. Persist verified"
-                    " rows or real repair progress before relying on another"
-                    " history return to refresh progress/diagnostic budgets."
+                "note": (
+                    "Page.go changed the document, but this worker's bounded"
+                    " history-navigation progress credits are spent and no new"
+                    " extraction artifact has been produced, so this return did"
+                    " not refresh the progress/diagnostic budgets."
                 ),
             }
         if history_navigation:
             self.history_navigation_credits_used += 1
         self.turns_since_artifact_progress = 0
         self.local_fs_streak = 0
-        self.pending_intervention = None
+        self.pending_observation = None
         scope = str(page_id or "") or "__global__"
         self.navigation_epochs[scope] = self.navigation_epochs.get(scope, 0) + 1
         prefix = f"{scope}:"
@@ -612,7 +553,7 @@ class ProgressAccountant:
             self.local_fs_without_extraction = 0
             self.local_fs_streak = 0
             self.repeated_local_result_count = 0
-            self.pending_intervention = None
+            self.pending_observation = None
             self.history_navigation_credits_used = 0
         return {
             "status": "repair_progress" if new_items else "repair_progress_duplicate",
@@ -639,7 +580,7 @@ class ProgressAccountant:
             "historyNavigationCreditLimit": self.history_navigation_credit_limit,
             "repairProgressFieldCount": len(self.repair_progress_signatures),
             "distinctTools": dict(sorted(self.distinct_tools.items())),
-            "interventionCount": len(self.interventions),
+            "observationCount": len(self.observations),
         }
 
 
@@ -730,6 +671,6 @@ def _tool_result_success(result: Optional[JsonDict]) -> bool:
     status = str(result.get("status") or "").strip().lower()
     if status in {"done", "ok", "success", "navigation_success"}:
         return True
-    if status in {"error", "failed", "rejected", "needs_fix", "progress_intervention"}:
+    if status in {"error", "failed", "rejected", "needs_fix"}:
         return False
     return not _infra_error_summary(result)

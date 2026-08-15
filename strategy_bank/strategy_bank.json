@@ -9,7 +9,6 @@
       "stage": "collection",
       "applies_to_stages": ["collection"],
       "fallback": false,
-      "phase_keywords": ["collection", "list", "table", "grid", "card", "row", "item", "repeated"],
       "applies_when": [
         "A page exposes repeated items such as a list, table, grid, or card collection.",
         "Target fields are visible text or attributes within each repeated item.",
@@ -51,7 +50,6 @@
       "stage": "attribute_links",
       "applies_to_stages": ["attribute_links", "collection"],
       "fallback": false,
-      "phase_keywords": ["href", "src", "link", "url", "attribute", "data-", "aria", "id"],
       "applies_when": [
         "The target output is mainly non-text attributes such as href, src, id, aria-*, data-*, or value.",
         "The visible label and attribute source should be tied back to the same semantic item or control."
@@ -86,72 +84,12 @@
       ]
     },
     {
-      "id": "web_scrape.detail_sections.reveal_then_text",
-      "description": "Reveal named detail regions and verify the changed DOM before reading their text.",
-      "task_types": ["web_scrape"],
-      "stage": "detail_sections",
-      "applies_to_stages": ["detail_sections"],
-      "fallback": false,
-      "phase_keywords": ["detail", "section", "heading", "tab", "accordion", "expand", "show more", "anchor", "body", "suppressed", "shell", "listing", "card"],
-      "applies_when": [
-        "A page contains named sections or detail regions whose bodies may need reveal actions.",
-        "Reveal mechanisms may include tabs, accordions, show-more buttons, anchor links, or scroll-triggered lazy loading.",
-        "The target output is section text, section structure, or section availability."
-      ],
-      "preferred_tools": [
-        "Page.getState",
-        "DOM.getAXTree",
-        "DOM.getSemanticTree",
-        "Input.click",
-        "Input.scroll",
-        "Page.list",
-        "Page.switchTo",
-        "Page.go",
-        "DOM.getText",
-        "DOM.getAttribute",
-        "record_extraction"
-      ],
-      "cautioned_tools": ["visual_verify"],
-      "discouraged_tools": ["Runtime.evaluate"],
-      "procedure": [
-        "Use DOM.getAXTree to locate headings, controls, tab labels, accordion buttons, show-more controls, anchor links, and section bodies.",
-        "Reveal hidden or lazy content through Input.click or Input.scroll only when the AXTree shows an appropriate control or target.",
-        "Refresh DOM.getAXTree after each reveal action and verify the intended state or subtree changed.",
-        "Use DOM.getSemanticTree when required section text is absent from AXTree but present in the semantic DOM; use DOM.getText for focused final text and DOM.getAttribute for ids, real hrefs, or state attributes.",
-        "If the page shell exists but multiple expected sections remain missing, treat content completeness as unresolved rather than recording empty values or target_absent.",
-        "When a search/listing source exists, save sourcePageId/sourceUrl and stable item identity, take a Page.list inventory snapshot, then click one freshly rebound real anchor and inspect Page.list plus Page.getState before the next action; classify NEW_TAB, SAME_TAB, IN_PAGE, or NO_EFFECT from returned page and DOM feedback.",
-        "When a tool result includes routeRecovery, follow its structured return method and requiredActions. Honor routePreference only inside its task-local source-template/cohort scope and discard it after challenge/auth change, selector drift, NO_EFFECT, or missing required-region markers.",
-        "For a new-tab detail, return with Page.switchTo(sourcePageId); for a same-tab detail, return with Page.go back one history entry and then refresh Page.getState plus DOM.getAXTree. Use Page.navigate(sourceUrl) only as fallback.",
-        "If listing-link recovery remains available, report route_sensitive_content_suppression; after its bounded attempts are exhausted, report blocked_content_suppression instead of target_absent.",
-        "For a uniform repeated collection, enumerate item/field canonical ids and batch DOM.getText/DOM.getAttribute. If records require scrolling or load-more materialization, repeat the same native AXTree + batch-read cycle after one bounded materialization action and deduplicate locally; do not use page JavaScript or local_fs as live state."
-      ],
-      "success_criteria": [
-        "section presence or absence is explicit",
-        "final text or records come from the selected structured DOM tool with cited page evidence",
-        "reveal actions are verified before extraction",
-        "navigation-click outcomes are classified from Page/DOM feedback",
-        "listing state is restored with switchTo or history back before the next item",
-        "explicit repeated-record targets meet their requested count inside the target subtree",
-        "row keys match expected_artifact"
-      ],
-      "failure_signatures": [
-        "text is only a form prompt or placeholder",
-        "click did not change target state or subtree",
-        "visible selector points to a container unrelated to the target section",
-        "section body was summarized without DOM text evidence",
-        "page shell success was mistaken for content completeness",
-        "a drawer shell or loading skeleton was mistaken for materialized records",
-        "a same-tab detail returned by direct navigation instead of history without a recorded fallback reason"
-      ]
-    },
-    {
       "id": "web_scrape.computed_relationship.eval_js",
       "description": "Use isolated JavaScript only for computed relationships native DOM reads cannot express.",
       "task_types": ["web_scrape"],
       "stage": "computed_relationship",
       "applies_to_stages": ["computed_relationship"],
       "fallback": false,
-      "phase_keywords": ["computed", "geometry", "coordinate", "relationship", "shadow", "iframe", "frame", "state", "javascript"],
       "applies_when": [
         "Native DOM.getAXTree, DOM.getText, and DOM.getAttribute cannot express a required computed relationship.",
         "The required relation involves geometry, cross-node aggregation, shadow DOM, cross-frame content, or non-DOM browser state.",
@@ -193,7 +131,6 @@
       "stage": "form_interaction",
       "applies_to_stages": ["form_interaction"],
       "fallback": false,
-      "phase_keywords": ["form", "field", "input", "select", "checkbox", "submit", "save", "login"],
       "applies_when": [
         "The task requires interacting with controls, entering values, submitting a form, or verifying an action result.",
         "Controls can be found through labels, roles, names, or accessible state."
@@ -245,17 +182,6 @@
       ],
       "fallback": true,
       "cross_cutting": true,
-      "phase_keywords": [
-        "occluded",
-        "overlay",
-        "modal",
-        "dialog",
-        "blocked",
-        "sign in",
-        "popup",
-        "banner",
-        "backdrop"
-      ],
       "applies_when": [
         "Input.click reports that the target element is occluded or mouse action is blocked.",
         "DOM.getText or DOM.getAttribute returns a visibility, viewport, or occlusion warning.",
@@ -296,15 +222,6 @@
       ],
       "fallback": true,
       "cross_cutting": true,
-      "phase_keywords": [
-        "login wall",
-        "auth",
-        "sign in to continue",
-        "sign in with google",
-        "account",
-        "session",
-        "fleet"
-      ],
       "applies_when": [
         "A login or account prompt blocks the task and the dismiss ladder cannot clear it.",
         "The user may have an existing authenticated fleet/session for the same origin.",
@@ -354,7 +271,6 @@
       ],
       "fallback": true,
       "cross_cutting": true,
-      "phase_keywords": ["hitl", "captcha", "challenge", "login", "approval", "manual"],
       "applies_when": [
         "A page may require human login, CAPTCHA, approval, payment confirmation, or manual review.",
         "The worker is considering Hitl.requestPause or has just resumed from HITL."

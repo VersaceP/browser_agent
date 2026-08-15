@@ -149,10 +149,10 @@ class ConsoleProgressReporter:
                 f"（{reason}）；将按普通分配从 phase 开头重跑，"
                 "如需登录将重新获取。"
             )
-        if event_type == "progress.intervention":
+        if event_type == "progress.observed":
             return (
-                f"[Progress] 干预 {payload.get('tool') or '?'}: "
-                f"{payload.get('reason') or 'no progress'}"
+                f"[Progress] 观察 {payload.get('tool') or '?'}: "
+                f"{payload.get('reasonObserved') or 'no progress'}"
             )
         if event_type == "lead.step_cap.reminder":
             return (

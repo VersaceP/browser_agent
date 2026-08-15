@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Tuple
 
 from runtime_config import HarnessConfig
 from harness.lifecycle import LifecycleContext, LifecycleManager
+from harness.offload import store_offloaded
 from harness.utils import (
     JsonDict,
     RunLogger,
@@ -607,9 +608,8 @@ def compact_messages_if_needed(
         "strategy": strategy,
         "middleGroups": middle_groups,
     }
-    path.write_text(
-        json.dumps(saved_payload, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
+    store_offloaded(
+        logger, path, resource_type="context_compaction", content=saved_payload
     )
 
     compacted_message = None

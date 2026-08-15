@@ -778,13 +778,20 @@ def reconcile_numeric_claims(
     resolved = [resolve_numeric_claim(claim, index) for claim in asserted]
     contradicted = [item for item in resolved if item["verdict"] == "contradicted"]
     conflicts = [item for item in resolved if item["verdict"] == "data_conflict"]
+    unresolved = [item for item in resolved if item["verdict"] == "unresolved"]
     return {
         "status": (
-            "failed" if (contradicted or conflicts) else "passed"
+            "failed" if (contradicted or conflicts)
+            else "inconclusive" if unresolved
+            else "passed"
         ),
         "claims": resolved,
         "contradicted": contradicted,
         "dataConflicts": conflicts,
+        "unresolved": unresolved,
+        "verifiedClaimCount": sum(
+            1 for item in resolved if item["verdict"] == "verified"
+        ),
         "checked": len(resolved),
         "dismissed": dismissed,
     }

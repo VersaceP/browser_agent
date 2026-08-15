@@ -188,6 +188,7 @@ up front. Every other role owns a full section (`provider` / `model_id` /
   },
 
   "vl": {
+    "max_encoded_image_bytes": 20971520,
     "extra_params": { "thinking": { "type": "enabled" } },
     "captcha_solve_extra_params": { "max_tokens": 2500 }
   },
@@ -200,6 +201,10 @@ The `{"type": "enabled"}` dict form is measured working on both wire formats
 (Ark `/api/coding` and DashScope compatible-mode) and, unlike `true`, does not
 synthesise a `budget_tokens` on the Anthropic path — write `budget_tokens`
 explicitly when you want Claude extended thinking.
+`vl.max_encoded_image_bytes` is the endpoint's per-image data-URI limit.
+Ordinary visual verification does not inherit thinking from global
+`vl.extra_params`; CAPTCHA solving still inherits it and may override it via
+`captcha_solve_extra_params`.
 
 ### Browser
 

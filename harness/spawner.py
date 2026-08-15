@@ -5302,6 +5302,18 @@ class BrowserAgentSpawner:
                 trace_summary["contentCompletenessPages"] = (
                     completeness_tracker.summaries()
                 )
+            # "The worker never did X" and "this phase cannot do X" are
+            # different facts, and only one of them is in the trace. In task
+            # a608b5e7 a worker spent its whole budget on comments without
+            # calling DOM.getImg once; the Lead read the absence as a
+            # capability limit and replanned the image work into a
+            # file_download phase, away from the page that had the images.
+            advertised = getattr(harness, "capability_methods", None)
+            if isinstance(advertised, (set, frozenset)):
+                called = set(trace_summary.get("methods") or {})
+                trace_summary["advertisedMethodsNeverCalled"] = sorted(
+                    str(method) for method in advertised if method not in called
+                )
             offloaded_files = trace_summary.pop("offloadedFiles", [])
             progress = getattr(harness, "progress", None)
             progress_snapshot = (
@@ -5320,6 +5332,7 @@ class BrowserAgentSpawner:
                 ),
                 file_evidence=getattr(harness, "file_action_evidence", []),
                 task_dir=self.logger.task_dir,
+                logger=self.logger,
             )
             unresolved_visual = _unresolved_repair_visual_evidence(harness)
             if unresolved_visual:
@@ -5355,18 +5368,21 @@ class BrowserAgentSpawner:
                 )
                 if feedback_classification is not None:
                     artifact_validation["classification"] = feedback_classification
-                    if feedback_classification.get("evidenceGate"):
-                        self.logger.write("semantic_terminal.evidence_gate", {
-                            "workerId": worker_id,
-                            "phaseId": phase_id,
-                            "claimedCategory": feedback_classification.get(
-                                "claimedCategory"
-                            ),
-                            "category": feedback_classification.get("category"),
-                            "evidenceGate": feedback_classification.get(
-                                "evidenceGate"
-                            ),
-                        })
+                    counterevidence = feedback_classification.get(
+                        "counterevidence"
+                    )
+                    if isinstance(counterevidence, dict):
+                        self.logger.write(
+                            "semantic_terminal.counterevidence",
+                            {
+                                "workerId": worker_id,
+                                "phaseId": phase_id,
+                                "category": feedback_classification.get(
+                                    "category"
+                                ),
+                                **counterevidence,
+                            },
+                        )
             # Completeness observations remain model-visible evidence, but do
             # not override the artifact contract mechanically.
             contract_validation = json.loads(json.dumps(artifact_validation))
@@ -5484,8 +5500,8 @@ class BrowserAgentSpawner:
                 "tracePath": trace_path,
                 "traceSummary": trace_summary,
                 "progressSnapshot": progress_snapshot,
-                "progressInterventionCount": progress_snapshot.get(
-                    "interventionCount",
+                "progressObservationCount": progress_snapshot.get(
+                    "observationCount",
                     0,
                 ),
                 "offloadedFiles": offloaded_files,
@@ -5860,14 +5876,6 @@ class BrowserAgentSpawner:
                 error = get_path(item, "result.error")
                 if error:
                     errors.append(str(error)[:500])
-            elif item.get("type") in {"progress_intervention", "progress_gate"}:
-                result = item.get("result")
-                if isinstance(result, dict):
-                    progress_interventions.append({
-                        "type": item.get("type"),
-                        "reason": str(result.get("reason") or "")[:120],
-                        "tool": str(result.get("tool") or result.get("method") or "")[:120],
-                    })
             elif item.get("type") == "progress_observation":
                 result = item.get("result")
                 if isinstance(result, dict):
@@ -5928,24 +5936,7 @@ class BrowserAgentSpawner:
                         "semanticChanged": bool(result.get("semanticChanged")),
                         "physicalChanged": bool(result.get("physicalChanged")),
                     })
-        progress_intervention_count = len(progress_interventions)
         loop_nudge_count = len(loop_nudges)
-        stall_signal_count = progress_intervention_count + loop_nudge_count
-        stall_replan = None
-        if stall_signal_count >= 2:
-            stall_replan = {
-                "type": "stall_replan_recommended",
-                "signalCount": stall_signal_count,
-                "progressInterventionCount": progress_intervention_count,
-                "loopNudgeCount": loop_nudge_count,
-                "recentProgressInterventions": progress_interventions[-3:],
-                "recentLoopNudges": loop_nudges[-3:],
-                "next_instruction": (
-                    "This worker emitted repeated stall signals inside one"
-                    " attempt. If the phase is retried, revise the approach"
-                    " instead of spawning another worker with the same path."
-                ),
-            }
         summary = {
             "steps": max_step,
             "traceEvents": len(trace),
@@ -5953,8 +5944,6 @@ class BrowserAgentSpawner:
             "methods": method_counts,
             "pageIds": sorted(page_ids),
             "errors": errors[:10],
-            "progressInterventions": progress_interventions[-5:],
-            "progressInterventionCount": progress_intervention_count,
             "progressObservations": progress_observations[-5:],
             "progressObservationCount": len(progress_observations),
             "loopNudges": loop_nudges[-5:],
@@ -5965,8 +5954,6 @@ class BrowserAgentSpawner:
             "snapshotDiffCount": len(snapshot_diffs),
             "offloadedFiles": sorted(set(offloaded))[:100],
         }
-        if stall_replan is not None:
-            summary["stallReplanRecommended"] = stall_replan
         return summary
 
     def _select_handles(self, worker_ids: Optional[List[str]]) -> List[BrowserAgentHandle]:
@@ -6211,7 +6198,7 @@ def _classification_from_browser_call(
             "method": result.get("method") or "Page.create",
             "hint": (
                 "Page.create failed with -32005 and no usable existing page was"
-                " found; reconnect or rebuild the Browser Client before retrying."
+                " found."
             ),
             "source": "browser_call.errorClassification",
         }
@@ -6466,15 +6453,27 @@ def _page_traversal_evidence(trace: Optional[List[JsonDict]]) -> JsonDict:
     }
 
 
-def _semantic_terminal_evidence_failure(
+def _semantic_terminal_counterevidence(
     category: str,
     blocker: JsonDict,
     classification: JsonDict,
     persisted_artifacts: Optional[List[str]],
     traversal: Optional[JsonDict] = None,
-) -> Optional[str]:
-    """Return None when the semantic-terminal claim may go terminal, else a
-    short human-readable reason why it must be downgraded to retryable."""
+) -> Optional[JsonDict]:
+    """Return what our own receipts say against a semantic-terminal claim.
+
+    The worker's category is its own to declare and is never rewritten here:
+    whether the evidence suffices to prove absence is a semantic reading, and
+    the model that gathered the evidence is the one to make it. What this
+    returns is the other half of the record. A `target_absent` report can be
+    perfectly self-consistent and still be wrong — the upstream batch says
+    `[]`, the worker enumerates what it can see, a screenshot agrees, and the
+    viewport never moved, so every observation describes the same screenful.
+    Nothing in the report is false, so no reader can catch it from the report
+    alone; only our ledger holds the missing fact.
+
+    Returns None when the ledger has nothing to add.
+    """
     reason_text = str(
         blocker.get("reason")
         or classification.get("reason")
@@ -6482,8 +6481,17 @@ def _semantic_terminal_evidence_failure(
         or blocker.get("detail")
         or ""
     ).strip()
+    facts: JsonDict = {
+        "observation": "semantic_terminal_counterevidence",
+        "claimedCategory": category,
+        "reasonTextLength": len(reason_text),
+        "note": (
+            "Attributed facts from this run's own receipts, not a verdict on"
+            " the claim."
+        ),
+    }
     if not reason_text:
-        return "blocker carries no reason text"
+        return {**facts, "findings": ["blocker carries no reason text"]}
     if (
         category == "target_absent"
         and isinstance(traversal, dict)
@@ -6495,20 +6503,23 @@ def _semantic_terminal_evidence_failure(
             ignored_scrolls = int(traversal.get("scrollsWithoutEffect") or 0)
         except (TypeError, ValueError):
             ignored_scrolls = 0
-        if ignored_scrolls:
-            # Distinguishable only with a scroll receipt, and worth saying out
-            # loud: repeating the same scroll is exactly the wrong next move.
-            return (
-                f"{ignored_scrolls} scroll(s) were dispatched but the page did"
-                " not move, and no collection was enumerated to exhaustion, so"
-                " every observation behind this claim describes the same"
-                " screenful"
+        finding = (
+            f"{ignored_scrolls} scroll(s) were dispatched and the page did not"
+            " move; no collection was enumerated to exhaustion"
+            if ignored_scrolls
+            # Distinguishable from the above only with a scroll receipt, and
+            # the difference matters: one says the page refused, the other
+            # says we never asked.
+            else (
+                "the page was never scrolled and no collection was enumerated"
+                " to exhaustion"
             )
-        return (
-            "the page was never scrolled and no collection was enumerated to"
-            " exhaustion, so every observation behind this claim describes the"
-            " same screenful"
         )
+        return {
+            **facts,
+            "findings": [finding],
+            "pageTraversal": dict(traversal),
+        }
     evidence_paths = _blocker_evidence_paths(blocker, classification)
     ledger = {
         os.path.normpath(str(path).strip())

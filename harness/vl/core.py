@@ -249,6 +249,54 @@ def build_visual_verify_prompt(
     )
 
 
+def _encoded_image_over_endpoint_limit(
+    config: Any, file_bytes: int, mime_type: str,
+) -> Optional[JsonDict]:
+    """Refuse to send a body the endpoint has already said it will not take.
+
+    In task a608b5e7 nine of fourteen VL calls failed. Two carried the server's
+    own words — `Exceeded limit on max bytes per data-uri` and an invalid-image
+    complaint about a 2448x77264 capture — and seven more came back as bare
+    `Connection error` while sending full-page screenshots of 28-39 MB, which
+    encode to roughly 38-53 MB of data URI. A request that is already over the
+    endpoint's stated ceiling does not need to be sent to learn that.
+
+    The limit is an endpoint's declared transport capacity, read from config.
+    Nothing here inspects the picture or guesses a geometry per model: the
+    check is `len(data URI) > declared limit`, and with no declaration nothing
+    is refused.
+
+    The length is computed from the file size before reading or base64-encoding
+    the image. Base64 encodes every three input bytes as four ASCII bytes, so
+    the exact payload length is arithmetic. Rejecting after ``read_bytes`` and
+    ``b64encode`` would still allocate the large byte and string copies this
+    preflight exists to avoid.
+    """
+    try:
+        limit = int(getattr(config, "max_encoded_image_bytes", 0) or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    if limit <= 0:
+        return None
+    raw_bytes = max(0, int(file_bytes))
+    encoded_bytes = len(
+        f"data:{mime_type};base64,".encode("utf-8")
+    ) + 4 * ((raw_bytes + 2) // 3)
+    if encoded_bytes <= limit:
+        return None
+    return {
+        "status": "failed",
+        "error": "encoded image exceeds this endpoint's declared request limit",
+        "reason": "payload_over_endpoint_limit",
+        "fileBytes": raw_bytes,
+        "encodedBytes": encoded_bytes,
+        "maxEncodedImageBytes": limit,
+        # Separated from timeouts and transport faults on purpose: this one is
+        # about the capture, and re-sending the same bytes cannot succeed.
+        "retryableWithSameImage": False,
+    }
+
+
 async def visual_verify_image(
     *,
     config: VLConfig,
@@ -266,8 +314,19 @@ async def visual_verify_image(
     if not path.exists() or not path.is_file():
         return {"status": "failed", "error": "screenshot file is missing", "path": image_path}
 
-    image_b64 = base64.b64encode(path.read_bytes()).decode("ascii")
     mime_type = mimetypes.guess_type(str(path))[0] or "image/png"
+    try:
+        file_bytes = int(path.stat().st_size)
+    except OSError as exc:
+        return {
+            "status": "failed",
+            "error": f"screenshot metadata is unreadable: {exc}",
+            "path": image_path,
+        }
+    oversized = _encoded_image_over_endpoint_limit(config, file_bytes, mime_type)
+    if oversized is not None:
+        return oversized
+    image_b64 = base64.b64encode(path.read_bytes()).decode("ascii")
     prompt = build_visual_verify_prompt(
         expected=expected,
         mode=mode,
@@ -295,6 +354,7 @@ async def visual_verify_image(
                 prompt=prompt,
                 timeout_seconds=timeout_seconds,
                 role_extra_params=role_extra_params,
+                inherit_base_thinking=(mode == "captcha_solve"),
             )
         elif provider == "anthropic":
             raw_text, usage = await _call_anthropic_compatible(
@@ -304,6 +364,7 @@ async def visual_verify_image(
                 prompt=prompt,
                 timeout_seconds=timeout_seconds,
                 role_extra_params=role_extra_params,
+                inherit_base_thinking=(mode == "captcha_solve"),
             )
         else:
             return {
@@ -730,14 +791,21 @@ _THINKING_CONTROL_KEYS = ("thinking", "reasoning_effort", "effort")
 def _merged_vl_extra_params(
     config: VLConfig,
     role_extra_params: JsonDict,
+    *,
+    inherit_base_thinking: bool = True,
 ) -> JsonDict:
-    """vl.extra_params for every VL role, overlaid by the role's own section.
+    """Provider params for a VL role, with deliberation scoped explicitly.
 
-    Symmetric across both wire formats on purpose: before this, the Anthropic
-    path silently ignored vl.extra_params, so "configure thinking per role"
-    was only half true.
+    Ordinary visual checks are short classifications and do not inherit the
+    global model's thinking controls. CAPTCHA solving may opt in through its
+    role-specific params, and retains an explicitly configured base thinking
+    policy for backward compatibility. Non-reasoning provider parameters keep
+    applying to every role.
     """
     merged: JsonDict = dict(config.extra_params or {})
+    if not inherit_base_thinking:
+        for key in _THINKING_CONTROL_KEYS:
+            merged.pop(key, None)
     merged.update(role_extra_params or {})
     return merged
 
@@ -764,6 +832,7 @@ async def _call_openai_compatible(
     prompt: str,
     timeout_seconds: float,
     role_extra_params: JsonDict,
+    inherit_base_thinking: bool = True,
 ) -> tuple[str, JsonDict]:
     try:
         from openai import AsyncOpenAI
@@ -801,7 +870,11 @@ async def _call_openai_compatible(
         "temperature": 0,
         "max_tokens": 800,
     }
-    merged = _merged_vl_extra_params(config, role_extra_params)
+    merged = _merged_vl_extra_params(
+        config,
+        role_extra_params,
+        inherit_base_thinking=inherit_base_thinking,
+    )
     intent = resolve_thinking_intent(merged)
     thinking_top, thinking_extra_body, thinking_warnings = openai_thinking_request(
         intent
@@ -832,6 +905,7 @@ async def _call_anthropic_compatible(
     prompt: str,
     timeout_seconds: float,
     role_extra_params: JsonDict,
+    inherit_base_thinking: bool = True,
 ) -> tuple[str, JsonDict]:
     try:
         from anthropic import AsyncAnthropic
@@ -870,7 +944,11 @@ async def _call_anthropic_compatible(
     }
     # Symmetric with the OpenAI-compatible path: vl.extra_params applies to
     # every VL role, and the role's own section overlays it.
-    merged = _merged_vl_extra_params(config, role_extra_params)
+    merged = _merged_vl_extra_params(
+        config,
+        role_extra_params,
+        inherit_base_thinking=inherit_base_thinking,
+    )
     intent = resolve_thinking_intent(merged)
     thinking_native, thinking_warnings = anthropic_thinking_request(
         intent,

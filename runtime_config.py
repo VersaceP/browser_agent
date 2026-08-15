@@ -104,6 +104,38 @@ def _validated_resource_compression(value: Any) -> str:
     return mode
 
 
+def _validated_resource_compression_min_bytes(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "harness.resource_compression_min_bytes must be a non-negative integer;"
+            f" got {value!r}"
+        ) from exc
+    if parsed < 0:
+        raise ValueError(
+            "harness.resource_compression_min_bytes must be a non-negative integer;"
+            f" got {value!r}"
+        )
+    return parsed
+
+
+def _validated_resource_compression_level(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "harness.resource_compression_level must be an integer from 0 to 9;"
+            f" got {value!r}"
+        ) from exc
+    if not 0 <= parsed <= 9:
+        raise ValueError(
+            "harness.resource_compression_level must be an integer from 0 to 9;"
+            f" got {value!r}"
+        )
+    return parsed
+
+
 def _normalize_hitl_attendance(value: Any) -> str:
     """Unknown spellings fall back to `attended`.
 
@@ -439,6 +471,49 @@ class ClaimExtractorConfig(PlanValidatorConfig):
     # unavailable" and silently fails the gate open (task 857616aa).
     max_tokens: int = 16000
 
+    @classmethod
+    def derived_from(
+        cls, validator: "PlanValidatorConfig",
+    ) -> "ClaimExtractorConfig":
+        """Reuse the auditor's model and credentials, not its thinking budget.
+
+        Binding a number in prose to a metric is a lookup; judging whether a
+        plan quietly dropped an objective is not. Inheriting the validator's
+        provider object gave the extractor `effort=high` and a shared 12k
+        output budget, and in task 5b91bd44 the extractor spent all of it
+        thinking and returned no tool call at all — which reads as "extractor
+        unavailable" and costs three minutes for nothing.
+        """
+        extra = {
+            key: value
+            for key, value in (validator.extra_params or {}).items()
+            if key not in _REASONING_PARAM_KEYS
+        }
+        return cls(
+            enabled=True,
+            provider=validator.provider,
+            model_id=validator.model_id,
+            api_key=validator.api_key,
+            base_url=validator.base_url,
+            llm_api_timeout_seconds=validator.llm_api_timeout_seconds,
+            llm_timeout_max_retries=validator.llm_timeout_max_retries,
+            llm_timeout_backoff_seconds=validator.llm_timeout_backoff_seconds,
+            llm_timeout_retry_interval_seconds=(
+                validator.llm_timeout_retry_interval_seconds
+            ),
+            extra_params=extra,
+        )
+
+
+# Spellings different providers use for the same "spend tokens deliberating"
+# switch. Stripped when a read-only lookup inherits an auditor's connection.
+_REASONING_PARAM_KEYS = frozenset({
+    "thinking",
+    "reasoning",
+    "reasoning_effort",
+    "effort",
+})
+
 
 # ---------------------------------------------------------------------------
 # "browser" 段：ABCPClientConfig（ABCP WebSocket 连接）
@@ -509,6 +584,18 @@ def _one_of(value: Any, allowed: set, default: str) -> str:
     return text if text in allowed else default
 
 
+def _optional_positive_int(value: Any, *, name: str) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive integer or null; got {value!r}") from exc
+    if parsed <= 0:
+        raise ValueError(f"{name} must be a positive integer or null; got {value!r}")
+    return parsed
+
+
 @dataclass
 class VLConfig:
     enabled: bool = False
@@ -535,6 +622,12 @@ class VLConfig:
     # Provider-specific CAPTCHA parameters (for example OpenAI-compatible
     # extra_body.enable_thinking) must not silently alter ordinary VL roles.
     captcha_solve_extra_params: Dict[str, Any] = field(default_factory=dict)
+    # What this ENDPOINT accepts in one request body, not what some model can
+    # understand. Declared per endpoint because it is a transport fact the
+    # server states in its own error text; the harness must not keep a table of
+    # model names and picture sizes. `None` means the endpoint has declared
+    # nothing and every image is sent, which is the historical behaviour.
+    max_encoded_image_bytes: Optional[int] = None
     # How many auto-solve episodes one worker may spend in total. A page whose
     # episode failed is additionally never retried — it belongs to the human path.
     captcha_solve_max_episodes_per_worker: int = 2
@@ -647,6 +740,10 @@ class VLConfig:
                 dict(data.get("captcha_solve_extra_params") or {})
                 if isinstance(data.get("captcha_solve_extra_params"), dict)
                 else {}
+            ),
+            max_encoded_image_bytes=_optional_positive_int(
+                data.get("max_encoded_image_bytes", cls.max_encoded_image_bytes),
+                name="vl.max_encoded_image_bytes",
             ),
             captcha_solve_max_episodes_per_worker=int(
                 data.get(
@@ -964,11 +1061,11 @@ class HarnessConfig:
     #   "file" -> the historical per-task JSONL/JSON layout
     #   "dual" -> both, files authoritative, backends compared on demand
     #   "db"   -> SQLite only
-    # "db" writes no process files at all. The model-facing readers cover that:
-    # local_fs_read/search present run_events, worker_trace_events and
-    # task_resources under the same paths those files used, and resume falls
-    # back to the database when a file is absent. Files still win wherever both
-    # exist, which is what keeps a pre-database worktree resumable unchanged.
+    # "db" writes no process files at all and makes the database authoritative;
+    # it never falls back to adjacent legacy files during resume. In "dual",
+    # files remain authoritative while the database is verified as a mirror.
+    # Model-facing readers present database events/traces/resources under the
+    # same logical paths the historical file backend used.
     storage_backend: str = "db"
     # Relative to worktree_dir, so it follows a relocated worktree.
     storage_sqlite_path: str = "harness.db"
@@ -1366,26 +1463,17 @@ class HarnessConfig:
             resource_compression=_validated_resource_compression(
                 data.get("resource_compression", cls.resource_compression)
             ),
-            resource_compression_min_bytes=max(
-                0,
-                int(
-                    data.get(
-                        "resource_compression_min_bytes",
-                        cls.resource_compression_min_bytes,
-                    )
-                ),
+            resource_compression_min_bytes=_validated_resource_compression_min_bytes(
+                data.get(
+                    "resource_compression_min_bytes",
+                    cls.resource_compression_min_bytes,
+                )
             ),
-            resource_compression_level=max(
-                0,
-                min(
-                    9,
-                    int(
-                        data.get(
-                            "resource_compression_level",
-                            cls.resource_compression_level,
-                        )
-                    ),
-                ),
+            resource_compression_level=_validated_resource_compression_level(
+                data.get(
+                    "resource_compression_level",
+                    cls.resource_compression_level,
+                )
             ),
         )
 

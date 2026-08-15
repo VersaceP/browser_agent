@@ -1,11 +1,11 @@
 # 基于 tau 源码研究的 harness 简化与经验闭环实施方案（v4.1）
 
 - 日期：2026-08-13（v4.1，执行版；历经四轮交叉 review，分歧已全部收敛）
-- 状态：待执行（自包含，执行者无需其他对话上下文）
+- 状态：主体已执行；真实 live 回归与提交拆分仍待完成
 - 研究对象：https://github.com/huggingface/tau （shallow clone，结论经源码核实）
 - v4→v4.1：max_attempts 改声明式预算（无默认硬墙）；修复 partial 追溯计数矛盾；
   批 R 移到批 2 后并改读 raw attempts；challenge 结构帧移出硬信号；批 8/9 合并；
-  compaction 成为批 1 明确交付项；判据三改 shadow A/B 回放；loop_guard 终态明确
+  compaction 成为批 1 明确交付项；拦截层判据改 shadow A/B 回放；loop_guard 终态明确
   （warn 实为拦截，一并候删）
 
 ---
@@ -108,7 +108,7 @@
 ## 2. 批次
 
 > 顺序：批 -1 → 批 0 → 批 1 → 批 2 → 批 R → 批 7 → 批 3 → 批 4 → 批 8（含原批 9）
-> → §3 replay 决策点 →（判据触发才做）批 6 与 progress/loop 拦截层拆除。
+> → §3 replay 决策点 →（判据触发才做）progress/loop 拦截层拆除。
 > 批 5 不实施。
 
 ### 批 -1 — 回放基线（不改行为）
@@ -280,8 +280,8 @@ agent_harness.py（plan prompt 段）
 
 ### 批 5 —（不实施）strategy_attempts 保持审计态
 
-多策略共现同一失败无法归因，注记信息量趋零。保留 append-only telemetry 供审计
-与批 6 蒸馏；批 1 投影重试场景带账本路径，模型自行读取。
+多策略共现同一失败无法归因，注记信息量趋零。保留 append-only telemetry 供审计；
+批 1 投影重试场景带账本路径，模型自行读取。
 
 ### 批 8 — 语义裁决权退役（含原批 9；依赖批 1；先出消费点清单）
 
@@ -316,9 +316,12 @@ harness/tools/browser_tools/__init__.py、harness/content_completeness.py
    机械路径（wait_for_hitl_resume 七出口）产生的 hitl_* 终态不变。
 
 **8c content_completeness 降观察器**：
-6. `terminal_veto()` 改名为仅供诊断的 `unresolved_observation()`；删除
-   `_apply_content_completeness_validation_veto` 裁决权，并从模型可见结果删除
-   route_recovery_required / blocked_content_suppression 等决策状态与指令输出。
+6. `terminal_veto()` 裁决权删除，并从模型可见结果删除 route_recovery_required /
+   blocked_content_suppression 等决策状态与指令输出。
+   （**已执行**：先改名为 `unresolved_observation()` 保留作诊断，后确认生产零调用，
+   连同 `recovery_receipt()` / `route_preference_for_page()` / `_DECISION_INSTRUCTIONS`
+   一并删除，共 233 行。保留 `routePreference` 的 audit-only fast-path candidate、
+   `recoveryAttempts` 算术事实、`route_recovery_pending` 的遥测用途。）
 7. 保留并转投影的事实：命中 marker、声明区域缺失清单、已做点击/导航/滚动及
    回执、尝试次数、页面变化。per-page 观察进批 1 投影与 attempt digest。
 8. Lead prompt 的 content_completeness 声明指令段（agent_harness.py:3665）随
@@ -337,24 +340,13 @@ incomplete 且 claim 可见；机械 HITL 路径行为不变；shell-marker 用�
 缺失区域事实、validation 不再被机械否决；route-sensitive replay 场景由模型驱动
 完成恢复。
 
-### 批 6 — cases/ 案例库（条件启动，见 §3）
-
-`strategy_bank/cases/<slug>/CASE.md`（不用 SKILL.md 名），frontmatter
-`kind: case`，description 以结构化键开头（method + 错误签名 + 观察面）；
-distill_trace + /skill-create 质量门产出；读侧 v1 pull（索引进 worker 首条
-user message，仅当持有 local_fs 工具）；v2 精确键 push 不实现，仅判据二成立才
-评审。多案例跨站复现 + replay 验证后才蒸馏升格为 bank 策略。
-
----
-
 ## 3. replay 决策点（批 8 后）
 
-三样本重放，三判据。**判据三必须用 shadow A/B**：
+三样本重放，两个判据。**拦截层判据必须用 shadow A/B**：
 
-- **判据一（批 6 立项否）**：模型在「truncated + 单面未命中 + 更完整面未查」下
+- **判据一（证据指导是否充分）**：模型在「truncated + 单面未命中 + 更完整面未查」下
   是否自行继续验证；
-- **判据二（cases v2 push 否）**：cases 试点后模型撞同签名错误是否主动检索；
-- **判据三（progress/loop 拦截层拆除否）**：A 组保持现行为；B 组**旁路全部
+- **判据二（progress/loop 拦截层拆除否）**：A 组保持现行为；B 组**旁路全部
   enforcement**（不拦截、不强停）但照常计算并注入事实（「同签名连续 N 次，
   上次回执已含本次将返回的内容」「过去 N 步 artifact 增量 0」）。比较 B 组在
   批 1 投影 + 批 4 guideline 下能否自行转向或终止。
@@ -363,6 +355,31 @@ user message，仅当持有 local_fs 工具）；v2 精确键 push 不实现，�
     progress 八子门硬拦同步降为投影事实；
   - 结论为否 → 维持现状，出差距分析再评。
   - 生产行为在结论前不变；旁路只存在于 replay fixture。
+
+> **判据二已结案并执行（A/B 装置随之退役）**：loop_guard 与 progress 都已降为
+> 观察器——照常计算、把事实归属到工具回执，不拦截也不强停。B 臂建模的正是这个
+> 行为，两臂因此测同一套 harness，`shadow_bypass()` 与 `docs/replay_shadow.py`
+> 一并删除，runner 改名 `live_replay_runner.py` 只保留「用历史任务原文起新跑」。
+> `docs/replay-baselines/` 下所有基线报告描述的是**门仍拦截时**的 harness，
+> 新跑在 blocked-call 计数上与它们不可比。后续 live 回归直接跑 `main.py`。
+
+### 3.1 例外：逐字重复的花费上限（显式政策）
+
+拆除 loop_guard 判定权后保留**一个**数字：`DUPLICATE_CALL_STOP_AT = 20`
+（`harness/tools/loop_guard.py`）。它不是判定权的回潮，边界如下：
+
+- **它不判断重复有没有用**。前 20 次全部照常派发，回执照常返回；第 21 次不
+  执行，worker 以 `duplicate_call_spend_limit` 结束，文案只陈述次数，不写
+  「上次回执里已经有答案了」这类关于模型推理的断言——那句正是把 Lead 推去翻
+  无关文件的东西，随旧 warn 拦截一并删除且不恢复。
+- **它是花费上限，不是重试预算**。铁律二针对的是「把语义裁决换成机械重试
+  N 次」；这里没有任何语义裁决被换掉，被约束的只是一个 byte-identical 请求
+  可以吃掉一次运行的多少额度，与 `max_steps` 同类。
+- **单一全局阈值，不分工具**。被它取代的按工具阈值表（`local_fs_*` 5 次、
+  `Runtime.evaluate` 8 次）才是过拟合：a608b5e7 十个 worker 最长逐字重复是
+  连续 5 次 `Input.scroll amount=800`，即正常翻页。阈值 20 对该样本零触发。
+- **证据来源**：kimi-2.6 曾在 23 步内发出 23 次相同 `local_fs_search`。
+- **约束**：必须小于 `HISTORY_WINDOW`（24），否则 streak 永远观测不到阈值。
 
 按证据升级/拆除，不按担心预建，也不按哲学批量拆。
 
@@ -375,7 +392,7 @@ user message，仅当持有 local_fs 工具）；v2 精确键 push 不实现，�
 硬锁、VL 终态 bounce、模型自报 HITL 终态白名单、content_completeness 裁决权
 （批 8）。
 
-**replay 判据三候删（shadow A/B 后）**：progress 八子门硬拦、loop_guard warn
+**replay 判据二候删（shadow A/B 后）**：progress 八子门硬拦、loop_guard warn
 拦截与 force 强停（检测与事实注入永久保留）。
 
 **卫生项**：page quarantine 无 TTL（中危，修 TTL）。truncation 分桶方案撤回
@@ -403,11 +420,10 @@ hash/下载对账、明确数值账本冲突（附录 B 边界内）、全局 st
 
 **删**：词法评分、21.5KB bank 内嵌、40 字符门、banned_strategies、plan 三重
 复述、默认 max_attempts 政策、语义终态熔断、S3 硬锁、objective_exhausted 硬锁、
-VL 终态 bounce、模型自报 HITL 终态、content_completeness 裁决权、（判据三后）
+VL 终态 bounce、模型自报 HITL 终态、content_completeness 裁决权、（判据二后）
 progress/loop 拦截层、（拟）战术出 plan。
 **改**：1 投影函数（wait/offload/validator/continuation/compaction 五方复用）、
 1 生命周期判定 + 1 计数谓词、validator 派生、reviewer 范围、2 句 guideline、
 1 更名、MODEL_ALLOWED 白名单收缩。
-**增**：批 -1 基线（含 enforcement 旁路 fixture）、批 R 一条矛盾检查、
-（条件）批 6 cases 目录。
+**增**：批 -1 基线（含 enforcement 旁路 fixture）、批 R 一条矛盾检查。
 **净**：裁决点大幅减少；新子系统 0；新模型工具 0；新枚举/字段/阈值表/默认预算 0。

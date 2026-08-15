@@ -519,22 +519,70 @@ async def execute_browser_tool(agent: Any, tool_call: JsonDict, step: int) -> Tu
 
     ProgressAccountant still computes exactly the same arithmetic facts, but
     production execution no longer treats its interpretation as permission to
-    run the tool.  Mutating the returned dict in place also updates the trace
-    entry that the implementation has already appended, so replay/audit sees
-    the same receipt the model saw.
+    run the tool.  The facts are attached to both the model result and the
+    corresponding trace receipt so replay/audit sees the same evidence.
     """
     agent._pending_progress_observations = []
+    agent._pending_loop_observations = []
+    trace_start = len(getattr(agent, "trace", []) or [])
     result, should_stop = await _execute_browser_tool_impl(agent, tool_call, step)
     observations = list(
         getattr(agent, "_pending_progress_observations", None) or []
+    )
+    loop_observations = list(
+        getattr(agent, "_pending_loop_observations", None) or []
     )
     if observations and isinstance(result, dict):
         result["progressObservations"] = observations
         result["progressObservationNotice"] = (
             "These are attributed arithmetic observations from the progress"
-            " accountant. The requested tool was executed; use its real"
-            " receipt and these facts to choose the next action."
+            " accountant, recorded before dispatch. They did not decide"
+            " whether the call runs, and they do not report whether it ran:"
+            " read the receipt beside them for the execution outcome."
         )
+        # Capability calls clean/offload their model result and then append a
+        # separate trace copy.  Mutating ``result`` above therefore does not
+        # update that receipt.  Attach the same facts to the last real action
+        # emitted by this invocation so transcript replay sees exactly what the
+        # model saw; the standalone observation entry keeps provenance.
+        trace = getattr(agent, "trace", None)
+        if isinstance(trace, list):
+            for entry in reversed(trace[trace_start:]):
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("type") == "progress_observation":
+                    continue
+                trace_result = entry.get("result")
+                if not isinstance(trace_result, dict):
+                    continue
+                trace_result["progressObservations"] = observations
+                trace_result["progressObservationNotice"] = result[
+                    "progressObservationNotice"
+                ]
+                break
+    if loop_observations and isinstance(result, dict):
+        result["loopObservations"] = loop_observations
+        result["loopObservationNotice"] = (
+            "These are attributed duplicate-call facts, recorded before"
+            " dispatch. They did not decide whether the call runs, and they do"
+            " not report whether it ran: interpret repetition using the"
+            " receipt beside them and the current goal."
+        )
+        trace = getattr(agent, "trace", None)
+        if isinstance(trace, list):
+            for entry in reversed(trace[trace_start:]):
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("type") in {"progress_observation", "loop_observation"}:
+                    continue
+                trace_result = entry.get("result")
+                if not isinstance(trace_result, dict):
+                    continue
+                trace_result["loopObservations"] = loop_observations
+                trace_result["loopObservationNotice"] = result[
+                    "loopObservationNotice"
+                ]
+                break
     return result, should_stop
 
 
@@ -566,10 +614,7 @@ async def _execute_browser_tool_impl(
         )
         return result, should_stop
 
-    progress_gate = _call_extraction_progress_gate(agent, name, tool_input)
-    if progress_gate is not None:
-        agent.trace.append({"type": "progress_gate", "result": progress_gate})
-        return progress_gate, False
+    _observe_unrecorded_extraction_before(agent, name, tool_input, step)
 
     # Loop guard: short-circuit if the model is hammering the same tool with
     # the same args. final_answer is exempted above so a deliberate retry of
@@ -2238,6 +2283,9 @@ async def _execute_browser_capability_tool(
                 "includeShadowDom": True,
             },
         )
+    params, image_output_receipt = _normalize_dom_get_img_output(
+        agent, method, params,
+    )
 
     navigation_context, navigation_context_error = _prepare_navigation_context(
         agent,
@@ -2712,6 +2760,7 @@ async def _execute_browser_capability_tool(
                 ]
         axtree_snapshot = _precompute_axtree_snapshot(method, params, response)
         response = agent._offload_response(method, params, response, step)
+        _annotate_axtree_offload(response, axtree_snapshot)
 
         hitl_pause_succeeded = (
             method == "Hitl.requestPause" and _hitl_pause_succeeded(response)
@@ -2767,6 +2816,10 @@ async def _execute_browser_capability_tool(
             **_transport_error_metadata(method, exc),
         }
         attach_method_schema(result, method, agent.method_schemas)
+
+    if image_output_receipt is not None:
+        result["normalizedFields"] = ["params.options.path"]
+        result["outputNormalization"] = image_output_receipt
 
     if runtime_receipt and "runtimePolicy" not in result:
         result["runtimePolicy"] = runtime_receipt
@@ -3113,6 +3166,7 @@ async def _invoke_browser_method(
             record_file_action(method, params, response)
         axtree_snapshot = _precompute_axtree_snapshot(method, params, response)
         response = agent._offload_response(method, params, response, step)
+        _annotate_axtree_offload(response, axtree_snapshot)
         hitl_pause_succeeded = (
             method == "Hitl.requestPause" and _hitl_pause_succeeded(response)
         )
@@ -8749,6 +8803,66 @@ def _normalize_screenshot_output(
     return normalize_screenshot_output_params(method, params)
 
 
+def _normalize_dom_get_img_output(
+    agent: Any,
+    method: str,
+    params: JsonDict,
+) -> Tuple[JsonDict, Optional[JsonDict]]:
+    """Resolve model-relative image export directories inside this task.
+
+    ABCP resolves relative paths in its own service working directory, not in
+    the harness worktree.  The resulting ENOENT was surfaced only as generic
+    JSON-RPC -32005.  Path resolution is mechanical adapter work: preserve an
+    explicit absolute path, and bind a relative one to this run's artifacts
+    directory before dispatch.
+    """
+    if method != "DOM.getImg" or not isinstance(params, dict):
+        return params, None
+    options = params.get("options")
+    raw_path = options.get("path") if isinstance(options, dict) else None
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return params, None
+    candidate = Path(raw_path.strip()).expanduser()
+    if candidate.is_absolute():
+        return params, None
+    task_dir = getattr(getattr(agent, "logger", None), "task_dir", None)
+    if task_dir is None:
+        return params, None
+    task_root = Path(task_dir).resolve()
+    artifacts_root = (task_root / "artifacts").resolve()
+    parts = candidate.parts
+    if parts and parts[0] == "artifacts":
+        resolved = (task_root / candidate).resolve()
+    else:
+        cwd_candidate = (Path.cwd() / candidate).resolve()
+        try:
+            cwd_candidate.relative_to(task_root)
+        except ValueError:
+            resolved = (artifacts_root / candidate).resolve()
+        else:
+            resolved = cwd_candidate
+    try:
+        resolved.relative_to(artifacts_root)
+    except ValueError:
+        # Do not let a model-relative export escape the run directory.
+        resolved = artifacts_root / "images"
+    resolved.mkdir(parents=True, exist_ok=True)
+    normalized = dict(params)
+    normalized_options = dict(options)
+    normalized_options["path"] = str(resolved)
+    normalized["options"] = normalized_options
+    receipt = {
+        "field": "params.options.path",
+        "from": raw_path,
+        "to": str(resolved),
+        "basis": "task_artifacts_directory",
+    }
+    logger = getattr(agent, "logger", None)
+    if logger is not None and hasattr(logger, "write"):
+        logger.write("browser.call.dom_get_img_output_normalized", receipt)
+    return normalized, receipt
+
+
 def _attach_normalized_handles(result: JsonDict) -> JsonDict:
     if not isinstance(result, dict):
         return result
@@ -10067,14 +10181,6 @@ async def _request_hitl_for_challenge(
         }
     return pause_result
 
-PROGRESS_GATE_MAX_BLOCKS = 2
-PROGRESS_GATE_RECOVERY_TOOLS = frozenset({
-    *NO_ARTIFACT_DIAGNOSTIC_TOOLS,
-    "local_fs_read",
-    "local_fs_search",
-})
-
-
 def _record_extraction_persisted(result: JsonDict) -> bool:
     return bool(isinstance(result, dict) and str(result.get("savedPath") or "").strip())
 
@@ -10087,88 +10193,128 @@ def _gate_subject_tool(next_tool: str, tool_input: JsonDict) -> str:
     return str(next_tool or "").strip()
 
 
-def _call_extraction_progress_gate(
+# What makes two progress observations the same observation. Deliberately
+# excludes the monotonic counters: `turnsSinceArtifactProgress` climbs every
+# turn, so including it would make every restatement look like news and the
+# de-duplication would do nothing.
+_PROGRESS_OBSERVATION_IDENTITY_KEYS = (
+    "source",
+    "reasonObserved",
+    "tool",
+    "pageId",
+    "diagnosticScope",
+)
+
+
+def _progress_observation_is_new(
+    agent: Any, progress: Any, fact: JsonDict,
+) -> bool:
+    """True when this observation has not been put to the model yet.
+
+    Task a608b5e7 emitted 102 progress observations covering 33 distinct
+    situations: roughly two in three were the same fact restated, each one
+    carried on a fresh ~83k-token context replay.
+
+    The memory is scoped to a stretch without artifact progress. When an
+    extraction lands the slate clears, so a stall that returns after real
+    progress is reported again — it genuinely is new information then.
+    """
+    identity = tuple(
+        str(fact.get(key) or "") for key in _PROGRESS_OBSERVATION_IDENTITY_KEYS
+    )
+    artifact_mark = int(getattr(progress, "extraction_artifact_count", 0) or 0)
+    seen = getattr(agent, "_progress_observation_identities", None)
+    if (
+        not isinstance(seen, set)
+        or getattr(agent, "_progress_observation_artifact_mark", None)
+        != artifact_mark
+    ):
+        seen = set()
+        try:
+            agent._progress_observation_identities = seen
+            agent._progress_observation_artifact_mark = artifact_mark
+        except Exception:
+            return True
+    if identity in seen:
+        return False
+    seen.add(identity)
+    return True
+
+
+def _annotate_axtree_offload(response: Any, snapshot: Optional[JsonDict]) -> None:
+    """Say that an offloaded AXTree is also queryable in memory, and until when.
+
+    The file and the live indexed snapshot hold the same tree, but only while
+    the epoch stands. Task a608b5e7 answered every AXTree question by searching
+    the file — 100 `local_fs_search` and 108 `local_fs_read` turns — with
+    `find_in_axtree` sitting on the same data in memory the whole time.
+
+    The file is not redundant: once `Input.*` or a navigation bumps the epoch
+    it is the only record of that tree, which is why this points at the live
+    tool rather than replacing the path. No epoch number is quoted here because
+    it is not settled until after this response is built; `find_in_axtree`
+    answers `needs_fresh_axtree` on its own when the tree has moved on.
+    """
+    if not snapshot or not isinstance(response, dict):
+        return
+    data = response.get("data")
+    if not isinstance(data, dict):
+        return
+    blob = data.get("lines")
+    if not isinstance(blob, dict) or not blob.get("_offloaded"):
+        return
+    blob["liveQuery"] = {
+        "tool": "find_in_axtree",
+        "holdsWhile": "this page's AXTree epoch is unchanged",
+        "note": (
+            "The same tree is indexed in memory: query it with find_in_axtree"
+            " instead of searching this file. After an Input.* action or a"
+            " navigation bumps the epoch, find_in_axtree reports"
+            " needs_fresh_axtree and this file becomes the only record of"
+            " this tree."
+        ),
+    }
+
+
+def _observe_unrecorded_extraction_before(
     agent: Any,
     next_tool: str,
     tool_input: JsonDict,
-) -> Optional[JsonDict]:
-    try:
-        return _check_extraction_progress_gate(agent, next_tool, tool_input)
-    except TypeError as exc:
-        # Some tests/plugins monkeypatch the internal gate using the old
-        # two-argument signature. Keep that compatibility while the real helper
-        # accepts tool_input so browser_call can be classified by method.
-        if "positional" not in str(exc) and "argument" not in str(exc):
-            raise
-        return _check_extraction_progress_gate(agent, next_tool)
-
-
-def _check_extraction_progress_gate(
-    agent: Any,
-    next_tool: str,
-    tool_input: Optional[JsonDict] = None,
-) -> Optional[JsonDict]:
+    step: Optional[int] = None,
+) -> None:
+    """Expose pending Runtime rows as facts without deciding the next action."""
     if next_tool == "record_extraction":
-        return None
-    subject_tool = _gate_subject_tool(next_tool, tool_input or {})
-    if subject_tool in PROGRESS_GATE_RECOVERY_TOOLS:
-        pending = getattr(agent, "pending_unrecorded_extraction", None)
-        if isinstance(pending, dict):
-            pending["recoveryBypassCount"] = (
-                optional_int(pending.get("recoveryBypassCount"), 0) or 0
-            ) + 1
-            agent.pending_unrecorded_extraction = pending
-        return None
+        return
     pending = getattr(agent, "pending_unrecorded_extraction", None)
     if not isinstance(pending, dict):
-        return None
-    turns = optional_int(pending.get("turns"), 0) or 0
-    if turns < 1:
-        pending["turns"] = turns + 1
-        agent.pending_unrecorded_extraction = pending
-        return None
-    gate_blocks = optional_int(pending.get("gateBlocks"), 0) or 0
-    if gate_blocks >= PROGRESS_GATE_MAX_BLOCKS:
-        downgraded = {
-            "status": "progress_gate_downgraded",
-            "reason": "unrecorded_structured_rows_gate_limit",
-            "rowCount": pending.get("rowCount"),
-            "source": pending.get("source"),
-            "tool": subject_tool,
-            "gateBlocks": gate_blocks,
-            "tool_was_executed": True,
-            "next_instruction": (
-                "The unrecorded-rows gate reached its bounded limit and was"
-                " downgraded so recovery tools can continue. Persist trustworthy"
-                " rows when possible; otherwise gather evidence and finalize with"
-                " a blocker or target_absent/instruction_infeasible classification."
-            ),
-        }
-        agent.pending_unrecorded_extraction = None
-        if hasattr(agent, "trace") and isinstance(agent.trace, list):
-            agent.trace.append({"type": "progress_gate_downgraded", "result": downgraded})
-        logger = getattr(agent, "logger", None)
-        if logger is not None and hasattr(logger, "write"):
-            logger.write("progress_gate.downgraded", downgraded)
-        return None
-    pending["gateBlocks"] = gate_blocks + 1
+        return
+    observations = optional_int(pending.get("observations"), 0) or 0
+    pending["observations"] = observations + 1
     agent.pending_unrecorded_extraction = pending
-    return {
-        "status": "progress_gate",
-        "reason": "unrecorded_structured_rows",
+    fact: JsonDict = {
+        "source": "unrecorded_runtime_rows",
+        "reasonObserved": "structured_rows_not_persisted",
         "rowCount": pending.get("rowCount"),
-        "source": pending.get("source"),
-        "tool": subject_tool,
-        "gateBlocks": pending.get("gateBlocks"),
-        "tool_was_executed": False,
-        "next_instruction": (
-            "You already extracted structured rows but did not persist them."
-            " Call record_extraction now if the rows are relevant, or use recovery"
-            " tools such as DOM.getAXTree/DOM.getText/DOM.getAttribute/Input.scroll to"
-            " gather missing evidence, or call final_answer with a blocker if"
-            " they are not trustworthy."
-        ),
+        "rowSource": pending.get("source"),
+        "observedAtStep": pending.get("step"),
+        "nextTool": _gate_subject_tool(next_tool, tool_input),
+        "observationCount": pending["observations"],
     }
+    queued = getattr(agent, "_pending_progress_observations", None)
+    if not isinstance(queued, list):
+        queued = []
+        agent._pending_progress_observations = queued
+    queued.append(fact)
+    logger = getattr(agent, "logger", None)
+    if logger is not None and hasattr(logger, "write"):
+        logger.write("progress.unrecorded_rows_observed", fact)
+    trace = getattr(agent, "trace", None)
+    if isinstance(trace, list):
+        trace.append({
+            "type": "progress_observation",
+            "step": step,
+            "result": fact,
+        })
 
 
 def _check_cross_task_memory_scope(
@@ -10254,8 +10400,7 @@ def _check_worker_contract(agent: Any, method_or_tool: str) -> Optional[JsonDict
             "classification": {
                 "category": "blocked_cross_task_type_required",
                 "hint": (
-                    "This phase needs a method outside its task_type policy;"
-                    " LeadAgent should replan a phase with the appropriate task_type."
+                    "This phase needs a method outside its task_type policy."
                 ),
                 "method": method_or_tool,
                 "task_type": resolved_contract_task_type,
@@ -10318,7 +10463,7 @@ def _is_own_artifact_read(agent: Any, tool_name: str, path_hint: Any) -> bool:
     return path in attempts
 
 
-def _check_progress_before(
+def _observe_progress_before(
     agent: Any,
     tool_name: str,
     tool_input: Optional[JsonDict] = None,
@@ -10326,6 +10471,11 @@ def _check_progress_before(
     *,
     charge_diagnostic: bool = True,
 ) -> Optional[JsonDict]:
+    """Record the accountant's arithmetic observation about this call.
+
+    The accountant emits facts, not verdicts: nothing here decides whether the
+    call runs, and the caller dispatches it either way.
+    """
     progress = getattr(agent, "progress", None)
     if progress is None:
         return None
@@ -10365,7 +10515,7 @@ def _check_progress_before(
             )
         ):
             mandatory_recovery_generation = lifecycle_state.generation
-    result = progress.before_tool(
+    result = progress.observe_before(
         tool_name=tool_name,
         artifact_count=extraction_artifact_count(getattr(agent, "artifacts", [])),
         local_fs_limit=limit,
@@ -10393,94 +10543,52 @@ def _check_progress_before(
     )
     if isinstance(allowance, dict) and tool_name == "DOM.getSemanticTree":
         agent.logger.write("semantic_tree.diagnostic_bypass", allowance)
-    if result is not None:
-        # Saves that carried schemaWarnings were persisted but deliberately NOT
-        # credited to the artifact ledger ("trust the ledger, not the claim").
-        # Surface them on the intervention so neither the model nor a human
-        # reading the log mistakes "uncredited save" for "never extracted
-        # anything" — task 9d5655d3's diagnosis stalled on that ambiguity.
-        attempted = [
-            str(path)
-            for path in (getattr(agent, "extraction_attempt_artifacts", None) or [])
-        ]
-        credited = {
-            str(path) for path in (getattr(agent, "artifacts", None) or [])
-        }
-        uncredited = [path for path in attempted if path not in credited]
-        if uncredited:
-            result["uncreditedArtifacts"] = {
-                "count": len(uncredited),
-                "paths": uncredited[-3:],
-                "note": (
-                    "saved with schema warnings, so not counted as extraction"
-                    " progress; fix the row keys/values and re-record"
-                ),
-            }
-        agent.logger.write("progress.intervention", result)
-    return result
-
-
-_PROGRESS_OBSERVATION_FACT_KEYS = {
-    "tool",
-    "pageId",
-    "localFsWithoutExtraction",
-    "localFsStreak",
-    "repeatedLocalResultCount",
-    "resultSignature",
-    "turnsSinceArtifactProgress",
-    "toolCalls",
-    "diagnosticScope",
-    "navigationEpoch",
-    "diagnosticUses",
-    "diagnosticLimit",
-    "rowCount",
-    "uncreditedArtifacts",
-    "duplicate_of_previous",
-}
-
-
-def _progress_observation_fact(intervention: JsonDict) -> JsonDict:
-    """Project detector output to facts, excluding action instructions."""
-    fact: JsonDict = {
-        "source": "progress_accountant",
-        "reasonObserved": str(intervention.get("reason") or ""),
+    if result is None:
+        return None
+    # Saves that carried schemaWarnings were persisted but deliberately NOT
+    # credited to the artifact ledger ("trust the ledger, not the claim").
+    # Surface them beside the observation so neither the model nor a human
+    # reading the log mistakes "uncredited save" for "never extracted
+    # anything" — task 9d5655d3's diagnosis stalled on that ambiguity.
+    attempted = [
+        str(path)
+        for path in (getattr(agent, "extraction_attempt_artifacts", None) or [])
+    ]
+    credited = {
+        str(path) for path in (getattr(agent, "artifacts", None) or [])
     }
-    for key in _PROGRESS_OBSERVATION_FACT_KEYS:
-        if key in intervention:
-            fact[key] = intervention[key]
-    return fact
-
-
-def _observe_progress_before(
-    agent: Any,
-    tool_name: str,
-    tool_input: Optional[JsonDict] = None,
-    step: Optional[int] = None,
-    *,
-    charge_diagnostic: bool = True,
-) -> None:
-    """Record the detector's arithmetic observation without blocking a tool."""
-    intervention = _check_progress_before(
-        agent,
-        tool_name,
-        tool_input,
-        step,
-        charge_diagnostic=charge_diagnostic,
-    )
-    if intervention is None:
-        return
-    fact = _progress_observation_fact(intervention)
-    pending = getattr(agent, "_pending_progress_observations", None)
-    if not isinstance(pending, list):
-        pending = []
-        agent._pending_progress_observations = pending
-    pending.append(fact)
-    agent.logger.write("progress.observed", fact)
-    agent.trace.append({
-        "type": "progress_observation",
-        "step": step,
-        "result": fact,
-    })
+    uncredited = [path for path in attempted if path not in credited]
+    if uncredited:
+        result["uncreditedArtifacts"] = {
+            "count": len(uncredited),
+            "paths": uncredited[-3:],
+            "note": (
+                "saved with schema warnings, so not counted as extraction"
+                " progress; fix the row keys/values and re-record"
+            ),
+        }
+    if _progress_observation_is_new(agent, progress, result):
+        pending = getattr(agent, "_pending_progress_observations", None)
+        if not isinstance(pending, list):
+            pending = []
+            agent._pending_progress_observations = pending
+        pending.append(result)
+    else:
+        # Restating a fact the model already has does not make it truer, and
+        # every restatement rides a full context replay. The counts still go
+        # to the trace and handoff below, where reading them costs nothing.
+        result["repeatOfReportedObservation"] = True
+    logger = getattr(agent, "logger", None)
+    if logger is not None and hasattr(logger, "write"):
+        logger.write("progress.observed", result)
+    trace = getattr(agent, "trace", None)
+    if isinstance(trace, list):
+        trace.append({
+            "type": "progress_observation",
+            "step": step,
+            "result": result,
+        })
+    return result
 
 
 def _observe_progress_after(agent: Any, tool_name: str, result: Optional[JsonDict] = None) -> None:
@@ -11236,6 +11344,7 @@ def _validate_recorded_extraction(agent: Any, saved_path: str) -> JsonDict:
             prior_artifacts=prior_artifacts,
             file_evidence=list(getattr(agent, "file_action_evidence", []) or []),
             task_dir=agent.logger.task_dir,
+            logger=agent.logger,
         )
     except Exception as exc:
         return {

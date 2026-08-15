@@ -21,7 +21,14 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from abcp_client import ABCPClient, ABCPTransportError
 from harness.auth_fleet import AUTH_FLEET_MEMORY_SCOPE, auth_fleet_memory_guidance
 from harness.compaction import compact_messages_if_needed, validate_tool_pairing
-from runtime_config import ABCPClientConfig, HarnessConfig, ModelConfig, RuntimeConfig, VLConfig
+from runtime_config import (
+    ABCPClientConfig,
+    ClaimExtractorConfig,
+    HarnessConfig,
+    ModelConfig,
+    RuntimeConfig,
+    VLConfig,
+)
 from harness.challenge_detector import ChallengeTracker
 from harness.content_completeness import ContentCompletenessTracker
 from harness.constants import (
@@ -538,14 +545,54 @@ def summarize_lead_tool_result_for_log(
     return trim_large_strings(summary, 1000)
 
 
+@dataclass(frozen=True)
+class CachePressureState:
+    """What the usage receipts have said so far about prompt-prefix reuse.
+
+    `rebuild_cache_read` is the cache_read floor observed on the one call that
+    paid for a rebuilt prefix. It is the baseline the next receipt is compared
+    against, and it is meaningful only while `awaiting_prefix_reuse` holds.
+    """
+
+    streak: int = 0
+    awaiting_prefix_reuse: bool = False
+    rebuild_cache_read: Optional[int] = None
+
+
 def update_cache_pressure_state(
+    state: CachePressureState,
     *,
-    current_streak: int,
     usage_payload: JsonDict,
     config: HarnessConfig,
     step: int,
     max_steps: int,
-) -> tuple[int, Optional[str]]:
+) -> tuple[CachePressureState, Optional[str]]:
+    """Track sustained cache misses, ignoring the ones compaction itself causes.
+
+    A compaction replaces the prompt prefix, so the call that follows it pays
+    for the whole prefix again. Counting that as evidence of pressure makes the
+    detector observe its own splash: in task a608b5e7 browser-002 compacted at
+    step 32 (uncached 44,335), read that as pressure and compacted again at
+    step 33 (43,152), and settled at step 34 (6,263). browser-004 did the same
+    at steps 47/48. The second compaction in each pair bought nothing and cost
+    a summarization round plus the causal detail it dropped.
+
+    While a rebuild is outstanding the miss is attributed to it rather than
+    accumulated. Two receipts can end that attribution, and both are arithmetic
+    on the usage payload rather than a step count guessed here:
+
+    * `uncached_input` back under the threshold — the prefix is demonstrably
+      warm; or
+    * `cache_read` above the floor recorded on the rebuild call — the rebuilt
+      prefix has been written and read back.
+
+    The second one matters because `cache_read` never falls to zero: the system
+    prompt and tool schemas keep their own warm segment across a rebuild. In
+    a608b5e7 every compaction landed on a floor of 20,480-24,576 and the very
+    next call read 35,072-70,144, so "cache_read > 0" would clear the
+    attribution instantly while "back under the threshold" could, on a worker
+    whose every step carries a large tool result, never clear at all.
+    """
     threshold = int(
         getattr(config, "cache_pressure_uncached_input_threshold", 10000) or 0
     )
@@ -554,20 +601,71 @@ def update_cache_pressure_state(
         getattr(config, "cache_pressure_min_remaining_steps", 2) or 0
     )
     if threshold <= 0 or required <= 0:
-        return 0, None
+        return CachePressureState(), None
     try:
         uncached_input = int(usage_payload.get("uncached_input") or 0)
     except (TypeError, ValueError):
         uncached_input = 0
-    streak = current_streak + 1 if uncached_input > threshold else 0
+    try:
+        cache_read = int(usage_payload.get("cache_read") or 0)
+    except (TypeError, ValueError):
+        cache_read = 0
+
+    if state.awaiting_prefix_reuse:
+        if state.rebuild_cache_read is None:
+            # The rebuild call itself. Record the floor its cache_read fell to
+            # and charge its miss to the rebuild.
+            return CachePressureState(0, True, cache_read), None
+        if cache_read <= state.rebuild_cache_read and uncached_input > threshold:
+            # The rebuilt prefix has still not been read back.
+            return state, None
+
+    if uncached_input <= threshold:
+        return CachePressureState(), None
+    streak = state.streak + 1
     remaining_steps = max_steps - step
     if streak >= required and remaining_steps > min_remaining:
         reason = (
             "cache_pressure:"
             f"uncached_input>{threshold} for {streak} consecutive step(s)"
         )
-        return 0, reason
-    return streak, None
+        return CachePressureState(), reason
+    return CachePressureState(streak), None
+
+
+def compact_and_track_prefix_rebuild(
+    agent: Any,
+    *,
+    actor: str,
+    step: int,
+    system_prompt: Any,
+    messages: List[JsonDict],
+    tools: Any,
+    force_reason: Optional[str] = None,
+) -> List[JsonDict]:
+    """Compact, and record it when the prompt prefix was actually rebuilt.
+
+    Every skip path in `compact_messages_if_needed` returns the same list
+    object it was handed, so identity is what separates a real rebuild from a
+    no-op. Both agents go through here rather than calling the compactor
+    directly: the error-recovery paths rebuild the prefix exactly like the
+    main loop does, and a detector that only knows about some of the rebuilds
+    goes back to counting its own splash on the others.
+    """
+    rebuilt = compact_messages_if_needed(
+        logger=agent.logger,
+        actor=actor,
+        step=step,
+        system_prompt=system_prompt,
+        messages=messages,
+        tools=tools,
+        config=agent.runtime.harness,
+        lifecycle=agent.lifecycle,
+        force_reason=force_reason,
+    )
+    if rebuilt is not messages:
+        agent._cache_pressure = CachePressureState(awaiting_prefix_reuse=True)
+    return rebuilt
 
 
 def _saved_paths_from_value(value: Any) -> List[str]:
@@ -646,7 +744,7 @@ class BrowserAgent:
         self.page_inventory_signal = PageInventorySignal()
         self.event_observer = BrowserEventObserver(self)
         self.recent_tool_signatures: List[str] = []
-        self._cache_pressure_streak = 0
+        self._cache_pressure = CachePressureState()
         self._forced_compaction_reason: Optional[str] = None
         self.static_context_block, self.static_context_hash = build_static_context_block(
             self.runtime.harness.context_file
@@ -726,15 +824,13 @@ class BrowserAgent:
             ):
                 force_reason = self._forced_compaction_reason
                 self._forced_compaction_reason = None
-                messages = compact_messages_if_needed(
-                    logger=self.logger,
+                messages = compact_and_track_prefix_rebuild(
+                    self,
                     actor="browser_agent",
                     step=step,
                     system_prompt=system_prompt,
                     messages=messages,
                     tools=tools,
-                    config=self.runtime.harness,
-                    lifecycle=self.lifecycle,
                     force_reason=force_reason,
                 )
                 self._write_agent_event("agent.step.start", {"step": step})
@@ -1685,6 +1781,7 @@ L3. Lifecycle And HITL
 - You never receive browser events directly. Call Page.list once to refresh handles, and stop using closed or stale pageIds, whenever a receipt reports `pageInventoryChanged` or a click/submit that should have navigated left your current page unchanged. Do not list pages after every ordinary click. After Page.dialogClosed or File.chooserClosed, call Page.getState before continuing. Page state is one of loading / ready / failed / crashed, and only `ready` is usable for DOM or Input: a page you just opened starts loading, so wait for it rather than probing it. A failed or crashed page reports WHY in `failure.kind` — `network` may be worth one fresh navigation, `renderer-lost` needs the page recreated, and `automation-unavailable` means the document may look fine while automation cannot attach to it, so navigating again changes nothing and it should be reported as a blocker. After Page.crashed, discard stale targets and resync or recreate the page.
 - A BrowserAgent may manage multiple tabs/pages inside its own instance. Use Page.create for additional pages and Page.switchTo/Page.list to select the active page. Control pages serially, not concurrently, and refresh Page/DOM perception after every switch before acting.
 - For a card click that may navigate, save sourcePageId/sourceUrl and the anchor's real href/item identity first, then issue ONE click. The Fleet click gate observes only a short window after the action, so its receipt is bounded evidence, not the whole truth. `same_page_changed` identifies the source page's new URL and can be used directly. `no_navigation_observed` (also reported as `no_navigation_observed_within_window`) means the gate saw nothing IN ITS SHORT WINDOW — it is NOT proof that no tab opened, because a site can open the results tab seconds later. On that outcome, and on `ambiguous`, do exactly this before anything else: call Page.list ONCE, look for a page in your assigned fleet with `claimable: true`, and address it to claim it. Do not re-click, do not hand-build a URL, and do not conclude from the old page's unchanged Page.getState that the action failed. Page.list is the only sanctioned way to discover a page you did not create; use it whenever a submit/click should have navigated but your current page did not change. When the page you claimed IS the destination of that click, say so on your first Page.getState against it by passing browser_call.navigation_context={{"kind":"route_recovery_claimed_page","sourcePageId":"<the page you clicked on>"}} — the harness cannot infer that link and will otherwise treat the listing click as unresolved. After working on a claimed page, return with Page.switchTo(sourcePageId); for a same-tab transition return with Page.go(direction="back", n=1), wait for Page.loaded/Page.loadFailed, then refresh Page.getState + DOM.getAXTree. Do not pre-compose dependent clicks before receiving the gate receipt.
+- For details discovered on a live listing, preserve the source and enter through a freshly rebound card identity/href first. Return with Page.switchTo(sourcePageId) after a new-tab detail or Page.go(back, n=1) after same-tab navigation, then refresh page/DOM evidence. Use direct Page.navigate(detailUrl) only when the source is unavailable or the card cannot be reliably rebound, and verify required regions afterward.
 {RUNTIME_AUTH_INTERRUPT_SOP}
 - After a successful Hitl.requestPause, the harness owns wait, resolve, visual recovery checks, and terminal confirmation. Do not call any Hitl.* method again. Continue only when `hitl_wait.status="resumed"`; on `timeout`, `page_settled_after_hitl`, `stale_pause_deadlock`, `still_challenge_after_hitl`, or `browser_error_after_hitl`, call final_answer with a blocker.
 - DOM.getAXTree can contain multiple depth-0 rootwebarea entries from embedded frames. A challenge-labelled frame with an actionable verification control (for example a slider, checkbox, or verify button) is decisive even when the main page title/content looks normal or a whole-page screenshot makes the small frame easy to miss. The harness may auto-request HITL from this structural evidence; do not downgrade it to normal_loading or blocked_content_suppression.
@@ -1694,7 +1791,7 @@ L3. Lifecycle And HITL
 L4. Actions, Verification, Data
 - Prefer Input.* for focus, scrolling, stabilization, and occlusion-aware interactions. When you hold BOTH a canonical AXTree id and a stable semantic selector for the same element, send BOTH in the same locator: ABCP resolves the id first and falls back to the selector inside one dispatch, and the receipt's `resolvedBy` tells you which answered. Never invent a selector to fill the pair, never pair an id with a selector for a different element (if the two could resolve differently, refresh instead of guessing), and never issue a second call with the other locator — that is a second real action, not a fallback. Send the id alone when that is all you have; a stable semantic selector alone is the fallback (avoid dynamic hash classes); raw coordinates are last resort. This applies wherever the live schema accepts both — Input.click/type/press/select, Input.drag (source id/selector, destination toId/toSelector), Input.scroll's target/container objects, DOM.getText/getAttribute/getImg targets[], Page.screenshot, File.handleChooser. When you sent an id and the receipt comes back `resolvedBy` "selector-fallback" or "snapshot-recovery", that id was stale: refresh DOM.getAXTree before reusing ids from that snapshot. (A selector-only call reports "selector" and says nothing about any id.) Keep Input.click force=false unless live evidence proves that dispatching toward an occluded target is intentional; force does not bypass hit testing and an overlay may receive the click. For select-like controls whose choices are unknown, call DOM.inspectSelect first; it is READ-ONLY and restores the control's original open/selection/scroll state, reporting `select-state-restore-failed` rather than assuming it succeeded. Its `query` filters options already discovered, it is not a search action — inspect `truncated`, `exploration`, and `diagnostics.incomplete` before believing the list is complete. Every Input.select selections item must carry EXACTLY ONE locator: id, exact value, exact label, or path — combining them is rejected. path is exclusive and each path segment follows the same one-locator rule. Prefer an exact returned value or label; a custom option id is only valid while the popup generation that exposed it is still open, so DOM.inspectSelect omits those ids after restoring a closed popup and you must use the returned value/label instead. Multiple direct choices declare the FINAL selection set (not an append) and require a control confirmed as `selectionMode: "multiple"`; multiple cascade paths are unsupported. Treat returned `selected` and `selectionMode` as the only completion proof, and on `select-selection-unconfirmed` inspect the control before attempting any correction — it may have partly changed. For cascades, use only a complete returned path; when diagnostics.incomplete or truncated is true and no complete path is returned, do not invent a path. Do not synthesize identifiers or manually open, click, hover, reload, or otherwise manage a supported control popup because Input.select owns that atomic interaction. Treat option ids returned by DOM.inspectSelect as opaque ABCP option descriptors, not arbitrary AXTree anchors. If DOM.inspectSelect explicitly reports that the element has no supported select semantics, do not call Input.select: a visible multi-column category/list browser is ordinary non-select UI and may instead be traversed with fresh AXTree targets plus one verified Input.click per visible level. Use Input.select.response.data.selected as the selection receipt, then verify dependent fields or navigation with fresh DOM/Page evidence. Input.drag needs both endpoints in the SAME document: cross-frame and cross-document drags are unsupported, and a source inside an iframe cannot use a coordinate or dx/dy destination because the frame that owns the offset is ambiguous — give canonical ids for both endpoints from that same frame. Relative offsets stop at the edge of the source document's visible area. Do not add manual scroll or wait steps before standard Input.* interactions — they already handle focus, scrolling, and stabilization; manually scroll only nested scrollable containers or lazy-loading flows.
 - Verify every state-changing action with the cheapest reliable signal: ActionFeedback, Page.getState for navigation/lifecycle, refreshed DOM.getAXTree, DOM.getText, or DOM.getAttribute(value).
-- Extraction priority is: DOM.getAXTree to enumerate stable canonical ids; one native batched DOM.getText call for related text targets; one native batched DOM.getAttribute call for related attribute targets; repeat that native cycle after bounded scrolling/load-more when a collection must grow; gated browser_call(method="Runtime.evaluate") only after the harness verifies TWO evidence classes on that pageId in the current page epoch: one structure read (DOM.getAXTree or DOM.getSemanticTree) AND one targeted native read (DOM.getText, DOM.getAttribute, or DOM.getImg). Page.getState is useful context but satisfies neither class. Pick one available method per class, never call the whole list, and remember Input.* starts a new epoch so re-read after scrolling. For shadow-host diagnosis, use DOM.getSemanticTree with includeShadowDom=true only when that parameter is advertised by the connected method schema; never invent unsupported params. Preserve targets input order when reconstructing rows, inspect every response.data.items entry independently, and call record_extraction after validation. When a successful structured read directly observes values for a declared content_completeness region, attach harness-only content_binding={{"regionId":"<declared id>"}} as a sibling of params. It only delays route recovery briefly; it never replaces record_extraction or certifies completion. Runtime.evaluate is read-only and last-resort only; it requires runtime_policy with intent/effect/reason_kind/why_structured_tools_insufficient/cross_check_plan and explicit world="isolated". All ordinary reason kinds remain strict isolated. Only non_dom_state may trigger a harness-controlled second strict main call: the expression must throw ReferenceError("ABCP_MAIN_WORLD_REQUIRED:<global>") when that required page global is absent. Ordinary JavaScript errors, timeouts, and empty values never authorize main. With result_mode=json, pass a JSON-serializable value expression or invoked IIFE, never a function body/top-level return or uninvoked function. Never request main or auto directly, use JavaScript to bypass permissions, mutate state, or replace form/upload interactions.
+- Extraction priority is: DOM.getAXTree to enumerate stable canonical ids; one native batched DOM.getText call for related text targets; one native batched DOM.getAttribute call for related attribute targets; repeat that native cycle after bounded scrolling/load-more when a collection must grow; gated browser_call(method="Runtime.evaluate") only after the harness verifies TWO evidence classes on that pageId in the current page epoch: one structure read (DOM.getAXTree or DOM.getSemanticTree) AND one targeted native read (DOM.getText, DOM.getAttribute, or DOM.getImg). Page.getState is useful context but satisfies neither class. Pick one available method per class, never call the whole list, and remember Input.* starts a new epoch so re-read after scrolling. For shadow-host diagnosis, use DOM.getSemanticTree with includeShadowDom=true only when that parameter is advertised by the connected method schema; never invent unsupported params. Preserve targets input order when reconstructing rows, inspect every response.data.items entry independently, and call record_extraction after validation. Runtime.evaluate is read-only and last-resort only; it requires runtime_policy with intent/effect/reason_kind/why_structured_tools_insufficient/cross_check_plan and explicit world="isolated". All ordinary reason kinds remain strict isolated. Only non_dom_state may trigger a harness-controlled second strict main call: the expression must throw ReferenceError("ABCP_MAIN_WORLD_REQUIRED:<global>") when that required page global is absent. Ordinary JavaScript errors, timeouts, and empty values never authorize main. With result_mode=json, pass a JSON-serializable value expression or invoked IIFE, never a function body/top-level return or uninvoked function. When that JSON value already IS the rows you intend to keep, add runtime_policy.record_name to persist them in the same call — reading a large result back out of its offload file to retype it into record_extraction costs several turns and risks copying it wrong. Never request main or auto directly, use JavaScript to bypass permissions, mutate state, or replace form/upload interactions.
 - Use DOM.getImg to export visual assets when the live capability exists: <img>, <picture>, SVG <image>, inline SVG, <canvas>, and other visual nodes the platform can capture by screenshot. Its `selector` resolves in the main document AND every nested author Shadow DOM, so a shadow-hosted image needs no special handling. Send ONE batch of up to 32 `targets` (each may carry id and selector together) plus the required `options.path` output directory; prefer imageFormat="auto", which keeps a safe self-contained inline SVG as .svg, keeps supported raster sources as-is, and otherwise encodes PNG. Read every response.data.items entry independently and trust its receipt over your expectation: `info.savedPath` is the artifact, `info.mimeType`/`info.extension` say what was actually written, and `info.method` distinguishes a native export from a screenshot fallback — a fallback is a real, citable artifact, not a failure, and `info.fallbackReason` records why it was needed. For a failed item read `error.code` plus `error.fallbackContext`, which separates a resolution failure from a load/decode/native-export/screenshot/output failure; a per-item failure is not a whole-call failure. Do not re-issue the whole batch for a failed item. Target the actual visual node, not a wrapper: a plain container that merely CONTAINS an image is not a native export target — it succeeds as a screenshot of the whole container (info.method="fallback-screenshot", info.fallbackReason.code="unsupported-image-target"), which is rarely the asset you wanted. A native export returns the SOURCE asset at its natural size, so a small source rendered large exports small; read info.width/height and info.naturalWidth/naturalHeight rather than assuming the on-screen box.
 {workflow_rule}
 - Any reusable data handed to LeadAgent must go through record_extraction. Row keys must match expected_artifact fields exactly. Critical fields need sourceTool, sourceSelectorOrAxId, pageUrl, and canonical <field>EvidenceText evidence fields such as rankEvidenceText where applicable.
@@ -1719,7 +1816,8 @@ L5. Recovery
 - If the instruction itself can never succeed on this source regardless of page state (contradictory requirements, a field/range this site does not define, a concept the source lacks), final_answer with status="incomplete" and include a blocker exactly like {{"classification":"instruction_infeasible","reason":"...","evidenceArtifacts":["<artifact path>"]}}. Use target_absent when this page could have held the target but demonstrably does not; use instruction_infeasible when no page of this source could satisfy the request.
 
 L6. Termination
-- Track remaining step budget. Near the cap, stop probing and call final_answer.
+- The runtime reports current/max/remaining step counts. They are arithmetic
+  resource facts, not an instruction to abandon or narrow the original goal.
 - final_answer.status must be one of the tool schema values: done, partial, incomplete, extraction_inconclusive.
 - final_answer.answer must be JSON shaped like {{"outcome":"done|partial|blocked|failed","data":{{}},"evidence":[],"blockers":[],"next_steps":[]}}. Put large rows in record_extraction artifacts and reference their savedPath, not inline data.
 """ + self.static_context_block
@@ -1869,7 +1967,9 @@ L6. Termination
         next_step = current_step + 1
         if next_step > max_steps:
             return None
-        remaining = max_steps - next_step
+        # Inclusive count: when step 48 has completed in a 50-step run, steps
+        # 49 and 50 are both still available.
+        remaining = max_steps - current_step
         if remaining > 2:
             return None
         if remaining <= 0:
@@ -1898,8 +1998,8 @@ L6. Termination
     def _observe_cache_pressure(
         self, usage_payload: JsonDict, *, step: int, max_steps: int,
     ) -> None:
-        self._cache_pressure_streak, reason = update_cache_pressure_state(
-            current_streak=self._cache_pressure_streak,
+        self._cache_pressure, reason = update_cache_pressure_state(
+            self._cache_pressure,
             usage_payload=usage_payload,
             config=self.runtime.harness,
             step=step,
@@ -1991,6 +2091,12 @@ L6. Termination
         if override_reason:
             payload["statusOverrideReason"] = override_reason
         self._write_agent_event("agent.final", payload)
+
+
+# Validator error kinds that mean no verdict was ever produced. Everything
+# else on `status: error` is a verdict the harness itself refused, which is a
+# finding about the candidate and can never be read as an absent reviewer.
+_UNREVIEWED_ERROR_KINDS = frozenset({"transport", "protocol"})
 
 
 def _plan_review_scope_signature(plan: Any) -> str:
@@ -2111,6 +2217,23 @@ class LeadAgent:
             )
             self.claim_extractor_model = extractor_config.model_id
             self.claim_extractor_provider_name = extractor_config.provider
+        elif (
+            plan_validator_provider is None
+            and validator_config.enabled
+            and validator_config.model_id
+        ):
+            # Same auditor model and credentials, its own connection: sharing
+            # the provider object also shared `thinking`/`effort` and the
+            # validator's output budget, which is a plan-review setting and
+            # wrong for a span-to-metric lookup. Only possible when this
+            # constructor built the validator from config — an injected
+            # provider is already parameterized and cannot be re-derived.
+            derived = ClaimExtractorConfig.derived_from(validator_config)
+            self.claim_extractor_provider = LLMFactory.create_provider(
+                derived.model_config()
+            )
+            self.claim_extractor_model = derived.model_id
+            self.claim_extractor_provider_name = derived.provider
         elif self.plan_validator_provider is not None:
             self.claim_extractor_provider = self.plan_validator_provider
             self.claim_extractor_model = validator_config.model_id
@@ -2120,7 +2243,7 @@ class LeadAgent:
         )
         self.recent_tool_signatures: List[str] = []
         self._current_step: int = 0
-        self._cache_pressure_streak = 0
+        self._cache_pressure = CachePressureState()
         self._forced_compaction_reason: Optional[str] = None
         # Set True when THIS run's schema bootstrap could not (re)build the cache
         # (no browser, empty capabilities, lock timeout, exception). A stale local
@@ -2241,6 +2364,7 @@ class LeadAgent:
         if provider is None:
             review = {
                 "status": "error",
+                "errorKind": "transport",
                 "candidateHash": candidate_hash,
                 "errors": ["plan validator provider is unavailable"],
             }
@@ -2257,6 +2381,11 @@ class LeadAgent:
                 provider_name=config.provider,
                 model_id=config.model_id,
             )
+        # Bind infrastructure failures to the mechanically normalized
+        # candidate that was actually submitted.  This lets acceptance
+        # distinguish "the critic was unavailable" from an unrelated or stale
+        # review object without converting availability into a semantic veto.
+        review.setdefault("candidateHash", candidate_hash)
         audit_path = write_plan_review_audit(
             self.logger,
             candidate_plan=candidate,
@@ -2387,8 +2516,44 @@ class LeadAgent:
                 if isinstance(plan_validator_review, dict)
                 else ""
             )
+            # `status: error` spans two different worlds and only one of them
+            # means "there was no review". A transport or protocol failure
+            # leaves the harness with no semantic opinion at all. A
+            # `verdict_invalid` error is the opposite: the critic answered, and
+            # `_validate_verdict` rejected the answer — most consequentially an
+            # approval that weakened an objective without citing evidence. That
+            # is a finding ABOUT the candidate. Task a608b5e7 read it as an
+            # absent reviewer and accepted a replan that dropped the image
+            # objective outright.
+            review_error_kind = (
+                str(plan_validator_review.get("errorKind") or "")
+                if isinstance(plan_validator_review, dict)
+                else ""
+            )
+            review_never_answered = (
+                isinstance(plan_validator_review, dict)
+                and plan_validator_review.get("status") == "error"
+                and review_error_kind in _UNREVIEWED_ERROR_KINDS
+                and reviewed_hash == plan_candidate_hash(plan, replan_reason)
+            )
+            # An absent critic still cannot wave through a REPLAN that changes
+            # goal, phase topology, dependencies, artifact contracts or
+            # validators: those are exactly what the review exists to examine,
+            # and a replan is where an objective quietly gets dropped. An
+            # initial plan has no prior scope to compare against, so it keeps
+            # the existing behaviour — failing closed there would let one bad
+            # API key stop every task from starting, which no evidence asks for.
+            scope_changed_replan = (
+                self.task_plan is not None
+                and _plan_review_scope_signature(plan)
+                != _plan_review_scope_signature(self.task_plan)
+            )
+            infrastructure_unreviewed = (
+                review_never_answered and not scope_changed_replan
+            )
             if (
                 not operational_continuation
+                and not infrastructure_unreviewed
                 and (
                     not isinstance(plan_validator_review, dict)
                     or plan_validator_review.get("status") != "approved"
@@ -2407,7 +2572,22 @@ class LeadAgent:
                         if isinstance(plan_validator_review, dict)
                         else "missing"
                     ),
+                    "validatorErrorKind": review_error_kind or None,
+                    "reviewScopeChanged": scope_changed_replan,
+                    # Two different situations reach this branch and they call
+                    # for different next moves, so say which one happened
+                    # instead of always reporting semantic findings to fix.
                     "next_instruction": (
+                        "The independent PlanValidator produced no verdict"
+                        " (see validatorErrorKind), and this candidate changes"
+                        " goal, phase topology, dependencies, artifact"
+                        " contracts or validators — exactly what that review"
+                        " exists to examine. Keep the current plan. Either"
+                        " continue the running phase (a continuation that"
+                        " leaves scope unchanged needs no review), or submit a"
+                        " smaller candidate."
+                        if review_never_answered
+                        else
                         "The candidate plan was not approved by the configured"
                         " independent PlanValidator. Preserve the current plan"
                         " and correct the reported semantic findings."
@@ -2415,6 +2595,16 @@ class LeadAgent:
                 }
                 self.logger.write("task_plan.rejected", result)
                 return result
+            if infrastructure_unreviewed:
+                self.logger.write("task_plan.review_unavailable", {
+                    "candidateHash": reviewed_hash,
+                    "auditPath": plan_validator_review.get("auditPath"),
+                    "errors": plan_validator_review.get("errors"),
+                    "effect": (
+                        "mechanically valid candidate accepted without an"
+                        " independent semantic review"
+                    ),
+                })
 
         checkpoint_state = reconcile_replan_checkpoints(self.logger)
         checkpoint_errors = replan_checkpoint_plan_errors(
@@ -2466,32 +2656,10 @@ class LeadAgent:
                 self.logger.write("task_plan.rejected", result)
                 return result
 
-            plan_phases = (
-                plan.get("phases") if isinstance(plan.get("phases"), list) else []
-            )
-            if len(plan_phases) > 1:
-                implicit = [
-                    str(phase.get("id") or "")
-                    for phase in plan_phases if isinstance(phase, dict)
-                    and phase.get("depends_on") is None
-                ]
-                if implicit:
-                    result = {
-                        "status": "failed",
-                        "error": (
-                            "multi-phase replan requires explicit depends_on for"
-                            " every phase"
-                        ),
-                        "phasesMissingDependsOn": implicit,
-                        "next_instruction": (
-                            "Re-emit the complete replan. Use depends_on=[] for"
-                            " independent remediation phases, or list their exact"
-                            " data dependencies, so the harness cannot silently"
-                            " serialize them by plan order."
-                        ),
-                    }
-                    self.logger.write("task_plan.rejected", result)
-                    return result
+            # Omitted dependencies already have a deterministic meaning:
+            # conservative serial plan order.  Requiring the model to spell
+            # that default on every replacement plan was a schema ritual, not
+            # a safety or correctness boundary.
         resume_replan_report: Optional[JsonDict] = None
         if replan_reason and self.resume is not None:
             try:
@@ -2618,6 +2786,20 @@ class LeadAgent:
                 " that later become phase_failed."
             ),
         }
+        if isinstance(plan_validator_review, dict):
+            review_status = str(plan_validator_review.get("status") or "")
+            result["planReview"] = {
+                "status": review_status,
+                "reviewed": review_status == "approved",
+                "auditPath": plan_validator_review.get("auditPath"),
+                "note": (
+                    "Candidate passed mechanical validation but the independent"
+                    " semantic reviewer was unavailable; this is not an"
+                    " approval or a rejection."
+                    if review_status == "error"
+                    else "Independent semantic review receipt."
+                ),
+            }
         # Echo what task_type policy ALREADY enforces worker-side, instead of
         # duplicating it into the plan: the model sees the coverage and stops
         # hand-authoring deny-lists of guessed method names (task 2ed5a466:
@@ -3308,15 +3490,13 @@ class LeadAgent:
             for step in range(1, self.runtime.harness.lead_max_steps + 1):
                 force_reason = self._forced_compaction_reason
                 self._forced_compaction_reason = None
-                messages = compact_messages_if_needed(
-                    logger=self.logger,
+                messages = compact_and_track_prefix_rebuild(
+                    self,
                     actor="lead_agent",
                     step=step,
                     system_prompt=system_prompt,
                     messages=messages,
                     tools=tools,
-                    config=self.runtime.harness,
-                    lifecycle=self.lifecycle,
                     force_reason=force_reason,
                 )
                 remaining = self.runtime.harness.lead_max_steps - step
@@ -3441,15 +3621,13 @@ class LeadAgent:
                                 "triggerAttempt": model_attempt,
                             },
                         )
-                        messages = compact_messages_if_needed(
-                            logger=self.logger,
+                        messages = compact_and_track_prefix_rebuild(
+                            self,
                             actor="lead_agent",
                             step=step,
                             system_prompt=system_prompt,
                             messages=messages,
                             tools=tools,
-                            config=self.runtime.harness,
-                            lifecycle=self.lifecycle,
                             force_reason=reason,
                         )
                     except LLMConnectionError as exc:
@@ -3495,15 +3673,13 @@ class LeadAgent:
                                 "triggerAttempt": model_attempt,
                             },
                         )
-                        messages = compact_messages_if_needed(
-                            logger=self.logger,
+                        messages = compact_and_track_prefix_rebuild(
+                            self,
                             actor="lead_agent",
                             step=step,
                             system_prompt=system_prompt,
                             messages=messages,
                             tools=tools,
-                            config=self.runtime.harness,
-                            lifecycle=self.lifecycle,
                             force_reason=reason,
                         )
                     except LLMProviderProtocolError as exc:
@@ -3532,15 +3708,13 @@ class LeadAgent:
                         if not will_retry:
                             raise
                         reason = "llm_protocol_step_retry"
-                        messages = compact_messages_if_needed(
-                            logger=self.logger,
+                        messages = compact_and_track_prefix_rebuild(
+                            self,
                             actor="lead_agent",
                             step=step,
                             system_prompt=system_prompt,
                             messages=messages,
                             tools=tools,
-                            config=self.runtime.harness,
-                            lifecycle=self.lifecycle,
                             force_reason=reason,
                         )
                 if model_call_failed:
@@ -3902,7 +4076,8 @@ class LeadAgent:
         next_step = current_step + 1
         if next_step > max_steps:
             return None
-        remaining = max_steps - next_step
+        # Inclusive count of model turns still available.
+        remaining = max_steps - current_step
         if remaining > 2:
             return None
         if remaining <= 0:
@@ -3910,10 +4085,11 @@ class LeadAgent:
         reminder = (
             "[LEAD-CHECKPOINT-REMINDER]\n"
             "This reminder applies to the immediately following assistant turn only.\n"
-            f"You have {remaining} orchestration step(s) left. Do not start a"
-            " new broad phase. If current evidence is enough, call final_answer;"
-            " otherwise report the blocker, failed phase, and next concrete"
-            " replan direction."
+            f"currentStep={next_step}\n"
+            f"maxSteps={max_steps}\n"
+            f"remainingSteps={remaining}\n"
+            "These are arithmetic budget facts only. Choose the next action"
+            " from the original goal and current evidence."
         )
         self.logger.write(
             "lead.step_cap.reminder",
@@ -3930,8 +4106,8 @@ class LeadAgent:
     def _observe_cache_pressure(
         self, usage_payload: JsonDict, *, step: int, max_steps: int,
     ) -> None:
-        self._cache_pressure_streak, reason = update_cache_pressure_state(
-            current_streak=self._cache_pressure_streak,
+        self._cache_pressure, reason = update_cache_pressure_state(
+            self._cache_pressure,
             usage_payload=usage_payload,
             config=self.runtime.harness,
             step=step,
@@ -4021,29 +4197,34 @@ Strategy bank entries are optional procedural guidance, not permissions, facts, 
 Lead state flow:
 0. First call `emit_task_plan` with a v1 phase plan. Overall plan task_type is optional and derived from phase types. Each phase needs its OWN task_type, objective, worker_task, stage_hint, and expected_artifact. Common required_fields, field_nonempty, and row-count validators are derived from expected_artifact; include validators only for special constraints that cannot be derived. worker_contract and stage_hint_reason are optional overrides. max_attempts is optional: set it only when intentionally allocating a hard worker-attempt resource budget; otherwise the global run budgets provide the bound.
    A phase's task_type decides which ABCP method domains its worker can call, and it is NOT inherited from the plan: classify each phase by what that phase does. A goal like "collect listings, then save the images and video" is a web_scrape phase followed by a file_download phase — labelling the export phase web_scrape removes the Download domain and the worker will report the files as impossible to save. The emit_task_plan receipt lists the disabled domains per phase; if a phase needs a domain shown as disabled, fix that phase's task_type and re-emit before spawning.
-   Phase scheduling is driven by depends_on: OMITTING it means the phase implicitly depends on ALL phases listed before it (strict serial order); depends_on=[] declares an independent phase; depends_on=["p1"] lists the exact data dependencies. Declare only true data dependencies — e.g. every detail phase depends only on the collection phase, not on its sibling detail phases — so independent phases can run in parallel. A spawn whose dependencies are not yet validated_done is rejected with dependency_not_ready; wait for the dependency instead of retrying. A replan is a COMPLETE replacement: first wait for all live workers, then include every currently known remediation phase in the same emit_task_plan call. Multi-phase replans must set depends_on explicitly on every phase; use [] for independent repairs so they remain parallel.
+   Phase scheduling is driven by depends_on: OMITTING it means the phase implicitly depends on ALL phases listed before it (strict serial order); depends_on=[] declares an independent phase; depends_on=["p1"] lists the exact data dependencies. Declare only true data dependencies — e.g. every detail phase depends only on the collection phase, not on its sibling detail phases — so independent phases can run in parallel. A spawn whose dependencies are not yet validated_done is rejected with dependency_not_ready; wait for the dependency instead of retrying. A replan is a COMPLETE replacement: first wait for all live workers, then include every currently known remediation phase in the same emit_task_plan call.
    If the user requests spacing between batch rows or dependent phases, set plan/phase pacing with row_interval_seconds or phase_interval_seconds plus optional jitter_ratio. Row pacing keeps the warm tab; phase pacing waits before slot reservation. Do not invent task-level pacing.
    For repeated homogeneous rows, do not create one detail phase per row. Declare execution_role and exactly one input form: prefer worker_contract.batch_source (validated artifact_name and selector) for browser-discovered rows so the harness constructs batch_rows at spawn time; worker_contract.batch_rows is allowed only when the row identities/URLs were explicit in the user's instruction and no upstream browser artifact exists. Every direct batch_rows contract must also declare batch_rows_provenance={"source":"user_instruction","identity_fields":["<stable field>"]}; the harness verifies at least one named identity value from every row against the immutable original user task, so copied browser discoveries cannot masquerade as user input. Prefer the cohort form for artifact-derived rows: worker_contract.cohort_source={"artifact_name":...,"identity_field":"<the field that names a row>"} plus worker_contract.row_selection={"mode":"<role>","source_indices":[...]}. It states the two facts separately — which cohort the phase belongs to, and which of its rows THIS worker takes — so a probe can own one item and still bind the whole cohort for the checkpoint. The harness reads those rows out of the validated artifact by index; never re-type row content. Legacy batch_source remains accepted, but a confidence role whose selector is unbounded is rejected: it takes the whole cohort under a confidence stage's name.
    The confidence ladder is CONDITIONAL, not a phase template: use probe (at most 1 row) only when the reusable path is unknown, then obey the checkpoint's requiredNextRole. A continuation that newly proves a reusable candidate upgrades to validation; a validated bulk whose trace no longer proves the candidate downgrades to continuation. Use bulk only when requiredNextRole=bulk and set row_independent=true. Do not pre-create validation/bulk solely because multiple rows exist, and do not invent empty ladder stages. Inside an active checkpoint cohort, failed or remaining rows MUST use checkpoint-bound continuation. Use remediation only for an explicit failed-row set outside every active checkpoint; remediation cannot bind a checkpoint.
 """ + lead_bulk_execution_rule + """
    If every row truly requires a separate identity/session boundary, set batch_policy.requires_isolation_per_row=true and explain that boundary; needs_isolated_session alone isolates the worker, not each row. Never batch heterogeneous rows, per-row isolation boundaries, HITL/visual flows, or rows whose decisions depend on earlier results.
    When a validated probe/validation/bulk/continuation result includes replanCheckpoint, treat every active checkpoint as a mechanical confidence boundary rather than optional advice. Emit or start a checkpoint-bound same-cohort phase only when its role equals requiredNextRole, carrying the exact top-level replan_checkpoint_ids set on replan. HARD REQUIREMENT: retain the checkpoint's validated predecessor phase in the complete replacement plan and explicitly list that exact phase id in the bound successor's depends_on. Retained validated_done history is audit state and does not compete with the active cohort or trigger the overlap gate. When more than one cohort is active, bind exactly one next phase to each checkpoint with worker_contract.replan_checkpoint_id; never cross-bind predecessors. Preserve batch_source.cohort_selector and the merged expected_artifact shape across the cohort. Preserve or strengthen every non-slice validator obligation; never remove or weaken one. Row-count validators, plus range/set/unique constraints that target the declared selector identity, may follow the selected remainingSourceIndices. stage_hint and strategy selection are execution profile and may change after evidence. Do not repeat validated indices or create horizontal single-row exploration phases. Initial plans must not invent validation/bulk/continuation checkpoint ids. The legacy top-level replan_checkpoint_id remains valid only for one active checkpoint. fastPathReceiptCandidate is audit-only in Stage 6B-A and MUST NOT be executed or translated into browser calls yet.
-   validators is an ARRAY of typed objects (never a dict keyed by validator name). Valid validator types (exact enum): """ + ", ".join(sorted(VALIDATOR_TYPES)) + """. Common shapes: {"type":"exact_rows","count":11}, {"type":"range","field":"rank","min":40,"max":50}, {"type":"set_equals","field":"rank","values":[39,41]} for an exact NON-CONTIGUOUS target set, {"type":"unique","fields":["detailUrl"]}, {"type":"url_pattern","field":"detailUrl","pattern":"^https://..."}, {"type":"required_fields","fields":[...]}, {"type":"field_nonempty","fields":[...]}. File phases use dedicated evidence validators: file_download normally combines download_completed with file_integrity; file_upload uses upload_selected and, when the page exposes a confirmation, upload_confirmed with its evidence field/pattern; DOM.getImg exports use image_exported. Keep file_download and file_upload as separate task_type values. A range includes every value between min/max and cannot express {38,40}; use set_equals or attach explicit skill_rows for such remediation. Do not invent type names (url_format/rank_range/no_duplicates are wrong).
+   validators is an ARRAY of typed objects (never a dict keyed by validator name). Valid validator types (exact enum): """ + ", ".join(sorted(VALIDATOR_TYPES)) + """. Common shapes: {"type":"exact_rows","count":11}, {"type":"range","field":"rank","min":40,"max":50}, {"type":"set_equals","field":"rank","values":[39,41]} for an exact target identity set, {"type":"unique","fields":["detailUrl"]}, {"type":"url_pattern","field":"detailUrl","pattern":"^https://..."}, {"type":"required_fields","fields":[...]}, {"type":"field_nonempty","fields":[...]}. File phases use dedicated evidence validators: file_download normally combines download_completed with file_integrity; file_upload uses upload_selected and, when the page exposes a confirmation, upload_confirmed with its evidence field/pattern; DOM.getImg exports use image_exported. Keep file_download and file_upload as separate task_type values. A range includes every value between min/max and cannot express {38,40}; use set_equals or attach explicit skill_rows for such remediation. Do not invent type names (url_format/rank_range/no_duplicates are wrong).
    A field that some target pages legitimately do not carry (a product with no written reviews, an item with no pros/cons section) must be declared emptiable, or the phase demands data that does not exist and burns every attempt against a page that will not change. Declare it as expected_artifact.allow_empty_with_outcome={"reviews":["confirmed_absent"]}. That is a licence to prove absence, not to skip the field: the row must still carry <field>Absence with regionMaterialized, overlayClear, enumerationExhausted, selectorCalibratedBy, sourceTool, sourceSelectorOrAxId, evidenceText and navigationEpoch, and an incomplete proof still fails. Declare it only for fields the target genuinely may omit, never as a blanket relaxation.
    When the user asks to save page-rendered visual assets (img/picture/SVG/canvas) and DOM.getImg is present in the live capability set exposed for that phase's task_type, keep the export in the page-owning phase and instruct one batched DOM.getImg call (up to 32 targets) before leaving the page. Do not mechanically split that image export into an image-URL artifact followed by a separate Download.start phase. Validate the returned savedPath items with image_exported and file_integrity.
-   When a detail phase has known task-critical regions, content_completeness markers/regions may be declared only to collect observations. Marker matches, missing regions and recovery receipts are evidence for the worker and Lead to interpret; they do not mechanically prove suppression, absence, or completion. Never invent a default count when the user gave none.
+   When a detail phase has known task-critical regions, content_completeness markers/regions may be declared only to collect observations. Do not put a route mode, recovery policy, or retry count in content_completeness; route choice belongs in the model's plan/experiment and remains revisable from live receipts. Marker matches and missing regions are evidence for the worker and Lead to interpret; they do not mechanically prove suppression, absence, or completion. Never invent a default count when the user gave none.
    When an expected artifact contains a nested repeated collection, declare its field shape explicitly, for example {"name":"reviews","type":"array","items":{"required":["reviewText","date"]}}. The child names must match the collect_items fields mapping, while the outer field remains part of required_fields when the user requires that collection. Do not describe nested item fields as top-level artifact fields.
 """ + lead_workflow_rule + """
    Valid stage_hint values: collection, detail_sections, attribute_links, form_interaction, computed_relationship, generic. Use generic only when the phase truly cannot be classified.
    Do not hand-author ABCP method lists. BrowserAgent method access is governed by task_type policy, which already disables whole method domains worker-side — a web_scrape worker cannot call Download/File/Bookmark/History methods no matter what the plan says, so you normally need NO forbidden_methods at all (the acceptance receipt echoes the policy-disabled domains). Add forbidden_methods only for an EXTRA restriction beyond policy, using canonical method names or Domain.* wildcards; never guess method names — unknown names in forbidden_methods are dropped with a warning, and unknown names in allowed_methods reject the plan. If a workflow crosses task types, split phases and replan with the correct task_type. Canonical task_type values include web_search, web_scrape, file_download, file_upload, form_filling, browser_state_management, and general. web_scrape/web_search intentionally disable Download and File methods, so a worker cannot save or upload files there. For file/PDF/export saving that is not handled by the DOM.getImg rule above, use a dedicated task_type="file_download" phase: first discover and validate the resolved URL in web_scrape/web_search, then pass that URL/path plan to file_download, where File.download and Download.* are available. For native upload controls, use task_type="file_upload", where File.handleChooser is available after the worker opens the page and triggers the chooser. For ordinary data entry, submission, login, settings changes, or forms that may include an upload control, use task_type="form_filling"; it has DOM/Input plus File.handleChooser, but not File.download or Download.*. Use task_type="browser_state_management" only for targeted Bookmark/History/Memory state work; it does not expose File.download, File.handleChooser, Download.*, Bookmark.clearAll, or History.clearAll. Legacy aliases download_file, form_fill, browser_action, and browser_data_collection are accepted but should not be emitted in new plans.
    BrowserAgent slots are expensive and pooled. Keep live slots within runtime_limits.max_browser_agent_instances. Every worker receives a coordinator-owned assignedFleetId. Normal phases in one task share the task fleet but open distinct pages; a fresh worker/page does not imply a fresh fleet. The whole task may occupy at most runtime_limits.max_task_fleets fleets (0 = unlimited); the harness never closes one, so a fleet a phase opens keeps its budget slot until the platform stops reporting it. At the ceiling a fleetless spawn silently reuses an existing task fleet, while a spawn demanding a separate identity (needs_isolated_session or a new session_key) is rejected with task_fleet_limit_reached. Same-page calls are serialized, while different pages may run concurrently. When the user supplies an existing Fleet UUID or UUID prefix, copy it verbatim into worker_contract.fleet_id and spawn_browser_agent.fleet_id; the harness resolves a unique prefix against authoritative inventory and never creates a replacement. Never put a Fleet UUID or prefix into session_key. The first use of a non-secret session_key always creates a fresh fleet and later phases reuse only that exact fleet; the sole adoption exception is an explicit reuse_from_worker_id handoff whose fleet is not already bound to another session_key. fleet_id and session_key are mutually exclusive. Use reuse_scope="page" (normally with reuse_from_worker_id or preferred_slot_id) only when prior pageIds themselves should be exposed. Declare worker_contract.needs_isolated_session=true only for a real cookie/storage/proxy identity boundary; isolated or named-session fleets never become the generic task fleet. If a named fleet is lost, follow session_fleet_lost into auth-interrupt/login recovery and never silently rebind the key. For durable login reuse, use a stable non-secret session_key and predeclare worker_contract.auth_verification with protected_url_prefixes plus stable authenticated_markers expressed as exact AX nodes, for example {"role":"button","name":"Sign out","match":"exact"}. Pick a marker that is visible only after authentication; ordinary text, substring matches, and hidden/blocked nodes are rejected. HITL resume without both harness-observed matches may reopen the current task's barrier but is never persisted as a verified cross-task login session.
-   If the user asks for an explicit item count such as "#1-10", "top 10", "all 10", or "for each of the 10 rows", encode that count as expected_artifact.exact_rows or an exact_rows validator. Use required_fields for every user-requested output field, and make scalar fields field_nonempty unless the task explicitly allows blanks or missing values.
+   If the user asks for an explicit item count such as "#1-10", "top 10", "all 10", or "for each of the 10 rows", encode that count as expected_artifact.exact_rows or an exact_rows validator. Count alone does not prove identity coverage: when the user names a concrete cohort such as ranks 11-20, also declare {"type":"set_equals","field":"rank","values":[11,12,13,14,15,16,17,18,19,20]} and {"type":"unique","fields":["rank"]}. The model translates the user's meaning into this contract; code only performs the declared arithmetic/set comparison and must not infer a cohort from prose. Use required_fields for every user-requested output field, and make scalar fields field_nonempty unless the task explicitly allows blanks or missing values.
 """ + LEAD_AUTH_PLANNING_SOP + """
 1. Spawn a BrowserAgent per startable phase: a phase is startable when every depends_on phase (or, with depends_on omitted, every prior phase) is validated_done. Independent phases MAY be spawned in parallel in one turn (respect runtime_limits.max_browser_agent_instances), then collected with wait_browser_agents. Give each worker a narrow worker_task, exact target fields, exact output format, explicit stop condition, and a `result_contract`. If a spawn returns dependency_not_ready, the dependency is still running — wait for it; do not re-spawn in a loop.
 2. When spawning a BrowserAgent, copy expected_artifact.fields / required_fields verbatim and state that record_extraction row keys must use those exact names. For provenance-sensitive fields, state the literal keys from worker_contract.validators: pageUrl, sourceTool, sourceSelectorOrAxId, and canonical <field>EvidenceText such as rankEvidenceText. The validator accepts legacy evidence/<field>Evidence aliases only as compatibility fallback; prefer the canonical keys.
 3. Never turn an unverified assumption into a worker instruction. Dynamic params must be described as observable labels, roles, headings, hrefs, artifact paths, or current-page evidence. Do not pass hard-coded pageId, fleetId, AXTree ids, CSS selectors, ranks, or list indexes unless they came from cited recent evidence.
 """ + lead_auto_selection_rule + """
 4. After each BrowserAgent result, read the model-facing worker handoff. Treat raw status, validation receipts and counters as receipts; treat Worker claims as unverified prose; preserve unresolved/counterevidence and suggested next experiments. Never infer completion from statusCategory or artifact existence alone.
+4a. A partial or incomplete attempt does not require a new plan. When the user
+    scope, phase topology and deliverable are unchanged, spawn the same phase
+    again with its prior handoff and, when useful, reuse_from_worker_id. Put the
+    changed hypothesis/selector/next experiment in spawn context; do not rewrite
+    durable plan state for tactical continuation.
    Describe a worker as "zero-LLM fast path" only when executionMode="skill_fast_path" and traceSummary.steps=0. executionMode="skill_repair" means a workflow produced a trusted baseline but a BrowserAgent LLM repaired localized fields; do not report that as zero-LLM.
 5. If artifact validation fails with schema_mismatch but the rows are trustworthy, use lead_save_artifact to reshape from trusted extraction artifacts. Do not re-scrape only to rename fields.
 6. A phase with validatedStatus="validation_failed" or task_state status="validation_failed" is not complete. Do not describe it as done/completed/successful, mark it DONE/SKIP, or build later phases as if it were validated unless you first use lead_save_artifact to create a replacement artifact that passes validation.
@@ -4053,7 +4234,7 @@ Lead state flow:
 8. phase_exhausted means only that an explicitly declared worker-attempt resource budget was used. It does not imply the target is absent or infeasible; adjust resource allocation, continue elsewhere, or report the raw blocker without changing the objective merely to bypass a counter.
 9. Repeated signatures, zero row delta and stall notices are observations. Reflect on the last hypothesis and receipt, then decide whether a changed experiment, continuation, or final blocker is justified; the counters themselves do not decide.
 11. If a worker returns partial, step_budget_exhausted with usable extraction artifacts, or validation with attemptExtractionArtifacts, continue serially with a focused worker. The continuation task must explicitly state remainingRange / remainingItems, existingArtifactPath, and which rows are already trusted so the next worker does not re-collect completed rows.
-12. Prefer related idle-slot reuse and same-instance multi-page work over creating a fresh slot. Normal new workers must create or navigate a fresh page inside assignedFleetId even when assigned to a reused slot. It is acceptable to ask one worker to open/manage multiple pages with Page.create and Page.list when the task stays within one task_type and contract; serialize same-page operations and require fresh Page.getState/DOM.getAXTree after navigation or any DOM-changing action before targeting. In listing-card batches, preserve sourcePageId/sourceUrl/item identity: new-tab details return with Page.switchTo(sourcePageId), while same-tab details return with Page.go(back, n=1); Page.navigate(sourceUrl) is fallback only.
+12. Prefer related idle-slot reuse and same-instance multi-page work over fresh slots; serialize same-page actions and refresh Page/DOM evidence after navigation or mutation. For details discovered on a live listing, default to source-card traversal: retain sourcePageId/sourceUrl/item identity and spawn with reuse_scope="page", page_policy="existing", reuse_from_worker_id=<source worker>. Rebind and click each card, returning by Page.switchTo or Page.go(back, n=1). Use direct Page.navigate(detailUrl) only when the source is unavailable or unbindable. Keep the durable plan at route-objective/identity level, without site selectors or hard-coded scripts.
 13. Before each action, distinguish established receipts, unverified claims and counterevidence. After repeated failure, state the last hypothesis, what falsified it, and the smallest changed experiment; use the global run budget deliberately.
 14. Stay within runtime_limits. Never exceed runtime_limits.max_browser_agent_instances live BrowserAgent slots, even if max_browser_agents is higher. Do not create a fresh slot just to visit another URL/listing/detail page. Put related page work inside one worker, or spawn a continuation with reuse_from_worker_id/preferred_slot_id so it reuses the prior idle slot and may see prior page candidates. Use separate slots only for deliberate parallelism, different task_type/session/account, or a hard reset after page_crashed / hitl_* terminal status; never as blind batch fan-out.
 
@@ -4080,6 +4261,10 @@ The final_answer must include:
 - Completed data range or artifact locations.
 - Failing/blocking URLs, ranks, or phases with raw worker status and receipts.
 - Whether the selected strategy completed, partially completed, or was blocked.
+Before choosing done, reread the original goal against the attributed receipts,
+worker claims, unresolved obligations and counterevidence in context.  If any
+requested deliverable remains unsupported, say partial/incomplete and name it;
+do not upgrade an artifact path or a worker claim into completion evidence.
 """ + self.static_context_block
 
 

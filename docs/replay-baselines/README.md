@@ -27,23 +27,27 @@ The replay comparison records:
 - productive browser actions and whether unresolved receipts survived the
   worker-to-Lead handoff.
 
-Progress/loop enforcement is not removed from production by this baseline.
-The decision requires a replay-only shadow run that still computes repeated
-calls, row/artifact deltas, and progress observations while bypassing their
-enforcement. No production configuration flag is introduced for that purpose.
+The shadow A/B comparison these baselines were built for has been retired.
+Progress detection is an observer in production: it computes arithmetic and
+attributes it to the tool receipt without withholding a call. Duplicate-call
+detection does the same for the first 20 byte-identical consecutive calls; a
+single global spend limit stops the 21st call and the worker, as documented in
+`docs/tau-informed-simplification-plan.md` §3.1. The old per-tool warn/force
+gates are gone, so the A/B arms no longer model the current harness.
+
+**Every baseline report in this directory describes the harness as it was when
+those gates enforced.** Read them as a record of that version. A new run is not
+comparable to them on blocked-call counts, because production no longer blocks.
 
 `analyze_runs.py` measures the original (non-resume) segment of each historical
-run and reports enforcement events that are candidates for a shadow bypass.
-It deliberately leaves `behavioralConclusion` null: a recorded blocked call has
-no browser receipt, so historical analysis cannot invent what the model would
-have done after that call executed. `docs.replay_shadow` supplies the test-only
-A/B gate fixture; neither utility is imported by production code.
+run and reports the enforcement events those runs recorded. It deliberately
+leaves `behavioralConclusion` null: a recorded blocked call has no browser
+receipt, so historical analysis cannot invent what the model would have done
+after that call executed. It remains useful against archived runs and is not
+imported by production code.
 
-For a real model/browser comparison, invoke `live_shadow_runner.py` with the
-ordinary `main.py` arguments after `--`: variant `A` delegates unchanged;
-variant `B` installs process-local witnesses and attaches
-`shadowEnforcementObservations` to the real tool receipt. The patch is restored
-when the process exits and no production configuration switch exists. Always
-use separate task directories/runs for A and B; historical worktrees remain
-read-only evidence. The B variant covers both BrowserAgent gates and the
-LeadAgent duplicate-call guard; their facts use distinct `gateKind` values.
+For a live regression, run `main.py` directly. `live_replay_runner.py` is a
+thin convenience wrapper that starts a fresh run from a past task's original
+`<user_task>` wording (`--historical-task-id`, with ordinary `main.py`
+arguments after `--`), so a comparison run is driven by the same request.
+Historical worktrees remain read-only evidence.
