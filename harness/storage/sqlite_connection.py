@@ -140,13 +140,26 @@ def connect(
     *,
     busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
     page_size: Optional[int] = DEFAULT_PAGE_SIZE,
+    check_same_thread: bool = True,
 ) -> sqlite3.Connection:
-    """Open a fully configured connection. Callers own its lifetime."""
+    """Open a fully configured connection. Callers own its lifetime.
+
+    Standalone callers keep sqlite3's owner-thread check.  A
+    :class:`ConnectionRegistry` opts out only so its shutdown coordinator can
+    close dormant per-thread handles after the worker threads have joined.
+    The registry still returns each handle exclusively through thread-local
+    storage; this flag is a lifecycle mechanism, not permission to share a
+    connection for queries.
+    """
 
     path = Path(database_path).expanduser()
     if str(path) != ":memory:":
         path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(str(path), isolation_level=None)
+    connection = sqlite3.connect(
+        str(path),
+        isolation_level=None,
+        check_same_thread=bool(check_same_thread),
+    )
     try:
         return configure_connection(
             connection,
@@ -230,10 +243,12 @@ def maybe_incremental_vacuum(
 class ConnectionRegistry:
     """One connection per thread, created lazily.
 
-    A sqlite3 connection must not cross threads or a fork.  Handing every
-    thread its own handle keeps that invariant without ``check_same_thread``
-    escape hatches, and keeps WAL's single-writer rule the only serialisation
-    point.
+    A sqlite3 connection must not be used for SQL across threads or a fork.
+    Handing every thread its own handle keeps that invariant and keeps WAL's
+    single-writer rule the only serialisation point.  Registry-created handles
+    disable sqlite3's owner-thread *close* restriction so ``close_all`` can
+    release every dormant handle from the shutdown coordinator after workers
+    have joined; query ownership remains thread-local here.
     """
 
     def __init__(
@@ -263,6 +278,7 @@ class ConnectionRegistry:
             self.database_path,
             busy_timeout_ms=self.busy_timeout_ms,
             page_size=self.page_size,
+            check_same_thread=False,
         )
         self._local.connection = created
         with self._all_lock:

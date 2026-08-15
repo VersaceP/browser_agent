@@ -413,6 +413,25 @@ class BackendConfigTest(unittest.TestCase):
                 backend,
             )
 
+    def test_invalid_resource_compression_numbers_are_rejected_not_clamped(self):
+        for config in (
+            {"resource_compression_min_bytes": -1},
+            {"resource_compression_min_bytes": "many"},
+            {"resource_compression_level": -1},
+            {"resource_compression_level": 10},
+            {"resource_compression_level": "high"},
+        ):
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                HarnessConfig.from_dict(config)
+
+    def test_sqlite_store_direct_configuration_rejects_invalid_compression_numbers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "harness.db"
+            with self.assertRaises(ValueError):
+                SqliteStore(path, resource_compression_min_bytes=-1)
+            with self.assertRaises(ValueError):
+                SqliteStore(path, resource_compression_level=10)
+
 
 if __name__ == "__main__":
     unittest.main()

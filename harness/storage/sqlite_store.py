@@ -98,6 +98,30 @@ def _validated_resource_compression(value: object) -> str:
     return mode
 
 
+def _validated_nonnegative_int(value: object, *, name: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a non-negative integer; got {value!r}") from exc
+    if parsed < 0:
+        raise ValueError(f"{name} must be a non-negative integer; got {value!r}")
+    return parsed
+
+
+def _validated_compression_level(value: object) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"resource_compression_level must be an integer from 0 to 9; got {value!r}"
+        ) from exc
+    if not 0 <= parsed <= 9:
+        raise ValueError(
+            f"resource_compression_level must be an integer from 0 to 9; got {value!r}"
+        )
+    return parsed
+
+
 class SqliteStore(Storage):
     def __init__(
         self,
@@ -120,8 +144,13 @@ class SqliteStore(Storage):
         # what future rows look like, and "none" is the rollback switch whose
         # byte-identical guarantee depends on the value being exact.
         self.resource_compression = _validated_resource_compression(resource_compression)
-        self.resource_compression_min_bytes = max(0, int(resource_compression_min_bytes))
-        self.resource_compression_level = max(0, min(9, int(resource_compression_level)))
+        self.resource_compression_min_bytes = _validated_nonnegative_int(
+            resource_compression_min_bytes,
+            name="resource_compression_min_bytes",
+        )
+        self.resource_compression_level = _validated_compression_level(
+            resource_compression_level
+        )
         apply_migrations(self.registry.connection())
 
     @property
@@ -600,50 +629,49 @@ class SqliteStore(Storage):
     ) -> int:
         """Write one resource version. Caller owns the transaction."""
 
-        if True:
-            previous = connection.execute(
-                "SELECT resource_id, resource_version FROM task_resources"
-                " WHERE task_id = ? AND run_id = ? AND logical_path = ? AND is_current = 1",
-                (task_id, run_id, logical_path),
-            ).fetchone()
-            version = 1
-            supersedes = None
-            if previous is not None:
-                version = int(previous["resource_version"]) + 1
-                supersedes = previous["resource_id"]
-                connection.execute(
-                    "UPDATE task_resources SET is_current = 0 WHERE resource_id = ?",
-                    (supersedes,),
-                )
+        previous = connection.execute(
+            "SELECT resource_id, resource_version FROM task_resources"
+            " WHERE task_id = ? AND run_id = ? AND logical_path = ? AND is_current = 1",
+            (task_id, run_id, logical_path),
+        ).fetchone()
+        version = 1
+        supersedes = None
+        if previous is not None:
+            version = int(previous["resource_version"]) + 1
+            supersedes = previous["resource_id"]
             connection.execute(
-                "INSERT INTO task_resources("
-                " resource_id, task_id, run_id, resource_type, logical_path, media_type,"
-                " content_encoding,"
-                " content_json, content_text, content_blob, external_path,"
-                " metadata_json, byte_size, stored_byte_size, sha256, created_at,"
-                " resource_version, is_current, supersedes_resource_id)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
-                (
-                    resource_id,
-                    task_id,
-                    run_id,
-                    resource_type,
-                    logical_path,
-                    media_type,
-                    content_encoding,
-                    columns["content_json"],
-                    columns["content_text"],
-                    columns["content_blob"],
-                    columns["external_path"],
-                    json.dumps(metadata, ensure_ascii=False, default=str),
-                    byte_size,
-                    stored_byte_size,
-                    digest,
-                    dao.utc_now_iso(),
-                    version,
-                    supersedes,
-                ),
+                "UPDATE task_resources SET is_current = 0 WHERE resource_id = ?",
+                (supersedes,),
             )
+        connection.execute(
+            "INSERT INTO task_resources("
+            " resource_id, task_id, run_id, resource_type, logical_path, media_type,"
+            " content_encoding,"
+            " content_json, content_text, content_blob, external_path,"
+            " metadata_json, byte_size, stored_byte_size, sha256, created_at,"
+            " resource_version, is_current, supersedes_resource_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+            (
+                resource_id,
+                task_id,
+                run_id,
+                resource_type,
+                logical_path,
+                media_type,
+                content_encoding,
+                columns["content_json"],
+                columns["content_text"],
+                columns["content_blob"],
+                columns["external_path"],
+                json.dumps(metadata, ensure_ascii=False, default=str),
+                byte_size,
+                stored_byte_size,
+                digest,
+                dao.utc_now_iso(),
+                version,
+                supersedes,
+            ),
+        )
         return version
 
     @staticmethod

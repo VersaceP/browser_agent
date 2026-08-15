@@ -1,5 +1,5 @@
 """
-harness.storage.resource_codec - The logical/physical split for JSON resources.
+harness.storage.resource_codec - Logical/physical storage for text resources.
 
 A JSON resource has two representations and they are deliberately different:
 
@@ -14,9 +14,10 @@ and hashes the logical form here; every reader renders the logical form here.
 One function on both sides is what stops them from drifting apart - a mismatch
 would show up as "corrupted artifact" long after the write that caused it.
 
-Only ``content_json`` is affected.  ``content_text`` holds a caller's string
-verbatim and ``content_blob`` holds bytes; neither has indentation to remove,
-and round-tripping them through a JSON parser would corrupt them.
+Large harness-internal JSON and text resources may both be zlib-compressed into
+``content_blob``. Native bytes remain identity blobs, business extraction stays
+readable, and text is never routed through a JSON parser. The encoding value
+preserves which logical column must be restored.
 """
 
 from __future__ import annotations

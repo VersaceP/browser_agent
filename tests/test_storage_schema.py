@@ -2,6 +2,7 @@
 
 import sqlite3
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -119,6 +120,45 @@ class StorageSchemaTest(unittest.TestCase):
         registry.close_all()
         # Reopening lazily after close would turn close() into a no-op and
         # hide a write-after-shutdown bug instead of surfacing it.
+        with self.assertRaises(StorageClosedError):
+            registry.connection()
+
+    def test_registry_closes_a_dormant_connection_created_by_another_thread(self):
+        """Shutdown must release every per-thread handle, not swallow failure.
+
+        The registry is intentionally closed only after the worker has stopped
+        using SQL.  The worker keeps the Python object alive so this test can
+        distinguish a real close from merely dropping the registry's list.
+        """
+
+        registry = ConnectionRegistry(Path(self._tmp.name) / "threaded.db")
+        created = threading.Event()
+        shutdown_complete = threading.Event()
+        outcome = {}
+
+        def worker():
+            connection = registry.connection()
+            connection.execute("CREATE TABLE owned_by_worker (value INTEGER)")
+            created.set()
+            shutdown_complete.wait(timeout=5)
+            try:
+                connection.execute("SELECT 1").fetchone()
+            except sqlite3.ProgrammingError as exc:
+                outcome["closed"] = True
+                outcome["error"] = str(exc)
+            else:
+                outcome["closed"] = False
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        self.assertTrue(created.wait(timeout=5))
+        registry.close_all()
+        shutdown_complete.set()
+        thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(outcome.get("closed"), outcome)
+        self.assertIn("closed", outcome.get("error", "").lower())
         with self.assertRaises(StorageClosedError):
             registry.connection()
 

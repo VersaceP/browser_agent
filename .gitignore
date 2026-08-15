@@ -9,8 +9,9 @@ env/
 ENV/
 .venv/
 worktree/
-tests/
+!tests/
 tests/*
+!tests/test_resume_runtime.py
 reports/
 dist/
 artifacts/
