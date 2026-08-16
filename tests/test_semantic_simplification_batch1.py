@@ -15,7 +15,7 @@ from harness.vl.core import (
     _merged_vl_extra_params,
     visual_verify_image,
 )
-from harness.worker_result import build_worker_handoff_projection
+from harness.results.worker_result import build_worker_handoff_projection
 from harness.tools.lead_tools import (
     _numeric_reconciliation_rejection,
     _reconcile_final_answer_numbers,

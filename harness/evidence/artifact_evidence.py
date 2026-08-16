@@ -12,7 +12,7 @@ import json
 import re
 from typing import Any, Dict, List, Optional
 
-from harness.extraction_artifacts import field_name_from_spec, field_names_from_specs
+from harness.evidence.extraction_artifacts import field_name_from_spec, field_names_from_specs
 from harness.utils import JsonDict
 
 

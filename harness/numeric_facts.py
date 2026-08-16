@@ -27,7 +27,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from harness.completion_receipt import _validated_artifacts
+from harness.results.completion_receipt import _validated_artifacts
 from harness.utils import JsonDict
 
 NUMERIC_CLAIM_TOOL = "submit_numeric_claims"

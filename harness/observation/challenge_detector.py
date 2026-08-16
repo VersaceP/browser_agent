@@ -1,5 +1,5 @@
 """
-harness.challenge_detector - Cheap challenge suspicion tracking.
+harness.observation.challenge_detector - Cheap challenge suspicion tracking.
 
 The detector is intentionally not a keyword wall. It accumulates behavior
 signals per page and only uses a tiny high-confidence keyword set as a fallback

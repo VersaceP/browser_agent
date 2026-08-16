@@ -1,12 +1,12 @@
 """
-harness.worker_result - Stable L1/L2/L3 worker result envelopes.
+harness.results.worker_result - Stable L1/L2/L3 worker result envelopes.
 """
 
 import json
 from pathlib import Path
 from typing import Any, List, Optional
 
-from harness.content_completeness import content_completeness_observation_facts
+from harness.observation.content_completeness import content_completeness_observation_facts
 from harness.utils import (
     JsonDict,
     json_size_bytes,

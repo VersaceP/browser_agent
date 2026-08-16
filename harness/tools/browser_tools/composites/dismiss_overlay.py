@@ -3,7 +3,7 @@
 import asyncio
 from typing import Any, List, Optional, Tuple
 
-from harness.call_outcome import replay_forbidden
+from harness.results.call_outcome import replay_forbidden
 from harness.observation.overlay_actions import (
     find_close_control,
     is_sensitive_method,

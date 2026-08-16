@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List
 
-from harness.plan_validator import review_plan_revision
+from harness.planning.validator import review_plan_revision
 from harness.utils import RunLogger
 
 

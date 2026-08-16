@@ -32,7 +32,7 @@ import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from abcp_client import ABCPClient
-from harness.challenge_detector import (
+from harness.observation.challenge_detector import (
     VL_CLEARANCE_VERDICTS,
     is_lingering_loading_title,
     title_looks_like_challenge,

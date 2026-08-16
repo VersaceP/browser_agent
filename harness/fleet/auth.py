@@ -1,5 +1,5 @@
 """
-harness.auth_fleet - Stable Memory scope names for reusable authenticated fleets.
+harness.fleet.auth - Stable Memory scope names for reusable authenticated fleets.
 
 This module intentionally does not store credentials. It only centralizes the
 names and shape used when agents record that a verified browser fleet/session

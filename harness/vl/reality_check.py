@@ -285,7 +285,7 @@ def resolve_current_row(url: str, row_keys: Any) -> Optional[str]:
     it will be compared against can never disagree about which row a page is —
     including its refusal to guess when two assigned rows both prefix the URL.
     """
-    from harness.row_ledger import row_key_for_url
+    from harness.results.row_ledger import row_key_for_url
 
     keys = [str(key) for key in (row_keys or []) if str(key or "").strip()]
     return row_key_for_url(str(url or ""), keys)
@@ -301,7 +301,7 @@ def assigned_row_keys(worker_contract: Any, phase: Any = None) -> List[str]:
     asked whether all three products were on it (observed live in task
     857616aa, the exact 5324506f shape this projection exists to prevent).
     """
-    from harness.row_ledger import assigned_row_keys_from_contract
+    from harness.results.row_ledger import assigned_row_keys_from_contract
 
     return assigned_row_keys_from_contract(worker_contract, phase)
 
@@ -323,7 +323,7 @@ def build_row_scoped_claim(
     scoped to what it depicts, so the row count is dropped here by design; the
     cohort-level expectation is checked against artifacts, not pixels.
     """
-    from harness.extraction_artifacts import field_names_from_specs
+    from harness.evidence.extraction_artifacts import field_names_from_specs
 
     contract = worker_contract if isinstance(worker_contract, dict) else {}
     # `fields` may arrive as bare names or as the object specs a contract

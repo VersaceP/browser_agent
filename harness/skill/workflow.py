@@ -18,7 +18,7 @@ import copy
 import uuid
 from typing import Any, Dict, List, Optional
 
-from harness.fleet_runtime import FleetClickGateTimeout
+from harness.fleet.runtime import FleetClickGateTimeout
 from harness.task_types import resolve_task_type_fail_closed
 from harness.workflow_policy import validate_workflow_params
 from harness.workflow_runtime import (

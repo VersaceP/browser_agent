@@ -414,7 +414,7 @@ def reconcile_torn_plan_alias(
     remains an error instead of being guessed through.
     """
 
-    from harness.plan_validator import plan_hash
+    from harness.planning.validator import plan_hash
 
     task_dir = _require_task_dir(value)
     recorded_hash = str(state.get("plan_hash") or "").strip()

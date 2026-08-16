@@ -155,7 +155,7 @@ async def reperceive_workflow_auth_generation(
         if hasattr(result, "__await__"):
             result = await result
         return bool(result)
-    from harness.call_outcome import classify_call_outcome
+    from harness.results.call_outcome import classify_call_outcome
     from harness.tools.browser_tools import _invoke_browser_method
 
     state = await _invoke_browser_method(

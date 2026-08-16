@@ -8,10 +8,9 @@ venv/
 env/
 ENV/
 .venv/
-worktree/
-!tests/
+worktree/*
+tests/
 tests/*
-!tests/test_resume_runtime.py
 reports/
 dist/
 artifacts/
@@ -36,4 +35,10 @@ skills/.guidance_health.json
 skills/**/.heal_history.json
 skills/**/workflow.v*.json
 skills/**/.create_report.json
+scratchpad/*
+tests/test_resume_plan_extension.py
+tests/test_resume_runtime.py
+tests/test_semantic_simplification_batch1.py
 tests/test_spawner_slots.py
+tests/test_storage_db_mode.py
+tests/test_storage_review_regressions.py

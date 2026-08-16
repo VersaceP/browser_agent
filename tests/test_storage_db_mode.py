@@ -12,7 +12,7 @@ from pathlib import Path
 
 from harness.local_fs import local_fs_read
 from harness.offload import offload_large_tool_result
-from harness.plan_validator import write_plan_review_audit, write_plan_version
+from harness.planning.validator import write_plan_review_audit, write_plan_version
 from harness.resume_state import (
     ResumeStateError,
     configure_resume_storage,
@@ -288,7 +288,7 @@ class ExtractionArtifactRoutingTest(unittest.TestCase):
     def _save(self, logger):
         from types import SimpleNamespace
 
-        from harness.extraction_artifacts import save_extraction_artifact
+        from harness.evidence.extraction_artifacts import save_extraction_artifact
 
         self.artifacts: list = []
         return save_extraction_artifact(

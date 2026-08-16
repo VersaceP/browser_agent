@@ -1,5 +1,5 @@
 """
-harness.call_outcome - one verdict for "did this browser call succeed?".
+harness.results.call_outcome - one verdict for "did this browser call succeed?".
 
 Every state mutation the harness performs off the back of a browser call —
 consuming a model declaration, binding a landing page, crediting recovery,

@@ -7,7 +7,7 @@ from runtime_config import HarnessConfig, RuntimeConfig, VLConfig
 from harness.local_fs import local_fs_read, local_fs_search
 from harness.model_config import browser_agent_model_config, lead_agent_model_config
 from harness.offload import offload_large_response_fields, offload_large_tool_result
-from harness.render_recovery import (
+from harness.observation.render_recovery import (
     RenderRecoveryOutcome,
     build_render_recovery_runner,
     call_with_render_recovery,

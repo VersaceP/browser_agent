@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from harness.extraction_artifacts import save_extraction_artifact
+from harness.evidence.extraction_artifacts import save_extraction_artifact
 from harness.local_fs import local_fs_read
 from harness.storage import create_storage
 from harness.storage.admin import PurgeRefused, purge_task, soft_delete_task
@@ -519,7 +519,7 @@ class SecondReviewRegressionTest(unittest.TestCase):
 
     # -- 1. worker handoff summary ----------------------------------------
     def test_db_worker_summary_reports_the_rows_it_has(self):
-        from harness.worker_result import summarize_extraction_artifacts
+        from harness.results.worker_result import summarize_extraction_artifacts
 
         logger, _store = self._db_logger()
         saved = save_extraction_artifact(

@@ -36,7 +36,7 @@ from harness.utils import (
     storage_for_logger,
     task_subdir,
 )
-from harness.worker_result import worker_handoff_projections
+from harness.results.worker_result import worker_handoff_projections
 
 
 def store_offloaded(

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from harness.render_recovery import build_render_recovery_runner
+from harness.observation.render_recovery import build_render_recovery_runner
 from harness.semantic_frames import graph_digest, root_tree
 from harness.utils import JsonDict
 

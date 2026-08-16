@@ -33,8 +33,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-from harness.call_outcome import classify_call_outcome
-from harness.challenge_detector import (
+from harness.results.call_outcome import classify_call_outcome
+from harness.observation.challenge_detector import (
     VL_CLEARANCE_VERDICTS,
     detect_structural_challenge_from_lines,
     title_looks_like_challenge,

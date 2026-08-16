@@ -4,7 +4,7 @@ harness.diagnostics.error_classification - Structured browser/tool error hints.
 
 from typing import Any, Optional
 
-from harness.call_outcome import action_runtime_info
+from harness.results.call_outcome import action_runtime_info
 from harness.constants import (
     API_CONTRACT_ERROR_MARKERS,
     PAGE_DEAD_OBSERVATION_MARKERS,

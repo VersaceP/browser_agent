@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 
-from harness.extraction_artifacts import field_names_from_specs
+from harness.evidence.extraction_artifacts import field_names_from_specs
 from harness.pacing import parse_utc_timestamp
 
 

@@ -288,7 +288,7 @@ def _result_candidates(value: JsonDict) -> List[JsonDict]:
 
 
 def _summarize_worker_result(value: JsonDict) -> Optional[JsonDict]:
-    from harness.worker_result import build_worker_handoff_projection
+    from harness.results.worker_result import build_worker_handoff_projection
 
     projection = build_worker_handoff_projection(value)
     if projection is not None:

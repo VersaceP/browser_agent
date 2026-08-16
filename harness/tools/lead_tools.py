@@ -8,12 +8,12 @@ import json
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
-from harness.extraction_artifacts import (
+from harness.evidence.extraction_artifacts import (
     save_extraction_artifact,
     validate_extraction_rows,
 )
-from harness.artifact_evidence import VALIDATOR_TYPES
-from harness.fleet_coordinator import VALID_PAGE_POLICIES, VALID_REUSE_SCOPES
+from harness.evidence.artifact_evidence import VALIDATOR_TYPES
+from harness.fleet.coordinator import VALID_PAGE_POLICIES, VALID_REUSE_SCOPES
 from harness.lifecycle import LifecycleContext, lifecycle_for
 from harness.local_fs import local_fs_read, local_fs_search
 from harness.strategy_bank import render_strategy_guidance
@@ -26,7 +26,7 @@ from harness.task_control import (
     load_task_state,
     write_task_state,
 )
-from harness.completion_receipt import (
+from harness.results.completion_receipt import (
     build_completion_receipt,
     terminal_consistency_contradictions,
 )

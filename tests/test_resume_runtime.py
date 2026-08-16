@@ -10,7 +10,7 @@ from unittest.mock import patch
 import main
 from abcp_client import ABCPClientConfig
 from agent_harness import LeadAgent, ResumeContext
-from harness.plan_validator import plan_hash, write_plan_version
+from harness.planning.validator import plan_hash, write_plan_version
 from harness.resume_state import (
     RUN_LOCK_DIR,
     configure_resume_storage,

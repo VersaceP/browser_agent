@@ -685,7 +685,7 @@ class VLConfig:
     reality_check_stall_turns: int = 15
     # How much a reality-check verdict counts. "advisory" (the default) means
     # the VL may direct further work but never closes anything: an absence
-    # still has to discharge the mechanical obligations in harness.row_ledger,
+    # still has to discharge the mechanical obligations in harness.results.row_ledger,
     # and a verdict alone is not a reason to stop. Raise to "corroborating"
     # only after harness.vl.precision_eval reports the per-class thresholds
     # met on a labelled fixture — an unmeasured model asserting "nothing here"

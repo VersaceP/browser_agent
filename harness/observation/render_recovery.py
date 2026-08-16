@@ -1,5 +1,5 @@
 """
-harness.render_recovery - Render context loss detection and recovery for ABCP calls.
+harness.observation.render_recovery - Render context loss detection and recovery for ABCP calls.
 """
 
 import time

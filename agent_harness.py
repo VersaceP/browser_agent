@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from abcp_client import ABCPClient, ABCPTransportError
-from harness.auth_fleet import AUTH_FLEET_MEMORY_SCOPE, auth_fleet_memory_guidance
+from harness.fleet.auth import AUTH_FLEET_MEMORY_SCOPE, auth_fleet_memory_guidance
 from harness.compaction import compact_messages_if_needed, validate_tool_pairing
 from runtime_config import (
     ABCPClientConfig,
@@ -29,8 +29,8 @@ from runtime_config import (
     RuntimeConfig,
     VLConfig,
 )
-from harness.challenge_detector import ChallengeTracker
-from harness.content_completeness import ContentCompletenessTracker
+from harness.observation.challenge_detector import ChallengeTracker
+from harness.observation.content_completeness import ContentCompletenessTracker
 from harness.constants import (
     CONTEXT_LIMIT_ERROR_MARKERS,
     LEAD_FLEET_ROUTING_DECISION_GUIDANCE,
@@ -64,7 +64,7 @@ from harness.observation.page_fingerprint import (
 )
 from harness.progress import ProgressAccountant
 from harness.pacing import merge_pacing
-from harness.render_recovery import (
+from harness.observation.render_recovery import (
     RenderRecoveryOutcome,
     build_render_recovery_runner,
     call_with_render_recovery,
@@ -91,7 +91,7 @@ from harness.spawner import (
     BrowserAgentSpawner,
     PinnedBrowserContext,
 )
-from harness.file_evidence import saved_paths_from_value
+from harness.evidence.file_evidence import saved_paths_from_value
 from harness.strategy_bank import (
     load_strategy_bank,
     render_strategy_guidance,
@@ -114,12 +114,12 @@ from harness.task_control import (
     validate_task_plan,
     accept_task_plan,
 )
-from harness.plan_validator import (
+from harness.planning.validator import (
     plan_candidate_hash,
     review_plan_revision,
     write_plan_review_audit,
 )
-from harness.completion_receipt import (
+from harness.results.completion_receipt import (
     build_completion_receipt,
     persist_completion_receipt,
 )

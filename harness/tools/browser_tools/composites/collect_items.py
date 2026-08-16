@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from harness.call_outcome import replay_forbidden
+from harness.results.call_outcome import replay_forbidden
 from harness.constants import COLLECTION_CONTRACT_REPLAN_REQUIRED
 from harness.observation.overlay_detector import detect_overlay_from_result
 from harness.observation.verifiers import probe_collection_state

@@ -1,5 +1,5 @@
 """
-harness.extraction_artifacts - Shared extraction artifact persistence.
+harness.evidence.extraction_artifacts - Shared extraction artifact persistence.
 """
 
 from __future__ import annotations

@@ -528,7 +528,7 @@ async def _default_verify(
     what catches an in-page slider that mutates no url/title). An unreadable
     Page.getState or an empty AXTree returns None — "the probes saw nothing" is
     never clearance, because only a positive clear skips the human."""
-    from harness.challenge_detector import detect_structural_challenge_from_lines
+    from harness.observation.challenge_detector import detect_structural_challenge_from_lines
     from harness.skill.pause import _is_challenge_url, _title_is_challenge
 
     resp = await control.call("Page.getState", {

@@ -16,12 +16,12 @@ from unittest.mock import patch
 import agent_harness
 from abcp_client import ABCPClientConfig
 from agent_harness import LeadAgent, ResumeContext
-from harness.completion_receipt import (
+from harness.results.completion_receipt import (
     build_completion_receipt,
     terminal_consistency_contradictions,
 )
 from harness.constants import WORKER_STATUS_DONE
-from harness.plan_validator import plan_candidate_hash
+from harness.planning.validator import plan_candidate_hash
 from harness.task_control import (
     evidence_contract_fingerprint,
     load_task_state,

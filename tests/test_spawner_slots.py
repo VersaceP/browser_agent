@@ -13,17 +13,17 @@ from abcp_client import ABCPTransportError
 from runtime_config import ABCPClientConfig
 from runtime_config import HarnessConfig, RuntimeConfig
 
-from harness.auth_fleet import (
+from harness.fleet.auth import (
     normalize_auth_verification_contract,
     verify_protected_auth_target,
 )
-from harness.fleet_coordinator import (
+from harness.fleet.coordinator import (
     FleetAssignment,
     FleetCoordinator,
     FleetRoutingError,
     resolve_fleet_reference,
 )
-from harness.fleet_runtime import PageLeaseManager, PageLeasedBrowserClient
+from harness.fleet.runtime import PageLeaseManager, PageLeasedBrowserClient
 from harness.observation.page_inventory import PageInventorySignal
 from harness.constants import (
     LEAD_FLEET_ROUTING_DECISION_CODES,
