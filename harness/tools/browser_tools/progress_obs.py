@@ -96,8 +96,13 @@ def _annotate_axtree_offload(response: Any, snapshot: Optional[JsonDict]) -> Non
         "holdsWhile": "this page's AXTree epoch is unchanged",
         "note": (
             "The same tree is indexed in memory: query it with find_in_axtree"
-            " instead of searching this file. After an Input.* action or a"
-            " navigation bumps the epoch, find_in_axtree reports"
+            " instead of searching this file. Its line_regex matches the whole"
+            " rendered line, so role, id and label go in one expression"
+            " (\"listboxoption.*广东\"), and relations returns a hit's"
+            " parent/siblings/children — the two reasons a file read used to be"
+            " the only way to answer. Reading this file returns the tree in"
+            " full; a query returns only the matching lines. After an Input.*"
+            " action or a navigation bumps the epoch, find_in_axtree reports"
             " needs_fresh_axtree and this file becomes the only record of"
             " this tree."
         ),

@@ -834,6 +834,18 @@ def _spawn_browser_agent_schema(_: Any = None) -> JsonDict:
                             " because cookies/storage/proxy identity must not be"
                             " shared with the slot default. The resulting fleet"
                             " never becomes the generic slot default."
+                            " SET THIS TRUE when the task itself asks for a"
+                            " fresh fleet or browser profile, for an environment"
+                            " that must not inherit an existing login, or for a"
+                            " different account than a previous run — in any"
+                            " language the task is written in. This field is the"
+                            " only channel that request travels through; stating"
+                            " it only in objective or worker_task prose leaves"
+                            " the routing layer unable to honour it. Needing a"
+                            " new page, tab, worker or slot is NOT such a"
+                            " request: those share the task fleet by design, and"
+                            " an isolated fleet holds a task fleet budget slot"
+                            " the harness never reclaims."
                         ),
                     },
                     "fleet_id": {

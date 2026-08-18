@@ -493,6 +493,20 @@ async def extract_numeric_claims(
          "start": item["start"], "end": item["end"]}
         for index, item in enumerate(numeric_spans(answer))
     ]
+    if not spans:
+        # No quantity-shaped number survived the mechanical filters (an answer
+        # holding only dates, URLs and version fragments lands here too), so
+        # there is nothing to bind and no question the extractor can answer.
+        # Calling it anyway is pure cost: runs 6ffd/791e each spent an extractor
+        # call whose every claim came back dismissed or unresolved. The ok+empty
+        # shape routes through reconcile as passed/checked=0 - a real verdict
+        # that the answer asserts no checkable quantity - not `unavailable`.
+        return {
+            "status": "ok",
+            "claims": [],
+            "spans": [],
+            "skippedReason": "no_numeric_spans",
+        }
     payload = {
         "answer": answer,
         "spans": [

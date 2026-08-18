@@ -133,6 +133,8 @@ from harness.tool_policy import (
     sanitize_tool_input_for_log,
 )
 from harness.tools.browser_tools import (
+    AXTREE_INVALIDATING_METHODS,
+    _invoke_result_failed,
     build_browser_agent_tool_specs,
     build_browser_tool_dispatcher,
 )
@@ -450,6 +452,182 @@ def offload_tool_result_for_model(
         prefix=runtime.agent_id,
         threshold_bytes=runtime.harness.tool_result_offload_threshold_bytes,
     )
+
+
+def _json_size_bytes(value: Any) -> int:
+    try:
+        return len(
+            json.dumps(value, ensure_ascii=False, default=str).encode("utf-8")
+        )
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_offload_stub(value: Any) -> bool:
+    """True only for a harness-produced offload receipt, not arbitrary data."""
+    return bool(
+        isinstance(value, dict)
+        and value.get("_offloaded") is True
+        and isinstance(value.get("originalBytes"), int)
+        and isinstance(value.get("savedPath"), str)
+        and value.get("savedPath")
+    )
+
+
+def _offload_stub_stats(value: Any) -> Tuple[int, int]:
+    """Count genuine offload stubs and their declared originalBytes.
+
+    Field-level stubs (AXTree lines, Runtime.evaluate values, ...) embed
+    {_offloaded: true, originalBytes: N} inside otherwise-inline results;
+    whole-result stubs carry the same keys at the top level.
+    """
+    count = 0
+    original = 0
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            if _is_offload_stub(item):
+                count += 1
+                declared = item.get("originalBytes")
+                original += declared
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return count, original
+
+
+def _offload_file_category(model_result: Any, logger: RunLogger) -> Optional[str]:
+    """Category of nested/whole offload paths, without logging any path.
+
+    Inline browser results carry field stubs below response.data, whereas a
+    whole-result offload carries its stub at the root.  Walk both shapes.  A
+    mixed category is explicit rather than choosing a misleading first path.
+    """
+    categories: Set[str] = set()
+    stack = [model_result]
+    task_dir = Path(logger.task_dir).resolve()
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            if _is_offload_stub(item):
+                saved = str(item.get("savedPath") or "")
+                saved_path = Path(saved)
+                resolved = (
+                    saved_path.resolve()
+                    if saved_path.is_absolute()
+                    else (task_dir / saved_path).resolve()
+                )
+                try:
+                    relative = resolved.relative_to(task_dir)
+                except (ValueError, OSError):
+                    pass
+                else:
+                    if relative.parts:
+                        categories.add(relative.parts[0])
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    if not categories:
+        # local_fs tools echo the file they served as a top-level
+        # relativePath ("observations/x.json"); its category segment answers
+        # read-back analysis (repeated payload reads vs artifact probes)
+        # without logging the path.
+        for source in (
+            model_result if isinstance(model_result, list) else [model_result]
+        ):
+            if isinstance(source, dict):
+                relative = str(source.get("relativePath") or "")
+                if relative:
+                    parts = Path(relative).parts
+                    if parts:
+                        return parts[0]
+        return None
+    if len(categories) > 1:
+        return "mixed"
+    return next(iter(categories))
+
+
+def log_model_visible_tool_result(
+    logger: RunLogger,
+    *,
+    actor: str,
+    step: int,
+    tool_name: str,
+    raw_result: Any,
+    model_result: Any,
+    final_content: Any,
+    worker_id: str = "",
+    method: str = "",
+) -> None:
+    """Observability: the exact bytes a tool result put into a model message.
+
+    Measured, never estimated, at the single boundary where tool results are
+    serialized into conversation messages - after every lossy layer:
+
+      rawBytes     the dispatcher result before the generic model-facing
+                   compaction/whole-result offload. Browser capability field
+                   offload already happened inside dispatch; its exact field
+                   payload sizes are reported separately below.
+      modelBytes   after compaction + whole-result offload, before the
+                   max_observation_chars string trim
+      messageBytes the final content string appended to the conversation
+
+    local_fs_read/search actual returned bytes therefore come for free:
+    their results are ordinary tool results at this boundary, so messageBytes
+    is what the model actually saw - not the request cap. Harness-internal
+    calls (schema bootstrap, transport probes) never reach a model message
+    and never appear here by construction. Deferred/batched placeholders are
+    harness-authored notices, not tool output, and are not logged.
+
+    Records sizes and status flags only - never content, never full paths.
+    """
+    content = final_content if isinstance(final_content, str) else ""
+    # Capability-level field offload happens inside dispatch, so its stubs are
+    # present in raw_result. A later whole-result offload replaces that object
+    # with one root stub; counting only model_result would lose the underlying
+    # AXTree/Runtime field accounting precisely when both layers fire.
+    stub_count, stub_original = _offload_stub_stats(raw_result)
+    raw_root_offloaded = _is_offload_stub(raw_result)
+    whole_result_offloaded = _is_offload_stub(model_result)
+    # If a tool itself returned an offload receipt, its root is not a field
+    # offload. Remove it while retaining genuine nested field stubs.
+    field_stub_count = stub_count - (1 if raw_root_offloaded else 0)
+    root_original = (
+        int(raw_result.get("originalBytes") or 0)
+        if raw_root_offloaded and isinstance(raw_result, dict)
+        else 0
+    )
+    field_stub_original = max(0, stub_original - root_original)
+    serialized_model = json.dumps(
+        model_result, ensure_ascii=False, default=str,
+    )
+    payload: JsonDict = {
+        "actor": actor,
+        "step": step,
+        "tool": tool_name,
+        "rawBytes": _json_size_bytes(raw_result),
+        "modelBytes": _json_size_bytes(model_result),
+        "messageBytes": len(content.encode("utf-8")),
+        "wholeResultOffloaded": whole_result_offloaded,
+        "fieldOffloadedCount": max(0, field_stub_count),
+        "fieldOriginalBytes": field_stub_original,
+        # After model_result, the only transformation at these call sites is
+        # trim_large_strings. Compare exact serializations so business text
+        # containing the literal marker is not misclassified as truncation.
+        "truncated": content != serialized_model,
+        "fileCategory": _offload_file_category(
+            [raw_result, model_result], logger,
+        ),
+    }
+    if method:
+        # The ABCP method behind a browser_call ("DOM.getAXTree"), taken
+        # from the dispatch input so per-method accounting falls out of the
+        # same event. Capped; method names are capability ids, not content.
+        payload["method"] = method[:120]
+    if worker_id:
+        payload["workerId"] = worker_id
+    logger.write("tool_result.model_visible", payload)
 
 
 def summarize_lead_tool_result_for_log(
@@ -1266,11 +1444,27 @@ class BrowserAgent:
                         result=result,
                         step=step,
                     )
+                    content = self._to_model_json(model_result)
+                    _tool_input = (
+                        tool_call.get("input")
+                        if isinstance(tool_call.get("input"), dict) else {}
+                    )
+                    log_model_visible_tool_result(
+                        self.logger,
+                        actor=str(self.runtime.agent_id),
+                        step=step,
+                        tool_name=str(tool_call.get("name") or "tool"),
+                        raw_result=result,
+                        model_result=model_result,
+                        final_content=content,
+                        worker_id=str(getattr(self, "worker_id", "") or ""),
+                        method=str(_tool_input.get("method") or ""),
+                    )
                     tool_results.append(
                         {
                             "type": "tool_result",
                             "tool_use_id": tool_call["id"],
-                            "content": self._to_model_json(model_result),
+                            "content": content,
                         }
                     )
                     boundary = (
@@ -2067,7 +2261,83 @@ L6. Termination
             ),
         }
         suffix = hints.get(final_status, "Reached the maximum orchestration step count without an explicit completion.")
-        return f"{suffix} See run log: {self.logger.path}"
+        parts = [f"{suffix} See run log: {self.logger.path}"]
+        progress = self._compose_step_cap_progress()
+        if progress:
+            parts.append(progress)
+        return "\n".join(parts)
+
+    def _compose_step_cap_progress(self) -> str:
+        """State this worker reached, for whoever picks the phase up next.
+
+        A worker cut off at the step cap never writes a final answer, so the
+        handoff used to be a hint plus a log path. The Lead then reconstructed
+        the story from the raw worker trace instead: in a608 that was five reads
+        of a 230KB trace file, 29% of the Lead's entire context. Everything
+        below is already in hand here and costs no extra call.
+        """
+        lines: List[str] = []
+        urls = getattr(self, "page_urls", None)
+        if isinstance(urls, dict) and urls:
+            page_id = str(getattr(self, "axtree_page_id", "") or "")
+            url = urls.get(page_id) or list(urls.values())[-1]
+            if url:
+                lines.append(f"- Page is now at: {url}")
+        artifacts = [
+            str(path) for path in (self.artifacts or [])
+            if "/artifacts/extractions/" in str(path).replace("\\", "/")
+        ]
+        if artifacts:
+            lines.append(
+                "- Extraction artifacts written: " + ", ".join(artifacts[-3:])
+            )
+        succeeded: List[str] = []
+        last_failure = ""
+        for item in (self.trace or []):
+            if not isinstance(item, dict) or item.get("type") != "browser_call":
+                continue
+            method = str(item.get("method") or "")
+            # Allowlist, not a denylist. Enumerating read-only methods to skip
+            # let Page.screenshot / Download.list / History.list read as state
+            # changes; the invalidating set is the harness's existing answer to
+            # "did this touch the page". Runtime.evaluate is carved back out:
+            # model-authored evaluates are read-only by contract, so listing one
+            # as a state change would misreport what this worker actually did.
+            if (
+                method not in AXTREE_INVALIDATING_METHODS
+                or method == "Runtime.evaluate"
+            ):
+                continue
+            # Same predicate the batch guard uses. A hand-rolled check on
+            # result.error misses the cases that actually matter here: browser
+            # action errors land in response.data.error (top-level error is only
+            # set on transport failures), and stale_element_reference /
+            # tool_was_executed=False carry no error object at all. Those would
+            # be listed to the Lead as actions that succeeded.
+            result = item.get("result")
+            failed = _invoke_result_failed(result)
+            params = item.get("params") if isinstance(item.get("params"), dict) else {}
+            target = str(
+                params.get("id") or params.get("selector") or params.get("url") or ""
+            )[:60]
+            entry = f"{method}({target})" if target else method
+            if failed:
+                last_failure = entry
+            else:
+                succeeded.append(entry)
+        if succeeded:
+            lines.append(
+                "- State-changing actions that succeeded, in order: "
+                + " -> ".join(succeeded[-8:])
+            )
+        if last_failure:
+            lines.append(f"- Last action that failed: {last_failure}")
+        if not lines:
+            return ""
+        return (
+            "Progress handoff (read this instead of the raw trace):\n"
+            + "\n".join(lines)
+        )
 
     def _write_agent_final(
         self,
@@ -2099,8 +2369,38 @@ L6. Termination
 _UNREVIEWED_ERROR_KINDS = frozenset({"transport", "protocol"})
 
 
+def _raw_plan_hash(raw_plan: Any) -> str:
+    """Stable identity hash for a plan that FAILED mechanical validation.
+
+    L1 observability needs to identify WHICH candidate was rejected without
+    logging its (untrusted, possibly huge) free-text content; hash the raw
+    payload instead.
+    """
+    return hashlib.sha256(json.dumps(
+        raw_plan, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), default=str,
+    ).encode("utf-8")).hexdigest()
+
+
 def _plan_review_scope_signature(plan: Any) -> str:
-    """Identity of plan changes that warrant an independent semantic review."""
+    """Identity of plan changes that warrant an independent semantic review.
+
+    Projection per phase: id, task_type, depends_on, expected_artifact,
+    validators, objective, worker_task and the whole worker_contract.
+    The last three were absent historically, which let a replan rewrite the
+    objective ("ranks 30-45" -> "any 16"), swap interaction for direct-URL
+    navigation, point a content_completeness marker at an unmatchable
+    identifier, or change cohort/auth policy - all while skipping the very
+    LLM rules written for those fields. Offline replay over 63 historical
+    replan pairs (scratchpad/signature_inflation_replay.py) shows the full
+    projection would add at least 5 reviews among 63 accepted replan pairs
+    (+8%; 92% already differ at the core layer, 0 pairs were pure-operational).
+    Rejected intermediate emits are not reconstructible from accepted-plan
+    history, so this is a lower bound rather than a complete call forecast.
+
+    Deliberately OUTSIDE the signature (operational, reviewed by nobody):
+    context, stage_hint/stage_hint_reason, pacing, max_steps, max_attempts.
+    """
     if not isinstance(plan, dict):
         return ""
     phases = []
@@ -2118,6 +2418,9 @@ def _plan_review_scope_signature(plan: Any) -> str:
             # explicit: weakening unique/set/url/provenance constraints must
             # never look like an operational continuation.
             "validators": phase.get("validators") or [],
+            "objective": phase.get("objective"),
+            "worker_task": phase.get("worker_task"),
+            "worker_contract": phase.get("worker_contract") or {},
         })
     payload = {
         "goal": plan.get("goal"),
@@ -2303,29 +2606,51 @@ class LeadAgent:
             user_task=self.original_user_task,
         )
         if candidate is None:
+            # L1 observability: identify the rejected candidate without
+            # logging its untrusted free-text errors or content.
+            self.logger.write("plan_validator.mechanical_invalid", {
+                "candidateHash": _raw_plan_hash(raw_plan),
+                "status": "mechanical_invalid",
+                "errorCount": len(errors),
+                "providerCalled": False,
+            })
             return {
                 "status": "mechanical_invalid",
                 "errors": errors,
             }
-        if (
-            self.task_plan is not None
-            and _plan_review_scope_signature(candidate)
-            == _plan_review_scope_signature(self.task_plan)
-        ):
-            # Operational continuation: tactics, stage notes, selectors and
-            # explicit resource allocation may change without altering user
-            # scope, phase topology, capability boundary, or deliverable.
-            return {
-                "status": "operational_continuation",
-                "reviewed": False,
-                "reason": "scope_topology_and_deliverables_unchanged",
-            }
-        provider = self.plan_validator_provider
         replan_reason = (
             str(raw_plan.get("replan_reason") or "").strip()
             if isinstance(raw_plan, dict)
             else ""
         )
+        if (
+            self.task_plan is not None
+            and _plan_review_scope_signature(candidate)
+            == _plan_review_scope_signature(self.task_plan)
+        ):
+            # Operational continuation: only fields deliberately outside the
+            # review projection (for example context/stage notes and bounded
+            # execution limits) may change.  Objective, worker_task and the
+            # full worker_contract are part of the signature above.
+            # The receipt binds THIS candidate (including its replan_reason)
+            # to the skip: the same plan re-emitted under a different reason
+            # gets a fresh receipt, and audits can reconstruct exactly which
+            # candidate bypassed review.
+            receipt = {
+                "status": "operational_continuation",
+                "reviewed": False,
+                "reason": "scope_topology_and_deliverables_unchanged",
+                "candidateHash": plan_candidate_hash(candidate, replan_reason),
+            }
+            self.logger.write("plan_validator.operational_continuation", {
+                "candidateHash": receipt["candidateHash"],
+                "scopeSignature": _plan_review_scope_signature(candidate),
+                "status": "operational_continuation",
+                "reason": receipt["reason"],
+                "providerCalled": False,
+            })
+            return receipt
+        provider = self.plan_validator_provider
         candidate_hash = plan_candidate_hash(candidate, replan_reason)
         task_state = load_task_state(self.logger)
         evidence_snapshot_hash = hashlib.sha256(
@@ -2503,6 +2828,12 @@ class LeadAgent:
                 return result
 
         if self.runtime.plan_validator.enabled:
+            reviewed_hash = (
+                str(plan_validator_review.get("candidateHash") or "")
+                if isinstance(plan_validator_review, dict)
+                else ""
+            )
+            submitted_candidate_hash = plan_candidate_hash(plan, replan_reason)
             operational_continuation = (
                 isinstance(plan_validator_review, dict)
                 and plan_validator_review.get("status")
@@ -2510,11 +2841,11 @@ class LeadAgent:
                 and self.task_plan is not None
                 and _plan_review_scope_signature(plan)
                 == _plan_review_scope_signature(self.task_plan)
-            )
-            reviewed_hash = (
-                str(plan_validator_review.get("candidateHash") or "")
-                if isinstance(plan_validator_review, dict)
-                else ""
+                # A matching scope signature only says L3 may be skipped.  The
+                # skip receipt must still belong to this exact normalized plan
+                # and replan_reason; otherwise a receipt for candidate A can be
+                # replayed to accept candidate B from the same scope bucket.
+                and reviewed_hash == submitted_candidate_hash
             )
             # `status: error` spans two different worlds and only one of them
             # means "there was no review". A transport or protocol failure
@@ -2534,7 +2865,7 @@ class LeadAgent:
                 isinstance(plan_validator_review, dict)
                 and plan_validator_review.get("status") == "error"
                 and review_error_kind in _UNREVIEWED_ERROR_KINDS
-                and reviewed_hash == plan_candidate_hash(plan, replan_reason)
+                and reviewed_hash == submitted_candidate_hash
             )
             # An absent critic still cannot wave through a REPLAN that changes
             # goal, phase topology, dependencies, artifact contracts or
@@ -3326,6 +3657,19 @@ class LeadAgent:
         final_completion_receipt: JsonDict = {}
         should_finish = False
         completed = False
+        # Record the effective offload ceilings once per run for telemetry.
+        self.logger.write(
+            "harness.config",
+            {
+                "agentId": str(self.runtime.agent_id or ""),
+                "offloadThresholdBytes": (
+                    self.runtime.harness.offload_threshold_bytes
+                ),
+                "toolResultOffloadThresholdBytes": (
+                    self.runtime.harness.tool_result_offload_threshold_bytes
+                ),
+            },
+        )
         if self.resume is not None:
             base_task = str(self.resume.original_user_task or task or "").strip()
             resume_instruction = str(self.resume.instruction or "").strip()
@@ -3868,17 +4212,32 @@ class LeadAgent:
                             step=step,
                         ),
                     )
+                    content = json.dumps(
+                        trim_large_strings(
+                            model_result,
+                            self.runtime.harness.max_observation_chars,
+                        ),
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                    log_model_visible_tool_result(
+                        self.logger,
+                        actor=str(self.runtime.agent_id),
+                        step=step,
+                        tool_name=str(tool_call.get("name") or "tool"),
+                        raw_result=result,
+                        model_result=model_result,
+                        final_content=content,
+                        method=str(
+                            (tool_call.get("input") or {}).get("method") or ""
+                        )
+                        if isinstance(tool_call.get("input"), dict)
+                        else "",
+                    )
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": tool_call["id"],
-                        "content": json.dumps(
-                            trim_large_strings(
-                                model_result,
-                                self.runtime.harness.max_observation_chars,
-                            ),
-                            ensure_ascii=False,
-                            default=str,
-                        ),
+                        "content": content,
                     })
                     if should_stop:
                         for deferred in tool_calls[tool_index + 1:]:

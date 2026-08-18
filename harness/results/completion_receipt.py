@@ -7,7 +7,7 @@ cannot set or override any field in it.
 import json
 import hashlib
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from harness.utils import JsonDict
 

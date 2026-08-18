@@ -1137,6 +1137,274 @@ async def _invoke_browser_method(
     })
     return model_result
 
+
+# grep's bounds, on a tree the model cannot see whole. Every one of these caps
+# is what stops a query from becoming the full-tree read it was meant to replace.
+_LINE_REGEX_MAX_CHARS = 200
+_SCAN_LIMIT_DEFAULT = 2000
+_SCAN_LIMIT_MAX = 20000
+_RELATION_SIBLINGS_MAX = 8
+_RELATION_CHILDREN_MAX = 12
+# Across the whole reply, not per match: per-match caps let 50 hits x 20
+# neighbours build a 1000-node result no matter how small each node is.
+_RELATION_TOTAL_NODE_BUDGET = 120
+
+# Per-search wall clock when a timeout-capable engine is available.
+_LINE_REGEX_TIMEOUT_SECONDS = 0.25
+# Safe-subset ceiling when it is not: with no quantified group and at most this
+# many unbounded quantifiers, backtracking on one line of length n is bounded by
+# O(n^2). AX lines run a few hundred chars, so that is microseconds.
+_UNBOUNDED_QUANTIFIER_LIMIT = 2
+
+try:  # pragma: no cover - import shape depends on the deployment
+    import regex as _regex_engine  # type: ignore
+except ImportError:  # pragma: no cover
+    _regex_engine = None
+
+# Structural checks for the fallback. These are NOT a general safety analysis --
+# static regex safety is undecidable in practice and the heuristic this replaced
+# waved through `(?:a+)+$`, `(?P<x>a+)+$` and `(a|aa)+$`, one of which hung the
+# process that was testing it. They are the conservative half of a two-mode
+# policy: an unquantified group cannot nest quantifiers, so the exponential
+# class is excluded by construction rather than pattern-matched for.
+_QUANTIFIED_GROUP_RE = re.compile(r"\)\s*(?:[*+?]|\{\s*\d*\s*,)")
+_BACKREFERENCE_RE = re.compile(r"\\[1-9]")
+_UNBOUNDED_QUANTIFIER_RE = re.compile(r"(?<!\\)(?:[*+]|\{\s*\d*\s*,\s*\})")
+
+
+def _line_regex_engine_note() -> str:
+    # "bounded-backtracking", not "non-backtracking": the subset still admits
+    # patterns that backtrack, e.g. `a*a*$` or `.*.*$`. What it excludes is
+    # unbounded blowup -- with no quantified group, no backreference and at most
+    # two unbounded quantifiers, one line of length n costs O(n^2).
+    return (
+        f"engine=regex, per-search timeout {_LINE_REGEX_TIMEOUT_SECONDS}s"
+        if _regex_engine is not None
+        else "engine=re (no timeout available); patterns are limited to a"
+        " restricted, bounded-backtracking subset"
+    )
+
+
+def _reject_catastrophic_regex(pattern: str) -> Optional[str]:
+    """Why this pattern must not be compiled, or None to allow it.
+
+    With a timeout-capable engine this only bounds the pattern's size; the
+    engine itself enforces the time bound, so full regex syntax stays available.
+    Without one, `re` cannot be interrupted mid-match -- a runaway pattern hangs
+    the worker with no step, no timeout and no log line, and capping the scan
+    does not help because the blowup happens inside a single line. There the
+    accepted language shrinks to what is provably bounded.
+    """
+    if len(pattern) > _LINE_REGEX_MAX_CHARS:
+        return (
+            f"pattern is {len(pattern)} chars; the limit is"
+            f" {_LINE_REGEX_MAX_CHARS}. Narrow it, or filter with role/"
+            "interactive_only and a shorter pattern."
+        )
+    if _regex_engine is not None:
+        return None
+    # Backreferences are checked BEFORE escapes are stripped: `\1` is itself an
+    # escape sequence, so stripping first deletes exactly what is being looked
+    # for. The stripping below exists for the opposite case -- `\+` is a literal
+    # plus, not a quantifier.
+    if _BACKREFERENCE_RE.search(pattern):
+        return (
+            "backreferences can backtrack exponentially and this runtime has no"
+            " timeout-capable regex engine (install `regex`). Match the text"
+            " directly instead."
+        )
+    stripped = re.sub(r"\\.", "", pattern)
+    if _QUANTIFIED_GROUP_RE.search(stripped):
+        return (
+            "a quantifier applied to a group can nest quantifiers and backtrack"
+            " exponentially. This runtime has no timeout-capable regex engine"
+            " (install `regex`), so quantified groups are rejected. Quantify a"
+            " character or class instead: `listboxoption.*广东`, not `(ab)+`."
+        )
+    unbounded = len(_UNBOUNDED_QUANTIFIER_RE.findall(stripped))
+    if unbounded > _UNBOUNDED_QUANTIFIER_LIMIT:
+        return (
+            f"{unbounded} unbounded quantifiers (limit"
+            f" {_UNBOUNDED_QUANTIFIER_LIMIT}) can backtrack polynomially with a"
+            " degree this runtime cannot interrupt (install `regex` for a"
+            " timeout). Anchor the pattern with literal text between them."
+        )
+    return None
+
+
+def _compile_line_regex(pattern: str, flags: int) -> Any:
+    """Compile with whichever engine is present; the caller searches uniformly."""
+    if _regex_engine is not None:
+        return _regex_engine.compile(pattern, flags)
+    return re.compile(pattern, flags)
+
+
+def _search_line_regex(compiled: Any, line: str) -> bool:
+    """True on match. A timeout is a match failure for THAT line, not a crash.
+
+    Only the timeout-capable engine can raise here. Treating the line as a
+    non-match keeps one pathological line from failing the whole query, and the
+    reply reports how many lines were abandoned so a caller is never told
+    `no_match` about a line the engine gave up on.
+    """
+    if _regex_engine is None:
+        return bool(compiled.search(line))
+    try:
+        return bool(compiled.search(line, timeout=_LINE_REGEX_TIMEOUT_SECONDS))
+    except TimeoutError:
+        raise
+    except TypeError:  # pragma: no cover - engine without timeout support
+        return bool(compiled.search(line))
+
+
+def _axtree_node_projection(node: JsonDict) -> JsonDict:
+    """A neighbour, compactly: enough to recognise and act on, no full line.
+
+    A match carries its whole rendered line because the caller asked for that
+    node. A neighbour did not match anything -- it is context. Repeating the
+    line (and rect) for every neighbour is what turned a 50-hit query with
+    relations into 69,832 bytes against an 11,268-byte tree: six times the tree
+    the tool exists to avoid re-reading, and past the 50,000-byte whole-result
+    offload threshold, so the reply would be written to a file and queried
+    again. Ask for the neighbour's id if its own line is needed.
+    """
+    return {
+        "id": str(node.get("id") or ""),
+        "role": node.get("role") or "",
+        "name": str(node.get("name") or ""),
+        "depth": node.get("depth"),
+        "lineNumber": node.get("lineNumber"),
+        "interactive": bool(node.get("interactive")),
+    }
+
+
+def _axtree_relations(
+    nodes: List[JsonDict],
+    index: int,
+    *,
+    want_parent: bool,
+    want_siblings: int,
+    want_children: int,
+    budget: JsonDict,
+) -> JsonDict:
+    """Ancestors/siblings/children of one node, read off the depth column.
+
+    Depth is the ORIGINAL tree depth, and the panel folds dense low-priority
+    subtrees (`(+N omitted)`), so depth can jump by more than one between two
+    printed lines. The nearest preceding line with a smaller depth is therefore
+    a true ANCESTOR but not necessarily the direct parent -- `direct` says
+    which, rather than letting the caller assume. For the same reason sibling
+    and child lists are what the tree printed, not what the DOM contains, and
+    say so via `mayBeIncomplete`.
+
+    `budget["left"]` counts neighbours still allowed across the WHOLE reply, not
+    per match. Per-match caps alone do not bound the result: 50 hits at 20
+    neighbours each is 1000 nodes however small each one is.
+
+    Every requested relation key is present on every match even when the budget
+    is gone, and `relationsOmittedByBudget` counts what this match lost. An
+    absent key would otherwise mean two different things -- "this node has no
+    siblings" and "you already spent the budget" -- and the caller would read
+    the second as the first.
+    """
+    out: JsonDict = {}
+    node = nodes[index]
+    depth = node.get("depth")
+    omitted = 0
+
+    def take(projected: JsonDict) -> Optional[JsonDict]:
+        nonlocal omitted
+        if budget["left"] <= 0:
+            # Refused, not merely empty: this is the only place that can tell
+            # a spent budget from a query that happened to fit inside it.
+            omitted += 1
+            budget["omitted"] += 1
+            return None
+        budget["left"] -= 1
+        return projected
+
+    if not isinstance(depth, int):
+        return out
+
+    parent_index = -1
+    for back in range(index - 1, -1, -1):
+        other_depth = nodes[back].get("depth")
+        if isinstance(other_depth, int) and other_depth < depth:
+            parent_index = back
+            break
+
+    if want_parent:
+        parent = None
+        if parent_index >= 0:
+            parent = take(_axtree_node_projection(nodes[parent_index]))
+            if parent is not None:
+                parent["direct"] = nodes[parent_index].get("depth") == depth - 1
+        out["parent"] = parent
+
+    if want_siblings > 0:
+        # Candidates are selected before any are taken, so a refused take can be
+        # counted rather than ending the walk. Breaking on the first refusal
+        # reported one omission no matter how many neighbours were dropped.
+        limit = min(want_siblings, _RELATION_SIBLINGS_MAX)
+        before: List[int] = []
+        for back in range(index - 1, parent_index, -1):
+            other_depth = nodes[back].get("depth")
+            if not isinstance(other_depth, int) or other_depth < depth:
+                break
+            if other_depth == depth:
+                before.append(back)
+                if len(before) >= limit:
+                    break
+        after: List[int] = []
+        for forward in range(index + 1, len(nodes)):
+            other_depth = nodes[forward].get("depth")
+            if not isinstance(other_depth, int) or other_depth < depth:
+                break
+            if other_depth == depth:
+                after.append(forward)
+                if len(after) >= limit:
+                    break
+        siblings: List[JsonDict] = []
+        for position in list(reversed(before)) + after:
+            taken = take(_axtree_node_projection(nodes[position]))
+            if taken is not None:
+                siblings.append(taken)
+        out["siblings"] = siblings
+
+    if want_children > 0:
+        limit = min(want_children, _RELATION_CHILDREN_MAX)
+        descendants: List[Tuple[int, JsonDict]] = []
+        for forward in range(index + 1, len(nodes)):
+            other_depth = nodes[forward].get("depth")
+            if not isinstance(other_depth, int) or other_depth <= depth:
+                break
+            descendants.append((other_depth, nodes[forward]))
+        children: List[JsonDict] = []
+        if descendants:
+            # Not depth+1: when the direct child level is folded away, the
+            # shallowest descendant printed IS the child level for this node.
+            child_depth = min(item[0] for item in descendants)
+            candidates = [
+                child for other_depth, child in descendants
+                if other_depth == child_depth
+            ][:limit]
+            for child in candidates:
+                taken = take(_axtree_node_projection(child))
+                if taken is None:
+                    continue
+                # Same distinction the parent carries, for the same reason: a
+                # folded-away level makes these descendants, not children.
+                taken["direct"] = child_depth == depth + 1
+                children.append(taken)
+        out["children"] = children
+
+    if out:
+        out["mayBeIncomplete"] = True
+        if omitted:
+            out["relationsOmittedByBudget"] = omitted
+    return out
+
+
 def _find_in_axtree(agent: Any, tool_input: JsonDict) -> JsonDict:
     page_id = str(tool_input.get("pageId") or "").strip()
     current_page_id = str(getattr(agent, "axtree_page_id", "") or "")
@@ -1169,10 +1437,12 @@ def _find_in_axtree(agent: Any, tool_input: JsonDict) -> JsonDict:
         }
 
     role = str(tool_input.get("role") or "").strip().lower()
+    # `or`, not `is not None`: the schema calls text an "alias/fallback for
+    # name", and every caller passes both keys with one of them empty. Treating
+    # an empty-but-present name as the chosen query made `{name:"", text:"北京"}`
+    # search for nothing and return the entire tree.
     query = str(
-        tool_input.get("name")
-        if tool_input.get("name") is not None
-        else tool_input.get("text") or ""
+        tool_input.get("name") or tool_input.get("text") or ""
     ).strip()
     match_mode = str(tool_input.get("match") or "contains").strip().lower()
     if match_mode not in {"exact", "contains", "regex"}:
@@ -1180,15 +1450,62 @@ def _find_in_axtree(agent: Any, tool_input: JsonDict) -> JsonDict:
     case_sensitive = bool(tool_input.get("case_sensitive", False))
     interactive_only = bool(tool_input.get("interactive_only", False))
     max_results = max(1, min(optional_int(tool_input.get("max_results"), 10) or 10, 50))
+    scan_limit = max(
+        1,
+        min(
+            optional_int(tool_input.get("scan_limit"), _SCAN_LIMIT_DEFAULT)
+            or _SCAN_LIMIT_DEFAULT,
+            _SCAN_LIMIT_MAX,
+        ),
+    )
+    line_regex = str(tool_input.get("line_regex") or "").strip()
 
+    flags = 0 if case_sensitive else re.I
     if match_mode == "regex":
-        flags = 0 if case_sensitive else re.I
+        rejection = _reject_catastrophic_regex(query)
+        if rejection:
+            return {"status": "invalid_pattern", "field": "name", "error": rejection}
         try:
-            query_re = re.compile(query, flags)
-        except re.error as exc:
-            return {"status": "failed", "error": f"invalid name/text regex: {exc}"}
+            query_re = _compile_line_regex(query, flags)
+        except Exception as exc:
+            return {
+                "status": "invalid_pattern",
+                "field": "name",
+                "error": f"invalid name/text regex: {exc}",
+            }
     else:
         query_re = None
+
+    # The whole rendered line: `depth [id] role "name" flags # @x,y,w,h`. This
+    # is the one query that can say "a listboxoption whose id is 3:3329 and
+    # whose label contains 广东" in a single expression -- the name/role filters
+    # cannot, which is why the model was falling back to reading the offloaded
+    # tree file whole and undoing the offload.
+    if line_regex:
+        rejection = _reject_catastrophic_regex(line_regex)
+        if rejection:
+            return {"status": "invalid_pattern", "field": "line_regex", "error": rejection}
+        try:
+            line_re = _compile_line_regex(line_regex, flags)
+        except Exception as exc:
+            return {
+                "status": "invalid_pattern",
+                "field": "line_regex",
+                "error": f"invalid line_regex: {exc}",
+            }
+    else:
+        line_re = None
+
+    relations = tool_input.get("relations")
+    relations = relations if isinstance(relations, dict) else {}
+    want_parent = bool(relations.get("parent", False))
+    want_siblings = max(0, optional_int(relations.get("siblings"), 0) or 0)
+    want_children = max(0, optional_int(relations.get("children"), 0) or 0)
+    with_relations = want_parent or want_siblings > 0 or want_children > 0
+    # `omitted` counts refusals, not remaining balance: a reply that consumed
+    # exactly the budget dropped nothing, and flagging it truncated would send
+    # the caller narrowing a query that already fit.
+    relation_budget: JsonDict = {"left": _RELATION_TOTAL_NODE_BUDGET, "omitted": 0}
 
     def text_matches(value: str) -> bool:
         if not query:
@@ -1198,38 +1515,51 @@ def _find_in_axtree(agent: Any, tool_input: JsonDict) -> JsonDict:
         if match_mode == "exact":
             return candidate == needle
         if match_mode == "regex" and query_re is not None:
-            return bool(query_re.search(value))
+            return _search_line_regex(query_re, value)
         return needle in candidate
 
-    lines = list(getattr(agent, "axtree_lines", []) or [])
     current_ids = set(getattr(agent, "axtree_ids", set()) or set())
     matches: List[JsonDict] = []
-    for node in nodes:
+    scanned = 0
+    scan_truncated = False
+    abandoned_lines = 0
+    for index, node in enumerate(nodes):
+        if scanned >= scan_limit:
+            scan_truncated = index < len(nodes)
+            break
+        scanned += 1
         if role and str(node.get("role") or "").lower() != role:
             continue
         if interactive_only and not bool(node.get("interactive")):
             continue
         name = str(node.get("name") or "")
         raw_line = str(node.get("line") or "")
-        if not text_matches(name or raw_line):
+        try:
+            if line_re is not None and not _search_line_regex(line_re, raw_line):
+                continue
+            # `name or raw_line` on purpose only when there is no name: an
+            # unnamed generic container is still findable by what its line says.
+            # When a name IS present, the name filter means the name --
+            # line_regex is the query that reaches the rest of the line.
+            if not text_matches(name or raw_line):
+                continue
+        except TimeoutError:
+            # This line defeated the engine's time budget. Counting it keeps a
+            # `no_match` honest: the reply must never claim the whole snapshot
+            # was examined when some of it was abandoned.
+            abandoned_lines += 1
             continue
         node_id = str(node.get("id") or "")
         if current_ids and node_id not in current_ids:
             continue
-        line_number = optional_int(node.get("lineNumber"), 0) or 0
-        context = ""
-        if lines and line_number > 0:
-            start = max(0, line_number - 2)
-            end = min(len(lines), line_number + 1)
-            context = "\n".join(lines[start:end])
         entry: JsonDict = {
             "id": node_id,
             "role": node.get("role") or "",
             "name": name,
             "interactive": bool(node.get("interactive")),
-            "lineNumber": line_number or None,
+            "depth": node.get("depth"),
+            "lineNumber": optional_int(node.get("lineNumber"), 0) or None,
             "line": raw_line,
-            "context": context,
         }
         node_flags = node.get("flags") or []
         if node_flags:
@@ -1237,20 +1567,95 @@ def _find_in_axtree(agent: Any, tool_input: JsonDict) -> JsonDict:
         node_rect = node.get("rect")
         if isinstance(node_rect, dict):
             entry["rect"] = node_rect
+        if with_relations:
+            entry.update(
+                _axtree_relations(
+                    nodes,
+                    index,
+                    want_parent=want_parent,
+                    want_siblings=want_siblings,
+                    want_children=want_children,
+                    budget=relation_budget,
+                )
+            )
         matches.append(entry)
         if len(matches) >= max_results:
+            scan_truncated = index + 1 < len(nodes)
             break
+
+    # Three states, not two. An empty result after a truncated scan says
+    # nothing about the page, but `no_match` reads as a fact about it -- and
+    # classify_target_yield in vl/reality_check.py counts an empty `matches`
+    # toward the target-shortfall streak. A scan_limit of 3 must not be able to
+    # feed that verdict.
+    incomplete = scan_truncated or abandoned_lines > 0
+    if matches:
+        match_status = "matched"
+    elif incomplete:
+        match_status = "scan_incomplete"
+    else:
+        match_status = "no_match"
+
+    if matches:
+        instruction = (
+            "Use a returned full id with DOM.getText/DOM.getAttribute/Input.*."
+        )
+        if scan_truncated:
+            instruction += (
+                " More of the tree went unscanned: raise max_results/scan_limit"
+                " or narrow line_regex if the target is not among these."
+            )
+        if relation_budget["omitted"]:
+            instruction += (
+                f" {relation_budget['omitted']} neighbour(s) were dropped on the"
+                " reply-wide relation budget; the matches that lost them carry"
+                " relationsOmittedByBudget. Narrow the query if you need them."
+            )
+    elif incomplete:
+        instruction = (
+            "The query did not finish, so this says nothing about whether the"
+            " target is on the page"
+        )
+        if scan_truncated:
+            instruction += f"; only {scanned} of {len(nodes)} nodes were scanned"
+        if abandoned_lines:
+            instruction += (
+                f"; {abandoned_lines} line(s) were abandoned on a regex timeout"
+                " -- simplify the pattern"
+            )
+        instruction += ". Raise scan_limit or narrow the pattern, then retry."
+    else:
+        # Zero matches is an answer about the page, not a tool failure. Saying
+        # so is what stops the next turn from being a full re-read of the tree.
+        instruction = (
+            f"No node matches in the cached snapshot (epoch"
+            f" {int(getattr(agent, 'axtree_epoch', 0) or 0)}, {len(nodes)}"
+            " nodes), which was scanned in full. Widen the query first: drop"
+            " role/interactive_only, or use line_regex against the whole"
+            " rendered line. Do not re-read the tree merely because this was"
+            " empty -- the harness has observed no invalidation since the"
+            " snapshot. Do re-read if you are waiting on an async component"
+            " that may have rendered without emitting an event."
+        )
 
     return {
         "status": "done",
+        "matchStatus": match_status,
         "pageId": page_id or current_page_id or None,
         "currentAXTreePageId": current_page_id or None,
         "axtreeEpoch": int(getattr(agent, "axtree_epoch", 0) or 0),
+        # Not "the page is current" -- only that no invalidation was observed
+        # for this cached tree. An async render that emits no event is exactly
+        # the case this word must not overclaim.
+        "freshness": "cache_current",
+        "totalNodes": len(nodes),
+        "nodesScanned": scanned,
+        "scanTruncated": scan_truncated,
         "count": len(matches),
         "matches": matches,
-        "next_instruction": (
-            "Use a returned full id with DOM.getText/DOM.getAttribute/Input.*."
-            if matches
-            else "No matching node exists in the current AXTree snapshot; refresh or change query."
-        ),
+        "regexEngine": _line_regex_engine_note(),
+        **({"linesAbandonedOnTimeout": abandoned_lines} if abandoned_lines else {}),
+        **({"relationsTruncated": True, "relationsOmitted": relation_budget["omitted"]}
+           if relation_budget["omitted"] else {}),
+        "next_instruction": instruction,
     }

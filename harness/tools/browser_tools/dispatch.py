@@ -1060,10 +1060,19 @@ async def _browser_record_extraction(ctx: ToolContext) -> JsonDict:
 @BROWSER_TOOLS.register(
     name="find_in_axtree",
     description=(
-        "Search the current DOM.getAXTree snapshot by role/name/text and return"
-        " complete canonical AXTree ids with line context. Use this instead of"
-        " grepping offloaded AXTree text when locating an element in a large"
-        " accessibility tree. Matches include layout `flags`"
+        "grep the current DOM.getAXTree snapshot, in memory, and return complete"
+        " canonical AXTree ids. ALWAYS reach for this before reading an"
+        " offloaded AXTree file with local_fs_read/local_fs_search: the file and"
+        " this index hold the same tree, but a file read pulls the whole tree"
+        " back into context while this returns only matching lines."
+        " `line_regex` matches the entire rendered line"
+        " (`depth [id] role \"name\" flags # @x,y,w,h`), so role, id and label"
+        " can be queried in one expression; role/name/interactive_only narrow"
+        " it further. Ask for `relations` to get the parent/siblings/children"
+        " of each hit instead of re-reading the surrounding tree. Zero matches"
+        " is a normal answer (matchStatus=no_match) about a snapshot that is"
+        " already current — widen the query rather than re-fetching the tree."
+        " Matches carry layout `flags`"
         " (hidden/off/blocked/scroll/sticky/clip/zN) and the `rect` viewport"
         " box when the line carries them — avoid hidden/blocked targets; use"
         " `rect` for spatial reasoning only, not for deriving click coordinates"
