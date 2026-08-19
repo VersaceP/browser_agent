@@ -804,6 +804,55 @@ class VLConfig:
 # "harness" 段：HarnessConfig（编排与运行时行为）
 # ---------------------------------------------------------------------------
 
+def _validated_contract_path(value: Any) -> Optional[str]:
+    """None or a non-empty string - an empty/blank path would look
+    configured but load nothing, silently disabling the fast path."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(
+            "harness.canonical_direct_contract_path must be null or a"
+            f" non-empty string, got {value!r}"
+        )
+    return value
+
+
+def _validated_skip_flag(value: Any) -> bool:
+    """Strict boolean. Strings are rejected, not bool()-coerced: bool(
+    'false') is True, which would silently ENABLE the reviewer skip."""
+    if not isinstance(value, bool):
+        raise ValueError(
+            "harness.canonical_direct_skip_enabled must be a boolean, got"
+            f" {value!r}"
+        )
+    if value:
+        # The skip execution branch requires the side-effect action gate,
+        # which is not implemented yet. Fail config load loudly instead of
+        # letting an operator enable a half-built path.
+        raise ValueError(
+            "harness.canonical_direct_skip_enabled=true is not ready:"
+            " the side-effect action gate is not implemented, so the"
+            " emit-time reviewer skip stays off. Direct adoption of the"
+            " trusted plan is a SEPARATE control:"
+            " harness.canonical_direct_adoption_enabled (phase 1,"
+            " default off, flag-gated, structured fallbacks)."
+        )
+    return False
+
+
+def _validated_adoption_flag(value: Any) -> bool:
+    """Strict boolean for the direct-adoption control path (phase 1).
+    Strings are rejected, not bool()-coerced. Unlike the skip flag this
+    path IS implemented (harness accepts + dispatches contract.plan), so
+    true is accepted; it stays default-OFF until the live pilot passes."""
+    if not isinstance(value, bool):
+        raise ValueError(
+            "harness.canonical_direct_adoption_enabled must be a boolean,"
+            f" got {value!r}"
+        )
+    return value
+
+
 @dataclass
 class HarnessConfig:
     max_steps: int = 40
@@ -975,6 +1024,23 @@ class HarnessConfig:
     # a phase whose required variables are not derivable falls back to the normal
     # loop (fail-safe). Empty = off.
     forced_skill_id: str = ""
+    # Optional path to a versioned canonical direct contract JSON (see
+    # harness/task_control/canonical_direct.py). Loaded at LeadAgent startup;
+    # an invalid file disables the fast path (contract=None) with an event,
+    # never silently. No contract configured -> every plan classifies as
+    # no_canonical_contract and the reviewer flow is untouched.
+    canonical_direct_contract_path: Optional[str] = None
+    # Step-4 gate, default OFF: skipping the Plan Validator is only legal
+    # for candidates proven identical to a trusted canonical contract bound
+    # to this run's user task. Turn on only after the emitted-candidate
+    # replay and a live shadow audit both pass.
+    canonical_direct_skip_enabled: bool = False
+    # Direct adoption (phase 1, default OFF): with a valid trusted contract
+    # bound to this run's exact user task on a FRESH run, the harness itself
+    # accepts contract.plan (no Lead emit round, no Plan Validator call) and
+    # dispatches the first phase via a phase_id-only spawn. Any condition
+    # failing -> structured canonical_direct.fallback -> normal Lead flow.
+    canonical_direct_adoption_enabled: bool = False
     # When the enabled skill fast path falls back AND the BrowserAgent slow path then
     # succeeds for a degraded (recently-failed) skill, distill the successful
     # trace into a candidate workflow and run skill_heal (write candidate →
@@ -1265,6 +1331,24 @@ class HarnessConfig:
             worktree_dir=data.get("worktree_dir", cls.worktree_dir),
             runs_dir=data.get("runs_dir", cls.runs_dir),
             context_file=data.get("context_file"),
+            canonical_direct_contract_path=_validated_contract_path(
+                data.get(
+                    "canonical_direct_contract_path",
+                    cls.canonical_direct_contract_path,
+                )
+            ),
+            canonical_direct_skip_enabled=_validated_skip_flag(
+                data.get(
+                    "canonical_direct_skip_enabled",
+                    cls.canonical_direct_skip_enabled,
+                )
+            ),
+            canonical_direct_adoption_enabled=_validated_adoption_flag(
+                data.get(
+                    "canonical_direct_adoption_enabled",
+                    cls.canonical_direct_adoption_enabled,
+                )
+            ),
             strategy_bank_path=data.get(
                 "strategy_bank_path",
                 cls.strategy_bank_path,

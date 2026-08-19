@@ -114,6 +114,14 @@ from harness.task_control import (
     validate_task_plan,
     accept_task_plan,
 )
+from harness.task_control.canonical_direct import (
+    ELIGIBLE as CANONICAL_DIRECT_ELIGIBLE,
+    classify_canonical_direct_eligibility,
+    contract_identity_hash,
+    normalize_contract,
+    task_identity_hash,
+    validate_contract_shape,
+)
 from harness.planning.validator import (
     plan_candidate_hash,
     review_plan_revision,
@@ -2438,6 +2446,49 @@ def _plan_review_scope_signature(plan: Any) -> str:
     ).hexdigest()
 
 
+_LEAD_NORMAL_INSTRUCTION = (
+    "Act as the LeadAgent: decompose the task, spawn BrowserAgent phases as"
+    " needed, and call final_answer with the final result."
+)
+
+
+def _canonical_direct_instruction(
+    spawn_status: str, phase_id: str,
+) -> str:
+    """Opening instruction for a direct-adoption run, matched to the ACTUAL
+    dispatch outcome - never claim a dispatch that failed, and never ask an
+    adopted run to decompose or re-plan (that would contradict the adoption
+    and pollute the reduced-Lead-turns experiment)."""
+    if spawn_status == "running":
+        return (
+            "<canonical_direct_adoption>\n"
+            "The task plan for this run was adopted directly from the trusted"
+            " operator contract (canonical direct path); the Plan Validator"
+            " was not consulted because the plan IS the reviewed contract."
+            f" Phase {phase_id} has already been dispatched by the harness"
+            " with a phase_id-only spawn (receipt above). Monitor the"
+            " already-dispatched phase, inspect only its result when needed,"
+            " and finish or report a concrete blocker. Do NOT call"
+            " emit_task_plan, extend_task_plan, or replan, and do not spawn"
+            " a duplicate phase: the plan is accepted and locked.\n"
+            "</canonical_direct_adoption>\n"
+        )
+    return (
+        "<canonical_direct_adoption>\n"
+        "The task plan for this run was adopted directly from the trusted"
+        " operator contract (canonical direct path) and is accepted and"
+        " locked; the Plan Validator was not consulted because the plan IS"
+        " the reviewed contract. The harness dispatch of phase"
+        f" {phase_id} did not start a worker (spawn status:"
+        f" {spawn_status!r}; receipt above). The accepted plan stands:"
+        " either retry the spawn with phase_id ONLY (no other fields - the"
+        " plan is locked) or report the concrete blocker with"
+        " final_answer. Do NOT call emit_task_plan, extend_task_plan, or"
+        " replan.\n"
+        "</canonical_direct_adoption>\n"
+    )
+
+
 class LeadAgent:
     """Lead agent that decomposes work and spawns isolated browser agents."""
 
@@ -2469,6 +2520,42 @@ class LeadAgent:
         self.static_context_block, self.static_context_hash = build_static_context_block(
             self.runtime.harness.context_file
         )
+        # Canonical direct contract (trusted-source fast path). Init does
+        # SHAPE validation only - the schema cache does not exist yet, and
+        # normalizing the embedded plan here would judge method allowlists
+        # under different rules than candidates. Full normalization happens
+        # lazily in review_task_plan_candidate with identical parameters.
+        self.canonical_direct_contract: Optional[JsonDict] = None
+        self._canonical_direct_normalized: bool = False
+        self.last_plan_validator_record: Optional[JsonDict] = None
+        self.canonical_active_receipt: Optional[JsonDict] = None
+        contract_path = getattr(
+            self.runtime.harness, "canonical_direct_contract_path", None
+        )
+        if contract_path:
+            try:
+                raw_contract = json.loads(
+                    Path(contract_path).read_text(encoding="utf-8")
+                )
+            except (OSError, ValueError) as exc:
+                self.logger.write("canonical_direct.contract_unreadable", {
+                    "path": str(contract_path),
+                    "error": f"{type(exc).__name__}: {exc}"[:200],
+                })
+            else:
+                shaped_contract, contract_errors = validate_contract_shape(
+                    raw_contract
+                )
+                if shaped_contract is None:
+                    self.logger.write("canonical_direct.contract_invalid", {
+                        "errors": contract_errors[:10],
+                    })
+                else:
+                    self.canonical_direct_contract = shaped_contract
+                    self.logger.write("canonical_direct.contract_loaded", {
+                        "contractHash": contract_identity_hash(shaped_contract),
+                        "normalized": False,
+                    })
         self.lifecycle = default_lifecycle_manager()
         self.task_plan: Optional[JsonDict] = (
             dict(resume.current_plan) if resume is not None else None
@@ -2591,14 +2678,50 @@ class LeadAgent:
                 ],
             }
         config = self.runtime.plan_validator
-        if not config.enabled:
-            return {"status": "disabled"}
         schema_status, schema_methods = self._schema_cache_status()
         known_methods = (
             schema_methods
             if schema_status == SchemaCacheStatus.LOADED_OK
             else None
         )
+        replan_reason = (
+            str(raw_plan.get("replan_reason") or "").strip()
+            if isinstance(raw_plan, dict)
+            else ""
+        )
+        # Canonical direct contract shadow - INDEPENDENT of the Lead's
+        # candidate: computed before L1 so a mechanically invalid candidate
+        # still yields an auditable direct-path record, and classified with
+        # the run state (resume/replan) the real adoption path would face.
+        # The skip itself is behind harness.canonical_direct_skip_enabled
+        # (default False) and may only be turned on after the emitted-
+        # candidate replay AND a shadow audit pass. The classifier binds the
+        # contract to THIS run's user task, so a stale contract from a
+        # previous task can never qualify.
+        contract = self._normalized_canonical_contract(known_methods)
+        original_task_text = str(
+            getattr(self, "original_user_task", "") or ""
+        )
+        canonical_runtime_state = {
+            "resume_active": self.resume is not None,
+            "has_accepted_plan": self.task_plan is not None,
+        }
+        if contract is not None:
+            # contract_shadow: could the harness have ADOPTED this contract
+            # directly for this run? (Final architecture - see module
+            # docstring. Non-blocking; audited against live outcomes.)
+            contract_shadow = classify_canonical_direct_eligibility(
+                contract["_normalized_plan"],
+                contract=contract,
+                original_user_task=original_task_text,
+                runtime_state=canonical_runtime_state,
+            )
+            self.logger.write("canonical_direct.contract_shadow", {
+                "contractHash": contract_identity_hash(contract),
+                "originalTaskHash": task_identity_hash(original_task_text),
+                "directAdoption": contract_shadow["eligibility"],
+                "reasons": contract_shadow["reasons"],
+            })
         candidate, errors = validate_task_plan(
             raw_plan,
             known_abcp_methods=known_methods,
@@ -2618,11 +2741,58 @@ class LeadAgent:
                 "status": "mechanical_invalid",
                 "errors": errors,
             }
-        replan_reason = (
-            str(raw_plan.get("replan_reason") or "").strip()
-            if isinstance(raw_plan, dict)
-            else ""
+        # Canonical candidate shadow (the contract-independent half ran
+        # above, before L1). The skip branch runs first so a skip writes
+        # canonical_direct.skip (not a contradictory "flow preserved"
+        # shadow); the shadow event then lands BEFORE the validator-disabled
+        # early return, so reviewer-less deployments still record whether
+        # the Lead's CURRENT valid candidate matches the trusted contract.
+        shadow = classify_canonical_direct_eligibility(
+            candidate,
+            contract=contract,
+            original_user_task=original_task_text,
+            runtime_state={
+                "resume_active": self.resume is not None,
+                "has_accepted_plan": self.task_plan is not None,
+            },
         )
+        if (
+            bool(getattr(
+                getattr(self.runtime, "harness", None),
+                "canonical_direct_skip_enabled",
+                False,
+            ))
+            and shadow["eligibility"] == CANONICAL_DIRECT_ELIGIBLE
+        ):
+            skip_receipt = {
+                "status": "canonical_direct",
+                "reviewed": False,
+                "candidateHash": plan_candidate_hash(
+                    candidate, replan_reason
+                ),
+                "contractHash": contract_identity_hash(contract),
+                "originalTaskHash": task_identity_hash(original_task_text),
+            }
+            self.logger.write("canonical_direct.skip", {
+                **skip_receipt,
+                "reviewerFlowPreserved": False,
+            })
+            return skip_receipt
+        self.logger.write("canonical_direct.shadow", {
+            "candidateHash": plan_candidate_hash(candidate, replan_reason),
+            "contractHash": (
+                contract_identity_hash(contract) if contract else None
+            ),
+            "originalTaskHash": task_identity_hash(original_task_text),
+            "eligibility": shadow["eligibility"],
+            "reasons": shadow["reasons"],
+            # Honest naming: shadow never alters the flow itself, but a later
+            # L2 operational-continuation may still skip the provider - so
+            # this is NOT a claim that the provider was called.
+            "reviewerFlowPreserved": True,
+        })
+        if not config.enabled:
+            return {"status": "disabled"}
         if (
             self.task_plan is not None
             and _plan_review_scope_signature(candidate)
@@ -2739,6 +2909,15 @@ class LeadAgent:
         plan_validator_review: Optional[JsonDict] = None,
         resume_decision: str = "replan",
     ) -> JsonDict:
+        # The accepted plan's validator record is the authoritative fact the
+        # spawn guard reads: if it says canonical_direct, the receipt MUST
+        # exist and match - missing/corrupt means fail-closed, not fallback.
+        self.last_plan_validator_record = (
+            dict(plan_validator_review)
+            if isinstance(plan_validator_review, dict)
+            else None
+        )
+        self.canonical_active_receipt = None
         replan_reason = ""
         if self.task_plan is not None:
             if isinstance(raw_plan, dict):
@@ -2882,9 +3061,20 @@ class LeadAgent:
             infrastructure_unreviewed = (
                 review_never_answered and not scope_changed_replan
             )
+            # Canonical direct path (feature-flagged, default OFF): the
+            # candidate was proven field-for-field identical to a trusted
+            # contract's normalized plan AND bound to this run's user task,
+            # so the reviewer call is redundant BY CONSTRUCTION. The receipt
+            # hash must still match this exact submission.
+            canonical_direct_ok = (
+                isinstance(plan_validator_review, dict)
+                and plan_validator_review.get("status") == "canonical_direct"
+                and reviewed_hash == submitted_candidate_hash
+            )
             if (
                 not operational_continuation
                 and not infrastructure_unreviewed
+                and not canonical_direct_ok
                 and (
                     not isinstance(plan_validator_review, dict)
                     or plan_validator_review.get("status") != "approved"
@@ -3068,6 +3258,11 @@ class LeadAgent:
                 "candidateHash": plan_validator_review.get("candidateHash"),
                 "verdict": plan_validator_review.get("verdict"),
                 "auditPath": plan_validator_review.get("auditPath"),
+                # Canonical binding, persisted with the plan version: the
+                # spawn guard's authorization survives restart/resume ONLY
+                # if these land here (memory does not).
+                "contractHash": plan_validator_review.get("contractHash"),
+                "originalTaskHash": plan_validator_review.get("originalTaskHash"),
             }
         extension_decision = None
         if resume_decision == "extend" and isinstance(preserve_from, dict):
@@ -3105,6 +3300,35 @@ class LeadAgent:
         self.task_plan = plan
         if self.initial_task_plan is None:
             self.initial_task_plan = plan
+        if (
+            isinstance(plan_validator_review, dict)
+            and plan_validator_review.get("status") == "canonical_direct"
+        ):
+            # Persist the canonical receipt: the spawn guard reads it to
+            # lock task/context/worker_contract against Lead overrides for
+            # as long as the accepted plan stays identical to the contract.
+            receipt = {
+                "status": "canonical_direct",
+                "candidateHash": plan_validator_review.get("candidateHash"),
+                "contractHash": plan_validator_review.get("contractHash"),
+                "originalTaskHash": task_identity_hash(
+                    self.original_user_task
+                ),
+            }
+            receipt_path = (
+                Path(self.logger.task_dir) / "canonical_direct.receipt.json"
+            )
+            receipt_path.write_text(
+                json.dumps(receipt, ensure_ascii=False, indent=1),
+                encoding="utf-8",
+            )
+            # In-memory twin: the sidecar file alone must never be the only
+            # authorization fact (a lost/corrupted file would fail open).
+            self.canonical_active_receipt = receipt
+            self.logger.write("canonical_direct.receipt_persisted", {
+                **receipt,
+                "savedPath": str(receipt_path),
+            })
         result = {
             "status": "done",
             "planPath": plan_path,
@@ -3647,6 +3871,215 @@ class LeadAgent:
         strategies = self.strategies_for_phase(phase)
         return render_strategy_guidance(strategies)
 
+    def _normalized_canonical_contract(
+        self, known_methods: Optional[Any],
+    ) -> Optional[JsonDict]:
+        """Lazily normalize the loaded contract under the EXACT parameters
+        a candidate is validated with (schema methods + harness tools), so
+        allowlists are never judged under two rule sets. Cached on the agent;
+        a contract that fails normalization is cleared and evented - callers
+        see None."""
+        contract = getattr(self, "canonical_direct_contract", None)
+        if contract is None:
+            return None
+        if not self._canonical_direct_normalized:
+            normalized_contract, contract_errors = normalize_contract(
+                contract,
+                known_abcp_methods=known_methods,
+                known_harness_tools=HARNESS_TOOL_NAMES,
+            )
+            if normalized_contract is None:
+                self.logger.write("canonical_direct.contract_invalid", {
+                    "stage": "normalize",
+                    "errors": contract_errors[:10],
+                })
+                self.canonical_direct_contract = None
+                return None
+            self.canonical_direct_contract = normalized_contract
+            self._canonical_direct_normalized = True
+            return normalized_contract
+        return contract
+
+    def _maybe_adopt_canonical_direct_plan(self) -> Optional[JsonDict]:
+        """Phase-1 direct adoption (feature-flagged, default OFF).
+
+        With a trusted contract bound to THIS run's exact user task on a
+        FRESH run (no resume, no accepted plan, no pending barriers), the
+        harness accepts contract.plan itself - no Lead emit round, no Plan
+        Validator call - and returns the first phase id for direct dispatch.
+        Every failure is a structured canonical_direct.fallback event and
+        returns None, leaving the ordinary Lead flow untouched."""
+        if not getattr(
+            getattr(self.runtime, "harness", None),
+            "canonical_direct_adoption_enabled",
+            False,
+        ):
+            return None
+        schema_status, schema_methods = self._schema_cache_status()
+        known_methods = (
+            schema_methods
+            if schema_status == SchemaCacheStatus.LOADED_OK
+            else None
+        )
+        contract = self._normalized_canonical_contract(known_methods)
+
+        def _fallback(reason: str, **extra: Any) -> None:
+            self.logger.write("canonical_direct.fallback", {
+                "reason": reason,
+                "contractConfigured": contract is not None,
+                **extra,
+            })
+
+        if contract is None:
+            _fallback("no_contract")
+            return None
+        if self.resume is not None:
+            _fallback("resume_active")
+            return None
+        if self.task_plan is not None:
+            _fallback("not_fresh_task")
+            return None
+        original_task_text = str(
+            getattr(self, "original_user_task", "") or ""
+        )
+        if original_task_text != str(contract.get("original_task") or ""):
+            _fallback("task_mismatch")
+            return None
+        classification = classify_canonical_direct_eligibility(
+            contract["_normalized_plan"],
+            contract=contract,
+            original_user_task=original_task_text,
+            runtime_state={
+                "resume_active": False,
+                "has_accepted_plan": False,
+            },
+        )
+        if classification["eligibility"] != CANONICAL_DIRECT_ELIGIBLE:
+            _fallback("ineligible", reasons=classification["reasons"])
+            return None
+        normalized_plan = contract["_normalized_plan"]
+        record = {
+            "status": "canonical_direct",
+            "candidateHash": plan_candidate_hash(normalized_plan, ""),
+            "contractHash": contract_identity_hash(contract),
+            "originalTaskHash": task_identity_hash(original_task_text),
+        }
+        # Submit the contract's RAW plan: accept_task_plan normalizes under
+        # the same parameters the contract was normalized with, so the
+        # resulting plan (and its candidateHash) is field-for-field the
+        # contract's normalized plan. Feeding the ALREADY-normalized plan
+        # would re-derive validators a second time and drift the hash.
+        result = self.accept_task_plan(
+            copy.deepcopy(contract.get("plan") or normalized_plan),
+            plan_validator_review=dict(record),
+        )
+        if result.get("status") != "done":
+            _fallback(
+                "accept_failed",
+                error=str(result.get("error") or "")[:200],
+            )
+            return None
+        phases = normalized_plan.get("phases") or []
+        phase_id = str((phases[0] or {}).get("id") or "") if phases else ""
+        self.logger.write("canonical_direct.adoption", {
+            "contractHash": record["contractHash"],
+            "originalTaskHash": record["originalTaskHash"],
+            "candidateHash": record["candidateHash"],
+            "phaseId": phase_id,
+            "phaseCount": len(phases),
+        })
+        return {"phase_id": phase_id, "record": record}
+
+    async def _dispatch_canonical_direct_phase(
+        self,
+        adoption: JsonDict,
+        messages: List[JsonDict],
+        dispatch_tool: Any,
+    ) -> str:
+        """Dispatch the trusted contract's first phase WITHOUT a Lead model
+        call: a synthetic phase_id-only spawn through the normal dispatcher.
+        The spawn guard (locked by the canonical acceptance) then proves the
+        input carries no field the contract did not fix, and the worker
+        contract comes from the accepted plan verbatim - nothing is assembled
+        from Lead tool input. Returns the spawn status so the caller can set
+        the Lead's opening instruction to match reality."""
+        phase_id = str(adoption.get("phase_id") or "")
+        tool_call = {
+            "id": "canonical-direct-spawn-1",
+            "name": "spawn_browser_agent",
+            "input": {"phase_id": phase_id},
+        }
+        result, should_stop = await dispatch_tool(tool_call)
+        # should_stop=True from a spawn is not a combination the production
+        # spawner produces (only final_answer-style tools stop the loop); if
+        # it ever appears we record it in dispatch_failed and still hand the
+        # real receipt to the Lead loop - an explicit terminate-vs-continue
+        # decision is deferred until evidence shows the combination exists.
+        model_result = offload_tool_result_for_model(
+            logger=self.logger,
+            runtime=self.runtime,
+            tool_call=tool_call,
+            result=result,
+            step=0,
+        )
+        self.logger.write(
+            "lead.tool.result",
+            summarize_lead_tool_result_for_log(
+                tool_call=tool_call,
+                result=result,
+                model_result=model_result,
+                step=0,
+            ),
+        )
+        content = json.dumps(
+            trim_large_strings(
+                model_result,
+                self.runtime.harness.max_observation_chars,
+            ),
+            ensure_ascii=False,
+            default=str,
+        )
+        messages.append({
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": tool_call["id"],
+                "name": tool_call["name"],
+                "input": tool_call["input"],
+            }],
+        })
+        messages.append({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": tool_call["id"],
+                "content": content,
+            }],
+        })
+        spawn_status = str(result.get("status") or "")
+        if spawn_status == "running":
+            self.logger.write("canonical_direct.dispatch", {
+                "phaseId": phase_id,
+                "spawnStatus": spawn_status,
+                "contractHash": (adoption.get("record") or {}).get(
+                    "contractHash"
+                ),
+            })
+        else:
+            # The plan stays accepted and locked; the Lead may retry the
+            # spawn with phase_id only or report the blocker. Never pretend
+            # the dispatch succeeded.
+            self.logger.write("canonical_direct.dispatch_failed", {
+                "phaseId": phase_id,
+                "spawnStatus": spawn_status,
+                "shouldStop": bool(should_stop),
+                "error": str(result.get("error") or "")[:200],
+                "contractHash": (adoption.get("record") or {}).get(
+                    "contractHash"
+                ),
+            })
+        return spawn_status
+
     async def run(self, task: str) -> str:
         system_prompt = ""
         messages: List[JsonDict] = []
@@ -3688,6 +4121,9 @@ class LeadAgent:
             self.original_user_task = base_task
 
         await self._bootstrap_schema_cache()
+        # Direct adoption decision (phase 1, flag-gated): decided ONCE here,
+        # before any Lead model call - adoption never activates mid-run.
+        adoption = self._maybe_adopt_canonical_direct_plan()
         runtime_limits = json.dumps(
             {
                 "max_browser_agent_instances": (
@@ -3776,43 +4212,54 @@ class LeadAgent:
                 "\nThis is a planning-time capability index in task context;"
                 " it is not system policy or evidence of task completion.\n\n"
             )
+        content_prefix = (
+            f"<user_task>\n{base_task}\n</user_task>\n\n"
+            + strategy_index_block
+            + known_skills_block
+            + (
+                f"<resume_instruction>\n{resume_instruction}\n"
+                "</resume_instruction>\n\n"
+                if resume_instruction else ""
+            )
+            + resumed_block
+            + f"<runtime_limits>\n{runtime_limits}\n</runtime_limits>\n\n"
+            + (
+                "<pinned_browser_context>\n"
+                f"{pinned_context}\n"
+                "</pinned_browser_context>\n"
+                "This routing context is immutable control-plane input."
+                " Reuse it and never plan Fleet.create or substitute"
+                " another fleet. When pageId is present, do not plan"
+                " Page.create/Page.close or substitute that page; when"
+                " pageId is absent, Page.create inside the pinned fleet"
+                " remains allowed.\n\n"
+                if pinned_context
+                else ""
+            )
+        )
         messages = [
             {
                 "role": "user",
-                "content": (
-                    f"<user_task>\n{base_task}\n</user_task>\n\n"
-                    + strategy_index_block
-                    + known_skills_block
-                    + (
-                        f"<resume_instruction>\n{resume_instruction}\n"
-                        "</resume_instruction>\n\n"
-                        if resume_instruction else ""
-                    )
-                    + resumed_block
-                    + f"<runtime_limits>\n{runtime_limits}\n</runtime_limits>\n\n"
-                    + (
-                        "<pinned_browser_context>\n"
-                        f"{pinned_context}\n"
-                        "</pinned_browser_context>\n"
-                        "This routing context is immutable control-plane input."
-                        " Reuse it and never plan Fleet.create or substitute"
-                        " another fleet. When pageId is present, do not plan"
-                        " Page.create/Page.close or substitute that page; when"
-                        " pageId is absent, Page.create inside the pinned fleet"
-                        " remains allowed.\n\n"
-                        if pinned_context
-                        else ""
-                    )
-                    +
-                    "Act as the LeadAgent: decompose the task, spawn BrowserAgent phases as needed, "
-                    "and call final_answer with the final result."
-                ),
+                "content": content_prefix + _LEAD_NORMAL_INSTRUCTION,
             }
         ]
         tools = build_lead_agent_tool_specs(
             include_resume=self.resume is not None,
         )
         dispatch_tool = build_lead_tool_dispatcher(self)
+        if adoption is not None:
+            # Dispatch BEFORE the opening instruction is finalized: the
+            # prompt must describe the dispatch that ACTUALLY happened
+            # (monitor a running phase vs retry/report a failed one) and
+            # must never ask an adopted run to decompose or re-plan.
+            spawn_status = await self._dispatch_canonical_direct_phase(
+                adoption, messages, dispatch_tool,
+            )
+            messages[0]["content"] = content_prefix + (
+                _canonical_direct_instruction(
+                    spawn_status, str(adoption.get("phase_id") or ""),
+                )
+            )
         system_prompt = self._build_system_prompt()
         try:
             lead_timeout_step_retries = max(
