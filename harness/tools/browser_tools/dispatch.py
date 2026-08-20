@@ -1037,6 +1037,54 @@ async def _browser_final_answer(ctx: ToolContext) -> JsonDict:
     ctx.agent.trace.append({"type": "final_answer", "result": result})
     return result
 
+
+@BROWSER_TOOLS.register(
+    name="request_step_extension",
+    description=(
+        "Near the current BrowserAgent step limit, request one bounded"
+        " continuation only when you believe the current phase can be"
+        " completed within the requested extra steps. List the concrete"
+        " remaining actions and the evidence supporting that estimate. The"
+        " harness may deny the request because of timing, loop, failure, HITL,"
+        " routing, or hard-limit guards. Call this tool alone and read its"
+        " receipt before taking another action."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "estimated_steps": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 50,
+                "description": (
+                    "Extra model turns needed to finish this phase; the"
+                    " configured harness maximum is authoritative."
+                ),
+            },
+            "remaining_actions": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 8,
+                "items": {"type": "string"},
+                "description": "Concrete bounded actions still required.",
+            },
+            "evidence": {
+                "type": "string",
+                "description": (
+                    "Brief current-page or artifact evidence supporting the"
+                    " estimate; do not restate the full task."
+                ),
+            },
+        },
+        "required": ["estimated_steps", "remaining_actions", "evidence"],
+        "additionalProperties": False,
+    },
+    loop_guard=False,
+    trace_type="step_extension_request",
+)
+async def _browser_request_step_extension(ctx: ToolContext) -> JsonDict:
+    return ctx.agent.request_step_extension(ctx.tool_input, step=ctx.step)
+
 @BROWSER_TOOLS.register(
     name="record_extraction",
     description=(
@@ -1060,19 +1108,10 @@ async def _browser_record_extraction(ctx: ToolContext) -> JsonDict:
 @BROWSER_TOOLS.register(
     name="find_in_axtree",
     description=(
-        "grep the current DOM.getAXTree snapshot, in memory, and return complete"
-        " canonical AXTree ids. ALWAYS reach for this before reading an"
-        " offloaded AXTree file with local_fs_read/local_fs_search: the file and"
-        " this index hold the same tree, but a file read pulls the whole tree"
-        " back into context while this returns only matching lines."
-        " `line_regex` matches the entire rendered line"
-        " (`depth [id] role \"name\" flags # @x,y,w,h`), so role, id and label"
-        " can be queried in one expression; role/name/interactive_only narrow"
-        " it further. Ask for `relations` to get the parent/siblings/children"
-        " of each hit instead of re-reading the surrounding tree. Zero matches"
-        " is a normal answer (matchStatus=no_match) about a snapshot that is"
-        " already current — widen the query rather than re-fetching the tree."
-        " Matches carry layout `flags`"
+        "Search the current DOM.getAXTree snapshot by role/name/text and return"
+        " complete canonical AXTree ids with line context. Use this instead of"
+        " grepping offloaded AXTree text when locating an element in a large"
+        " accessibility tree. Matches include layout `flags`"
         " (hidden/off/blocked/scroll/sticky/clip/zN) and the `rect` viewport"
         " box when the line carries them — avoid hidden/blocked targets; use"
         " `rect` for spatial reasoning only, not for deriving click coordinates"
@@ -1145,6 +1184,7 @@ def build_browser_agent_tool_specs(
     task_type: Any = "web_scrape",
     *,
     workflow_enabled: bool = False,
+    step_extension_enabled: bool = False,
 ) -> List[JsonDict]:
     hidden = hidden_harness_tools_for_task_type(task_type)
     # A live capability does not authorize Harness execution by itself. Both
@@ -1156,6 +1196,10 @@ def build_browser_agent_tool_specs(
         spec
         for spec in BROWSER_TOOLS.tool_specs(capability_methods)
         if spec.get("name") not in hidden
+        and (
+            step_extension_enabled
+            or spec.get("name") != "request_step_extension"
+        )
         and (
             workflow_visible
             or spec.get("name") not in {

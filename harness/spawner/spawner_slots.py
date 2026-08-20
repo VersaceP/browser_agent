@@ -6,6 +6,7 @@ import asyncio
 import json
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 from typing import AsyncIterator
 from typing import Dict
@@ -17,6 +18,7 @@ from harness.fleet.coordinator import FleetAssignment
 from harness.fleet.coordinator import FleetRoutingError
 from harness.fleet.coordinator import handle_records_from_value
 from harness.fleet.coordinator import resolve_fleet_reference
+from harness.fleet.task_reuse import find_similar_task_fleet
 from harness.observation.event_observer import unwrap_notification
 from harness.utils import JsonDict
 from harness.utils import make_browser_event_logger
@@ -1140,6 +1142,8 @@ class SpawnerSlotsMixin:
         isolation_auto_applied: bool = False,
         resume_browser_hint: Optional[ResumeBrowserHint] = None,
         resume_hint_may_select_page: bool = True,
+        root_task: str = "",
+        automatic_task_reuse_allowed: bool = False,
     ) -> Optional[FleetAssignment]:
         lock_key = str(
             fleet_group_key
@@ -1169,6 +1173,8 @@ class SpawnerSlotsMixin:
                 isolation_auto_applied=isolation_auto_applied,
                 resume_browser_hint=resume_browser_hint,
                 resume_hint_may_select_page=resume_hint_may_select_page,
+                root_task=root_task,
+                automatic_task_reuse_allowed=automatic_task_reuse_allowed,
             )
 
     async def _assign_fleet_for_worker_locked(
@@ -1186,6 +1192,8 @@ class SpawnerSlotsMixin:
         isolation_auto_applied: bool = False,
         resume_browser_hint: Optional[ResumeBrowserHint] = None,
         resume_hint_may_select_page: bool = True,
+        root_task: str = "",
+        automatic_task_reuse_allowed: bool = False,
     ) -> Optional[FleetAssignment]:
         """Select or create the one fleet the worker is allowed to address.
 
@@ -1391,6 +1399,116 @@ class SpawnerSlotsMixin:
                         "resumeBrowserHint": resume_browser_hint.to_dict(),
                     },
                 )
+        if (
+            assignment is None
+            and automatic_task_reuse_allowed
+            and getattr(
+                self.runtime.harness,
+                "similar_task_fleet_reuse_enabled",
+                True,
+            )
+            and str(root_task or "").strip()
+        ):
+            match = find_similar_task_fleet(
+                slot.registration,
+                str(root_task).strip(),
+                candidate_fleet_ids=slot.fleet_ids,
+                current_task_id=Path(str(
+                    getattr(self.logger, "task_dir", "") or ""
+                )).name,
+                threshold=getattr(
+                    self.runtime.harness,
+                    "similar_task_reuse_threshold",
+                    0.78,
+                ),
+                running_stale_seconds=getattr(
+                    self.runtime.harness,
+                    "similar_task_running_stale_seconds",
+                    86400.0,
+                ),
+            )
+            if match is None:
+                self.logger.write("spawner.similar_task_reuse.miss", {
+                    "workerId": worker_id,
+                    "slotId": slot.slot_id,
+                    "threshold": float(getattr(
+                        self.runtime.harness,
+                        "similar_task_reuse_threshold",
+                        0.78,
+                    )),
+                })
+            else:
+                owner_slot_id = (
+                    self.fleet_coordinator.owner_slot_for_fleet(
+                        match.fleet_id,
+                        admitted_only=False,
+                    )
+                    or slot.slot_id
+                )
+                provisional = FleetAssignment(
+                    worker_id=worker_id,
+                    slot_id=slot.slot_id,
+                    owner_agent_id=slot.agent_id,
+                    fleet_id=match.fleet_id,
+                    assignment_reason="similar_task_fleet_reuse",
+                    reuse_scope="fleet",
+                    page_policy="new",
+                    allowed_fleet_ids=(match.fleet_id,),
+                    created_for_worker=False,
+                    is_isolated=needs_isolated_session,
+                    owner_slot_id=owner_slot_id,
+                    fleet_group_key=fleet_group_key,
+                    delegated=owner_slot_id != slot.slot_id,
+                )
+                try:
+                    readiness = await self._ensure_assigned_fleet_ready(
+                        slot,
+                        provisional,
+                        worker_id=worker_id,
+                        force=True,
+                    )
+                    assignment = self.fleet_coordinator.admit_similar_task_fleet(
+                        worker_id=worker_id,
+                        slot_id=slot.slot_id,
+                        owner_agent_id=slot.agent_id,
+                        fleet_id=match.fleet_id,
+                        observed_fleet_ids=slot.fleet_ids,
+                        is_isolated=needs_isolated_session,
+                        owner_slot_id=owner_slot_id,
+                        fleet_group_key=fleet_group_key,
+                        delegated=owner_slot_id != slot.slot_id,
+                    )
+                except FleetReadinessError as exc:
+                    # The candidate was never committed, so ordinary routing
+                    # can safely create/reuse without coordinator rollback.
+                    self.logger.write(
+                        "spawner.similar_task_reuse.readiness_fallback",
+                        {
+                            **match.to_dict(),
+                            "workerId": worker_id,
+                            "slotId": slot.slot_id,
+                            "error": str(exc)[:500],
+                        },
+                    )
+                    assignment = None
+                except FleetRoutingError as exc:
+                    self.logger.write(
+                        "spawner.similar_task_reuse.rejected",
+                        {
+                            **match.to_dict(),
+                            "workerId": worker_id,
+                            "slotId": slot.slot_id,
+                            "reason": exc.code,
+                        },
+                    )
+                    assignment = None
+                else:
+                    self._preverified_fleet_readiness[worker_id] = readiness
+                    self.logger.write("spawner.similar_task_reuse.matched", {
+                        **match.to_dict(),
+                        "workerId": worker_id,
+                        "slotId": slot.slot_id,
+                    })
         if assignment is None:
             assignment = self.fleet_coordinator.choose_existing(
                 worker_id=worker_id,
@@ -1685,12 +1803,14 @@ class SpawnerSlotsMixin:
         assignment: Optional[FleetAssignment],
         *,
         worker_id: str,
+        force: bool = False,
     ) -> JsonDict:
-        if assignment is None or not getattr(
+        barrier_enabled = bool(getattr(
             self.runtime.harness,
             "fleet_readiness_barrier_enabled",
             True,
-        ):
+        ))
+        if assignment is None or (not force and not barrier_enabled):
             return {
                 "status": "not_applicable" if assignment is None else "disabled"
             }

@@ -18,6 +18,7 @@ config.json 里不认识的字段打印告警，不再静默吞掉写了也不�
 """
 
 import json
+import math
 import os
 import sys
 from dataclasses import dataclass, field, fields, replace
@@ -39,6 +40,7 @@ DEFAULT_LOCAL_FS_READ_BYTES = 20000
 DEFAULT_LLM_API_TIMEOUT_SECONDS = 180.0
 DEFAULT_LLM_TIMEOUT_MAX_RETRIES = 1
 DEFAULT_LLM_TIMEOUT_BACKOFF_SECONDS = 1.0
+MIN_SIMILAR_TASK_RUNNING_STALE_SECONDS = 60.0
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +63,20 @@ def _optional_float_config(value: Any, *, minimum: float = 0.0) -> Optional[floa
     except (TypeError, ValueError):
         return None
     return max(minimum, parsed)
+
+
+def _running_stale_seconds_config(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = float(default)
+    if not math.isfinite(parsed):
+        parsed = float(default)
+    if parsed <= 0.0:
+        return 0.0
+    # Positive values are active leases with periodic refresh. Extremely short
+    # leases create write amplification and can expire inside one RPC timeout.
+    return max(MIN_SIMILAR_TASK_RUNNING_STALE_SECONDS, parsed)
 
 
 def _int_config(value: Any, default: int, *, minimum: int = 0, maximum: int = 10) -> int:
@@ -134,6 +150,29 @@ def _validated_resource_compression_level(value: Any) -> int:
             f" got {value!r}"
         )
     return parsed
+
+
+def _validated_browser_agent_step_extension_enabled(value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(
+            "harness.browser_agent_step_extension_enabled must be a boolean;"
+            f" got {value!r}"
+        )
+    return value
+
+
+def _validated_browser_agent_max_extension_steps(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            "harness.browser_agent_max_extension_steps must be an integer"
+            f" from 1 to 50; got {value!r}"
+        )
+    if not 1 <= value <= 50:
+        raise ValueError(
+            "harness.browser_agent_max_extension_steps must be an integer"
+            f" from 1 to 50; got {value!r}"
+        )
+    return value
 
 
 def _normalize_hitl_attendance(value: Any) -> str:
@@ -804,60 +843,16 @@ class VLConfig:
 # "harness" 段：HarnessConfig（编排与运行时行为）
 # ---------------------------------------------------------------------------
 
-def _validated_contract_path(value: Any) -> Optional[str]:
-    """None or a non-empty string - an empty/blank path would look
-    configured but load nothing, silently disabling the fast path."""
-    if value is None:
-        return None
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(
-            "harness.canonical_direct_contract_path must be null or a"
-            f" non-empty string, got {value!r}"
-        )
-    return value
-
-
-def _validated_skip_flag(value: Any) -> bool:
-    """Strict boolean. Strings are rejected, not bool()-coerced: bool(
-    'false') is True, which would silently ENABLE the reviewer skip."""
-    if not isinstance(value, bool):
-        raise ValueError(
-            "harness.canonical_direct_skip_enabled must be a boolean, got"
-            f" {value!r}"
-        )
-    if value:
-        # The skip execution branch requires the side-effect action gate,
-        # which is not implemented yet. Fail config load loudly instead of
-        # letting an operator enable a half-built path.
-        raise ValueError(
-            "harness.canonical_direct_skip_enabled=true is not ready:"
-            " the side-effect action gate is not implemented, so the"
-            " emit-time reviewer skip stays off. Direct adoption of the"
-            " trusted plan is a SEPARATE control:"
-            " harness.canonical_direct_adoption_enabled (phase 1,"
-            " default off, flag-gated, structured fallbacks)."
-        )
-    return False
-
-
-def _validated_adoption_flag(value: Any) -> bool:
-    """Strict boolean for the direct-adoption control path (phase 1).
-    Strings are rejected, not bool()-coerced. Unlike the skip flag this
-    path IS implemented (harness accepts + dispatches contract.plan), so
-    true is accepted; it stays default-OFF until the live pilot passes."""
-    if not isinstance(value, bool):
-        raise ValueError(
-            "harness.canonical_direct_adoption_enabled must be a boolean,"
-            f" got {value!r}"
-        )
-    return value
-
-
 @dataclass
 class HarnessConfig:
     max_steps: int = 40
     lead_max_steps: int = 40
     worker_max_steps: int = 40
+    # Experimental BrowserAgent continuation.  The current worker may ask for
+    # one bounded extension near its step cap; harness guards remain
+    # authoritative and the default keeps historical fixed-cap behaviour.
+    browser_agent_step_extension_enabled: bool = False
+    browser_agent_max_extension_steps: int = 10
     max_browser_agent_instances: int = 3
     max_browser_agents: int = 3
     # Deterministic fleet routing.  When enabled, the spawner assigns every
@@ -866,6 +861,17 @@ class HarnessConfig:
     # calls.  Unknown/cross-assignment fleet ids fail closed instead of letting
     # the Dispatcher silently create or adopt a fleet.
     fleet_reuse_enabled: bool = True
+    # Before the first successful Fleet acquisition for an unconstrained task,
+    # inspect the trusted harness-owned task index in existing Fleet memory. A
+    # conservative match reuses only that Fleet and always opens a fresh page.
+    # Explicit fleet/session/isolation/resume routing always wins.
+    similar_task_fleet_reuse_enabled: bool = True
+    similar_task_reuse_threshold: float = 0.78
+    # A worker writes ``running`` before browser work and refreshes that lease
+    # in the background. Cancellation/failure paths stop the heartbeat before
+    # a best-effort terminal checkpoint. Positive values normalize to at least
+    # 60 seconds; zero disables expiry and stays fail-closed indefinitely.
+    similar_task_running_stale_seconds: float = 86400.0
     # Allow different BrowserAgent slots in one task to use distinct pages in
     # the same coordinator-owned fleet. The owner socket remains connected and
     # its notifications are relayed in-process to delegated workers.
@@ -1024,23 +1030,6 @@ class HarnessConfig:
     # a phase whose required variables are not derivable falls back to the normal
     # loop (fail-safe). Empty = off.
     forced_skill_id: str = ""
-    # Optional path to a versioned canonical direct contract JSON (see
-    # harness/task_control/canonical_direct.py). Loaded at LeadAgent startup;
-    # an invalid file disables the fast path (contract=None) with an event,
-    # never silently. No contract configured -> every plan classifies as
-    # no_canonical_contract and the reviewer flow is untouched.
-    canonical_direct_contract_path: Optional[str] = None
-    # Step-4 gate, default OFF: skipping the Plan Validator is only legal
-    # for candidates proven identical to a trusted canonical contract bound
-    # to this run's user task. Turn on only after the emitted-candidate
-    # replay and a live shadow audit both pass.
-    canonical_direct_skip_enabled: bool = False
-    # Direct adoption (phase 1, default OFF): with a valid trusted contract
-    # bound to this run's exact user task on a FRESH run, the harness itself
-    # accepts contract.plan (no Lead emit round, no Plan Validator call) and
-    # dispatches the first phase via a phase_id-only spawn. Any condition
-    # failing -> structured canonical_direct.fallback -> normal Lead flow.
-    canonical_direct_adoption_enabled: bool = False
     # When the enabled skill fast path falls back AND the BrowserAgent slow path then
     # succeeds for a degraded (recently-failed) skill, distill the successful
     # trace into a candidate workflow and run skill_heal (write candidate →
@@ -1158,6 +1147,22 @@ class HarnessConfig:
             max_steps=int(data.get("max_steps", cls.max_steps)),
             lead_max_steps=int(data.get("lead_max_steps", cls.lead_max_steps)),
             worker_max_steps=int(data.get("worker_max_steps", cls.worker_max_steps)),
+            browser_agent_step_extension_enabled=(
+                _validated_browser_agent_step_extension_enabled(
+                    data.get(
+                        "browser_agent_step_extension_enabled",
+                        cls.browser_agent_step_extension_enabled,
+                    )
+                )
+            ),
+            browser_agent_max_extension_steps=(
+                _validated_browser_agent_max_extension_steps(
+                    data.get(
+                        "browser_agent_max_extension_steps",
+                        cls.browser_agent_max_extension_steps,
+                    )
+                )
+            ),
             max_browser_agent_instances=int(
                 data.get(
                     "max_browser_agent_instances",
@@ -1169,6 +1174,29 @@ class HarnessConfig:
             ),
             fleet_reuse_enabled=bool(
                 data.get("fleet_reuse_enabled", cls.fleet_reuse_enabled)
+            ),
+            similar_task_fleet_reuse_enabled=bool(
+                data.get(
+                    "similar_task_fleet_reuse_enabled",
+                    cls.similar_task_fleet_reuse_enabled,
+                )
+            ),
+            similar_task_reuse_threshold=min(
+                1.0,
+                max(
+                    0.0,
+                    float(data.get(
+                        "similar_task_reuse_threshold",
+                        cls.similar_task_reuse_threshold,
+                    )),
+                ),
+            ),
+            similar_task_running_stale_seconds=_running_stale_seconds_config(
+                data.get(
+                    "similar_task_running_stale_seconds",
+                    cls.similar_task_running_stale_seconds,
+                ),
+                cls.similar_task_running_stale_seconds,
             ),
             same_fleet_multiworker_enabled=bool(
                 data.get(
@@ -1331,24 +1359,6 @@ class HarnessConfig:
             worktree_dir=data.get("worktree_dir", cls.worktree_dir),
             runs_dir=data.get("runs_dir", cls.runs_dir),
             context_file=data.get("context_file"),
-            canonical_direct_contract_path=_validated_contract_path(
-                data.get(
-                    "canonical_direct_contract_path",
-                    cls.canonical_direct_contract_path,
-                )
-            ),
-            canonical_direct_skip_enabled=_validated_skip_flag(
-                data.get(
-                    "canonical_direct_skip_enabled",
-                    cls.canonical_direct_skip_enabled,
-                )
-            ),
-            canonical_direct_adoption_enabled=_validated_adoption_flag(
-                data.get(
-                    "canonical_direct_adoption_enabled",
-                    cls.canonical_direct_adoption_enabled,
-                )
-            ),
             strategy_bank_path=data.get(
                 "strategy_bank_path",
                 cls.strategy_bank_path,

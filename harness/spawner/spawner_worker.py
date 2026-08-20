@@ -14,6 +14,7 @@ from typing import Set
 from abcp_client import ABCPClient
 from abcp_client import ABCPTransportError
 from harness.constants import WORKER_STATUS_CANCELLED
+from harness.constants import WORKER_STATUS_DONE
 from harness.constants import WORKER_STATUS_FAILED
 from harness.diagnostics import status_category
 from harness.fleet.coordinator import FleetAssignment
@@ -53,6 +54,9 @@ from harness.workflow_runtime import workflow_execution_enabled
 from llm import LLMFactory
 from .spawner_classification import _allowance_from_validators, _clone_capability_bundle, _cohort_identity_fields, _safe_str_list, _validated_rows_for_ledger, _worker_feedback_classification  # noqa: F401
 from .spawner_helpers import BrowserAgentHandle, BrowserAgentSlot, _TaskContextTrackingBrowserClient, _effective_worker_status, _finalize_skill_execution_metadata, _fresh_click_settlement_class, _prompt_worker_contract, _skill_execution_metadata, _unresolved_repair_visual_evidence, _verified_workflow_hitl_settlement  # noqa: F401
+
+_TASK_MEMORY_TERMINAL_WRITE_TIMEOUT_SECONDS = 5.0
+_WORKER_FAILURE_CLEANUP_TIMEOUT_SECONDS = 5.0
 
 def _sp():
     import harness.spawner as sp
@@ -157,6 +161,9 @@ class SpawnerWorkerMixin:
             # the whole defect this ledger was built to prevent.
             worker_harness = getattr(getattr(harness, "runtime", None), "harness", None)
             max_steps = optional_int(
+                getattr(harness, "effective_max_steps", None),
+                0,
+            ) or optional_int(
                 getattr(worker_harness, "max_steps", None),
                 0,
             ) or int(self.runtime.harness.worker_max_steps or 0)
@@ -277,6 +284,101 @@ class SpawnerWorkerMixin:
         except Exception as exc:  # weak signal must never break the worker
             self.logger.write("skill.guidance.signal_error", {"error": str(exc)})
 
+    async def _checkpoint_terminal_task_memory(
+        self,
+        harness: Any,
+        *,
+        reuse_status: str,
+        suppress_cancellation: bool = False,
+    ) -> JsonDict:
+        """Best-effort terminal memory write that never masks worker outcome."""
+
+        if harness is None or not str(
+            getattr(harness, "assigned_fleet_id", "") or ""
+        ).strip():
+            return {"status": "skipped", "reason": "no assigned fleet"}
+        auto_reuse_eligible = getattr(
+            harness, "task_memory_auto_reuse_eligible", None
+        )
+        if not isinstance(auto_reuse_eligible, bool):
+            result = {
+                "status": "failed",
+                "reuseStatus": reuse_status,
+                "error": "task memory reuse eligibility was not explicit",
+            }
+            self.logger.write("memory.terminal_checkpoint.failed", result)
+            return result
+        try:
+            return await asyncio.wait_for(
+                harness._ensure_task_memory(
+                    str(getattr(harness, "task_memory_root_task", "") or "").strip(),
+                    auto_reuse_eligible=auto_reuse_eligible,
+                    reuse_status=reuse_status,
+                ),
+                timeout=_TASK_MEMORY_TERMINAL_WRITE_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError as exc:
+            if not suppress_cancellation:
+                raise
+            self.logger.write("memory.terminal_checkpoint.failed", {
+                "reuseStatus": reuse_status,
+                "error": str(exc) or "cancelled during terminal checkpoint",
+            })
+            return {
+                "status": "failed",
+                "reuseStatus": reuse_status,
+                "cancellationObserved": True,
+            }
+        except Exception as exc:
+            self.logger.write("memory.terminal_checkpoint.failed", {
+                "reuseStatus": reuse_status,
+                "error": str(exc),
+            })
+        return {"status": "failed", "reuseStatus": reuse_status}
+
+    async def _complete_failure_cleanup(
+        self,
+        awaitable: Any,
+        *,
+        operation: str,
+    ) -> JsonDict:
+        """Finish bounded cleanup and report any cancellation it suppressed."""
+
+        task = asyncio.create_task(asyncio.wait_for(
+            awaitable,
+            timeout=_WORKER_FAILURE_CLEANUP_TIMEOUT_SECONDS,
+        ))
+        cancellation_observed = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # The browser operation already failed. Preserve that root
+                # outcome and allow the bounded child cleanup to finish.
+                cancellation_observed = True
+        if cancellation_observed:
+            self.logger.write("spawner.browser.failure_cleanup.cancel_suppressed", {
+                "operation": operation,
+            })
+        try:
+            task.result()
+        except (asyncio.CancelledError, Exception) as exc:
+            self.logger.write("spawner.browser.failure_cleanup.failed", {
+                "operation": operation,
+                "error": str(exc),
+            })
+            return {
+                "operation": operation,
+                "status": "failed",
+                "cancellationObserved": cancellation_observed,
+                "error": str(exc),
+            }
+        return {
+            "operation": operation,
+            "status": "completed",
+            "cancellationObserved": cancellation_observed,
+        }
+
     async def _run_browser_worker(
         self,
         slot: BrowserAgentSlot,
@@ -312,6 +414,9 @@ class SpawnerWorkerMixin:
         )
 
         harness = None
+        run_failed = False
+        cancelled_during_failure = False
+        failure_cleanup_receipts: List[JsonDict] = []
         try:
             if slot.client is None:
                 raise ABCPTransportError(f"Slot {slot.slot_id} has no browser client")
@@ -439,6 +544,23 @@ class SpawnerWorkerMixin:
                     )
                 )
             harness.worker_contract = worker_contract or {}
+            harness.task_memory_root_task = str(
+                self.root_task or task or ""
+            ).strip()
+            memory_auto_reuse_eligible = (worker_contract or {}).get(
+                "_fleet_memory_auto_reuse_eligible"
+            )
+            if assignment is not None and not isinstance(
+                memory_auto_reuse_eligible, bool
+            ):
+                raise TypeError(
+                    "assigned worker requires explicit Fleet memory reuse eligibility"
+                )
+            harness.task_memory_auto_reuse_eligible = (
+                memory_auto_reuse_eligible
+                if isinstance(memory_auto_reuse_eligible, bool)
+                else False
+            )
             batch_rows = (
                 harness.worker_contract.get("batch_rows")
                 if isinstance(harness.worker_contract, dict)
@@ -796,6 +918,14 @@ class SpawnerWorkerMixin:
                 result["fastPathReceiptCandidate"] = receipt_candidate
             if assignment is not None:
                 result["fleetAssignment"] = assignment.to_dict()
+                await self._checkpoint_terminal_task_memory(
+                    harness,
+                    reuse_status=(
+                        "completed"
+                        if harness.final_status == WORKER_STATUS_DONE
+                        else "failed"
+                    ),
+                )
             self._update_slot_after_worker(
                 slot,
                 worker_id=worker_id,
@@ -806,6 +936,11 @@ class SpawnerWorkerMixin:
             )
         except asyncio.CancelledError:
             harness_obj = harness
+            await self._checkpoint_terminal_task_memory(
+                harness_obj,
+                reuse_status="cancelled",
+                suppress_cancellation=True,
+            )
             trace = (
                 getattr(harness_obj, "trace", [])
                 if harness_obj is not None
@@ -854,7 +989,26 @@ class SpawnerWorkerMixin:
             )
             raise
         except Exception as exc:
+            run_failed = True
             harness_obj = harness
+            memory_receipt = await self._checkpoint_terminal_task_memory(
+                harness_obj,
+                reuse_status="failed",
+                suppress_cancellation=True,
+            )
+            memory_cleanup_receipt: JsonDict = {
+                "operation": "task_memory_terminal_checkpoint",
+                "status": str(memory_receipt.get("status") or "unknown"),
+                "cancellationObserved": bool(
+                    memory_receipt.get("cancellationObserved")
+                ),
+            }
+            if memory_receipt.get("error"):
+                memory_cleanup_receipt["error"] = str(memory_receipt["error"])
+            failure_cleanup_receipts.append(memory_cleanup_receipt)
+            cancelled_during_failure = bool(
+                memory_cleanup_receipt["cancellationObserved"]
+            )
             trace = (
                 getattr(harness_obj, "trace", [])
                 if harness_obj is not None
@@ -870,7 +1024,15 @@ class SpawnerWorkerMixin:
                 self.fleet_coordinator.mark_slot_suspect(slot.slot_id)
                 slot.sync_errors.append(str(exc)[:500])
                 if slot.client is not None:
-                    await slot.client.close()
+                    close_receipt = await self._complete_failure_cleanup(
+                        slot.client.close(),
+                        operation="close_broken_slot_client",
+                    )
+                    failure_cleanup_receipts.append(close_receipt)
+                    cancelled_during_failure = bool(
+                        cancelled_during_failure
+                        or close_receipt.get("cancellationObserved")
+                    )
                     slot.client = None
             result = {
                 "status": WORKER_STATUS_FAILED,
@@ -893,7 +1055,21 @@ class SpawnerWorkerMixin:
             self._mark_slot_idle(slot, worker_id=worker_id)
 
         self._remove_notification_relay_for_assignment(assignment)
-        await self.fleet_auth_barrier.abandon_worker(worker_id)
+        if run_failed:
+            auth_cleanup_receipt = await self._complete_failure_cleanup(
+                self.fleet_auth_barrier.abandon_worker(worker_id),
+                operation="abandon_fleet_auth_worker",
+            )
+            failure_cleanup_receipts.append(auth_cleanup_receipt)
+            cancelled_during_failure = bool(
+                cancelled_during_failure
+                or auth_cleanup_receipt.get("cancellationObserved")
+            )
+            result["failureCleanup"] = failure_cleanup_receipts
+            if cancelled_during_failure:
+                result["cancelledDuringFailure"] = True
+        else:
+            await self.fleet_auth_barrier.abandon_worker(worker_id)
         if isinstance(assignment, FleetAssignment):
             result.setdefault("fleetAssignment", assignment.to_dict())
         result = self._prepare_worker_result(
@@ -1120,6 +1296,7 @@ class SpawnerWorkerMixin:
         loop_nudges: List[JsonDict] = []
         page_stats_events: List[JsonDict] = []
         snapshot_diffs: List[JsonDict] = []
+        step_extension: JsonDict = {}
         tool_calls = 0
         max_step = 0
         for item in trace:
@@ -1209,6 +1386,39 @@ class SpawnerWorkerMixin:
                         "semanticChanged": bool(result.get("semanticChanged")),
                         "physicalChanged": bool(result.get("physicalChanged")),
                     })
+            elif item.get("type") == "step_extension_request":
+                result = item.get("result")
+                if isinstance(result, dict):
+                    step_extension["requestCount"] = (
+                        int(step_extension.get("requestCount") or 0) + 1
+                    )
+                    status = str(result.get("status") or "")
+                    if status == "granted":
+                        step_extension.update({
+                            "granted": True,
+                            "grantStep": (
+                                optional_int(result.get("step"), 0) or 0
+                            ),
+                            "grantedSteps": (
+                                optional_int(result.get("grantedSteps"), 0) or 0
+                            ),
+                            "effectiveMaxSteps": (
+                                optional_int(
+                                    result.get("effectiveMaxSteps"), 0
+                                ) or 0
+                            ),
+                        })
+                    elif status == "denied":
+                        step_extension["deniedCount"] = (
+                            int(step_extension.get("deniedCount") or 0) + 1
+                        )
+                        step_extension["lastDenialStep"] = (
+                            optional_int(result.get("step"), 0) or 0
+                        )
+                        step_extension["lastDenialReasons"] = [
+                            str(reason)[:120]
+                            for reason in (result.get("reasons") or [])
+                        ][:10]
         loop_nudge_count = len(loop_nudges)
         summary = {
             "steps": max_step,
@@ -1225,6 +1435,7 @@ class SpawnerWorkerMixin:
             "pageStatsCount": len(page_stats_events),
             "snapshotDiffs": snapshot_diffs[-5:],
             "snapshotDiffCount": len(snapshot_diffs),
+            "stepExtension": step_extension or None,
             "offloadedFiles": sorted(set(offloaded))[:100],
         }
         return summary

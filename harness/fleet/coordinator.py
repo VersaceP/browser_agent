@@ -911,6 +911,83 @@ class FleetCoordinator:
             delegated=selected_record.slot_id != str(slot_id),
         )
 
+    def admit_similar_task_fleet(
+        self,
+        *,
+        worker_id: str,
+        slot_id: str,
+        owner_agent_id: str,
+        fleet_id: str,
+        observed_fleet_ids: Iterable[str],
+        is_isolated: bool = False,
+        owner_slot_id: str = "",
+        fleet_group_key: str = "",
+        delegated: bool = False,
+    ) -> FleetAssignment:
+        """Atomically admit one pre-verified historical generic Fleet.
+
+        Similar-task memory is only candidate evidence. The caller must first
+        verify platform readiness without mutating coordinator state; this
+        method then re-checks the process-local identity boundaries before the
+        single committing bind.
+        """
+
+        fleet = str(fleet_id or "").strip()
+        observed = {
+            str(item or "").strip()
+            for item in observed_fleet_ids
+            if str(item or "").strip()
+        }
+        if not fleet or fleet not in observed:
+            raise FleetRoutingError(
+                "reuse_fleet_lost",
+                "similar-task Fleet is absent from the authoritative inventory",
+                details={"lostFleetId": fleet},
+            )
+        record = self._fleets.get(fleet)
+        if record is None or record.status != "active":
+            raise FleetRoutingError(
+                "reuse_fleet_lost",
+                "similar-task Fleet is unavailable after readiness verification",
+                details={"lostFleetId": fleet},
+            )
+        if record.retired_from_session:
+            raise FleetRoutingError(
+                "released_fleet_conflict",
+                f"fleet {fleet!r} was released from a prior named session",
+                details={"assignedFleetId": fleet},
+            )
+        if record.session_key:
+            raise FleetRoutingError(
+                "fleet_session_conflict",
+                f"fleet {fleet!r} is reserved for a named session",
+                details={
+                    "boundSessionKey": record.session_key,
+                    "assignedFleetId": fleet,
+                },
+            )
+        if record.is_isolated:
+            raise FleetRoutingError(
+                "session_isolation_conflict",
+                "an isolated Fleet cannot be automatically admitted by task similarity",
+                details={"assignedFleetId": fleet},
+            )
+        return self.bind_assignment(
+            worker_id=worker_id,
+            slot_id=slot_id,
+            owner_agent_id=owner_agent_id,
+            fleet_id=fleet,
+            assignment_reason="similar_task_fleet_reuse",
+            reuse_scope="fleet",
+            page_policy="new",
+            allowed_fleet_ids=[fleet],
+            created_for_worker=False,
+            is_isolated=is_isolated,
+            owner_slot_id=owner_slot_id,
+            fleet_group_key=fleet_group_key,
+            delegated=delegated,
+        )
+
     def bind_assignment(
         self,
         *,

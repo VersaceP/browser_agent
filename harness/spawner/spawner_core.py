@@ -194,11 +194,49 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
         self._fleet_readiness_tasks: Dict[
             tuple[str, str], "asyncio.Task[JsonDict]"
         ] = {}
+        # Only the first successful Fleet acquisition in one top-level task
+        # may consult historical task memory. The lock remains held through
+        # readiness so concurrent first workers cannot both claim that role.
+        self._first_fleet_acquisition_lock = None
+        self._first_fleet_acquisition_committed = False
+        self._preverified_fleet_readiness: Dict[str, JsonDict] = {}
         self._browser_context_fingerprints: Dict[str, str] = {}
         # Page inventory is slot-global, while resume state is task-local.
         # Record only pages this task actually addressed; sharing a Fleet does
         # not make every tab returned by Page.list part of this task.
         self._task_browser_page_ids: Dict[str, Set[str]] = {}
+        # LeadAgent sets this to the original user objective before the first
+        # spawn. Direct spawner tests/callers fall back to the worker task.
+        self.root_task = ""
+
+    async def _begin_first_fleet_acquisition(self) -> bool:
+        """Claim the task's first-acquisition gate, if still uncommitted."""
+
+        if self._first_fleet_acquisition_lock is None:
+            self._first_fleet_acquisition_lock = asyncio.Lock()
+        await self._first_fleet_acquisition_lock.acquire()
+        if self._first_fleet_acquisition_committed:
+            self._first_fleet_acquisition_lock.release()
+            return False
+        return True
+
+    def _finish_first_fleet_acquisition(
+        self,
+        claimed: bool,
+        *,
+        committed: bool,
+    ) -> None:
+        if not claimed:
+            return
+        if committed:
+            self._first_fleet_acquisition_committed = True
+        lock = self._first_fleet_acquisition_lock
+        if lock is None:
+            raise RuntimeError("first Fleet acquisition lock was not initialized")
+        # ``claimed`` is the ownership token returned only after this task
+        # acquired the lock. asyncio.Lock.locked() does not identify an owner
+        # and could otherwise release a different task's acquisition.
+        lock.release()
 
     def _resume_hint_for_worker(
         self,
@@ -862,6 +900,30 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
             and isinstance(effective_contract, dict)
             and effective_contract.get("needs_isolated_session") is True
         )
+        hard_isolation_requested = bool(
+            isolation_declared
+            and effective_contract.get("needs_isolated_session") is True
+        )
+        automatic_task_reuse_allowed = not bool(
+            pinned is not None
+            or self.resume_browser_hint is not None
+            or effective_fleet_reference
+            or effective_session_key
+            or str(preferred_slot_id or "").strip()
+            or str(reuse_from_worker_id or "").strip()
+            or requested_reuse_scope
+            or requested_page_policy
+            or hard_isolation_requested
+        )
+        effective_contract = {
+            **effective_contract,
+            # Harness-private memory policy; _prompt_worker_contract strips it.
+            "_fleet_memory_auto_reuse_eligible": not bool(
+                effective_session_key
+                or hard_isolation_requested
+                or pinned is not None
+            ),
+        }
         resume_hint = self._resume_hint_for_worker(
             phase_id=str(phase_id or ""),
             worker_contract=effective_contract,
@@ -885,6 +947,7 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
         assignment: Optional[FleetAssignment] = None
         readiness_receipt: JsonDict = {}
         resume_page_inventory_refreshed = False
+        first_acquisition_claimed = False
         try:
             fleet_group_key = self._fleet_group_key(
                 session_key=effective_session_key,
@@ -1001,6 +1064,9 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                                 phase_id=resume_hint.phase_id,
                                 source=resume_hint.source,
                             )
+                    first_acquisition_claimed = (
+                        await self._begin_first_fleet_acquisition()
+                    )
                     assignment = await self._assign_fleet_for_worker(
                         slot,
                         worker_id=worker_id,
@@ -1018,13 +1084,43 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                         resume_hint_may_select_page=(
                             resume_hint_may_select_page
                         ),
+                        root_task=str(self.root_task or task or "").strip(),
+                        automatic_task_reuse_allowed=(
+                            automatic_task_reuse_allowed
+                            and first_acquisition_claimed
+                        ),
                     )
+                    preverified = self._preverified_fleet_readiness.pop(
+                        worker_id, None
+                    )
+                    preverified_matches = bool(
+                        isinstance(preverified, dict)
+                        and assignment is not None
+                        and preverified.get("fleetId") == assignment.fleet_id
+                    )
+                    if preverified_matches:
+                        # Similar-task admission commits only after its own
+                        # readiness probe, so the task's first acquisition is
+                        # already successful before any later page/relay work.
+                        self._finish_first_fleet_acquisition(
+                            first_acquisition_claimed,
+                            committed=True,
+                        )
+                        first_acquisition_claimed = False
                     self._ensure_notification_relay(slot, assignment)
-                    readiness_receipt = await self._ensure_assigned_fleet_ready(
-                        slot,
-                        assignment,
-                        worker_id=worker_id,
-                    )
+                    if preverified_matches:
+                        readiness_receipt = preverified
+                    else:
+                        readiness_receipt = await self._ensure_assigned_fleet_ready(
+                            slot,
+                            assignment,
+                            worker_id=worker_id,
+                        )
+                        self._finish_first_fleet_acquisition(
+                            first_acquisition_claimed,
+                            committed=assignment is not None,
+                        )
+                        first_acquisition_claimed = False
                     if assignment is not None and (
                         expose_reusable_pages
                         or bool(
@@ -1083,6 +1179,12 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                             ),
                         )
         except asyncio.CancelledError:
+            self._preverified_fleet_readiness.pop(worker_id, None)
+            self._finish_first_fleet_acquisition(
+                first_acquisition_claimed,
+                committed=False,
+            )
+            first_acquisition_claimed = False
             cancel_phase_running_reservation(
                 self.logger,
                 phase_id=phase_id,
@@ -1109,6 +1211,12 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                 )
             raise
         except FleetRoutingError as exc:
+            self._preverified_fleet_readiness.pop(worker_id, None)
+            self._finish_first_fleet_acquisition(
+                first_acquisition_claimed,
+                committed=False,
+            )
+            first_acquisition_claimed = False
             cancel_phase_running_reservation(
                 self.logger,
                 phase_id=phase_id,
@@ -1151,6 +1259,12 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
             self.logger.write("spawner.fleet.assignment_rejected", result)
             return result
         except Exception as exc:
+            self._preverified_fleet_readiness.pop(worker_id, None)
+            self._finish_first_fleet_acquisition(
+                first_acquisition_claimed,
+                committed=False,
+            )
+            first_acquisition_claimed = False
             cancel_phase_running_reservation(
                 self.logger,
                 phase_id=phase_id,
@@ -1187,6 +1301,15 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                 result["status"] = "spawn_infrastructure_exhausted"
             self.logger.write("spawner.slot.acquire_failed", result)
             return result
+        finally:
+            # The explicit success/error branches decide whether an acquisition
+            # committed and clear this token. This is the BaseException safety
+            # net: no uncommon control-flow escape may strand every later spawn.
+            self._finish_first_fleet_acquisition(
+                first_acquisition_claimed,
+                committed=False,
+            )
+            first_acquisition_claimed = False
         if isinstance(slot, dict):
             cancel_phase_running_reservation(
                 self.logger,
@@ -1229,6 +1352,12 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
             self.logger,
             acquisition_fingerprint=acquisition_fingerprint,
         )
+        reported_reuse_scope = (
+            assignment.reuse_scope if assignment else effective_reuse_scope
+        )
+        reported_page_policy = (
+            assignment.page_policy if assignment else effective_page_policy
+        )
         self.logger.write(
             "spawner.browser.spawn",
             {
@@ -1237,8 +1366,8 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                 "slotId": slot.slot_id,
                 "slotReuse": bool(slot.last_worker_id),
                 "pageReuseAllowed": expose_reusable_pages,
-                "reuseScope": effective_reuse_scope,
-                "pagePolicy": effective_page_policy,
+                "reuseScope": reported_reuse_scope,
+                "pagePolicy": reported_page_policy,
                 "sessionKey": effective_session_key,
                 "fleetReference": effective_fleet_reference,
                 "fleetGroupKey": fleet_group_key,
@@ -1258,8 +1387,8 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
             "slotId": slot.slot_id,
             "name": agent_name,
             "phaseId": phase_id,
-            "reuseScope": effective_reuse_scope,
-            "pagePolicy": effective_page_policy,
+            "reuseScope": reported_reuse_scope,
+            "pagePolicy": reported_page_policy,
             "sessionKey": effective_session_key,
             "fleetReference": effective_fleet_reference,
             "fleetGroupKey": fleet_group_key,
