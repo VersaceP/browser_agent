@@ -158,15 +158,6 @@ def classify_target_yield(tool_name: str, result: JsonDict) -> Optional[bool]:
         return None
 
     if tool_name == "find_in_axtree":
-        # An empty result only means "the target is not there" when the whole
-        # snapshot was examined. A scan cut short by scan_limit/max_results, or
-        # lines the regex engine timed out on, produce the same empty list while
-        # saying nothing about the page -- counting those toward the shortfall
-        # streak would let a deliberately narrow query drive the verdict.
-        if str(result.get("matchStatus") or "") == "scan_incomplete":
-            return None
-        if result.get("scanTruncated") is True:
-            return None
         matches = result.get("matches")
         if isinstance(matches, list):
             return True if len(matches) == 0 else None

@@ -1160,6 +1160,61 @@ def _reject_singleton_phase_fragmentation(
             "rangeField": range_field,
         })
 
+
+def _normalize_input_artifacts(
+    value: Any,
+    errors: List[str],
+    *,
+    phase_id: str,
+) -> Optional[List[JsonDict]]:
+    """Validate explicit artifact lineage without inferring a producer.
+
+    ``input_artifacts`` records data provenance, while ``depends_on`` remains
+    the scheduling gate.  A name/row-shape coincidence is never sufficient to
+    create either relationship.
+    """
+
+    if value is None:
+        # Preserve absence rather than canonicalizing it to []. Existing phase
+        # fingerprints distinguish absent optional source declarations from
+        # explicit values, and changing that identity would retire otherwise
+        # valid evidence during an extension/replan.
+        return None
+    if not isinstance(value, list) or not value:
+        errors.append(
+            f"phase {phase_id}: input_artifacts must be a non-empty array"
+        )
+        return []
+
+    normalized: List[JsonDict] = []
+    seen: Set[Tuple[str, str]] = set()
+    for index, item in enumerate(value):
+        where = f"phase {phase_id}: input_artifacts[{index}]"
+        if not isinstance(item, dict):
+            errors.append(f"{where} must be an object")
+            continue
+        extra = sorted(set(item) - {"phase_id", "artifact_name"})
+        if extra:
+            errors.append(f"{where} has unknown keys {extra}")
+        source_phase_id = str(item.get("phase_id") or "").strip()
+        artifact_name = str(item.get("artifact_name") or "").strip()
+        if not source_phase_id:
+            errors.append(f"{where}.phase_id must be a non-empty string")
+        if not artifact_name:
+            errors.append(f"{where}.artifact_name must be a non-empty string")
+        if not source_phase_id or not artifact_name:
+            continue
+        pair = (source_phase_id, artifact_name)
+        if pair in seen:
+            errors.append(f"{where} duplicates a prior input artifact reference")
+            continue
+        seen.add(pair)
+        normalized.append({
+            "phase_id": source_phase_id,
+            "artifact_name": artifact_name,
+        })
+    return normalized
+
 def validate_task_plan(
     raw_plan: Any,
     *,
@@ -1263,6 +1318,11 @@ def validate_task_plan(
                 f" {sorted(VALID_STAGE_HINTS)}; got {stage_hint!r}"
             )
         stage_hint_reason = str(raw_phase.get("stage_hint_reason") or "").strip()
+        input_artifacts = _normalize_input_artifacts(
+            raw_phase.get("input_artifacts"),
+            errors,
+            phase_id=phase_id,
+        )
 
         expected_artifact = raw_phase.get("expected_artifact") or {}
         if expected_artifact is not None and not isinstance(expected_artifact, dict):
@@ -1525,6 +1585,11 @@ def validate_task_plan(
             # schedules — `or []` used to collapse both into [], erasing the
             # planner's only syntax for parallel phases (task 2ed5a466).
             "depends_on": _tc()._normalized_depends_on(raw_phase.get("depends_on")),
+            **(
+                {"input_artifacts": input_artifacts}
+                if input_artifacts is not None
+                else {}
+            ),
             "pacing": (
                 _validate_pacing(
                     raw_phase.get("pacing"), errors,
@@ -1562,6 +1627,46 @@ def validate_task_plan(
                 errors.append(
                     f"phase {phase_id}: depends_on references unknown phase"
                     f" id {dep_id!r}"
+                )
+
+    phase_positions = {
+        str(phase.get("id") or ""): index
+        for index, phase in enumerate(phases)
+    }
+    phases_by_id = {
+        str(phase.get("id") or ""): phase
+        for phase in phases
+    }
+    for phase in phases:
+        phase_id = str(phase.get("id") or "")
+        dependencies = _tc()._phase_dependency_ids(phase)
+        for index, reference in enumerate(phase.get("input_artifacts") or []):
+            if not isinstance(reference, dict):
+                continue
+            where = f"phase {phase_id}: input_artifacts[{index}]"
+            source_id = str(reference.get("phase_id") or "")
+            source_phase = phases_by_id.get(source_id)
+            if source_phase is None:
+                errors.append(f"{where}.phase_id references unknown phase {source_id!r}")
+                continue
+            if phase_positions.get(source_id, -1) >= phase_positions.get(phase_id, -1):
+                errors.append(f"{where}.phase_id must refer to an earlier phase")
+            source_expected = source_phase.get("expected_artifact")
+            source_name = (
+                str(source_expected.get("name") or "").strip()
+                if isinstance(source_expected, dict)
+                else ""
+            )
+            artifact_name = str(reference.get("artifact_name") or "")
+            if artifact_name != source_name:
+                errors.append(
+                    f"{where}.artifact_name must equal phase {source_id!r} "
+                    f"expected_artifact.name ({source_name!r})"
+                )
+            if dependencies is None or source_id not in dependencies:
+                errors.append(
+                    f"{where}.phase_id must also appear in depends_on so the "
+                    "source is validated before this phase starts"
                 )
 
     _validate_execution_role_dependencies(phases, errors)
@@ -1767,7 +1872,11 @@ def phase_contract(
         "worker_task": str(
             contract.get("worker_task") or phase.get("worker_task") or ""
         ),
-        "input_artifacts": contract.get("input_artifacts") or [],
+        "input_artifacts": (
+            contract.get("input_artifacts")
+            if "input_artifacts" in contract
+            else phase.get("input_artifacts") or []
+        ),
         "expected_artifact": expected_artifact,
         "validators": validators,
         "validators_normalized": True,

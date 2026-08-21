@@ -42,3 +42,7 @@ tests/test_semantic_simplification_batch1.py
 tests/test_spawner_slots.py
 tests/test_storage_db_mode.py
 tests/test_storage_review_regressions.py
+tests/test_canonical_direct.py
+tests/test_spawner_slots.py
+worktree/harness.db
+scripts

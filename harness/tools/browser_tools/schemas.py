@@ -576,7 +576,7 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                     "description": (
                         "Passwords/tokens: replaces the value with `<masked"
                         " len=N>` in this tool's receipt, in the agent trace,"
-                        " and in render-recovery logs. Known limits — it does"
+                        " and in render-recovery logs. Known limits \u2014 it does"
                         " NOT redact the raw JSON-RPC transport log, and it"
                         " does not affect any later DOM/AXTree read, which"
                         " returns the value from the live page as typed."
@@ -777,31 +777,13 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                     "type": "string",
                     "description": "Page id whose current DOM.getAXTree snapshot should be searched.",
                 },
-                "line_regex": {
-                    "type": "string",
-                    "description": (
-                        "Regex over the WHOLE rendered line"
-                        " `depth [id] role \"name\" flags # @x,y,w,h`, so one"
-                        " expression can mix role, id and label:"
-                        " \"listboxoption.*广东\" or \"3:3329|button.*提交\"."
-                        " This is the only query that reaches the parts of a"
-                        " line the role/name filters cannot see. Combines with"
-                        " role/name/interactive_only as AND. Pass \"\" to skip."
-                        " Max 200 chars. The reply's `regexEngine` says whether"
-                        " this runtime can time a search out; where it cannot,"
-                        " quantified groups, backreferences and more than two"
-                        " unbounded quantifiers are refused"
-                        " (status=invalid_pattern) because they cannot be"
-                        " interrupted. `listboxoption.*广东` is fine either way."
-                    ),
-                },
                 "role": {
                     "type": "string",
                     "description": "Optional AX role filter, e.g. link, button, textbox. Pass \"\" for any role.",
                 },
                 "name": {
                     "type": "string",
-                    "description": "Accessible name to locate; matches the line only for nodes that have no name. Pass \"\" to skip.",
+                    "description": "Accessible name/text to locate. Pass \"\" to list by role only.",
                 },
                 "text": {
                     "type": "string",
@@ -818,38 +800,9 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                     "description": "When true, only return AXTree lines marked with # (preferred actionable targets).",
                 },
                 "max_results": {"type": "integer", "minimum": 1, "maximum": 50},
-                "scan_limit": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 20000,
-                    "description": "Max nodes to examine (default 2000). The reply reports nodesScanned/totalNodes/scanTruncated.",
-                },
-                "relations": {
-                    "type": "object",
-                    "description": (
-                        "Neighbours to return per match, read off the depth"
-                        " column. The panel folds dense subtrees, so `parent`"
-                        " and each child carry `direct` (false = folded levels"
-                        " in between) and every relation block is flagged"
-                        " `mayBeIncomplete`. Neighbours come back compact"
-                        " (id/role/name/depth/lineNumber) without the rendered"
-                        " line; query a neighbour's id when its own line is"
-                        " needed. Neighbours are capped across the whole reply,"
-                        " not per match — a spent budget sets"
-                        " `relationsTruncated`."
-                    ),
-                    "properties": {
-                        "parent": {"type": "boolean", "description": "Nearest enclosing printed node."},
-                        "siblings": {"type": "integer", "minimum": 0, "maximum": 8, "description": "Same-depth nodes each side, 0 for none."},
-                        "children": {"type": "integer", "minimum": 0, "maximum": 12, "description": "Nodes at the shallowest descendant level, 0 for none."},
-                    },
-                    "required": ["parent", "siblings", "children"],
-                    "additionalProperties": False,
-                },
             },
             "required": [
                 "pageId",
-                "line_regex",
                 "role",
                 "name",
                 "text",
@@ -857,8 +810,6 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                 "case_sensitive",
                 "interactive_only",
                 "max_results",
-                "scan_limit",
-                "relations",
             ],
             "additionalProperties": False,
         },

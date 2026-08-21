@@ -15,6 +15,7 @@ from typing import List
 from typing import Optional
 from typing import Set
 from typing import Tuple
+from urllib.parse import urlsplit
 from harness.evidence.extraction_artifacts import field_names_from_specs
 from harness.evidence.artifact_evidence import VALIDATOR_SCOPE
 from harness.utils import JsonDict
@@ -25,6 +26,313 @@ def _tc():
     import harness.task_control as tc
 
     return tc
+
+
+_AUTO_BIND_URL_FIELDS = (
+    "url",
+    "detailUrl",
+    "detail_url",
+    "productUrl",
+    "product_url",
+    "href",
+    "link",
+)
+_AUTO_BIND_ID_FIELDS = (
+    "id",
+    "itemId",
+    "item_id",
+    "productId",
+    "product_id",
+    "asin",
+    "sku",
+)
+_AUTO_BIND_EXCLUDED_STAGES = frozenset({
+    "computed_relationship",
+    "form_interaction",
+})
+
+
+def _auto_bind_exact_row_count(
+    expected: JsonDict,
+    validators: Any,
+) -> Optional[int]:
+    """Return a declared *exact* row count, never infer one from prose."""
+
+    exact = expected.get("exact_rows")
+    if isinstance(exact, int) and not isinstance(exact, bool) and exact > 0:
+        return exact
+    count_range = expected.get("count_range")
+    if (
+        isinstance(count_range, list)
+        and len(count_range) >= 2
+        and isinstance(count_range[0], int)
+        and isinstance(count_range[1], int)
+        and not isinstance(count_range[0], bool)
+        and not isinstance(count_range[1], bool)
+        and count_range[0] == count_range[1]
+        and count_range[0] > 0
+    ):
+        return int(count_range[0])
+    if isinstance(validators, list):
+        for validator in validators:
+            if not isinstance(validator, dict):
+                continue
+            if str(validator.get("type") or "") != "exact_rows":
+                continue
+            value = validator.get("value", validator.get("count"))
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return value
+    return None
+
+
+def _auto_bind_expected_fields(expected: JsonDict) -> Set[str]:
+    raw = expected.get("required_fields")
+    if not isinstance(raw, list) or not raw:
+        raw = expected.get("fields")
+    return {
+        str(name).strip()
+        for name in field_names_from_specs(raw if isinstance(raw, list) else [])
+        if str(name).strip()
+    }
+
+
+def _auto_bind_identity_field(
+    rows: List[JsonDict],
+    expected_fields: Set[str],
+    validators: Any,
+) -> Optional[str]:
+    """Find a stable key that the downstream artifact explicitly preserves."""
+
+    candidates: List[str] = []
+    if isinstance(validators, list):
+        for validator in validators:
+            if not isinstance(validator, dict) or str(validator.get("type") or "") != "unique":
+                continue
+            raw = validator.get("fields")
+            if isinstance(raw, list) and len(raw) == 1:
+                field = str(raw[0]).strip()
+                if field in expected_fields and field in (
+                    _AUTO_BIND_URL_FIELDS + _AUTO_BIND_ID_FIELDS
+                ):
+                    candidates.append(field)
+    candidates.extend(
+        field for field in _AUTO_BIND_URL_FIELDS + _AUTO_BIND_ID_FIELDS
+        if field in expected_fields
+    )
+    seen: Set[str] = set()
+    for field in candidates:
+        if not field or field in seen:
+            continue
+        seen.add(field)
+        values = [row.get(field) for row in rows]
+        if any(value is None or isinstance(value, (dict, list)) or not str(value).strip() for value in values):
+            continue
+        normalized = [str(value).strip() for value in values]
+        if len(set(normalized)) != len(normalized):
+            continue
+        if field in _AUTO_BIND_URL_FIELDS:
+            try:
+                if not all(
+                    urlsplit(value).scheme in {"http", "https"}
+                    and bool(urlsplit(value).netloc)
+                    for value in normalized
+                ):
+                    continue
+            except ValueError:
+                continue
+        return field
+    return None
+
+
+def _latest_validated_extraction_paths(
+    logger: RunLogger,
+    phase_id: str,
+) -> List[str]:
+    state = _tc().load_task_state(logger)
+    phases = state.get("phases") if isinstance(state, dict) else None
+    phase_state = phases.get(phase_id) if isinstance(phases, dict) else None
+    attempts = phase_state.get("attempts") if isinstance(phase_state, dict) else None
+    if not isinstance(attempts, list):
+        return []
+    for attempt in reversed(attempts):
+        if not isinstance(attempt, dict) or not _tc()._attempt_was_validated_done(attempt):
+            continue
+        validation = attempt.get("validation")
+        candidates: List[Any] = []
+        if isinstance(validation, dict):
+            for key in ("validExtractionArtifacts", "artifacts", "attemptExtractionArtifacts"):
+                value = validation.get(key)
+                if isinstance(value, list) and value:
+                    candidates.extend(value)
+                    break
+        if not candidates:
+            digest = attempt.get("attemptDigest")
+            if isinstance(digest, dict) and isinstance(digest.get("artifactPaths"), list):
+                candidates.extend(digest.get("artifactPaths") or [])
+        return list(dict.fromkeys(
+            str(path) for path in candidates
+            if "/artifacts/extractions/" in str(path)
+        ))
+    return []
+
+
+def assess_batch_source_binding(
+    logger: RunLogger,
+    *,
+    phase: JsonDict,
+    plan: Optional[JsonDict],
+    worker_contract: JsonDict,
+) -> JsonDict:
+    """Classify whether an ordinary downstream batch source is derivable.
+
+    This is deliberately conservative. It only binds a phase when the plan
+    explicitly names exactly one source artifact and its producing phase, that
+    phase is an explicit scheduling dependency, its latest attempt has one
+    matching extraction artifact, the downstream contract declares the same
+    exact row count, and every row carries a unique identity field preserved
+    by the downstream artifact.  Equal row counts, plan order, and matching
+    field names never prove a cohort relationship. Every failed proof is an
+    optional optimization miss, not a new execution gate: the ordinary
+    Lead/worker path remains available. Checkpoint/replan, joins/aggregates,
+    and form interaction phases remain explicit Lead responsibilities.
+    """
+
+    if not isinstance(worker_contract, dict) or any(
+        key in worker_contract for key in ("batch_source", "cohort_source", "batch_rows")
+    ):
+        return {"status": "not_applicable"}
+    if not isinstance(plan, dict):
+        return {"status": "not_applicable"}
+    if str(phase.get("stage_hint") or "") in _AUTO_BIND_EXCLUDED_STAGES:
+        return {"status": "not_applicable"}
+    batch_policy = worker_contract.get("batch_policy")
+    if not isinstance(batch_policy, dict):
+        batch_policy = {}
+    if (
+        worker_contract.get("replan_checkpoint_id")
+        or batch_policy.get("requires_isolation_per_row") is True
+        or phase.get("execution_role")
+    ):
+        return {"status": "not_applicable"}
+
+    references = phase.get("input_artifacts")
+    if not isinstance(references, list) or not references:
+        return {"status": "not_applicable", "reason": "input_artifact_not_declared"}
+    if len(references) != 1 or not isinstance(references[0], dict):
+        return {"status": "not_applicable", "reason": "input_artifact_count_not_one"}
+    reference = references[0]
+    dependency_id = str(reference.get("phase_id") or "").strip()
+    declared_artifact_name = str(reference.get("artifact_name") or "").strip()
+    if not dependency_id or not declared_artifact_name:
+        return {"status": "not_applicable", "reason": "input_artifact_invalid"}
+    dependencies = _tc()._phase_dependency_ids(phase)
+    # Omitted depends_on means serial scheduling, not an assertion that an
+    # earlier phase supplied the rows. The source reference independently
+    # proves lineage, but must still be scheduled explicitly.
+    if dependencies is None or dependency_id not in dependencies:
+        return {"status": "not_applicable", "reason": "input_artifact_not_scheduled"}
+    dependency_phase = next(
+        (item for item in (plan.get("phases") or []) if isinstance(item, dict) and str(item.get("id") or "") == dependency_id),
+        None,
+    )
+    if not isinstance(dependency_phase, dict):
+        return {"status": "not_applicable", "reason": "dependency_not_in_plan"}
+    dependency_expected = dependency_phase.get("expected_artifact")
+    if (
+        not isinstance(dependency_expected, dict)
+        or str(dependency_expected.get("name") or "").strip()
+        != declared_artifact_name
+    ):
+        return {"status": "not_applicable", "reason": "input_artifact_plan_mismatch"}
+    expected = worker_contract.get("expected_artifact")
+    expected = expected if isinstance(expected, dict) else {}
+    target_count = _auto_bind_exact_row_count(expected, worker_contract.get("validators"))
+    # A one-row downstream result can be a summary, join, or other semantic
+    # reduction.  Leave that shape to the Lead rather than guessing it is a
+    # detail phase.
+    if target_count is None or target_count <= 1:
+        return {"status": "not_applicable"}
+    paths = _latest_validated_extraction_paths(logger, dependency_id)
+    if len(paths) != 1:
+        return {
+            "status": "not_applicable",
+            "phaseId": str(phase.get("id") or ""),
+            "dependencyPhaseId": dependency_id,
+            "reason": "validated_dependency_artifact_not_unique",
+            "candidateCount": len(paths),
+        }
+    payload = load_task_json(logger, paths[0])
+    if (
+        not isinstance(payload, dict)
+        or str(payload.get("name") or "").strip() != declared_artifact_name
+    ):
+        return {
+            "status": "not_applicable",
+            "phaseId": str(phase.get("id") or ""),
+            "dependencyPhaseId": dependency_id,
+            "reason": "validated_input_artifact_name_mismatch",
+        }
+    rows = payload.get("rows") if isinstance(payload, dict) else None
+    if not isinstance(rows, list) or not rows or not all(isinstance(row, dict) for row in rows):
+        return {
+            "status": "not_applicable",
+            "phaseId": str(phase.get("id") or ""),
+            "dependencyPhaseId": dependency_id,
+            "reason": "validated_dependency_artifact_has_no_object_rows",
+        }
+    source_rows = [dict(row) for row in rows]
+    if target_count != len(source_rows):
+        return {
+            "status": "not_applicable",
+            "phaseId": str(phase.get("id") or ""),
+            "dependencyPhaseId": dependency_id,
+            "reason": "upstream_row_count_does_not_match_expected_artifact",
+            "upstreamRowCount": len(source_rows),
+            "expectedRowCount": target_count,
+        }
+    identity_field = _auto_bind_identity_field(
+        source_rows,
+        _auto_bind_expected_fields(expected),
+        worker_contract.get("validators"),
+    )
+    if not identity_field:
+        return {
+            "status": "not_applicable",
+            "phaseId": str(phase.get("id") or ""),
+            "dependencyPhaseId": dependency_id,
+            "reason": "upstream_artifact_has_no_unique_preserved_identity_field",
+        }
+    return {
+        "status": "derived",
+        "batch_source": {
+            "artifact_name": declared_artifact_name,
+            "_artifact_path": str(paths[0]),
+            "identity_field": identity_field,
+            "selector": {"field": identity_field},
+        },
+        "dependencyPhaseId": dependency_id,
+        "upstreamRowCount": len(source_rows),
+        "identityField": identity_field,
+    }
+
+
+def derive_batch_source_from_upstream_artifact(
+    logger: RunLogger,
+    *,
+    phase: JsonDict,
+    plan: Optional[JsonDict],
+    worker_contract: JsonDict,
+) -> Optional[JsonDict]:
+    """Compatibility helper returning only the derived source, if any."""
+
+    decision = assess_batch_source_binding(
+        logger,
+        phase=phase,
+        plan=plan,
+        worker_contract=worker_contract,
+    )
+    source = decision.get("batch_source") if isinstance(decision, dict) else None
+    return source if isinstance(source, dict) else None
 
 def materialize_batch_rows_from_source(
     logger: RunLogger,
@@ -43,6 +351,13 @@ def materialize_batch_rows_from_source(
     if not isinstance(source, dict):
         return None
     artifact_name = str(source.get("artifact_name") or "").strip()
+    artifact_path_hint = str(source.get("_artifact_path") or "").strip()
+    resolved_artifact_path_hint: Optional[Path] = None
+    if artifact_path_hint:
+        try:
+            resolved_artifact_path_hint = Path(artifact_path_hint).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            resolved_artifact_path_hint = None
     state = _tc().load_task_state(logger)
     ledger_paths = [
         str(path) for path in state.get("artifacts") or [] if str(path).strip()
@@ -54,6 +369,8 @@ def materialize_batch_rows_from_source(
         try:
             path.relative_to(extraction_root)
         except ValueError:
+            continue
+        if resolved_artifact_path_hint is not None and path != resolved_artifact_path_hint:
             continue
         payload = load_task_json(logger, str(path))
         if payload is None:

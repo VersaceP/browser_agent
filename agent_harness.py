@@ -13,6 +13,7 @@ import json
 import re
 import shutil
 import os
+import time
 import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -20,6 +21,14 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from abcp_client import ABCPClient, ABCPTransportError
 from harness.fleet.auth import AUTH_FLEET_MEMORY_SCOPE, auth_fleet_memory_guidance
+from harness.fleet.task_reuse import (
+    DEFAULT_RUNNING_STALE_SECONDS,
+    FLEET_MEMORY_SCHEMA,
+    FLEET_REUSE_POLICY_VERSION,
+    compact_running_memory_records,
+    parse_fleet_memory,
+    task_text_from_memory_entry,
+)
 from harness.compaction import compact_messages_if_needed, validate_tool_pairing
 from runtime_config import (
     ABCPClientConfig,
@@ -113,14 +122,6 @@ from harness.task_control import (
     replan_checkpoint_plan_errors,
     validate_task_plan,
     accept_task_plan,
-)
-from harness.task_control.canonical_direct import (
-    ELIGIBLE as CANONICAL_DIRECT_ELIGIBLE,
-    classify_canonical_direct_eligibility,
-    contract_identity_hash,
-    normalize_contract,
-    task_identity_hash,
-    validate_contract_shape,
 )
 from harness.planning.validator import (
     plan_candidate_hash,
@@ -975,6 +976,7 @@ class BrowserAgent:
         system_prompt = ""
         tools: List[JsonDict] = []
         messages: List[JsonDict] = []
+        task_memory_heartbeat: Optional[asyncio.Task] = None
         self.base_max_steps = max(0, int(self.runtime.harness.max_steps or 0))
         self.effective_max_steps = self.base_max_steps
         self._step_extension_granted_steps = 0
@@ -983,6 +985,12 @@ class BrowserAgent:
 
         try:
             bootstrap = await self._bootstrap_browser(task)
+            task_memory_heartbeat = self._start_task_memory_heartbeat(
+                bootstrap,
+                task=str(
+                    getattr(self, "task_memory_root_task", "") or task
+                ).strip(),
+            )
             system_prompt = self._build_system_prompt()
             tools = build_browser_agent_tool_specs(
                 self._visible_capability_methods(),
@@ -1621,6 +1629,7 @@ class BrowserAgent:
                     return final_answer
             raise
         finally:
+            await self._stop_task_memory_heartbeat(task_memory_heartbeat)
             try:
                 self.event_observer.detach()
             except Exception:
@@ -1699,7 +1708,37 @@ class BrowserAgent:
         self.methods_requiring_purpose = set(bundle.methods_requiring_purpose)
         self.purpose_hints = dict(bundle.purpose_hints)
         self.skills_doc = bundle.skills_doc
-        memory_bootstrap = await self._ensure_task_memory(task, registration=registration)
+        memory_auto_reuse_eligible = getattr(
+            self, "task_memory_auto_reuse_eligible", None
+        )
+        if not self.assigned_fleet_id:
+            # Standalone BrowserAgent tests/callers have no Fleet memory to
+            # authorize. Use an explicit fail-closed value and let the memory
+            # helper return its ordinary "no assigned fleet" skip receipt.
+            memory_auto_reuse_eligible = False
+        memory_bootstrap = await self._ensure_task_memory(
+            str(getattr(self, "task_memory_root_task", "") or task),
+            registration=registration,
+            auto_reuse_eligible=memory_auto_reuse_eligible,
+            reuse_status="running",
+        )
+        if (
+            self.fleet_assignment_reason == "similar_task_fleet_reuse"
+            and memory_auto_reuse_eligible is True
+            and memory_bootstrap.get("status") != "saved"
+        ):
+            # A historical Fleet still contains the completed record that made
+            # it match. Do not begin browser work unless this worker has first
+            # replaced that reusable state with a visible running lease.
+            raise RuntimeError(
+                "similar-task Fleet reuse could not establish its running "
+                "memory lease: "
+                + str(
+                    memory_bootstrap.get("reason")
+                    or memory_bootstrap.get("error")
+                    or memory_bootstrap.get("status")
+                )
+            )
 
         vl_cfg = self.runtime.harness.vl
         bootstrap = {
@@ -1733,12 +1772,16 @@ class BrowserAgent:
         task: str = "",
         *,
         registration: Any = None,
+        auto_reuse_eligible: bool,
+        reuse_status: str = "running",
     ) -> JsonDict:
         """Initialize ABCP Memory with task context when Memory.save/get exist.
 
         Memory is used for agent task context only. It is not page state, and it
         must not hold secrets or extracted page data.
         """
+        if not isinstance(auto_reuse_eligible, bool):
+            raise TypeError("auto_reuse_eligible must be an explicit boolean")
         methods = set(getattr(self, "capability_methods", set()) or set())
         if not {"Memory.get", "Memory.save"}.issubset(methods):
             return {"status": "skipped", "reason": "Memory.get/save unavailable"}
@@ -1777,7 +1820,12 @@ class BrowserAgent:
                 }
                 self.logger.write("memory.bootstrap.foreign_context", result)
                 return result
-            envelope = self._merge_task_memory_envelope(parsed["envelope"], task)
+            envelope = self._merge_task_memory_envelope(
+                parsed["envelope"],
+                task,
+                auto_reuse_eligible=auto_reuse_eligible,
+                reuse_status=reuse_status,
+            )
             params: JsonDict = {
                 "fleetId": fleet_id,
                 "context": json.dumps(envelope, ensure_ascii=False),
@@ -1813,6 +1861,101 @@ class BrowserAgent:
                 return result
         return {"status": "failed", "fleetId": fleet_id}
 
+    def _task_memory_heartbeat_interval_seconds(self) -> float:
+        try:
+            stale_seconds = float(getattr(
+                self.runtime.harness,
+                "similar_task_running_stale_seconds",
+                DEFAULT_RUNNING_STALE_SECONDS,
+            ))
+        except (TypeError, ValueError, OverflowError):
+            stale_seconds = DEFAULT_RUNNING_STALE_SECONDS
+        if stale_seconds <= 0.0:
+            return 0.0
+        base_interval = min(300.0, stale_seconds / 3.0)
+        identity = f"{self.runtime.agent_id}:{self.worker_id}".encode("utf-8")
+        jitter_bucket = int.from_bytes(
+            hashlib.sha256(identity).digest()[:2], "big"
+        ) / 65535.0
+        # Stable per-worker jitter avoids synchronized optimistic-write
+        # conflicts while always remaining below one third of the lease TTL.
+        return max(0.05, base_interval * (0.75 + (0.20 * jitter_bucket)))
+
+    def _start_task_memory_heartbeat(
+        self,
+        bootstrap: Any,
+        *,
+        task: str,
+    ) -> Optional[asyncio.Task]:
+        memory = bootstrap.get("memory") if isinstance(bootstrap, dict) else None
+        if (
+            not isinstance(memory, dict)
+            or memory.get("status") != "saved"
+            or getattr(self, "task_memory_auto_reuse_eligible", None) is not True
+            or self._task_memory_heartbeat_interval_seconds() <= 0.0
+        ):
+            return None
+        return asyncio.create_task(
+            self._task_memory_heartbeat_loop(task),
+            name=f"fleet-memory-heartbeat:{self.worker_id or self.runtime.agent_id}",
+        )
+
+    async def _task_memory_heartbeat_loop(self, task: str) -> None:
+        interval = self._task_memory_heartbeat_interval_seconds()
+        if interval <= 0.0:
+            return
+        try:
+            stale_seconds = float(getattr(
+                self.runtime.harness,
+                "similar_task_running_stale_seconds",
+                DEFAULT_RUNNING_STALE_SECONDS,
+            ))
+        except (TypeError, ValueError, OverflowError):
+            stale_seconds = DEFAULT_RUNNING_STALE_SECONDS
+        write_timeout = max(1.0, min(30.0, stale_seconds / 3.0))
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                receipt = await asyncio.wait_for(
+                    self._ensure_task_memory(
+                        task,
+                        auto_reuse_eligible=True,
+                        reuse_status="running",
+                    ),
+                    timeout=write_timeout,
+                )
+                self._write_agent_event("memory.heartbeat", {
+                    "status": str(receipt.get("status") or "unknown"),
+                    "fleetId": str(receipt.get("fleetId") or ""),
+                    "intervalSeconds": round(interval, 3),
+                })
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # The existing lease remains authoritative until its TTL. A
+                # heartbeat failure is observable but never masks worker work.
+                self._write_agent_event(
+                    "memory.heartbeat.failed",
+                    exception_payload(exc, intervalSeconds=round(interval, 3)),
+                )
+
+    async def _stop_task_memory_heartbeat(
+        self,
+        heartbeat: Optional[asyncio.Task],
+    ) -> None:
+        if heartbeat is None:
+            return
+        heartbeat.cancel()
+        try:
+            await heartbeat
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            self._write_agent_event(
+                "memory.heartbeat.stop_failed",
+                exception_payload(exc),
+            )
+
     @staticmethod
     def _registration_fleet_memory(registration: Any, fleet_id: str) -> Tuple[bool, Any]:
         data = registration.get("data") if isinstance(registration, dict) else None
@@ -1824,38 +1967,160 @@ class BrowserAgent:
 
     @staticmethod
     def _parse_fleet_memory(value: Any) -> JsonDict:
-        data = value.get("data") if isinstance(value, dict) and isinstance(value.get("data"), dict) else value
-        if data is None:
-            return {"envelope": {}, "revision": None, "foreign": False}
-        context = data if isinstance(data, str) else (
-            data.get("context") if isinstance(data, dict) else None
-        )
-        revision = data.get("revision") if isinstance(data, dict) else None
-        if not context:
-            return {"envelope": {}, "revision": revision, "foreign": False}
-        try:
-            envelope = json.loads(context) if isinstance(context, str) else context
-        except (TypeError, ValueError, json.JSONDecodeError):
-            envelope = None
-        recognized = isinstance(envelope, dict) and envelope.get("schema") == "abcp-harness-fleet-memory/v1"
-        return {
-            "envelope": envelope if recognized else {},
-            "revision": revision,
-            "foreign": not recognized,
-        }
+        return parse_fleet_memory(value)
 
-    def _merge_task_memory_envelope(self, existing: Any, task: str) -> JsonDict:
+    def _merge_task_memory_envelope(
+        self,
+        existing: Any,
+        task: str,
+        *,
+        auto_reuse_eligible: bool,
+        reuse_status: str = "running",
+    ) -> JsonDict:
+        if not isinstance(auto_reuse_eligible, bool):
+            raise TypeError("auto_reuse_eligible must be an explicit boolean")
         envelope = dict(existing) if isinstance(existing, dict) else {}
         tasks = list(envelope.get("tasks") or []) if isinstance(envelope.get("tasks"), list) else []
+        now = time.time()
+        prior_policy = (
+            envelope.get("reusePolicy")
+            if isinstance(envelope.get("reusePolicy"), dict)
+            else None
+        )
+        try:
+            prior_policy_version = int(
+                (prior_policy or {}).get("version") or 0
+            )
+        except (TypeError, ValueError, OverflowError):
+            prior_policy_version = 0
+        trusted_policy = bool(
+            prior_policy
+            and prior_policy_version >= FLEET_REUSE_POLICY_VERSION
+        )
+        # Existing task history without the Fleet-level policy may contain an
+        # old session/isolated use. Never promote that unknown identity merely
+        # because a later generic worker touched the Fleet.
+        blocked = bool(
+            not auto_reuse_eligible
+            or (tasks and not trusted_policy)
+            or (trusted_policy and prior_policy.get("blocked") is not False)
+            or any(
+                isinstance(item, dict)
+                and item.get("autoReuseEligible") is False
+                for item in tasks
+            )
+        )
+        envelope["reusePolicy"] = {
+            "version": FLEET_REUSE_POLICY_VERSION,
+            "blocked": blocked,
+            "updatedAt": now,
+        }
         task_id = getattr(getattr(self, "logger", None), "task_dir", Path("")).name
-        tasks = [item for item in tasks if isinstance(item, dict) and item.get("taskId") != task_id]
-        tasks.append({
+        worker_id = str(getattr(self, "worker_id", "") or "").strip()
+        tasks = [
+            item for item in tasks
+            if (
+                isinstance(item, dict)
+                and not (
+                    item.get("taskId") == task_id
+                    and str(item.get("workerId") or "").strip() == worker_id
+                )
+            )
+        ]
+        normalized_status = (
+            str(reuse_status or "running").strip().lower() or "running"
+        )
+        record = {
             "taskId": task_id,
+            "workerId": worker_id,
             "agentId": self.runtime.agent_id,
-            "task": str(task or "")[:2000],
-            "memoryContext": str(self.runtime.harness.memory_context or "")[:1000],
-        })
-        return {"schema": "abcp-harness-fleet-memory/v1", "tasks": tasks[-12:]}
+            "updatedAt": now,
+            "reuseStatus": normalized_status,
+            "autoReuseEligible": auto_reuse_eligible,
+        }
+        # Active-worker leases need identity and freshness only. The task text
+        # becomes reusable history only once that worker reaches a terminal
+        # state, so parallel workers cannot expose an in-flight Fleet.
+        if normalized_status != "running":
+            record["rootTask"] = str(task or "")[:2000]
+        tasks.append(record)
+        envelope["schema"] = FLEET_MEMORY_SCHEMA
+        # This value is injected into the live BrowserAgent prompt directly;
+        # persisting a second, unread copy in Fleet memory only grows payloads.
+        envelope.pop("memoryContext", None)
+
+        running_stale_seconds = getattr(
+            self.runtime.harness,
+            "similar_task_running_stale_seconds",
+            DEFAULT_RUNNING_STALE_SECONDS,
+        )
+        running_records: List[JsonDict] = []
+        terminal_by_task: Dict[str, Tuple[int, JsonDict]] = {}
+        for index, item in enumerate(tasks):
+            if not isinstance(item, dict):
+                continue
+            status = str(item.get("reuseStatus") or "").strip().lower()
+            if status == "running":
+                running_records.append(item)
+                continue
+
+            # Worker identity remains useful for diagnosis, but completed task
+            # history is one reusable summary per task. Prefer a completed
+            # outcome over other terminal outcomes, then the newest record.
+            history_key = str(item.get("taskId") or "").strip()
+            if not history_key:
+                # An identity-free terminal record cannot be safely matched or
+                # excluded as the current task. It is transition debris, not a
+                # reusable history candidate.
+                continue
+            previous = terminal_by_task.get(history_key)
+            previous_item = previous[1] if previous is not None else None
+            is_completed = status == "completed"
+            previous_completed = bool(
+                previous_item
+                and str(previous_item.get("reuseStatus") or "").lower()
+                == "completed"
+            )
+            if (
+                previous is None
+                or (is_completed and not previous_completed)
+                or (is_completed == previous_completed)
+            ):
+                terminal_by_task[history_key] = (index, item)
+
+        terminal_history: List[JsonDict] = []
+        for _, item in sorted(terminal_by_task.values(), key=lambda pair: pair[0]):
+            summary: JsonDict = {
+                "taskId": str(item.get("taskId") or ""),
+                "workerId": str(item.get("workerId") or ""),
+                "agentId": str(item.get("agentId") or ""),
+                "updatedAt": item.get("updatedAt"),
+                "reuseStatus": str(item.get("reuseStatus") or "").strip().lower(),
+                "autoReuseEligible": item.get("autoReuseEligible"),
+            }
+            root_task = task_text_from_memory_entry(item)[:2000]
+            if root_task:
+                summary["rootTask"] = root_task
+            terminal_history.append(summary)
+
+        active_running = [{
+            "taskId": str(item.get("taskId") or ""),
+            "workerId": str(item.get("workerId") or ""),
+            "agentId": str(item.get("agentId") or ""),
+            "updatedAt": item.get("updatedAt"),
+            "reuseStatus": "running",
+            "autoReuseEligible": item.get("autoReuseEligible"),
+        } for item in compact_running_memory_records(
+            running_records,
+            now=now,
+            running_stale_seconds=running_stale_seconds,
+        )]
+
+        # The cap applies only to reusable terminal history. Every active
+        # worker lease is retained outside it, so a terminal write can neither
+        # evict another live worker nor be silently discarded by live workers.
+        envelope["tasks"] = terminal_history[-12:] + active_running
+        return envelope
 
     @staticmethod
     def _memory_revision_conflict(exc: BaseException) -> bool:
@@ -2519,6 +2784,12 @@ L6. Termination
             "reachedStepCap": reached_step_cap,
             "diagnostics": self.diagnostics.to_log_payload(),
         }
+        if self._step_extension_granted_steps:
+            payload["stepExtension"] = {
+                "baseMaxSteps": self.base_max_steps,
+                "effectiveMaxSteps": self.effective_max_steps,
+                "grantedSteps": self._step_extension_granted_steps,
+            }
         if model_reported_status and model_reported_status != final_status:
             payload["modelReportedStatus"] = model_reported_status
         if override_reason:
@@ -2548,8 +2819,9 @@ def _raw_plan_hash(raw_plan: Any) -> str:
 def _plan_review_scope_signature(plan: Any) -> str:
     """Identity of plan changes that warrant an independent semantic review.
 
-    Projection per phase: id, task_type, depends_on, expected_artifact,
-    validators, objective, worker_task and the whole worker_contract.
+    Projection per phase: id, task_type, depends_on, input_artifacts,
+    expected_artifact, validators, objective, worker_task and the whole
+    worker_contract.
     The last three were absent historically, which let a replan rewrite the
     objective ("ranks 30-45" -> "any 16"), swap interaction for direct-URL
     navigation, point a content_completeness marker at an unmatchable
@@ -2574,6 +2846,10 @@ def _plan_review_scope_signature(plan: Any) -> str:
             "id": phase.get("id"),
             "task_type": phase.get("task_type"),
             "depends_on": phase.get("depends_on"),
+            # Data lineage controls which browser-discovered rows reach a
+            # worker. Repointing it is a semantic change, never an
+            # operational continuation.
+            "input_artifacts": phase.get("input_artifacts"),
             "expected_artifact": phase.get("expected_artifact") or {},
             # Normalization already derives the ordinary validators from the
             # artifact contract. Including the complete normalized list is
@@ -2599,49 +2875,6 @@ def _plan_review_scope_signature(plan: Any) -> str:
             default=str,
         ).encode("utf-8")
     ).hexdigest()
-
-
-_LEAD_NORMAL_INSTRUCTION = (
-    "Act as the LeadAgent: decompose the task, spawn BrowserAgent phases as"
-    " needed, and call final_answer with the final result."
-)
-
-
-def _canonical_direct_instruction(
-    spawn_status: str, phase_id: str,
-) -> str:
-    """Opening instruction for a direct-adoption run, matched to the ACTUAL
-    dispatch outcome - never claim a dispatch that failed, and never ask an
-    adopted run to decompose or re-plan (that would contradict the adoption
-    and pollute the reduced-Lead-turns experiment)."""
-    if spawn_status == "running":
-        return (
-            "<canonical_direct_adoption>\n"
-            "The task plan for this run was adopted directly from the trusted"
-            " operator contract (canonical direct path); the Plan Validator"
-            " was not consulted because the plan IS the reviewed contract."
-            f" Phase {phase_id} has already been dispatched by the harness"
-            " with a phase_id-only spawn (receipt above). Monitor the"
-            " already-dispatched phase, inspect only its result when needed,"
-            " and finish or report a concrete blocker. Do NOT call"
-            " emit_task_plan, extend_task_plan, or replan, and do not spawn"
-            " a duplicate phase: the plan is accepted and locked.\n"
-            "</canonical_direct_adoption>\n"
-        )
-    return (
-        "<canonical_direct_adoption>\n"
-        "The task plan for this run was adopted directly from the trusted"
-        " operator contract (canonical direct path) and is accepted and"
-        " locked; the Plan Validator was not consulted because the plan IS"
-        " the reviewed contract. The harness dispatch of phase"
-        f" {phase_id} did not start a worker (spawn status:"
-        f" {spawn_status!r}; receipt above). The accepted plan stands:"
-        " either retry the spawn with phase_id ONLY (no other fields - the"
-        " plan is locked) or report the concrete blocker with"
-        " final_answer. Do NOT call emit_task_plan, extend_task_plan, or"
-        " replan.\n"
-        "</canonical_direct_adoption>\n"
-    )
 
 
 class LeadAgent:
@@ -2675,42 +2908,6 @@ class LeadAgent:
         self.static_context_block, self.static_context_hash = build_static_context_block(
             self.runtime.harness.context_file
         )
-        # Canonical direct contract (trusted-source fast path). Init does
-        # SHAPE validation only - the schema cache does not exist yet, and
-        # normalizing the embedded plan here would judge method allowlists
-        # under different rules than candidates. Full normalization happens
-        # lazily in review_task_plan_candidate with identical parameters.
-        self.canonical_direct_contract: Optional[JsonDict] = None
-        self._canonical_direct_normalized: bool = False
-        self.last_plan_validator_record: Optional[JsonDict] = None
-        self.canonical_active_receipt: Optional[JsonDict] = None
-        contract_path = getattr(
-            self.runtime.harness, "canonical_direct_contract_path", None
-        )
-        if contract_path:
-            try:
-                raw_contract = json.loads(
-                    Path(contract_path).read_text(encoding="utf-8")
-                )
-            except (OSError, ValueError) as exc:
-                self.logger.write("canonical_direct.contract_unreadable", {
-                    "path": str(contract_path),
-                    "error": f"{type(exc).__name__}: {exc}"[:200],
-                })
-            else:
-                shaped_contract, contract_errors = validate_contract_shape(
-                    raw_contract
-                )
-                if shaped_contract is None:
-                    self.logger.write("canonical_direct.contract_invalid", {
-                        "errors": contract_errors[:10],
-                    })
-                else:
-                    self.canonical_direct_contract = shaped_contract
-                    self.logger.write("canonical_direct.contract_loaded", {
-                        "contractHash": contract_identity_hash(shaped_contract),
-                        "normalized": False,
-                    })
         self.lifecycle = default_lifecycle_manager()
         self.task_plan: Optional[JsonDict] = (
             dict(resume.current_plan) if resume is not None else None
@@ -2833,50 +3030,14 @@ class LeadAgent:
                 ],
             }
         config = self.runtime.plan_validator
+        if not config.enabled:
+            return {"status": "disabled"}
         schema_status, schema_methods = self._schema_cache_status()
         known_methods = (
             schema_methods
             if schema_status == SchemaCacheStatus.LOADED_OK
             else None
         )
-        replan_reason = (
-            str(raw_plan.get("replan_reason") or "").strip()
-            if isinstance(raw_plan, dict)
-            else ""
-        )
-        # Canonical direct contract shadow - INDEPENDENT of the Lead's
-        # candidate: computed before L1 so a mechanically invalid candidate
-        # still yields an auditable direct-path record, and classified with
-        # the run state (resume/replan) the real adoption path would face.
-        # The skip itself is behind harness.canonical_direct_skip_enabled
-        # (default False) and may only be turned on after the emitted-
-        # candidate replay AND a shadow audit pass. The classifier binds the
-        # contract to THIS run's user task, so a stale contract from a
-        # previous task can never qualify.
-        contract = self._normalized_canonical_contract(known_methods)
-        original_task_text = str(
-            getattr(self, "original_user_task", "") or ""
-        )
-        canonical_runtime_state = {
-            "resume_active": self.resume is not None,
-            "has_accepted_plan": self.task_plan is not None,
-        }
-        if contract is not None:
-            # contract_shadow: could the harness have ADOPTED this contract
-            # directly for this run? (Final architecture - see module
-            # docstring. Non-blocking; audited against live outcomes.)
-            contract_shadow = classify_canonical_direct_eligibility(
-                contract["_normalized_plan"],
-                contract=contract,
-                original_user_task=original_task_text,
-                runtime_state=canonical_runtime_state,
-            )
-            self.logger.write("canonical_direct.contract_shadow", {
-                "contractHash": contract_identity_hash(contract),
-                "originalTaskHash": task_identity_hash(original_task_text),
-                "directAdoption": contract_shadow["eligibility"],
-                "reasons": contract_shadow["reasons"],
-            })
         candidate, errors = validate_task_plan(
             raw_plan,
             known_abcp_methods=known_methods,
@@ -2896,58 +3057,11 @@ class LeadAgent:
                 "status": "mechanical_invalid",
                 "errors": errors,
             }
-        # Canonical candidate shadow (the contract-independent half ran
-        # above, before L1). The skip branch runs first so a skip writes
-        # canonical_direct.skip (not a contradictory "flow preserved"
-        # shadow); the shadow event then lands BEFORE the validator-disabled
-        # early return, so reviewer-less deployments still record whether
-        # the Lead's CURRENT valid candidate matches the trusted contract.
-        shadow = classify_canonical_direct_eligibility(
-            candidate,
-            contract=contract,
-            original_user_task=original_task_text,
-            runtime_state={
-                "resume_active": self.resume is not None,
-                "has_accepted_plan": self.task_plan is not None,
-            },
+        replan_reason = (
+            str(raw_plan.get("replan_reason") or "").strip()
+            if isinstance(raw_plan, dict)
+            else ""
         )
-        if (
-            bool(getattr(
-                getattr(self.runtime, "harness", None),
-                "canonical_direct_skip_enabled",
-                False,
-            ))
-            and shadow["eligibility"] == CANONICAL_DIRECT_ELIGIBLE
-        ):
-            skip_receipt = {
-                "status": "canonical_direct",
-                "reviewed": False,
-                "candidateHash": plan_candidate_hash(
-                    candidate, replan_reason
-                ),
-                "contractHash": contract_identity_hash(contract),
-                "originalTaskHash": task_identity_hash(original_task_text),
-            }
-            self.logger.write("canonical_direct.skip", {
-                **skip_receipt,
-                "reviewerFlowPreserved": False,
-            })
-            return skip_receipt
-        self.logger.write("canonical_direct.shadow", {
-            "candidateHash": plan_candidate_hash(candidate, replan_reason),
-            "contractHash": (
-                contract_identity_hash(contract) if contract else None
-            ),
-            "originalTaskHash": task_identity_hash(original_task_text),
-            "eligibility": shadow["eligibility"],
-            "reasons": shadow["reasons"],
-            # Honest naming: shadow never alters the flow itself, but a later
-            # L2 operational-continuation may still skip the provider - so
-            # this is NOT a claim that the provider was called.
-            "reviewerFlowPreserved": True,
-        })
-        if not config.enabled:
-            return {"status": "disabled"}
         if (
             self.task_plan is not None
             and _plan_review_scope_signature(candidate)
@@ -3064,15 +3178,6 @@ class LeadAgent:
         plan_validator_review: Optional[JsonDict] = None,
         resume_decision: str = "replan",
     ) -> JsonDict:
-        # The accepted plan's validator record is the authoritative fact the
-        # spawn guard reads: if it says canonical_direct, the receipt MUST
-        # exist and match - missing/corrupt means fail-closed, not fallback.
-        self.last_plan_validator_record = (
-            dict(plan_validator_review)
-            if isinstance(plan_validator_review, dict)
-            else None
-        )
-        self.canonical_active_receipt = None
         replan_reason = ""
         if self.task_plan is not None:
             if isinstance(raw_plan, dict):
@@ -3216,20 +3321,9 @@ class LeadAgent:
             infrastructure_unreviewed = (
                 review_never_answered and not scope_changed_replan
             )
-            # Canonical direct path (feature-flagged, default OFF): the
-            # candidate was proven field-for-field identical to a trusted
-            # contract's normalized plan AND bound to this run's user task,
-            # so the reviewer call is redundant BY CONSTRUCTION. The receipt
-            # hash must still match this exact submission.
-            canonical_direct_ok = (
-                isinstance(plan_validator_review, dict)
-                and plan_validator_review.get("status") == "canonical_direct"
-                and reviewed_hash == submitted_candidate_hash
-            )
             if (
                 not operational_continuation
                 and not infrastructure_unreviewed
-                and not canonical_direct_ok
                 and (
                     not isinstance(plan_validator_review, dict)
                     or plan_validator_review.get("status") != "approved"
@@ -3413,11 +3507,6 @@ class LeadAgent:
                 "candidateHash": plan_validator_review.get("candidateHash"),
                 "verdict": plan_validator_review.get("verdict"),
                 "auditPath": plan_validator_review.get("auditPath"),
-                # Canonical binding, persisted with the plan version: the
-                # spawn guard's authorization survives restart/resume ONLY
-                # if these land here (memory does not).
-                "contractHash": plan_validator_review.get("contractHash"),
-                "originalTaskHash": plan_validator_review.get("originalTaskHash"),
             }
         extension_decision = None
         if resume_decision == "extend" and isinstance(preserve_from, dict):
@@ -3455,35 +3544,6 @@ class LeadAgent:
         self.task_plan = plan
         if self.initial_task_plan is None:
             self.initial_task_plan = plan
-        if (
-            isinstance(plan_validator_review, dict)
-            and plan_validator_review.get("status") == "canonical_direct"
-        ):
-            # Persist the canonical receipt: the spawn guard reads it to
-            # lock task/context/worker_contract against Lead overrides for
-            # as long as the accepted plan stays identical to the contract.
-            receipt = {
-                "status": "canonical_direct",
-                "candidateHash": plan_validator_review.get("candidateHash"),
-                "contractHash": plan_validator_review.get("contractHash"),
-                "originalTaskHash": task_identity_hash(
-                    self.original_user_task
-                ),
-            }
-            receipt_path = (
-                Path(self.logger.task_dir) / "canonical_direct.receipt.json"
-            )
-            receipt_path.write_text(
-                json.dumps(receipt, ensure_ascii=False, indent=1),
-                encoding="utf-8",
-            )
-            # In-memory twin: the sidecar file alone must never be the only
-            # authorization fact (a lost/corrupted file would fail open).
-            self.canonical_active_receipt = receipt
-            self.logger.write("canonical_direct.receipt_persisted", {
-                **receipt,
-                "savedPath": str(receipt_path),
-            })
         result = {
             "status": "done",
             "planPath": plan_path,
@@ -4026,215 +4086,6 @@ class LeadAgent:
         strategies = self.strategies_for_phase(phase)
         return render_strategy_guidance(strategies)
 
-    def _normalized_canonical_contract(
-        self, known_methods: Optional[Any],
-    ) -> Optional[JsonDict]:
-        """Lazily normalize the loaded contract under the EXACT parameters
-        a candidate is validated with (schema methods + harness tools), so
-        allowlists are never judged under two rule sets. Cached on the agent;
-        a contract that fails normalization is cleared and evented - callers
-        see None."""
-        contract = getattr(self, "canonical_direct_contract", None)
-        if contract is None:
-            return None
-        if not self._canonical_direct_normalized:
-            normalized_contract, contract_errors = normalize_contract(
-                contract,
-                known_abcp_methods=known_methods,
-                known_harness_tools=HARNESS_TOOL_NAMES,
-            )
-            if normalized_contract is None:
-                self.logger.write("canonical_direct.contract_invalid", {
-                    "stage": "normalize",
-                    "errors": contract_errors[:10],
-                })
-                self.canonical_direct_contract = None
-                return None
-            self.canonical_direct_contract = normalized_contract
-            self._canonical_direct_normalized = True
-            return normalized_contract
-        return contract
-
-    def _maybe_adopt_canonical_direct_plan(self) -> Optional[JsonDict]:
-        """Phase-1 direct adoption (feature-flagged, default OFF).
-
-        With a trusted contract bound to THIS run's exact user task on a
-        FRESH run (no resume, no accepted plan, no pending barriers), the
-        harness accepts contract.plan itself - no Lead emit round, no Plan
-        Validator call - and returns the first phase id for direct dispatch.
-        Every failure is a structured canonical_direct.fallback event and
-        returns None, leaving the ordinary Lead flow untouched."""
-        if not getattr(
-            getattr(self.runtime, "harness", None),
-            "canonical_direct_adoption_enabled",
-            False,
-        ):
-            return None
-        schema_status, schema_methods = self._schema_cache_status()
-        known_methods = (
-            schema_methods
-            if schema_status == SchemaCacheStatus.LOADED_OK
-            else None
-        )
-        contract = self._normalized_canonical_contract(known_methods)
-
-        def _fallback(reason: str, **extra: Any) -> None:
-            self.logger.write("canonical_direct.fallback", {
-                "reason": reason,
-                "contractConfigured": contract is not None,
-                **extra,
-            })
-
-        if contract is None:
-            _fallback("no_contract")
-            return None
-        if self.resume is not None:
-            _fallback("resume_active")
-            return None
-        if self.task_plan is not None:
-            _fallback("not_fresh_task")
-            return None
-        original_task_text = str(
-            getattr(self, "original_user_task", "") or ""
-        )
-        if original_task_text != str(contract.get("original_task") or ""):
-            _fallback("task_mismatch")
-            return None
-        classification = classify_canonical_direct_eligibility(
-            contract["_normalized_plan"],
-            contract=contract,
-            original_user_task=original_task_text,
-            runtime_state={
-                "resume_active": False,
-                "has_accepted_plan": False,
-            },
-        )
-        if classification["eligibility"] != CANONICAL_DIRECT_ELIGIBLE:
-            _fallback("ineligible", reasons=classification["reasons"])
-            return None
-        normalized_plan = contract["_normalized_plan"]
-        record = {
-            "status": "canonical_direct",
-            "candidateHash": plan_candidate_hash(normalized_plan, ""),
-            "contractHash": contract_identity_hash(contract),
-            "originalTaskHash": task_identity_hash(original_task_text),
-        }
-        # Submit the contract's RAW plan: accept_task_plan normalizes under
-        # the same parameters the contract was normalized with, so the
-        # resulting plan (and its candidateHash) is field-for-field the
-        # contract's normalized plan. Feeding the ALREADY-normalized plan
-        # would re-derive validators a second time and drift the hash.
-        result = self.accept_task_plan(
-            copy.deepcopy(contract.get("plan") or normalized_plan),
-            plan_validator_review=dict(record),
-        )
-        if result.get("status") != "done":
-            _fallback(
-                "accept_failed",
-                error=str(result.get("error") or "")[:200],
-            )
-            return None
-        phases = normalized_plan.get("phases") or []
-        phase_id = str((phases[0] or {}).get("id") or "") if phases else ""
-        self.logger.write("canonical_direct.adoption", {
-            "contractHash": record["contractHash"],
-            "originalTaskHash": record["originalTaskHash"],
-            "candidateHash": record["candidateHash"],
-            "phaseId": phase_id,
-            "phaseCount": len(phases),
-        })
-        return {"phase_id": phase_id, "record": record}
-
-    async def _dispatch_canonical_direct_phase(
-        self,
-        adoption: JsonDict,
-        messages: List[JsonDict],
-        dispatch_tool: Any,
-    ) -> str:
-        """Dispatch the trusted contract's first phase WITHOUT a Lead model
-        call: a synthetic phase_id-only spawn through the normal dispatcher.
-        The spawn guard (locked by the canonical acceptance) then proves the
-        input carries no field the contract did not fix, and the worker
-        contract comes from the accepted plan verbatim - nothing is assembled
-        from Lead tool input. Returns the spawn status so the caller can set
-        the Lead's opening instruction to match reality."""
-        phase_id = str(adoption.get("phase_id") or "")
-        tool_call = {
-            "id": "canonical-direct-spawn-1",
-            "name": "spawn_browser_agent",
-            "input": {"phase_id": phase_id},
-        }
-        result, should_stop = await dispatch_tool(tool_call)
-        # should_stop=True from a spawn is not a combination the production
-        # spawner produces (only final_answer-style tools stop the loop); if
-        # it ever appears we record it in dispatch_failed and still hand the
-        # real receipt to the Lead loop - an explicit terminate-vs-continue
-        # decision is deferred until evidence shows the combination exists.
-        model_result = offload_tool_result_for_model(
-            logger=self.logger,
-            runtime=self.runtime,
-            tool_call=tool_call,
-            result=result,
-            step=0,
-        )
-        self.logger.write(
-            "lead.tool.result",
-            summarize_lead_tool_result_for_log(
-                tool_call=tool_call,
-                result=result,
-                model_result=model_result,
-                step=0,
-            ),
-        )
-        content = json.dumps(
-            trim_large_strings(
-                model_result,
-                self.runtime.harness.max_observation_chars,
-            ),
-            ensure_ascii=False,
-            default=str,
-        )
-        messages.append({
-            "role": "assistant",
-            "content": [{
-                "type": "tool_use",
-                "id": tool_call["id"],
-                "name": tool_call["name"],
-                "input": tool_call["input"],
-            }],
-        })
-        messages.append({
-            "role": "user",
-            "content": [{
-                "type": "tool_result",
-                "tool_use_id": tool_call["id"],
-                "content": content,
-            }],
-        })
-        spawn_status = str(result.get("status") or "")
-        if spawn_status == "running":
-            self.logger.write("canonical_direct.dispatch", {
-                "phaseId": phase_id,
-                "spawnStatus": spawn_status,
-                "contractHash": (adoption.get("record") or {}).get(
-                    "contractHash"
-                ),
-            })
-        else:
-            # The plan stays accepted and locked; the Lead may retry the
-            # spawn with phase_id only or report the blocker. Never pretend
-            # the dispatch succeeded.
-            self.logger.write("canonical_direct.dispatch_failed", {
-                "phaseId": phase_id,
-                "spawnStatus": spawn_status,
-                "shouldStop": bool(should_stop),
-                "error": str(result.get("error") or "")[:200],
-                "contractHash": (adoption.get("record") or {}).get(
-                    "contractHash"
-                ),
-            })
-        return spawn_status
-
     async def run(self, task: str) -> str:
         system_prompt = ""
         messages: List[JsonDict] = []
@@ -4274,11 +4125,9 @@ class LeadAgent:
             base_task = str(task or "")
             resume_instruction = ""
             self.original_user_task = base_task
+        self.spawner.root_task = base_task
 
         await self._bootstrap_schema_cache()
-        # Direct adoption decision (phase 1, flag-gated): decided ONCE here,
-        # before any Lead model call - adoption never activates mid-run.
-        adoption = self._maybe_adopt_canonical_direct_plan()
         runtime_limits = json.dumps(
             {
                 "max_browser_agent_instances": (
@@ -4367,54 +4216,43 @@ class LeadAgent:
                 "\nThis is a planning-time capability index in task context;"
                 " it is not system policy or evidence of task completion.\n\n"
             )
-        content_prefix = (
-            f"<user_task>\n{base_task}\n</user_task>\n\n"
-            + strategy_index_block
-            + known_skills_block
-            + (
-                f"<resume_instruction>\n{resume_instruction}\n"
-                "</resume_instruction>\n\n"
-                if resume_instruction else ""
-            )
-            + resumed_block
-            + f"<runtime_limits>\n{runtime_limits}\n</runtime_limits>\n\n"
-            + (
-                "<pinned_browser_context>\n"
-                f"{pinned_context}\n"
-                "</pinned_browser_context>\n"
-                "This routing context is immutable control-plane input."
-                " Reuse it and never plan Fleet.create or substitute"
-                " another fleet. When pageId is present, do not plan"
-                " Page.create/Page.close or substitute that page; when"
-                " pageId is absent, Page.create inside the pinned fleet"
-                " remains allowed.\n\n"
-                if pinned_context
-                else ""
-            )
-        )
         messages = [
             {
                 "role": "user",
-                "content": content_prefix + _LEAD_NORMAL_INSTRUCTION,
+                "content": (
+                    f"<user_task>\n{base_task}\n</user_task>\n\n"
+                    + strategy_index_block
+                    + known_skills_block
+                    + (
+                        f"<resume_instruction>\n{resume_instruction}\n"
+                        "</resume_instruction>\n\n"
+                        if resume_instruction else ""
+                    )
+                    + resumed_block
+                    + f"<runtime_limits>\n{runtime_limits}\n</runtime_limits>\n\n"
+                    + (
+                        "<pinned_browser_context>\n"
+                        f"{pinned_context}\n"
+                        "</pinned_browser_context>\n"
+                        "This routing context is immutable control-plane input."
+                        " Reuse it and never plan Fleet.create or substitute"
+                        " another fleet. When pageId is present, do not plan"
+                        " Page.create/Page.close or substitute that page; when"
+                        " pageId is absent, Page.create inside the pinned fleet"
+                        " remains allowed.\n\n"
+                        if pinned_context
+                        else ""
+                    )
+                    +
+                    "Act as the LeadAgent: decompose the task, spawn BrowserAgent phases as needed, "
+                    "and call final_answer with the final result."
+                ),
             }
         ]
         tools = build_lead_agent_tool_specs(
             include_resume=self.resume is not None,
         )
         dispatch_tool = build_lead_tool_dispatcher(self)
-        if adoption is not None:
-            # Dispatch BEFORE the opening instruction is finalized: the
-            # prompt must describe the dispatch that ACTUALLY happened
-            # (monitor a running phase vs retry/report a failed one) and
-            # must never ask an adopted run to decompose or re-plan.
-            spawn_status = await self._dispatch_canonical_direct_phase(
-                adoption, messages, dispatch_tool,
-            )
-            messages[0]["content"] = content_prefix + (
-                _canonical_direct_instruction(
-                    spawn_status, str(adoption.get("phase_id") or ""),
-                )
-            )
         system_prompt = self._build_system_prompt()
         try:
             lead_timeout_step_retries = max(
@@ -5160,7 +4998,7 @@ Lead state flow:
    A phase's task_type decides which ABCP method domains its worker can call, and it is NOT inherited from the plan: classify each phase by what that phase does. A goal like "collect listings, then save the images and video" is a web_scrape phase followed by a file_download phase — labelling the export phase web_scrape removes the Download domain and the worker will report the files as impossible to save. The emit_task_plan receipt lists the disabled domains per phase; if a phase needs a domain shown as disabled, fix that phase's task_type and re-emit before spawning.
    Phase scheduling is driven by depends_on: OMITTING it means the phase implicitly depends on ALL phases listed before it (strict serial order); depends_on=[] declares an independent phase; depends_on=["p1"] lists the exact data dependencies. Declare only true data dependencies — e.g. every detail phase depends only on the collection phase, not on its sibling detail phases — so independent phases can run in parallel. A spawn whose dependencies are not yet validated_done is rejected with dependency_not_ready; wait for the dependency instead of retrying. A replan is a COMPLETE replacement: first wait for all live workers, then include every currently known remediation phase in the same emit_task_plan call.
    If the user requests spacing between batch rows or dependent phases, set plan/phase pacing with row_interval_seconds or phase_interval_seconds plus optional jitter_ratio. Row pacing keeps the warm tab; phase pacing waits before slot reservation. Do not invent task-level pacing.
-   For repeated homogeneous rows, do not create one detail phase per row. Declare execution_role and exactly one input form: prefer worker_contract.batch_source (validated artifact_name and selector) for browser-discovered rows so the harness constructs batch_rows at spawn time; worker_contract.batch_rows is allowed only when the row identities/URLs were explicit in the user's instruction and no upstream browser artifact exists. Every direct batch_rows contract must also declare batch_rows_provenance={"source":"user_instruction","identity_fields":["<stable field>"]}; the harness verifies at least one named identity value from every row against the immutable original user task, so copied browser discoveries cannot masquerade as user input. Prefer the cohort form for artifact-derived rows: worker_contract.cohort_source={"artifact_name":...,"identity_field":"<the field that names a row>"} plus worker_contract.row_selection={"mode":"<role>","source_indices":[...]}. It states the two facts separately — which cohort the phase belongs to, and which of its rows THIS worker takes — so a probe can own one item and still bind the whole cohort for the checkpoint. The harness reads those rows out of the validated artifact by index; never re-type row content. Legacy batch_source remains accepted, but a confidence role whose selector is unbounded is rejected: it takes the whole cohort under a confidence stage's name.
+   For repeated homogeneous rows, do not create one detail phase per row. When an INITIAL ordinary downstream phase consumes rows from one upstream browser artifact, declare the exact provenance at phase level: input_artifacts=[{"phase_id":"<producer phase id>","artifact_name":"<that phase's expected_artifact.name>"}], and include that same phase id in depends_on. This is required even in serial plans: plan position, same row counts, and similarly named fields never identify a row cohort. If the declared source is validated, has the same exact row count, and preserves a unique identity required by the downstream artifact, OMIT execution_role, batch_source, cohort_source, row_selection, and batch_rows: the harness derives batch_source and loads the rows at spawn time. This keeps row identities out of the Lead's prompt and prevents copied browser discoveries from being presented as user input. If the phase joins, aggregates, selects a semantic subset, requires per-row isolation, HITL, a checkpoint, or more than one input artifact, use an explicit cohort contract instead; never name a source by guessing from a sibling artifact. Direct batch_rows remain allowed only when row identities/URLs were explicit in the user's instruction and must carry batch_rows_provenance={"source":"user_instruction","identity_fields":["<stable field>"]}; the harness verifies those values against the immutable original task. For an active checkpoint/replan or an intentional bounded slice, use the explicit cohort form: worker_contract.cohort_source={"artifact_name":...,"identity_field":"<the field that names a row>"} plus worker_contract.row_selection={"mode":"<role>","source_indices":[...]}. Legacy batch_source remains accepted, but a confidence role whose selector is unbounded is rejected: it takes the whole cohort under a confidence stage's name.
    The confidence ladder is CONDITIONAL, not a phase template: use probe (at most 1 row) only when the reusable path is unknown, then obey the checkpoint's requiredNextRole. A continuation that newly proves a reusable candidate upgrades to validation; a validated bulk whose trace no longer proves the candidate downgrades to continuation. Use bulk only when requiredNextRole=bulk and set row_independent=true. Do not pre-create validation/bulk solely because multiple rows exist, and do not invent empty ladder stages. Inside an active checkpoint cohort, failed or remaining rows MUST use checkpoint-bound continuation. Use remediation only for an explicit failed-row set outside every active checkpoint; remediation cannot bind a checkpoint.
 """ + lead_bulk_execution_rule + """
    If every row truly requires a separate identity/session boundary, set batch_policy.requires_isolation_per_row=true and explain that boundary; needs_isolated_session alone isolates the worker, not each row. Never batch heterogeneous rows, per-row isolation boundaries, HITL/visual flows, or rows whose decisions depend on earlier results.

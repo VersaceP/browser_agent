@@ -115,6 +115,8 @@ from .cohorts import (  # noqa: F401
     _fast_path_validator_obligations,
     _row_keys_for_indices,
     _tc,
+    assess_batch_source_binding,
+    derive_batch_source_from_upstream_artifact,
     materialize_batch_rows_from_source,
 )
 from .fingerprints import (  # noqa: F401

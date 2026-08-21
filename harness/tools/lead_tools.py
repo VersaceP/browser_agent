@@ -19,36 +19,13 @@ from harness.local_fs import local_fs_read, local_fs_search
 from harness.strategy_bank import render_strategy_guidance
 from harness.task_control import (
     EXECUTION_ROLES,
+    assess_batch_source_binding,
     direct_batch_rows_provenance_errors,
     mark_phase_exhausted_if_needed,
     materialize_batch_rows_from_source,
     replan_checkpoint_spawn_rejection,
     load_task_state,
     write_task_state,
-)
-from harness.task_control.canonical_direct import (
-    ELIGIBLE as CANONICAL_DIRECT_ELIGIBLE,
-    classify_canonical_direct_eligibility,
-    contract_identity_hash,
-    task_identity_hash,
-)
-
-# Spawn inputs that change EXECUTION or ROUTING. Under an accepted canonical
-# plan every one of these must come from the trusted plan verbatim - the
-# Lead may not swap task text, contracts, budgets, or fleet/session/page
-# routing (login state and account boundaries ride on those).
-_SPAWN_EXECUTION_INPUT_KEYS = (
-    "task",
-    "context",
-    "worker_contract",
-    "max_steps",
-    "result_contract",
-    "preferred_slot_id",
-    "reuse_from_worker_id",
-    "reuse_scope",
-    "session_key",
-    "fleet_id",
-    "page_policy",
 )
 from harness.results.completion_receipt import (
     build_completion_receipt,
@@ -531,6 +508,26 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                         " collection phase) so independent"
                                         " phases can run in parallel."
                                     ),
+                                },
+                                "input_artifacts": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "description": (
+                                        "Explicit data lineage for artifacts this phase consumes. "
+                                        "Each reference names the producing phase and its reviewed "
+                                        "expected_artifact.name. This is not inferred from plan order "
+                                        "or equal row counts. Also include every referenced phase in "
+                                        "depends_on so it is validated before this phase starts."
+                                    ),
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "phase_id": {"type": "string", "minLength": 1},
+                                            "artifact_name": {"type": "string", "minLength": 1},
+                                        },
+                                        "required": ["phase_id", "artifact_name"],
+                                        "additionalProperties": False,
+                                    },
                                 },
                                 "pacing": pacing_schema,
                                 "validators": {
@@ -1168,8 +1165,7 @@ async def _lead_emit_task_plan(ctx: ToolContext) -> JsonDict:
         plan_validator_review=(
             review
             if review.get("status")
-            in {"approved", "operational_continuation", "error",
-                "canonical_direct"}
+            in {"approved", "operational_continuation", "error"}
             else None
         ),
     )
@@ -1302,169 +1298,6 @@ def _resume_instruction_gate_rejection(agent: Any) -> Optional[JsonDict]:
     }
 
 
-def _canonical_spawn_shadow(agent: Any, tool_input: Dict[str, Any]) -> None:
-    """Non-blocking: which execution/routing fields the Lead passed that
-    the trusted plan does not carry, for the live shadow audit (the normal
-    flow is untouched; this only records the delta)."""
-    contract = getattr(agent, "canonical_direct_contract", None)
-    if not isinstance(contract, dict) or "_normalized_plan" not in contract:
-        return
-    original_task = str(getattr(agent, "original_user_task", "") or "")
-    if original_task != str(contract.get("original_task") or ""):
-        return  # contract is for a different task: no shadow comparison
-    deviations = sorted(
-        key for key in _SPAWN_EXECUTION_INPUT_KEYS
-        if tool_input.get(key) not in (None, "", {}, [])
-    )
-    if deviations:
-        agent.logger.write("canonical_direct.spawn_shadow", {
-            "fields": deviations,
-            "contractHash": contract_identity_hash(contract),
-        })
-
-
-def _persisted_plan_validator_record(agent: Any) -> Optional[JsonDict]:
-    """The accepted plan's validator record from task_plan_history - the
-    committed, restart-safe authorization fact (written atomically with the
-    plan version). The sidecar receipt file is cache/diagnostic only."""
-    history_dir = Path(agent.logger.task_dir) / "task_plan_history"
-    if not history_dir.is_dir():
-        return None
-    files = sorted(history_dir.glob("plan.*.json"))
-    if not files:
-        return None
-    try:
-        data = json.loads(files[-1].read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    record = data.get("validatorReview")
-    return record if isinstance(record, dict) else None
-
-
-def _canonical_direct_spawn_guard(
-    agent: Any,
-    tool_input: Dict[str, Any],
-) -> Optional[JsonDict]:
-    """Lock an accepted canonical-direct plan against spawn-time overrides.
-
-    Authorization source is ONLY the persisted validator record of the
-    accepted plan (task_plan_history/plan.NNNN.json#validatorReview) - it
-    survives restart and resume; memory is a cache of the same fact and the
-    sidecar receipt file is diagnostic. If EITHER source says canonical, the
-    plan reached acceptance without the reviewer and the spawn must be
-    locked; a binding that cannot be re-established (contract gone/changed,
-    task mismatch, plan drifted) is fail-closed, never a silent fallback.
-    While locked, only phase_id/name may be passed; every execution or
-    routing field must come from the trusted plan verbatim."""
-    memory_record = getattr(agent, "last_plan_validator_record", None)
-    memory_canonical = (
-        isinstance(memory_record, dict)
-        and memory_record.get("status") == "canonical_direct"
-    )
-    persisted_record = _persisted_plan_validator_record(agent)
-    persisted_canonical = (
-        isinstance(persisted_record, dict)
-        and persisted_record.get("status") == "canonical_direct"
-    )
-
-    if memory_canonical and not persisted_canonical:
-        # Memory witnessed a canonical acceptance but the committed record is
-        # missing/unreadable/not-canonical: the commit was lost after the
-        # fact - fail closed (a restart that wipes memory is fine; a restart
-        # that wipes the PERSISTED record is not).
-        agent.logger.write("canonical_direct.record_divergence", {
-            "memoryCanonical": memory_canonical,
-            "persistedCanonical": persisted_canonical,
-            "persistedReadable": persisted_record is not None,
-        })
-        return {
-            "status": "canonical_receipt_required",
-            "error": (
-                "This plan was accepted canonically in this process, but the"
-                " persisted validator record is missing or disagrees."
-                " Spawning is blocked - re-accept the plan through the"
-                " normal reviewer flow."
-            ),
-            "tool_was_executed": False,
-        }
-
-    if not persisted_canonical:
-        # Normal reviewer-approved plan (memory agrees): an old sidecar
-        # receipt is stale diagnostic.
-        receipt_path = (
-            Path(agent.logger.task_dir) / "canonical_direct.receipt.json"
-        )
-        if receipt_path.exists():
-            agent.logger.write("canonical_direct.spawn_guard_stale", {
-                "sidecarPresent": True,
-            })
-        return None
-
-    record = persisted_record
-    contract = getattr(agent, "canonical_direct_contract", None)
-    original_task_text = str(
-        getattr(agent, "original_user_task", "") or ""
-    )
-    # Fail-closed binding re-establishment: the persisted hashes must match
-    # the CURRENT configured contract and THIS run's user task, and the
-    # accepted plan must still classify eligible against that contract.
-    binding_ok = (
-        isinstance(contract, dict)
-        and "_normalized_plan" in contract
-        and isinstance(getattr(agent, "task_plan", None), dict)
-        and record.get("contractHash")
-        and record.get("originalTaskHash")
-        and record.get("contractHash") == contract_identity_hash(contract)
-        and record.get("originalTaskHash")
-        == task_identity_hash(original_task_text)
-        and classify_canonical_direct_eligibility(
-            agent.task_plan,
-            contract=contract,
-            original_user_task=original_task_text,
-        )["eligibility"]
-        == CANONICAL_DIRECT_ELIGIBLE
-    )
-    if not binding_ok:
-        agent.logger.write("canonical_direct.receipt_invalid", {
-            "recordContractHash": str(record.get("contractHash") or "")[:16],
-            "recordTaskHash": str(record.get("originalTaskHash") or "")[:16],
-            "contractConfigured": isinstance(contract, dict),
-        })
-        return {
-            "status": "canonical_receipt_required",
-            "error": (
-                "This task runs an accepted canonical-direct plan, but its"
-                " persisted authorization cannot be re-established against"
-                " the current contract/task/plan (hash mismatch or contract"
-                " unavailable). Spawning is blocked - re-accept the plan"
-                " through the normal reviewer flow."
-            ),
-            "tool_was_executed": False,
-        }
-
-    overrides = sorted(
-        key for key in _SPAWN_EXECUTION_INPUT_KEYS
-        if tool_input.get(key) not in (None, "", {}, [])
-    )
-    if not overrides:
-        return None
-    agent.logger.write("canonical_direct.spawn_override_rejected", {
-        "fields": overrides,
-        "contractHash": record.get("contractHash"),
-    })
-    return {
-        "status": "canonical_plan_lock",
-        "error": (
-            "This task runs an accepted canonical direct plan; the"
-            f" spawn-time field(s) {', '.join(overrides)} would change"
-            " execution or routing the trusted contract fixed. Spawn with"
-            " phase_id only - every other field comes from the accepted"
-            " plan verbatim."
-        ),
-        "tool_was_executed": False,
-    }
-
-
 @LEAD_TOOLS.register(
     name="spawn_browser_agent",
     description=(
@@ -1499,10 +1332,6 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
             "next_instruction": "Emit a valid task_plan with phases, expected_artifact, and validators.",
         }
     exhausted = mark_phase_exhausted_if_needed(agent.task_plan, agent.logger)
-    _canonical_spawn_shadow(agent, tool_input)
-    canonical_guard = _canonical_direct_spawn_guard(agent, tool_input)
-    if canonical_guard is not None:
-        return canonical_guard
     phase_id = tool_input.get("phase_id")
     # The override contract must reach the pre-check: a spawn that genuinely
     # changes the objective via worker_contract would otherwise be rejected
@@ -1590,6 +1419,35 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
         phase,
         raw_contract if isinstance(raw_contract, dict) else None,
     )
+    # Initial ordinary downstream phases do not need the Lead to copy row
+    # identities into a worker_contract. Derive only from an explicitly
+    # declared input artifact, then verify that producer at runtime; never
+    # guess a source from phase order or same-shaped artifacts. Explicit
+    # batch/cohort/checkpoint contracts remain authoritative.
+    if not isinstance(raw_contract, dict) or not any(
+        key in raw_contract for key in ("batch_source", "cohort_source", "batch_rows")
+    ):
+        binding_decision = assess_batch_source_binding(
+            agent.logger,
+            phase=phase,
+            plan=agent.task_plan,
+            worker_contract=worker_contract,
+        )
+        derived_batch_source = binding_decision.get("batch_source")
+        if isinstance(derived_batch_source, dict):
+            worker_contract["batch_source"] = derived_batch_source
+            agent.logger.write(
+                "batch_source.derived",
+                {
+                    "phaseId": str(phase.get("id") or ""),
+                    "artifactName": derived_batch_source.get("artifact_name"),
+                    "identityField": derived_batch_source.get("identity_field"),
+                    "selector": derived_batch_source.get("selector"),
+                    "dependencyPhaseId": binding_decision.get("dependencyPhaseId"),
+                    "upstreamRowCount": binding_decision.get("upstreamRowCount"),
+                    "reason": "declared_input_artifact_exact_row_count",
+                },
+            )
     state = load_task_state(agent.logger)
     phase_state = (
         (state.get("phases") or {}).get(str(phase.get("id") or ""))
@@ -1636,6 +1494,11 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
     )
     if batch_rejection is not None:
         return batch_rejection
+    derived_source = worker_contract.get("batch_source")
+    if isinstance(derived_source, dict):
+        # The resolved local path is a harness pin used during materialization,
+        # not BrowserAgent input. The receipt below retains the audited path.
+        derived_source.pop("_artifact_path", None)
     strategies = (
         agent.strategies_for_phase(phase)
         if hasattr(agent, "strategies_for_phase")

@@ -45,6 +45,9 @@
     "worker_max_steps": 50,
     "workflow_execution_enabled": false,
     "max_task_fleets": 3,
+    "similar_task_fleet_reuse_enabled": true,
+    "similar_task_reuse_threshold": 0.78,
+    "similar_task_running_stale_seconds": 86400,
     "semantic_tree": "internal"
   }
 }
