@@ -157,6 +157,7 @@ from harness.utils import (
     build_static_context_block,
     exception_payload,
     make_browser_event_logger,
+    optional_int,
     strip_llm_hidden_fields,
     trim_large_strings,
     write_context_snapshot,
@@ -268,6 +269,7 @@ _STATE_BOUNDARY_HARNESS_TOOLS = {
     "collect_items",
     "execute_selected_skill",
     "execute_browser_workflow",
+    "request_step_extension",
 }
 
 
@@ -932,6 +934,11 @@ class BrowserAgent:
         self.recent_tool_signatures: List[str] = []
         self._cache_pressure = CachePressureState()
         self._forced_compaction_reason: Optional[str] = None
+        self.base_max_steps = max(0, int(self.runtime.harness.max_steps or 0))
+        self.effective_max_steps = self.base_max_steps
+        self._step_extension_granted_steps = 0
+        self._recent_tool_outcomes: List[JsonDict] = []
+        self._current_step = 0
         self.static_context_block, self.static_context_hash = build_static_context_block(
             self.runtime.harness.context_file
         )
@@ -968,6 +975,11 @@ class BrowserAgent:
         system_prompt = ""
         tools: List[JsonDict] = []
         messages: List[JsonDict] = []
+        self.base_max_steps = max(0, int(self.runtime.harness.max_steps or 0))
+        self.effective_max_steps = self.base_max_steps
+        self._step_extension_granted_steps = 0
+        self._recent_tool_outcomes = []
+        self._current_step = 0
 
         try:
             bootstrap = await self._bootstrap_browser(task)
@@ -976,6 +988,9 @@ class BrowserAgent:
                 self._visible_capability_methods(),
                 task_type=self._contract_task_type(),
                 workflow_enabled=workflow_execution_enabled(self),
+                step_extension_enabled=bool(
+                    self.runtime.harness.browser_agent_step_extension_enabled
+                ),
             )
             dispatch_tool = build_browser_tool_dispatcher(self)
             self.render_recovery_runner = build_render_recovery_runner(
@@ -1003,11 +1018,9 @@ class BrowserAgent:
 
             truncation_streak = 0
             streak_kinds: List[str] = []
-            for step in (
-                range(1, self.runtime.harness.max_steps + 1)
-                if not should_finish
-                else ()
-            ):
+            while not should_finish and step < self.effective_max_steps:
+                step += 1
+                self._current_step = step
                 force_reason = self._forced_compaction_reason
                 self._forced_compaction_reason = None
                 messages = compact_and_track_prefix_rebuild(
@@ -1159,7 +1172,7 @@ class BrowserAgent:
                     self._observe_cache_pressure(
                         usage_payload,
                         step=step,
-                        max_steps=self.runtime.harness.max_steps,
+                        max_steps=self.effective_max_steps,
                     )
                 # Mask sensitive tool-call inputs (e.g. fill_field_verified text
                 # with mask=true) at the earliest log/trace boundary. The real
@@ -1527,7 +1540,7 @@ class BrowserAgent:
                         })
                     reminder = self._step_cap_reminder_block(
                         current_step=step,
-                        max_steps=self.runtime.harness.max_steps,
+                        max_steps=self.effective_max_steps,
                     )
                     if reminder is not None:
                         tool_results.append(reminder)
@@ -1536,6 +1549,20 @@ class BrowserAgent:
                     break
 
             reached_step_cap = not should_finish
+            if self._step_extension_granted_steps:
+                extension_event = (
+                    "agent.step_extension.exhausted"
+                    if reached_step_cap
+                    else "agent.step_extension.completed"
+                )
+                self._write_agent_event(extension_event, {
+                    "step": step,
+                    "baseMaxSteps": self.base_max_steps,
+                    "effectiveMaxSteps": self.effective_max_steps,
+                    "grantedSteps": self._step_extension_granted_steps,
+                    "modelReportedStatus": model_reported_status,
+                    "phaseCompleted": model_reported_status == WORKER_STATUS_DONE,
+                })
             final_status, override_reason = classify_terminal_status(
                 diagnostics=self.diagnostics,
                 model_reported_status=model_reported_status,
@@ -2185,6 +2212,22 @@ L6. Termination
             "These are arithmetic budget facts only. Choose the next action"
             " from the original goal and current evidence."
         )
+        harness_config = getattr(getattr(self, "runtime", None), "harness", None)
+        if bool(getattr(
+            harness_config, "browser_agent_step_extension_enabled", False,
+        )):
+            if not self._step_extension_granted_steps:
+                reminder += (
+                    " If you can finish this phase within the configured"
+                    " bounded extension, call request_step_extension with a"
+                    " concrete remaining-action checklist and estimate."
+                    " Otherwise finalize or allow the fixed cap to hand off."
+                )
+            else:
+                reminder += (
+                    " The one permitted extension has already been granted;"
+                    " no further extension is available."
+                )
         self._write_agent_event(
             "agent.step_cap.reminder",
             {
@@ -2223,6 +2266,13 @@ L6. Termination
         """Feed browser_call results into diagnostics for status classification."""
         if not isinstance(result, dict):
             return
+        self._recent_tool_outcomes.append({
+            "step": int(getattr(self, "_current_step", 0) or 0),
+            "tool": str(tool_call.get("name") or ""),
+            "failed": bool(_invoke_result_failed(result)),
+        })
+        if len(self._recent_tool_outcomes) > 20:
+            self._recent_tool_outcomes = self._recent_tool_outcomes[-20:]
         name = tool_call.get("name")
         method = result.get("method") or ""
         # Direct-capability tools (when ABCP method is wired as a top-level tool)
@@ -2232,6 +2282,111 @@ L6. Termination
                 return
             params = result.get("params") or {}
             self.diagnostics.observe_browser_call(str(method), params, result)
+
+    def request_step_extension(
+        self, tool_input: JsonDict, *, step: int,
+    ) -> JsonDict:
+        """Evaluate one model-authored request under harness-owned hard guards."""
+        estimated_steps = optional_int(tool_input.get("estimated_steps"), 0) or 0
+        remaining_actions = [
+            str(item).strip()
+            for item in (tool_input.get("remaining_actions") or [])
+            if str(item).strip()
+        ]
+        configured_max = int(
+            self.runtime.harness.browser_agent_max_extension_steps or 0
+        )
+        requested_payload = {
+            "step": step,
+            "estimatedSteps": estimated_steps,
+            "remainingActionCount": len(remaining_actions),
+            "baseMaxSteps": self.base_max_steps,
+            "currentMaxSteps": self.effective_max_steps,
+            "configuredMaxExtensionSteps": configured_max,
+        }
+        self._write_agent_event(
+            "agent.step_extension.requested", requested_payload,
+        )
+
+        denial_reasons: List[str] = []
+        if not bool(self.runtime.harness.browser_agent_step_extension_enabled):
+            denial_reasons.append("feature_disabled")
+        if self._step_extension_granted_steps:
+            denial_reasons.append("extension_already_granted")
+        # The request is useful only at the handoff boundary. An early grant
+        # turns the hard cap into an invisible larger default and defeats the
+        # A/B comparison this feature exists to measure.
+        if step < max(1, self.base_max_steps - 2):
+            denial_reasons.append("request_too_early")
+        if estimated_steps < 1:
+            denial_reasons.append("invalid_estimate")
+        elif estimated_steps > configured_max:
+            denial_reasons.append("estimate_exceeds_configured_limit")
+        if not remaining_actions:
+            denial_reasons.append("remaining_actions_required")
+
+        recent_window_start = max(1, step - 4)
+        if any(
+            isinstance(item, dict)
+            and item.get("type") == "loop_nudge"
+            and int(item.get("step") or 0) >= recent_window_start
+            for item in self.trace
+        ):
+            denial_reasons.append("recent_loop_nudge")
+        recent_outcomes = [
+            item for item in self._recent_tool_outcomes
+            if int(item.get("step") or 0) >= recent_window_start
+            and item.get("tool") != "request_step_extension"
+        ]
+        if (
+            len(recent_outcomes) >= 2
+            and all(bool(item.get("failed")) for item in recent_outcomes[-2:])
+        ):
+            denial_reasons.append("consecutive_tool_failures")
+        if self.diagnostics.last_pause_pageId:
+            denial_reasons.append("hitl_unresolved")
+        if self.diagnostics.routing_failure_status:
+            denial_reasons.append("routing_failure")
+
+        if denial_reasons:
+            result = {
+                "status": "denied",
+                "reasons": denial_reasons,
+                "step": step,
+                "baseMaxSteps": self.base_max_steps,
+                "effectiveMaxSteps": self.effective_max_steps,
+                "next_instruction": (
+                    "Do not request another extension unless the only reason"
+                    " was request_too_early. Finish within the current budget"
+                    " or provide the best truthful terminal status/blocker."
+                ),
+            }
+            self._write_agent_event(
+                "agent.step_extension.denied",
+                {**requested_payload, "reasons": denial_reasons},
+            )
+            return result
+
+        self._step_extension_granted_steps = estimated_steps
+        self.effective_max_steps = self.base_max_steps + estimated_steps
+        result = {
+            "status": "granted",
+            "grantedSteps": estimated_steps,
+            "step": step,
+            "baseMaxSteps": self.base_max_steps,
+            "effectiveMaxSteps": self.effective_max_steps,
+            "hardLimit": self.base_max_steps + configured_max,
+            "remainingActionCount": len(remaining_actions),
+            "next_instruction": (
+                "Execute only the bounded remaining checklist, then call"
+                " final_answer. No further extension is available."
+            ),
+        }
+        self._write_agent_event(
+            "agent.step_extension.granted",
+            {**requested_payload, **result},
+        )
+        return result
 
     def _has_extraction_artifact(self) -> bool:
         """True iff this worker wrote at least one extraction artifact via
