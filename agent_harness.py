@@ -169,6 +169,7 @@ from llm import (
     LLMEmptyResponseError,
     LLMFactory,
     LLMProviderProtocolError,
+    LLMRateLimitError,
     LLMRequestTimeoutError,
     input_moderation_rejection,
     retry_usage_from_attempts,
@@ -195,6 +196,32 @@ TRUNCATION_STREAK_LIMIT = 3
 # re-sending the same prompt earns the same refusal.
 INFRA_STREAK_INCIDENTS = frozenset({"connection", "timeout", "protocol"})
 INFRA_STREAK_LIMIT = 5
+
+
+def llm_rate_limit_terminal_result(exc: LLMRateLimitError) -> JsonDict:
+    """Stable host/UI payload for provider throttling that ended this run."""
+    incident = exc.to_payload()
+    blocker_type = (
+        "llm_quota_exhausted"
+        if exc.kind == "quota_exhausted"
+        else "llm_rate_limited"
+    )
+    if exc.kind == "quota_exhausted":
+        detail = "The configured LLM allocation quota is exhausted."
+    else:
+        detail = "The configured LLM provider is temporarily rate limited."
+    if exc.reset_at:
+        detail += f" Provider reset time: {exc.reset_at}."
+    elif exc.retry_after_seconds is not None:
+        detail += f" Retry after {exc.retry_after_seconds:g} seconds."
+    return {
+        "status": WORKER_STATUS_INCOMPLETE,
+        "blockers": [{
+            "type": blocker_type,
+            "detail": detail,
+        }],
+        "providerIncident": incident,
+    }
 
 
 @dataclass
@@ -1598,6 +1625,26 @@ class BrowserAgent:
                 exception_payload(exc, last_step=step, artifacts=self.artifacts),
             )
             raise
+        except LLMRateLimitError as exc:
+            incident = exc.to_payload()
+            self._write_agent_event("agent.model_rate_limited", {
+                "step": step,
+                **incident,
+            })
+            final_answer = json.dumps(
+                llm_rate_limit_terminal_result(exc),
+                ensure_ascii=False,
+            )
+            self.final_status = WORKER_STATUS_INCOMPLETE
+            self._write_agent_final(
+                final_status=WORKER_STATUS_INCOMPLETE,
+                final_answer=final_answer,
+                model_reported_status=None,
+                override_reason=f"llm_{exc.kind}",
+                reached_step_cap=False,
+            )
+            completed = True
+            return final_answer
         except Exception as exc:
             self.diagnostics.record_exception(exc)
             self._write_agent_event(
@@ -2916,6 +2963,11 @@ class LeadAgent:
             dict(resume.initial_plan) if resume is not None else None
         )
         self.original_user_task: str = ""
+        # Stable terminal metadata for in-process hosts such as the ABCP user
+        # panel. The public run() return type remains str for compatibility.
+        self.final_status: str = ""
+        self.final_trigger: str = ""
+        self.terminal_error: Optional[JsonDict] = None
         self._resume_instruction_pending = bool(
             resume is not None and str(resume.instruction or "").strip()
         )
@@ -4096,6 +4148,9 @@ class LeadAgent:
         final_completion_receipt: JsonDict = {}
         should_finish = False
         completed = False
+        self.final_status = ""
+        self.final_trigger = ""
+        self.terminal_error = None
         # Record the effective offload ceilings once per run for telemetry.
         self.logger.write(
             "harness.config",
@@ -4733,6 +4788,25 @@ class LeadAgent:
                 exception_payload(exc, last_step=step),
             )
             raise
+        except LLMRateLimitError as exc:
+            incident = exc.to_payload()
+            self.terminal_error = incident
+            final_trigger = f"llm_{exc.kind}"
+            final_answer = json.dumps(
+                llm_rate_limit_terminal_result(exc),
+                ensure_ascii=False,
+            )
+            self.logger.write(
+                "lead.model_rate_limited",
+                {
+                    "step": step,
+                    **incident,
+                },
+            )
+            # This is a handled terminal outcome, not an interrupted coroutine.
+            # The normal finally block still persists the completion receipt and
+            # context snapshot before lead.final is emitted below.
+            completed = True
         except Exception as exc:
             self.logger.write(
                 "lead.error",
@@ -4840,6 +4914,12 @@ class LeadAgent:
                 "max_steps": self.runtime.harness.lead_max_steps,
                 "completionReceipt": final_completion_receipt or None,
             },
+        )
+        self.final_trigger = final_trigger or "unknown"
+        self.final_status = (
+            WORKER_STATUS_INCOMPLETE
+            if self.terminal_error is not None
+            else "completed"
         )
         return final_answer
 

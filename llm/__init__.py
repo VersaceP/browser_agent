@@ -7,10 +7,12 @@ from llm.base import (
     BaseLLMProvider,
     LLMConnectionError,
     LLMProviderProtocolError,
+    LLMRateLimitError,
     LLMEmptyResponseError,
     LLMRequestTimeoutError,
     LLMStreamDecodeError,
     retry_usage_from_attempts,
+    rate_limit_error_details,
 )
 from llm.content_moderation import input_moderation_rejection
 from llm.factory import LLMFactory
@@ -22,6 +24,7 @@ __all__ = [
     "BaseLLMProvider",
     "LLMConnectionError",
     "LLMProviderProtocolError",
+    "LLMRateLimitError",
     "LLMEmptyResponseError",
     "LLMFactory",
     "LLMRequestTimeoutError",
@@ -29,4 +32,5 @@ __all__ = [
     "OpenAIProvider",
     "input_moderation_rejection",
     "retry_usage_from_attempts",
+    "rate_limit_error_details",
 ]

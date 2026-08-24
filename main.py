@@ -23,6 +23,7 @@ from agent_harness import (
     ResumeContext,
     exception_payload,
     lead_agent_model_config,
+    llm_rate_limit_terminal_result,
 )
 from harness.storage import create_storage_from_config
 from harness.storage.factory import resolve_sqlite_path
@@ -48,12 +49,13 @@ from harness.task_control import (
     prepare_resume_state,
     write_task_state,
 )
-from llm import LLMFactory
+from llm import LLMFactory, LLMRateLimitError
 from runtime_config import RuntimeConfig, load_runtime_config
 
 
 _LAST_LOGGER: Optional[RunLogger] = None
 _CANCELLED_LOGGED = False
+LLM_TEMPORARY_FAILURE_EXIT_CODE = 75
 
 
 def _validated_pinned_browser_context(
@@ -1605,6 +1607,8 @@ async def run_cli(args: argparse.Namespace) -> int:
     task_for_agent = task
     run_started = False
     run_status = "interrupted"
+    answer = ""
+    exit_code = 0
     try:
         if resume_requested:
             try:
@@ -1834,7 +1838,13 @@ async def run_cli(args: argparse.Namespace) -> int:
             resume=resume_context,
         )
         answer = await harness.run(task_for_agent)
-        run_status = "completed"
+        terminal_error = getattr(harness, "terminal_error", None)
+        if isinstance(terminal_error, dict):
+            run_status = "failed"
+            exit_code = LLM_TEMPORARY_FAILURE_EXIT_CODE
+            logger.write("run.rate_limited", terminal_error)
+        else:
+            run_status = "completed"
     except asyncio.CancelledError as exc:
         run_status = "cancelled"
         _CANCELLED_LOGGED = True
@@ -1844,6 +1854,19 @@ async def run_cli(args: argparse.Namespace) -> int:
                 exception_payload(exc, mode="lead", task=task_for_agent),
             )
         raise
+    except LLMRateLimitError as exc:
+        # Narrow final safety boundary: all normal Lead/Worker model calls turn
+        # this into a controlled incomplete result themselves. Keep the CLI
+        # safe if a future model call is added outside those agent boundaries.
+        run_status = "failed"
+        exit_code = LLM_TEMPORARY_FAILURE_EXIT_CODE
+        incident = exc.to_payload()
+        answer = json.dumps(
+            llm_rate_limit_terminal_result(exc),
+            ensure_ascii=False,
+        )
+        if logger is not None:
+            logger.write("run.rate_limited", incident)
     except Exception as exc:
         run_status = "failed"
         if logger is not None:
@@ -1864,7 +1887,7 @@ async def run_cli(args: argparse.Namespace) -> int:
     print(f"\n任务ID: {logger.task_id}")
     print(f"\n任务目录: {logger.task_dir}")
     print(f"\n运行日志: {logger.path}")
-    return 0
+    return exit_code
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

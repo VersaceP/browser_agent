@@ -4,6 +4,7 @@ llm.base - Shared LLM provider interface.
 
 import asyncio
 import importlib
+import re
 import time
 from abc import ABC, abstractmethod
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
@@ -42,6 +43,130 @@ def _connection_error_types() -> Tuple[type, ...]:
 
 
 _CONNECTION_ERROR_TYPES = _connection_error_types()
+
+
+def _error_response_body(exc: BaseException) -> Any:
+    body = getattr(exc, "body", None)
+    if body is not None:
+        return body
+    response = getattr(exc, "response", None)
+    json_method = getattr(response, "json", None)
+    if callable(json_method):
+        try:
+            return json_method()
+        except Exception:
+            pass
+    return None
+
+
+def _nested_error_value(value: Any, *names: str) -> str:
+    """Read a provider error field without depending on one SDK/body shape."""
+    if not isinstance(value, dict):
+        return ""
+    lowered = {str(key).lower(): item for key, item in value.items()}
+    for name in names:
+        item = lowered.get(name.lower())
+        if item is not None and not isinstance(item, (dict, list)):
+            rendered = str(item).strip()
+            if rendered:
+                return rendered
+    nested = lowered.get("error")
+    if isinstance(nested, dict):
+        return _nested_error_value(nested, *names)
+    return ""
+
+
+def _response_header(exc: BaseException, name: str) -> str:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return ""
+    try:
+        value = headers.get(name)
+    except Exception:
+        return ""
+    return str(value or "").strip()
+
+
+def rate_limit_error_details(exc: BaseException) -> Optional[Dict[str, Any]]:
+    """Return normalized metadata for an HTTP 429 provider failure.
+
+    SDK exception classes are intentionally not used here. ABCP deployments can
+    put OpenAI- or Anthropic-compatible gateways in front of several providers,
+    but all of them retain the HTTP status and some combination of body/headers.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        return None
+    if status != 429:
+        return None
+
+    body = _error_response_body(exc)
+    provider_code = _nested_error_value(body, "code", "type")
+    provider_message = _nested_error_value(body, "message", "detail")
+    if not provider_message:
+        provider_message = str(exc or "").strip() or "provider rate limit"
+    request_id = (
+        _nested_error_value(body, "request_id", "requestId")
+        or _response_header(exc, "request-id")
+        or _response_header(exc, "x-request-id")
+    )
+
+    marker_text = f"{provider_code} {provider_message}".lower()
+    quota_markers = (
+        "allocationquota",
+        "allocation_quota",
+        "insufficient_quota",
+        "quota has been exhausted",
+        "quota is exhausted",
+        "quota exhausted",
+        "billing hard limit",
+    )
+    kind = (
+        "quota_exhausted"
+        if any(marker in marker_text for marker in quota_markers)
+        else "rate_limited"
+    )
+
+    retry_after_raw = _response_header(exc, "retry-after")
+    retry_after_seconds: Optional[float] = None
+    try:
+        if retry_after_raw:
+            retry_after_seconds = max(0.0, float(retry_after_raw))
+    except (TypeError, ValueError):
+        retry_after_seconds = None
+
+    reset_at = (
+        _response_header(exc, "x-ratelimit-reset")
+        or _response_header(exc, "x-rate-limit-reset")
+    )
+    if not reset_at:
+        match = re.search(
+            r"\breset(?:s)?\s+at\s+"
+            r"([0-9T:/+\- ]{5,32}(?:UTC|GMT|Z)?)",
+            provider_message,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            reset_at = match.group(1).strip(" .,;:'\"")
+
+    return {
+        "kind": kind,
+        "statusCode": 429,
+        "providerCode": provider_code,
+        "providerMessage": provider_message,
+        "requestId": request_id,
+        # No automatic retry inside the current agent loop. A host may offer a
+        # later retry when the provider supplied a reset/delay signal.
+        "automaticRetry": False,
+        "retryable": kind != "quota_exhausted" or bool(reset_at),
+        "retryAfterSeconds": retry_after_seconds,
+        "resetAt": reset_at,
+    }
 
 
 def connection_failure_reason(exc: BaseException) -> Optional[str]:
@@ -186,6 +311,59 @@ class LLMConnectionError(Exception):
             f"{provider}.{operation} lost the connection ({reason}) after "
             f"{len(attempts)} attempt(s), max_retries={max_retries}"
         )
+
+
+class LLMRateLimitError(Exception):
+    """Normalized provider throttling/quota failure.
+
+    The current agent run must not blindly retry this exception. Provider SDKs
+    already apply their own bounded 429 policy, and an allocation quota can be
+    unavailable for days. Callers receive structured timing metadata so a host
+    can offer an explicit retry/resume action without treating the incident as
+    an internal harness crash.
+    """
+
+    def __init__(
+        self,
+        *,
+        provider: str,
+        model: str,
+        operation: str,
+        details: Dict[str, Any],
+    ):
+        self.provider = provider
+        self.model = model
+        self.operation = operation
+        self.kind = str(details.get("kind") or "rate_limited")
+        self.status_code = int(details.get("statusCode") or 429)
+        self.provider_code = str(details.get("providerCode") or "")
+        self.provider_message = str(details.get("providerMessage") or "")
+        self.request_id = str(details.get("requestId") or "")
+        self.automatic_retry = bool(details.get("automaticRetry", False))
+        self.retryable = bool(details.get("retryable", True))
+        self.retry_after_seconds = details.get("retryAfterSeconds")
+        self.reset_at = str(details.get("resetAt") or "")
+        super().__init__(
+            f"{provider}.{operation} {self.kind} for model {model}"
+            + (f" ({self.provider_code})" if self.provider_code else "")
+            + (f"; reset_at={self.reset_at}" if self.reset_at else "")
+        )
+
+    def to_payload(self) -> Dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "statusCode": self.status_code,
+            "provider": self.provider,
+            "model": self.model,
+            "operation": self.operation,
+            "providerCode": self.provider_code or None,
+            "message": self.provider_message,
+            "requestId": self.request_id or None,
+            "automaticRetry": self.automatic_retry,
+            "retryable": self.retryable,
+            "retryAfterSeconds": self.retry_after_seconds,
+            "resetAt": self.reset_at or None,
+        }
 
 
 class LLMStreamDecodeError(Exception):
@@ -417,6 +595,14 @@ class BaseLLMProvider(ABC):
                 except BaseException as fallback_exc:
                     if isinstance(fallback_exc, asyncio.CancelledError):
                         raise
+                    rate_limit = rate_limit_error_details(fallback_exc)
+                    if rate_limit is not None:
+                        raise LLMRateLimitError(
+                            provider=provider,
+                            model=self.config.model_id,
+                            operation=operation,
+                            details=rate_limit,
+                        ) from fallback_exc
                     attempts.append({
                         "attempt": fallback_attempt,
                         "reason": "nonstream_fallback_failed",
@@ -445,6 +631,14 @@ class BaseLLMProvider(ABC):
                 })
                 return fallback_response, attempts
             except Exception as exc:
+                rate_limit = rate_limit_error_details(exc)
+                if rate_limit is not None:
+                    raise LLMRateLimitError(
+                        provider=provider,
+                        model=self.config.model_id,
+                        operation=operation,
+                        details=rate_limit,
+                    ) from exc
                 reason = connection_failure_reason(exc)
                 if reason is None:
                     raise
