@@ -5,6 +5,7 @@ harness.diagnostics.error_classification - Structured browser/tool error hints.
 from typing import Any, Optional
 
 from harness.results.call_outcome import action_runtime_info
+from harness.results.call_outcome import public_action_failure
 from harness.constants import (
     API_CONTRACT_ERROR_MARKERS,
     PAGE_DEAD_OBSERVATION_MARKERS,
@@ -13,22 +14,40 @@ from harness.constants import (
 from harness.utils import JsonDict
 
 
+# Rebuilt select contract (2026-08 platform generation). Two rules govern
+# every entry: (1) codes whose semantics are "the popup/option window moved"
+# must NOT license an automatic Input.select replay - the platform's own
+# suggested prompts say to continue with ONE generic Input.click/type/scroll;
+# (2) only codes that mean "your request didn't match the current window"
+# allow exactly one reinspect-then-retry.
 SELECT_FAILURE_ACTIONS = {
-    "select-option-stale": "reinspect_then_retry_once_with_returned_fields",
-    "select-option-not-found": "reinspect_query_or_load_more_then_retry_once",
+    # One bounded retry: re-read the current window, then retry once with
+    # fields that window actually returned.
+    "select-option-not-in-current-window": "reinspect_current_window_then_retry_once_with_returned_fields",
+    "select-option-id-unavailable": "reinspect_current_window_then_retry_once_with_returned_fields",
+    "select-option-label-ambiguous": "read_popup_semantic_tree_then_retry_once_with_optionIds",
+    # No Input.select replay: continue with generic input actions.
+    "select-agent-takeover-required": "keep_popup_state_and_continue_with_one_generic_input_action",
+    "select-popup-not-ready": "observe_popup_with_ax_and_semantic_tree_then_one_bounded_generic_action",
+    "select-popup-not-found": "reobserve_page_then_use_generic_input_actions",
+    "select-popup-ambiguous": "reobserve_page_then_use_generic_input_actions",
+    "select-popup-relation-changed": "reobserve_control_and_popup_then_one_generic_input_action",
+    "select-option-id-proof-unavailable": "reobserve_control_state_before_any_further_input",
+    # Terminal / contract mismatches: stop and report.
     "select-option-disabled": "stop_and_report_requested_option_unavailable",
-    "select-popup-lost": "stop_repeating_and_report_platform_select_failure",
-    "select-navigation-stalled": "stop_repeating_and_report_platform_cascade_failure",
+    "select-target-not-select": "stop_select_and_use_generic_input_actions",
+    "select-selection-mode-unknown": "stop_and_report_platform_select_contract_failure",
+    "select-multiple-unsupported": "stop_and_report_unsupported_multi_select",
+    "select-control-kind-mismatch": "stop_and_reinspect_the_control_kind",
+    "select-state-restore-failed": "reinspect_before_continuing",
+    "select-final-state-unproven": "inspect_control_before_any_correction",
 }
 
 
 # --- Structured runtime classification -------------------------------------
 #
-# ABCP attaches `runtime: {code, phase, sideEffectStarted, actionKind}` to a
-# failed action. The prose matching further down predates that block and is
-# kept only as the fallback for envelopes that carry no runtime — a message is
-# a rendering, and classifying a rendering means re-deriving something the
-# platform already decided.
+# Current ABCP builds expose a stable public ``error.code``. Older builds may
+# still attach ``runtime``; prose matching remains the last compatibility path.
 #
 # The code enum is ~70 entries and grows with the platform, so it is NOT
 # transcribed here. Only codes that change what the harness DOES get an entry;
@@ -73,7 +92,10 @@ _RUNTIME_CODE_FAMILIES = (
     ("cross-frame-drag", "drag_unsupported", "stop_and_keep_both_endpoints_in_one_document"),
     ("cross-document-drag", "drag_unsupported", "stop_and_keep_both_endpoints_in_one_document"),
     ("drag-", "drag_unsupported", "stop_and_keep_both_endpoints_in_one_document"),
-    ("select-", "select_failure", "reinspect_select_then_retry_once_with_returned_fields"),
+    # Unknown select codes default to guidance, not an automatic Input.select
+    # replay: on this contract generation a failed select may already have
+    # moved the popup, and the platform's own prompts never say "just retry".
+    ("select-", "select_failure", "reinspect_select_then_follow_returned_guidance"),
     ("scroll-", "scroll_failed", "inspect_viewport_then_correct_the_scroll_request"),
     ("input-", "input_surface_unavailable", "inspect_page_state_before_retrying_input"),
     ("semantic-tree-", "contract_error", "switch_method_or_report_platform_contract_bug"),
@@ -85,6 +107,43 @@ _TIMEOUT_SUFFIX = "-timeout"
 # recommend a retry: the action may have taken effect and the receipt simply
 # never arrived.
 _SIDE_EFFECT_ACTION = "inspect_page_state_and_do_not_replay"
+
+
+# These are client-generated transport codes, not ABCP action-runtime codes.
+# Keep them separate from the platform's ``runtime.code`` taxonomy: a socket
+# that has already lost its reader cannot be recovered by another browser tool
+# call, while an RPC action failure can often be handled by the normal action
+# recovery policies above.
+_TRANSPORT_ERROR_TYPES = {
+    "ABCP_TRANSPORT_CONNECT_FAILED": (
+        "transport_connection_lost",
+        "reconnect_browser_transport_before_rescheduling",
+    ),
+    "ABCP_TRANSPORT_NOT_CONNECTED": (
+        "transport_connection_lost",
+        "reconnect_browser_transport_before_rescheduling",
+    ),
+    "ABCP_TRANSPORT_CLOSED": (
+        "transport_connection_lost",
+        "reconnect_browser_transport_before_rescheduling",
+    ),
+    "ABCP_TRANSPORT_READER_FAILED": (
+        "transport_connection_lost",
+        "reconnect_browser_transport_before_rescheduling",
+    ),
+    "ABCP_TRANSPORT_SEND_FAILED": (
+        "transport_connection_lost",
+        "reconnect_browser_transport_before_rescheduling",
+    ),
+    "ABCP_TRANSPORT_CALL_TIMEOUT": (
+        "transport_timeout",
+        "treat_action_outcome_as_unknown_and_do_not_replay_automatically",
+    ),
+    "ABCP_RPC_ERROR": (
+        "rpc_error",
+        "follow_method_specific_error_guidance",
+    ),
+}
 
 
 def classify_runtime_error(runtime: Any, *, method: str = "") -> Optional[JsonDict]:
@@ -135,6 +194,48 @@ def classify_runtime_error(runtime: Any, *, method: str = "") -> Optional[JsonDi
     return classification
 
 
+def classify_public_action_failure(
+    failure: Any,
+    *,
+    method: str = "",
+) -> Optional[JsonDict]:
+    """Classify the stable public failure envelope without private metadata."""
+    if not isinstance(failure, dict):
+        return None
+    code = str(failure.get("code") or "").strip()
+    if not code:
+        return None
+    mapped = _RUNTIME_CODE_TYPES.get(code)
+    if mapped is None and code in SELECT_FAILURE_ACTIONS:
+        mapped = ("select_failure", SELECT_FAILURE_ACTIONS[code])
+    if mapped is None:
+        for prefix, error_type, action in _RUNTIME_CODE_FAMILIES:
+            if code.startswith(prefix):
+                mapped = (error_type, action)
+                break
+    if mapped is None and code.endswith(_TIMEOUT_SUFFIX):
+        mapped = ("timeout", "retry_with_backoff_or_reduce_surface")
+    if mapped is None:
+        mapped = (
+            "action_failure",
+            "inspect_page_state_then_follow_platform_guidance",
+        )
+    error_type, suggested_action = mapped
+    classification: JsonDict = {
+        "type": error_type,
+        "errorCode": code,
+        "suggested_action": suggested_action,
+        "method": str(method or failure.get("method") or ""),
+        "source": "public_action_failure",
+        # With private sideEffectStarted removed, replay safety is unknown.
+        "replayForbidden": True,
+    }
+    platform_prompt = str(failure.get("suggested_prompt") or "").strip()
+    if platform_prompt:
+        classification["platformSuggestedPrompt"] = platform_prompt[:1000]
+    return classification
+
+
 def classify_browser_error(
     error_text: Any,
     *,
@@ -151,22 +252,59 @@ def classify_browser_error(
     lower = text.lower()
     method_name = str(method or "")
 
+    if (
+        method_name == "DOM.getAXTree"
+        and "nodecount=" in lower
+        and "no parseable axtree nodes" in lower
+    ):
+        return {
+            "type": "axtree_data_inconsistent",
+            "errorCode": "axtree_node_count_parse_mismatch",
+            "suggested_action": (
+                "report_platform_axtree_data_error_and_do_not_reuse_prior_ids"
+            ),
+            "method": method_name,
+        }
+
     if method_name == "DOM.inspectSelect":
-        if "select-control-not-visible" in lower:
-            return {
-                "type": "select_control_not_visible",
-                "errorCode": "select-control-not-visible",
-                "suggested_action": "refresh_ax_and_target_only_a_visible_select_control",
-                "method": method_name,
-            }
+        # Rebuilt inspect contract: the retired not-visible/unsupported codes
+        # are gone. The remaining inspect failures describe the popup binding
+        # or the control itself; all of them route to observation, never to an
+        # immediate repeat of the same inspect.
+        for error_code, suggested_action in (
+            ("select-popup-not-found", "reobserve_page_then_use_generic_input_actions"),
+            ("select-popup-ambiguous", "reobserve_page_then_use_generic_input_actions"),
+            ("select-popup-not-ready", "read_popup_semantic_tree_before_any_further_input"),
+            ("select-popup-relation-changed", "reobserve_control_and_popup_then_one_generic_input_action"),
+            ("select-target-not-select", "stop_select_and_use_generic_input_actions"),
+            ("select-selection-mode-unknown", "stop_and_report_platform_select_contract_failure"),
+            ("select-option-id-unavailable", "reinspect_current_window_then_retry_once_with_returned_fields"),
+            ("select-option-not-in-current-window", "reinspect_current_window_then_retry_once_with_returned_fields"),
+            ("select-state-restore-failed", "reinspect_before_continuing"),
+        ):
+            if error_code in lower:
+                return {
+                    "type": error_code.replace("-", "_"),
+                    "errorCode": error_code,
+                    "suggested_action": suggested_action,
+                    "method": method_name,
+                }
+        # Some platform builds collapse an inspect implementation failure to
+        # the bare JSON-RPC envelope, with no public select-* reason code.
+        # This is not an unknown application error: repeating the same inspect
+        # cannot add information and a successful generic input receipt alone
+        # does not prove that a popup ever opened.
         if (
-            "select control was not found" in lower
-            or "no supported accessibility semantics" in lower
+            "-32005" in lower
+            and "action dom.inspectselect failed" in lower
         ):
             return {
-                "type": "select_control_unsupported",
-                "errorCode": "select-control-unsupported",
-                "suggested_action": "use_fresh_ax_guided_interaction_for_non_select_ui",
+                "type": "inspect_select_platform_failure",
+                "errorCode": "inspect-select-platform-action-failed",
+                "suggested_action": (
+                    "reobserve_control_then_use_one_generic_input_action"
+                    "_with_visible_popup_proof"
+                ),
                 "method": method_name,
             }
 
@@ -179,6 +317,22 @@ def classify_browser_error(
                     "suggested_action": suggested_action,
                     "method": method_name,
                 }
+        # Family fallback mirrors the runtime classifier: an unrecognized
+        # select code still yields a structured classification carrying the
+        # code verbatim, and never recommends an automatic Input.select
+        # replay (a failed select may already have moved the popup).
+        import re as _re
+
+        match = _re.search(r"(select-[a-z]+(?:-[a-z]+)*)", lower)
+        if match:
+            return {
+                "type": "select_failure",
+                "errorCode": match.group(1),
+                "suggested_action": (
+                    "reinspect_select_then_follow_returned_guidance"
+                ),
+                "method": method_name,
+            }
 
     if (
         method_name == "Page.create"
@@ -250,14 +404,42 @@ def attach_error_classification(result: JsonDict, *, method: str = "") -> JsonDi
     """
     if isinstance(result.get("errorClassification"), dict):
         return result
+    transport_code = str(result.get("transportCode") or "").strip()
+    # A server-side JSON-RPC failure still travels through
+    # ABCPTransportError, but its action/runtime payload is more specific
+    # than this transport wrapper. Keep the wrapper code for audit only and
+    # continue into the established method-specific classifier below.
+    if transport_code and transport_code != "ABCP_RPC_ERROR":
+        error_type, suggested_action = _TRANSPORT_ERROR_TYPES.get(
+            transport_code,
+            ("transport_error", "report_transport_diagnostics_to_lead"),
+        )
+        classification: JsonDict = {
+            "type": error_type,
+            "errorCode": transport_code,
+            "suggested_action": suggested_action,
+            "method": str(method or result.get("method") or ""),
+            "source": "abcp_transport",
+        }
+        if result.get("exceptionType"):
+            classification["exceptionType"] = str(result["exceptionType"])
+        if result.get("connectionFatal") is True:
+            classification["connectionFatal"] = True
+        if isinstance(result.get("requestSent"), bool):
+            classification["requestSent"] = result["requestSent"]
+        result["errorClassification"] = classification
+        return result
     message = _extract_error_message(result)
+    public_failure = public_action_failure(result)
     runtime = action_runtime_info(result)
     if message and _contains(
         message.lower(), "err_page_paused", "paused for human intervention"
     ):
         result["errorClassification"] = classify_browser_error(message, method=method)
         return result
-    structured = classify_runtime_error(runtime, method=method)
+    structured = classify_public_action_failure(public_failure, method=method)
+    if structured is None:
+        structured = classify_runtime_error(runtime, method=method)
     if structured is not None:
         result["errorClassification"] = structured
         return result

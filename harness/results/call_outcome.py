@@ -39,10 +39,9 @@ FAILED = "failed"
 NOT_DISPATCHED = "not_dispatched"
 
 
-# ABCP attaches `ActionRuntimeErrorInfo` to a failed action: which stage the
-# failure happened in, and — decisively — whether the browser had already begun
-# dispatching input. Only these four bounded scalars are carried; the rest of
-# the provider payload stays out.
+# Older ABCP builds attached private ActionRuntimeErrorInfo fields. New builds
+# deliberately expose only the stable public failure envelope; keep this parser
+# solely as a compatibility path for cached/older browser generations.
 _ACTION_RUNTIME_FIELDS = ("code", "phase", "sideEffectStarted", "actionKind")
 
 
@@ -64,6 +63,43 @@ def action_runtime_info(value: Any) -> Optional[JsonDict]:
         if info.get("code") or info.get("phase"):
             return info
     return None
+
+
+def public_action_failure(value: Any) -> Optional[JsonDict]:
+    """Return ABCP's stable public ``error.code`` failure envelope.
+
+    A top-level harness ``error`` is often a string, so only an object-shaped
+    error carrying a non-empty code qualifies. Observation and suggested prompt
+    are copied as bounded public guidance; private runtime fields are ignored.
+    """
+    for candidate in _public_failure_candidates(value):
+        error = candidate.get("error") if isinstance(candidate, dict) else None
+        if not isinstance(error, dict):
+            continue
+        raw_code = error.get("code")
+        if not isinstance(raw_code, str) or not raw_code.strip():
+            continue
+        code = raw_code.strip()
+        failure: JsonDict = {"code": code}
+        message = str(error.get("message") or "").strip()
+        if message:
+            failure["message"] = message
+        for key in ("observation", "suggested_prompt", "details", "method"):
+            if candidate.get(key) not in (None, "", {}):
+                failure[key] = candidate[key]
+        return failure
+    return None
+
+
+def _public_failure_candidates(value: Any) -> Tuple[JsonDict, ...]:
+    if not isinstance(value, dict):
+        return ()
+    candidates = [value]
+    for key in ("rpcData", "response", "data"):
+        nested = value.get(key)
+        if isinstance(nested, dict):
+            candidates.extend(_public_failure_candidates(nested))
+    return tuple(candidates)
 
 
 def _runtime_candidates(value: Any) -> Tuple[Any, ...]:
@@ -89,7 +125,12 @@ def replay_forbidden(result: Any) -> bool:
     from an error string.
     """
     info = action_runtime_info(result)
-    return bool(info and info.get("sideEffectStarted") is True)
+    if info and info.get("sideEffectStarted") is True:
+        return True
+    # The public contract intentionally no longer exposes side-effect timing.
+    # A failed dispatched action therefore has an unknown outcome and must not
+    # be replayed automatically by a composite.
+    return public_action_failure(result) is not None
 
 
 @dataclass(frozen=True)
