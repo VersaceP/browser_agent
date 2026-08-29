@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
+from typing import Dict
+from typing import Optional
+from typing import Tuple
+
+from harness.schema_loader import schema_param_spec
 
 
 JsonDict = Dict[str, Any]
@@ -98,8 +103,7 @@ class RuntimeEvaluationService:
 
     def supports_world(self, requested: str) -> bool:
         schema = self.method_schemas.get("Runtime.evaluate")
-        params = schema.get("params") if isinstance(schema, dict) else None
-        world = params.get("world") if isinstance(params, dict) else None
+        world = schema_param_spec(schema, "world") if isinstance(schema, dict) else None
         supported = world.get("enum") if isinstance(world, dict) else None
         return isinstance(supported, list) and requested in supported
 

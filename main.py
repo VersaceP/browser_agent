@@ -26,6 +26,7 @@ from agent_harness import (
     llm_rate_limit_terminal_result,
 )
 from harness.storage import create_storage_from_config
+from harness.storage.base import StorageError
 from harness.storage.factory import resolve_sqlite_path
 from harness.utils import JsonDict, RunLogger
 from harness.version import HARNESS_VERSION
@@ -49,13 +50,209 @@ from harness.task_control import (
     prepare_resume_state,
     write_task_state,
 )
-from llm import LLMFactory, LLMRateLimitError
+from llm import (
+    LLMConnectionError,
+    LLMEmptyResponseError,
+    LLMFactory,
+    LLMProviderProtocolError,
+    LLMRateLimitError,
+    LLMRequestTimeoutError,
+)
+from llm.base import connection_failure_reason
 from runtime_config import RuntimeConfig, load_runtime_config
 
 
 _LAST_LOGGER: Optional[RunLogger] = None
 _CANCELLED_LOGGED = False
 LLM_TEMPORARY_FAILURE_EXIT_CODE = 75
+CLI_ERROR_EXIT_CODE = 1
+CLI_INPUT_ERROR_EXIT_CODE = 2
+CLI_IO_FAILURE_EXIT_CODE = 74
+CLI_CANCELLED_EXIT_CODE = 130
+
+
+def _safe_logger_write(
+    logger: Optional[RunLogger],
+    event_type: str,
+    payload: JsonDict,
+) -> bool:
+    """Best-effort event write that can never replace the primary failure."""
+    if logger is None:
+        return False
+    try:
+        logger.write(event_type, payload)
+        return True
+    except Exception:
+        return False
+
+
+def _exception_http_status(exc: BaseException) -> Optional[int]:
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _cli_failure_result(
+    *,
+    code: str,
+    message: str,
+    error_type: str,
+    retryable: bool,
+    status: str = "failed",
+    details: Optional[JsonDict] = None,
+) -> JsonDict:
+    """Stable failure envelope for CLI and in-process panel callers."""
+    rendered = str(message or error_type or code).strip()[:2000]
+    error: JsonDict = {
+        "code": code,
+        "type": error_type,
+        "message": rendered,
+        "retryable": retryable,
+    }
+    if details:
+        error["details"] = details
+    return {
+        "status": status,
+        "blockers": [{"type": code, "detail": rendered}],
+        "error": error,
+    }
+
+
+def _classify_cli_exception(
+    exc: BaseException,
+    *,
+    phase: str,
+) -> "tuple[JsonDict, int]":
+    """Map an exception to a non-throwing host result and process exit code."""
+    if isinstance(exc, LLMRateLimitError):
+        return llm_rate_limit_terminal_result(exc), LLM_TEMPORARY_FAILURE_EXIT_CODE
+
+    llm_kinds = (
+        (LLMRequestTimeoutError, "llm_timeout", "LLM request timed out."),
+        (LLMConnectionError, "llm_connection_error", "LLM connection failed."),
+        (
+            LLMProviderProtocolError,
+            "llm_provider_protocol_error",
+            "LLM provider returned an unusable protocol response.",
+        ),
+        (
+            LLMEmptyResponseError,
+            "llm_empty_response",
+            "LLM provider repeatedly returned an empty response.",
+        ),
+    )
+    for error_class, code, fallback_message in llm_kinds:
+        if isinstance(exc, error_class):
+            return _cli_failure_result(
+                code=code,
+                message=str(exc) or fallback_message,
+                error_type=type(exc).__name__,
+                retryable=True,
+                status="incomplete",
+            ), LLM_TEMPORARY_FAILURE_EXIT_CODE
+
+    raw_connection_reason = connection_failure_reason(exc)
+    if isinstance(exc, asyncio.TimeoutError) or raw_connection_reason:
+        code = (
+            "provider_timeout"
+            if isinstance(exc, asyncio.TimeoutError)
+            else "provider_connection_error"
+        )
+        return _cli_failure_result(
+            code=code,
+            message=str(exc) or code,
+            error_type=type(exc).__name__,
+            retryable=True,
+            status="incomplete",
+            details=(
+                {"reason": raw_connection_reason}
+                if raw_connection_reason
+                else None
+            ),
+        ), LLM_TEMPORARY_FAILURE_EXIT_CODE
+
+    http_status = _exception_http_status(exc)
+    if http_status is not None:
+        if http_status in {408, 409, 425, 429} or http_status >= 500:
+            return _cli_failure_result(
+                code="provider_temporary_error",
+                message=str(exc),
+                error_type=type(exc).__name__,
+                retryable=True,
+                status="incomplete",
+                details={"statusCode": http_status},
+            ), LLM_TEMPORARY_FAILURE_EXIT_CODE
+        if http_status in {401, 403}:
+            return _cli_failure_result(
+                code="provider_auth_error",
+                message=str(exc),
+                error_type=type(exc).__name__,
+                retryable=False,
+                details={"statusCode": http_status},
+            ), CLI_INPUT_ERROR_EXIT_CODE
+        return _cli_failure_result(
+            code="provider_request_error",
+            message=str(exc),
+            error_type=type(exc).__name__,
+            retryable=False,
+            details={"statusCode": http_status},
+        ), CLI_ERROR_EXIT_CODE
+
+    if phase == "startup":
+        return _cli_failure_result(
+            code="startup_error",
+            message=str(exc),
+            error_type=type(exc).__name__,
+            retryable=False,
+        ), CLI_INPUT_ERROR_EXIT_CODE
+    if isinstance(exc, (StorageError, OSError)):
+        return _cli_failure_result(
+            code="io_or_storage_error",
+            message=str(exc),
+            error_type=type(exc).__name__,
+            retryable=True,
+        ), CLI_IO_FAILURE_EXIT_CODE
+    return _cli_failure_result(
+        code="internal_error",
+        message=str(exc),
+        error_type=type(exc).__name__,
+        retryable=False,
+    ), CLI_ERROR_EXIT_CODE
+
+
+def _cancelled_cli_result(reason: str) -> JsonDict:
+    return _cli_failure_result(
+        code="cancelled",
+        message=reason or "Task execution was cancelled.",
+        error_type="CancelledError",
+        retryable=True,
+        status="cancelled",
+    )
+
+
+def _print_json_result(payload: JsonDict, *, stream: Any = None) -> bool:
+    try:
+        print(
+            json.dumps(payload, ensure_ascii=False, default=str),
+            file=stream or sys.stdout,
+            flush=True,
+        )
+        return True
+    except (BrokenPipeError, OSError, UnicodeError):
+        return False
+
+
+def _print_text(value: Any, *, stream: Any = None) -> bool:
+    """Best-effort text output for hosts that may close stdout early."""
+    try:
+        print(value, file=stream or sys.stdout, flush=True)
+        return True
+    except (BrokenPipeError, OSError, UnicodeError):
+        return False
 
 
 def _validated_pinned_browser_context(
@@ -1401,25 +1598,39 @@ def _open_task_storage(logger, runtime) -> None:
         on_verify=_report_verification,
     )
     logger.attach_storage(storage)
-    storage.create_task(task_id=logger.task_id, harness_version=HARNESS_VERSION)
-    storage.start_run(
-        task_id=logger.task_id,
-        harness_version=HARNESS_VERSION,
-        run_id=logger.run_id,
-    )
+    try:
+        storage.create_task(
+            task_id=logger.task_id,
+            harness_version=HARNESS_VERSION,
+        )
+        storage.start_run(
+            task_id=logger.task_id,
+            harness_version=HARNESS_VERSION,
+            run_id=logger.run_id,
+        )
+    except Exception:
+        # start_run can fail after the backend has opened file/db handles.
+        # Release them here because run_cli has no successfully-started run to
+        # finish in its normal cleanup path yet.
+        try:
+            storage.close()
+        except Exception:
+            pass
+        raise
 
 
-def _close_task_storage(logger, *, status: str) -> None:
+def _close_task_storage(logger, *, status: str) -> List[str]:
     """Close the run row and, in dual mode, report whether the backends agree.
 
-    Verification runs before the handles are released, and its findings go to
-    the event log rather than being raised: a storage bookkeeping problem must
-    not change the exit status of a task that otherwise finished.
+    Verification runs before the handles are released. Failures are returned
+    to the process boundary so a host never mistakes incomplete persistence
+    for a successful task, while the original task result remains available.
     """
 
     if not getattr(logger, "storage_attached", False):
-        return
+        return []
     storage = logger.storage
+    errors: List[str] = []
     try:
         storage.finish_run(
             task_id=logger.task_id, run_id=logger.run_id, status=status
@@ -1427,16 +1638,16 @@ def _close_task_storage(logger, *, status: str) -> None:
         verify = getattr(storage, "verify", None)
         if callable(verify):
             verify(task_id=logger.task_id, run_id=logger.run_id)
-    except Exception as exc:  # noqa: BLE001 - never fail a run over bookkeeping
-        try:
-            logger.write("storage.close_failed", {"error": str(exc)})
-        except Exception:
-            pass
+    except Exception as exc:  # noqa: BLE001 - report after preserving result
+        detail = f"finish/verify failed: {type(exc).__name__}: {exc}"
+        errors.append(detail)
+        _safe_logger_write(logger, "storage.close_failed", {"error": detail})
     finally:
         try:
             storage.close()
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - surfaced as cleanup failure
+            errors.append(f"close failed: {type(exc).__name__}: {exc}")
+    return errors
 
 
 def _artifact_row_count(path: Path) -> Optional[int]:
@@ -1464,6 +1675,331 @@ def _artifact_row_count(path: Path) -> Optional[int]:
     except (OSError, UnicodeError, json.JSONDecodeError):
         return None
     return None
+
+
+_RESUME_PROJECTION_MAX_ARTIFACT_BYTES = 2 * 1024 * 1024
+_RESUME_PROJECTION_MAX_ROWS_PER_ARTIFACT = 500
+
+
+def _resolve_resume_artifact_path(task_dir: Path, raw_path: Any) -> Optional[Path]:
+    """Resolve one task-owned artifact without following a foreign pointer.
+
+    Resume state is durable input, not trusted instruction.  In particular,
+    an interrupted attempt can contain a temporary screenshot under /tmp or a
+    manually edited path.  ResumeProjection only exposes extraction artifacts
+    that still live below the task directory.
+    """
+
+    text = str(raw_path or "").strip()
+    if not text:
+        return None
+    candidate = Path(text).expanduser()
+    if not candidate.is_absolute():
+        candidate = task_dir / candidate
+    try:
+        resolved = candidate.resolve(strict=False)
+        resolved.relative_to(task_dir.resolve())
+    except (OSError, ValueError):
+        return None
+    return resolved if resolved.is_file() else None
+
+
+def _resume_artifact_rows(path: Path) -> "tuple[List[Dict[str, Any]], Optional[str]]":
+    """Read a small structured-artifact projection, never values for prompt.
+
+    The caller uses the rows only to derive stable ``controlKey`` coverage.
+    Values remain in the artifact and must be read again by the continuation
+    worker when it has a concrete need for them.  A size cap keeps a damaged or
+    unexpectedly large artifact from making `/resume` slow.
+    """
+
+    try:
+        if path.stat().st_size > _RESUME_PROJECTION_MAX_ARTIFACT_BYTES:
+            return [], "artifact_too_large"
+        suffix = path.suffix.lower()
+        raw_rows: Any = []
+        if suffix in {".jsonl", ".ndjson"}:
+            rows: List[Any] = []
+            with path.open("r", encoding="utf-8") as stream:
+                for line in stream:
+                    if not line.strip():
+                        continue
+                    rows.append(json.loads(line))
+                    if len(rows) >= _RESUME_PROJECTION_MAX_ROWS_PER_ARTIFACT:
+                        break
+            raw_rows = rows
+        elif suffix == ".json":
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, list):
+                raw_rows = payload
+            elif isinstance(payload, dict):
+                raw_rows = next(
+                    (
+                        payload[key]
+                        for key in ("rows", "items", "records", "results", "data")
+                        if isinstance(payload.get(key), list)
+                    ),
+                    [],
+                )
+        else:
+            return [], "unsupported_artifact_format"
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return [], "artifact_unreadable"
+
+    if not isinstance(raw_rows, list):
+        return [], "artifact_rows_not_array"
+    return [
+        row for row in raw_rows[:_RESUME_PROJECTION_MAX_ROWS_PER_ARTIFACT]
+        if isinstance(row, dict)
+    ], None
+
+
+def _resume_required_controls(phase: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Return canonical, display-safe control requirements from a phase."""
+
+    expected = phase.get("expected_artifact")
+    expected = expected if isinstance(expected, dict) else {}
+    raw_controls = expected.get("requiredControls")
+    if raw_controls is None:
+        raw_controls = expected.get("required_controls")
+    if not isinstance(raw_controls, list):
+        return []
+
+    controls: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for raw in raw_controls:
+        if not isinstance(raw, dict):
+            continue
+        control_key = str(
+            raw.get("controlKey") or raw.get("control_key") or ""
+        ).strip()
+        if not control_key or control_key in seen:
+            continue
+        seen.add(control_key)
+        item = {"controlKey": control_key}
+        for key in ("label", "section"):
+            value = str(raw.get(key) or "").strip()
+            if value:
+                item[key] = value
+        controls.append(item)
+    return controls
+
+
+def _resume_artifact_references(
+    task_dir: Path,
+    raw_state: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Collect credible and partial extraction pointers without mixing rows.
+
+    ``validated_artifacts`` is the phase-level credited source.  Attempt
+    validation artifacts are also useful to avoid redoing a filled form, but
+    must remain explicitly uncredited unless that attempt itself completed.
+    Screenshots and broad attempt digests are deliberately excluded.
+    """
+
+    references: Dict[str, Dict[str, Any]] = {}
+
+    def add_paths(
+        raw_paths: Any,
+        *,
+        credit_status: str,
+        source: str,
+        attempt_status: str = "",
+    ) -> None:
+        if not isinstance(raw_paths, list):
+            return
+        for raw_path in raw_paths:
+            artifact_path = _resolve_resume_artifact_path(task_dir, raw_path)
+            if artifact_path is None:
+                continue
+            key = str(artifact_path)
+            current = references.get(key)
+            if current is None:
+                current = {
+                    "path": key,
+                    "rowCount": _artifact_row_count(artifact_path),
+                    "creditStatus": credit_status,
+                    "sources": [source],
+                }
+                if attempt_status:
+                    current["attemptStatus"] = attempt_status
+                references[key] = current
+            else:
+                sources = current.get("sources")
+                if isinstance(sources, list) and source not in sources:
+                    sources.append(source)
+                # A phase-level validated path outranks any partial-attempt
+                # pointer to the same immutable artifact.
+                if credit_status == "credited":
+                    current["creditStatus"] = "credited"
+                    current.pop("attemptStatus", None)
+
+    add_paths(
+        raw_state.get("validated_artifacts"),
+        credit_status="credited",
+        source="phase_validated_artifacts",
+    )
+    attempts = raw_state.get("attempts")
+    for attempt in attempts if isinstance(attempts, list) else []:
+        if not isinstance(attempt, dict):
+            continue
+        validation = attempt.get("validation")
+        validation = validation if isinstance(validation, dict) else {}
+        attempt_status = str(attempt.get("status") or "").strip().lower()
+        validation_done = str(validation.get("status") or "").strip().lower() == "done"
+        credited = attempt_status in {"done", "validated_done"} and validation_done
+        for field in ("artifacts", "validExtractionArtifacts"):
+            add_paths(
+                validation.get(field),
+                credit_status="credited" if credited else "uncredited_partial",
+                source=f"attempt_validation.{field}",
+                attempt_status=attempt_status or "unknown",
+            )
+
+    return list(references.values())
+
+
+def _resume_browser_context_projection(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Expose useful browser continuity facts without leaking reusable ids.
+
+    Fleet/page UUIDs are coordinator-owned and do not belong in an LLM's plan.
+    The prompt only needs to know that the next worker is task-pinned and what
+    the last task-owned page looked like when it was recorded.
+    """
+
+    browser = state.get("browser_context")
+    browser = browser if isinstance(browser, dict) else {}
+    projection: Dict[str, Any] = {"taskSessionContinuity": "not_required"}
+    binding = browser.get("task_session_binding")
+    binding = binding if isinstance(binding, dict) else {}
+    if binding:
+        projection["taskSessionContinuity"] = "required"
+        phase_id = str(binding.get("phaseId") or binding.get("phase_id") or "").strip()
+        if phase_id:
+            projection["bindingPhaseId"] = phase_id
+        source = str(binding.get("source") or "").strip()
+        if source:
+            projection["bindingSource"] = source
+
+    primary = browser.get("last_primary")
+    primary = primary if isinstance(primary, dict) else {}
+    fleet_id = str(primary.get("fleetId") or primary.get("fleet_id") or "").strip()
+    page_id = str(primary.get("pageId") or primary.get("page_id") or "").strip()
+    if not fleet_id or not page_id:
+        return projection
+    fleets = browser.get("fleets")
+    fleet = fleets.get(fleet_id) if isinstance(fleets, dict) else None
+    pages = fleet.get("pages") if isinstance(fleet, dict) else None
+    for page in pages if isinstance(pages, list) else []:
+        if not isinstance(page, dict):
+            continue
+        candidate_id = str(page.get("pageId") or page.get("page_id") or "").strip()
+        if candidate_id != page_id:
+            continue
+        recorded = {
+            key: str(page.get(key) or "").strip()
+            for key in ("url", "title", "status")
+            if str(page.get(key) or "").strip()
+        }
+        if recorded:
+            projection["lastRecordedPage"] = recorded
+        break
+    return projection
+
+
+def _resume_projection(
+    task_dir: Path,
+    plan: Dict[str, Any],
+    state: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Build a read-only recovery map from durable state and artifacts.
+
+    It intentionally does not change phase status, copy filled values into
+    task state, or convert partial work into completion.  The Lead gets stable
+    control identities and artifact pointers; a continuation must re-perceive
+    the live page and re-read any value it needs from the cited artifact.
+    """
+
+    phase_states = state.get("phases")
+    phase_states = phase_states if isinstance(phase_states, dict) else {}
+    phases: List[Dict[str, Any]] = []
+    for phase in plan.get("phases") or []:
+        if not isinstance(phase, dict):
+            continue
+        phase_id = str(phase.get("id") or "").strip()
+        if not phase_id:
+            continue
+        raw_state = phase_states.get(phase_id)
+        raw_state = raw_state if isinstance(raw_state, dict) else {}
+        references = _resume_artifact_references(task_dir, raw_state)
+        required_controls = _resume_required_controls(phase)
+        required_keys = {item["controlKey"] for item in required_controls}
+        credited_keys: set[str] = set()
+        partial_keys: set[str] = set()
+        legacy_control_labels: set[str] = set()
+        for reference in references:
+            path = Path(str(reference["path"]))
+            rows, issue = _resume_artifact_rows(path)
+            if issue:
+                reference["projectionRead"] = issue
+                continue
+            observed = {
+                str(row.get("controlKey") or "").strip()
+                for row in rows
+                if str(row.get("controlKey") or "").strip()
+            }
+            if observed:
+                reference["controlKeys"] = sorted(observed)
+            if not required_controls:
+                legacy_labels = {
+                    str(row.get("controlLabel") or row.get("label") or "").strip()
+                    for row in rows
+                    if str(row.get("controlLabel") or row.get("label") or "").strip()
+                }
+                if legacy_labels:
+                    reference["legacyControlLabels"] = sorted(legacy_labels)
+                    legacy_control_labels.update(legacy_labels)
+            if reference.get("creditStatus") == "credited":
+                credited_keys.update(observed)
+            else:
+                partial_keys.update(observed)
+
+        item: Dict[str, Any] = {
+            "phaseId": phase_id,
+            "phaseStatus": str(raw_state.get("status") or "pending"),
+            "artifactRefs": references,
+        }
+        if required_controls:
+            observed_keys = credited_keys | partial_keys
+            item.update({
+                "requiredControls": required_controls,
+                "creditedControlKeys": sorted(credited_keys & required_keys),
+                "partialObservedControlKeys": sorted(
+                    (partial_keys - credited_keys) & required_keys
+                ),
+                "notYetObservedControls": [
+                    control for control in required_controls
+                    if control["controlKey"] not in observed_keys
+                ],
+            })
+            unexpected = observed_keys - required_keys
+            if unexpected:
+                item["unexpectedObservedControlKeys"] = sorted(unexpected)
+        elif references:
+            item["controlCoverage"] = "not_declared_by_legacy_contract"
+            if legacy_control_labels:
+                item["legacyObservedControlLabels"] = sorted(
+                    legacy_control_labels
+                )
+        phases.append(item)
+
+    return {
+        "version": "v1",
+        "source": "recomputed_from_resume_state_and_task_owned_artifacts",
+        "valueHandling": "read_values_from_artifact_on_demand; values_are_not_copied_into_resume_state",
+        "browserContext": _resume_browser_context_projection(state),
+        "phases": phases,
+    }
 
 
 def _resume_phase_summary(
@@ -1543,7 +2079,7 @@ def _confirm_interrupted_replay(
     return answer in {"y", "yes"}
 
 
-async def run_cli(args: argparse.Namespace) -> int:
+async def _run_cli_impl(args: argparse.Namespace) -> int:
     global _CANCELLED_LOGGED, _LAST_LOGGER
 
     _CANCELLED_LOGGED = False
@@ -1609,6 +2145,7 @@ async def run_cli(args: argparse.Namespace) -> int:
     run_status = "interrupted"
     answer = ""
     exit_code = 0
+    cleanup_errors: List[str] = []
     try:
         if resume_requested:
             try:
@@ -1662,6 +2199,7 @@ async def run_cli(args: argparse.Namespace) -> int:
                 logger.context_run_id = logger.run_id
                 logger.resumed_from = str(task_dir.resolve())
                 _open_task_storage(logger, runtime)
+                run_started = True
 
                 report = prepare_resume_state(
                     logger,
@@ -1675,6 +2213,7 @@ async def run_cli(args: argparse.Namespace) -> int:
                         getattr(args, "resume_retry_interrupted", False)
                     ),
                 ):
+                    run_status = "cancelled"
                     return 2
 
                 reconciled_state = report["state"]
@@ -1707,6 +2246,10 @@ async def run_cli(args: argparse.Namespace) -> int:
                 prompt_report["phaseStates"] = _resume_phase_summary(
                     task_dir, current_plan, reconciled_state,
                 )
+                resume_projection = _resume_projection(
+                    task_dir, current_plan, reconciled_state,
+                )
+                prompt_report["resumeProjection"] = resume_projection
                 prompt_report["browserRecovery"] = {
                     "candidateRecorded": bool(browser_hint),
                     "status": (
@@ -1746,7 +2289,36 @@ async def run_cli(args: argparse.Namespace) -> int:
                         "planAliasRecovery": plan_alias_recovery,
                     },
                 )
+                projection_phases = resume_projection.get("phases")
+                projection_phases = (
+                    projection_phases
+                    if isinstance(projection_phases, list) else []
+                )
+                logger.write(
+                    "resume.projection_built",
+                    {
+                        "phaseCount": len(projection_phases),
+                        "artifactRefCount": sum(
+                            len(item.get("artifactRefs") or [])
+                            for item in projection_phases
+                            if isinstance(item, dict)
+                        ),
+                        "partialArtifactRefCount": sum(
+                            1
+                            for item in projection_phases
+                            if isinstance(item, dict)
+                            for reference in item.get("artifactRefs") or []
+                            if isinstance(reference, dict)
+                            and reference.get("creditStatus")
+                            == "uncredited_partial"
+                        ),
+                        "taskSessionContinuity": (
+                            resume_projection.get("browserContext") or {}
+                        ).get("taskSessionContinuity"),
+                    },
+                )
             except (ResumeStateError, RunLockError, ValueError, OSError) as exc:
+                run_status = "failed"
                 print(f"无法恢复任务: {exc}", flush=True)
                 return 2
         else:
@@ -1757,6 +2329,7 @@ async def run_cli(args: argparse.Namespace) -> int:
             logger.run_id = _new_run_id(resumed=False)
             run_lock = acquire_run_lock(logger.task_dir)
             _open_task_storage(logger, runtime)
+            run_started = True
             write_task_manifest(
                 logger,
                 original_user_task=task,
@@ -1775,7 +2348,6 @@ async def run_cli(args: argparse.Namespace) -> int:
             print("无法初始化任务日志。", flush=True)
             return 2
         _LAST_LOGGER = logger
-        run_started = True
         if resume_context is not None:
             phase_states = resume_context.report.get("phaseStates") or []
             kept = sum(
@@ -1842,52 +2414,151 @@ async def run_cli(args: argparse.Namespace) -> int:
         if isinstance(terminal_error, dict):
             run_status = "failed"
             exit_code = LLM_TEMPORARY_FAILURE_EXIT_CODE
-            logger.write("run.rate_limited", terminal_error)
+            _safe_logger_write(logger, "run.rate_limited", terminal_error)
         else:
-            run_status = "completed"
+            lead_status = str(
+                getattr(harness, "final_status", "") or ""
+            ).strip().lower()
+            if lead_status and lead_status not in {"done", "completed"}:
+                run_status = "failed"
+                exit_code = CLI_ERROR_EXIT_CODE
+                lead_trigger = str(
+                    getattr(harness, "final_trigger", "") or "unknown"
+                )
+                failure = _cli_failure_result(
+                    code="task_not_completed",
+                    message=(
+                        f"LeadAgent ended with status={lead_status} "
+                        f"(trigger={lead_trigger})."
+                    ),
+                    error_type="LeadTerminalOutcome",
+                    retryable=lead_status in {"blocked", "incomplete"},
+                    status=(
+                        lead_status
+                        if lead_status in {"blocked", "failed", "incomplete"}
+                        else "failed"
+                    ),
+                    details={"trigger": lead_trigger},
+                )
+                failure["answer"] = answer
+                answer = json.dumps(failure, ensure_ascii=False)
+                _safe_logger_write(
+                    logger,
+                    "run.incomplete",
+                    {
+                        "status": lead_status,
+                        "trigger": lead_trigger,
+                    },
+                )
+            else:
+                run_status = "completed"
     except asyncio.CancelledError as exc:
         run_status = "cancelled"
+        exit_code = CLI_CANCELLED_EXIT_CODE
         _CANCELLED_LOGGED = True
-        if logger is not None:
-            logger.write(
-                "run.cancelled",
-                exception_payload(exc, mode="lead", task=task_for_agent),
-            )
-        raise
-    except LLMRateLimitError as exc:
-        # Narrow final safety boundary: all normal Lead/Worker model calls turn
-        # this into a controlled incomplete result themselves. Keep the CLI
-        # safe if a future model call is added outside those agent boundaries.
-        run_status = "failed"
-        exit_code = LLM_TEMPORARY_FAILURE_EXIT_CODE
-        incident = exc.to_payload()
         answer = json.dumps(
-            llm_rate_limit_terminal_result(exc),
+            _cancelled_cli_result(str(exc) or "Task execution was cancelled."),
             ensure_ascii=False,
         )
-        if logger is not None:
-            logger.write("run.rate_limited", incident)
+        _safe_logger_write(
+            logger,
+            "run.cancelled",
+            exception_payload(exc, mode="lead", task=task_for_agent),
+        )
     except Exception as exc:
         run_status = "failed"
-        if logger is not None:
-            logger.write(
-                "run.error",
-                exception_payload(exc, mode="lead", task=task_for_agent),
-            )
-        raise
+        failure, exit_code = _classify_cli_exception(exc, phase="run")
+        answer = json.dumps(failure, ensure_ascii=False, default=str)
+        event_type = (
+            "run.rate_limited"
+            if isinstance(exc, LLMRateLimitError)
+            else "run.error"
+        )
+        _safe_logger_write(
+            logger,
+            event_type,
+            {
+                **exception_payload(exc, mode="lead", task=task_for_agent),
+                "terminal": failure.get("error"),
+            },
+        )
     finally:
         if logger is not None and run_started:
-            logger.write_usage_summary()
-            _close_task_storage(logger, status=run_status)
+            try:
+                logger.write_usage_summary()
+            except Exception as exc:  # noqa: BLE001 - preserve primary result
+                cleanup_errors.append(
+                    f"usage summary failed: {type(exc).__name__}: {exc}"
+                )
+            if cleanup_errors and exit_code == 0:
+                run_status = "failed"
+            cleanup_errors.extend(
+                _close_task_storage(logger, status=run_status)
+            )
         if run_lock is not None:
-            release_run_lock(run_lock)
+            try:
+                released = release_run_lock(run_lock)
+            except Exception as exc:  # noqa: BLE001 - report at boundary
+                cleanup_errors.append(
+                    f"run lock release failed: {type(exc).__name__}: {exc}"
+                )
+            else:
+                if not released:
+                    cleanup_errors.append("run lock release failed")
 
-    print(answer)
-    assert logger is not None
-    print(f"\n任务ID: {logger.task_id}")
-    print(f"\n任务目录: {logger.task_dir}")
-    print(f"\n运行日志: {logger.path}")
+    if cleanup_errors:
+        _safe_logger_write(
+            logger,
+            "run.cleanup_failed",
+            {"errors": cleanup_errors},
+        )
+        if exit_code == 0:
+            exit_code = CLI_IO_FAILURE_EXIT_CODE
+        _print_json_result(
+            _cli_failure_result(
+                code="cleanup_error",
+                message="; ".join(cleanup_errors),
+                error_type="CleanupError",
+                retryable=True,
+                status="incomplete",
+            ),
+            stream=sys.stderr,
+        )
+
+    if answer:
+        if not _print_text(answer):
+            return CLI_IO_FAILURE_EXIT_CODE
+    if logger is not None:
+        if not _print_text(f"\n任务ID: {logger.task_id}"):
+            return CLI_IO_FAILURE_EXIT_CODE
+        if not _print_text(f"\n任务目录: {logger.task_dir}"):
+            return CLI_IO_FAILURE_EXIT_CODE
+        if not _print_text(f"\n运行日志: {logger.path}"):
+            return CLI_IO_FAILURE_EXIT_CODE
     return exit_code
+
+
+async def run_cli(args: argparse.Namespace) -> int:
+    """Never let bootstrap failures escape into an embedding host."""
+    try:
+        return await _run_cli_impl(args)
+    except asyncio.CancelledError as exc:
+        _print_json_result(
+            _cancelled_cli_result(str(exc) or "Task execution was cancelled."),
+        )
+        return CLI_CANCELLED_EXIT_CODE
+    except Exception as exc:  # bootstrap/config/input boundary
+        failure, exit_code = _classify_cli_exception(exc, phase="startup")
+        _safe_logger_write(
+            _LAST_LOGGER,
+            "run.startup_failed",
+            {
+                **exception_payload(exc, mode="lead"),
+                "terminal": failure.get("error"),
+            },
+        )
+        _print_json_result(failure)
+        return exit_code
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1932,9 +2603,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    global _CANCELLED_LOGGED
-
+def _main_impl(argv: Optional[Sequence[str]] = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     if raw_argv and raw_argv[0] in _SKILL_CREATE_COMMANDS:
         line = " ".join(shlex.quote(part) for part in raw_argv)
@@ -1956,13 +2625,49 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("可用技能:", ", ".join(ids) or "(无)")
         return 0
     try:
-        return asyncio.run(run_cli(args))
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError(
+            "main() cannot run inside an active event loop; await run_cli(args)"
+        )
+    return asyncio.run(run_cli(args))
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Top-level containment boundary for CLI and panel process adapters."""
+    global _CANCELLED_LOGGED
+
+    try:
+        return _main_impl(argv)
     except KeyboardInterrupt:
         if _LAST_LOGGER is not None and not _CANCELLED_LOGGED:
-            _LAST_LOGGER.write("run.cancelled", {"reason": "KeyboardInterrupt"})
+            _safe_logger_write(
+                _LAST_LOGGER,
+                "run.cancelled",
+                {"reason": "KeyboardInterrupt"},
+            )
             _CANCELLED_LOGGED = True
-        print("已停止。")
-        return 130
+        _print_json_result(_cancelled_cli_result("KeyboardInterrupt"))
+        return CLI_CANCELLED_EXIT_CODE
+    except asyncio.CancelledError as exc:
+        _print_json_result(
+            _cancelled_cli_result(str(exc) or "Task execution was cancelled.")
+        )
+        return CLI_CANCELLED_EXIT_CODE
+    except Exception as exc:  # noqa: BLE001 - last non-SystemExit boundary
+        failure, exit_code = _classify_cli_exception(exc, phase="main")
+        _safe_logger_write(
+            _LAST_LOGGER,
+            "run.fatal",
+            {
+                **exception_payload(exc, mode="lead"),
+                "terminal": failure.get("error"),
+            },
+        )
+        _print_json_result(failure, stream=sys.stderr)
+        return exit_code
 
 
 if __name__ == "__main__":

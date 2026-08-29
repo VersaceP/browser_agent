@@ -106,7 +106,6 @@ DIAGNOSTIC_TOOLS_AFTER_INFRA_ERROR = {
     "System.describeAction",
     "System.describeEvent",
     "System.getCapabilities",
-    "Fleet.status",
     "Fleet.list",
     "Fleet.close",
     "Page.list",

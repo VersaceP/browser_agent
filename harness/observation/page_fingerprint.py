@@ -426,6 +426,52 @@ def render_page_stats_for_prompt(page_stats: JsonDict) -> str:
     return "\n".join(parts)
 
 
+def render_snapshot_diff_for_prompt(snapshot: JsonDict) -> str:
+    """Render a compact, directional AXTree delta for the next model turn.
+
+    A delta is not a completion or absence verdict.  Its value is to steer a
+    worker toward the current in-memory AXTree and a narrower follow-up query,
+    rather than repeatedly searching an offloaded copy of an older tree.
+    """
+
+    semantic_added = int(snapshot.get("semanticAdded") or 0)
+    semantic_removed = int(snapshot.get("semanticRemoved") or 0)
+    physical_added = int(snapshot.get("physicalAdded") or 0)
+    physical_removed = int(snapshot.get("physicalRemoved") or 0)
+    cross_page = bool(snapshot.get("crossPageDiff"))
+    changed = bool(
+        snapshot.get("semanticChanged")
+        or snapshot.get("physicalChanged")
+        or cross_page
+    )
+    parts = [
+        "<axtree_snapshot_diff>",
+        (
+            f"fromStep={snapshot.get('fromStep') or 0} "
+            f"toStep={snapshot.get('toStep') or 0} "
+            f"semanticAdded={semantic_added} semanticRemoved={semantic_removed} "
+            f"physicalAdded={physical_added} physicalRemoved={physical_removed}"
+        ),
+    ]
+    if cross_page:
+        parts.append(
+            "hint=The page changed; all prior AX ids are stale. Query only the "
+            "current AXTree and re-perceive before acting."
+        )
+    elif changed:
+        parts.append(
+            "hint=The current AXTree changed. Use find_in_axtree for a focused "
+            "current-epoch name/role query before falling back to its offloaded file."
+        )
+    else:
+        parts.append(
+            "hint=No material AXTree delta was observed. This is not proof that "
+            "an unqueried target is absent."
+        )
+    parts.append("</axtree_snapshot_diff>")
+    return "\n".join(parts)
+
+
 def _collect_from_any(
     value: Any,
     *,

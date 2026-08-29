@@ -12,6 +12,7 @@ from harness.observation.page_fingerprint import (
     PageObservationTracker,
     page_fingerprint_from_result,
     render_page_stats_for_prompt,
+    render_snapshot_diff_for_prompt,
     snapshot_diff,
 )
 
@@ -24,5 +25,6 @@ __all__ = [
     "detect_overlay_from_text",
     "page_fingerprint_from_result",
     "render_page_stats_for_prompt",
+    "render_snapshot_diff_for_prompt",
     "snapshot_diff",
 ]
