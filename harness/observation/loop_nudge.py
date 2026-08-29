@@ -171,6 +171,14 @@ def normalize_action_params(label: str, params: Any) -> Any:
             "targetId": _locator(params.get("target")),
         }
     if label in {"Input.click", "Input.select", "Input.type", "Input.press", "Input.drag"}:
+        select_summary: Optional[JsonDict] = None
+        if label == "Input.select":
+            # Rebuilt contract: exactly one selection array replaces the old
+            # selections envelope.
+            for field in ("nativeValues", "optionIds", "optionLabels"):
+                if params.get(field) is not None:
+                    select_summary = {field: params.get(field)}
+                    break
         return {
             "pageId": params.get("pageId"),
             "target": (
@@ -181,7 +189,7 @@ def normalize_action_params(label: str, params: Any) -> Any:
             ),
             "key": params.get("key") if label == "Input.press" else None,
             "text": params.get("text") if label == "Input.type" else None,
-            "selections": params.get("selections") if label == "Input.select" else None,
+            "select": select_summary,
         }
     if label in {"DOM.getText", "DOM.getAttribute"}:
         return {

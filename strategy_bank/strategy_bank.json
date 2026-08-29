@@ -138,9 +138,12 @@
       "preferred_tools": [
         "Page.getState",
         "DOM.getAXTree",
+        "DOM.getSemanticTree",
+        "DOM.inspectSelect",
         "Input.click",
         "Input.type",
         "Input.press",
+        "Input.select",
         "DOM.getAttribute",
         "DOM.getText",
         "record_extraction"
@@ -149,7 +152,10 @@
       "discouraged_tools": ["Runtime.evaluate"],
       "procedure": [
         "Locate controls and labels with DOM.getAXTree.",
-        "Fill values with Input.type/Input.press and toggle/select with Input.click using AXTree ids or stable selectors.",
+        "Fill ordinary editable values with Input.type/Input.press and toggle ordinary controls with Input.click using fresh AXTree ids or independently observed stable selectors.",
+        "For a select-like control with unknown choices, call DOM.inspectSelect once. A combobox/textfieldwithcombobox may be a custom framework control whose popup is rendered through a portal elsewhere in the document; framework classes such as Ant Design or Element are diagnostic hints, not control identity or proof that the control is unsupported.",
+        "If inspectSelect returns a bare platform failure, do not repeat it or derive a selector from the error text. Treat the failed Action as potentially state-changing: refresh control identity, then use DOM.getSemanticTree to read aria-controls, aria-owns, aria-activedescendant, expanded state, and any independently exposed selector. After at most one generic click/press/type, search the fresh page-wide AX/Semantic surface—not only the control subtree—for the related listbox and visible option nodes.",
+        "Call Input.select only with exactly one current selection array supported by live evidence: nativeValues for a native select, or fresh optionIds/optionLabels from the currently open related custom popup. A public failure does not prove no effect; re-observe before correcting. When the adapter remains unavailable but a visible option has a fresh actionable AX target, one verified generic option click is the bounded fallback.",
         "Verify entered values with DOM.getAttribute(value) or refreshed AXTree state.",
         "Before submit/save, call Page.getState to catch unexpected dialogs or navigation state.",
         "After submit/save, verify the result with Page.getState, DOM.getAXTree, DOM.getText, or visual_verify only when DOM evidence is insufficient."
