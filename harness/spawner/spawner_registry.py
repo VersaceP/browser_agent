@@ -41,14 +41,20 @@ class SpawnerRegistryMixin:
         worker_id: str,
         required_fleet_id: str = "",
         include_page_details: bool = True,
-    ) -> None:
+    ) -> JsonDict:
+        sync_receipt: JsonDict = {
+            "fleetListSucceeded": False,
+            "pageListAttemptedFleetIds": [],
+            "pageListSucceededFleetIds": [],
+        }
         if slot.client is None:
-            return
+            return sync_receipt
         slot.sync_errors = []
         try:
             fleet_response = await slot.client.call("Fleet.list", {})
             self._replace_slot_fleets_from_response(slot, fleet_response)
             self._update_slot_registry_from_value(slot, fleet_response)
+            sync_receipt["fleetListSucceeded"] = True
         except Exception as exc:
             slot.sync_errors.append(f"Fleet.list: {str(exc)[:240]}")
 
@@ -89,6 +95,7 @@ class SpawnerRegistryMixin:
             else []
         )
         for fleet_id in fleet_ids_to_scan:
+            sync_receipt["pageListAttemptedFleetIds"].append(fleet_id)
             try:
                 pages_response = await slot.client.call(
                     "Page.list",
@@ -100,6 +107,7 @@ class SpawnerRegistryMixin:
                     pages_response=pages_response,
                 )
                 self._update_slot_registry_from_value(slot, pages_response)
+                sync_receipt["pageListSucceededFleetIds"].append(fleet_id)
             except Exception as exc:
                 note_fleet_timeout(fleet_id, exc)
                 slot.sync_errors.append(f"Page.list({fleet_id}): {str(exc)[:240]}")
@@ -269,6 +277,7 @@ class SpawnerRegistryMixin:
                 f"-32012 Fleet open timeout for required fleet {required}; "
                 "retry the same phase id after the acquisition cooldown"
             )
+        return sync_receipt
 
     def _render_slot_context(
         self,
@@ -347,6 +356,7 @@ class SpawnerRegistryMixin:
         *,
         assignment: Optional[FleetAssignment],
         expose_reusable_pages: bool,
+        required_page_id: str = "",
     ) -> Dict[str, str]:
         """Return existing page handles explicitly delegated to this worker."""
 
@@ -367,6 +377,7 @@ class SpawnerRegistryMixin:
             )
             else ""
         )
+        required_page_id = str(required_page_id or "").strip()
         return {
             str(page_id): str(page.get("fleetId") or "")
             for page_id, page in slot.page_registry.items()
@@ -375,6 +386,7 @@ class SpawnerRegistryMixin:
                 and str(page.get("fleetId") or "") in allowed_fleets
                 and (not pinned_page_id or str(page_id) == pinned_page_id)
                 and (not resume_page_id or str(page_id) == resume_page_id)
+                and (not required_page_id or str(page_id) == required_page_id)
                 and not _page_hidden_from_reuse(slot, page)
                 and not self.page_lease_manager.owner_for(str(page_id))
             )

@@ -168,6 +168,7 @@ def mark_phase_result(
         "hitl_timeout",
         "page_settled_after_hitl",
         "stale_pause_deadlock",
+        "page_continuation_lost",
         "session_fleet_lost",
     }:
         phase_state["status"] = result_status
@@ -175,7 +176,7 @@ def mark_phase_result(
             "type": "challenge_blocker",
             "status": result_status,
             "message": (
-                "Worker reported a challenge/HITL/session blocker; do not"
+                "Worker reported a challenge/HITL/session continuity blocker; do not"
                 " retry the same browser/session binding without user action"
                 " or a deliberate auth recovery pivot."
             ),
@@ -928,8 +929,17 @@ def phase_pacing_remaining_seconds(
 
 def _attempt_was_validated_done(attempt: JsonDict) -> bool:
     """True only for the attempt that actually established dependency readiness."""
-    if str(attempt.get("status") or "") == "validated_done":
+    status = str(attempt.get("status") or "")
+    # Old task-state generations wrote the phase result directly into the
+    # attempt status. Preserve that durable representation, but do not let a
+    # modern partial worker inherit completion merely because its artifact
+    # shape passed validation.
+    if status == "validated_done":
         return True
+    # A modern status is authoritative: in particular, a partial attempt that
+    # happened to validate its artifact must never become an upstream source.
+    if status and status != WORKER_STATUS_DONE:
+        return False
     if str(attempt.get("validatedStatus") or "") == "validated_done":
         return True
     validation = attempt.get("validation")

@@ -29,6 +29,9 @@ ROUTING_ERROR_GUIDANCE = {
     "fleet_reference_not_found": (
         "Refresh the authoritative Fleet inventory and choose an existing Fleet; do not create a replacement."
     ),
+    "fleet_inventory_temporarily_unavailable": (
+        "Retry after Fleet.list succeeds, keeping the same fleet/session reference; do not create a replacement."
+    ),
     "ambiguous_fleet_reference": (
         "Use a longer Fleet UUID prefix that identifies exactly one existing Fleet."
     ),

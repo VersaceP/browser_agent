@@ -62,6 +62,7 @@ SCREENSHOT_METHODS = {"Page.screenshot", "DOM.getElementScreenshot"}
 # this catalog together so tests can mechanically reject undocumented additions.
 LEAD_FLEET_ROUTING_DECISION_CODES = (
     "session_fleet_lost",
+    "page_continuation_lost",
     "fleet_assignment_lost",
     "fleet_auth_gated",
     "fleet_auth_resolver_required",
@@ -72,6 +73,7 @@ LEAD_FLEET_ROUTING_DECISION_CODES = (
     "fleet_owner_unavailable",
     "fleet_reference_invalid",
     "fleet_reference_not_found",
+    "fleet_inventory_temporarily_unavailable",
     "ambiguous_fleet_reference",
     "reuse_fleet_lost",
     "reuse_session_conflict",
@@ -84,6 +86,7 @@ LEAD_FLEET_ROUTING_DECISION_CODES = (
 )
 
 LEAD_FLEET_ROUTING_DECISION_GUIDANCE = """- session_fleet_lost: the named fleet disappeared from the owner inventory and is effectively terminal until explicit reset/re-authentication. Mark the auth session stale and follow the auth-interrupt/login recovery flow; never retry or silently rebind the same session_key.
+- page_continuation_lost: an authoritative Page.list confirmed that the exact page carrying unfinished page-local state has disappeared. The unsaved page state cannot be recovered. Do not claim a fresh page resumes it; report the loss or request an operator reset only to deliberately restart.
 - fleet_assignment_lost: stop the worker and request a fresh coordinator assignment; do not retry calls against the lost fleetId.
 - fleet_auth_gated: another worker is resolving login/CAPTCHA for the shared fleet. Wait; do not create another fleet or continue account actions.
   - reasonKind=fleet_auth_resolver_required: the gate is closed but currently has no resolver. Spawn or continue exactly one worker on the same fleet/session to refresh Page.getState and DOM.getAXTree, then explicitly call Hitl.requestPause to claim resolution. Do not create another fleet and do not wait without assigning a resolver.
@@ -96,6 +99,7 @@ Fleet routing rejection table for spawn_browser_agent:
 - fleet_owner_unavailable: wait for the owner slot to reconnect; do not replace the task/session fleet.
 - fleet_reference_invalid: copy an existing Fleet UUID or a hexadecimal UUID prefix of at least eight characters into fleet_id; never put it in session_key.
 - fleet_reference_not_found: refresh the authoritative Fleet inventory or ask the user for the current Fleet; never create a replacement.
+- fleet_inventory_temporarily_unavailable: Fleet.list did not answer, so existence was not disproved. Retry later with the same fleet/session reference; never create a replacement.
 - ambiguous_fleet_reference: use a longer Fleet UUID prefix that uniquely identifies one existing Fleet.
 - reuse_fleet_lost: drop reuse_from_worker_id and request a fresh coordinator assignment.
 - reuse_session_conflict: keep the source worker's session_key, or start a fresh named session without inheriting that worker.
@@ -203,6 +207,7 @@ WORKER_STATUS_FAILED = "failed"
 WORKER_STATUS_CANCELLED = "cancelled"
 WORKER_STATUS_RUNNING = "running"
 WORKER_STATUS_SESSION_FLEET_LOST = "session_fleet_lost"
+WORKER_STATUS_PAGE_CONTINUATION_LOST = "page_continuation_lost"
 WORKER_STATUS_FLEET_ASSIGNMENT_LOST = "fleet_assignment_lost"
 
 # Classifier priority (higher index = lower priority). The classifier walks this
@@ -211,6 +216,7 @@ WORKER_STATUS_FLEET_ASSIGNMENT_LOST = "fleet_assignment_lost"
 WORKER_STATUS_HARD_PRIORITY = (
     WORKER_STATUS_CONTEXT_LIMIT,
     WORKER_STATUS_SESSION_FLEET_LOST,
+    WORKER_STATUS_PAGE_CONTINUATION_LOST,
     WORKER_STATUS_FLEET_ASSIGNMENT_LOST,
     WORKER_STATUS_STALE_PAUSE_DEADLOCK,
     WORKER_STATUS_PAGE_SETTLED_AFTER_HITL,
@@ -249,6 +255,7 @@ WORKER_STATUS_CATEGORIES = {
     WORKER_STATUS_UNKNOWN: WORKER_STATUS_CATEGORY_UNKNOWN,
     WORKER_STATUS_RUNNING: WORKER_STATUS_CATEGORY_UNKNOWN,
     WORKER_STATUS_SESSION_FLEET_LOST: WORKER_STATUS_CATEGORY_NEEDS_HUMAN,
+    WORKER_STATUS_PAGE_CONTINUATION_LOST: WORKER_STATUS_CATEGORY_NEEDS_HUMAN,
     WORKER_STATUS_FLEET_ASSIGNMENT_LOST: WORKER_STATUS_CATEGORY_RECOVERABLE,
 }
 

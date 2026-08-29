@@ -30,6 +30,7 @@ CHALLENGE_PHASE_STATUSES = frozenset({
     "hitl_timeout",
     "page_settled_after_hitl",
     "stale_pause_deadlock",
+    "page_continuation_lost",
     "session_fleet_lost",
     "fleet_assignment_lost",
 })

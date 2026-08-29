@@ -145,6 +145,7 @@ from .spawner_helpers import (  # noqa: F401
     FleetReadinessError,
     PinnedBrowserContext,
     ResumeBrowserHint,
+    TaskSessionBinding,
     SLOT_FULL_SYNC_TTL_SECONDS,
     URL_RE,
     _SessionStartLock,

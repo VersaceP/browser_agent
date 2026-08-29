@@ -17,6 +17,7 @@ from harness.constants import WORKER_STATUS_CANCELLED
 from harness.constants import WORKER_STATUS_DONE
 from harness.constants import WORKER_STATUS_FAILED
 from harness.diagnostics import status_category
+from harness.diagnostics.error_classification import attach_error_classification
 from harness.fleet.coordinator import FleetAssignment
 from harness.observation.render_recovery import extract_page_id_from_values
 from harness.evidence.extraction_artifacts import field_names_from_specs
@@ -53,7 +54,7 @@ from harness.results.worker_result import build_worker_result_levels
 from harness.workflow_runtime import workflow_execution_enabled
 from llm import LLMFactory
 from .spawner_classification import _allowance_from_validators, _clone_capability_bundle, _cohort_identity_fields, _safe_str_list, _validated_rows_for_ledger, _worker_feedback_classification  # noqa: F401
-from .spawner_helpers import BrowserAgentHandle, BrowserAgentSlot, _TaskContextTrackingBrowserClient, _effective_worker_status, _finalize_skill_execution_metadata, _fresh_click_settlement_class, _prompt_worker_contract, _skill_execution_metadata, _unresolved_repair_visual_evidence, _verified_workflow_hitl_settlement  # noqa: F401
+from .spawner_helpers import BrowserAgentHandle, BrowserAgentSlot, TaskSessionBinding, _TaskContextTrackingBrowserClient, _effective_worker_status, _finalize_skill_execution_metadata, _fresh_click_settlement_class, _prompt_worker_contract, _skill_execution_metadata, _unresolved_repair_visual_evidence, _verified_workflow_hitl_settlement  # noqa: F401
 
 _TASK_MEMORY_TERMINAL_WRITE_TIMEOUT_SECONDS = 5.0
 _WORKER_FAILURE_CLEANUP_TIMEOUT_SECONDS = 5.0
@@ -62,6 +63,56 @@ def _sp():
     import harness.spawner as sp
 
     return sp
+
+def _dedupe_download_receipts(receipts: Any) -> List[JsonDict]:
+    """Collapse alias-keyed ledger entries into one receipt per operation.
+
+    The download ledger files one receipt under several identity keys
+    (downloadId, url+savePath, pageId+savePath) so retries find it; the
+    worker handoff must not report the same operation once per alias.
+    """
+    seen: set = set()
+    unique: List[JsonDict] = []
+    for receipt in receipts:
+        if not isinstance(receipt, dict):
+            continue
+        download_id = str(receipt.get("downloadId") or "").strip()
+        if download_id:
+            identity = ("downloadId", download_id)
+        else:
+            identity = (
+                "url_path",
+                str(receipt.get("url") or ""),
+                str(receipt.get("savePath") or ""),
+            )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(dict(receipt))
+    return unique
+
+
+def _transport_failure_fields(exc: ABCPTransportError) -> JsonDict:
+    """Serialize the typed client failure for a worker handoff and platform triage."""
+    result: JsonDict = {
+        "exceptionType": type(exc).__name__,
+        "transportCode": str(
+            getattr(exc, "transport_code", "ABCP_TRANSPORT_UNKNOWN")
+            or "ABCP_TRANSPORT_UNKNOWN"
+        ),
+    }
+    if bool(getattr(exc, "connection_fatal", False)):
+        result["connectionFatal"] = True
+    request_sent = getattr(exc, "request_sent", None)
+    if isinstance(request_sent, bool):
+        result["requestSent"] = request_sent
+    rpc_code = getattr(exc, "rpc_code", None)
+    if isinstance(rpc_code, int):
+        result["rpcCode"] = rpc_code
+    rpc_method = str(getattr(exc, "rpc_method", "") or "").strip()
+    if rpc_method:
+        result["rpcMethod"] = rpc_method
+    return result
 
 class SpawnerWorkerMixin:
 
@@ -395,6 +446,7 @@ class SpawnerWorkerMixin:
         worker_contract: JsonDict,
         phase: Optional[JsonDict],
         readiness_receipt: Optional[JsonDict] = None,
+        task_session_binding: Optional[TaskSessionBinding] = None,
     ) -> JsonDict:
         worker_runtime = replace(
             self.runtime,
@@ -583,21 +635,42 @@ class SpawnerWorkerMixin:
                 slot,
                 assignment=assignment,
                 expose_reusable_pages=expose_reusable_pages,
+                required_page_id=(
+                    task_session_binding.page_id
+                    if (
+                        task_session_binding is not None
+                        and task_session_binding.requires_exact_page
+                    )
+                    else ""
+                ),
             )
             harness.allowed_page_ids = set(page_bindings)
             harness.page_fleet_ids = dict(page_bindings)
             self.page_lease_manager.seed_worker_pages(worker_id, page_bindings)
             harness.fleet_page_fleet_ids = {}
-            harness.pinned_browser_context = (
-                self.pinned_browser_context.to_dict()
+            worker_pin = (
+                task_session_binding.to_dict()
+                if task_session_binding is not None
+                else self.pinned_browser_context.to_dict()
                 if self.pinned_browser_context is not None
                 else {}
             )
-            harness.pinned_page_id = (
-                self.pinned_browser_context.page_id
-                if self.pinned_browser_context is not None
-                else ""
-            )
+            if task_session_binding is not None:
+                worker_pin = dict(worker_pin)
+                worker_pin["pinSource"] = (
+                    "task_page_continuation"
+                    if task_session_binding.requires_exact_page
+                    else "task_auth"
+                )
+                if not task_session_binding.requires_exact_page:
+                    # Fleet continuity keeps cookies/storage without turning a
+                    # generic CAPTCHA resume into an exact-tab prison.
+                    worker_pin["pageId"] = None
+            elif worker_pin:
+                worker_pin = dict(worker_pin)
+                worker_pin["pinSource"] = "lead_pinned"
+            harness.pinned_browser_context = worker_pin
+            harness.pinned_page_id = str(worker_pin.get("pageId") or "")
             harness.fleet_assignment_reason = (
                 assignment.assignment_reason if assignment else ""
             )
@@ -638,6 +711,13 @@ class SpawnerWorkerMixin:
                     assignment, payload
                 ))
                 if assignment is not None and assignment.session_key
+                else None
+            )
+            harness.task_session_binding_handler = (
+                (lambda payload: self._record_task_session_binding(
+                    assignment, payload
+                ))
+                if assignment is not None and phase_id
                 else None
             )
             harness.auth_session_lost_handler = (
@@ -904,7 +984,7 @@ class SpawnerWorkerMixin:
                 if diagnostics is not None
                 else {},
                 "fastPathAssessment": fast_path_assessment,
-                "downloadOperationReceipts": list(
+                "downloadOperationReceipts": _dedupe_download_receipts(
                     getattr(harness, "download_operation_receipts", {}).values()
                 ),
                 "challengeReceipt": challenge_receipt,
@@ -934,6 +1014,12 @@ class SpawnerWorkerMixin:
                 result=result,
                 trace=getattr(harness, "trace", []),
             )
+            binding_transition = self._update_task_session_binding_after_worker(
+                phase=phase or {},
+                result=result,
+            )
+            if isinstance(binding_transition, dict):
+                result["taskSessionBindingTransition"] = binding_transition
         except asyncio.CancelledError:
             harness_obj = harness
             await self._checkpoint_terminal_task_memory(
@@ -1044,6 +1130,12 @@ class SpawnerWorkerMixin:
                 "phaseId": phase_id,
                 "error": str(exc),
             }
+            if isinstance(exc, ABCPTransportError):
+                result.update(_transport_failure_fields(exc))
+                attach_error_classification(
+                    result,
+                    method=str(getattr(exc, "rpc_method", "") or ""),
+                )
             self._record_slot_result(
                 slot,
                 worker_id=worker_id,
@@ -1190,6 +1282,8 @@ class SpawnerWorkerMixin:
         self,
         browser: ABCPClient,
         worker_runtime: RuntimeConfig,
+        *,
+        caps_response: Optional[JsonDict] = None,
     ) -> CapabilityBundle:
         if self._capability_bundle_lock is None:
             self._capability_bundle_lock = asyncio.Lock()
@@ -1208,6 +1302,7 @@ class SpawnerWorkerMixin:
                 logger=self.logger,
                 blocked_methods=ALWAYS_FORBIDDEN_ABCP_METHODS,
                 schema_cache_dir=global_schemas_dir(worker_runtime.harness.worktree_dir),
+                caps_response=caps_response,
             )
             self._capability_bundle = _clone_capability_bundle(bundle)
             return _clone_capability_bundle(bundle)

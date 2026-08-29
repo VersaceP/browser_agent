@@ -32,14 +32,15 @@ BrowserAgentFactory = Callable[[Any, ABCPClient, RuntimeConfig, RunLogger], Any]
 class FleetReadinessError(ABCPTransportError):
     """Assigned Fleet did not become usable before worker construction."""
 
-    # Readiness has already spent its bounded status probes. Re-entering the
-    # same acquisition path immediately only repeats Fleet startup/restore
-    # pressure, so reuse the existing acquisition ledger's cooldown. Keep the
-    # duration authoritative in task_control rather than duplicating it here.
+    # Readiness has already spent its bounded Fleet.ready event wait.
+    # Re-entering the same acquisition path immediately only repeats Fleet
+    # startup/restore pressure, so reuse the existing acquisition ledger's
+    # cooldown. Keep the duration authoritative in task_control rather than
+    # duplicating it here.
     requires_spawn_acquisition_cooldown = True
 
     def __init__(self, message: str, *, fleet_id: str, owner_slot_id: str):
-        super().__init__(message, rpc_method="Fleet.status")
+        super().__init__(message)
         self.fleet_id = str(fleet_id)
         self.owner_slot_id = str(owner_slot_id)
 
@@ -252,6 +253,9 @@ class BrowserAgentSlot:
     recovery_failure_cycles: int = 0
     recovery_unavailable_since: float = 0.0
     idle_event_logger: Optional[Callable[[str, JsonDict], None]] = None
+    # True only after this exact WebSocket connection completed the current
+    # Dispatcher handshake (System.register -> System.getCapabilities).
+    protocol_initialized: bool = False
 
 @dataclass(frozen=True)
 class PinnedBrowserContext:
@@ -295,6 +299,116 @@ class PinnedBrowserContext:
             "pageId": self.page_id or None,
             "source": self.source,
             "mode": "existing_only",
+        }
+
+
+@dataclass(frozen=True)
+class TaskSessionBinding:
+    """Task-local Fleet or Page continuation constraint.
+
+    It deliberately is not an auth-ledger record: verified authentication may
+    preserve Fleet identity, while an unfinished page-local form may preserve
+    one exact Page. Neither case grants cross-task login reuse rights.
+    """
+
+    phase_id: str
+    fleet_id: str
+    page_id: str = ""
+    session_generation: int = 0
+    source: str = "hitl_resume"
+    binding_scope: str = "page"
+    state: str = "active"
+    reason: str = ""
+    created_at_ms: int = 0
+    last_verified_at_ms: int = 0
+    auth_verified: bool = False
+
+    @classmethod
+    def from_value(
+        cls,
+        value: Any,
+        *,
+        phase_id: str = "",
+    ) -> Optional["TaskSessionBinding"]:
+        if value in (None, {}, ""):
+            return None
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, dict):
+            return None
+        resolved_phase_id = str(
+            phase_id or value.get("phaseId") or value.get("phase_id") or ""
+        ).strip()
+        fleet_id = str(value.get("fleetId") or value.get("fleet_id") or "").strip()
+        page_id = str(value.get("pageId") or value.get("page_id") or "").strip()
+        binding_scope = str(
+            value.get("bindingScope")
+            or value.get("binding_scope")
+            or "page"
+        ).strip().lower()
+        if binding_scope not in {"fleet", "page"}:
+            return None
+        if not resolved_phase_id or not fleet_id:
+            return None
+        if binding_scope == "page" and not page_id:
+            return None
+        try:
+            uuid.UUID(fleet_id)
+            if page_id:
+                uuid.UUID(page_id)
+        except (ValueError, AttributeError):
+            return None
+        generation = optional_int(
+            value.get("sessionGeneration", value.get("session_generation")), 0
+        ) or 0
+        return cls(
+            phase_id=resolved_phase_id,
+            fleet_id=fleet_id,
+            page_id=page_id,
+            session_generation=max(0, generation),
+            source=str(value.get("source") or "hitl_resume").strip() or "hitl_resume",
+            binding_scope=binding_scope,
+            state=(
+                str(value.get("state") or "active").strip().lower()
+                if str(value.get("state") or "active").strip().lower()
+                in {"active", "needs_reverification", "stale"}
+                else "needs_reverification"
+            ),
+            reason=str(value.get("reason") or "").strip(),
+            created_at_ms=max(
+                0, optional_int(value.get("createdAtMs", value.get("created_at_ms")), 0) or 0
+            ),
+            last_verified_at_ms=max(
+                0,
+                optional_int(
+                    value.get("lastVerifiedAtMs", value.get("last_verified_at_ms")),
+                    0,
+                ) or 0,
+            ),
+            auth_verified=bool(
+                value.get("authVerified", value.get("auth_verified", False))
+            ),
+        )
+
+    @property
+    def requires_exact_page(self) -> bool:
+        return self.binding_scope == "page"
+
+    def to_dict(self) -> JsonDict:
+        return {
+            "phaseId": self.phase_id,
+            "fleetId": self.fleet_id,
+            "pageId": self.page_id,
+            "sessionGeneration": self.session_generation,
+            "source": self.source,
+            "bindingScope": self.binding_scope,
+            "state": self.state,
+            "reason": self.reason or None,
+            "createdAtMs": self.created_at_ms or None,
+            "lastVerifiedAtMs": self.last_verified_at_ms or None,
+            "authVerified": self.auth_verified,
+            "continuity": "required",
+            "scope": "task",
         }
 
 @dataclass(frozen=True)
