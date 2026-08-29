@@ -68,6 +68,21 @@ _OPTIONAL_IDENTIFIER_FIELDS = {
     },
 }
 _OPTIONAL_WORKER_CONTRACT_IDENTIFIER_FIELDS = {"session_key", "fleet_id"}
+_AUTO_BIND_SEMANTIC_OVERRIDE_KEYS = frozenset({
+    "expected_artifact",
+    "validators",
+    "input_artifacts",
+    "objective",
+    "worker_task",
+    "stage_hint",
+    "execution_role",
+    "batch_policy",
+    "replan_checkpoint_id",
+    "batch_source",
+    "cohort_source",
+    "row_selection",
+    "batch_rows",
+})
 
 
 def _normalize_optional_identifiers(
@@ -334,6 +349,32 @@ def _expected_artifact_schema() -> JsonDict:
         "additionalProperties": True,
     }
     field_list: JsonDict = {"type": "array", "items": field_items}
+    required_controls: JsonDict = {
+        "type": "array",
+        "minItems": 1,
+        "description": (
+            "Required business controls for form_filling/form_interaction."
+            " Emit one artifact row per stable controlKey; every row must"
+            " include a non-empty filledValue read back from the page."
+        ),
+        "items": {
+            "type": "object",
+            "properties": {
+                "controlKey": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": (
+                        "Stable business identity for the control; never an"
+                        " AXTree id or transient DOM selector."
+                    ),
+                },
+                "label": {"type": "string", "minLength": 1},
+                "section": {"type": "string", "minLength": 1},
+            },
+            "required": ["controlKey"],
+            "additionalProperties": False,
+        },
+    }
     return {
         "type": "object",
         "description": (
@@ -359,6 +400,7 @@ def _expected_artifact_schema() -> JsonDict:
             "nonempty_fields": field_list,
             "field_nonempty": field_list,
             "provenance_required": field_list,
+            "requiredControls": required_controls,
         },
         "propertyNames": {"minLength": 1},
         "additionalProperties": True,
@@ -1313,9 +1355,14 @@ def _resume_instruction_gate_rejection(agent: Any) -> Optional[JsonDict]:
         " pages/tabs, put that into one worker as serial Page.create and"
         " Page.switchTo work instead of fan-out."
         " The task/context should state which fields to collect and how to derive dynamic"
-        " params from live feedback (response.data handles, DOM.getAXTree ids,"
-        " DOM.getText/DOM.getAttribute evidence, or cited record_extraction artifacts),"
-        " not hard-code stale pageIds, AXTree ids, selectors, or assumed positions."
+        " params from the original user instruction, accepted plan artifacts,"
+        " authoritative routing receipts, or current browser evidence"
+        " (response.data handles, DOM.getAXTree ids, DOM.getText/DOM.getAttribute"
+        " evidence, or cited record_extraction artifacts). A pageId remains the"
+        " page identity across navigation, but is invalid after that page is"
+        " authoritatively closed, replaced, or absent from Page.list. AXTree ids,"
+        " selectors tied to a rendered document, and geometry are epoch-bound;"
+        " never guess or reuse them after invalidation."
     ),
     input_schema=_spawn_browser_agent_schema,
 )
@@ -1415,6 +1462,10 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
             "status": "failed",
             "error": f"phase not found or no pending phase: {phase_id}",
         }
+    # The automatic input-binding proof reads only this reviewed-plan view.
+    # Spawn overrides remain available for routing/session purposes, but must
+    # not rewrite the expected artifact or validators used as proof.
+    reviewed_worker_contract = agent.build_worker_contract(phase)
     worker_contract = agent.build_worker_contract(
         phase,
         raw_contract if isinstance(raw_contract, dict) else None,
@@ -1424,14 +1475,20 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
     # declared input artifact, then verify that producer at runtime; never
     # guess a source from phase order or same-shaped artifacts. Explicit
     # batch/cohort/checkpoint contracts remain authoritative.
-    if not isinstance(raw_contract, dict) or not any(
-        key in raw_contract for key in ("batch_source", "cohort_source", "batch_rows")
-    ):
+    binding_override_keys = (
+        sorted(
+            key for key in raw_contract
+            if key in _AUTO_BIND_SEMANTIC_OVERRIDE_KEYS
+        )
+        if isinstance(raw_contract, dict)
+        else []
+    )
+    if not binding_override_keys:
         binding_decision = assess_batch_source_binding(
             agent.logger,
             phase=phase,
             plan=agent.task_plan,
-            worker_contract=worker_contract,
+            worker_contract=reviewed_worker_contract,
         )
         derived_batch_source = binding_decision.get("batch_source")
         if isinstance(derived_batch_source, dict):
@@ -1448,6 +1505,15 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
                     "reason": "declared_input_artifact_exact_row_count",
                 },
             )
+    elif hasattr(agent, "logger"):
+        agent.logger.write(
+            "batch_source.not_derived",
+            {
+                "phaseId": str(phase.get("id") or ""),
+                "reason": "spawn_override_changes_binding_semantics",
+                "overrideKeys": binding_override_keys,
+            },
+        )
     state = load_task_state(agent.logger)
     phase_state = (
         (state.get("phases") or {}).get(str(phase.get("id") or ""))

@@ -95,6 +95,7 @@ TERMINAL_PHASE_STATUSES = frozenset({
     "page_settled_after_hitl",
     "stale_pause_deadlock",
     "blocked_by_dependency",
+    "page_continuation_lost",
     "session_fleet_lost",
 })
 
@@ -643,6 +644,13 @@ def _adapt_cohort_row_selection(
         worker_contract["batch_source"]["cohort_selector"] = cohort_selector
     if mode and not worker_contract.get("execution_role"):
         worker_contract["execution_role"] = mode
+    # This is an adapter to the normalized batch form.  Keeping the original
+    # cohort spelling beside batch_source makes a second validation of the
+    # same accepted plan reject it as "cohort_source or batch_source, not
+    # both".  Plans are validated again on persistence and resume, so this
+    # transform must be idempotent.
+    worker_contract.pop("cohort_source", None)
+    worker_contract.pop("row_selection", None)
     return mode
 
 def _normalize_batch_contract(
@@ -1221,6 +1229,7 @@ def validate_task_plan(
     known_abcp_methods: Optional[AbstractSet[str]] = None,
     known_harness_tools: Optional[AbstractSet[str]] = None,
     user_task: str = "",
+    legacy_required_controls_phase_ids: Optional[AbstractSet[str]] = None,
 ) -> Tuple[Optional[JsonDict], List[str]]:
     """Validate and normalize the v1 task plan.
 
@@ -1286,6 +1295,11 @@ def validate_task_plan(
 
     phases: List[JsonDict] = []
     seen_ids = set()
+    legacy_required_controls_phase_ids = {
+        str(item).strip()
+        for item in (legacy_required_controls_phase_ids or set())
+        if str(item).strip()
+    }
     for index, raw_phase in enumerate(raw_phases):
         if not isinstance(raw_phase, dict):
             errors.append(f"phases[{index}] must be an object")
@@ -1339,6 +1353,14 @@ def validate_task_plan(
             errors,
             warnings,
             phase_id=phase_id,
+            # Phase-level type is the authorization boundary.  The plan-level
+            # type has not yet been derived here and may describe another
+            # phase, so it must not decide a form completion contract.
+            task_type=normalize_task_type(raw_phase.get("task_type")),
+            stage_hint=stage_hint,
+            allow_legacy_missing_required_controls=(
+                phase_id in legacy_required_controls_phase_ids
+            ),
         )
         validators = _tc()._normalize_validators(
             expected_artifact,

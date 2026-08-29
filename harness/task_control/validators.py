@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import fnmatch
 import re
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -23,6 +24,8 @@ from harness.evidence.artifact_evidence import cumulative_row_key as _cumulative
 from harness.evidence.artifact_evidence import detect_blocker_data_rows
 from harness.evidence.artifact_evidence import detect_placeholder_rows
 from harness.evidence.file_evidence import saved_paths_from_value
+from harness.tools.browser_tools.downloads import _download_records
+from harness.tools.browser_tools.downloads import _normalize_download_record
 from harness.results.row_ledger import ROW_OUTCOMES
 from harness.results.row_ledger import field_absence_accepted
 from harness.utils import JsonDict
@@ -333,19 +336,86 @@ def _run_file_validator(
     ])
 
     if validator_type == "download_completed":
+        # A completion receipt must come from the operation itself
+        # (Download.start, or the legacy File.download) or from a Download.*
+        # query whose response carries the record. When the validator
+        # declares a target (download_id and/or path_pattern), an unrelated
+        # completed record inside a broad Download.list response must NOT
+        # prove this phase's download completed.
+        expected_download_id = str(
+            validator.get("download_id")
+            or validator.get("downloadId")
+            or ""
+        ).strip()
+        expected_pattern = str(
+            validator.get("path_pattern") or validator.get("pattern") or ""
+        ).strip()
         receipts = [
             item for item in evidence
             if isinstance(item, dict) and (
-                str(item.get("method") or "") == "File.download"
+                str(item.get("method") or "") in {"Download.start", "File.download"}
                 or str(item.get("method") or "").startswith("Download.")
             )
         ]
-        completed = any(_file_receipt_completed(item) for item in receipts)
+
+        def receipt_proves_completion(item: JsonDict) -> bool:
+            """One download RECORD must prove the whole claim on its own.
+
+            Evidence may never be stitched across records: a response where
+            `other -> completed` and `target -> waiting` proves nothing about
+            the target, even though the response contains both a completed
+            state, the target id, and matching paths somewhere inside it. Each
+            candidate record is normalized and must independently carry the
+            expected downloadId (when declared), the expected savePath (when
+            declared), AND state == completed.
+            """
+            response = item.get("response")
+            if not _file_receipt_succeeded(item):
+                return False
+            candidates: List[JsonDict] = [
+                normalized
+                for normalized in (
+                    _normalize_download_record(record)
+                    for record in _download_records(response)
+                )
+                if normalized is not None
+            ]
+            if not candidates:
+                # Legacy envelopes (File.download {downloaded: <path>}) carry
+                # no download records; fall back to the whole-response shape
+                # check with the target constraints applied to saved paths.
+                if not _file_receipt_completed(item):
+                    return False
+                if not expected_download_id and not expected_pattern:
+                    return True
+                paths = list(_receipt_saved_paths(response))
+                if expected_download_id:
+                    return False
+                return any(
+                    fnmatch.fnmatch(path, expected_pattern) for path in paths
+                )
+            for record in candidates:
+                if str(record.get("state") or "") != "completed":
+                    continue
+                if expected_download_id and str(
+                    record.get("downloadId") or ""
+                ).strip() != expected_download_id:
+                    continue
+                if expected_pattern and not fnmatch.fnmatch(
+                    str(record.get("savePath") or ""), expected_pattern
+                ):
+                    continue
+                return True
+            return False
+
+        completed = any(receipt_proves_completion(item) for item in receipts)
         if completed:
             return []
         return [{
             "type": validator_type,
             "message": "no successful completed download receipt was recorded",
+            "expectedDownloadId": expected_download_id or None,
+            "expectedPathPattern": expected_pattern or None,
             "receiptCount": len(receipts),
         }]
 
@@ -710,6 +780,9 @@ def _normalize_expected_artifact_contract(
     warnings: List[JsonDict],
     *,
     phase_id: str,
+    task_type: str = "",
+    stage_hint: str = "",
+    allow_legacy_missing_required_controls: bool = False,
 ) -> JsonDict:
     """Recover one canonical expected-artifact shape from equivalent inputs.
 
@@ -719,6 +792,96 @@ def _normalize_expected_artifact_contract(
     receipt, then backfill only from an unambiguous contract source.
     """
     expected = dict(expected_artifact)
+    # Form phases can declare the business controls they must complete.  This
+    # is deliberately an artifact contract rather than a second state store:
+    # workers emit one evidence row per stable controlKey and the ordinary
+    # validators below prove the exact key set.  Accept the early snake_case
+    # spelling but persist one canonical shape for replans/resume.
+    raw_controls = expected.get("requiredControls")
+    if raw_controls is None:
+        raw_controls = expected.pop("required_controls", None)
+    if (
+        raw_controls is None
+        and task_type == "form_filling"
+        and stage_hint == "form_interaction"
+    ):
+        if allow_legacy_missing_required_controls:
+            warnings.append({
+                "type": "legacy_required_controls_missing",
+                "phase": phase_id,
+                "message": (
+                    "An already accepted historical form phase has no"
+                    " expected_artifact.requiredControls contract. It remains"
+                    " valid only as an immutable prefix of this extension; new"
+                    " or changed form phases must declare stable controlKey"
+                    " values."
+                ),
+            })
+        else:
+            errors.append(
+                f"phase {phase_id}: form_filling/form_interaction requires "
+                "expected_artifact.requiredControls with stable controlKey values"
+            )
+    if raw_controls is not None:
+        if not isinstance(raw_controls, list) or not raw_controls:
+            errors.append(
+                f"phase {phase_id}: expected_artifact.requiredControls must be a non-empty array"
+            )
+        else:
+            controls: List[JsonDict] = []
+            seen_control_keys: Set[str] = set()
+            for index, item in enumerate(raw_controls):
+                if not isinstance(item, dict):
+                    errors.append(
+                        f"phase {phase_id}: requiredControls[{index}] must be an object"
+                    )
+                    continue
+                control_key = str(item.get("controlKey") or item.get("control_key") or "").strip()
+                if not control_key:
+                    errors.append(
+                        f"phase {phase_id}: requiredControls[{index}].controlKey is required"
+                    )
+                    continue
+                if control_key in seen_control_keys:
+                    errors.append(
+                        f"phase {phase_id}: duplicate requiredControls controlKey {control_key!r}"
+                    )
+                    continue
+                seen_control_keys.add(control_key)
+                normalized_control: JsonDict = {"controlKey": control_key}
+                for key in ("label", "section"):
+                    value = str(item.get(key) or "").strip()
+                    if value:
+                        normalized_control[key] = value
+                controls.append(normalized_control)
+            if controls:
+                expected["requiredControls"] = controls
+                declared_count = len(controls)
+                exact = _tc()._positive_int(expected.get("exact_rows"), default=0)
+                if exact and exact != declared_count:
+                    errors.append(
+                        f"phase {phase_id}: exact_rows={exact} conflicts with "
+                        f"requiredControls count={declared_count}"
+                    )
+                expected["exact_rows"] = declared_count
+                for field_key in ("fields", "required_fields"):
+                    fields = expected.get(field_key)
+                    if fields is None:
+                        fields = []
+                    if not isinstance(fields, list):
+                        errors.append(
+                            f"phase {phase_id}: expected_artifact.{field_key} must be an array"
+                        )
+                        continue
+                    normalized_fields = list(fields)
+                    field_names = field_names_from_specs(normalized_fields)
+                    for required_field in ("controlKey", "filledValue"):
+                        if required_field not in field_names:
+                            normalized_fields.append({
+                                "name": required_field,
+                                "nonempty": True,
+                            })
+                    expected[field_key] = normalized_fields
     blank_values = []
     for key in list(expected):
         if str(key).strip():
@@ -939,6 +1102,26 @@ def _normalize_validators(
                 "require_source_tool": True,
                 "require_selector": True,
             })
+
+    required_controls = expected_artifact.get("requiredControls")
+    if isinstance(required_controls, list) and required_controls:
+        control_keys = [
+            str(item.get("controlKey") or "").strip()
+            for item in required_controls
+            if isinstance(item, dict) and str(item.get("controlKey") or "").strip()
+        ]
+        if control_keys:
+            # set_equals prevents a partial subset from satisfying a row-count
+            # contract; unique prevents duplicate rows from impersonating two
+            # controls.  Both are existing validators with normal receipts.
+            normalized.extend((
+                {"type": "set_equals", "field": "controlKey", "values": control_keys},
+                {"type": "unique", "fields": ["controlKey"]},
+                {
+                    "type": "field_nonempty",
+                    "fields": ["controlKey", "filledValue"],
+                },
+            ))
 
     for index, validator in enumerate(validators):
         if not isinstance(validator, dict):

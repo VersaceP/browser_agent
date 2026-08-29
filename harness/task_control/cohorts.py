@@ -18,6 +18,7 @@ from typing import Tuple
 from urllib.parse import urlsplit
 from harness.evidence.extraction_artifacts import field_names_from_specs
 from harness.evidence.artifact_evidence import VALIDATOR_SCOPE
+from harness.task_types import normalize_task_type
 from harness.utils import JsonDict
 from harness.utils import RunLogger
 from harness.utils import load_task_json
@@ -50,6 +51,7 @@ _AUTO_BIND_EXCLUDED_STAGES = frozenset({
     "computed_relationship",
     "form_interaction",
 })
+_AUTO_BIND_TASK_TYPES = frozenset({"web_search", "web_scrape"})
 
 
 def _auto_bind_exact_row_count(
@@ -111,9 +113,11 @@ def _auto_bind_identity_field(
             raw = validator.get("fields")
             if isinstance(raw, list) and len(raw) == 1:
                 field = str(raw[0]).strip()
-                if field in expected_fields and field in (
-                    _AUTO_BIND_URL_FIELDS + _AUTO_BIND_ID_FIELDS
-                ):
+                # A reviewed unique validator is stronger than a field-name
+                # convention.  Conventional URL/ID names remain a fallback,
+                # but a generic stable key (for example sourceProductKey)
+                # must not be rejected merely because it is not called "id".
+                if field in expected_fields:
                     candidates.append(field)
     candidates.extend(
         field for field in _AUTO_BIND_URL_FIELDS + _AUTO_BIND_ID_FIELDS
@@ -203,8 +207,14 @@ def assess_batch_source_binding(
         return {"status": "not_applicable"}
     if not isinstance(plan, dict):
         return {"status": "not_applicable"}
+    if normalize_task_type(phase.get("task_type")) not in _AUTO_BIND_TASK_TYPES:
+        return {"status": "not_applicable", "reason": "task_type_not_read_only"}
     if str(phase.get("stage_hint") or "") in _AUTO_BIND_EXCLUDED_STAGES:
         return {"status": "not_applicable"}
+    # A join/fanout is not a simple one-source, row-preserving transformation.
+    # Do not infer a source merely because a count happens to match.
+    if phase.get("join") is not None or phase.get("fanout_from") is not None:
+        return {"status": "not_applicable", "reason": "non_rowwise_plan_shape"}
     batch_policy = worker_contract.get("batch_policy")
     if not isinstance(batch_policy, dict):
         batch_policy = {}
@@ -244,9 +254,15 @@ def assess_batch_source_binding(
         != declared_artifact_name
     ):
         return {"status": "not_applicable", "reason": "input_artifact_plan_mismatch"}
-    expected = worker_contract.get("expected_artifact")
+    # The accepted phase is the output-contract authority.  The effective
+    # worker contract can include a spawn-time Lead override; it must never
+    # alter the row-count or identity proof for automatic binding.
+    if phase.get("validators_normalized") is not True:
+        return {"status": "not_applicable", "reason": "phase_not_normalized"}
+    expected = phase.get("expected_artifact")
     expected = expected if isinstance(expected, dict) else {}
-    target_count = _auto_bind_exact_row_count(expected, worker_contract.get("validators"))
+    reviewed_validators = phase.get("validators")
+    target_count = _auto_bind_exact_row_count(expected, reviewed_validators)
     # A one-row downstream result can be a summary, join, or other semantic
     # reduction.  Leave that shape to the Lead rather than guessing it is a
     # detail phase.
@@ -293,7 +309,7 @@ def assess_batch_source_binding(
     identity_field = _auto_bind_identity_field(
         source_rows,
         _auto_bind_expected_fields(expected),
-        worker_contract.get("validators"),
+        reviewed_validators,
     )
     if not identity_field:
         return {
