@@ -1,14 +1,162 @@
 {
   "method": "Page.list",
-  "description": "Lists all tracked tabs for a fleet so the agent can select, switch to, inspect, or close the correct pageId.",
-  "params": {
-    "fleetId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Fleet ID whose tracked pages should be listed.",
-      "required": true
+  "description": "Lists pages owned by a Fleet with their lifecycle and queue-activity states.",
+  "requiresPurpose": false,
+  "actionRevision": "sha256:47a235ddf3d3650b19cdf2e22a650ce7d64d1870857e4c00898f5a8db149ccba",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "fleetId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Fleet ID whose tracked pages should be listed."
+      }
+    },
+    "required": [
+      "fleetId"
+    ],
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "array",
+    "items": {
+      "type": "object",
+      "properties": {
+        "pageId": {
+          "description": "Page ID.",
+          "type": "string"
+        },
+        "lifecycle": {
+          "description": "Page lifecycle state.",
+          "type": "string"
+        },
+        "status": {
+          "description": "Page runtime status.",
+          "type": "string"
+        },
+        "url": {
+          "description": "Current page URL.",
+          "type": "string"
+        },
+        "title": {
+          "description": "Current document title.",
+          "type": "string"
+        },
+        "queue": {
+          "description": "Queued page work summary.",
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {}
+        }
+      },
+      "additionalProperties": {},
+      "description": "One page summary."
     }
   },
-  "requiresPurpose": false
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "pageId": {
+              "description": "Page ID.",
+              "type": "string"
+            },
+            "lifecycle": {
+              "description": "Page lifecycle state.",
+              "type": "string"
+            },
+            "status": {
+              "description": "Page runtime status.",
+              "type": "string"
+            },
+            "url": {
+              "description": "Current page URL.",
+              "type": "string"
+            },
+            "title": {
+              "description": "Current document title.",
+              "type": "string"
+            },
+            "queue": {
+              "description": "Queued page work summary.",
+              "type": "object",
+              "propertyNames": {
+                "type": "string"
+              },
+              "additionalProperties": {}
+            }
+          },
+          "additionalProperties": {},
+          "description": "One page summary."
+        },
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  }
 }

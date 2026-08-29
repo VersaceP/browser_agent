@@ -1,6 +1,180 @@
 {
   "method": "System.listEvents",
-  "description": "Lists agent-visible push events; use it to understand notifications that may interrupt or update automation, not to invoke browser behavior.",
-  "params": {},
-  "requiresPurpose": false
+  "description": "Returns Agent-visible event summaries and the current event-catalog revision.",
+  "requiresPurpose": false,
+  "actionRevision": "sha256:b60e13937f4a7a9a37ba038a61d2becb26a0ff1d0c8f682f82ab85c5fc508854",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {},
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "eventCatalogRevision": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Content revision of the current event catalog."
+      },
+      "events": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Canonical Agent-visible event name."
+            },
+            "category": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Event category used for routing and interpretation."
+            },
+            "severity": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Event severity as defined by the event registry."
+            },
+            "description": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Compact event condition summary."
+            }
+          },
+          "required": [
+            "event",
+            "category",
+            "severity",
+            "description"
+          ],
+          "additionalProperties": false,
+          "description": "Compact event summary used for discovery."
+        },
+        "description": "Agent-visible event summaries in the current catalog."
+      }
+    },
+    "required": [
+      "eventCatalogRevision",
+      "events"
+    ],
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "eventCatalogRevision": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Content revision of the current event catalog."
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "event": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Canonical Agent-visible event name."
+                },
+                "category": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Event category used for routing and interpretation."
+                },
+                "severity": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Event severity as defined by the event registry."
+                },
+                "description": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Compact event condition summary."
+                }
+              },
+              "required": [
+                "event",
+                "category",
+                "severity",
+                "description"
+              ],
+              "additionalProperties": false,
+              "description": "Compact event summary used for discovery."
+            },
+            "description": "Agent-visible event summaries in the current catalog."
+          }
+        },
+        "required": [
+          "eventCatalogRevision",
+          "events"
+        ],
+        "additionalProperties": false,
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  }
 }

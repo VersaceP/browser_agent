@@ -1,65 +1,175 @@
 {
   "method": "DOM.getAttribute",
-  "description": "Reads one or more attributes from one or more known DOM elements by canonical id or selector.",
-  "params": {
-    "pageId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Page ID containing the target elements.",
-      "required": true
-    },
-    "targets": {
-      "minItems": 1,
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "description": "Preferred canonical element ID from DOM.getAXTree.",
-            "type": "string",
-            "pattern": "^\\d+:\\d+:\\d+$"
-          },
-          "selector": {
-            "description": "Fallback CSS selector for the target element in the main frame.",
-            "type": "string",
-            "minLength": 1
-          }
-        },
-        "additionalProperties": false,
-        "description": "DOM query target identified by id, selector, or both."
+  "description": "Reads selected HTML attributes, or all available attributes, from one or more elements.",
+  "requiresPurpose": true,
+  "actionRevision": "sha256:a74ce9df308c0fdfa733104d4ebe72dbc90412816c0b2973b42b344298a1b20e",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "pageId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Page ID containing the target elements."
       },
-      "description": "Targets to read, preserving input order in response.data.items.",
-      "required": true
-    },
-    "attributes": {
-      "anyOf": [
-        {
-          "type": "string",
-          "minLength": 1,
-          "description": "Attribute name to read, such as \"href\", \"value\", or \"aria-checked\"."
+      "targets": {
+        "minItems": 1,
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "description": "Preferred canonical element ID from DOM.getAXTree.",
+              "type": "string",
+              "pattern": "^\\d+:\\d+:\\d+$"
+            },
+            "selector": {
+              "description": "Fallback CSS selector for the target element in the main frame.",
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": true,
+          "description": "DOM query target identified by id, selector, or both."
         },
-        {
-          "type": "array",
-          "items": {
+        "description": "Targets to read, preserving input order in response.data.items."
+      },
+      "attributes": {
+        "anyOf": [
+          {
             "type": "string",
             "minLength": 1,
             "description": "Attribute name to read, such as \"href\", \"value\", or \"aria-checked\"."
           },
-          "description": "Attribute names to read. An empty array reads all attributes."
-        }
-      ],
-      "description": "Attribute name or names to read from every target. Use [] to read all attributes.",
-      "required": true
+          {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Attribute name to read, such as \"href\", \"value\", or \"aria-checked\"."
+            },
+            "description": "Attribute names to read. An empty array reads all attributes."
+          }
+        ],
+        "description": "Attribute name or names to read from every target. Use [] to read all attributes."
+      },
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "Describe why these attributes are needed, e.g., checking a link href, validating aria state, reading an input value, or debugging selector stability"
+      }
     },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe why these attributes are needed, e.g., checking a link href, validating aria state, reading an input value, or debugging selector stability",
-      "required": true
-    }
+    "required": [
+      "pageId",
+      "targets",
+      "attributes",
+      "purpose"
+    ],
+    "additionalProperties": true
   },
-  "requiresPurpose": true,
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "items": {
+        "description": "Attribute records for each matched element.",
+        "type": "array",
+        "items": {}
+      },
+      "summary": {
+        "description": "Counts and query summary for the returned items.",
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {}
+      }
+    },
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "items": {
+            "description": "Attribute records for each matched element.",
+            "type": "array",
+            "items": {}
+          },
+          "summary": {
+            "description": "Counts and query summary for the returned items.",
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          }
+        },
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
   "purposeHint": "Describe why these attributes are needed, e.g., checking a link href, validating aria state, reading an input value, or debugging selector stability"
 }

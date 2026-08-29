@@ -1,97 +1,247 @@
 {
   "method": "Page.screenshot",
-  "description": "Captures visual evidence for rendering, canvas/graphics, layout, or audit proof; do not use screenshots to read ordinary text that DOM actions can retrieve.",
-  "params": {
-    "pageId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Page ID to capture.",
-      "required": true
-    },
-    "fullPage": {
-      "default": false,
-      "description": "Capture the full scrollable page when true.",
-      "type": "boolean",
-      "required": true
-    },
-    "x": {
-      "description": "Left coordinate for region capture.",
-      "type": "integer",
-      "minimum": -9007199254740991,
-      "maximum": 9007199254740991,
-      "required": false
-    },
-    "y": {
-      "description": "Top coordinate for region capture.",
-      "type": "integer",
-      "minimum": -9007199254740991,
-      "maximum": 9007199254740991,
-      "required": false
-    },
-    "width": {
-      "description": "Region width for partial capture.",
-      "type": "integer",
-      "minimum": -9007199254740991,
-      "maximum": 9007199254740991,
-      "required": false
-    },
-    "height": {
-      "description": "Region height for partial capture.",
-      "type": "integer",
-      "minimum": -9007199254740991,
-      "maximum": 9007199254740991,
-      "required": false
-    },
-    "selector": {
-      "description": "Fallback CSS selector for element capture.",
-      "type": "string",
-      "required": false
-    },
-    "id": {
-      "description": "Preferred canonical element ID for element capture.",
-      "type": "string",
-      "pattern": "^\\d+:\\d+:\\d+$",
-      "required": false
-    },
-    "options": {
-      "description": "Output options for the screenshot result.",
-      "type": "object",
-      "properties": {
-        "format": {
-          "default": "file",
-          "description": "Output format for the screenshot payload.",
-          "type": "string",
-          "enum": [
-            "base64",
-            "png",
-            "jpeg",
-            "dataUrl",
-            "file"
-          ]
-        },
-        "path": {
-          "description": "Output path when format is \"file\".",
-          "type": "string"
-        },
-        "quality": {
-          "description": "JPEG quality when format is \"jpeg\".",
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 100
-        }
-      },
-      "required": false,
-      "additionalProperties": false
-    },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe the visual condition to verify, e.g., canvas output, layout overlap, CAPTCHA state, or proof-of-work screen",
-      "required": true
-    }
-  },
+  "description": "Captures the full page, viewport, rectangular region, or resolved element as an image.",
   "requiresPurpose": true,
+  "actionRevision": "sha256:49abfcec13d57af87a6769e6afe01c35ce4739f03b330f1c7871a5251fdb66e2",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "pageId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Page ID to capture."
+      },
+      "fullPage": {
+        "default": false,
+        "description": "Capture the full scrollable page when true.",
+        "type": "boolean"
+      },
+      "x": {
+        "description": "Left coordinate for region capture.",
+        "type": "integer",
+        "minimum": -9007199254740991,
+        "maximum": 9007199254740991
+      },
+      "y": {
+        "description": "Top coordinate for region capture.",
+        "type": "integer",
+        "minimum": -9007199254740991,
+        "maximum": 9007199254740991
+      },
+      "width": {
+        "description": "Region width for partial capture.",
+        "type": "integer",
+        "minimum": -9007199254740991,
+        "maximum": 9007199254740991
+      },
+      "height": {
+        "description": "Region height for partial capture.",
+        "type": "integer",
+        "minimum": -9007199254740991,
+        "maximum": 9007199254740991
+      },
+      "selector": {
+        "description": "Fallback CSS selector for element capture.",
+        "type": "string"
+      },
+      "id": {
+        "description": "Preferred canonical element ID for element capture.",
+        "type": "string",
+        "pattern": "^\\d+:\\d+:\\d+$"
+      },
+      "options": {
+        "description": "Output options for the screenshot result.",
+        "type": "object",
+        "properties": {
+          "format": {
+            "default": "file",
+            "description": "Output format for the screenshot payload.",
+            "type": "string",
+            "enum": [
+              "base64",
+              "png",
+              "jpeg",
+              "dataUrl",
+              "file"
+            ]
+          },
+          "path": {
+            "description": "Output path when format is \"file\".",
+            "type": "string"
+          },
+          "quality": {
+            "description": "JPEG quality when format is \"jpeg\".",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          }
+        },
+        "required": [
+          "format"
+        ],
+        "additionalProperties": true
+      },
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "Describe the visual condition to verify, e.g., canvas output, layout overlap, CAPTCHA state, or proof-of-work screen"
+      }
+    },
+    "required": [
+      "pageId",
+      "fullPage",
+      "purpose"
+    ],
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "pageId": {
+        "description": "Page ID captured.",
+        "type": "string"
+      },
+      "mode": {
+        "description": "Capture mode used.",
+        "type": "string"
+      },
+      "path": {
+        "description": "Output file path when a file was written.",
+        "type": "string"
+      },
+      "data": {
+        "description": "Inline image data when requested.",
+        "type": "string"
+      },
+      "mimeType": {
+        "description": "Image MIME type.",
+        "type": "string"
+      },
+      "width": {
+        "description": "Captured width in pixels.",
+        "type": "number"
+      },
+      "height": {
+        "description": "Captured height in pixels.",
+        "type": "number"
+      },
+      "target": {
+        "description": "Resolved target summary for an element or region capture."
+      },
+      "resolvedBy": {
+        "description": "Resolution mode used for the capture target.",
+        "type": "string"
+      }
+    },
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "description": "Page ID captured.",
+            "type": "string"
+          },
+          "mode": {
+            "description": "Capture mode used.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Output file path when a file was written.",
+            "type": "string"
+          },
+          "data": {
+            "description": "Inline image data when requested.",
+            "type": "string"
+          },
+          "mimeType": {
+            "description": "Image MIME type.",
+            "type": "string"
+          },
+          "width": {
+            "description": "Captured width in pixels.",
+            "type": "number"
+          },
+          "height": {
+            "description": "Captured height in pixels.",
+            "type": "number"
+          },
+          "target": {
+            "description": "Resolved target summary for an element or region capture."
+          },
+          "resolvedBy": {
+            "description": "Resolution mode used for the capture target.",
+            "type": "string"
+          }
+        },
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
   "purposeHint": "Describe the visual condition to verify, e.g., canvas output, layout overlap, CAPTCHA state, or proof-of-work screen"
 }

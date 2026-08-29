@@ -1,53 +1,183 @@
 {
   "method": "Network.setInterception",
-  "description": "Sets network request interception rules to filter unwanted requests and improve performance.",
-  "params": {
-    "pageId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Page ID whose network requests should be filtered.",
-      "required": true
+  "description": "Replaces the ordered network-interception rules for a page session.",
+  "requiresPurpose": true,
+  "actionRevision": "sha256:3a29449250c08474a802bc15351c413d72a4a6719f5674f51b8d04d8611b1c20",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "pageId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Page ID whose network requests should be filtered."
+      },
+      "patterns": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "urlPattern": {
+              "type": "string",
+              "description": "URL match pattern for the request rule."
+            },
+            "resourceType": {
+              "description": "Optional request resource type to narrow the rule.",
+              "type": "string"
+            },
+            "action": {
+              "type": "string",
+              "enum": [
+                "block",
+                "allow"
+              ],
+              "description": "Whether matching requests should be blocked or explicitly allowed."
+            }
+          },
+          "required": [
+            "urlPattern",
+            "action"
+          ],
+          "additionalProperties": true
+        },
+        "description": "Interception rules to apply in order."
+      },
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "Describe why you are intercepting requests, e.g., blocking ad requests to improve performance"
+      }
     },
-    "patterns": {
-      "type": "array",
-      "items": {
+    "required": [
+      "pageId",
+      "patterns",
+      "purpose"
+    ],
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "pageId": {
+        "description": "Page ID whose interception rules were replaced.",
+        "type": "string"
+      },
+      "ruleCount": {
+        "description": "Number of active interception rules after replacement.",
+        "type": "number"
+      },
+      "replaced": {
+        "description": "Whether the previous rule set was replaced.",
+        "type": "boolean"
+      },
+      "ruleIds": {
+        "description": "Opaque IDs assigned to the active rules.",
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "patternsSet": {
+        "description": "Number of URL patterns accepted by the browser session.",
+        "type": "number"
+      }
+    },
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "properties": {
-          "urlPattern": {
-            "type": "string",
-            "description": "URL match pattern for the request rule."
-          },
-          "resourceType": {
-            "description": "Optional request resource type to narrow the rule.",
+          "pageId": {
+            "description": "Page ID whose interception rules were replaced.",
             "type": "string"
           },
-          "action": {
+          "ruleCount": {
+            "description": "Number of active interception rules after replacement.",
+            "type": "number"
+          },
+          "replaced": {
+            "description": "Whether the previous rule set was replaced.",
+            "type": "boolean"
+          },
+          "ruleIds": {
+            "description": "Opaque IDs assigned to the active rules.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "patternsSet": {
+            "description": "Number of URL patterns accepted by the browser session.",
+            "type": "number"
+          }
+        },
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
             "type": "string",
-            "enum": [
-              "block",
-              "allow"
-            ],
-            "description": "Whether matching requests should be blocked or explicitly allowed."
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
           }
         },
         "required": [
-          "urlPattern",
-          "action"
+          "code",
+          "message"
         ],
         "additionalProperties": false
       },
-      "description": "Interception rules to apply in order.",
-      "required": true
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
     },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe why you are intercepting requests, e.g., blocking ad requests to improve performance",
-      "required": true
-    }
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
   },
-  "requiresPurpose": true,
   "purposeHint": "Describe why you are intercepting requests, e.g., blocking ad requests to improve performance"
 }

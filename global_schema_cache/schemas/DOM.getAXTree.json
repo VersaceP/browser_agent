@@ -1,34 +1,178 @@
 {
   "method": "DOM.getAXTree",
-  "description": "Retrieves a compact page map with structure, actionable targets, canonical ids, and compact layout hints; use it as the default page exploration entry before DOM reads or Input actions.",
-  "params": {
-    "pageId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Page ID whose compact page map should be returned.",
-      "required": true
-    },
-    "id": {
-      "description": "Canonical element ID used to scope the AX tree to a specific subtree.",
-      "type": "string",
-      "pattern": "^\\d+:\\d+:\\d+$",
-      "required": false
-    },
-    "selector": {
-      "description": "CSS selector used to scope the AX tree to the first matching element in the main frame.",
-      "type": "string",
-      "minLength": 1,
-      "required": false
-    },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe why you need the current page map, e.g., understanding page structure, locating an actionable target, checking enabled/checked/layout state, or refreshing canonical element ids",
-      "required": true
-    }
-  },
+  "description": "Returns a compact accessibility-tree page map for locating interactive and semantic elements.",
   "requiresPurpose": true,
+  "actionRevision": "sha256:2016d51a2c5cc20f7a500bb37d435ba817551057db11f070d38cac975bac95c5",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "pageId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Page ID whose compact page map should be returned."
+      },
+      "id": {
+        "description": "Canonical element ID used to scope the AX tree to a specific subtree.",
+        "type": "string",
+        "pattern": "^\\d+:\\d+:\\d+$"
+      },
+      "selector": {
+        "description": "CSS selector used to scope the AX tree to the first matching element in the main frame.",
+        "type": "string",
+        "minLength": 1
+      },
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "Describe why you need the current page map, e.g., understanding page structure, locating an actionable target, checking enabled/checked/layout state, or refreshing canonical element ids"
+      }
+    },
+    "required": [
+      "pageId",
+      "purpose"
+    ],
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "lines": {
+        "description": "Compact accessibility-tree lines for the current page and included frames.",
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "nodeCount": {
+        "description": "Number of accessibility nodes represented in lines.",
+        "type": "number"
+      },
+      "frameCount": {
+        "description": "Number of frames represented in the page map.",
+        "type": "number"
+      },
+      "truncated": {
+        "description": "Whether the page map was truncated by the configured output limit.",
+        "type": "boolean"
+      },
+      "resolutionSource": {
+        "description": "Target resolution route used when a target was requested.",
+        "type": "string"
+      },
+      "recoveredTarget": {
+        "description": "Snapshot details used when a stale target was recovered.",
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {}
+      }
+    },
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "lines": {
+            "description": "Compact accessibility-tree lines for the current page and included frames.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "nodeCount": {
+            "description": "Number of accessibility nodes represented in lines.",
+            "type": "number"
+          },
+          "frameCount": {
+            "description": "Number of frames represented in the page map.",
+            "type": "number"
+          },
+          "truncated": {
+            "description": "Whether the page map was truncated by the configured output limit.",
+            "type": "boolean"
+          },
+          "resolutionSource": {
+            "description": "Target resolution route used when a target was requested.",
+            "type": "string"
+          },
+          "recoveredTarget": {
+            "description": "Snapshot details used when a stale target was recovered.",
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          }
+        },
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
   "purposeHint": "Describe why you need the current page map, e.g., understanding page structure, locating an actionable target, checking enabled/checked/layout state, or refreshing canonical element ids"
 }

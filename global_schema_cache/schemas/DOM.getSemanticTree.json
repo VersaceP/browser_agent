@@ -1,44 +1,207 @@
 {
   "method": "DOM.getSemanticTree",
-  "description": "Retrieves a bounded native semantic DOM frame graph, including accessible iframe documents, for tag hierarchy, bounds, Shadow DOM, and selector diagnostics; use DOM.getAXTree as the default page map first.",
-  "params": {
-    "pageId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Page ID whose DOM structure should be inspected.",
-      "required": true
-    },
-    "id": {
-      "description": "Canonical element ID to inspect from DOM.getAXTree.",
-      "type": "string",
-      "pattern": "^\\d+:\\d+:\\d+$",
-      "required": false
-    },
-    "selector": {
-      "description": "Unique CSS selector used to resolve the semantic tree root.",
-      "type": "string",
-      "minLength": 1,
-      "required": false
-    },
-    "includeShadowDom": {
-      "description": "Include Shadow DOM content in the returned tree when true.",
-      "type": "boolean",
-      "required": false
-    },
-    "filterNoise": {
-      "description": "Filter low-signal nodes from the returned tree when true.",
-      "type": "boolean",
-      "required": false
-    },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe why raw local DOM structure is needed, e.g., diagnosing a selector, inspecting Shadow DOM, bounds, or nested layout after DOM.getAXTree was insufficient",
-      "required": true
-    }
-  },
+  "description": "Returns structured semantic DOM content for the main document and accessible child frames when the accessibility tree is insufficient.",
   "requiresPurpose": true,
-  "purposeHint": "Describe why raw local DOM structure is needed, e.g., diagnosing a selector, inspecting Shadow DOM, bounds, or nested layout after DOM.getAXTree was insufficient"
+  "actionRevision": "sha256:30d83f583fcdd3cdf5f7827f206382e22a530b718a553745fc0d6070bcfdc536",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "pageId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Page ID whose DOM structure should be inspected."
+      },
+      "id": {
+        "description": "Canonical DOM target ID.",
+        "type": "string",
+        "pattern": "^\\d+:\\d+:\\d+$"
+      },
+      "selector": {
+        "description": "Unique CSS selector for the DOM root.",
+        "type": "string",
+        "minLength": 1
+      },
+      "context": {
+        "description": "Optional DOM context depth limits.",
+        "type": "object",
+        "properties": {
+          "maxParentDepth": {
+            "default": 4,
+            "description": "Maximum number of DOM parents to include above the target. Ignored when neither id nor selector is provided.",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 64
+          },
+          "maxSubtreeDepth": {
+            "default": 12,
+            "description": "Maximum DOM descendant depth to include.",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 64
+          }
+        },
+        "required": [
+          "maxParentDepth",
+          "maxSubtreeDepth"
+        ],
+        "additionalProperties": true
+      },
+      "includeShadowDom": {
+        "description": "Include Shadow DOM descendants.",
+        "type": "boolean"
+      },
+      "filterNoise": {
+        "description": "Filter low-signal DOM nodes.",
+        "type": "boolean"
+      },
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "Use this when DOM.getAXTree does not expose the DOM element you need. id and selector stay at the top level; omit both to inspect the document. context.maxParentDepth is ignored for a document-root request. Element bounds and scroll metrics use CSS pixels; bounds are local to each returned Frame viewport, and visible does not prove hit-testability."
+      }
+    },
+    "required": [
+      "pageId",
+      "purpose"
+    ],
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "rootFrameId": {
+        "description": "Frame ID of the returned document root.",
+        "type": "string"
+      },
+      "frames": {
+        "description": "Structured semantic trees for the root document and accessible child frames.",
+        "type": "array",
+        "items": {}
+      },
+      "summary": {
+        "description": "Node counts, truncation, and visibility summary.",
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {}
+      },
+      "resolutionSource": {
+        "description": "Target resolution route used when a target was requested.",
+        "type": "string"
+      },
+      "recoveredTarget": {
+        "description": "Snapshot details used when a stale target was recovered.",
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {}
+      }
+    },
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "rootFrameId": {
+            "description": "Frame ID of the returned document root.",
+            "type": "string"
+          },
+          "frames": {
+            "description": "Structured semantic trees for the root document and accessible child frames.",
+            "type": "array",
+            "items": {}
+          },
+          "summary": {
+            "description": "Node counts, truncation, and visibility summary.",
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          },
+          "resolutionSource": {
+            "description": "Target resolution route used when a target was requested.",
+            "type": "string"
+          },
+          "recoveredTarget": {
+            "description": "Snapshot details used when a stale target was recovered.",
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          }
+        },
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
+  "purposeHint": "Use this when DOM.getAXTree does not expose the DOM element you need. id and selector stay at the top level; omit both to inspect the document. context.maxParentDepth is ignored for a document-root request. Element bounds and scroll metrics use CSS pixels; bounds are local to each returned Frame viewport, and visible does not prove hit-testability."
 }

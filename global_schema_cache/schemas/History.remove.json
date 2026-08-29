@@ -1,44 +1,142 @@
 {
   "method": "History.remove",
-  "description": "Removes browsing history by record, origin, or all records.",
-  "params": {
-    "fleetId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Fleet ID whose browsing history should be changed.",
-      "required": true
-    },
-    "scope": {
-      "type": "string",
-      "enum": [
-        "item",
-        "origin",
-        "all"
-      ],
-      "description": "Removal scope.",
-      "required": true
-    },
-    "visitId": {
-      "description": "Opaque history visit ID when scope is item.",
-      "type": "string",
-      "minLength": 1,
-      "required": false
-    },
-    "origin": {
-      "description": "Origin string when scope is origin.",
-      "type": "string",
-      "minLength": 1,
-      "required": false
-    },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe why you are removing browsing history, e.g., cleaning up sensitive records",
-      "required": true
-    }
-  },
+  "description": "Removes a history item, all records for an origin, or all history for a Fleet.",
   "requiresPurpose": true,
+  "actionRevision": "sha256:088320b772e651d2ed7c42eb21f0d592e54e3af0d8cde71514ff720220c01de8",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "fleetId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Fleet ID whose browsing history should be changed."
+      },
+      "scope": {
+        "type": "string",
+        "enum": [
+          "item",
+          "origin",
+          "all"
+        ],
+        "description": "Removal scope."
+      },
+      "visitId": {
+        "description": "Opaque history visit ID when scope is item.",
+        "type": "string",
+        "minLength": 1
+      },
+      "origin": {
+        "description": "Origin string when scope is origin.",
+        "type": "string",
+        "minLength": 1
+      },
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "Describe why you are removing browsing history, e.g., cleaning up sensitive records"
+      }
+    },
+    "required": [
+      "fleetId",
+      "scope",
+      "purpose"
+    ],
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "removed": {
+        "description": "Number of history records removed by the underlying store.",
+        "type": "number"
+      },
+      "removedCount": {
+        "description": "Normalized number of history records removed.",
+        "type": "number"
+      }
+    },
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "removed": {
+            "description": "Number of history records removed by the underlying store.",
+            "type": "number"
+          },
+          "removedCount": {
+            "description": "Normalized number of history records removed.",
+            "type": "number"
+          }
+        },
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
   "purposeHint": "Describe why you are removing browsing history, e.g., cleaning up sensitive records"
 }

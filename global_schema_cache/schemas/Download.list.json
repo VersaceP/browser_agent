@@ -1,52 +1,625 @@
 {
   "method": "Download.list",
-  "description": "Lists recent download records, optionally filtered by ID or lifecycle state.",
-  "params": {
-    "fleetId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Fleet ID whose downloads should be queried.",
-      "required": true
-    },
-    "downloadId": {
-      "description": "Optional opaque download ID to inspect.",
-      "type": "string",
-      "minLength": 1,
-      "required": false
-    },
-    "states": {
-      "description": "Optional lifecycle states to include.",
-      "minItems": 1,
-      "type": "array",
-      "items": {
-        "type": "string",
-        "enum": [
-          "downloading",
-          "paused",
-          "completed",
-          "failed",
-          "cancelled"
-        ]
-      },
-      "required": false
-    },
-    "limit": {
-      "default": 100,
-      "description": "Maximum recent download records to return.",
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 1000,
-      "required": true
-    },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe why you are viewing downloads, e.g., checking if a download has completed",
-      "required": true
-    }
-  },
+  "description": "Lists recent download records for a Fleet, optionally filtered by ID or lifecycle state.",
   "requiresPurpose": true,
+  "actionRevision": "sha256:51ccee85f7f29e668b6efbade37262c05f730b9d6ff68072533215cdc2d95698",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "fleetId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Fleet ID whose downloads should be queried."
+      },
+      "downloadId": {
+        "description": "Optional opaque download ID to inspect.",
+        "type": "string",
+        "minLength": 1
+      },
+      "states": {
+        "description": "Optional lifecycle states to include.",
+        "minItems": 1,
+        "type": "array",
+        "items": {
+          "type": "string",
+          "enum": [
+            "waiting",
+            "downloading",
+            "paused",
+            "completed",
+            "failed",
+            "cancelled"
+          ]
+        }
+      },
+      "limit": {
+        "default": 100,
+        "description": "Maximum recent download records to return.",
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 1000
+      },
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "Describe why you are viewing downloads, e.g., checking if a download has completed"
+      }
+    },
+    "required": [
+      "fleetId",
+      "limit",
+      "purpose"
+    ],
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "summary": {
+        "type": "object",
+        "properties": {
+          "total": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Number of records returned after filtering."
+          },
+          "waiting": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Number of records waiting for a page-initiated download."
+          },
+          "active": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Number of downloading or paused records."
+          },
+          "terminal": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Number of completed, failed, or cancelled records."
+          }
+        },
+        "required": [
+          "total",
+          "waiting",
+          "active",
+          "terminal"
+        ],
+        "additionalProperties": false,
+        "description": "Counts grouped by the current download lifecycle."
+      },
+      "downloads": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "downloadId": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Opaque download record ID."
+            },
+            "sourceType": {
+              "type": "string",
+              "enum": [
+                "url",
+                "page"
+              ],
+              "description": "Whether the download came from a direct URL or a page-initiated request."
+            },
+            "pageId": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Page ID that owns or initiated the download, when applicable."
+            },
+            "documentRevision": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": -9007199254740991,
+                  "maximum": 9007199254740991
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Document revision observed when the page download was reserved."
+            },
+            "requestedUrl": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "URL originally requested for a direct download, when available."
+            },
+            "finalUrl": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Final URL observed by the browser, when available."
+            },
+            "filename": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filename reported by the download host, when available."
+            },
+            "savePath": {
+              "type": "string",
+              "description": "Destination path selected for the download."
+            },
+            "state": {
+              "type": "string",
+              "enum": [
+                "waiting",
+                "downloading",
+                "paused",
+                "completed",
+                "failed",
+                "cancelled"
+              ],
+              "description": "Current download lifecycle state."
+            },
+            "totalBytes": {
+              "type": "number",
+              "minimum": 0,
+              "description": "Total byte length when known; zero means the host has not reported it."
+            },
+            "receivedBytes": {
+              "type": "number",
+              "minimum": 0,
+              "description": "Bytes received so far."
+            },
+            "mimeType": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "MIME type reported by the download host, when available."
+            },
+            "expiresAt": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Reservation expiry timestamp in milliseconds, or null when not reserved."
+            },
+            "createdAt": {
+              "type": "number",
+              "description": "Record creation timestamp in milliseconds."
+            },
+            "startedAt": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Download start timestamp in milliseconds, when started."
+            },
+            "updatedAt": {
+              "type": "number",
+              "description": "Last record update timestamp in milliseconds."
+            },
+            "completedAt": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Completion timestamp in milliseconds, when terminal."
+            },
+            "failure": {
+              "type": "object",
+              "properties": {
+                "code": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Stable public failure code."
+                },
+                "message": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Concise public explanation of the failure."
+                },
+                "suggested_prompt": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Next-observation guidance for the Agent."
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "suggested_prompt"
+              ],
+              "additionalProperties": false,
+              "description": "Structured failure details for a terminal download."
+            }
+          },
+          "required": [
+            "downloadId",
+            "sourceType",
+            "pageId",
+            "documentRevision",
+            "requestedUrl",
+            "finalUrl",
+            "filename",
+            "savePath",
+            "state",
+            "totalBytes",
+            "receivedBytes",
+            "mimeType",
+            "expiresAt",
+            "createdAt",
+            "startedAt",
+            "updatedAt",
+            "completedAt"
+          ],
+          "additionalProperties": {}
+        },
+        "description": "Download records ordered by the action implementation."
+      }
+    },
+    "required": [
+      "summary",
+      "downloads"
+    ],
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "summary": {
+            "type": "object",
+            "properties": {
+              "total": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Number of records returned after filtering."
+              },
+              "waiting": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Number of records waiting for a page-initiated download."
+              },
+              "active": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Number of downloading or paused records."
+              },
+              "terminal": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Number of completed, failed, or cancelled records."
+              }
+            },
+            "required": [
+              "total",
+              "waiting",
+              "active",
+              "terminal"
+            ],
+            "additionalProperties": false,
+            "description": "Counts grouped by the current download lifecycle."
+          },
+          "downloads": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "downloadId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Opaque download record ID."
+                },
+                "sourceType": {
+                  "type": "string",
+                  "enum": [
+                    "url",
+                    "page"
+                  ],
+                  "description": "Whether the download came from a direct URL or a page-initiated request."
+                },
+                "pageId": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Page ID that owns or initiated the download, when applicable."
+                },
+                "documentRevision": {
+                  "anyOf": [
+                    {
+                      "type": "integer",
+                      "minimum": -9007199254740991,
+                      "maximum": 9007199254740991
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Document revision observed when the page download was reserved."
+                },
+                "requestedUrl": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "URL originally requested for a direct download, when available."
+                },
+                "finalUrl": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Final URL observed by the browser, when available."
+                },
+                "filename": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Filename reported by the download host, when available."
+                },
+                "savePath": {
+                  "type": "string",
+                  "description": "Destination path selected for the download."
+                },
+                "state": {
+                  "type": "string",
+                  "enum": [
+                    "waiting",
+                    "downloading",
+                    "paused",
+                    "completed",
+                    "failed",
+                    "cancelled"
+                  ],
+                  "description": "Current download lifecycle state."
+                },
+                "totalBytes": {
+                  "type": "number",
+                  "minimum": 0,
+                  "description": "Total byte length when known; zero means the host has not reported it."
+                },
+                "receivedBytes": {
+                  "type": "number",
+                  "minimum": 0,
+                  "description": "Bytes received so far."
+                },
+                "mimeType": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "MIME type reported by the download host, when available."
+                },
+                "expiresAt": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Reservation expiry timestamp in milliseconds, or null when not reserved."
+                },
+                "createdAt": {
+                  "type": "number",
+                  "description": "Record creation timestamp in milliseconds."
+                },
+                "startedAt": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Download start timestamp in milliseconds, when started."
+                },
+                "updatedAt": {
+                  "type": "number",
+                  "description": "Last record update timestamp in milliseconds."
+                },
+                "completedAt": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Completion timestamp in milliseconds, when terminal."
+                },
+                "failure": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Stable public failure code."
+                    },
+                    "message": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Concise public explanation of the failure."
+                    },
+                    "suggested_prompt": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Next-observation guidance for the Agent."
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "suggested_prompt"
+                  ],
+                  "additionalProperties": false,
+                  "description": "Structured failure details for a terminal download."
+                }
+              },
+              "required": [
+                "downloadId",
+                "sourceType",
+                "pageId",
+                "documentRevision",
+                "requestedUrl",
+                "finalUrl",
+                "filename",
+                "savePath",
+                "state",
+                "totalBytes",
+                "receivedBytes",
+                "mimeType",
+                "expiresAt",
+                "createdAt",
+                "startedAt",
+                "updatedAt",
+                "completedAt"
+              ],
+              "additionalProperties": {}
+            },
+            "description": "Download records ordered by the action implementation."
+          }
+        },
+        "required": [
+          "summary",
+          "downloads"
+        ],
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
   "purposeHint": "Describe why you are viewing downloads, e.g., checking if a download has completed"
 }

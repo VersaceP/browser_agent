@@ -1,13 +1,200 @@
 {
   "method": "System.describeEvent",
-  "description": "Describes one agent-visible push event, including its meaning, severity, payload schema, and recommended response. The target may be supplied under any parameter name; event is the default name.",
-  "params": {
-    "event": {
-      "description": "Push event name, such as \"Page.loaded\" or \"Hitl.resumed\".",
-      "type": "string",
-      "minLength": 1,
-      "required": false
-    }
+  "description": "Returns the meaning, payload schema, and recommended response for one Agent-visible event. The target may be supplied under any parameter name; event is preferred.",
+  "requiresPurpose": false,
+  "actionRevision": "sha256:599ab0d7890020ff01102aff559415a01e695128fc540d9ecac05bc0d879b15d",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "event": {
+        "description": "Push event name, such as \"Page.loaded\" or \"Hitl.resumed\".",
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "additionalProperties": {}
   },
-  "requiresPurpose": false
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "event": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Canonical Agent-visible event name."
+      },
+      "eventRevision": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Content revision of this event contract."
+      },
+      "category": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Event category used for routing and interpretation."
+      },
+      "severity": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Event severity as defined by the event registry."
+      },
+      "description": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Human-readable event condition."
+      },
+      "agentMeaning": {
+        "type": "string",
+        "minLength": 1,
+        "description": "What the event means for the Agent task state."
+      },
+      "recommendedResponse": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Action-independent response guidance for this event."
+      },
+      "payloadSchema": {
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {},
+        "description": "Schema for the event payload carried in System.notification."
+      }
+    },
+    "required": [
+      "event",
+      "eventRevision",
+      "category",
+      "severity",
+      "description",
+      "agentMeaning",
+      "recommendedResponse",
+      "payloadSchema"
+    ],
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "event": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Canonical Agent-visible event name."
+          },
+          "eventRevision": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Content revision of this event contract."
+          },
+          "category": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Event category used for routing and interpretation."
+          },
+          "severity": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Event severity as defined by the event registry."
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Human-readable event condition."
+          },
+          "agentMeaning": {
+            "type": "string",
+            "minLength": 1,
+            "description": "What the event means for the Agent task state."
+          },
+          "recommendedResponse": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Action-independent response guidance for this event."
+          },
+          "payloadSchema": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {},
+            "description": "Schema for the event payload carried in System.notification."
+          }
+        },
+        "required": [
+          "event",
+          "eventRevision",
+          "category",
+          "severity",
+          "description",
+          "agentMeaning",
+          "recommendedResponse",
+          "payloadSchema"
+        ],
+        "additionalProperties": false,
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  }
 }

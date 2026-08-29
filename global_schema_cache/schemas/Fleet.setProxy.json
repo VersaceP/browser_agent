@@ -1,103 +1,237 @@
 {
   "method": "Fleet.setProxy",
-  "description": "Set the dynamic proxy for the specified Fleet. A bootstrap proxy file makes the configuration immutable.",
-  "params": {
-    "fleetId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Fleet whose Client session should apply the proxy.",
-      "required": true
-    },
-    "config": {
-      "oneOf": [
-        {
-          "type": "object",
-          "properties": {
-            "mode": {
-              "type": "string",
-              "const": "system"
-            }
-          },
-          "required": [
-            "mode"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "mode": {
-              "type": "string",
-              "const": "direct"
-            }
-          },
-          "required": [
-            "mode"
-          ],
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "mode": {
-              "type": "string",
-              "const": "fixed"
-            },
-            "protocol": {
-              "type": "string",
-              "enum": [
-                "http",
-                "https",
-                "socks4",
-                "socks5"
-              ]
-            },
-            "host": {
-              "type": "string",
-              "minLength": 1
-            },
-            "port": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 65535
-            },
-            "username": {
-              "type": "string"
-            },
-            "password": {
-              "type": "string"
-            },
-            "bypass": {
-              "type": "array",
-              "items": {
-                "type": "string"
+  "description": "Applies a sanitized proxy configuration to a Fleet when its browser partition still permits proxy changes.",
+  "requiresPurpose": true,
+  "actionRevision": "sha256:01a844bfd2a8a87f4fddb3d99a595d8d222fe8b659e6ad82413698e0bbc45721",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "fleetId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Fleet whose Client session should apply the proxy."
+      },
+      "config": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "mode": {
+                "type": "string",
+                "const": "system",
+                "description": "Use the system proxy configuration."
               }
             },
-            "skipCertificateValidation": {
-              "type": "boolean"
-            }
+            "required": [
+              "mode"
+            ],
+            "additionalProperties": true
           },
-          "required": [
-            "mode",
-            "protocol",
-            "host",
-            "port",
-            "skipCertificateValidation"
-          ],
-          "additionalProperties": false
-        }
-      ],
-      "description": "Normalized proxy configuration.",
-      "required": true
+          {
+            "type": "object",
+            "properties": {
+              "mode": {
+                "type": "string",
+                "const": "direct",
+                "description": "Connect directly without a proxy."
+              }
+            },
+            "required": [
+              "mode"
+            ],
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "properties": {
+              "mode": {
+                "type": "string",
+                "const": "fixed",
+                "description": "Use the explicitly supplied proxy endpoint."
+              },
+              "protocol": {
+                "type": "string",
+                "enum": [
+                  "http",
+                  "https",
+                  "socks4",
+                  "socks5"
+                ],
+                "description": "Proxy protocol."
+              },
+              "host": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Proxy hostname or IP address."
+              },
+              "port": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535,
+                "description": "Proxy TCP port."
+              },
+              "username": {
+                "description": "Optional proxy username.",
+                "type": "string"
+              },
+              "password": {
+                "description": "Optional proxy password.",
+                "type": "string"
+              },
+              "bypass": {
+                "description": "Host patterns that should bypass the proxy.",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "skipCertificateValidation": {
+                "type": "boolean",
+                "description": "Whether HTTPS certificate validation may be skipped."
+              }
+            },
+            "required": [
+              "mode",
+              "protocol",
+              "host",
+              "port",
+              "skipCertificateValidation"
+            ],
+            "additionalProperties": true
+          }
+        ],
+        "description": "Normalized proxy configuration."
+      },
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "Describe the intent for this action."
+      }
     },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe the intent for this action.",
-      "required": true
-    }
+    "required": [
+      "fleetId",
+      "config",
+      "purpose"
+    ],
+    "additionalProperties": true
   },
-  "requiresPurpose": true
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "fleetId": {
+        "description": "Fleet ID whose proxy configuration was changed.",
+        "type": "string"
+      },
+      "applied": {
+        "description": "Whether the sanitized proxy configuration was accepted.",
+        "type": "boolean"
+      },
+      "proxy": {
+        "description": "Sanitized proxy configuration summary.",
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {}
+      },
+      "restartRequired": {
+        "description": "Whether a browser restart is required before the proxy takes effect.",
+        "type": "boolean"
+      }
+    },
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "fleetId": {
+            "description": "Fleet ID whose proxy configuration was changed.",
+            "type": "string"
+          },
+          "applied": {
+            "description": "Whether the sanitized proxy configuration was accepted.",
+            "type": "boolean"
+          },
+          "proxy": {
+            "description": "Sanitized proxy configuration summary.",
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          },
+          "restartRequired": {
+            "description": "Whether a browser restart is required before the proxy takes effect.",
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  }
 }

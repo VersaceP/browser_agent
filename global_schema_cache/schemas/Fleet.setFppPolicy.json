@@ -1,40 +1,202 @@
 {
   "method": "Fleet.setFppPolicy",
-  "description": "Stages a new fingerprint profile and optionally schedules a Client restart. Running pages remain unchanged until restart completes.",
-  "params": {
-    "fleetId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Target Fleet ID.",
-      "required": true
+  "description": "Stages a fingerprint-protection profile for a Fleet and optionally schedules an immediate Client restart.",
+  "requiresPurpose": false,
+  "actionRevision": "sha256:4142c152dd8ba620f8ba030fab699144ff034867ab3ab630c8ee1aa4833ae8bf",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "fleetId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Target Fleet ID."
+      },
+      "profileId": {
+        "anyOf": [
+          {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "Fingerprint profile ID to stage, or null for system identity."
+      },
+      "forceRestart": {
+        "default": false,
+        "description": "Whether to force restart the Fleet Client process immediately after staging (default: false).",
+        "type": "boolean"
+      },
+      "purpose": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Reason for identity change."
+      }
     },
-    "profileId": {
-      "anyOf": [
-        {
-          "type": "string",
-          "format": "uuid",
-          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "Fingerprint profile ID to stage, or null for system identity.",
-      "required": true
-    },
-    "forceRestart": {
-      "default": false,
-      "description": "Whether to force restart the Fleet Client process immediately after staging (default: false).",
-      "type": "boolean",
-      "required": true
-    },
-    "purpose": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Reason for identity change.",
-      "required": true
-    }
+    "required": [
+      "fleetId",
+      "profileId",
+      "forceRestart",
+      "purpose"
+    ],
+    "additionalProperties": true
   },
-  "requiresPurpose": false
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "fleetId": {
+        "description": "Fleet ID whose fingerprint policy was staged.",
+        "type": "string"
+      },
+      "applied": {
+        "description": "Whether the policy was accepted by the Fleet.",
+        "type": "boolean"
+      },
+      "restartRequested": {
+        "description": "Whether an immediate Client restart was requested.",
+        "type": "boolean"
+      },
+      "restartRequired": {
+        "description": "Whether a restart is required before the policy takes effect.",
+        "type": "boolean"
+      },
+      "policySummary": {
+        "description": "Sanitized summary of the staged fingerprint policy.",
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {}
+      },
+      "restartToken": {
+        "description": "Token identifying a scheduled restart, or null when none was scheduled.",
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "status": {
+        "description": "Policy application or restart scheduling status.",
+        "type": "string"
+      }
+    },
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "fleetId": {
+            "description": "Fleet ID whose fingerprint policy was staged.",
+            "type": "string"
+          },
+          "applied": {
+            "description": "Whether the policy was accepted by the Fleet.",
+            "type": "boolean"
+          },
+          "restartRequested": {
+            "description": "Whether an immediate Client restart was requested.",
+            "type": "boolean"
+          },
+          "restartRequired": {
+            "description": "Whether a restart is required before the policy takes effect.",
+            "type": "boolean"
+          },
+          "policySummary": {
+            "description": "Sanitized summary of the staged fingerprint policy.",
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          },
+          "restartToken": {
+            "description": "Token identifying a scheduled restart, or null when none was scheduled.",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "description": "Policy application or restart scheduling status.",
+            "type": "string"
+          }
+        },
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  }
 }

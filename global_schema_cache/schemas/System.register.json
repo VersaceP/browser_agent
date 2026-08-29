@@ -1,13 +1,187 @@
 {
   "method": "System.register",
-  "description": "Registers the current Agent session and returns all shared Fleet recovery state, including tags, remarks, and shared Memory. Authenticated connections must announce their assigned Agent ID; unauthenticated connections may declare an Agent ID for the connection.",
-  "params": {
-    "agentId": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Agent ID announced by the Agent during registration.",
-      "required": true
-    }
+  "description": "Registers the current connection, restores its authorized context, and returns event and catalog cursors.",
+  "requiresPurpose": false,
+  "actionRevision": "sha256:9b5df3fd3291f6c8459280ac21b42aca0ac9060ee0f57fb7a92849e5d9910ebb",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "agentId": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Agent ID announced by the Agent during registration."
+      }
+    },
+    "required": [
+      "agentId"
+    ],
+    "additionalProperties": true
   },
-  "requiresPurpose": false
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "agentId": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Agent ID accepted for this connection."
+      },
+      "registered": {
+        "type": "boolean",
+        "const": true,
+        "description": "Confirms that registration completed."
+      },
+      "catalogRevision": {
+        "type": "string",
+        "pattern": "^sha256:.*",
+        "description": "Content revision of the callable Action catalog."
+      },
+      "guideRevision": {
+        "type": "string",
+        "pattern": "^sha256:.*",
+        "description": "Content revision of the Agent guide."
+      },
+      "eventCatalogRevision": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Content revision of the Agent-visible event catalog."
+      },
+      "eventCursor": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991,
+        "description": "Next event cursor to use when reading or acknowledging notifications."
+      },
+      "fleets": {
+        "type": "array",
+        "items": {},
+        "description": "Authorized Fleet recovery summaries available to this connection."
+      }
+    },
+    "required": [
+      "agentId",
+      "registered",
+      "catalogRevision",
+      "guideRevision",
+      "eventCatalogRevision",
+      "eventCursor",
+      "fleets"
+    ],
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "agentId": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Agent ID accepted for this connection."
+          },
+          "registered": {
+            "type": "boolean",
+            "const": true,
+            "description": "Confirms that registration completed."
+          },
+          "catalogRevision": {
+            "type": "string",
+            "pattern": "^sha256:.*",
+            "description": "Content revision of the callable Action catalog."
+          },
+          "guideRevision": {
+            "type": "string",
+            "pattern": "^sha256:.*",
+            "description": "Content revision of the Agent guide."
+          },
+          "eventCatalogRevision": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Content revision of the Agent-visible event catalog."
+          },
+          "eventCursor": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Next event cursor to use when reading or acknowledging notifications."
+          },
+          "fleets": {
+            "type": "array",
+            "items": {},
+            "description": "Authorized Fleet recovery summaries available to this connection."
+          }
+        },
+        "required": [
+          "agentId",
+          "registered",
+          "catalogRevision",
+          "guideRevision",
+          "eventCatalogRevision",
+          "eventCursor",
+          "fleets"
+        ],
+        "additionalProperties": false,
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  }
 }

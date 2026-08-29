@@ -1,139 +1,366 @@
 {
   "method": "Input.scroll",
-  "description": "Uses the browser's native smooth scrolling to bring target into the root viewport, sends real wheel input to a visible container by direction and amount, or sends real wheel input to the page viewport when neither locator is provided. target mode derives direction automatically; container and viewport modes use direction and amount.",
-  "params": {
-    "pageId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Page ID whose content should be scrolled.",
-      "required": true
-    },
-    "target": {
-      "anyOf": [
-        {
-          "type": "object",
-          "properties": {
-            "id": {
-              "type": "string",
-              "pattern": "^\\d+:\\d+:\\d+$"
-            },
-            "selector": {
-              "type": "string",
-              "minLength": 1
-            }
-          },
-          "additionalProperties": false,
-          "description": "Element that must be brought into the root viewport. The id is preferred and selector is its fallback."
-        },
-        {
-          "not": {}
-        },
-        {
-          "not": {}
-        }
-      ],
-      "required": false
-    },
-    "container": {
-      "anyOf": [
-        {
-          "description": "Optional scroll container that must control target exposure. Necessary outer containers may also move.",
-          "type": "object",
-          "properties": {
-            "id": {
-              "type": "string",
-              "pattern": "^\\d+:\\d+:\\d+$"
-            },
-            "selector": {
-              "type": "string",
-              "minLength": 1
-            }
-          },
-          "additionalProperties": false
-        },
-        {
-          "type": "object",
-          "properties": {
-            "id": {
-              "type": "string",
-              "pattern": "^\\d+:\\d+:\\d+$"
-            },
-            "selector": {
-              "type": "string",
-              "minLength": 1
-            }
-          },
-          "additionalProperties": false,
-          "description": "Visible scrollable container that receives the requested wheel input."
-        },
-        {
-          "not": {}
-        }
-      ],
-      "required": false
-    },
-    "amount": {
-      "anyOf": [
-        {
-          "default": 300,
-          "description": "Maximum CSS-pixel distance of each bounded native smooth-scroll command while revealing target.",
-          "type": "number",
-          "exclusiveMinimum": 0
-        },
-        {
-          "default": 300,
-          "description": "Requested wheel distance in CSS pixels. Zero reads scroll state without dispatching input.",
-          "type": "number",
-          "minimum": 0
-        },
-        {
-          "default": 300,
-          "description": "Requested viewport wheel distance in CSS pixels. Zero reads scroll state without dispatching input.",
-          "type": "number",
-          "minimum": 0
-        }
-      ],
-      "required": true
-    },
-    "direction": {
-      "anyOf": [
-        {
-          "not": {}
-        },
-        {
-          "default": "down",
-          "description": "Direction of the wheel input within container.",
-          "type": "string",
-          "enum": [
-            "up",
-            "down",
-            "left",
-            "right"
-          ]
-        },
-        {
-          "default": "down",
-          "description": "Direction of the wheel input in the page viewport.",
-          "type": "string",
-          "enum": [
-            "up",
-            "down",
-            "left",
-            "right"
-          ]
-        }
-      ],
-      "required": false
-    },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe whether this scroll should reveal a target, move content inside a known container, or browse farther in the page viewport. For target mode, explain the interaction that will follow after the target becomes visible.",
-      "required": true
-    }
-  },
+  "description": "Scrolls the page viewport, a visible container, or a target into view and reports the actual movement and boundary state.",
   "requiresPurpose": true,
-  "purposeHint": "Describe whether this scroll should reveal a target, move content inside a known container, or browse farther in the page viewport. For target mode, explain the interaction that will follow after the target becomes visible."
+  "actionRevision": "sha256:788c2ee7cb09946be173e201941d8377296bdf22b4754d89b900a91b9351d849",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "anyOf": [
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Page ID whose content should be scrolled."
+          },
+          "target": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "description": "Preferred canonical target ID from the latest DOM observation.",
+                "type": "string",
+                "pattern": "^\\d+:\\d+:\\d+$"
+              },
+              "selector": {
+                "description": "Fallback CSS selector for the scroll target.",
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": true,
+            "description": "Element to reveal through Blink native scrolling."
+          },
+          "container": {
+            "description": "Optional hard boundary; only ancestors at or below this container may scroll.",
+            "type": "object",
+            "properties": {
+              "id": {
+                "description": "Preferred canonical target ID from the latest DOM observation.",
+                "type": "string",
+                "pattern": "^\\d+:\\d+:\\d+$"
+              },
+              "selector": {
+                "description": "Fallback CSS selector for the scroll target.",
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": true
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "Describe the intent for this action."
+          }
+        },
+        "required": [
+          "pageId",
+          "target",
+          "purpose"
+        ],
+        "additionalProperties": true
+      },
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Page ID whose content should be scrolled."
+          },
+          "container": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "description": "Preferred canonical target ID from the latest DOM observation.",
+                "type": "string",
+                "pattern": "^\\d+:\\d+:\\d+$"
+              },
+              "selector": {
+                "description": "Fallback CSS selector for the scroll target.",
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": true,
+            "description": "Visible scrollable container that receives wheel input."
+          },
+          "direction": {
+            "description": "Wheel direction. Defaults to down.",
+            "type": "string",
+            "enum": [
+              "up",
+              "down",
+              "left",
+              "right"
+            ]
+          },
+          "amount": {
+            "description": "Wheel distance in CSS pixels. Defaults to 300; zero reads state without input.",
+            "type": "number",
+            "minimum": 0
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "Describe the intent for this action."
+          }
+        },
+        "required": [
+          "pageId",
+          "container",
+          "purpose"
+        ],
+        "additionalProperties": true
+      },
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Page ID whose content should be scrolled."
+          },
+          "direction": {
+            "description": "Primary viewport scroll direction. Defaults to down.",
+            "type": "string",
+            "enum": [
+              "up",
+              "down",
+              "left",
+              "right"
+            ]
+          },
+          "amount": {
+            "description": "Viewport distance in CSS pixels. Defaults to 300; zero reads current state without scrolling.",
+            "type": "number",
+            "minimum": 0
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "Describe the intent for this action."
+          }
+        },
+        "required": [
+          "pageId",
+          "purpose"
+        ],
+        "additionalProperties": true
+      }
+    ]
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "scope": {
+        "description": "Scroll scope used: viewport, container, or target.",
+        "type": "string"
+      },
+      "requestedDelta": {
+        "description": "Requested scroll delta or target movement.",
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {}
+      },
+      "actualDelta": {
+        "description": "Observed scroll movement after dispatch.",
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {}
+      },
+      "atStart": {
+        "description": "Whether the scrolled scope is at its start boundary.",
+        "type": "boolean"
+      },
+      "atEnd": {
+        "description": "Whether the scrolled scope is at its end boundary.",
+        "type": "boolean"
+      },
+      "target": {
+        "description": "Resolved target or container summary.",
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {}
+      },
+      "position": {
+        "description": "Observed scroll position.",
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {}
+      },
+      "extent": {
+        "description": "Observed scrollable extent.",
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {}
+      },
+      "layers": {
+        "description": "Scroll layers considered during target reveal.",
+        "type": "array",
+        "items": {}
+      },
+      "resolution": {
+        "description": "Target resolution and convergence summary.",
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {}
+      }
+    },
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "scope": {
+            "description": "Scroll scope used: viewport, container, or target.",
+            "type": "string"
+          },
+          "requestedDelta": {
+            "description": "Requested scroll delta or target movement.",
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          },
+          "actualDelta": {
+            "description": "Observed scroll movement after dispatch.",
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          },
+          "atStart": {
+            "description": "Whether the scrolled scope is at its start boundary.",
+            "type": "boolean"
+          },
+          "atEnd": {
+            "description": "Whether the scrolled scope is at its end boundary.",
+            "type": "boolean"
+          },
+          "target": {
+            "description": "Resolved target or container summary.",
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          },
+          "position": {
+            "description": "Observed scroll position.",
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          },
+          "extent": {
+            "description": "Observed scrollable extent.",
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          },
+          "layers": {
+            "description": "Scroll layers considered during target reveal.",
+            "type": "array",
+            "items": {}
+          },
+          "resolution": {
+            "description": "Target resolution and convergence summary.",
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          }
+        },
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  }
 }

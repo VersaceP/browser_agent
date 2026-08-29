@@ -1,52 +1,190 @@
 {
   "method": "Input.type",
-  "description": "Types text into a known visible, editable, and focusable target; prefer a canonical id from DOM.getAXTree, use a stable selector as fallback, and set clear=true when replacing existing content.",
-  "params": {
-    "pageId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Page ID containing the editable target.",
-      "required": true
-    },
-    "selector": {
-      "description": "Fallback CSS selector for the editable target.",
-      "type": "string",
-      "minLength": 1,
-      "required": false
-    },
-    "id": {
-      "description": "Preferred canonical element ID from DOM.getAXTree.",
-      "type": "string",
-      "pattern": "^\\d+:\\d+:\\d+$",
-      "required": false
-    },
-    "text": {
-      "type": "string",
-      "description": "Text to type into the target.",
-      "required": true
-    },
-    "clear": {
-      "default": false,
-      "description": "Clear existing content before typing when true.",
-      "type": "boolean",
-      "required": true
-    },
-    "delay": {
-      "default": 50,
-      "description": "Delay in milliseconds between keystrokes.",
-      "type": "number",
-      "minimum": 0,
-      "required": true
-    },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe why this exact text is being entered, e.g., filling a search query, username, password, or form field",
-      "required": true
-    }
-  },
+  "description": "Types text into a resolved editable target, optionally clearing its current value first.",
   "requiresPurpose": true,
+  "actionRevision": "sha256:55f7d9d261f4fe262655855ff4157f3718870c103bd0957166ebb03a513a12a8",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "pageId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Page ID containing the editable target."
+      },
+      "selector": {
+        "description": "Fallback CSS selector for the editable target.",
+        "type": "string",
+        "minLength": 1
+      },
+      "id": {
+        "description": "Preferred canonical element ID from DOM.getAXTree.",
+        "type": "string",
+        "pattern": "^\\d+:\\d+:\\d+$"
+      },
+      "text": {
+        "type": "string",
+        "description": "Text to type into the target."
+      },
+      "clear": {
+        "default": false,
+        "description": "Clear existing content before typing when true.",
+        "type": "boolean"
+      },
+      "delay": {
+        "default": 50,
+        "description": "Delay in milliseconds between keystrokes.",
+        "type": "number",
+        "minimum": 0
+      },
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "Describe why this exact text is being entered, e.g., filling a search query, username, password, or form field"
+      }
+    },
+    "required": [
+      "pageId",
+      "text",
+      "clear",
+      "delay",
+      "purpose"
+    ],
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "target": {
+        "description": "Target identity used for typing.",
+        "type": "string"
+      },
+      "resolvedBy": {
+        "description": "Actor or resolution mode that selected the target.",
+        "type": "string"
+      },
+      "recoveredTarget": {
+        "description": "Snapshot details used when a stale target was recovered.",
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {}
+      },
+      "cleared": {
+        "description": "Whether the target value was cleared before typing.",
+        "type": "boolean"
+      },
+      "characterCount": {
+        "description": "Number of characters dispatched.",
+        "type": "number"
+      },
+      "resolutionSource": {
+        "description": "Target resolution route used by the action.",
+        "type": "string"
+      }
+    },
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "target": {
+            "description": "Target identity used for typing.",
+            "type": "string"
+          },
+          "resolvedBy": {
+            "description": "Actor or resolution mode that selected the target.",
+            "type": "string"
+          },
+          "recoveredTarget": {
+            "description": "Snapshot details used when a stale target was recovered.",
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          },
+          "cleared": {
+            "description": "Whether the target value was cleared before typing.",
+            "type": "boolean"
+          },
+          "characterCount": {
+            "description": "Number of characters dispatched.",
+            "type": "number"
+          },
+          "resolutionSource": {
+            "description": "Target resolution route used by the action.",
+            "type": "string"
+          }
+        },
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
   "purposeHint": "Describe why this exact text is being entered, e.g., filling a search query, username, password, or form field"
 }

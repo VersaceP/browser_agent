@@ -1,14 +1,212 @@
 {
   "method": "Workflow.getStatus",
-  "description": "Returns the in-memory status snapshot for one workflow execution.",
-  "params": {
-    "executionId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Workflow execution ID returned by Workflow.execute.",
-      "required": true
-    }
+  "description": "Returns the current step, variables summary, timing, and state of a workflow run.",
+  "requiresPurpose": false,
+  "actionRevision": "sha256:7de5c02962eb78cd67b41ae4230265d9a24184c115010a0e52ad68b7f2104bce",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "workflowId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Public workflow ID returned by Workflow.execute or a Workflow.progress event."
+      }
+    },
+    "required": [
+      "workflowId"
+    ],
+    "additionalProperties": true
   },
-  "requiresPurpose": false
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "workflowId": {
+        "description": "Opaque workflow ID.",
+        "type": "string"
+      },
+      "status": {
+        "description": "Current workflow lifecycle status.",
+        "type": "string"
+      },
+      "currentStep": {
+        "description": "Current step path and execution summary.",
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {}
+      },
+      "variables": {
+        "description": "Current workflow variables.",
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {}
+      },
+      "store": {
+        "description": "Current explicit workflow store.",
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {}
+      },
+      "storeRevision": {
+        "description": "Current explicit store revision.",
+        "type": "number"
+      },
+      "results": {
+        "description": "Ordered results for completed steps.",
+        "type": "array",
+        "items": {}
+      },
+      "error": {
+        "description": "Public workflow error summary, when failed.",
+        "type": "string"
+      },
+      "failedStepPath": {
+        "description": "Workflow step path that failed, when failed.",
+        "type": "string"
+      },
+      "createdAt": {
+        "description": "Workflow creation timestamp in milliseconds.",
+        "type": "number"
+      },
+      "updatedAt": {
+        "description": "Last workflow update timestamp in milliseconds.",
+        "type": "number"
+      }
+    },
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "workflowId": {
+            "description": "Opaque workflow ID.",
+            "type": "string"
+          },
+          "status": {
+            "description": "Current workflow lifecycle status.",
+            "type": "string"
+          },
+          "currentStep": {
+            "description": "Current step path and execution summary.",
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          },
+          "variables": {
+            "description": "Current workflow variables.",
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          },
+          "store": {
+            "description": "Current explicit workflow store.",
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          },
+          "storeRevision": {
+            "description": "Current explicit store revision.",
+            "type": "number"
+          },
+          "results": {
+            "description": "Ordered results for completed steps.",
+            "type": "array",
+            "items": {}
+          },
+          "error": {
+            "description": "Public workflow error summary, when failed.",
+            "type": "string"
+          },
+          "failedStepPath": {
+            "description": "Workflow step path that failed, when failed.",
+            "type": "string"
+          },
+          "createdAt": {
+            "description": "Workflow creation timestamp in milliseconds.",
+            "type": "number"
+          },
+          "updatedAt": {
+            "description": "Last workflow update timestamp in milliseconds.",
+            "type": "number"
+          }
+        },
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  }
 }

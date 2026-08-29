@@ -1,61 +1,179 @@
 {
   "method": "Network.setCookies",
-  "description": "Sets page cookies.",
-  "params": {
-    "pageId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Page ID whose session should receive the cookies.",
-      "required": true
+  "description": "Sets cookies in a page session and reports each accepted or rejected cookie.",
+  "requiresPurpose": true,
+  "actionRevision": "sha256:1593dab9949008dfc88728775c47168dcd04468242acacbaf12b9a1533f4a842",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "pageId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Page ID whose session should receive the cookies."
+      },
+      "cookies": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "Cookie name."
+            },
+            "value": {
+              "type": "string",
+              "description": "Cookie value."
+            },
+            "domain": {
+              "description": "Cookie domain; omit to use the current page domain.",
+              "type": "string"
+            },
+            "path": {
+              "description": "Cookie path; omit for the default path.",
+              "type": "string"
+            },
+            "httpOnly": {
+              "description": "Mark the cookie as HttpOnly when true.",
+              "type": "boolean"
+            },
+            "secure": {
+              "description": "Mark the cookie as Secure when true.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "name",
+            "value"
+          ],
+          "additionalProperties": true
+        },
+        "description": "Cookies to set for the page session."
+      },
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "Describe why you are setting cookies, e.g., maintaining login state"
+      }
     },
-    "cookies": {
-      "type": "array",
+    "required": [
+      "pageId",
+      "cookies",
+      "purpose"
+    ],
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
       "items": {
+        "description": "Per-cookie acceptance or rejection records.",
+        "type": "array",
+        "items": {}
+      },
+      "acceptedCount": {
+        "description": "Number of cookies accepted by the browser.",
+        "type": "number"
+      },
+      "rejectedCount": {
+        "description": "Number of cookies rejected by validation or the browser.",
+        "type": "number"
+      },
+      "set": {
+        "description": "Normalized number of cookies set.",
+        "type": "number"
+      }
+    },
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "properties": {
-          "name": {
+          "items": {
+            "description": "Per-cookie acceptance or rejection records.",
+            "type": "array",
+            "items": {}
+          },
+          "acceptedCount": {
+            "description": "Number of cookies accepted by the browser.",
+            "type": "number"
+          },
+          "rejectedCount": {
+            "description": "Number of cookies rejected by validation or the browser.",
+            "type": "number"
+          },
+          "set": {
+            "description": "Normalized number of cookies set.",
+            "type": "number"
+          }
+        },
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
             "type": "string",
-            "description": "Cookie name."
+            "description": "Stable public failure code."
           },
-          "value": {
+          "message": {
             "type": "string",
-            "description": "Cookie value."
-          },
-          "domain": {
-            "description": "Cookie domain; omit to use the current page domain.",
-            "type": "string"
-          },
-          "path": {
-            "description": "Cookie path; omit for the default path.",
-            "type": "string"
-          },
-          "httpOnly": {
-            "description": "Mark the cookie as HttpOnly when true.",
-            "type": "boolean"
-          },
-          "secure": {
-            "description": "Mark the cookie as Secure when true.",
-            "type": "boolean"
+            "description": "Concise public explanation for the failure code."
           }
         },
         "required": [
-          "name",
-          "value"
+          "code",
+          "message"
         ],
         "additionalProperties": false
       },
-      "description": "Cookies to set for the page session.",
-      "required": true
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
     },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe why you are setting cookies, e.g., maintaining login state",
-      "required": true
-    }
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
   },
-  "requiresPurpose": true,
   "purposeHint": "Describe why you are setting cookies, e.g., maintaining login state"
 }

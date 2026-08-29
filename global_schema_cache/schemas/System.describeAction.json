@@ -1,13 +1,226 @@
 {
   "method": "System.describeAction",
-  "description": "Describes the exact schema, parameter constraints, and purpose requirement for one callable action before invocation. The target may be supplied under any parameter name; action is the default name.",
-  "params": {
-    "action": {
-      "description": "Canonical Action method or MCP tool name, such as \"Input.click\" or \"input_click\".",
-      "type": "string",
-      "minLength": 1,
-      "required": false
-    }
+  "description": "Returns the exact input, result, success, and failure schemas for one registered Action. The target may be supplied under any parameter name; action is preferred.",
+  "requiresPurpose": false,
+  "actionRevision": "sha256:535410d4f47dd1f935145ac0dc02728e0cb0116e0e1b0e7e6857c911e8d88a0f",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "action": {
+        "description": "Canonical Action method or MCP tool name, such as \"Input.click\" or \"input_click\".",
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "additionalProperties": {}
   },
-  "requiresPurpose": false
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "method": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Canonical registered Action method name."
+      },
+      "description": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Action-specific purpose and operating boundary."
+      },
+      "requiresPurpose": {
+        "type": "boolean",
+        "description": "Whether this Action requires a non-empty purpose field."
+      },
+      "actionRevision": {
+        "type": "string",
+        "pattern": "^sha256:.*",
+        "description": "Content revision of this Action definition."
+      },
+      "inputSchema": {
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {},
+        "description": "Complete declared input schema, including union branches and field descriptions."
+      },
+      "resultSchema": {
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {},
+        "description": "Business result schema returned by the Action implementation."
+      },
+      "outputSchema": {
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {},
+        "description": "Public success envelope schema for this Action."
+      },
+      "failureSchema": {
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {},
+        "description": "Stable public failure envelope and field meanings."
+      },
+      "purposeHint": {
+        "description": "Action-specific wording for the purpose field, when required.",
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "required": [
+      "method",
+      "description",
+      "requiresPurpose",
+      "actionRevision",
+      "inputSchema",
+      "resultSchema",
+      "outputSchema",
+      "failureSchema"
+    ],
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "method": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Canonical registered Action method name."
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Action-specific purpose and operating boundary."
+          },
+          "requiresPurpose": {
+            "type": "boolean",
+            "description": "Whether this Action requires a non-empty purpose field."
+          },
+          "actionRevision": {
+            "type": "string",
+            "pattern": "^sha256:.*",
+            "description": "Content revision of this Action definition."
+          },
+          "inputSchema": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {},
+            "description": "Complete declared input schema, including union branches and field descriptions."
+          },
+          "resultSchema": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {},
+            "description": "Business result schema returned by the Action implementation."
+          },
+          "outputSchema": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {},
+            "description": "Public success envelope schema for this Action."
+          },
+          "failureSchema": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {},
+            "description": "Stable public failure envelope and field meanings."
+          },
+          "purposeHint": {
+            "description": "Action-specific wording for the purpose field, when required.",
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "method",
+          "description",
+          "requiresPurpose",
+          "actionRevision",
+          "inputSchema",
+          "resultSchema",
+          "outputSchema",
+          "failureSchema"
+        ],
+        "additionalProperties": false,
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  }
 }

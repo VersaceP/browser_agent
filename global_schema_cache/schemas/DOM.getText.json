@@ -1,45 +1,155 @@
 {
   "method": "DOM.getText",
-  "description": "Reads textContent from one or more known DOM elements by canonical id or selector.",
-  "params": {
-    "pageId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Page ID containing the target elements.",
-      "required": true
+  "description": "Reads textContent from one or more page elements.",
+  "requiresPurpose": true,
+  "actionRevision": "sha256:836245f626101a5c43f7a35ebe018731636cd1cadf8c1650e08815848d456648",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "pageId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Page ID containing the target elements."
+      },
+      "targets": {
+        "minItems": 1,
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "description": "Preferred canonical element ID from DOM.getAXTree.",
+              "type": "string",
+              "pattern": "^\\d+:\\d+:\\d+$"
+            },
+            "selector": {
+              "description": "Fallback CSS selector for the target element in the main frame.",
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": true,
+          "description": "DOM query target identified by id, selector, or both."
+        },
+        "description": "Targets to read, preserving input order in response.data.items."
+      },
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "Describe why this element text is needed, e.g., verifying a success message, reading a result section, or extracting submitted feedback"
+      }
     },
-    "targets": {
-      "minItems": 1,
-      "type": "array",
+    "required": [
+      "pageId",
+      "targets",
+      "purpose"
+    ],
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
       "items": {
+        "description": "Text records for each matched element.",
+        "type": "array",
+        "items": {}
+      },
+      "summary": {
+        "description": "Counts and query summary for the returned text records.",
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {}
+      }
+    },
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "properties": {
-          "id": {
-            "description": "Preferred canonical element ID from DOM.getAXTree.",
-            "type": "string",
-            "pattern": "^\\d+:\\d+:\\d+$"
+          "items": {
+            "description": "Text records for each matched element.",
+            "type": "array",
+            "items": {}
           },
-          "selector": {
-            "description": "Fallback CSS selector for the target element in the main frame.",
-            "type": "string",
-            "minLength": 1
+          "summary": {
+            "description": "Counts and query summary for the returned text records.",
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
           }
         },
-        "additionalProperties": false,
-        "description": "DOM query target identified by id, selector, or both."
-      },
-      "description": "Targets to read, preserving input order in response.data.items.",
-      "required": true
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
     },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe why this element text is needed, e.g., verifying a success message, reading a result section, or extracting submitted feedback",
-      "required": true
-    }
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
   },
-  "requiresPurpose": true,
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
   "purposeHint": "Describe why this element text is needed, e.g., verifying a success message, reading a result section, or extracting submitted feedback"
 }

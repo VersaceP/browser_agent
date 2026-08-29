@@ -1,35 +1,142 @@
 {
   "method": "Page.navigate",
-  "description": "Navigates an existing pageId to a URL and starts an asynchronous page load; use Page.create when a new tab is needed.",
-  "params": {
-    "pageId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Page ID to navigate.",
-      "required": true
-    },
-    "url": {
-      "type": "string",
-      "format": "uri",
-      "description": "Destination URL to load.",
-      "required": true
-    },
-    "tag": {
-      "description": "Optional exact tag to persist on the resulting navigation history entry.",
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 128,
-      "required": false
-    },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe why this URL is needed for the task, e.g., opening a product detail page or returning to search results",
-      "required": true
-    }
-  },
+  "description": "Starts navigation of an existing page to the specified URL.",
   "requiresPurpose": true,
+  "actionRevision": "sha256:329ab7edf85e0e293a4633559b9688d4d5f7d25181ccef0cda0c4dcc668d4595",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "pageId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Page ID to navigate."
+      },
+      "url": {
+        "type": "string",
+        "format": "uri",
+        "description": "Destination URL to load."
+      },
+      "tag": {
+        "description": "Optional exact tag to persist on the resulting navigation history entry.",
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
+      },
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "Describe why this URL is needed for the task, e.g., opening a product detail page or returning to search results"
+      }
+    },
+    "required": [
+      "pageId",
+      "url",
+      "purpose"
+    ],
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "pageId": {
+        "description": "Page ID whose navigation was requested.",
+        "type": "string"
+      },
+      "url": {
+        "description": "Destination URL accepted by the browser.",
+        "type": "string"
+      },
+      "navigationStarted": {
+        "description": "Whether navigation was dispatched.",
+        "type": "boolean"
+      }
+    },
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "description": "Page ID whose navigation was requested.",
+            "type": "string"
+          },
+          "url": {
+            "description": "Destination URL accepted by the browser.",
+            "type": "string"
+          },
+          "navigationStarted": {
+            "description": "Whether navigation was dispatched.",
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
   "purposeHint": "Describe why this URL is needed for the task, e.g., opening a product detail page or returning to search results"
 }

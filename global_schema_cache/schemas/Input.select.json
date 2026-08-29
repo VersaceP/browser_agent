@@ -1,92 +1,301 @@
 {
   "method": "Input.select",
-  "description": "Sets the final selection set of a native or custom select-like control to the requested choices. Automatically handles searchable controls, virtual scrolling, and pagination associated with the control. Each selection item must use exactly one locator: id, value, label, or path.",
-  "params": {
-    "pageId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Page ID containing the select-like control.",
-      "required": true
+  "description": "Sets the final selection set of a native or custom select-like control.",
+  "requiresPurpose": true,
+  "actionRevision": "sha256:0e622f86f0d3089658390679a8380096397fc9b4eec79884b9d8aa893d2d7a96",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "pageId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Page ID containing the select control."
+      },
+      "id": {
+        "description": "Canonical select control ID.",
+        "type": "string",
+        "pattern": "^\\d+:\\d+:\\d+$"
+      },
+      "selector": {
+        "description": "Unique CSS selector for one select control.",
+        "type": "string",
+        "minLength": 1
+      },
+      "nativeValues": {
+        "description": "Exact native <select> option values. Only for native HTML select controls.",
+        "minItems": 1,
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "optionIds": {
+        "description": "Current-window option IDs. Only for custom select popups.",
+        "minItems": 1,
+        "type": "array",
+        "items": {
+          "type": "string",
+          "pattern": "^\\d+:\\d+:\\d+$"
+        }
+      },
+      "optionLabels": {
+        "description": "Exact current-window option labels. Only for custom select popups.",
+        "minItems": 1,
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "Provide exactly one selection field: nativeValues for a native HTML select, or optionIds/optionLabels for options in the currently open custom popup. Do not combine the fields. After search, scrolling, or pagination, call DOM.inspectSelect or DOM.getSemanticTree again and use only the newly returned options."
+      }
     },
-    "id": {
-      "description": "Preferred canonical control ID from DOM.getAXTree or DOM.inspectSelect.",
-      "type": "string",
-      "pattern": "^\\d+:\\d+:\\d+$",
-      "required": false
+    "required": [
+      "pageId",
+      "purpose"
+    ],
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "controlId": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Current canonical ID of the select control."
+      },
+      "controlKind": {
+        "type": "string",
+        "enum": [
+          "native",
+          "custom"
+        ],
+        "description": "Whether the control is a native HTML select or a custom popup."
+      },
+      "selectionMode": {
+        "type": "string",
+        "enum": [
+          "single",
+          "multiple"
+        ],
+        "description": "Whether one or multiple options may be selected."
+      },
+      "selected": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "description": "Current option ID when the option is represented in the popup tree.",
+              "type": "string"
+            },
+            "label": {
+              "description": "Visible option label observed after selection.",
+              "type": "string"
+            },
+            "value": {
+              "description": "Native option value observed after selection.",
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "description": "One option confirmed as selected."
+        },
+        "description": "Options confirmed as selected after the action."
+      },
+      "proof": {
+        "type": "string",
+        "enum": [
+          "native-selected-state",
+          "open-option-selected-state",
+          "control-value",
+          "control-aria-valuetext"
+        ],
+        "description": "Observation used to confirm the final selection state."
+      },
+      "resolutionSource": {
+        "description": "Resolution route used for the select control.",
+        "type": "string",
+        "enum": [
+          "id",
+          "snapshot-recovery",
+          "selector",
+          "selector-fallback"
+        ]
+      },
+      "recoveredTarget": {
+        "description": "Snapshot details used when a stale target was recovered.",
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {}
+      }
     },
-    "selector": {
-      "description": "CSS selector for a select-like control. It must resolve to one control; use DOM.inspectSelect or DOM.getAXTree when the target contains multiple controls.",
-      "type": "string",
-      "minLength": 1,
-      "required": false
-    },
-    "selections": {
-      "minItems": 1,
-      "maxItems": 100,
-      "type": "array",
-      "items": {
+    "required": [
+      "controlId",
+      "controlKind",
+      "selectionMode",
+      "selected",
+      "proof"
+    ],
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "properties": {
-          "id": {
-            "description": "Opaque canonical option ID returned by DOM.inspectSelect or DOM.getAXTree. Use id only when this is the only locator field in the item.",
+          "controlId": {
             "type": "string",
-            "pattern": "^\\d+:\\d+:\\d+$"
+            "minLength": 1,
+            "description": "Current canonical ID of the select control."
           },
-          "value": {
-            "description": "One direct option locator. Use the exact value returned by DOM.inspectSelect, and do not combine it with id or label.",
-            "type": "string"
-          },
-          "label": {
-            "description": "One direct option locator. Use the exact visible label returned by DOM.inspectSelect, and do not combine it with id or value.",
+          "controlKind": {
             "type": "string",
-            "minLength": 1
+            "enum": [
+              "native",
+              "custom"
+            ],
+            "description": "Whether the control is a native HTML select or a custom popup."
           },
-          "path": {
-            "description": "Exclusive cascading locator. Do not provide id, value, or label alongside path; each path segment must contain exactly one of id, value, or label.",
-            "minItems": 2,
-            "maxItems": 32,
+          "selectionMode": {
+            "type": "string",
+            "enum": [
+              "single",
+              "multiple"
+            ],
+            "description": "Whether one or multiple options may be selected."
+          },
+          "selected": {
             "type": "array",
             "items": {
               "type": "object",
               "properties": {
                 "id": {
-                  "description": "Opaque canonical option ID returned by DOM.inspectSelect or DOM.getAXTree. Use id only when this is the only locator field in the item.",
-                  "type": "string",
-                  "pattern": "^\\d+:\\d+:\\d+$"
-                },
-                "value": {
-                  "description": "One possible option locator. Use the exact value returned by DOM.inspectSelect, and do not combine it with id or label.",
+                  "description": "Current option ID when the option is represented in the popup tree.",
                   "type": "string"
                 },
                 "label": {
-                  "description": "One possible option locator. Use the exact visible label returned by DOM.inspectSelect, and do not combine it with id or value.",
-                  "type": "string",
-                  "minLength": 1
+                  "description": "Visible option label observed after selection.",
+                  "type": "string"
+                },
+                "value": {
+                  "description": "Native option value observed after selection.",
+                  "type": "string"
                 }
-              }
-            }
+              },
+              "additionalProperties": false,
+              "description": "One option confirmed as selected."
+            },
+            "description": "Options confirmed as selected after the action."
+          },
+          "proof": {
+            "type": "string",
+            "enum": [
+              "native-selected-state",
+              "open-option-selected-state",
+              "control-value",
+              "control-aria-valuetext"
+            ],
+            "description": "Observation used to confirm the final selection state."
+          },
+          "resolutionSource": {
+            "description": "Resolution route used for the select control.",
+            "type": "string",
+            "enum": [
+              "id",
+              "snapshot-recovery",
+              "selector",
+              "selector-fallback"
+            ]
+          },
+          "recoveredTarget": {
+            "description": "Snapshot details used when a stale target was recovered.",
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
           }
-        }
-      },
-      "description": "Each item must contain exactly one locator: id, value, label, or path. path is exclusive and each path segment must contain exactly one of id, value, or label. Multiple direct choices define the final multi-select set, not an append operation, and are valid only for a confirmed multi-select control.",
-      "required": true
+        },
+        "required": [
+          "controlId",
+          "controlKind",
+          "selectionMode",
+          "selected",
+          "proof"
+        ],
+        "additionalProperties": false,
+        "description": "Validated business result returned by the Action."
+      }
     },
-    "timeout": {
-      "description": "Maximum exploration time in seconds. Omit or pass 0 to use the 300-second default.",
-      "type": "integer",
-      "minimum": 0,
-      "maximum": 300,
-      "required": false
-    },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe the intended selected values, such as choosing a country, date, color, tags, or a root-to-leaf cascading location path. Each selections item must contain exactly one of id, value, label, or path; path is exclusive and each path segment must contain exactly one of id, value, or label. Use exact fields returned by DOM.inspectSelect. Multiple direct choices require a multi-select control; multiple cascading paths are unsupported. Use DOM.inspectSelect when choices are unknown or when target resolution is ambiguous or fails.",
-      "required": true
-    }
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
   },
-  "requiresPurpose": true,
-  "purposeHint": "Describe the intended selected values, such as choosing a country, date, color, tags, or a root-to-leaf cascading location path. Each selections item must contain exactly one of id, value, label, or path; path is exclusive and each path segment must contain exactly one of id, value, or label. Use exact fields returned by DOM.inspectSelect. Multiple direct choices require a multi-select control; multiple cascading paths are unsupported. Use DOM.inspectSelect when choices are unknown or when target resolution is ambiguous or fails."
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
+  "purposeHint": "Provide exactly one selection field: nativeValues for a native HTML select, or optionIds/optionLabels for options in the currently open custom popup. Do not combine the fields. After search, scrolling, or pagination, call DOM.inspectSelect or DOM.getSemanticTree again and use only the newly returned options."
 }

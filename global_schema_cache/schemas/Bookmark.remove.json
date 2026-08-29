@@ -1,37 +1,136 @@
 {
   "method": "Bookmark.remove",
-  "description": "Removes one bookmark or all bookmarks while preserving the folder tree.",
-  "params": {
-    "fleetId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Fleet ID whose bookmark store should be changed.",
-      "required": true
-    },
-    "scope": {
-      "type": "string",
-      "enum": [
-        "item",
-        "all"
-      ],
-      "description": "Removal scope.",
-      "required": true
-    },
-    "id": {
-      "description": "Opaque bookmark ID when scope is item.",
-      "type": "string",
-      "minLength": 1,
-      "required": false
-    },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe why you are removing this bookmark, set of bookmarks, or folder, e.g., cleaning up unneeded saves",
-      "required": true
-    }
-  },
+  "description": "Removes one bookmark or all bookmarks in a Fleet without removing the folder tree.",
   "requiresPurpose": true,
+  "actionRevision": "sha256:d27335bc1330f50802ae81fd5d808bc45d428de2095c7ed8d411be0ad19d0769",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "fleetId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Fleet ID whose bookmark store should be changed."
+      },
+      "scope": {
+        "type": "string",
+        "enum": [
+          "item",
+          "all"
+        ],
+        "description": "Removal scope."
+      },
+      "id": {
+        "description": "Opaque bookmark ID when scope is item.",
+        "type": "string",
+        "minLength": 1
+      },
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "Describe why you are removing this bookmark, set of bookmarks, or folder, e.g., cleaning up unneeded saves"
+      }
+    },
+    "required": [
+      "fleetId",
+      "scope",
+      "purpose"
+    ],
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "anyOf": [
+      {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": {},
+        "description": "Removal result fields returned by the bookmark store."
+      },
+      {
+        "type": "null",
+        "description": "Null when the underlying bookmark API returns no result."
+      }
+    ]
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": {},
+            "description": "Removal result fields returned by the bookmark store."
+          },
+          {
+            "type": "null",
+            "description": "Null when the underlying bookmark API returns no result."
+          }
+        ],
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
   "purposeHint": "Describe why you are removing this bookmark, set of bookmarks, or folder, e.g., cleaning up unneeded saves"
 }

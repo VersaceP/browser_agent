@@ -1,17 +1,174 @@
 {
   "method": "Fleet.list",
-  "description": "Lists the available shared browser Fleets so the Agent can choose a fleetId for subsequent actions.",
-  "params": {
-    "status": {
-      "description": "Optional persisted status filter. Defaults to all Fleets.",
-      "type": "string",
-      "enum": [
-        "active",
-        "prepared",
-        "all"
-      ],
-      "required": false
+  "description": "Lists Fleets filtered by active, prepared, or all lifecycle states.",
+  "requiresPurpose": false,
+  "actionRevision": "sha256:8e9b74676dbd405a4d7f54e2181db9cf54ae6388f72ca04f87593c15dfe6915c",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "status": {
+        "description": "Optional persisted status filter. Defaults to all Fleets.",
+        "type": "string",
+        "enum": [
+          "active",
+          "prepared",
+          "all"
+        ]
+      }
+    },
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "array",
+    "items": {
+      "type": "object",
+      "properties": {
+        "fleetId": {
+          "description": "Fleet ID.",
+          "type": "string"
+        },
+        "state": {
+          "description": "Fleet lifecycle state.",
+          "type": "string"
+        },
+        "status": {
+          "description": "Fleet runtime status.",
+          "type": "string"
+        },
+        "scope": {
+          "description": "Fleet scope, or null when not assigned.",
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tags": {
+          "description": "Agent-visible Fleet tags.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "remark": {
+          "description": "Fleet remark or human-readable label.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": {},
+      "description": "One Fleet summary."
     }
   },
-  "requiresPurpose": false
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "fleetId": {
+              "description": "Fleet ID.",
+              "type": "string"
+            },
+            "state": {
+              "description": "Fleet lifecycle state.",
+              "type": "string"
+            },
+            "status": {
+              "description": "Fleet runtime status.",
+              "type": "string"
+            },
+            "scope": {
+              "description": "Fleet scope, or null when not assigned.",
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "tags": {
+              "description": "Agent-visible Fleet tags.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "remark": {
+              "description": "Fleet remark or human-readable label.",
+              "type": "string"
+            }
+          },
+          "additionalProperties": {},
+          "description": "One Fleet summary."
+        },
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  }
 }

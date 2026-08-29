@@ -1,51 +1,398 @@
 {
   "method": "File.handleChooser",
-  "description": "Handles native page file choosers or directly fills a file input/upload component.",
-  "params": {
-    "pageId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Page ID with the pending file chooser.",
-      "required": true
-    },
-    "chooserId": {
-      "description": "Target chooser session id. Required when the page has multiple pending choosers.",
-      "type": "string",
-      "required": false
-    },
-    "accept": {
-      "type": "boolean",
-      "description": "True to accept the chooser, false to cancel it.",
-      "required": true
-    },
-    "files": {
-      "description": "File paths to submit when accepting the chooser.",
-      "type": "array",
-      "items": {
-        "type": "string"
-      },
-      "required": false
-    },
-    "id": {
-      "description": "Preferred canonical upload target id.",
-      "type": "string",
-      "pattern": "^\\d+:\\d+:\\d+$",
-      "required": false
-    },
-    "selector": {
-      "description": "Fallback CSS selector for the upload target.",
-      "type": "string",
-      "required": false
-    },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe your intent for handling this file chooser or upload component, e.g., uploading a document",
-      "required": true
-    }
-  },
+  "description": "Handles exactly one file flow: accept or cancel a pending native chooser, or set files directly on a resolved upload target.",
   "requiresPurpose": true,
-  "purposeHint": "Describe your intent for handling this file chooser or upload component, e.g., uploading a document"
+  "actionRevision": "sha256:198d1dbcdd8a58f1997a0b2e39d2e45901715947f05d537b4fb1279573bff8d2",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "anyOf": [
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Page ID containing the upload target."
+          },
+          "files": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "description": "Files to set on the upload target."
+          },
+          "id": {
+            "description": "Preferred canonical upload target ID.",
+            "type": "string",
+            "pattern": "^\\d+:\\d+:\\d+$"
+          },
+          "selector": {
+            "description": "Fallback CSS selector for the upload target.",
+            "type": "string",
+            "minLength": 1
+          },
+          "fileOpId": {
+            "description": "Omit fileOpId when setting files on a resolved upload target.",
+            "not": {}
+          },
+          "accept": {
+            "description": "Omit accept when setting files on a resolved upload target.",
+            "not": {}
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "Explain whether this operation uploads files through the resolved control, accepts a pending chooser, or cancels an unintended chooser."
+          }
+        },
+        "required": [
+          "pageId",
+          "files",
+          "purpose"
+        ],
+        "additionalProperties": true
+      },
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Page ID with the pending file chooser."
+          },
+          "fileOpId": {
+            "description": "File operation ID. Required when more than one chooser is pending.",
+            "type": "string",
+            "minLength": 1
+          },
+          "accept": {
+            "type": "boolean",
+            "const": true,
+            "description": "Accept the native chooser."
+          },
+          "files": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "description": "Files to submit through the native chooser."
+          },
+          "id": {
+            "description": "Omit id when resolving a pending native chooser.",
+            "not": {}
+          },
+          "selector": {
+            "description": "Omit selector when resolving a pending native chooser.",
+            "not": {}
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "Explain whether this operation uploads files through the resolved control, accepts a pending chooser, or cancels an unintended chooser."
+          }
+        },
+        "required": [
+          "pageId",
+          "accept",
+          "files",
+          "purpose"
+        ],
+        "additionalProperties": true
+      },
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Page ID with the pending file chooser."
+          },
+          "fileOpId": {
+            "description": "File operation ID. Required when more than one chooser is pending.",
+            "type": "string",
+            "minLength": 1
+          },
+          "accept": {
+            "type": "boolean",
+            "const": false,
+            "description": "Cancel the native chooser."
+          },
+          "files": {
+            "description": "Omit files when cancelling a pending native chooser.",
+            "not": {}
+          },
+          "id": {
+            "description": "Omit id when resolving a pending native chooser.",
+            "not": {}
+          },
+          "selector": {
+            "description": "Omit selector when resolving a pending native chooser.",
+            "not": {}
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "Explain whether this operation uploads files through the resolved control, accepts a pending chooser, or cancels an unintended chooser."
+          }
+        },
+        "required": [
+          "pageId",
+          "accept",
+          "purpose"
+        ],
+        "additionalProperties": true
+      }
+    ]
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "fileOpId": {
+        "type": "string",
+        "minLength": 1,
+        "description": "File operation ID resolved or created for this flow."
+      },
+      "pageId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Page ID containing the chooser or upload target."
+      },
+      "source": {
+        "type": "string",
+        "enum": [
+          "target",
+          "chooser"
+        ],
+        "description": "Whether the files were set on a target or submitted to a native chooser."
+      },
+      "handled": {
+        "type": "boolean",
+        "const": true,
+        "description": "Confirms that the requested file operation was handled."
+      },
+      "action": {
+        "type": "string",
+        "enum": [
+          "accept",
+          "cancel"
+        ],
+        "description": "Chooser action applied to this operation."
+      },
+      "state": {
+        "type": "string",
+        "enum": [
+          "completed",
+          "cancelled"
+        ],
+        "description": "Observed terminal state after handling."
+      },
+      "selectedFileCount": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991,
+        "description": "Number of file paths accepted for the operation."
+      },
+      "resolvedBy": {
+        "type": "string",
+        "enum": [
+          "agent",
+          "user"
+        ],
+        "description": "Actor that supplied or resolved the operation target."
+      },
+      "targetResolvedBy": {
+        "description": "Resolution route used for a direct upload target.",
+        "type": "string",
+        "enum": [
+          "id",
+          "selector",
+          "snapshot-recovery",
+          "selector-fallback"
+        ]
+      },
+      "recoveredTarget": {
+        "description": "Snapshot details used when the target was recovered after a stale reference.",
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {}
+      }
+    },
+    "required": [
+      "fileOpId",
+      "pageId",
+      "source",
+      "handled",
+      "action",
+      "state",
+      "selectedFileCount",
+      "resolvedBy"
+    ],
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "fileOpId": {
+            "type": "string",
+            "minLength": 1,
+            "description": "File operation ID resolved or created for this flow."
+          },
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Page ID containing the chooser or upload target."
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "target",
+              "chooser"
+            ],
+            "description": "Whether the files were set on a target or submitted to a native chooser."
+          },
+          "handled": {
+            "type": "boolean",
+            "const": true,
+            "description": "Confirms that the requested file operation was handled."
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "accept",
+              "cancel"
+            ],
+            "description": "Chooser action applied to this operation."
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "completed",
+              "cancelled"
+            ],
+            "description": "Observed terminal state after handling."
+          },
+          "selectedFileCount": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Number of file paths accepted for the operation."
+          },
+          "resolvedBy": {
+            "type": "string",
+            "enum": [
+              "agent",
+              "user"
+            ],
+            "description": "Actor that supplied or resolved the operation target."
+          },
+          "targetResolvedBy": {
+            "description": "Resolution route used for a direct upload target.",
+            "type": "string",
+            "enum": [
+              "id",
+              "selector",
+              "snapshot-recovery",
+              "selector-fallback"
+            ]
+          },
+          "recoveredTarget": {
+            "description": "Snapshot details used when the target was recovered after a stale reference.",
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          }
+        },
+        "required": [
+          "fileOpId",
+          "pageId",
+          "source",
+          "handled",
+          "action",
+          "state",
+          "selectedFileCount",
+          "resolvedBy"
+        ],
+        "additionalProperties": false,
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
+  "purposeHint": "Explain whether this operation uploads files through the resolved control, accepts a pending chooser, or cancels an unintended chooser."
 }

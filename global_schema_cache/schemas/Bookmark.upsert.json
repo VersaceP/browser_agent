@@ -1,45 +1,143 @@
 {
   "method": "Bookmark.upsert",
-  "description": "Creates a bookmark or updates its title/favicon; resolves the target folder by name and creates it if missing.",
-  "params": {
-    "fleetId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Fleet ID whose bookmark store should be changed.",
-      "required": true
-    },
-    "url": {
-      "type": "string",
-      "format": "uri",
-      "description": "Bookmark target URL.",
-      "required": true
-    },
-    "title": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Bookmark title to store. Used as the new title when updating an existing bookmark.",
-      "required": true
-    },
-    "faviconUrl": {
-      "description": "Optional favicon URL to store with the bookmark.",
-      "type": "string",
-      "required": false
-    },
-    "folderId": {
-      "description": "Opaque folder ID to place the bookmark under. Omit for the root folder.",
-      "type": "string",
-      "minLength": 1,
-      "required": false
-    },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe why you are saving or refreshing this bookmark, e.g., saving an important page for later",
-      "required": true
-    }
-  },
+  "description": "Creates a bookmark or updates the matching bookmark URL, title, favicon, and folder.",
   "requiresPurpose": true,
+  "actionRevision": "sha256:d79fed2a07d55195085a2864a9bb5c4bed26e3f9d4058324cfb3de0a18857c79",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "fleetId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Fleet ID whose bookmark store should be changed."
+      },
+      "url": {
+        "type": "string",
+        "format": "uri",
+        "description": "Bookmark target URL."
+      },
+      "title": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Bookmark title to store. Used as the new title when updating an existing bookmark."
+      },
+      "faviconUrl": {
+        "description": "Optional favicon URL to store with the bookmark.",
+        "type": "string"
+      },
+      "folderId": {
+        "description": "Opaque folder ID to place the bookmark under. Omit for the root folder.",
+        "type": "string",
+        "minLength": 1
+      },
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "Describe why you are saving or refreshing this bookmark, e.g., saving an important page for later"
+      }
+    },
+    "required": [
+      "fleetId",
+      "url",
+      "title",
+      "purpose"
+    ],
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "anyOf": [
+      {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": {},
+        "description": "Created or updated bookmark result fields."
+      },
+      {
+        "type": "null",
+        "description": "Null when the underlying bookmark API returns no result."
+      }
+    ]
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": {},
+            "description": "Created or updated bookmark result fields."
+          },
+          {
+            "type": "null",
+            "description": "Null when the underlying bookmark API returns no result."
+          }
+        ],
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
   "purposeHint": "Describe why you are saving or refreshing this bookmark, e.g., saving an important page for later"
 }

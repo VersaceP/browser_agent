@@ -1,54 +1,329 @@
 {
   "method": "Bookmark.folder",
-  "description": "Lists and manages the hierarchical bookmark folder tree.",
-  "params": {
-    "operation": {
-      "type": "string",
-      "enum": [
-        "list",
-        "create",
-        "rename",
-        "move",
-        "remove"
-      ],
-      "required": true
-    },
-    "fleetId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "required": true
-    },
-    "parentId": {
-      "anyOf": [
-        {
-          "type": "string",
-          "minLength": 1
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "required": false
-    },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe why you are managing bookmark folders, e.g., organizing saved pages",
-      "required": true
-    },
-    "name": {
-      "type": "string",
-      "minLength": 1,
-      "required": false
-    },
-    "folderId": {
-      "type": "string",
-      "minLength": 1,
-      "required": false
-    }
-  },
+  "description": "Lists, creates, renames, moves, or removes bookmark folders in a Fleet.",
   "requiresPurpose": true,
+  "actionRevision": "sha256:4f260d252b4358f511eee91c8531f82bd93e92bbd1b4dfd37f8d97b2bb6cb49a",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "oneOf": [
+      {
+        "type": "object",
+        "properties": {
+          "operation": {
+            "type": "string",
+            "const": "list",
+            "description": "List folders in the Fleet."
+          },
+          "fleetId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Fleet ID whose folder tree should be read."
+          },
+          "parentId": {
+            "description": "Optional parent folder ID to scope the list; omit for the root tree.",
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "Describe why you are managing bookmark folders, e.g., organizing saved pages"
+          }
+        },
+        "required": [
+          "operation",
+          "fleetId",
+          "purpose"
+        ],
+        "additionalProperties": true
+      },
+      {
+        "type": "object",
+        "properties": {
+          "operation": {
+            "type": "string",
+            "const": "create",
+            "description": "Create a new folder."
+          },
+          "fleetId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Fleet ID whose folder tree should be changed."
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "description": "New folder name."
+          },
+          "parentId": {
+            "description": "Optional parent folder ID; omit or use null for the root tree.",
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "Describe why you are managing bookmark folders, e.g., organizing saved pages"
+          }
+        },
+        "required": [
+          "operation",
+          "fleetId",
+          "name",
+          "purpose"
+        ],
+        "additionalProperties": true
+      },
+      {
+        "type": "object",
+        "properties": {
+          "operation": {
+            "type": "string",
+            "const": "rename",
+            "description": "Rename an existing folder."
+          },
+          "fleetId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Fleet ID whose folder tree should be changed."
+          },
+          "folderId": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Opaque folder ID to rename."
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "description": "New folder name."
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "Describe why you are managing bookmark folders, e.g., organizing saved pages"
+          }
+        },
+        "required": [
+          "operation",
+          "fleetId",
+          "folderId",
+          "name",
+          "purpose"
+        ],
+        "additionalProperties": true
+      },
+      {
+        "type": "object",
+        "properties": {
+          "operation": {
+            "type": "string",
+            "const": "move",
+            "description": "Move an existing folder."
+          },
+          "fleetId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Fleet ID whose folder tree should be changed."
+          },
+          "folderId": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Opaque folder ID to move."
+          },
+          "parentId": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Destination parent folder ID, or null for the root tree."
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "Describe why you are managing bookmark folders, e.g., organizing saved pages"
+          }
+        },
+        "required": [
+          "operation",
+          "fleetId",
+          "folderId",
+          "parentId",
+          "purpose"
+        ],
+        "additionalProperties": true
+      },
+      {
+        "type": "object",
+        "properties": {
+          "operation": {
+            "type": "string",
+            "const": "remove",
+            "description": "Remove an existing folder."
+          },
+          "fleetId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Fleet ID whose folder tree should be changed."
+          },
+          "folderId": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Opaque folder ID to remove."
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "Describe why you are managing bookmark folders, e.g., organizing saved pages"
+          }
+        },
+        "required": [
+          "operation",
+          "fleetId",
+          "folderId",
+          "purpose"
+        ],
+        "additionalProperties": true
+      }
+    ]
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "anyOf": [
+      {
+        "type": "array",
+        "items": {},
+        "description": "Folder records returned by a list operation."
+      },
+      {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": {},
+        "description": "Created, renamed, moved, or removed folder result fields."
+      },
+      {
+        "type": "boolean",
+        "description": "Whether the requested folder operation changed state."
+      },
+      {
+        "type": "null",
+        "description": "Null when the underlying browser API returns no result."
+      }
+    ]
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {},
+            "description": "Folder records returned by a list operation."
+          },
+          {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": {},
+            "description": "Created, renamed, moved, or removed folder result fields."
+          },
+          {
+            "type": "boolean",
+            "description": "Whether the requested folder operation changed state."
+          },
+          {
+            "type": "null",
+            "description": "Null when the underlying browser API returns no result."
+          }
+        ],
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
   "purposeHint": "Describe why you are managing bookmark folders, e.g., organizing saved pages"
 }

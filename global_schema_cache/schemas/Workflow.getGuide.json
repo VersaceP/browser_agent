@@ -1,12 +1,171 @@
 {
   "method": "Workflow.getGuide",
-  "description": "Retrieve the workflow orchestration guide and syntax documentation to write correct sequential steps.",
-  "params": {
-    "skillFile": {
-      "description": "Return the workflow guide as a file path instead of inline content when true.",
-      "type": "boolean",
-      "required": false
-    }
+  "description": "Returns the workflow-orchestration guide as inline content or a local file path.",
+  "requiresPurpose": false,
+  "actionRevision": "sha256:9570c036641ca54cfb8c4a3e8bd74fa11a152787839d30202eace8b726c25432",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "skillFile": {
+        "description": "Return the workflow guide as a file path instead of inline content when true.",
+        "type": "boolean"
+      }
+    },
+    "additionalProperties": true
   },
-  "requiresPurpose": false
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "guideRevision": {
+        "description": "Content revision of the workflow-orchestration guide.",
+        "type": "string"
+      },
+      "skillsGuide": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "content",
+              "path"
+            ],
+            "description": "Whether the guide is inline content or a local path."
+          },
+          "value": {
+            "type": "string",
+            "description": "Guide content or path according to type."
+          }
+        },
+        "required": [
+          "type",
+          "value"
+        ],
+        "additionalProperties": {},
+        "description": "Normalized guide payload."
+      },
+      "format": {
+        "description": "Legacy or transport-specific guide format, when returned.",
+        "type": "string"
+      },
+      "content": {
+        "description": "Inline workflow guide content, when returned.",
+        "type": "string"
+      },
+      "path": {
+        "description": "Local workflow guide path, when returned.",
+        "type": "string"
+      }
+    },
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "guideRevision": {
+            "description": "Content revision of the workflow-orchestration guide.",
+            "type": "string"
+          },
+          "skillsGuide": {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "content",
+                  "path"
+                ],
+                "description": "Whether the guide is inline content or a local path."
+              },
+              "value": {
+                "type": "string",
+                "description": "Guide content or path according to type."
+              }
+            },
+            "required": [
+              "type",
+              "value"
+            ],
+            "additionalProperties": {},
+            "description": "Normalized guide payload."
+          },
+          "format": {
+            "description": "Legacy or transport-specific guide format, when returned.",
+            "type": "string"
+          },
+          "content": {
+            "description": "Inline workflow guide content, when returned.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Local workflow guide path, when returned.",
+            "type": "string"
+          }
+        },
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  }
 }

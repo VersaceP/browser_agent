@@ -1,54 +1,189 @@
 {
   "method": "Input.press",
-  "description": "Dispatches a physical keyboard key press to the current focus or an optional known target; establish or verify focus before using it for form submission or shortcuts.",
-  "params": {
-    "pageId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Page ID that should receive the key press.",
-      "required": true
-    },
-    "key": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Key value to press, such as \"Enter\", \"Escape\", or \"a\".",
-      "required": true
-    },
-    "modifiers": {
-      "description": "Optional modifier keys held while pressing the main key.",
-      "type": "array",
-      "items": {
-        "type": "string",
-        "enum": [
-          "Control",
-          "Shift",
-          "Alt",
-          "Meta"
-        ]
-      },
-      "required": false
-    },
-    "selector": {
-      "description": "Optional CSS selector to focus before pressing the key.",
-      "type": "string",
-      "minLength": 1,
-      "required": false
-    },
-    "id": {
-      "description": "Optional canonical element ID to focus before pressing the key.",
-      "type": "string",
-      "pattern": "^\\d+:\\d+:\\d+$",
-      "required": false
-    },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe why this key is needed, e.g., pressing Enter to submit, Escape to close an overlay, Tab to move focus, or a shortcut with modifiers",
-      "required": true
-    }
-  },
+  "description": "Dispatches a keyboard key with optional modifiers to the page or a resolved target.",
   "requiresPurpose": true,
+  "actionRevision": "sha256:388aa48876579f0681008f3b6933b2324950f2b1e473a5236eedabaa49229770",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "pageId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Page ID that should receive the key press."
+      },
+      "key": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Key value to press, such as \"Enter\", \"Escape\", or \"a\"."
+      },
+      "modifiers": {
+        "description": "Optional modifier keys held while pressing the main key.",
+        "type": "array",
+        "items": {
+          "type": "string",
+          "enum": [
+            "Control",
+            "Shift",
+            "Alt",
+            "Meta"
+          ]
+        }
+      },
+      "selector": {
+        "description": "Optional CSS selector to focus before pressing the key.",
+        "type": "string",
+        "minLength": 1
+      },
+      "id": {
+        "description": "Optional canonical element ID to focus before pressing the key.",
+        "type": "string",
+        "pattern": "^\\d+:\\d+:\\d+$"
+      },
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "Describe why this key is needed, e.g., pressing Enter to submit, Escape to close an overlay, Tab to move focus, or a shortcut with modifiers"
+      }
+    },
+    "required": [
+      "pageId",
+      "key",
+      "purpose"
+    ],
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "key": {
+        "description": "Keyboard key dispatched.",
+        "type": "string"
+      },
+      "modifiers": {
+        "description": "Modifier keys held during dispatch.",
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "target": {
+        "description": "Target identity used for the key dispatch.",
+        "type": "string"
+      },
+      "resolvedBy": {
+        "description": "Actor or resolution mode that selected the target.",
+        "type": "string"
+      },
+      "repeat": {
+        "description": "Number of repeated key dispatches.",
+        "type": "number"
+      },
+      "resolutionSource": {
+        "description": "Target resolution route used by the action.",
+        "type": "string"
+      }
+    },
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "key": {
+            "description": "Keyboard key dispatched.",
+            "type": "string"
+          },
+          "modifiers": {
+            "description": "Modifier keys held during dispatch.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "target": {
+            "description": "Target identity used for the key dispatch.",
+            "type": "string"
+          },
+          "resolvedBy": {
+            "description": "Actor or resolution mode that selected the target.",
+            "type": "string"
+          },
+          "repeat": {
+            "description": "Number of repeated key dispatches.",
+            "type": "number"
+          },
+          "resolutionSource": {
+            "description": "Target resolution route used by the action.",
+            "type": "string"
+          }
+        },
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
   "purposeHint": "Describe why this key is needed, e.g., pressing Enter to submit, Escape to close an overlay, Tab to move focus, or a shortcut with modifiers"
 }

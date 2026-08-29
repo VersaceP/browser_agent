@@ -1,13 +1,113 @@
 {
   "method": "Memory.get",
-  "description": "Retrieves Fleet-global task context; this is not a page data or browser state query.",
-  "params": {
-    "fleetId": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Fleet ID whose shared context should be read.",
-      "required": true
-    }
+  "description": "Returns the current saved Agent memory for a Fleet, or null when none exists.",
+  "requiresPurpose": false,
+  "actionRevision": "sha256:c38766a607c61c918bd03c33d4c4a92735fa52fdc9bf47ab5a013fb1b8f5482c",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "fleetId": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Fleet ID whose shared context should be read."
+      }
+    },
+    "required": [
+      "fleetId"
+    ],
+    "additionalProperties": true
   },
-  "requiresPurpose": false
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "anyOf": [
+      {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": {},
+        "description": "Saved memory object containing the Agent context fields."
+      },
+      {
+        "type": "null",
+        "description": "No saved memory exists for the requested Fleet."
+      }
+    ]
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": {},
+            "description": "Saved memory object containing the Agent context fields."
+          },
+          {
+            "type": "null",
+            "description": "No saved memory exists for the requested Fleet."
+          }
+        ],
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  }
 }

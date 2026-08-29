@@ -1,12 +1,262 @@
 {
   "method": "System.getCapabilities",
-  "description": "Discovers callable actions and the high-level agent SOP guide; use it first, then query unfamiliar action schemas with System.describeAction or event contracts with System.listEvents.",
-  "params": {
-    "skillFile": {
-      "description": "Return the SOP guide as a file path instead of inline content when true.",
-      "type": "boolean",
-      "required": false
-    }
+  "description": "Returns compact summaries of callable Actions and the current Action-catalog and Agent-guide revisions, with the Agent Guide included only when requested.",
+  "requiresPurpose": false,
+  "actionRevision": "sha256:9b12bc5b6bfac6d46267fd738823186f9d0e187c870ef2a867174cf05801b860",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "guide": {
+        "default": "omit",
+        "description": "omit returns only catalog metadata; content returns the guide text; path returns a local path when the caller shares the Dispatcher filesystem.",
+        "type": "string",
+        "enum": [
+          "omit",
+          "content",
+          "path"
+        ]
+      }
+    },
+    "required": [
+      "guide"
+    ],
+    "additionalProperties": true
   },
-  "requiresPurpose": false
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "catalogRevision": {
+        "type": "string",
+        "pattern": "^sha256:.*",
+        "description": "Content revision of the current callable Action catalog."
+      },
+      "guideRevision": {
+        "type": "string",
+        "pattern": "^sha256:.*",
+        "description": "Content revision of the Agent guide."
+      },
+      "actions": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "method": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Callable Action method name."
+            },
+            "description": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Compact Action-specific purpose and boundary."
+            },
+            "requiresPurpose": {
+              "type": "boolean",
+              "description": "Whether the Action requires a non-empty purpose field."
+            },
+            "actionRevision": {
+              "type": "string",
+              "pattern": "^sha256:.*",
+              "description": "Content revision of this Action definition."
+            },
+            "purposeHint": {
+              "description": "Action-specific purpose wording, when required.",
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "method",
+            "description",
+            "requiresPurpose",
+            "actionRevision"
+          ],
+          "additionalProperties": false,
+          "description": "Compact summary used for Action discovery."
+        },
+        "description": "Callable Action summaries in the current catalog."
+      },
+      "agentGuide": {
+        "type": "object",
+        "properties": {
+          "format": {
+            "type": "string",
+            "enum": [
+              "content",
+              "path"
+            ],
+            "description": "Whether the guide is inline content or a local path."
+          },
+          "value": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Guide content or path according to format."
+          }
+        },
+        "required": [
+          "format",
+          "value"
+        ],
+        "additionalProperties": false,
+        "description": "Optional Agent guide requested by the caller."
+      }
+    },
+    "required": [
+      "catalogRevision",
+      "guideRevision",
+      "actions"
+    ],
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "catalogRevision": {
+            "type": "string",
+            "pattern": "^sha256:.*",
+            "description": "Content revision of the current callable Action catalog."
+          },
+          "guideRevision": {
+            "type": "string",
+            "pattern": "^sha256:.*",
+            "description": "Content revision of the Agent guide."
+          },
+          "actions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Callable Action method name."
+                },
+                "description": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Compact Action-specific purpose and boundary."
+                },
+                "requiresPurpose": {
+                  "type": "boolean",
+                  "description": "Whether the Action requires a non-empty purpose field."
+                },
+                "actionRevision": {
+                  "type": "string",
+                  "pattern": "^sha256:.*",
+                  "description": "Content revision of this Action definition."
+                },
+                "purposeHint": {
+                  "description": "Action-specific purpose wording, when required.",
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "method",
+                "description",
+                "requiresPurpose",
+                "actionRevision"
+              ],
+              "additionalProperties": false,
+              "description": "Compact summary used for Action discovery."
+            },
+            "description": "Callable Action summaries in the current catalog."
+          },
+          "agentGuide": {
+            "type": "object",
+            "properties": {
+              "format": {
+                "type": "string",
+                "enum": [
+                  "content",
+                  "path"
+                ],
+                "description": "Whether the guide is inline content or a local path."
+              },
+              "value": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Guide content or path according to format."
+              }
+            },
+            "required": [
+              "format",
+              "value"
+            ],
+            "additionalProperties": false,
+            "description": "Optional Agent guide requested by the caller."
+          }
+        },
+        "required": [
+          "catalogRevision",
+          "guideRevision",
+          "actions"
+        ],
+        "additionalProperties": false,
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  }
 }

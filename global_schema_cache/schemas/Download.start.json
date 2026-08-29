@@ -1,34 +1,364 @@
 {
   "method": "Download.start",
-  "description": "Starts a browser-session download and returns its tracking ID immediately.",
-  "params": {
-    "pageId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Page ID whose session should perform the download.",
-      "required": true
-    },
-    "url": {
-      "type": "string",
-      "format": "uri",
-      "description": "Direct file URL to download.",
-      "required": true
-    },
-    "savePath": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Workspace-relative or absolute save path.",
-      "required": true
-    },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe why you are downloading this file, e.g., saving report data",
-      "required": true
-    }
-  },
+  "description": "Starts a direct URL download or reserves the next download initiated by a page for five minutes.",
   "requiresPurpose": true,
+  "actionRevision": "sha256:21044b9db2d20b3db80d8966402cfcaebd467281b4981c8f524b9f476563857f",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "anyOf": [
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Page ID whose WebContents should initiate the download."
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Direct file URL. The browser receives this value unchanged."
+          },
+          "savePath": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Workspace-relative or absolute destination path."
+          },
+          "overwrite": {
+            "default": false,
+            "description": "Whether an existing destination may be replaced.",
+            "type": "boolean"
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "Describe why you are downloading this file, e.g., saving report data"
+          }
+        },
+        "required": [
+          "pageId",
+          "url",
+          "savePath",
+          "overwrite",
+          "purpose"
+        ],
+        "additionalProperties": true
+      },
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Page ID whose next download should be captured."
+          },
+          "url": {
+            "description": "Omit url when reserving the next download initiated by the page.",
+            "not": {}
+          },
+          "savePath": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Workspace-relative or absolute destination path."
+          },
+          "overwrite": {
+            "default": false,
+            "description": "Whether an existing destination may be replaced.",
+            "type": "boolean"
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "Describe why you are downloading this file, e.g., saving report data"
+          }
+        },
+        "required": [
+          "pageId",
+          "savePath",
+          "overwrite",
+          "purpose"
+        ],
+        "additionalProperties": true
+      }
+    ]
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "anyOf": [
+      {
+        "type": "object",
+        "properties": {
+          "downloadId": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Opaque download record ID created for the direct URL."
+          },
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Page ID whose browser session started the download."
+          },
+          "sourceType": {
+            "type": "string",
+            "const": "url",
+            "description": "Direct URL download branch."
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "URL accepted by the browser for the download."
+          },
+          "savePath": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Destination path selected for the download."
+          },
+          "state": {
+            "type": "string",
+            "const": "downloading",
+            "description": "Initial lifecycle state reported after dispatch."
+          },
+          "expiresAt": {
+            "type": "null",
+            "description": "Direct downloads do not have a reservation expiry."
+          }
+        },
+        "required": [
+          "downloadId",
+          "pageId",
+          "sourceType",
+          "url",
+          "savePath",
+          "state",
+          "expiresAt"
+        ],
+        "additionalProperties": false
+      },
+      {
+        "type": "object",
+        "properties": {
+          "downloadId": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Opaque reservation ID used to correlate the next page download."
+          },
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Page ID whose next download is reserved."
+          },
+          "sourceType": {
+            "type": "string",
+            "const": "page",
+            "description": "Page-initiated download reservation branch."
+          },
+          "url": {
+            "type": "null",
+            "description": "No direct URL is known for a page-initiated reservation."
+          },
+          "savePath": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Destination path selected for the reserved download."
+          },
+          "state": {
+            "type": "string",
+            "const": "waiting",
+            "description": "Reservation is waiting for the page to initiate a download."
+          },
+          "expiresAt": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Reservation expiry timestamp in milliseconds."
+          }
+        },
+        "required": [
+          "downloadId",
+          "pageId",
+          "sourceType",
+          "url",
+          "savePath",
+          "state",
+          "expiresAt"
+        ],
+        "additionalProperties": false
+      }
+    ]
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "downloadId": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Opaque download record ID created for the direct URL."
+              },
+              "pageId": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                "description": "Page ID whose browser session started the download."
+              },
+              "sourceType": {
+                "type": "string",
+                "const": "url",
+                "description": "Direct URL download branch."
+              },
+              "url": {
+                "type": "string",
+                "format": "uri",
+                "description": "URL accepted by the browser for the download."
+              },
+              "savePath": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Destination path selected for the download."
+              },
+              "state": {
+                "type": "string",
+                "const": "downloading",
+                "description": "Initial lifecycle state reported after dispatch."
+              },
+              "expiresAt": {
+                "type": "null",
+                "description": "Direct downloads do not have a reservation expiry."
+              }
+            },
+            "required": [
+              "downloadId",
+              "pageId",
+              "sourceType",
+              "url",
+              "savePath",
+              "state",
+              "expiresAt"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "downloadId": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Opaque reservation ID used to correlate the next page download."
+              },
+              "pageId": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                "description": "Page ID whose next download is reserved."
+              },
+              "sourceType": {
+                "type": "string",
+                "const": "page",
+                "description": "Page-initiated download reservation branch."
+              },
+              "url": {
+                "type": "null",
+                "description": "No direct URL is known for a page-initiated reservation."
+              },
+              "savePath": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Destination path selected for the reserved download."
+              },
+              "state": {
+                "type": "string",
+                "const": "waiting",
+                "description": "Reservation is waiting for the page to initiate a download."
+              },
+              "expiresAt": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Reservation expiry timestamp in milliseconds."
+              }
+            },
+            "required": [
+              "downloadId",
+              "pageId",
+              "sourceType",
+              "url",
+              "savePath",
+              "state",
+              "expiresAt"
+            ],
+            "additionalProperties": false
+          }
+        ],
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
   "purposeHint": "Describe why you are downloading this file, e.g., saving report data"
 }

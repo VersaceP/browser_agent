@@ -1,36 +1,205 @@
 {
   "method": "History.list",
-  "description": "Lists recent browsing history entries, optionally filtered by a keyword.",
-  "params": {
-    "fleetId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Fleet ID whose browsing history should be queried.",
-      "required": true
+  "description": "Lists browsing-history records for a Fleet using optional query and limit filters.",
+  "requiresPurpose": true,
+  "actionRevision": "sha256:00e6dbf1951e8ca365b0269f078649e13c46946cceebfb61adc5e45d138a2427",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "fleetId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Fleet ID whose browsing history should be queried."
+      },
+      "query": {
+        "description": "Optional text matched against history title, URL, or origin.",
+        "type": "string",
+        "minLength": 1
+      },
+      "limit": {
+        "default": 200,
+        "description": "Maximum recent history entries to return.",
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 1000
+      },
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "Describe why you are viewing browsing history, e.g., revisiting a previously accessed page"
+      }
     },
-    "query": {
-      "description": "Optional text matched against history title, URL, or origin.",
-      "type": "string",
-      "minLength": 1,
-      "required": false
-    },
-    "limit": {
-      "default": 200,
-      "description": "Maximum recent history entries to return.",
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 1000,
-      "required": true
-    },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe why you are viewing browsing history, e.g., revisiting a previously accessed page",
-      "required": true
+    "required": [
+      "fleetId",
+      "limit",
+      "purpose"
+    ],
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "array",
+    "items": {
+      "type": "object",
+      "properties": {
+        "visitId": {
+          "description": "Opaque history record ID.",
+          "type": "string"
+        },
+        "url": {
+          "description": "Visited URL.",
+          "type": "string"
+        },
+        "title": {
+          "description": "Page title recorded for the visit.",
+          "type": "string"
+        },
+        "origin": {
+          "description": "URL origin derived from the visit.",
+          "type": "string"
+        },
+        "faviconUrl": {
+          "description": "Favicon URL when available.",
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "visitCount": {
+          "description": "Number of visits represented by the record.",
+          "type": "number"
+        },
+        "lastVisitedAt": {
+          "description": "Most recent visit timestamp in milliseconds.",
+          "type": "number"
+        },
+        "createdAt": {
+          "description": "History record creation timestamp in milliseconds.",
+          "type": "number"
+        }
+      },
+      "additionalProperties": {},
+      "description": "One browsing-history record."
     }
   },
-  "requiresPurpose": true,
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "visitId": {
+              "description": "Opaque history record ID.",
+              "type": "string"
+            },
+            "url": {
+              "description": "Visited URL.",
+              "type": "string"
+            },
+            "title": {
+              "description": "Page title recorded for the visit.",
+              "type": "string"
+            },
+            "origin": {
+              "description": "URL origin derived from the visit.",
+              "type": "string"
+            },
+            "faviconUrl": {
+              "description": "Favicon URL when available.",
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "visitCount": {
+              "description": "Number of visits represented by the record.",
+              "type": "number"
+            },
+            "lastVisitedAt": {
+              "description": "Most recent visit timestamp in milliseconds.",
+              "type": "number"
+            },
+            "createdAt": {
+              "description": "History record creation timestamp in milliseconds.",
+              "type": "number"
+            }
+          },
+          "additionalProperties": {},
+          "description": "One browsing-history record."
+        },
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
   "purposeHint": "Describe why you are viewing browsing history, e.g., revisiting a previously accessed page"
 }

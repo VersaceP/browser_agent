@@ -1,19 +1,134 @@
 {
   "method": "Workflow.pause",
-  "description": "Requests an active workflow execution to pause at the next safe boundary.",
-  "params": {
-    "executionId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Workflow execution ID returned by Workflow.execute.",
-      "required": true
+  "description": "Requests that an active workflow pause at the next safe orchestration boundary.",
+  "requiresPurpose": false,
+  "actionRevision": "sha256:4aa4a7439838304d61981cf23fc45e972b8894a28fa169cc384e0dd4648495eb",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "workflowId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Public workflow ID returned by Workflow.execute or a Workflow.progress event."
+      },
+      "reason": {
+        "description": "Optional reason recorded in Workflow.progress when the run reaches the paused state.",
+        "type": "string"
+      }
     },
-    "reason": {
-      "description": "Optional reason recorded in Workflow.progress when the run reaches the paused state.",
-      "type": "string",
-      "required": false
-    }
+    "required": [
+      "workflowId"
+    ],
+    "additionalProperties": true
   },
-  "requiresPurpose": false
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "workflowId": {
+        "description": "Opaque workflow ID requested for pause.",
+        "type": "string"
+      },
+      "status": {
+        "description": "Workflow lifecycle status after the pause request.",
+        "type": "string"
+      },
+      "requested": {
+        "description": "Whether a pause request was accepted.",
+        "type": "boolean"
+      },
+      "reason": {
+        "description": "Reason recorded for the pause request.",
+        "type": "string"
+      }
+    },
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "workflowId": {
+            "description": "Opaque workflow ID requested for pause.",
+            "type": "string"
+          },
+          "status": {
+            "description": "Workflow lifecycle status after the pause request.",
+            "type": "string"
+          },
+          "requested": {
+            "description": "Whether a pause request was accepted.",
+            "type": "boolean"
+          },
+          "reason": {
+            "description": "Reason recorded for the pause request.",
+            "type": "string"
+          }
+        },
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  }
 }

@@ -1,94 +1,217 @@
 {
   "method": "Input.drag",
-  "description": "Drag a source to an element, coordinate, or relative offset. Relative offsets stop at the edge of the source document’s visible interaction area. Cross-frame dragging is not supported.",
-  "params": {
-    "pageId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Page ID containing the drag source and destination.",
-      "required": true
-    },
-    "selector": {
-      "description": "Fallback CSS selector for the drag source.",
-      "type": "string",
-      "minLength": 1,
-      "required": false
-    },
-    "id": {
-      "description": "Preferred canonical element ID for the drag source.",
-      "type": "string",
-      "pattern": "^\\d+:\\d+:\\d+$",
-      "required": false
-    },
-    "x": {
-      "description": "Fallback source X coordinate.",
-      "type": "number",
-      "required": false
-    },
-    "y": {
-      "description": "Fallback source Y coordinate.",
-      "type": "number",
-      "required": false
-    },
-    "toSelector": {
-      "description": "CSS selector for the destination. Without toOffset, the drop point defaults to the destination center.",
-      "type": "string",
-      "minLength": 1,
-      "required": false
-    },
-    "toId": {
-      "description": "Canonical destination ID. Without toOffset, the drop point defaults to the destination center.",
-      "type": "string",
-      "pattern": "^\\d+:\\d+:\\d+$",
-      "required": false
-    },
-    "toX": {
-      "description": "Fallback destination X coordinate.",
-      "type": "number",
-      "required": false
-    },
-    "toY": {
-      "description": "Fallback destination Y coordinate.",
-      "type": "number",
-      "required": false
-    },
-    "toOffset": {
-      "description": "Normalized point inside the destination (0–1). Use y=0.2/0.8 when upper/lower drop zones change the result.",
-      "type": "object",
-      "properties": {
-        "x": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 1
-        },
-        "y": {
-          "type": "number",
-          "minimum": 0,
-          "maximum": 1
-        }
-      },
-      "required": false,
-      "additionalProperties": false
-    },
-    "dx": {
-      "description": "Relative horizontal drag offset when not using an explicit destination. If omitted while dy is provided, defaults to 0.",
-      "type": "number",
-      "required": false
-    },
-    "dy": {
-      "description": "Relative vertical drag offset when not using an explicit destination. If omitted while dx is provided, defaults to 0.",
-      "type": "number",
-      "required": false
-    },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe the intended drag effect. Keep source and destination in the same document, and prefer canonical element IDs when targeting an element.",
-      "required": true
-    }
-  },
+  "description": "Drags from one resolved source to a resolved target, coordinate, or bounded offset within the same document.",
   "requiresPurpose": true,
+  "actionRevision": "sha256:7698b5c104d0f36f63d2cdf2debd711fafcf0ef4b4971fd835a0c6d47a970c4a",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "pageId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Page ID containing the drag source and destination."
+      },
+      "selector": {
+        "description": "Fallback CSS selector for the drag source.",
+        "type": "string",
+        "minLength": 1
+      },
+      "id": {
+        "description": "Preferred canonical element ID for the drag source.",
+        "type": "string",
+        "pattern": "^\\d+:\\d+:\\d+$"
+      },
+      "x": {
+        "description": "Fallback source X coordinate in CSS pixels.",
+        "type": "number"
+      },
+      "y": {
+        "description": "Fallback source Y coordinate in CSS pixels.",
+        "type": "number"
+      },
+      "toSelector": {
+        "description": "CSS selector for the destination. Without toOffset, the drop point defaults to the destination center.",
+        "type": "string",
+        "minLength": 1
+      },
+      "toId": {
+        "description": "Canonical destination ID. Without toOffset, the drop point defaults to the destination center.",
+        "type": "string",
+        "pattern": "^\\d+:\\d+:\\d+$"
+      },
+      "toX": {
+        "description": "Fallback destination X coordinate.",
+        "type": "number"
+      },
+      "toY": {
+        "description": "Fallback destination Y coordinate.",
+        "type": "number"
+      },
+      "toOffset": {
+        "description": "Normalized point inside the destination (0–1). Use y=0.2/0.8 when upper/lower drop zones change the result.",
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Normalized horizontal drop position inside the destination, from 0 to 1."
+          },
+          "y": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Normalized vertical drop position inside the destination, from 0 to 1."
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "additionalProperties": true
+      },
+      "dx": {
+        "description": "Relative horizontal drag offset when not using an explicit destination. If omitted while dy is provided, defaults to 0.",
+        "type": "number"
+      },
+      "dy": {
+        "description": "Relative vertical drag offset when not using an explicit destination. If omitted while dx is provided, defaults to 0.",
+        "type": "number"
+      },
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "Describe the intended drag effect. Keep source and destination in the same document, and prefer canonical element IDs when targeting an element."
+      }
+    },
+    "required": [
+      "pageId",
+      "purpose"
+    ],
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "source": {
+        "description": "Resolved drag source identity or point."
+      },
+      "destination": {
+        "description": "Resolved drag destination identity or point."
+      },
+      "resolvedBy": {
+        "description": "Resolution mode used for the drag endpoints.",
+        "type": "string"
+      },
+      "distance": {
+        "description": "Drag path distance in CSS pixels.",
+        "type": "number"
+      },
+      "completed": {
+        "description": "Whether the native drag and drop operation completed.",
+        "type": "boolean"
+      },
+      "resolutionSource": {
+        "description": "Target resolution route used by the action.",
+        "type": "string"
+      }
+    },
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "source": {
+            "description": "Resolved drag source identity or point."
+          },
+          "destination": {
+            "description": "Resolved drag destination identity or point."
+          },
+          "resolvedBy": {
+            "description": "Resolution mode used for the drag endpoints.",
+            "type": "string"
+          },
+          "distance": {
+            "description": "Drag path distance in CSS pixels.",
+            "type": "number"
+          },
+          "completed": {
+            "description": "Whether the native drag and drop operation completed.",
+            "type": "boolean"
+          },
+          "resolutionSource": {
+            "description": "Target resolution route used by the action.",
+            "type": "string"
+          }
+        },
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
   "purposeHint": "Describe the intended drag effect. Keep source and destination in the same document, and prefer canonical element IDs when targeting an element."
 }

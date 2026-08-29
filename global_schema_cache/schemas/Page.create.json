@@ -1,20 +1,151 @@
 {
   "method": "Page.create",
-  "description": "Creates a new tab in an existing Fleet; Fleet.create must be called first for a new Fleet.",
-  "params": {
-    "fleetId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Existing Fleet ID in which the new page should be created.",
-      "required": true
+  "description": "Creates a page in a ready Fleet and optionally starts navigation to an initial URL.",
+  "requiresPurpose": false,
+  "actionRevision": "sha256:1702e89f76b2c298cc77b7f50ecb88f9d38203241ecfc08d310db40a90d3b625",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "fleetId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Existing Fleet ID in which the new page should be created."
+      },
+      "url": {
+        "description": "Optional initial URL to open in the new page.",
+        "type": "string",
+        "format": "uri"
+      }
     },
-    "url": {
-      "description": "Optional initial URL to open in the new page.",
-      "type": "string",
-      "format": "uri",
-      "required": false
-    }
+    "required": [
+      "fleetId"
+    ],
+    "additionalProperties": true
   },
-  "requiresPurpose": false
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "fleetId": {
+        "description": "Fleet ID that owns the new page.",
+        "type": "string"
+      },
+      "pageId": {
+        "description": "New page ID.",
+        "type": "string"
+      },
+      "lifecycle": {
+        "description": "Page lifecycle state after creation.",
+        "type": "string"
+      },
+      "status": {
+        "description": "Page runtime status after creation.",
+        "type": "string"
+      },
+      "url": {
+        "description": "Initial or current page URL.",
+        "type": "string"
+      },
+      "navigationStarted": {
+        "description": "Whether initial navigation was dispatched.",
+        "type": "boolean"
+      }
+    },
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "fleetId": {
+            "description": "Fleet ID that owns the new page.",
+            "type": "string"
+          },
+          "pageId": {
+            "description": "New page ID.",
+            "type": "string"
+          },
+          "lifecycle": {
+            "description": "Page lifecycle state after creation.",
+            "type": "string"
+          },
+          "status": {
+            "description": "Page runtime status after creation.",
+            "type": "string"
+          },
+          "url": {
+            "description": "Initial or current page URL.",
+            "type": "string"
+          },
+          "navigationStarted": {
+            "description": "Whether initial navigation was dispatched.",
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  }
 }

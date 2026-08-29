@@ -1,6 +1,128 @@
 {
   "method": "Memory.list",
-  "description": "Lists all Fleet-global task memory records so the Agent can choose the correct Fleet before resuming, recovering, or updating context.",
-  "params": {},
-  "requiresPurpose": false
+  "description": "Lists memory summaries visible to the registered Agent.",
+  "requiresPurpose": false,
+  "actionRevision": "sha256:7c9d3f382a43a6bcdac9984c869d03946b1326dc93b817ad4fe59f9354c7bfac",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {},
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "array",
+    "items": {
+      "type": "object",
+      "properties": {
+        "fleetId": {
+          "description": "Fleet ID with saved memory.",
+          "type": "string"
+        },
+        "revision": {
+          "description": "Current memory revision.",
+          "type": "number"
+        },
+        "updatedAt": {
+          "description": "Last memory update timestamp in milliseconds.",
+          "type": "number"
+        },
+        "size": {
+          "description": "Serialized memory size in bytes.",
+          "type": "number"
+        }
+      },
+      "additionalProperties": {},
+      "description": "One saved-memory summary."
+    }
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "fleetId": {
+              "description": "Fleet ID with saved memory.",
+              "type": "string"
+            },
+            "revision": {
+              "description": "Current memory revision.",
+              "type": "number"
+            },
+            "updatedAt": {
+              "description": "Last memory update timestamp in milliseconds.",
+              "type": "number"
+            },
+            "size": {
+              "description": "Serialized memory size in bytes.",
+              "type": "number"
+            }
+          },
+          "additionalProperties": {},
+          "description": "One saved-memory summary."
+        },
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  }
 }

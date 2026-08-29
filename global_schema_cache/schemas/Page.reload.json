@@ -1,27 +1,142 @@
 {
   "method": "Page.reload",
-  "description": "Reloads the current page in the given pageId, equivalent to the browser reload button. Use as a recovery step when a page is stuck loading or in a degraded state before escalating to HITL.",
-  "params": {
-    "pageId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Page ID to reload.",
-      "required": true
-    },
-    "ignoreCache": {
-      "description": "When true, bypass the HTTP cache during reload (hard reload). Defaults to false.",
-      "type": "boolean",
-      "required": false
-    },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe why a reload is needed, e.g. \"page is stuck loading\" or \"attempting recovery before HITL escalation\"",
-      "required": true
-    }
-  },
+  "description": "Starts a reload of the current page, optionally bypassing browser cache.",
   "requiresPurpose": true,
+  "actionRevision": "sha256:5ffdb0e8e7d15c11397f40c5e037bcd41bd03bbd6e465f775709f043fa03c6dd",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "pageId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Page ID to reload."
+      },
+      "ignoreCache": {
+        "description": "When true, bypass the HTTP cache during reload (hard reload). Defaults to false.",
+        "type": "boolean"
+      },
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "Describe why a reload is needed, e.g. \"page is stuck loading\" or \"attempting recovery before HITL escalation\""
+      }
+    },
+    "required": [
+      "pageId",
+      "purpose"
+    ],
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "pageId": {
+        "description": "Page ID whose document was reloaded.",
+        "type": "string"
+      },
+      "bypassCache": {
+        "description": "Whether cache bypass was requested.",
+        "type": "boolean"
+      },
+      "ignoreCache": {
+        "description": "Whether the browser was asked to ignore cache.",
+        "type": "boolean"
+      },
+      "navigationStarted": {
+        "description": "Whether reload navigation was dispatched.",
+        "type": "boolean"
+      }
+    },
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "description": "Page ID whose document was reloaded.",
+            "type": "string"
+          },
+          "bypassCache": {
+            "description": "Whether cache bypass was requested.",
+            "type": "boolean"
+          },
+          "ignoreCache": {
+            "description": "Whether the browser was asked to ignore cache.",
+            "type": "boolean"
+          },
+          "navigationStarted": {
+            "description": "Whether reload navigation was dispatched.",
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
   "purposeHint": "Describe why a reload is needed, e.g. \"page is stuck loading\" or \"attempting recovery before HITL escalation\""
 }

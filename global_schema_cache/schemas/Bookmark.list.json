@@ -1,48 +1,237 @@
 {
   "method": "Bookmark.list",
-  "description": "Lists bookmarks with optional keyword, exact URL, or folder filters.",
-  "params": {
-    "fleetId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Fleet ID whose bookmark store should be queried.",
-      "required": true
+  "description": "Lists bookmarks stored for a Fleet, optionally limited by keyword, exact URL, or folder.",
+  "requiresPurpose": true,
+  "actionRevision": "sha256:1495f46925c7d2a723cafd2cccccb4275a9d8729af975873bc5444329ad66f70",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "fleetId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Fleet ID whose bookmark store should be queried."
+      },
+      "query": {
+        "description": "Optional keyword matched against bookmark title or URL.",
+        "type": "string",
+        "minLength": 1
+      },
+      "url": {
+        "description": "Optional exact URL lookup; an empty result means the URL is not bookmarked.",
+        "type": "string",
+        "format": "uri"
+      },
+      "folderId": {
+        "description": "Optional opaque folder ID to scope the listing.",
+        "type": "string",
+        "minLength": 1
+      },
+      "limit": {
+        "default": 500,
+        "description": "Maximum bookmarks to return.",
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 1000
+      },
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "Describe why you are listing bookmarks, e.g., finding a saved page"
+      }
     },
-    "query": {
-      "description": "Optional keyword matched against bookmark title or URL.",
-      "type": "string",
-      "minLength": 1,
-      "required": false
-    },
-    "url": {
-      "description": "Optional exact URL lookup; an empty result means the URL is not bookmarked.",
-      "type": "string",
-      "format": "uri",
-      "required": false
-    },
-    "folderId": {
-      "description": "Optional opaque folder ID to scope the listing.",
-      "type": "string",
-      "minLength": 1,
-      "required": false
-    },
-    "limit": {
-      "default": 500,
-      "description": "Maximum bookmarks to return.",
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 1000,
-      "required": true
-    },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe why you are listing bookmarks, e.g., finding a saved page",
-      "required": true
+    "required": [
+      "fleetId",
+      "limit",
+      "purpose"
+    ],
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "array",
+    "items": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "description": "Opaque bookmark ID.",
+          "type": "string"
+        },
+        "url": {
+          "description": "Bookmark URL.",
+          "type": "string"
+        },
+        "title": {
+          "description": "Bookmark title.",
+          "type": "string"
+        },
+        "origin": {
+          "description": "URL origin derived from the bookmark URL.",
+          "type": "string"
+        },
+        "faviconUrl": {
+          "description": "Favicon URL when available.",
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "folderId": {
+          "description": "Containing folder ID, or null for the root folder.",
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sortOrder": {
+          "description": "Order within the containing folder.",
+          "type": "number"
+        },
+        "createdAt": {
+          "description": "Creation timestamp in milliseconds.",
+          "type": "number"
+        },
+        "updatedAt": {
+          "description": "Last update timestamp in milliseconds.",
+          "type": "number"
+        }
+      },
+      "additionalProperties": {},
+      "description": "One bookmark record."
     }
   },
-  "requiresPurpose": true,
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "description": "Opaque bookmark ID.",
+              "type": "string"
+            },
+            "url": {
+              "description": "Bookmark URL.",
+              "type": "string"
+            },
+            "title": {
+              "description": "Bookmark title.",
+              "type": "string"
+            },
+            "origin": {
+              "description": "URL origin derived from the bookmark URL.",
+              "type": "string"
+            },
+            "faviconUrl": {
+              "description": "Favicon URL when available.",
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "folderId": {
+              "description": "Containing folder ID, or null for the root folder.",
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "sortOrder": {
+              "description": "Order within the containing folder.",
+              "type": "number"
+            },
+            "createdAt": {
+              "description": "Creation timestamp in milliseconds.",
+              "type": "number"
+            },
+            "updatedAt": {
+              "description": "Last update timestamp in milliseconds.",
+              "type": "number"
+            }
+          },
+          "additionalProperties": {},
+          "description": "One bookmark record."
+        },
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
   "purposeHint": "Describe why you are listing bookmarks, e.g., finding a saved page"
 }

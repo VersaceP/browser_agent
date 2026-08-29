@@ -1,32 +1,155 @@
 {
   "method": "Page.handleDialog",
-  "description": "Accepts or dismisses a blocking browser dialog (alert, confirm, or prompt) that prevents further page interaction.",
-  "params": {
-    "pageId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Page ID with the pending native dialog.",
-      "required": true
-    },
-    "accept": {
-      "type": "boolean",
-      "description": "True to accept the dialog, false to dismiss it.",
-      "required": true
-    },
-    "userInput": {
-      "description": "Optional text for prompt dialogs when accepting.",
-      "type": "string",
-      "required": false
-    },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe why the dialog should be accepted or dismissed, e.g., confirming submission or cancelling an unsafe prompt",
-      "required": true
-    }
-  },
+  "description": "Accepts or dismisses the active JavaScript dialog on a page.",
   "requiresPurpose": true,
+  "actionRevision": "sha256:caa518734d0225830384b1e2fe4a0fdbb091f77ebac499399b3e8dff9339d05d",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "pageId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Page ID with the pending native dialog."
+      },
+      "accept": {
+        "type": "boolean",
+        "description": "True to accept the dialog, false to dismiss it."
+      },
+      "userInput": {
+        "description": "Optional text for prompt dialogs when accepting.",
+        "type": "string"
+      },
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "Describe why the dialog should be accepted or dismissed, e.g., confirming submission or cancelling an unsafe prompt"
+      }
+    },
+    "required": [
+      "pageId",
+      "accept",
+      "purpose"
+    ],
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "pageId": {
+        "description": "Page ID containing the handled dialog.",
+        "type": "string"
+      },
+      "dialogType": {
+        "description": "Native dialog type observed.",
+        "type": "string"
+      },
+      "action": {
+        "description": "Dialog action applied.",
+        "type": "string",
+        "enum": [
+          "accept",
+          "dismiss"
+        ]
+      },
+      "inputProvided": {
+        "description": "Whether text input was supplied to a prompt dialog.",
+        "type": "boolean"
+      }
+    },
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "description": "Page ID containing the handled dialog.",
+            "type": "string"
+          },
+          "dialogType": {
+            "description": "Native dialog type observed.",
+            "type": "string"
+          },
+          "action": {
+            "description": "Dialog action applied.",
+            "type": "string",
+            "enum": [
+              "accept",
+              "dismiss"
+            ]
+          },
+          "inputProvided": {
+            "description": "Whether text input was supplied to a prompt dialog.",
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
   "purposeHint": "Describe why the dialog should be accepted or dismissed, e.g., confirming submission or cancelling an unsafe prompt"
 }

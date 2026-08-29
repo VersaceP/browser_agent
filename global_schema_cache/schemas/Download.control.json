@@ -1,38 +1,172 @@
 {
   "method": "Download.control",
-  "description": "Controls an active download by pausing, resuming, or cancelling it.",
-  "params": {
-    "fleetId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Fleet ID whose download should be controlled.",
-      "required": true
-    },
-    "downloadId": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Opaque download ID to control.",
-      "required": true
-    },
-    "command": {
-      "type": "string",
-      "enum": [
-        "pause",
-        "resume",
-        "cancel"
-      ],
-      "description": "Lifecycle command to execute.",
-      "required": true
-    },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe why you are changing the download state, e.g., pausing until network recovery",
-      "required": true
-    }
-  },
+  "description": "Pauses, resumes, or cancels one active download and reports the observed state transition.",
   "requiresPurpose": true,
+  "actionRevision": "sha256:0a00b31901ccc7d877cf57d79bbb06c43f7aa4bd7ff119c664692231ad71d121",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "fleetId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Fleet ID whose download should be controlled."
+      },
+      "downloadId": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Opaque download ID to control."
+      },
+      "command": {
+        "type": "string",
+        "enum": [
+          "pause",
+          "resume",
+          "cancel"
+        ],
+        "description": "Lifecycle command to execute."
+      },
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "Describe why you are changing the download state, e.g., pausing until network recovery"
+      }
+    },
+    "required": [
+      "fleetId",
+      "downloadId",
+      "command",
+      "purpose"
+    ],
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "downloadId": {
+        "description": "Opaque download record ID controlled by this action.",
+        "type": "string"
+      },
+      "requestedCommand": {
+        "description": "Lifecycle command requested by the caller.",
+        "type": "string",
+        "enum": [
+          "pause",
+          "resume",
+          "cancel"
+        ]
+      },
+      "previousState": {
+        "description": "Download state observed before the command.",
+        "type": "string"
+      },
+      "currentState": {
+        "description": "Download state observed after the command.",
+        "type": "string"
+      },
+      "changed": {
+        "description": "Whether the observed lifecycle state changed.",
+        "type": "boolean"
+      }
+    },
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "downloadId": {
+            "description": "Opaque download record ID controlled by this action.",
+            "type": "string"
+          },
+          "requestedCommand": {
+            "description": "Lifecycle command requested by the caller.",
+            "type": "string",
+            "enum": [
+              "pause",
+              "resume",
+              "cancel"
+            ]
+          },
+          "previousState": {
+            "description": "Download state observed before the command.",
+            "type": "string"
+          },
+          "currentState": {
+            "description": "Download state observed after the command.",
+            "type": "string"
+          },
+          "changed": {
+            "description": "Whether the observed lifecycle state changed.",
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
   "purposeHint": "Describe why you are changing the download state, e.g., pausing until network recovery"
 }

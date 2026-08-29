@@ -1,37 +1,142 @@
 {
   "method": "Download.remove",
-  "description": "Removes one terminal download record or all terminal download records.",
-  "params": {
-    "fleetId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Fleet ID whose download records should be changed.",
-      "required": true
-    },
-    "scope": {
-      "type": "string",
-      "enum": [
-        "item",
-        "finalized"
-      ],
-      "description": "Removal scope.",
-      "required": true
-    },
-    "downloadId": {
-      "description": "Opaque download ID when scope is item.",
-      "type": "string",
-      "minLength": 1,
-      "required": false
-    },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe why you are removing this download entry, e.g., cleaning up unneeded downloads",
-      "required": true
-    }
-  },
+  "description": "Removes one terminal download record or all terminal records without deleting downloaded files.",
   "requiresPurpose": true,
+  "actionRevision": "sha256:5d1724eb01530a8694d853fcdcb93348027cb799fe0683d03d6618682b697553",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "fleetId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Fleet ID whose download records should be changed."
+      },
+      "scope": {
+        "type": "string",
+        "enum": [
+          "item",
+          "finalized"
+        ],
+        "description": "Removal scope."
+      },
+      "downloadId": {
+        "description": "Opaque download ID when scope is item.",
+        "type": "string",
+        "minLength": 1
+      },
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "Describe why you are removing this download entry, e.g., cleaning up unneeded downloads"
+      }
+    },
+    "required": [
+      "fleetId",
+      "scope",
+      "purpose"
+    ],
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "removedCount": {
+        "description": "Number of terminal download records removed.",
+        "type": "number"
+      },
+      "removedIds": {
+        "description": "Opaque IDs of the records removed.",
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    },
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "removedCount": {
+            "description": "Number of terminal download records removed.",
+            "type": "number"
+          },
+          "removedIds": {
+            "description": "Opaque IDs of the records removed.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
   "purposeHint": "Describe why you are removing this download entry, e.g., cleaning up unneeded downloads"
 }

@@ -1,94 +1,211 @@
 {
   "method": "DOM.getImg",
-  "description": "Exports img, picture, SVG image, inline SVG, canvas, or screenshot-backed visual targets by canonical id or deep selector.",
-  "params": {
-    "pageId": {
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "description": "Page ID containing the target image elements.",
-      "required": true
-    },
-    "targets": {
-      "minItems": 1,
-      "maxItems": 32,
-      "type": "array",
-      "items": {
+  "description": "Exports image content from one or more page elements as files and optionally inline data.",
+  "requiresPurpose": true,
+  "actionRevision": "sha256:3cbf9502fd85d61de028f29ae0f6baf49cef8d98e1b72acae4d98a8adcdc7d55",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "pageId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Page ID containing the target image elements."
+      },
+      "targets": {
+        "minItems": 1,
+        "maxItems": 32,
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "description": "Preferred canonical element ID from DOM.getAXTree.",
+              "type": "string",
+              "pattern": "^\\d+:\\d+:\\d+$"
+            },
+            "selector": {
+              "description": "Fallback CSS selector resolved in the main document and all nested author Shadow DOM trees.",
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": true,
+          "description": "DOM query target identified by id, selector, or both."
+        },
+        "description": "One to 32 targets to export, preserving input order in response.data.items."
+      },
+      "options": {
         "type": "object",
         "properties": {
-          "id": {
-            "description": "Preferred canonical element ID from DOM.getAXTree.",
+          "path": {
             "type": "string",
-            "pattern": "^\\d+:\\d+:\\d+$"
+            "minLength": 1,
+            "description": "Required output directory. Every successful image item is written to this directory with an automatic filename."
           },
-          "selector": {
-            "description": "Fallback CSS selector resolved in the main document and all nested author Shadow DOM trees.",
+          "format": {
+            "default": "file",
+            "description": "Response payload format. Successful images are always written to options.path; base64/dataUrl additionally include inline data.",
             "type": "string",
-            "minLength": 1
+            "enum": [
+              "file",
+              "base64",
+              "dataUrl"
+            ]
+          },
+          "imageFormat": {
+            "default": "auto",
+            "description": "Preferred image encoding. auto preserves safe self-contained inline SVG, keeps supported raster sources when possible, and otherwise encodes PNG.",
+            "type": "string",
+            "enum": [
+              "auto",
+              "png",
+              "jpeg",
+              "webp"
+            ]
+          },
+          "quality": {
+            "default": 80,
+            "description": "Quality for lossy encodings such as JPEG or WebP.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "timeout": {
+            "default": 300,
+            "description": "Maximum batch wait time for image loading, in seconds. 0 waits until every image finishes or fails.",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
           }
         },
-        "additionalProperties": false,
-        "description": "DOM query target identified by id, selector, or both."
+        "required": [
+          "path",
+          "format",
+          "imageFormat",
+          "quality",
+          "timeout"
+        ],
+        "additionalProperties": true,
+        "description": "Required output options. path is an output directory, not a file path."
       },
-      "description": "One to 32 targets to export, preserving input order in response.data.items.",
-      "required": true
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "Describe why these image files are needed, e.g., saving product thumbnails, collecting visual assets, or preserving image evidence"
+      }
     },
-    "options": {
-      "type": "object",
-      "properties": {
-        "path": {
-          "type": "string",
-          "minLength": 1,
-          "description": "Required output directory. Every successful image item is written to this directory with an automatic filename."
-        },
-        "format": {
-          "default": "file",
-          "description": "Response payload format. Successful images are always written to options.path; base64/dataUrl additionally include inline data.",
-          "type": "string",
-          "enum": [
-            "file",
-            "base64",
-            "dataUrl"
-          ]
-        },
-        "imageFormat": {
-          "default": "auto",
-          "description": "Preferred image encoding. auto preserves safe self-contained inline SVG, keeps supported raster sources when possible, and otherwise encodes PNG.",
-          "type": "string",
-          "enum": [
-            "auto",
-            "png",
-            "jpeg",
-            "webp"
-          ]
-        },
-        "quality": {
-          "default": 80,
-          "description": "Quality for lossy encodings such as JPEG or WebP.",
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 100
-        },
-        "timeout": {
-          "default": 300,
-          "description": "Maximum batch wait time for image loading, in seconds. 0 waits until every image finishes or fails.",
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 9007199254740991
-        }
-      },
-      "required": true,
-      "additionalProperties": false,
-      "description": "Required output options. path is an output directory, not a file path."
-    },
-    "purpose": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "string",
-      "minLength": 1,
-      "description": "Describe why these image files are needed, e.g., saving product thumbnails, collecting visual assets, or preserving image evidence",
-      "required": true
-    }
+    "required": [
+      "pageId",
+      "targets",
+      "options",
+      "purpose"
+    ],
+    "additionalProperties": true
   },
-  "requiresPurpose": true,
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "items": {
+        "description": "Exported image records, including paths or inline data requested by the caller.",
+        "type": "array",
+        "items": {}
+      },
+      "summary": {
+        "description": "Counts and export summary for the returned images.",
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {}
+      }
+    },
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "items": {
+            "description": "Exported image records, including paths or inline data requested by the caller.",
+            "type": "array",
+            "items": {}
+          },
+          "summary": {
+            "description": "Counts and export summary for the returned images.",
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          }
+        },
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
   "purposeHint": "Describe why these image files are needed, e.g., saving product thumbnails, collecting visual assets, or preserving image evidence"
 }

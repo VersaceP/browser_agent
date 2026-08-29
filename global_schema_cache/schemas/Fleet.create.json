@@ -1,30 +1,149 @@
 {
   "method": "Fleet.create",
-  "description": "Creates a new browser instance or reuses an existing Fleet partition by fleetId.",
-  "params": {
-    "fleetId": {
-      "description": "Optional Fleet ID. If provided, reuses existing cache/partition or initializes one with this ID.",
-      "type": "string",
-      "format": "uuid",
-      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-      "required": false
-    },
-    "scope": {
-      "description": "Optional memory scope label for the fleet; defaults to fleetId.",
-      "type": "string",
-      "required": false
-    },
-    "tags": {
-      "description": "Optional tags; when provided they replace prepared Fleet tags.",
-      "maxItems": 20,
-      "type": "array",
-      "items": {
+  "description": "Creates an isolated browser Fleet or restores the explicitly requested Fleet partition when available.",
+  "requiresPurpose": false,
+  "actionRevision": "sha256:d93fe3233111bad64b3d6fcbd27ccf96c2721009bba370693759104d0eeb26d8",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "fleetId": {
+        "description": "Optional Fleet ID. If provided, reuses existing cache/partition or initializes one with this ID.",
         "type": "string",
-        "minLength": 1,
-        "maxLength": 32
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
       },
-      "required": false
-    }
+      "scope": {
+        "description": "Optional memory scope label for the fleet; defaults to fleetId.",
+        "type": "string"
+      },
+      "tags": {
+        "description": "Optional tags; when provided they replace prepared Fleet tags.",
+        "maxItems": 20,
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        }
+      }
+    },
+    "additionalProperties": true
   },
-  "requiresPurpose": false
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "fleetId": {
+        "description": "Created or restored Fleet ID.",
+        "type": "string"
+      },
+      "state": {
+        "description": "Fleet lifecycle state observed after creation.",
+        "type": "string"
+      },
+      "restored": {
+        "description": "Whether an existing authorized Fleet partition was restored.",
+        "type": "boolean"
+      },
+      "partition": {
+        "description": "Browser partition identifier used by the Fleet.",
+        "type": "string"
+      },
+      "profileId": {
+        "description": "Fingerprint profile ID associated with the Fleet, when configured.",
+        "type": "string"
+      }
+    },
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Factual observation of the completed Action and its current visible result."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Action-specific next-step guidance based on the returned result."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "fleetId": {
+            "description": "Created or restored Fleet ID.",
+            "type": "string"
+          },
+          "state": {
+            "description": "Fleet lifecycle state observed after creation.",
+            "type": "string"
+          },
+          "restored": {
+            "description": "Whether an existing authorized Fleet partition was restored.",
+            "type": "boolean"
+          },
+          "partition": {
+            "description": "Browser partition identifier used by the Fleet.",
+            "type": "string"
+          },
+          "profileId": {
+            "description": "Fingerprint profile ID associated with the Fleet, when configured.",
+            "type": "string"
+          }
+        },
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Factual observation that does not expose private runtime diagnostics."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  }
 }
