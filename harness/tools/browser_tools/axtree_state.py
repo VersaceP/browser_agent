@@ -1,5 +1,6 @@
 """AXTree cache, stale-id guard, and browser-side rematch bookkeeping."""
 
+import json
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -94,7 +95,78 @@ def _precompute_axtree_snapshot(
         "lines": lines,
         "nodes": nodes,
         "pageId": page_id,
+        "rawLineSamples": _axtree_raw_line_samples(response),
     }
+
+
+def _axtree_raw_line_samples(
+    value: Any,
+    *,
+    limit: int = 3,
+    max_chars: int = 300,
+) -> List[str]:
+    """Return bounded raw payload samples before the AX line parser runs.
+
+    The normal line extractor intentionally discards unknown formats, which is
+    exactly the wrong source for diagnosing a format drift. Restrict sampling
+    to a payload key literally named ``lines`` so observations, prompts and
+    unrelated page text are not copied into the error receipt.
+    """
+
+    samples: List[str] = []
+
+    def append(item: Any) -> None:
+        if len(samples) >= limit:
+            return
+        if isinstance(item, str):
+            candidates = item.splitlines() or [item]
+            for candidate in candidates:
+                text = candidate.strip()
+                if text:
+                    samples.append(text[:max_chars])
+                if len(samples) >= limit:
+                    return
+            return
+        if isinstance(item, (dict, list)):
+            try:
+                text = json.dumps(
+                    item, ensure_ascii=False, sort_keys=True, default=str,
+                )
+            except Exception:
+                text = str(item)
+            if text.strip():
+                samples.append(text.strip()[:max_chars])
+            return
+        if item is not None:
+            samples.append(str(item)[:max_chars])
+
+    def visit(item: Any) -> None:
+        if len(samples) >= limit:
+            return
+        if isinstance(item, dict):
+            if "lines" in item:
+                lines_value = item.get("lines")
+                if isinstance(lines_value, list):
+                    for row in lines_value:
+                        append(row)
+                        if len(samples) >= limit:
+                            return
+                else:
+                    append(lines_value)
+                if samples:
+                    return
+            for nested in item.values():
+                visit(nested)
+                if samples:
+                    return
+        elif isinstance(item, list):
+            for nested in item:
+                visit(nested)
+                if samples:
+                    return
+
+    visit(value)
+    return samples
 
 
 def _axtree_lines_from_value(value: Any, *, limit: int = 10000) -> List[str]:
@@ -401,6 +473,21 @@ def _observe_axtree_state_after(
 ) -> None:
     _observe_page_url(agent, params, result)
     if method == "DOM.getAXTree":
+        data_error = result.get("axtreeDataError")
+        if isinstance(data_error, dict):
+            # The platform says nodes exist but the response cannot form a
+            # trustworthy local snapshot.  Clear any prior epoch so callers
+            # cannot accidentally target it after this failed perception.
+            _invalidate_axtree_snapshot(
+                agent, "DOM.getAXTree.parse_inconsistent", params,
+            )
+            logger = getattr(agent, "logger", None)
+            if logger is not None:
+                logger.write("axtree.parse_inconsistent", {
+                    "pageId": str(params.get("pageId") or "") or None,
+                    **data_error,
+                })
+            return
         snapshot = precomputed_snapshot if isinstance(precomputed_snapshot, dict) else {}
         raw_ids = snapshot.get("ids")
         ids = {str(item) for item in raw_ids if str(item).strip()} if isinstance(raw_ids, set) else set()
@@ -436,6 +523,16 @@ def _observe_axtree_state_after(
     for recovered in _recovered_targets_from_result(result):
         _apply_recovered_target(agent, method, params, result, recovered)
     _observe_target_resolution(agent, method, params, result)
+
+    # Page.go can report that the requested history entry is already current.
+    # No document changed in that case, so the existing AX snapshot remains as
+    # valid as it was before the call.  PageLifecycleTracker restores the same
+    # lifecycle obligations; keep the physical target cache consistent with it.
+    if (
+        method == "Page.go"
+        and _response_data(result).get("navigationStarted") is False
+    ):
+        return
 
     if method in AXTREE_INVALIDATING_METHODS and not (
         method == "Runtime.evaluate" and read_only_eval

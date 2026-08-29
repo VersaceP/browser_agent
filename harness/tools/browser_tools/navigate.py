@@ -1148,7 +1148,18 @@ def _observe_navigation_progress_after(
     # navigate_verified has its own verified reset in _observe_progress_after.
     if method == "Page.go":
         pending.pop(page_id, None)
-        if page_id and not _bt()._invoke_result_failed(result):
+        navigation_started = _bt()._response_data(result).get(
+            "navigationStarted"
+        )
+        if navigation_started is False:
+            result["progressNavigation"] = {
+                "status": "history_navigation_not_started",
+                "pageId": page_id,
+                "navigationKind": "history",
+                "navigationStarted": False,
+                "creditApplied": False,
+            }
+        elif page_id and not _bt()._invoke_result_failed(result):
             pending[page_id] = str(last_urls.get(page_id) or "")
         return
     if method in {"Page.navigate", "Page.reload"}:
@@ -1843,6 +1854,18 @@ def _transport_error_metadata(
         ):
             if key in local_receipt:
                 metadata[key] = local_receipt.get(key)
+    metadata["exceptionType"] = type(exc).__name__
+    transport_code = str(getattr(exc, "transport_code", "") or "").strip()
+    # Legacy callers construct ABCPTransportError for structured JSON-RPC
+    # failures without a transport code. Do not let the default placeholder
+    # hide their method-specific rpcData classification.
+    if transport_code and transport_code != "ABCP_TRANSPORT_UNKNOWN":
+        metadata["transportCode"] = transport_code
+    if bool(getattr(exc, "connection_fatal", False)):
+        metadata["connectionFatal"] = True
+    request_sent = getattr(exc, "request_sent", None)
+    if isinstance(request_sent, bool):
+        metadata["requestSent"] = request_sent
     rpc_code = getattr(exc, "rpc_code", None)
     rpc_method = str(getattr(exc, "rpc_method", "") or "")
     if rpc_code is not None:
@@ -1861,35 +1884,108 @@ def _transport_error_metadata(
     return metadata
 
 _SELECT_FAILURE_GUIDANCE: Dict[str, Tuple[int, str]] = {
-    "select-option-stale": (
+    # Rebuilt select contract (2026-08 platform generation). Retry budget is
+    # 1 only for "your request did not match the CURRENT option window"
+    # codes; every popup-mutation/takeover code is 0 because the platform's
+    # own prompts require continuing with one generic Input.click/type/scroll
+    # after re-observing, never an automatic Input.select replay.
+    "select-option-not-in-current-window": (
         1,
-        "Call DOM.inspectSelect again, copy only fields returned for the requested"
-        " option, then retry Input.select once, preferring its exact value or"
-        " label when present and using option id only as fallback. Do not open"
-        " or operate the popup manually or reuse an arbitrary AXTree option id.",
+        "Call DOM.inspectSelect again, copy only option descriptors the new"
+        " optionWindow actually returned (optionIds/optionLabels for a custom"
+        " popup, nativeValues for a native select), then retry Input.select"
+        " once. After any search, scroll, or pagination, inspect again first.",
     ),
-    "select-option-not-found": (
+    "select-option-id-unavailable": (
         1,
-        "Call DOM.inspectSelect again with an appropriate query/maxOptions and"
-        " inspect its loadMore/truncated state. Retry once only with an exact"
-        " option descriptor returned by that inspection.",
+        "The option carried no provable id. Re-run DOM.inspectSelect and retry"
+        " once with exact nativeValues/optionLabels instead of option ids.",
+    ),
+    "select-option-label-ambiguous": (
+        1,
+        "Multiple current options share the normalized label. Read the popup"
+        " with DOM.getSemanticTree, then retry once with the exact optionIds"
+        " entries for the intended options.",
+    ),
+    "select-agent-takeover-required": (
+        0,
+        "This control needs Agent takeover: search, remote loading,"
+        " pagination, virtualized options, or an incomplete option window."
+        " Keep the popup in its current state, re-read DOM.inspectSelect or"
+        " DOM.getSemanticTree, and continue with ONE generic Input.click /"
+        " Input.type / Input.scroll action, observing the page again after"
+        " every mutation. Do not replay Input.select automatically.",
+    ),
+    "select-popup-not-ready": (
+        0,
+        "The popup could not be observed as visible and stable. Do not repeat"
+        " Input.select; read the current control and popup with"
+        " DOM.getAXTree and DOM.getSemanticTree, then continue with one"
+        " bounded generic action.",
+    ),
+    "select-popup-not-found": (
+        0,
+        "The popup could not be bound through standard accessibility"
+        " relationships. Inspect the page with DOM.getAXTree and"
+        " DOM.getSemanticTree, then use generic Input.click/type/scroll"
+        " without repeating this Input.select request.",
+    ),
+    "select-popup-ambiguous": (
+        0,
+        "Multiple popup candidates were bound to the control. Re-observe the"
+        " page with DOM.getAXTree/DOM.getSemanticTree and continue with one"
+        " generic action; do not repeat Input.select.",
+    ),
+    "select-popup-relation-changed": (
+        0,
+        "The control no longer points to the observed popup, so old option"
+        " ids are invalid. Read DOM.getAXTree and the current popup with"
+        " DOM.getSemanticTree, then continue with one bounded generic action.",
+    ),
+    "select-option-id-proof-unavailable": (
+        0,
+        "Input may already have changed the control, but the exact option id"
+        " is no longer observable. Do not replay Input.select; read the"
+        " current control and popup state first.",
     ),
     "select-option-disabled": (
         0,
-        "The requested option is disabled. Stop retrying and report that it is"
-        " unavailable; do not silently choose a different option.",
+        "The requested option is disabled. Stop retrying and report that it"
+        " is unavailable; do not silently choose a different option.",
     ),
-    "select-popup-lost": (
+    "select-target-not-select": (
         0,
-        "ABCP lost the select popup while executing the atomic Input.select"
-        " action. Do not repeat the call, reload the page, or operate the popup"
-        " manually; report the platform failure with this receipt.",
+        "The target is not an ABCP-supported select control. Do not call"
+        " Input.select for it; traverse ordinary visible UI with fresh"
+        " AXTree targets and one verified Input.click per visible level.",
     ),
-    "select-navigation-stalled": (
+    "select-selection-mode-unknown": (
         0,
-        "ABCP could not advance the cascading selection. Do not repeat the same"
-        " path or replace it with manual popup clicks; report the platform"
-        " failure with the DOM.inspectSelect path used.",
+        "The platform could not determine the selection mode. Report this"
+        " ABCP select contract failure with the inspect receipts.",
+    ),
+    "select-multiple-unsupported": (
+        0,
+        "Multiple selection is not supported on this control. Report the"
+        " unsupported multi-select instead of retrying.",
+    ),
+    "select-control-kind-mismatch": (
+        0,
+        "The selection array does not match the control kind inspect reported"
+        " (nativeValues vs optionIds/optionLabels). Re-run DOM.inspectSelect"
+        " and use the array matching controlKind.",
+    ),
+    "select-state-restore-failed": (
+        0,
+        "ABCP could not restore the control's open/selection/scroll state"
+        " after inspection. Re-observe the control before continuing; do not"
+        " assume the pre-inspect state.",
+    ),
+    "select-final-state-unproven": (
+        0,
+        "The final selection state could not be proven. Inspect the control"
+        " with DOM.inspectSelect/DOM.getAttribute(value) before attempting"
+        " any correction - it may have partly changed.",
     ),
 }
 
@@ -1903,6 +1999,19 @@ def _apply_select_failure_guidance(
 
     if not isinstance(result, dict):
         return result
+    if method in {"DOM.inspectSelect", "Input.select"}:
+        # This generation validates request shape and suppresses automatic
+        # select retries, but it does not yet maintain a successful-inspection
+        # ledger capable of proving that a custom popup is still the same open
+        # generation. Make that boundary explicit instead of presenting prompt
+        # guidance as a mechanical guarantee.
+        result["selectGuardMode"] = "advisory"
+        result["selectGuard"] = {
+            "requestShapeValidated": method == "Input.select",
+            "freshInspectAssociationEnforced": False,
+            "popupVisibilityEnforced": False,
+            "genericInputFallbackAvailable": True,
+        }
     if method == "DOM.inspectSelect":
         classification = result.get("errorClassification")
         error_code = (
@@ -1910,29 +2019,136 @@ def _apply_select_failure_guidance(
             if isinstance(classification, dict)
             else ""
         )
-        if error_code == "select-control-not-visible":
-            result["next_instruction"] = (
-                "Refresh DOM.getAXTree and target only a currently visible"
-                " select-like control. Do not retry the same hidden container"
-                " selector or construct an Input.select request from hidden"
-                " option rows."
-            )
+        inspect_guidance: Dict[str, str] = {
+            "select-popup-not-found": (
+                "The popup could not be bound through standard accessibility"
+                " relationships. Refresh DOM.getAXTree, then use generic"
+                " Input.click/Input.type/Input.scroll with fresh targets; do"
+                " not retry the same inspect immediately."
+            ),
+            "select-popup-ambiguous": (
+                "Multiple popup candidates matched the control. Re-observe"
+                " with DOM.getAXTree/DOM.getSemanticTree and disambiguate"
+                " before acting."
+            ),
+            "select-popup-not-ready": (
+                "The popup could not be observed as visible and stable and was"
+                " left in its current state. Do not immediately repeat"
+                " DOM.inspectSelect; read the popup with DOM.getSemanticTree"
+                " first, then continue with one bounded generic action."
+            ),
+            "select-popup-relation-changed": (
+                "The control no longer points to the observed popup. Read"
+                " DOM.getAXTree and the current popup with"
+                " DOM.getSemanticTree, then continue with one bounded generic"
+                " action."
+            ),
+            "select-target-not-select": (
+                "This element is not an ABCP-supported select control. Do not"
+                " call Input.select for it. A visible multi-column"
+                " category/list browser is ordinary non-select UI: traverse it"
+                " with fresh AXTree targets plus one verified Input.click per"
+                " visible level."
+            ),
+            "select-selection-mode-unknown": (
+                "The platform could not determine the selection mode. Report"
+                " this ABCP select contract failure with this receipt."
+            ),
+            "select-state-restore-failed": (
+                "The control's open/selection/scroll state could not be"
+                " restored after inspection. Re-observe the control before"
+                " continuing; do not assume the pre-inspect state."
+            ),
+            "inspect-select-platform-action-failed": (
+                "ABCP returned a generic -32005 failure without a public"
+                " inspectSelect reason code. Do not repeat the same inspect"
+                " automatically or infer a selector from this error text."
+                " The failed Action may still have re-rendered or opened the"
+                " control, so discard prior element ids and re-observe first."
+                " A custom popup may be rendered through a portal outside the"
+                " control subtree: use fresh DOM.getSemanticTree/AX evidence"
+                " to relate aria-controls, aria-owns, or"
+                " aria-activedescendant to a page-wide listbox/option surface."
+                " Only a selector independently returned by that fresh"
+                " semantic evidence may be used. Then perform at most one"
+                " generic Input.click/Input.press/Input.type action. Its"
+                " success receipt does NOT prove a popup opened: require a"
+                " fresh visible related popup before calling Input.select."
+            ),
+        }
+        if error_code in inspect_guidance:
+            result["next_instruction"] = inspect_guidance[error_code]
             result["selectRecovery"] = {
                 "errorCode": error_code,
                 "retryAllowed": False,
             }
-        elif error_code == "select-control-unsupported":
-            result["next_instruction"] = (
-                "This element is not an ABCP-supported select-like control. Do"
-                " not call Input.select for it. If it is an ordinary visible"
-                " category/list browser, use fresh DOM.getAXTree targets and"
-                " one verified Input.click per visible level; this is a"
-                " non-select UI fallback, not manual popup management."
+            return result
+        if _bt()._invoke_result_failed(result):
+            return result
+        # Success path: translate the new optionWindow/popup envelope into
+        # bounded next-step facts and invalidate cached AX ids when this
+        # inspection itself changed what the page exposes.
+        data = _bt()._response_data(result)
+        option_window = (
+            data.get("optionWindow")
+            if isinstance(data.get("optionWindow"), dict) else {}
+        )
+        coverage = (
+            option_window.get("coverage")
+            if isinstance(option_window.get("coverage"), dict) else {}
+        )
+        coverage_kind = str(coverage.get("kind") or "")
+        popup = data.get("popup") if isinstance(data.get("popup"), dict) else {}
+        popup_state = str(popup.get("state") or "")
+        expanded = data.get("expanded") if isinstance(data.get("expanded"), dict) else {}
+        opened_by_action = popup.get("openedByAction") is True
+        popup_retained = (
+            popup_state == "open"
+            and str(popup.get("retainedBecause") or "") == "agent-exploration-required"
+        )
+        window_moved = (
+            expanded.get("before") != expanded.get("after")
+            or opened_by_action
+            or popup_retained
+        )
+        if window_moved:
+            # Inspection may have opened (and deliberately retained) the
+            # popup: visible DOM and option-id windows changed, so cached
+            # AX ids from the pre-inspect snapshot are no longer trustworthy.
+            # A pure native-select read changes nothing and must NOT
+            # invalidate.
+            _invalidate_axtree_snapshot(
+                agent,
+                "dom.inspect_select_opened_popup",
+                {"pageId": params.get("pageId")},
             )
-            result["selectRecovery"] = {
-                "errorCode": error_code,
-                "retryAllowed": False,
-            }
+        facts: Dict[str, Any] = {
+            "controlKind": data.get("controlKind"),
+            "selectionMode": data.get("selectionMode"),
+            "coverageKind": coverage_kind or None,
+            "popupState": popup_state or None,
+            "popupId": popup.get("id") if popup_state == "open" else None,
+            "popupOpenedByAction": opened_by_action or None,
+            "axtreeInvalidated": bool(window_moved) or None,
+        }
+        result["selectWindow"] = facts
+        if coverage_kind == "current-window":
+            result["next_instruction"] = (
+                "This option window is incomplete (searchable, scrollable,"
+                " paginated, or virtualized) and Input.select will NOT explore"
+                " it. Keep the popup open and combine DOM.getSemanticTree"
+                " (popup.id) with ONE generic Input.type/Input.scroll/"
+                " Input.click action per step, re-inspecting after every"
+                " mutation; use only freshly returned options."
+            )
+        elif popup_state == "open":
+            result["next_instruction"] = (
+                "Use only the returned current option ids or exact labels with"
+                " Input.select. The popup is open; explore it with"
+                " DOM.getSemanticTree via popup.id, and after every mutation"
+                " inspect again - option ids are only valid for the popup"
+                " generation that exposed them."
+            )
         return result
     if method != "Input.select":
         return result

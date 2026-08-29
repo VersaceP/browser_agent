@@ -240,10 +240,12 @@ async def _page_lifecycle_guard_before(
         "Page.go",
         "Page.close",
     }
-    # Download controls are mutually composable (pause -> resume/cancel). They
-    # may dirty page state for later DOM work, but must not deadlock each other
-    # behind that deferred resynchronization obligation.
-    is_file_control = method == "File.download" or method.startswith("Download.")
+    # Download controls are mutually composable (control pause -> resume /
+    # cancel). They may dirty page state for later DOM work, but must not
+    # deadlock each other behind that deferred resynchronization obligation.
+    is_file_control = method.startswith("Download.") or method in {
+        "File.download", "File.handleChooser",
+    }
     if (
         state.requires_state_resync
         and method not in lifecycle_recovery_methods
@@ -289,6 +291,7 @@ def _page_lifecycle_after_action(
     if not isinstance(tracker, PageLifecycleTracker):
         return
     page_id = _lifecycle_page_id(agent, params)
+    tracker.observe_navigation_response(method, page_id, response)
     if method == "Page.getState":
         tracker.observe_state_response(page_id, response)
     elif method == "DOM.getAXTree" and not _bt()._invoke_result_failed({"response": response}):
@@ -296,7 +299,7 @@ def _page_lifecycle_after_action(
     if (
         method in {
             "Page.navigate", "Page.getState", "DOM.getAXTree",
-            "File.download", "File.handleChooser", "Workflow.execute",
+            "Download.start", "File.handleChooser", "Workflow.execute",
         }
         or method.startswith("Download.")
     ):

@@ -406,6 +406,7 @@ from .validation import (  # noqa: F401
     _annotate_dom_batch_response,
     _attach_normalized_handles,
     _check_id_param_format,
+    _check_dialog_param_requirements,
     _check_nested_id_format,
     _check_screenshot_misuse,
     _check_scroll_param_requirements,

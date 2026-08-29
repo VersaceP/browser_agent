@@ -7,10 +7,10 @@ from typing import Any, List
 
 _SAVED_PATH_KEYS = frozenset({
     "savedpath",   # DOM.getImg/Page.screenshot
-    "savepath",    # Download.getStatus
+    "savepath",    # Download.start/Download.list records
     "localpath",
     "filepath",
-    "downloaded",  # File.download returns {downloaded: <path>, url}
+    "downloaded",  # legacy File.download returned {downloaded: <path>, url}
 })
 
 

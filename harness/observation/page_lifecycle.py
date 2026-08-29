@@ -79,6 +79,7 @@ class PageLifecycleTracker:
 
     def __init__(self) -> None:
         self._pages: Dict[str, PageLifecycleState] = {}
+        self._page_go_snapshots: Dict[str, tuple[str, bool, bool, str, int]] = {}
 
     def state(self, page_id: Any) -> Optional[PageLifecycleState]:
         key = str(page_id or "").strip()
@@ -98,12 +99,61 @@ class PageLifecycleTracker:
         state = self.ensure(page_id)
         if state is None:
             return
-        if method in {"Page.navigate", "Page.reload", "Page.go"}:
+        if method == "Page.go":
+            self._page_go_snapshots[state.page_id] = (
+                state.status,
+                state.requires_state_resync,
+                state.requires_ax_refresh,
+                state.last_event,
+                state.generation,
+            )
             self._mark_loading(state, method)
             state.requires_state_resync = True
             state.requires_ax_refresh = True
-        elif method in {"File.download", "Download.cancel", "Download.pause", "Download.resume"}:
+        elif method in {"Page.navigate", "Page.reload"}:
+            self._mark_loading(state, method)
             state.requires_state_resync = True
+            state.requires_ax_refresh = True
+        elif method in {
+            # Rebuilt Download domain: start (direct or page reservation) and
+            # control (pause/resume/cancel) change browser-side download
+            # state. Legacy names preserve replay compatibility.
+            "Download.start", "Download.control", "File.download",
+            "Download.cancel", "Download.pause", "Download.resume",
+        }:
+            state.requires_state_resync = True
+
+    def observe_navigation_response(
+        self,
+        method: str,
+        page_id: Any,
+        response: Any,
+    ) -> None:
+        """Honor Page.go's explicit statement that no navigation started."""
+        if method != "Page.go":
+            return
+        key = str(page_id or "").strip()
+        snapshot = self._page_go_snapshots.pop(key, None)
+        if not key or snapshot is None:
+            return
+        body = response if isinstance(response, dict) else {}
+        data = body.get("data") if isinstance(body.get("data"), dict) else {}
+        if data.get("navigationStarted") is not False:
+            return
+        state = self.ensure(key)
+        if state is None:
+            return
+        (
+            state.status,
+            state.requires_state_resync,
+            state.requires_ax_refresh,
+            state.last_event,
+            state.generation,
+        ) = snapshot
+        if state.status == "settled":
+            self._set_settled_event(state)
+        else:
+            self._clear_settled_event(state)
 
     def observe_event(self, name: str, payload: Any) -> Optional[PageLifecycleState]:
         payload = payload if isinstance(payload, dict) else {}

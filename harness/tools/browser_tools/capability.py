@@ -39,6 +39,57 @@ def _bt():
 
     return bt
 
+
+def _mark_axtree_parse_inconsistency(
+    method: str,
+    result: JsonDict,
+    snapshot: Any,
+) -> bool:
+    """Fail closed when the browser's AXTree count contradicts its payload.
+
+    A positive ``nodeCount`` with no parseable AX nodes is not an empty page.
+    Keeping the preceding snapshot live in that case lets a worker act against
+    an old epoch, while treating it as an empty result invites false absence.
+    The original browser response stays attached for platform diagnosis.
+    """
+
+    if method != "DOM.getAXTree" or not isinstance(snapshot, dict):
+        return False
+    nodes = snapshot.get("nodes")
+    if isinstance(nodes, list) and nodes:
+        return False
+    response = result.get("response")
+    data = response.get("data") if isinstance(response, dict) else None
+    node_count = optional_int(
+        data.get("nodeCount") if isinstance(data, dict) else None,
+        0,
+    ) or 0
+    if node_count <= 0:
+        return False
+    result.update({
+        "status": "failed",
+        "error": (
+            "ABCP DOM.getAXTree returned nodeCount="
+            f"{node_count} but no parseable AXTree nodes"
+        ),
+        "axtreeDataError": {
+            "code": "axtree_node_count_parse_mismatch",
+            "nodeCount": node_count,
+            "parsedNodeCount": 0,
+            "rawLineSamples": [
+                str(item)[:300]
+                for item in (snapshot.get("rawLineSamples") or [])[:3]
+            ],
+        },
+        "next_instruction": (
+            "This is an inconsistent ABCP AXTree response, not evidence of an"
+            " empty page. Do not use a prior AXTree id or infer absence; report"
+            " the platform data error or use an independent current observation"
+            " surface."
+        ),
+    })
+    return True
+
 async def _execute_browser_capability_tool(
     agent: Any,
     tool_name: str,
@@ -62,7 +113,10 @@ async def _execute_browser_capability_tool(
             "tool.direct_capability_wrapped",
             {
                 "tool": method,
-                "params": agent._trim_for_log(params),
+                "params": agent._trim_for_log(mask_params(
+                    params,
+                    {"userInput"} if method == "Page.handleDialog" else None,
+                )),
             },
         )
     else:
@@ -91,6 +145,13 @@ async def _execute_browser_capability_tool(
     navigation_context: JsonDict = {}
     runtime_receipt: JsonDict = {}
     runtime_json_expression = ""
+
+    # Dialog prompt input is a secret-bearing value. The browser receives it,
+    # but every harness log/trace/result uses the masked view.
+    sensitive_params = {"userInput"} if method == "Page.handleDialog" else None
+
+    def shown_params() -> JsonDict:
+        return mask_params(params, sensitive_params)
 
     if params_error:
         result = {
@@ -272,7 +333,7 @@ async def _execute_browser_capability_tool(
         agent.trace.append({
             "type": "fleet_binding_guard",
             "method": method,
-            "params": params,
+            "params": shown_params(),
             "result": fleet_binding_guard,
         })
         return fleet_binding_guard, False
@@ -285,7 +346,7 @@ async def _execute_browser_capability_tool(
         agent.trace.append({
             "type": "page_binding_guard",
             "method": method,
-            "params": params,
+            "params": shown_params(),
             "result": page_binding_guard,
         })
         return page_binding_guard, False
@@ -301,7 +362,7 @@ async def _execute_browser_capability_tool(
         agent.trace.append({
             "type": "fleet_auth_gate",
             "method": method,
-            "params": params,
+            "params": shown_params(),
             "result": auth_barrier_guard,
         })
         return auth_barrier_guard, False
@@ -324,6 +385,13 @@ async def _execute_browser_capability_tool(
         agent.logger.write("browser.call.screenshot_rejected", screenshot_guard)
         agent.trace.append({"type": "screenshot_guard", "result": screenshot_guard})
         return screenshot_guard, False
+
+    dialog_guard = _bt()._check_dialog_param_requirements(agent, method, params)
+    if dialog_guard is not None:
+        attach_method_schema(dialog_guard, method, agent.method_schemas)
+        agent.logger.write("browser.call.dialog_rejected", dialog_guard)
+        agent.trace.append({"type": "dialog_guard", "result": dialog_guard})
+        return dialog_guard, False
 
     target_param_guard = _bt()._check_target_param_requirements(
         method, params, getattr(agent, "method_schemas", {})
@@ -380,7 +448,7 @@ async def _execute_browser_capability_tool(
         agent.trace.append({
             "type": "fleet_auth_gate",
             "method": method,
-            "params": params,
+            "params": shown_params(),
             "result": page_create_claim_guard,
         })
         return page_create_claim_guard, False
@@ -396,7 +464,7 @@ async def _execute_browser_capability_tool(
         agent.trace.append({
             "type": "captcha_auto_solved",
             "method": method,
-            "params": params,
+            "params": shown_params(),
             "result": captcha_short_circuit,
         })
         return captcha_short_circuit, False
@@ -408,7 +476,7 @@ async def _execute_browser_capability_tool(
         agent.trace.append({
             "type": "fleet_auth_gate",
             "method": method,
-            "params": params,
+            "params": shown_params(),
             "result": hitl_claim_guard,
         })
         return hitl_claim_guard, False
@@ -456,7 +524,13 @@ async def _execute_browser_capability_tool(
             )
         else:
             try:
-                response, _recovery = await runner.call(method, params)
+                runner_kwargs = (
+                    {"redact_params": sensitive_params}
+                    if sensitive_params else {}
+                )
+                response, _recovery = await runner.call(
+                    method, params, **runner_kwargs
+                )
             except ABCPTransportError as exc:
                 # JSON-RPC action timeouts may happen after Electron has begun
                 # a download.  Contain this one method locally so reconciliation
@@ -601,6 +675,20 @@ async def _execute_browser_capability_tool(
                         },
                     )
         _bt()._page_lifecycle_after_action(agent, method, params, response)
+        observer = getattr(agent, "event_observer", None)
+        if method == "Page.getState" and isinstance(response, dict):
+            pending_fn = getattr(observer, "pending_dialogs", None)
+            pending = pending_fn(params.get("pageId")) if callable(pending_fn) else []
+            if pending:
+                data = response.get("data")
+                if isinstance(data, dict):
+                    data["pendingDialogs"] = pending
+                    data["latestDialogId"] = pending[-1]["dialogId"]
+                    data["pendingDialogCount"] = len(pending)
+        if method == "Page.handleDialog" and not _bt()._invoke_result_failed({"response": response}):
+            settle = getattr(observer, "settle_dialog", None)
+            if callable(settle):
+                settle(params.get("pageId"), params.get("dialogId"))
         response = agent._capture_artifacts(method, response)
         structural_challenge = detect_structural_challenge(method, response)
         record_file_action = getattr(agent, "_capture_file_action", None)
@@ -629,9 +717,15 @@ async def _execute_browser_capability_tool(
 
         result = {
             "method": method,
-            "params": params,
+            "params": shown_params(),
             "response": response,
         }
+        if _mark_axtree_parse_inconsistency(
+            method,
+            result,
+            axtree_snapshot if "axtree_snapshot" in locals() else None,
+        ):
+            structural_challenge = None
         if structural_challenge:
             result["structuralChallenge"] = structural_challenge
         if runtime_receipt:
@@ -662,15 +756,33 @@ async def _execute_browser_capability_tool(
     except FleetClickGateTimeout as exc:
         result = {
             "method": method,
-            "params": params,
+            "params": shown_params(),
             "error": str(exc),
             **exc.receipt,
         }
         attach_method_schema(result, method, agent.method_schemas)
     except ABCPTransportError as exc:
+        # A JSON-RPC error and a call timeout are represented by the same
+        # exception class, but a dead reader/send path proves this client can
+        # no longer make useful browser calls.  Do not downgrade that terminal
+        # connection state into a model-facing tool error: the spawner owns
+        # slot teardown/reconnect and must receive the typed exception.
+        if bool(getattr(exc, "connection_fatal", False)):
+            agent.logger.write(
+                "browser.transport.fatal",
+                {
+                    "method": method,
+                    "transportCode": str(
+                        getattr(exc, "transport_code", "") or ""
+                    ),
+                    "requestSent": getattr(exc, "request_sent", None),
+                    "error": str(exc)[:1000],
+                },
+            )
+            raise
         result = {
             "method": method,
-            "params": params,
+            "params": shown_params(),
             "error": str(exc),
             **_bt()._transport_error_metadata(method, exc),
         }
@@ -878,7 +990,7 @@ async def _execute_browser_capability_tool(
     agent.trace.append({
         "type": "browser_call",
         "method": method,
-        "params": params,
+        "params": shown_params(),
         "result": agent._clean_for_model(model_result),
     })
     return model_result, page_create_should_stop
@@ -1034,6 +1146,12 @@ async def _invoke_browser_method(
             "params": _shown_params(params),
             "response": response,
         }
+        if _mark_axtree_parse_inconsistency(
+            method,
+            result,
+            axtree_snapshot if "axtree_snapshot" in locals() else None,
+        ):
+            structural_challenge = None
         if structural_challenge:
             result["structuralChallenge"] = structural_challenge
         if runtime_receipt:
@@ -1049,6 +1167,8 @@ async def _invoke_browser_method(
         }
         attach_method_schema(result, method, agent.method_schemas)
     except ABCPTransportError as exc:
+        if bool(getattr(exc, "connection_fatal", False)):
+            raise
         result = {
             "method": method,
             "params": _shown_params(params),

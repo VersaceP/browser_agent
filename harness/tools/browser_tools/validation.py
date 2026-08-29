@@ -6,9 +6,12 @@ import re
 from typing import Any
 from typing import List
 from typing import Optional
+from typing import Set
 from typing import Tuple
 from pathlib import Path
 from harness.screenshot_policy import normalize_screenshot_output_params
+from harness.schema_loader import schema_param_spec
+from harness.schema_loader import schema_param_specs
 from harness.utils import JsonDict
 from .axtree_state import AXTREE_ID_RE
 
@@ -38,113 +41,200 @@ def _check_select_param_requirements(
     method: str,
     params: JsonDict,
 ) -> Optional[JsonDict]:
-    """Fail early on malformed Input.select selection envelopes.
+    """Fail early on malformed Input.select requests for the rebuilt select
+    contract.
 
-    The live schema now requires EXACTLY ONE locator per item — id, value,
-    label, or path — with `path` exclusive and every path segment following the
-    same rule. An earlier revision of this guard deliberately accepted several
-    coexisting fields because the schema of the day allowed it; that is now the
-    opposite of the contract, and combining them is rejected by the platform.
+    The current platform schema is: pageId + (id and/or selector - at least
+    one, both allowed so the id-first/selector-fallback pair keeps working)
+    plus EXACTLY ONE selection array - nativeValues, optionIds, or
+    optionLabels - which are mutually exclusive. nativeValues is for native
+    HTML selects; optionIds/optionLabels address options in the currently
+    open custom popup window. Arrays must be non-empty, duplicate-free, and
+    (for labels) non-blank and distinct after whitespace normalization.
 
-    Multiple direct choices mean "this is the final selection set", not "append
-    one more", and are only valid on a confirmed multi-select control — which
-    the harness cannot know before dispatch, so that stays the platform's call.
+    The earlier `selections` envelope (per-item id/value/label/path cascades)
+    belonged to the retired beta contract; a request carrying it is rejected
+    with a migration hint instead of reaching the browser as an opaque
+    -32602.
     """
 
     if method != "Input.select":
         return None
-    selections = params.get("selections")
-    if not isinstance(selections, list) or not selections:
-        return {
-            "method": method,
-            "params": params,
-            "status": "invalid_params",
-            "error": "Input.select requires a non-empty params.selections array.",
-            "invalidParam": "selections",
-            "missingAnyOf": [["selections"]],
-            "tool_was_executed": False,
-            "next_instruction": (
-                "Call DOM.inspectSelect when choices are unknown, then pass"
-                " selections as an array even for one choice. Copy only the"
-                " id/value/label or complete path fields returned for the"
-                " intended option, preferring exact value or label when present;"
-                " Input.select manages the popup atomically."
-            ),
-        }
 
-    canonical_id = re.compile(r"^\d+:\d+:\d+$")
-
-    def invalid(path: str, detail: str) -> JsonDict:
+    def invalid(param: str, detail: str, instruction: str) -> JsonDict:
         return {
             "method": method,
             "params": params,
             "status": "invalid_params",
             "error": detail,
-            "invalidParam": path,
+            "invalidParam": param,
             "tool_was_executed": False,
-            "next_instruction": (
-                "Every selections item must carry EXACTLY ONE locator: id,"
-                " exact value, exact label, or path. path is exclusive, and"
-                " each path segment follows the same one-locator rule. Copy"
-                " only option descriptor fields returned by DOM.inspectSelect;"
-                " do not synthesize identifiers or operate the popup manually."
-            ),
+            "next_instruction": instruction,
         }
 
-    def present_locators(choice: JsonDict, *, allow_path: bool) -> List[str]:
-        names = ["id", "value", "label"] + (["path"] if allow_path else [])
-        present: List[str] = []
-        for name in names:
-            value = choice.get(name)
-            if value is None:
-                continue
-            if isinstance(value, str) and not value.strip() and name != "value":
-                # An empty value IS a legitimate option value; an empty
-                # id/label is just an unfilled field.
-                continue
-            present.append(name)
-        return present
+    canonical_id = re.compile(r"^\d+:\d+:\d+$")
+    control_instruction = (
+        "Target the select control with its canonical id and/or a unique CSS"
+        " selector (at least one; both may be sent together and the platform"
+        " resolves the id first). Do not guess identifiers."
+    )
 
-    def validate_choice(choice: Any, path: str, *, allow_path: bool) -> Optional[JsonDict]:
-        if not isinstance(choice, dict):
-            return invalid(path, f"Input.select {path} must be an object.")
-        raw_id = choice.get("id")
-        if raw_id is not None and (
-            not isinstance(raw_id, str) or canonical_id.fullmatch(raw_id.strip()) is None
-        ):
-            return invalid(f"{path}.id", f"Input.select {path}.id is not a canonical option id.")
-        if not allow_path and choice.get("path") is not None:
-            return invalid(f"{path}.path", "Nested Input.select cascade paths are not supported.")
-        locators = present_locators(choice, allow_path=allow_path)
-        if not locators:
+    raw_id = params.get("id")
+    if raw_id is not None and (
+        not isinstance(raw_id, str)
+        or canonical_id.fullmatch(raw_id.strip()) is None
+    ):
+        return invalid(
+            "id",
+            "Input.select id is not a canonical control id"
+            " (frameId:axNodeId:domNodeId).",
+            control_instruction,
+        )
+    selector = params.get("selector")
+    if selector is not None and (not isinstance(selector, str) or not selector.strip()):
+        return invalid("selector", "Input.select selector must be a non-empty string.", control_instruction)
+    if raw_id is None and selector is None:
+        return {
+            "method": method,
+            "params": params,
+            "status": "invalid_params",
+            "error": "Input.select requires params.id and/or params.selector.",
+            "invalidParam": "id",
+            "missingAnyOf": [["id"], ["selector"]],
+            "tool_was_executed": False,
+            "next_instruction": control_instruction,
+        }
+
+    if "selections" in params or "path" in params:
+        return invalid(
+            "selections",
+            "Input.select no longer accepts the selections/path envelope.",
+            (
+                "The select contract changed: pass exactly one of"
+                " nativeValues (native HTML select), optionIds, or"
+                " optionLabels (options in the currently open custom popup),"
+                " copied from a fresh DOM.inspectSelect response. Cascading"
+                " paths and per-item id/value/label objects are gone; complex"
+                " popups return select-agent-takeover-required and must be"
+                " operated with generic Input.click/type/scroll instead."
+            ),
+        )
+
+    selection_fields = {
+        "nativeValues": "nativeValues",
+        "optionIds": "optionIds",
+        "optionLabels": "optionLabels",
+    }
+    present = [field for field in selection_fields if params.get(field) is not None]
+    if not present:
+        return {
+            "method": method,
+            "params": params,
+            "status": "invalid_params",
+            "error": (
+                "Input.select requires exactly one of nativeValues, optionIds,"
+                " or optionLabels."
+            ),
+            "invalidParam": "nativeValues",
+            "missingAnyOf": [["nativeValues"], ["optionIds"], ["optionLabels"]],
+            "tool_was_executed": False,
+            "next_instruction": (
+                "Call DOM.inspectSelect first, then copy one selection array"
+                " verbatim: nativeValues for a native select, optionIds or"
+                " optionLabels for the currently open custom popup. The three"
+                " fields are mutually exclusive."
+            ),
+        }
+    if len(present) > 1:
+        return invalid(
+            present[0],
+            f"Input.select carries {len(present)} selection fields"
+            f" ({', '.join(present)}); exactly one is allowed.",
+            (
+                "nativeValues, optionIds, and optionLabels are mutually"
+                " exclusive. Send exactly the one array that matches the"
+                " control kind DOM.inspectSelect reported."
+            ),
+        )
+
+    field = present[0]
+    values = params.get(field)
+    if not isinstance(values, list) or not values:
+        return invalid(field, f"Input.select {field} must be a non-empty array.",
+                       f"Copy the {field} entries from a fresh DOM.inspectSelect response.")
+    seen: Set[str] = set()
+    for index, value in enumerate(values):
+        if not isinstance(value, str):
+            return invalid(f"{field}[{index}]", f"Input.select {field}[{index}] must be a string.",
+                           f"Copy the {field} entries from a fresh DOM.inspectSelect response.")
+        if field == "optionIds" and canonical_id.fullmatch(value.strip()) is None:
             return invalid(
-                path,
-                f"Input.select {path} requires exactly one of id, value, label"
-                + (", or path." if allow_path else "."),
+                f"{field}[{index}]",
+                f"Input.select {field}[{index}] is not a canonical option id.",
+                (
+                    "Option ids are only valid for the popup generation that"
+                    " exposed them. Re-run DOM.inspectSelect and copy current"
+                    " optionIds verbatim, or use optionLabels/nativeValues."
+                ),
             )
-        if len(locators) > 1:
+        if not value.strip():
+            # The live schema requires min length 1 on every array item
+            # (nativeValues included); an empty string is not a selectable
+            # native value on this contract generation.
+            return invalid(f"{field}[{index}]", f"Input.select {field}[{index}] must not be blank.",
+                           f"Copy the {field} entries from a fresh DOM.inspectSelect response.")
+        dedupe_key = (
+            re.sub(r"\s+", " ", value.strip())
+            if field == "optionLabels"
+            else value
+        )
+        if dedupe_key in seen:
             return invalid(
-                path,
-                f"Input.select {path} carries {len(locators)} locators"
-                f" ({', '.join(locators)}); the schema accepts exactly one.",
+                field,
+                f"Input.select {field} contains duplicate"
+                + (" normalized labels." if field == "optionLabels" else " values."),
+                (
+                    "Duplicates are rejected by the platform. For repeated"
+                    " labels use the optionIds array instead."
+                ),
             )
-        cascade = choice.get("path")
-        if cascade is not None:
-            if not isinstance(cascade, list) or len(cascade) < 2:
-                return invalid(
-                    f"{path}.path",
-                    f"Input.select {path}.path must contain at least two ordered choices.",
-                )
-            for index, step in enumerate(cascade):
-                error = validate_choice(step, f"{path}.path[{index}]", allow_path=False)
-                if error is not None:
-                    return error
+        seen.add(dedupe_key)
+    return None
+
+
+def _check_dialog_param_requirements(
+    agent: Any,
+    method: str,
+    params: JsonDict,
+) -> Optional[JsonDict]:
+    """Require dialog identity only when concurrent dialogs make it ambiguous."""
+    if method != "Page.handleDialog":
         return None
-
-    for index, selection in enumerate(selections):
-        error = validate_choice(selection, f"selections[{index}]", allow_path=True)
-        if error is not None:
-            return error
+    observer = getattr(agent, "event_observer", None)
+    pending_fn = getattr(observer, "pending_dialogs", None)
+    pending = pending_fn(params.get("pageId")) if callable(pending_fn) else []
+    dialog_id = str(params.get("dialogId") or "").strip()
+    pending_ids = [str(item.get("dialogId") or "") for item in pending]
+    if len(pending_ids) > 1 and not dialog_id:
+        return {
+            "method": method,
+            "status": "invalid_params",
+            "error": "Page.handleDialog requires dialogId when multiple dialogs are pending.",
+            "invalidParam": "dialogId",
+            "tool_was_executed": False,
+            "pendingDialogIds": pending_ids,
+            "next_instruction": "Copy the intended dialogId from Page.getState pendingDialogs.",
+        }
+    if dialog_id and pending_ids and dialog_id not in pending_ids:
+        return {
+            "method": method,
+            "status": "invalid_params",
+            "error": "Page.handleDialog dialogId is not pending on this page.",
+            "invalidParam": "dialogId",
+            "tool_was_executed": False,
+            "pendingDialogIds": pending_ids,
+            "next_instruction": "Refresh Page.getState and use a currently pending dialogId.",
+        }
     return None
 
 def _check_nested_id_format(method: str, params: JsonDict) -> Optional[JsonDict]:
@@ -208,10 +298,7 @@ def _check_id_param_format(
     schema = method_schemas.get(method)
     if not isinstance(schema, dict):
         return None
-    spec_params = schema.get("params")
-    if not isinstance(spec_params, dict):
-        return None
-    id_spec = spec_params.get("id")
+    id_spec = schema_param_spec(schema, "id")
     if not isinstance(id_spec, dict):
         return None
     pattern = id_spec.get("pattern")
@@ -340,8 +427,8 @@ def _check_target_param_requirements(
     has_batch_targets = isinstance(raw_targets, list) and bool(raw_targets)
     if method in batch_methods and has_batch_targets:
         schema = method_schemas.get(method) if isinstance(method_schemas, dict) else None
-        schema_params = schema.get("params") if isinstance(schema, dict) else None
-        if isinstance(schema_params, dict) and "targets" not in schema_params:
+        schema_param_names = set(schema_param_specs(schema)) if isinstance(schema, dict) else set()
+        if schema_param_names and "targets" not in schema_param_names:
             return {
                 "method": method,
                 "params": params,
@@ -544,8 +631,8 @@ def _default_semantic_tree_shadow_dom(
         method_schemas.get(method)
         if isinstance(method_schemas, dict) else None
     )
-    schema_params = schema.get("params") if isinstance(schema, dict) else None
-    if not isinstance(schema_params, dict) or "includeShadowDom" not in schema_params:
+    schema_param_names = set(schema_param_specs(schema)) if isinstance(schema, dict) else set()
+    if not schema_param_names or "includeShadowDom" not in schema_param_names:
         return params, False
     normalized = dict(params)
     normalized["includeShadowDom"] = True

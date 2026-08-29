@@ -15,6 +15,21 @@ def _bt():
 
     return bt
 
+def _pin_source(agent: Any) -> str:
+    raw = getattr(agent, "pinned_browser_context", None)
+    raw = raw if isinstance(raw, dict) else {}
+    explicit = str(raw.get("pinSource") or "").strip()
+    if explicit:
+        return explicit
+    source = str(raw.get("source") or "").strip()
+    if source == "hitl_resume":
+        return (
+            "task_page_continuation"
+            if str(raw.get("bindingScope") or "page") == "page"
+            else "task_auth"
+        )
+    return "lead_pinned" if raw else "unknown"
+
 def _apply_fleet_binding(
     agent: Any,
     method: str,
@@ -53,14 +68,16 @@ def _apply_fleet_binding(
         getattr(agent, "pinned_page_id", "") or ""
     ).strip()
     if pinned_page_id and method == "Page.create":
+        pin_source = _pin_source(agent)
         return {
             "status": "pinned_browser_context_violation",
             "error": (
-                "Page.create cannot replace the user-pinned existing page"
+                "Page.create cannot replace the pinned existing page"
                 f" {pinned_page_id!r}."
             ),
             "assignedFleetId": assigned_fleet_id,
             "pinnedPageId": pinned_page_id,
+            "pinSource": pin_source,
             "tool_was_executed": False,
             "next_instruction": (
                 "Use the pinned pageId from slot_context. If that page is no"
@@ -73,14 +90,16 @@ def _apply_fleet_binding(
         and method == "Page.close"
         and str(params.get("pageId") or "").strip() == pinned_page_id
     ):
+        pin_source = _pin_source(agent)
         return {
             "status": "pinned_browser_context_violation",
             "error": (
-                "Page.close cannot close the user-pinned existing page"
+                "Page.close cannot close the pinned existing page"
                 f" {pinned_page_id!r}."
             ),
             "assignedFleetId": assigned_fleet_id,
             "pinnedPageId": pinned_page_id,
+            "pinSource": pin_source,
             "tool_was_executed": False,
             "next_instruction": (
                 "Leave the pinned page open and continue on that page, or"
@@ -188,6 +207,28 @@ def _check_page_binding(
     page_id = str(params.get("pageId") or "").strip()
     if not page_id:
         return None
+    pinned_page_id = str(getattr(agent, "pinned_page_id", "") or "").strip()
+    if pinned_page_id and page_id != pinned_page_id:
+        # A task-local HITL binding is stricter than ordinary same-Fleet page
+        # claiming.  Do not fall through to the generic advice to Page.create:
+        # that would silently discard the authenticated browser context this
+        # task is required to preserve.
+        return {
+            "status": "pinned_browser_context_violation",
+            "error": (
+                f"pageId {page_id!r} cannot replace the task-pinned page"
+                f" {pinned_page_id!r}."
+            ),
+            "pageId": page_id,
+            "pinnedPageId": pinned_page_id,
+            "pinSource": _pin_source(agent),
+            "tool_was_executed": False,
+            "next_instruction": (
+                "Use the task-pinned pageId from slot_context. If it is no"
+                " longer usable, report pinned_page_unavailable; do not"
+                " create or claim a replacement page."
+            ),
+        }
     allowed_pages = {
         str(item).strip()
         for item in (getattr(agent, "allowed_page_ids", set()) or set())
@@ -261,6 +302,9 @@ def _page_is_claimable(agent: Any, page_id: str) -> bool:
     """
 
     if not page_id:
+        return False
+    pinned_page_id = str(getattr(agent, "pinned_page_id", "") or "").strip()
+    if pinned_page_id and page_id != pinned_page_id:
         return False
     fleet_pages = getattr(agent, "fleet_page_fleet_ids", None)
     if not isinstance(fleet_pages, dict):

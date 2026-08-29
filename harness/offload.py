@@ -224,7 +224,8 @@ SUGGESTED_PROMPT_SUCCESS_MAX_CHARS = 200
 # CJK expands ~6x, which is both token waste and a provider content-moderation
 # trigger.  Fold the payload for download bookkeeping only: a page-authored
 # `data:` asset (an <img> src the agent still has to hand to Download.start)
-# must survive untouched, so this never applies outside Download.*/File.download.
+# must survive untouched, so this never applies outside Download.* (the
+# legacy File.download name is retained for receipts replayed from old runs).
 DATA_URL_ELIDE_MIN_CHARS = 256
 DATA_URL_PAYLOAD_METHODS = ("Download.", "File.download")
 

@@ -255,11 +255,11 @@ def _build_completion_receipt_from_results(
         for receipt in result.get("downloadOperationReceipts") or []:
             if not isinstance(receipt, dict):
                 continue
-            key = json.dumps([
-                str(receipt.get("url") or ""),
-                str(receipt.get("savePath") or ""),
-            ], ensure_ascii=False)
-            download_operations[key] = dict(receipt)
+            # downloadId is the authoritative identity on the rebuilt domain;
+            # URL+savePath only remains the fallback for legacy envelopes and
+            # for receipts that never attached (a page reservation that never
+            # produced a download has no URL at all).
+            download_operations[_download_identity(receipt)] = dict(receipt)
         challenge = result.get("challengeReceipt")
         if isinstance(challenge, dict):
             observed_challenge = observed_challenge or bool(challenge.get("observed"))
@@ -273,6 +273,10 @@ def _build_completion_receipt_from_results(
     completed = sum(
         1 for receipt in download_operations.values()
         if receipt.get("state") == "completed"
+    )
+    waiting = sum(
+        1 for receipt in download_operations.values()
+        if receipt.get("state") == "waiting"
     )
     active = sum(
         1 for receipt in download_operations.values()
@@ -299,6 +303,7 @@ def _build_completion_receipt_from_results(
         },
         "downloads": {
             "completed": completed,
+            "waiting": waiting,
             "active": active,
             "ambiguous": ambiguous,
         },

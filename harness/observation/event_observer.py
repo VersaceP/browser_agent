@@ -59,6 +59,25 @@ class BrowserEventObserver:
         self._unsubscribe: Optional[Callable[[], None]] = None
         self.event_counts: dict[str, int] = {}
         self._background_tasks: set["asyncio.Task[Any]"] = set()
+        # Public dialog identity only. Prompt text/default/user input are
+        # intentionally never retained in this Layer-0 ledger.
+        self._pending_dialogs: dict[str, list[JsonDict]] = {}
+
+    def pending_dialogs(self, page_id: Any) -> list[JsonDict]:
+        return [dict(item) for item in self._pending_dialogs.get(str(page_id or ""), [])]
+
+    def settle_dialog(self, page_id: Any, dialog_id: Any = "") -> None:
+        page_key = str(page_id or "")
+        pending = self._pending_dialogs.get(page_key, [])
+        target = str(dialog_id or "").strip()
+        if target:
+            pending = [item for item in pending if item.get("dialogId") != target]
+        elif pending:
+            pending = pending[:-1]
+        if pending:
+            self._pending_dialogs[page_key] = pending
+        else:
+            self._pending_dialogs.pop(page_key, None)
 
     def attach(self, client: Any) -> None:
         if self._unsubscribe is not None:
@@ -97,12 +116,58 @@ class BrowserEventObserver:
                 self._log("page.lifecycle.event", tracker.receipt(lifecycle_state.page_id))
             if name in {"Hitl.paused", "Hitl.requested"}:
                 self._claim_workflow_hitl(name, event.get("payload"))
+            if name in {"Download.waiting", "Download.started",
+                        "Download.progressed", "Download.stateChanged"}:
+                self._observe_download_event(name, event.get("payload"))
+            if name in {"Page.dialogOpened", "Page.dialogClosed"}:
+                self._observe_dialog_event(name, event.get("payload"))
             if name == "DOM.axTreeUpdated":
                 self._handle_axtree_updated(event.get("payload"))
         except Exception as exc:  # noqa: BLE001 - never break the reader
             logger = getattr(self.agent, "logger", None)
             if logger is not None:
                 logger.write("event_observer.error", {"error": str(exc)[:300]})
+
+    def _observe_download_event(self, event_name: str, payload: Any) -> None:
+        """Fold Download lifecycle events into the receipt ledger.
+
+        Layer-0 discipline still holds: state + log only, never model context.
+        The updated receipt surfaces later through tool receipts (a reused
+        Download.start) and the completion ledger, so page-reservation flows
+        (start(waiting) -> Input action -> started -> progressed ->
+        stateChanged) stay observable without polling Download.list.
+        """
+        from harness.tools.browser_tools.downloads import _remember_download_event
+
+        _remember_download_event(self.agent, event_name, payload)
+
+    def _observe_dialog_event(self, event_name: str, payload: Any) -> None:
+        if not isinstance(payload, dict):
+            return
+        page_id = str(payload.get("pageId") or "").strip()
+        dialog = payload.get("dialog")
+        dialog_id = str(
+            payload.get("dialogId")
+            or (dialog.get("id") if isinstance(dialog, dict) else "")
+            or ""
+        ).strip()
+        if not page_id:
+            return
+        if event_name == "Page.dialogClosed":
+            self.settle_dialog(page_id, dialog_id)
+        elif dialog_id:
+            pending = self._pending_dialogs.setdefault(page_id, [])
+            pending[:] = [item for item in pending if item.get("dialogId") != dialog_id]
+            # Only non-sensitive routing facts cross into harness state.
+            pending.append({
+                "dialogId": dialog_id,
+                "type": str(dialog.get("type") or "") if isinstance(dialog, dict) else "",
+            })
+        self._log("page.dialog.ledger", {
+            "pageId": page_id,
+            "event": event_name,
+            "pendingDialogIds": [item["dialogId"] for item in self._pending_dialogs.get(page_id, [])],
+        })
 
     def _observe_page_inventory(self, event_name: str, payload: Any) -> None:
         """Record that the fleet's page set moved, without judging why.

@@ -16,6 +16,7 @@ from harness.observation.challenge_detector import ChallengeTracker
 from harness.observation.challenge_detector import detect_structural_challenge_from_lines
 from harness.observation.challenge_detector import extract_page_id
 from harness.diagnostics.error_classification import attach_error_classification
+from harness.fleet.auth import verify_protected_auth_target
 from harness.fleet.runtime import FleetClickGateTimeout
 from harness.observation.render_recovery import build_render_recovery_runner
 from harness.tools.parsers import attach_method_schema
@@ -668,6 +669,8 @@ async def _post_hitl_raw_browser_call(
             result, method, getattr(agent, "method_schemas", {})
         )
     except ABCPTransportError as exc:
+        if bool(getattr(exc, "connection_fatal", False)):
+            raise
         result = {
             "method": method,
             "params": params,
@@ -1493,37 +1496,39 @@ async def _verify_and_open_fleet_auth_barrier(
         agent.fleet_reperception_tree_seen = True
         agent.fleet_barrier_generation = int(resolved.get("generation") or 0)
         agent.fleet_reperception_pending = False
+    contract = getattr(agent, "worker_contract", None)
+    verification_contract = (
+        contract.get("auth_verification")
+        if isinstance(contract, dict)
+        else None
+    )
+    verification_evidence = {
+        "fleetId": fleet_id,
+        "pageId": page_id,
+        "url": state_data.get("url"),
+        "title": state_data.get("title"),
+        "sessionKey": getattr(agent, "fleet_session_key", ""),
+        "verificationContract": verification_contract,
+        # Both the task-local proof and the durable ledger use this only for an
+        # in-memory marker match; raw AX text is never persisted in receipts.
+        "axTreeText": str(
+            tree.get("_authAXTreeText")
+            or "\n".join(_axtree_lines_from_value(tree))
+        ),
+        "evidence": {
+            "pageStateObserved": True,
+            "axTreeObserved": True,
+            "hitlPaused": False,
+        },
+    }
+    task_auth_verification = verify_protected_auth_target(
+        verification_evidence,
+    )
     callback = getattr(agent, "auth_session_verified_handler", None)
     ledger_receipt: JsonDict = {}
     if resolved.get("resolved") and callable(callback):
         try:
-            contract = getattr(agent, "worker_contract", None)
-            verification_contract = (
-                contract.get("auth_verification")
-                if isinstance(contract, dict)
-                else None
-            )
-            value = callback(
-                {
-                    "fleetId": fleet_id,
-                    "pageId": page_id,
-                    "url": state_data.get("url"),
-                    "title": state_data.get("title"),
-                    "sessionKey": getattr(agent, "fleet_session_key", ""),
-                    "verificationContract": verification_contract,
-                    # The ledger uses this only for an in-memory marker match;
-                    # the raw tree is never persisted or included in receipts.
-                    "axTreeText": str(
-                        tree.get("_authAXTreeText")
-                        or "\n".join(_axtree_lines_from_value(tree))
-                    ),
-                    "evidence": {
-                        "pageStateObserved": True,
-                        "axTreeObserved": True,
-                        "hitlPaused": False,
-                    },
-                }
-            )
+            value = callback(verification_evidence)
             if hasattr(value, "__await__"):
                 value = await value
             if isinstance(value, dict):
@@ -1541,11 +1546,58 @@ async def _verify_and_open_fleet_auth_barrier(
             logger = getattr(agent, "logger", None)
             if logger is not None:
                 logger.write("auth_fleet.ledger_handler_failed", ledger_receipt)
+    task_binding_callback = getattr(agent, "task_session_binding_handler", None)
+    task_binding_receipt: JsonDict = {}
+    if resolved.get("resolved") and callable(task_binding_callback):
+        try:
+            value = task_binding_callback(
+                {
+                    "phaseId": str(getattr(agent, "phase_id", "") or ""),
+                    "fleetId": fleet_id,
+                    "pageId": page_id,
+                    "sessionGeneration": int(
+                        getattr(agent, "fleet_session_generation", 0) or 0
+                    ),
+                    "url": state_data.get("url"),
+                    "title": state_data.get("title"),
+                    # A generic human-resumed CAPTCHA establishes at most
+                    # same-Fleet continuity. Only the independently checked
+                    # auth contract may label the binding authenticated; exact
+                    # Page scope is promoted later from unfinished page-local
+                    # work, never from HITL alone.
+                    "bindingScope": "fleet",
+                    "authVerified": bool(task_auth_verification.get("verified")),
+                    "reason": (
+                        "verified_auth_task_continuity"
+                        if task_auth_verification.get("verified")
+                        else "hitl_resumed_fleet_continuity"
+                    ),
+                }
+            )
+            if hasattr(value, "__await__"):
+                value = await value
+            if isinstance(value, dict):
+                task_binding_receipt = value
+        except Exception as exc:
+            task_binding_receipt = {
+                "recorded": False,
+                "reason": "task_session_binding_handler_failed",
+                "errorType": type(exc).__name__,
+                "error": str(exc)[:300],
+            }
+            logger = getattr(agent, "logger", None)
+            if logger is not None:
+                logger.write(
+                    "spawner.task_session_binding.handler_failed",
+                    task_binding_receipt,
+                )
     return {
         "enabled": True,
         "opened": bool(resolved.get("resolved")),
         "generation": resolved.get("generation"),
+        "taskAuthVerification": task_auth_verification,
         "ledger": ledger_receipt or None,
+        "taskSessionBinding": task_binding_receipt or None,
         "reason": resolved.get("reason"),
     }
 
