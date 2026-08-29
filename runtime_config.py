@@ -920,15 +920,24 @@ class HarnessConfig:
     # still share a busy one — ordinary routing already puts two live workers in
     # one fleet, so the cap must not be stricter than the rule it degrades from.
     max_task_fleets: int = 3
-    # Hold BrowserAgent construction until the coordinator-assigned Fleet has
-    # answered Fleet.status successfully. Fleet.ready is only a wake-up signal;
-    # the barrier always confirms readiness with an authoritative RPC. This is
-    # a soft signal-wait budget, not a total wall-clock timeout: up to two
-    # uncancellable ABCP status calls may extend the observed elapsed time.
+    # Hold BrowserAgent construction until the coordinator-assigned Fleet
+    # answers a target-scoped Page.list readiness probe. Fleet.ready is only a
+    # bounded wake-up hint because session restore may complete without a new
+    # event. Fleet.status remains quarantined because it can terminate the
+    # caller's WebSocket on the current ABCP platform. This is a soft event
+    # budget, not a wall-clock cap: two in-flight Page.list calls are never
+    # cancelled because doing so can contaminate the shared WebSocket, so total
+    # elapsed time can also include up to two browser call timeouts.
     fleet_readiness_barrier_enabled: bool = True
     fleet_readiness_wait_seconds: float = 45.0
     fleet_auth_barrier_enabled: bool = True
     fleet_auth_barrier_wait_seconds: float = 120.0
+    # Task-local Fleet/Page continuity must not become an immortal routing
+    # lock after a process restart. A persisted binding older than this is
+    # archived as expired and normal allocation/authentication may start
+    # again. 0 disables expiry. The default is one day so ordinary same-day
+    # resume keeps unsaved form continuity while abandoned tasks recover.
+    task_session_binding_ttl_seconds: float = 86400.0
     # A quarantined page leaves the assignable pool until Page.getState proves
     # it usable again. When the platform keeps reporting `paused` for a page
     # whose challenge is actually over (the page_settled_after_hitl shape),
@@ -1239,6 +1248,15 @@ class HarnessConfig:
                     data.get(
                         "fleet_auth_barrier_wait_seconds",
                         cls.fleet_auth_barrier_wait_seconds,
+                    )
+                ),
+            ),
+            task_session_binding_ttl_seconds=max(
+                0.0,
+                float(
+                    data.get(
+                        "task_session_binding_ttl_seconds",
+                        cls.task_session_binding_ttl_seconds,
                     )
                 ),
             ),

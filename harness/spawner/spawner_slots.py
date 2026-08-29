@@ -13,6 +13,7 @@ from typing import Dict
 from typing import List
 from typing import Optional
 from typing import Set
+from typing import Tuple
 from abcp_client import ABCPTransportError
 from harness.fleet.coordinator import FleetAssignment
 from harness.fleet.coordinator import FleetRoutingError
@@ -218,16 +219,13 @@ class SpawnerSlotsMixin:
         if assignment is None:
             # The cached inventory says "refuse". Confirm that against the
             # authoritative view before acting on it.
-            await self._sync_slot_registry(
+            inventory_sync = await self._sync_slot_registry(
                 slot,
                 worker_id=worker_id,
                 include_page_details=False,
             )
             self._observe_slot_fleets(slot)
-            if not any(
-                str(error).startswith("Fleet.list")
-                for error in slot.sync_errors
-            ):
+            if bool(inventory_sync.get("fleetListSucceeded")):
                 # Fleet.list answered, so this connection now holds a complete
                 # inventory. `_observe_slot_fleets` can only retire this slot's
                 # own records; a fleet another slot created and the platform has
@@ -474,6 +472,75 @@ class SpawnerSlotsMixin:
                     "next_instruction": (
                         "Wait for the worker using the pinned page to finish;"
                         " do not create or select another fleet/page."
+                    ),
+                }
+
+        task_binding = getattr(self, "_task_session_binding", None)
+        if (
+            pinned is None
+            and task_binding is not None
+            and str(getattr(task_binding, "state", "") or "") != "stale"
+            and (
+                getattr(task_binding, "requires_exact_page", False)
+                or not getattr(
+                    self.runtime.harness,
+                    "same_fleet_multiworker_enabled",
+                    False,
+                )
+            )
+        ):
+            owner_slot_id = self.fleet_coordinator.owner_slot_for_fleet(
+                task_binding.fleet_id
+            )
+            owner_slot = self._slots.get(owner_slot_id) if owner_slot_id else None
+            matching_slots = [
+                item for item in live_slots
+                if (
+                    task_binding.fleet_id in item.fleet_ids
+                    and (
+                        not getattr(task_binding, "requires_exact_page", False)
+                        or task_binding.page_id in item.page_registry
+                    )
+                )
+            ]
+            task_slot = owner_slot or (
+                sorted(matching_slots, key=lambda item: item.slot_id)[0]
+                if matching_slots else None
+            )
+            if (
+                task_slot is not None
+                and (
+                    task_slot.status != "idle"
+                    or bool(task_slot.current_worker_id)
+                )
+            ):
+                return {
+                    "status": (
+                        "task_session_context_busy"
+                        if getattr(task_binding, "requires_exact_page", False)
+                        else "task_session_fleet_busy"
+                    ),
+                    "error": (
+                        (
+                            f"task continuation page {task_binding.page_id!r}"
+                            if getattr(task_binding, "requires_exact_page", False)
+                            else f"task continuity Fleet {task_binding.fleet_id!r}"
+                        )
+                        + f" is attached to busy slot {task_slot.slot_id!r}"
+                    ),
+                    "retryable": True,
+                    "pinSource": (
+                        "task_page_continuation"
+                        if getattr(task_binding, "requires_exact_page", False)
+                        else "task_auth"
+                    ),
+                    "taskSessionBinding": task_binding.to_dict(),
+                    "slot": self._slot_summary(task_slot),
+                    "tool_was_executed": False,
+                    "next_instruction": (
+                        "Wait for the worker using this bound task context."
+                        " Do not start another worker or choose a replacement"
+                        " Fleet/Page."
                     ),
                 }
 
@@ -803,7 +870,15 @@ class SpawnerSlotsMixin:
         return slot
 
     async def _initialize_reserved_slot(self, slot: BrowserAgentSlot) -> None:
-        """Connect a reserved slot without holding the global slot-pool lock."""
+        """Connect and fully initialize a slot before Fleet work begins.
+
+        Newer ABCP Dispatchers require the connection sequence
+        ``System.register -> System.getCapabilities`` before any business
+        Action such as Fleet.list/create/status.  A worker used to defer the
+        capability load until after its Fleet had been assigned; that is too
+        late for the connection contract and can make the Dispatcher close the
+        socket without a close frame.
+        """
 
         if slot.client is not None:
             if slot.status == "starting":
@@ -817,12 +892,41 @@ class SpawnerSlotsMixin:
         client = _sp().ABCPClient(self.runtime.browser, on_event=event_logger)
         slot.client = client
         slot.idle_event_logger = event_logger
+        bootstrap_started = time.monotonic()
+        timings: JsonDict = {}
+        outcome = "failed"
         try:
+            stage_started = time.monotonic()
             await client.connect()
+            timings["connectMs"] = int(
+                (time.monotonic() - stage_started) * 1000
+            )
+            stage_started = time.monotonic()
             registration = await client.call(
                 "System.register",
                 {"agentId": slot.agent_id},
             )
+            timings["registerMs"] = int(
+                (time.monotonic() - stage_started) * 1000
+            )
+            stage_started = time.monotonic()
+            caps_response = await client.call(
+                "System.getCapabilities",
+                {"guide": "omit"},
+            )
+            timings["getCapabilitiesMs"] = int(
+                (time.monotonic() - stage_started) * 1000
+            )
+            stage_started = time.monotonic()
+            await self._capability_bundle_for_worker(
+                client,
+                self.runtime,
+                caps_response=caps_response,
+            )
+            timings["schemaBundleMs"] = int(
+                (time.monotonic() - stage_started) * 1000
+            )
+            outcome = "ready"
         except Exception:
             try:
                 await client.close()
@@ -830,7 +934,21 @@ class SpawnerSlotsMixin:
                 slot.client = None
                 slot.status = "broken"
             raise
+        finally:
+            self.logger.write(
+                "spawner.slot.bootstrap_timing",
+                {
+                    "slotId": slot.slot_id,
+                    "agentId": slot.agent_id,
+                    **timings,
+                    "elapsedMs": int(
+                        (time.monotonic() - bootstrap_started) * 1000
+                    ),
+                    "outcome": outcome,
+                },
+            )
         slot.registration = registration
+        slot.protocol_initialized = True
         self._replace_slot_fleets_from_response(slot, registration)
         self._update_slot_registry_from_value(slot, registration)
         slot.status = "running" if slot.current_worker_id else "idle"
@@ -913,6 +1031,15 @@ class SpawnerSlotsMixin:
                     "System.register",
                     {"agentId": slot.agent_id},
                 )
+                caps_response = await client.call(
+                    "System.getCapabilities",
+                    {"guide": "omit"},
+                )
+                await self._capability_bundle_for_worker(
+                    client,
+                    self.runtime,
+                    caps_response=caps_response,
+                )
             except Exception as exc:
                 slot.sync_errors.append(
                     f"reconnect {attempt}/{attempts}: {str(exc)[:300]}"
@@ -937,6 +1064,7 @@ class SpawnerSlotsMixin:
             slot.client = client
             slot.idle_event_logger = event_logger
             slot.registration = registration
+            slot.protocol_initialized = True
             self._replace_slot_fleets_from_response(slot, registration)
             self._update_slot_registry_from_value(slot, registration)
             self._observe_slot_fleets(slot)
@@ -1048,25 +1176,39 @@ class SpawnerSlotsMixin:
         *,
         expose_reusable_pages: bool,
         required_fleet_id: str = "",
-    ) -> JsonDict:
+    ) -> Tuple[JsonDict, JsonDict]:
         if slot.client is None:
             raise ABCPTransportError(f"Slot {slot.slot_id} has no browser client")
-        registration = await slot.client.call(
-            "System.register",
-            {"agentId": slot.agent_id},
-        )
+        # Normal slots were registered and capability-initialized when the
+        # connection was created/recovered. Re-registering them here can reset
+        # the Dispatcher-side initialization sequence immediately before Fleet
+        # actions, so use that authoritative receipt instead. The fallback is
+        # retained solely for externally-adopted legacy slots that predate this
+        # invariant (including resume/test injection paths).
+        if slot.protocol_initialized:
+            registration = slot.registration
+        else:
+            registration = await slot.client.call(
+                "System.register",
+                {"agentId": slot.agent_id},
+            )
         slot.registration = registration
         self._replace_slot_fleets_from_response(slot, registration)
         self._update_slot_registry_from_value(slot, registration)
+        inventory_sync: JsonDict = {
+            "fleetListSucceeded": False,
+            "pageListAttemptedFleetIds": [],
+            "pageListSucceededFleetIds": [],
+        }
         if expose_reusable_pages or self._slot_sync_due(slot):
-            await self._sync_slot_registry(
+            inventory_sync = await self._sync_slot_registry(
                 slot,
                 worker_id=worker_id,
                 required_fleet_id=required_fleet_id,
                 include_page_details=False,
             )
         self._observe_slot_fleets(slot)
-        return registration
+        return registration, inventory_sync
 
     def _observe_slot_fleets(self, slot: BrowserAgentSlot) -> None:
         """Refresh non-authoritative routing metadata from the slot snapshot."""
@@ -1144,6 +1286,7 @@ class SpawnerSlotsMixin:
         resume_hint_may_select_page: bool = True,
         root_task: str = "",
         automatic_task_reuse_allowed: bool = False,
+        inventory_sync: Optional[JsonDict],
     ) -> Optional[FleetAssignment]:
         lock_key = str(
             fleet_group_key
@@ -1175,6 +1318,7 @@ class SpawnerSlotsMixin:
                 resume_hint_may_select_page=resume_hint_may_select_page,
                 root_task=root_task,
                 automatic_task_reuse_allowed=automatic_task_reuse_allowed,
+                inventory_sync=inventory_sync,
             )
 
     async def _assign_fleet_for_worker_locked(
@@ -1194,6 +1338,7 @@ class SpawnerSlotsMixin:
         resume_hint_may_select_page: bool = True,
         root_task: str = "",
         automatic_task_reuse_allowed: bool = False,
+        inventory_sync: Optional[JsonDict],
     ) -> Optional[FleetAssignment]:
         """Select or create the one fleet the worker is allowed to address.
 
@@ -1213,6 +1358,23 @@ class SpawnerSlotsMixin:
         pinned = self.pinned_browser_context
         if pinned is not None:
             if pinned.fleet_id not in slot.fleet_ids:
+                if (
+                    inventory_sync is not None
+                    and not inventory_sync.get("fleetListSucceeded")
+                ):
+                    raise FleetRoutingError(
+                        "fleet_inventory_temporarily_unavailable",
+                        "Fleet.list did not answer while resolving the pinned Fleet.",
+                        retryable=True,
+                        next_instruction=(
+                            "Retry with the same pinned context after Fleet.list"
+                            " succeeds; do not create a replacement Fleet."
+                        ),
+                        details={
+                            "pinnedBrowserContext": pinned.to_dict(),
+                            "registrySync": dict(inventory_sync),
+                        },
+                    )
                 raise FleetRoutingError(
                     "pinned_fleet_unavailable",
                     (
@@ -1264,6 +1426,32 @@ class SpawnerSlotsMixin:
                 delegated=stable_owner_slot_id != slot.slot_id,
             )
         if fleet_id:
+            # The public wrapper always passes the receipt argument explicitly.
+            # ``None`` remains a deliberate legacy/test value, but a future
+            # direct caller of this locked implementation cannot silently omit
+            # the evidence that makes the inventory guards fail closed.
+            if (
+                inventory_sync is not None
+                and not bool(inventory_sync.get("fleetListSucceeded"))
+            ):
+                raise FleetRoutingError(
+                    "fleet_inventory_temporarily_unavailable",
+                    (
+                        "the authoritative Fleet.list inventory was not"
+                        " available while resolving the explicit fleet"
+                        " reference"
+                    ),
+                    retryable=True,
+                    next_instruction=(
+                        "Retry after Fleet.list succeeds. Keep the same"
+                        " fleet/session reference and do not create a"
+                        " replacement Fleet."
+                    ),
+                    details={
+                        "fleetReference": fleet_id,
+                        "registrySync": dict(inventory_sync or {}),
+                    },
+                )
             resolved_fleet_id = resolve_fleet_reference(
                 fleet_id,
                 slot.fleet_ids,
@@ -1314,9 +1502,9 @@ class SpawnerSlotsMixin:
         assignment: Optional[FleetAssignment] = None
         if resume_browser_hint is not None:
             hint_fleet_id = resume_browser_hint.fleet_id
-            inventory_failed = any(
-                str(error).startswith("Fleet.list")
-                for error in slot.sync_errors
+            inventory_failed = bool(
+                inventory_sync is not None
+                and not inventory_sync.get("fleetListSucceeded")
             )
             if hint_fleet_id in slot.fleet_ids and not inventory_failed:
                 hinted_page = slot.page_registry.get(
@@ -1609,42 +1797,6 @@ class SpawnerSlotsMixin:
         return assignment
 
     @staticmethod
-    def _fleet_status_ready(response: Any, fleet_id: str) -> bool:
-        """Treat a successful Fleet.status response as authoritative readiness.
-
-        Current ABCP returns data.status="active". Keeping the accepted set
-        narrow catches a future explicit transitional state, while accepting a
-        response without status preserves compatibility with older clients and
-        test doubles: the status RPC itself could only complete after opening
-        the Fleet.
-        """
-
-        explicit_statuses: List[str] = []
-        root_data = response.get("data") if isinstance(response, dict) else None
-        if isinstance(root_data, dict):
-            root_fleet_id = str(
-                root_data.get("fleetId") or root_data.get("fleet_id") or ""
-            ).strip()
-            root_status = str(root_data.get("status") or "").strip().lower()
-            if root_status and (not root_fleet_id or root_fleet_id == fleet_id):
-                explicit_statuses.append(root_status)
-        for item in handle_records_from_value(response):
-            item_fleet_id = str(
-                item.get("fleetId") or item.get("fleet_id") or ""
-            ).strip()
-            status = str(item.get("status") or "").strip().lower()
-            # Ignore nested page/task status fields. Only the record carrying
-            # this Fleet's identity may certify its lifecycle state.
-            if status and item_fleet_id == fleet_id:
-                explicit_statuses.append(status)
-        if not explicit_statuses:
-            return True
-        return any(
-            status in {"active", "ready", "running", "idle"}
-            for status in explicit_statuses
-        )
-
-    @staticmethod
     def _fleet_ready_notification(message: Any, fleet_id: str) -> bool:
         event = unwrap_notification(message)
         if event is None or str(event.get("event") or "") != "Fleet.ready":
@@ -1705,34 +1857,90 @@ class SpawnerSlotsMixin:
             "workerId": worker_id,
             "timeoutSeconds": timeout,
         })
-        initial_error = ""
-        initial_status = ""
-        try:
+        page_list_error = ""
+
+        async def verify_with_page_list() -> Optional[JsonDict]:
+            """Use one target-scoped, read-only browser RPC as live proof.
+
+            Fleet.list is persisted inventory and can include a prepared Fleet
+            with idle-looking page records, so its success is not a readiness
+            certificate. Page.list must reach the selected Fleet's live page
+            owner. A successful empty result is also valid: a ready Fleet need
+            not have an existing page.
+            """
+
+            nonlocal page_list_error
             try:
-                response = await client.call("Fleet.status", {"fleetId": fleet_id})
-                if self._fleet_status_ready(response, fleet_id):
-                    receipt = {
-                        "fleetId": fleet_id,
-                        "ownerSlotId": owner_slot.slot_id,
-                        "status": "ready",
-                        "verifiedBy": "status",
-                        "elapsedMs": int((time.monotonic() - started) * 1000),
-                    }
-                    self.logger.write("spawner.fleet.readiness_ready", receipt)
-                    return receipt
-                initial_status = "transitional"
+                response = await client.call(
+                    "Page.list", {"fleetId": fleet_id}
+                )
+                page_items = self._extract_page_items(response)
+                if page_items is None:
+                    page_list_error = (
+                        "Page.list returned no authoritative page collection"
+                    )
+                    return None
+                foreign_fleet_ids = sorted({
+                    str(item.get("fleetId") or item.get("fleet_id") or "").strip()
+                    for item in page_items
+                    if (
+                        isinstance(item, dict)
+                        and str(
+                            item.get("fleetId") or item.get("fleet_id") or ""
+                        ).strip()
+                        not in {"", fleet_id}
+                    )
+                })
+                if foreign_fleet_ids:
+                    page_list_error = (
+                        "Page.list returned pages for a different Fleet: "
+                        + ", ".join(foreign_fleet_ids[:3])
+                    )
+                    return None
+                self._replace_fleet_pages_from_list(
+                    owner_slot,
+                    fleet_id=fleet_id,
+                    pages_response=response,
+                )
+                self._update_slot_registry_from_value(owner_slot, response)
+                page_list_error = ""
+                return response
+            except ABCPTransportError as exc:
+                # Page.list is a real socket RPC now. A dead reader or send
+                # path proves the owner slot is unusable; preserve the typed
+                # transport failure so spawn_browser_agent marks it broken
+                # instead of spending the Fleet-readiness retry budget.
+                if bool(getattr(exc, "connection_fatal", False)):
+                    raise
+                page_list_error = str(exc)[:500]
+                return None
             except Exception as exc:
-                initial_error = str(exc)[:500]
+                page_list_error = str(exc)[:500]
+                return None
+
+        def ready_receipt(verified_by: str) -> JsonDict:
+            receipt = {
+                "fleetId": fleet_id,
+                "ownerSlotId": owner_slot.slot_id,
+                "status": "ready",
+                "verifiedBy": verified_by,
+                "elapsedMs": int((time.monotonic() - started) * 1000),
+            }
+            self.logger.write("spawner.fleet.readiness_ready", receipt)
+            return receipt
+
+        try:
+            if await verify_with_page_list() is not None:
+                return ready_receipt("page_list")
 
             event = None
             if event_waiter is not None:
                 remaining = max(0.0, deadline - time.monotonic())
                 if remaining > 0:
-                    # Never spend the entire remaining budget waiting for an
-                    # event. ABCP emits Fleet.ready for process startup, but a
-                    # later session-restore completion has no corresponding
-                    # control event. Reserve at least half of this window for
-                    # one terminal Fleet.status retry.
+                    # Fleet.ready is a wake-up hint, not readiness proof. Keep
+                    # its wait short because session restore may complete with
+                    # no corresponding event, then always perform one terminal
+                    # live probe.
                     event_wait_seconds = min(5.0, remaining / 2.0)
                     try:
                         event = await asyncio.wait_for(
@@ -1741,38 +1949,28 @@ class SpawnerSlotsMixin:
                         )
                     except asyncio.TimeoutError:
                         event = None
-            # A Fleet.ready signal must be confirmed, but its absence does not
-            # prove session restore is still pending. Probe exactly once more
-            # even when the soft signal budget was consumed by the first RPC.
-            # Never loop or cancel an already-dispatched WebSocket RPC: the
-            # actual wall-clock duration may therefore exceed `timeout`.
-            try:
-                response = await client.call(
-                    "Fleet.status", {"fleetId": fleet_id}
-                )
-                if self._fleet_status_ready(response, fleet_id):
-                    receipt = {
-                        "fleetId": fleet_id,
-                        "ownerSlotId": owner_slot.slot_id,
-                        "status": "ready",
-                        "verifiedBy": (
-                            "event_then_status"
-                            if event is not None
-                            else "status_retry"
-                        ),
-                        "elapsedMs": int(
-                            (time.monotonic() - started) * 1000
-                        ),
-                    }
-                    self.logger.write(
-                        "spawner.fleet.readiness_ready", receipt
-                    )
-                    return receipt
-                initial_status = "transitional_after_retry"
-            except Exception as exc:
-                initial_error = str(exc)[:500]
 
-            detail = initial_error or initial_status or "Fleet.ready was not observed"
+            # Restore completion can be eventless. Retry exactly once even if
+            # no Fleet.ready notification arrived. Do not cancel an in-flight
+            # ABCP RPC merely to enforce the soft readiness budget; ABCPClient
+            # retains its own bounded call timeout and serializes the socket.
+            if await verify_with_page_list() is not None:
+                return ready_receipt(
+                    "event_then_page_list"
+                    if event is not None else "page_list_retry"
+                )
+
+            detail = (
+                "target Page.list did not verify Fleet readiness"
+                + (f": {page_list_error}" if page_list_error else "")
+                + (
+                    "; Fleet.ready was not observed"
+                    if event is None else
+                    "; Fleet.ready was observed but live verification still failed"
+                )
+                + "; Fleet.status remains disabled due to the ABCP WebSocket"
+                " lifecycle bug"
+            )
             failure = {
                 "fleetId": fleet_id,
                 "ownerSlotId": owner_slot.slot_id,
@@ -1850,7 +2048,7 @@ class SpawnerSlotsMixin:
         assignment: FleetAssignment,
         *,
         worker_id: str,
-    ) -> None:
+    ) -> JsonDict:
         """Inspect pages only after the selected Fleet is ready.
 
         Inventory discovery before assignment remains Fleet.list-only. This
@@ -1868,7 +2066,7 @@ class SpawnerSlotsMixin:
                 fleet_id=assignment.fleet_id,
                 owner_slot_id=owner_slot_id,
             )
-        await self._sync_slot_registry(
+        sync_receipt = await self._sync_slot_registry(
             owner_slot,
             worker_id=worker_id,
             required_fleet_id=assignment.fleet_id,
@@ -1885,19 +2083,34 @@ class SpawnerSlotsMixin:
                 not isinstance(page, dict)
                 or str(page.get("fleetId") or "") != pinned.fleet_id
             ):
+                page_list_succeeded = pinned.fleet_id in set(
+                    sync_receipt.get("pageListSucceededFleetIds") or []
+                )
                 raise FleetRoutingError(
                     "pinned_page_unavailable",
                     (
                         f"pinned page {pinned.page_id!r} was not found in"
                         f" fleet {pinned.fleet_id!r} after readiness"
                     ),
-                    retryable=False,
+                    retryable=not page_list_succeeded,
                     next_instruction=(
+                        (
+                            "The bound Fleet's Page.list did not complete, so"
+                            " this is not proof that the pinned page closed."
+                            " Retry after transport recovery without changing"
+                            " the pinned Fleet/Page."
+                        )
+                        if not page_list_succeeded else
                         "Do not create or navigate a replacement page. Ask the"
                         " user to reopen the pinned page."
                     ),
-                    details={"pinnedBrowserContext": pinned.to_dict()},
+                    details={
+                        "pinnedBrowserContext": pinned.to_dict(),
+                        "inventoryAuthoritative": page_list_succeeded,
+                        "registrySync": sync_receipt,
+                    },
                 )
+        return sync_receipt
 
     def _ensure_notification_relay(
         self,

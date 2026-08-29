@@ -2043,16 +2043,19 @@ weakened/removed。修复后，原始用户纠偏以
 - Lead 终态或异常中断都附带/记录不可由模型覆盖的 `completionReceipt`，从 task state、当前 artifact
   generation、去重 download operation receipt 与 challenge/HITL ledger 机械生成。
 - Fleet 启动采用 **assignment 后、Worker 构造前**的按需 readiness barrier：先预置
-  `Fleet.ready` 监听，再调用 owner-slot 的 `Fleet.status`；事件只负责唤醒，必须由后续
-  `Fleet.status` 再确认。session restore 完成没有对应 ready 事件，因此首次状态失败后
-  事件等待最多使用 5 秒且不超过剩余预算的一半；未收到事件仍保留一次
-  `status_retry`，全程最多两次状态 RPC。`fleet_readiness_wait_seconds` 是信号等待与
+  `Fleet.ready` 监听，再调用 owner-slot 对目标 Fleet 执行只读 `Page.list`；只有返回可解析
+  的权威 page collection（允许空数组，拒绝其他 Fleet 页面）才构成 live proof。事件只负责
+  唤醒，必须由后续 `Page.list` 再确认。session restore 完成没有对应 ready 事件，因此首次
+  探测失败后，事件等待最多使用 5 秒且不超过剩余预算的一半；未收到事件仍保留一次
+  `page_list_retry`，全程最多两次目标 Page RPC。`fleet_readiness_wait_seconds` 是信号等待与
   发起终局探测的软预算，不是总墙钟上限；为避免取消在途 WebSocket RPC 污染共享连接，
   实际耗时可能达到该预算加两次 ABCP 单调用/restore 上限，并以 receipt 的 `elapsedMs`
-  如实记录。相同 Fleet 的并发 phase 共用 single-flight probe，失败进入既有
-  spawn-acquisition cooldown 且不创建 BrowserAgent。启动前 inventory 只做 `Fleet.list`，
-  Page.list/Page.getState 延后到 Fleet ready 后并仅检查选中的 Fleet，避免无关坏 Fleet
-  拖累整个 slot。`mark_phase_running` 暂继续兼作并发 reservation；真实 Worker 创建和
+  如实记录。`Fleet.status` 因当前 ABCP WebSocket 生命周期缺陷继续隔离。相同 Fleet 的并发
+  phase 共用 single-flight probe，失败进入既有
+  spawn-acquisition cooldown 且不创建 BrowserAgent。启动前全局 inventory 只做
+  `Fleet.list`；readiness 仅对选中的 Fleet 做 `Page.list`，`Page.getState` 等页面细节探测
+  延后到 ready 后，避免无关坏 Fleet 拖累整个 slot。`mark_phase_running` 暂继续兼作并发
+  reservation；真实 Worker 创建和
   `fleetReadiness` receipt 均发生在 barrier 之后。
 - `-32012` / `-32005` 的平台瞬时故障分类不在本批实现范围内，等待 ABCP 修复。
 

@@ -84,9 +84,16 @@ Decision:
   and only then atomically admits and binds it in the coordinator. A readiness
   failure therefore needs no coordinator rollback and falls back once through
   ordinary routing/Fleet creation.
-- Platform lifecycle status uses a positive allow-list: `active` and
-  `prepared`. A truly deleted Fleet is absent from `System.register`; a
-  `prepared` Fleet is expected to auto-wake on the readiness `Fleet.status`.
+- Platform lifecycle inventory uses a positive allow-list: `active` and
+  `prepared`. A truly deleted Fleet is absent from `System.register`. Readiness
+  is verified separately with a target-scoped `Page.list`: persisted inventory
+  can contain idle-looking pages for a prepared Fleet and is not live proof.
+  `Fleet.ready` is only a bounded wake-up hint because session restore may
+  complete without emitting it; `Fleet.status` remains quarantined while it can
+  terminate the caller WebSocket. The probe can wake a cold Fleet: similar-task
+  candidates are verified before they are admitted, so a rejected candidate may
+  still leave a newly started browser process. This is an accepted, bounded
+  consequence of verifying the actual browser execution path.
 
 Rationale:
 

@@ -129,6 +129,11 @@ HARNESS_TOOL_NAMES: FrozenSet[str] = frozenset({
 # harness/hitl.py. Re-verify against the capability surface before removing any
 # of them.
 ALWAYS_FORBIDDEN_ABCP_METHODS: FrozenSet[str] = frozenset({
+    # TEMPORARY PLATFORM QUARANTINE (2026-08-23): Fleet.status currently
+    # tears down the caller's WebSocket after returning readiness. It must not
+    # be exposed to any model or invoked through a stale capability contract
+    # until the ABCP Fleet lifecycle bug is fixed.
+    "Fleet.status",
     "Hitl.getTaskSummary",
     "Hitl.resumeEvent",
     "Memory.delete",
