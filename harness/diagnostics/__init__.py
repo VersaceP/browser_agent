@@ -49,6 +49,7 @@ from harness.constants import (
     WORKER_STATUS_PAGE_CRASHED,
     WORKER_STATUS_PARTIAL,
     WORKER_STATUS_INCOMPLETE,
+    WORKER_STATUS_PAGE_CONTINUATION_LOST,
     WORKER_STATUS_SESSION_FLEET_LOST,
     WORKER_STATUS_STALE_PAUSE_DEADLOCK,
     WORKER_STATUS_STEP_BUDGET,
@@ -64,10 +65,13 @@ class WorkerDiagnostics:
     last_exception_type: Optional[str] = None
     last_exception_message: Optional[str] = None
 
-    # HITL bookkeeping. Today only last_pause_pageId is set; the rest are
-    # populated when PR #4 (BrowserAgent HITL wait) lands. Keeping the fields
-    # here avoids another diagnostics migration when that PR ships.
+    # HITL bookkeeping. ``hitl_resumed_observed`` is lifetime telemetry, not
+    # authority for the current pause.  The local generation pair prevents a
+    # resume from pause N from accidentally clearing a later pause N+1 when
+    # the browser does not expose a stable public pauseId.
     last_pause_pageId: Optional[str] = None
+    hitl_pause_generation: int = 0
+    hitl_resumed_generation: int = 0
     hitl_wait_entered: bool = False
     hitl_wait_timed_out: bool = False
     hitl_resumed_observed: bool = False
@@ -94,6 +98,7 @@ class WorkerDiagnostics:
         if (
             result.get("terminal") is True
             and routing_status in {
+                WORKER_STATUS_PAGE_CONTINUATION_LOST,
                 WORKER_STATUS_SESSION_FLEET_LOST,
                 WORKER_STATUS_FLEET_ASSIGNMENT_LOST,
             }
@@ -101,9 +106,26 @@ class WorkerDiagnostics:
             self.routing_failure_status = routing_status
 
         if method == "Hitl.requestPause" and _is_pause_success(observation, result):
-            page_id = (params or {}).get("pageId") or _get_page_id_from_response(result)
-            if page_id:
-                self.last_pause_pageId = str(page_id)
+            # ``Hitl.requestPause`` is locally enriched with the terminal wait
+            # result before BrowserAgent observes the tool receipt.  The raw
+            # pause observation still says "successfully paused", so treating
+            # it in isolation reintroduced a pending-pause marker *after*
+            # ``wait_for_hitl_resume`` had already cleared it.  Prefer the
+            # structured terminal fact carried by this same receipt.
+            hitl_wait_status = _hitl_wait_status(result)
+            if hitl_wait_status == "resumed":
+                self.mark_hitl_resumed()
+            else:
+                page_id = (
+                    (params or {}).get("pageId")
+                    or _get_page_id_from_response(result)
+                )
+                if page_id:
+                    # The normal wait path starts the generation before it
+                    # blocks.  Older/no-wait receipts reach this observer with
+                    # no unresolved generation and must start one here.
+                    if not self.hitl_unresolved():
+                        self.begin_hitl_pause(str(page_id))
 
         if _is_api_contract_error(observation, error_text):
             self.contract_errors.append({
@@ -130,16 +152,47 @@ class WorkerDiagnostics:
         self.last_exception_type = type(exc).__name__
         self.last_exception_message = str(exc)
 
-    def mark_hitl_wait_entered(self) -> None:
+    def begin_hitl_pause(self, page_id: str) -> int:
+        self.hitl_pause_generation += 1
+        self.last_pause_pageId = str(page_id or "") or None
+        # These flags classify the current unresolved pause. A previous pause
+        # must not leak its terminal shape into a later pause generation.
+        self.hitl_wait_timed_out = False
+        self.hitl_page_settled_observed = False
+        self.hitl_stale_pause_deadlock_observed = False
+        return self.hitl_pause_generation
+
+    def mark_hitl_wait_entered(self, page_id: str = "") -> None:
         self.hitl_wait_entered = True
+        if page_id:
+            self.begin_hitl_pause(page_id)
 
     def mark_hitl_wait_timed_out(self) -> None:
         self.hitl_wait_timed_out = True
 
     def mark_hitl_resumed(self) -> None:
         self.hitl_resumed_observed = True
+        self.hitl_resumed_generation = self.hitl_pause_generation
         # Once resumed, the pending-pause signal is cleared.
         self.last_pause_pageId = None
+
+    def hitl_unresolved(self) -> bool:
+        """Whether the current worker still has an unresolved HITL pause.
+
+        ``last_pause_pageId`` is retained for stale-pause forensics, but a
+        historical pause must not block step continuation after the receipt
+        has conclusively reported a resume.
+        """
+
+        if not self.last_pause_pageId:
+            return False
+        # Compatibility for diagnostics assembled by older workers/tests,
+        # which carried only ``last_pause_pageId`` and terminal flags.  Once
+        # either generation counter exists, the generation pair is the sole
+        # authority and a sticky historical resume cannot clear pause N+1.
+        if self.hitl_pause_generation == 0 and self.hitl_resumed_generation == 0:
+            return not self.hitl_resumed_observed
+        return self.hitl_pause_generation > self.hitl_resumed_generation
 
     def mark_hitl_page_settled(self) -> None:
         self.hitl_page_settled_observed = True
@@ -152,6 +205,8 @@ class WorkerDiagnostics:
             "last_exception_type": self.last_exception_type,
             "last_exception_message": (self.last_exception_message or "")[:500],
             "last_pause_pageId": self.last_pause_pageId,
+            "hitl_pause_generation": self.hitl_pause_generation,
+            "hitl_resumed_generation": self.hitl_resumed_generation,
             "hitl_wait_entered": self.hitl_wait_entered,
             "hitl_wait_timed_out": self.hitl_wait_timed_out,
             "hitl_resumed_observed": self.hitl_resumed_observed,
@@ -270,6 +325,7 @@ def _classify_hard(
         return WORKER_STATUS_CONTEXT_LIMIT
 
     if diag.routing_failure_status in {
+        WORKER_STATUS_PAGE_CONTINUATION_LOST,
         WORKER_STATUS_SESSION_FLEET_LOST,
         WORKER_STATUS_FLEET_ASSIGNMENT_LOST,
     }:
@@ -313,9 +369,7 @@ def _classify_hitl(diag: WorkerDiagnostics) -> Optional[str]:
       - stale_pause_deadlock: resolvePause itself is rejected as paused, usually
         because the installed ABCP build did not exempt the unlock method.
     """
-    if not diag.last_pause_pageId:
-        return None
-    if diag.hitl_resumed_observed:
+    if not diag.hitl_unresolved():
         return None
     if diag.hitl_stale_pause_deadlock_observed:
         return WORKER_STATUS_STALE_PAUSE_DEADLOCK
@@ -395,6 +449,24 @@ def _get_page_id_from_response(result: Any) -> Optional[str]:
         if isinstance(page_id, str):
             return page_id
     return None
+
+
+def _hitl_wait_status(result: Any) -> str:
+    """Read the terminal wait status from an enriched HITL tool receipt."""
+
+    if not isinstance(result, dict):
+        return ""
+    candidates = [result]
+    response = result.get("response")
+    if isinstance(response, dict):
+        candidates.append(response)
+    for candidate in candidates:
+        wait = candidate.get("hitl_wait")
+        if isinstance(wait, dict):
+            status = str(wait.get("status") or "").strip().lower()
+            if status:
+                return status
+    return ""
 
 
 def _is_pause_success(observation: Optional[str], result: Any) -> bool:

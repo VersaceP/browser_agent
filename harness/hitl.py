@@ -638,7 +638,7 @@ async def wait_for_hitl_resume(
     the tool_result with the HITL wait outcome.
     """
     if diagnostics is not None:
-        diagnostics.mark_hitl_wait_entered()
+        diagnostics.mark_hitl_wait_entered(page_id)
     if logger is not None:
         logger.write(
             "hitl.wait.start",
