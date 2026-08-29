@@ -30,6 +30,19 @@ NotificationPredicate = Callable[[JsonDict], bool]
 NotificationCallback = Callable[[JsonDict], None]
 
 
+# ``ABCPTransportError`` also represents JSON-RPC action failures, so its
+# Python type alone cannot answer whether the underlying WebSocket is usable.
+# Keep that distinction explicit and machine-readable at the client boundary.
+ABCP_TRANSPORT_CONNECT_FAILED = "ABCP_TRANSPORT_CONNECT_FAILED"
+ABCP_TRANSPORT_NOT_CONNECTED = "ABCP_TRANSPORT_NOT_CONNECTED"
+ABCP_TRANSPORT_CLOSED = "ABCP_TRANSPORT_CLOSED"
+ABCP_TRANSPORT_READER_FAILED = "ABCP_TRANSPORT_READER_FAILED"
+ABCP_TRANSPORT_SEND_FAILED = "ABCP_TRANSPORT_SEND_FAILED"
+ABCP_TRANSPORT_CALL_TIMEOUT = "ABCP_TRANSPORT_CALL_TIMEOUT"
+ABCP_RPC_ERROR = "ABCP_RPC_ERROR"
+ABCP_TRANSPORT_UNKNOWN = "ABCP_TRANSPORT_UNKNOWN"
+
+
 class ABCPTransportError(RuntimeError):
     """Raised when the WebSocket transport cannot complete a request.
 
@@ -45,11 +58,18 @@ class ABCPTransportError(RuntimeError):
         rpc_code: Optional[int] = None,
         rpc_method: str = "",
         rpc_data: Any = None,
+        transport_code: str = ABCP_TRANSPORT_UNKNOWN,
+        connection_fatal: bool = False,
+        request_sent: Optional[bool] = None,
     ) -> None:
         super().__init__(message)
         self.rpc_code = rpc_code
         self.rpc_method = str(rpc_method or "")
         self.rpc_data = rpc_data
+        self.transport_code = str(transport_code or ABCP_TRANSPORT_UNKNOWN)
+        self.connection_fatal = bool(connection_fatal)
+        # ``None`` means a send failed while its delivery was indeterminate.
+        self.request_sent = request_sent if isinstance(request_sent, bool) else None
 
 
 @dataclass
@@ -308,20 +328,24 @@ class ABCPClient:
             kwargs["proxy"] = None
 
         try:
-            self._ws = await websockets.connect(
-                self.config.ws_url,
-                additional_headers=headers or None,
-                **kwargs,
-            )
-        except TypeError:
-            self._ws = await websockets.connect(
-                self.config.ws_url,
-                extra_headers=headers or None,
-                **kwargs,
-            )
+            try:
+                self._ws = await websockets.connect(
+                    self.config.ws_url,
+                    additional_headers=headers or None,
+                    **kwargs,
+                )
+            except TypeError:
+                self._ws = await websockets.connect(
+                    self.config.ws_url,
+                    extra_headers=headers or None,
+                    **kwargs,
+                )
         except OSError as exc:
             raise ABCPTransportError(
-                f"Unable to connect to ABCP Browser WebSocket: {self.config.ws_url}"
+                f"Unable to connect to ABCP Browser WebSocket: {self.config.ws_url}",
+                transport_code=ABCP_TRANSPORT_CONNECT_FAILED,
+                connection_fatal=True,
+                request_sent=False,
             ) from exc
 
         self._closed = False
@@ -342,7 +366,12 @@ class ABCPClient:
         self.notifications.close()
         pending = self._pending_call
         if pending is not None and not pending.done():
-            pending.set_exception(ABCPTransportError("WebSocket closed"))
+            pending.set_exception(ABCPTransportError(
+                "WebSocket closed",
+                transport_code=ABCP_TRANSPORT_CLOSED,
+                connection_fatal=not self._closed,
+                request_sent=True,
+            ))
         if self._ws is not None:
             try:
                 await self._ws.close()
@@ -352,12 +381,26 @@ class ABCPClient:
 
     async def call(self, method: str, params: Optional[JsonDict] = None) -> JsonDict:
         if self._ws is None:
-            raise ABCPTransportError("WebSocket is not connected")
+            raise ABCPTransportError(
+                "WebSocket is not connected",
+                transport_code=ABCP_TRANSPORT_NOT_CONNECTED,
+                connection_fatal=True,
+                request_sent=False,
+            )
         if self._closed:
-            raise ABCPTransportError("WebSocket has been closed")
+            raise ABCPTransportError(
+                "WebSocket has been closed",
+                transport_code=ABCP_TRANSPORT_CLOSED,
+                connection_fatal=True,
+                request_sent=False,
+            )
         if self._reader_failure is not None:
             raise ABCPTransportError(
-                f"WebSocket background reader failed: {self._reader_failure}"
+                f"WebSocket background reader failed: {self._reader_failure}",
+                rpc_method=method,
+                transport_code=ABCP_TRANSPORT_READER_FAILED,
+                connection_fatal=True,
+                request_sent=False,
             )
 
         request_id = str(uuid.uuid4())
@@ -371,14 +414,26 @@ class ABCPClient:
             self._pending_method = method
             try:
                 self._emit("request", payload)
-                await self._ws.send(json.dumps(payload, ensure_ascii=False))
+                try:
+                    await self._ws.send(json.dumps(payload, ensure_ascii=False))
+                except Exception as exc:
+                    raise ABCPTransportError(
+                        f"WebSocket send failed for {method}: {exc}",
+                        rpc_method=method,
+                        transport_code=ABCP_TRANSPORT_SEND_FAILED,
+                        connection_fatal=True,
+                        request_sent=None,
+                    ) from exc
                 try:
                     raw_response = await asyncio.wait_for(
                         future, timeout=self.config.call_timeout_seconds
                     )
                 except asyncio.TimeoutError as exc:
                     raise ABCPTransportError(
-                        f"Call to {method} timed out ({self.config.call_timeout_seconds}s)"
+                        f"Call to {method} timed out ({self.config.call_timeout_seconds}s)",
+                        rpc_method=method,
+                        transport_code=ABCP_TRANSPORT_CALL_TIMEOUT,
+                        request_sent=True,
                     ) from exc
             finally:
                 self._pending_call = None
@@ -398,6 +453,8 @@ class ABCPClient:
                 rpc_code=raw_code if isinstance(raw_code, int) else None,
                 rpc_method=method,
                 rpc_data=rpc_error.get("data"),
+                transport_code=ABCP_RPC_ERROR,
+                request_sent=True,
             )
         response = self._unwrap_response(raw_response)
         self._emit("response", response)
@@ -454,7 +511,12 @@ class ABCPClient:
             # resolve once the read loop is gone.
             self._fail_pending(
                 self._reader_failure
-                or ABCPTransportError("WebSocket reader stopped")
+                or ABCPTransportError(
+                    "WebSocket reader stopped",
+                    transport_code=ABCP_TRANSPORT_READER_FAILED,
+                    connection_fatal=not self._closed,
+                    request_sent=True,
+                )
             )
 
     def _dispatch_message(self, message: JsonDict) -> None:
@@ -520,9 +582,16 @@ class ABCPClient:
     def _fail_pending(self, exc: BaseException) -> None:
         future = self._pending_call
         if future is not None and not future.done():
-            future.set_exception(
-                ABCPTransportError(str(exc) or "transport failure")
-            )
+            if isinstance(exc, ABCPTransportError):
+                future.set_exception(exc)
+            else:
+                future.set_exception(ABCPTransportError(
+                    str(exc) or "transport failure",
+                    rpc_method=str(self._pending_method or ""),
+                    transport_code=ABCP_TRANSPORT_READER_FAILED,
+                    connection_fatal=True,
+                    request_sent=True,
+                ))
 
     def _build_payload(self, request_id: str, method: str, params: JsonDict) -> JsonDict:
         shape = self.config.request_shape.lower()

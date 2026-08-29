@@ -488,6 +488,8 @@ async def attempt_render_recovery_strategy(
     try:
         response = await browser.call(call_method, call_params)
     except ABCPTransportError as exc:
+        if bool(getattr(exc, "connection_fatal", False)):
+            raise
         reason = detect_render_lost(str(exc)) or str(exc)
         return None, reason
     reason = detect_render_lost(response)

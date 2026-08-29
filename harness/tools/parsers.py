@@ -63,16 +63,20 @@ def method_schema_summary(
     schema = method_schemas.get(method)
     if not isinstance(schema, dict):
         return None
-    return trim_large_strings(
-        {
-            "method": schema.get("method", method),
-            "description": schema.get("description", ""),
-            "params": schema.get("params", {}),
-            "requiresPurpose": schema.get("requiresPurpose", False),
-            "purposeHint": schema.get("purposeHint"),
-        },
-        6000,
-    )
+    summary: JsonDict = {
+        "method": schema.get("method", method),
+        "description": schema.get("description", ""),
+        "requiresPurpose": schema.get("requiresPurpose", False),
+        "purposeHint": schema.get("purposeHint"),
+    }
+    # Two describeAction generations ship different shapes: the legacy agent
+    # view (params) and JSON-Schema views (inputSchema, possibly a union).
+    # Surface whichever exists so schema recall annotations never go empty.
+    if isinstance(schema.get("inputSchema"), dict):
+        summary["inputSchema"] = schema.get("inputSchema")
+    if isinstance(schema.get("params"), dict):
+        summary["params"] = schema.get("params")
+    return trim_large_strings(summary, 6000)
 
 
 def attach_method_schema(
