@@ -117,9 +117,20 @@ HARNESS_TOOL_NAMES: FrozenSet[str] = frozenset({
 # (it is now a known capability method). HARNESS-INTERNAL auto-digest use stays
 # separately gated by HarnessConfig.semantic_tree.
 #
+# `Fleet.status` was quarantined here (2026-08-23) because it tore down the
+# caller's WebSocket: reading status went through `sendAndWait`, which woke a
+# stopped Client. ABCP 1.1.9 reads it from durable state instead
+# (`hasFleetDirectory` + `sendAndWaitIfRunning`). Re-verified live against the
+# running dispatcher on 2026-08-30: four fleets in prepared/active state plus a
+# nonexistent fleetId all answered in 2-41ms, every follow-up call on the same
+# socket succeeded, and an unknown fleet returned a clean -32009 fleet-not-found.
+# `status` is now the enum prepared|active. It proves the Fleet directory exists
+# and whether a Client process is running — NOT that any particular page is
+# usable, so the readiness barrier deliberately stays on target-scoped Page.list.
+#
 # Keeping these entries after the methods vanished from System.getCapabilities
 # has now paid for itself: `Memory.delete` is BACK in the live capability
-# surface (verified against the running dispatcher, 61 capabilities), so this
+# surface (verified against the running dispatcher, 62 capabilities), so this
 # block is load-bearing again rather than inert — a worker could otherwise
 # destroy another phase's memory. `Hitl.getTaskSummary` / `Hitl.resumeEvent`
 # remain absent and stay listed on the same reasoning: unlike a stale
@@ -129,11 +140,6 @@ HARNESS_TOOL_NAMES: FrozenSet[str] = frozenset({
 # harness/hitl.py. Re-verify against the capability surface before removing any
 # of them.
 ALWAYS_FORBIDDEN_ABCP_METHODS: FrozenSet[str] = frozenset({
-    # TEMPORARY PLATFORM QUARANTINE (2026-08-23): Fleet.status currently
-    # tears down the caller's WebSocket after returning readiness. It must not
-    # be exposed to any model or invoked through a stale capability contract
-    # until the ABCP Fleet lifecycle bug is fixed.
-    "Fleet.status",
     "Hitl.getTaskSummary",
     "Hitl.resumeEvent",
     "Memory.delete",

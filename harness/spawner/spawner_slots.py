@@ -1968,8 +1968,9 @@ class SpawnerSlotsMixin:
                     if event is None else
                     "; Fleet.ready was observed but live verification still failed"
                 )
-                + "; Fleet.status remains disabled due to the ABCP WebSocket"
-                " lifecycle bug"
+                + "; Fleet.status cannot substitute because it only reports"
+                " Fleet directory and Client-process state, not whether the"
+                " assigned page is usable"
             )
             failure = {
                 "fleetId": fleet_id,

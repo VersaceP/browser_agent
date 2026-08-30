@@ -2050,7 +2050,9 @@ weakened/removed。修复后，原始用户纠偏以
   `page_list_retry`，全程最多两次目标 Page RPC。`fleet_readiness_wait_seconds` 是信号等待与
   发起终局探测的软预算，不是总墙钟上限；为避免取消在途 WebSocket RPC 污染共享连接，
   实际耗时可能达到该预算加两次 ABCP 单调用/restore 上限，并以 receipt 的 `elapsedMs`
-  如实记录。`Fleet.status` 因当前 ABCP WebSocket 生命周期缺陷继续隔离。相同 Fleet 的并发
+  如实记录。`Fleet.status` 的隔离已在 ABCP 1.1.9 解除（2026-08-30 实测复验），但它仍不替代
+  `Page.list`：它只回答 Fleet 目录与 Client 进程状态（`prepared|active`），证明不了目标页面可
+  用。相同 Fleet 的并发
   phase 共用 single-flight probe，失败进入既有
   spawn-acquisition cooldown 且不创建 BrowserAgent。启动前全局 inventory 只做
   `Fleet.list`；readiness 仅对选中的 Fleet 做 `Page.list`，`Page.getState` 等页面细节探测
@@ -2059,7 +2061,11 @@ weakened/removed。修复后，原始用户纠偏以
   `fleetReadiness` receipt 均发生在 barrier 之后。
 - `-32012` / `-32005` 的平台瞬时故障分类不在本批实现范围内，等待 ABCP 修复。
 
-**2026-08-03 Fleet readiness live canary：**证据保存在
+**2026-08-03 Fleet readiness live canary（已被现行设计取代，见上文 `Fleet.status`
+段）：**下述 `verifiedBy=status` 出口属于当时的实现，此后 `Fleet.status` 因 WebSocket
+生命周期缺陷被隔离，readiness 改为一律走目标 Page RPC；2026-08-30 隔离解除后也没有恢复
+该出口——`Fleet.status` 只回答 Fleet 目录与 Client 进程状态，证明不了目标页面可用。本段仅
+作历史证据保留，不描述当前行为。证据保存在
 `tests/20260803/fleet-readiness-canary/`。热 Fleet
 `873abbb6-4324-4c84-93ee-998cad4e4a50` 由一次 `Fleet.status` 验证为
 `verifiedBy=status`，事件顺序为 `fleet.readiness.ready → spawner.browser.spawned →

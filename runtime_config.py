@@ -923,9 +923,11 @@ class HarnessConfig:
     # Hold BrowserAgent construction until the coordinator-assigned Fleet
     # answers a target-scoped Page.list readiness probe. Fleet.ready is only a
     # bounded wake-up hint because session restore may complete without a new
-    # event. Fleet.status remains quarantined because it can terminate the
-    # caller's WebSocket on the current ABCP platform. This is a soft event
-    # budget, not a wall-clock cap: two in-flight Page.list calls are never
+    # event. Fleet.status is safe to call again on ABCP 1.1.9 but is NOT a
+    # substitute here: it proves the Fleet directory exists and whether a Client
+    # process runs (status=prepared|active), never that the assigned page is
+    # usable, which is exactly what this barrier must establish. This is a soft
+    # event budget, not a wall-clock cap: two in-flight Page.list calls are never
     # cancelled because doing so can contaminate the shared WebSocket, so total
     # elapsed time can also include up to two browser call timeouts.
     fleet_readiness_barrier_enabled: bool = True

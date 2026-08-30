@@ -89,8 +89,12 @@ Decision:
   is verified separately with a target-scoped `Page.list`: persisted inventory
   can contain idle-looking pages for a prepared Fleet and is not live proof.
   `Fleet.ready` is only a bounded wake-up hint because session restore may
-  complete without emitting it; `Fleet.status` remains quarantined while it can
-  terminate the caller WebSocket. The probe can wake a cold Fleet: similar-task
+  complete without emitting it. `Fleet.status` was quarantined until ABCP 1.1.9
+  because reading it woke a stopped Client and tore down the caller WebSocket;
+  it now reads durable state and was re-verified live on 2026-08-30, so the
+  quarantine is lifted. It still does not replace the `Page.list` probe: its
+  `prepared|active` answer proves the Fleet directory and Client process, never
+  that the assigned page is usable. The probe can wake a cold Fleet: similar-task
   candidates are verified before they are admitted, so a rejected candidate may
   still leave a newly started browser process. This is an accepted, bounded
   consequence of verifying the actual browser execution path.
