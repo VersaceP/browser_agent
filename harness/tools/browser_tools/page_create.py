@@ -9,7 +9,6 @@ from typing import Optional
 from typing import Set
 from typing import Tuple
 import json
-from urllib.parse import urlparse
 from harness.utils import JsonDict
 
 def _bt():
@@ -464,63 +463,6 @@ async def _recover_page_create_32005(
         ),
     }
     return terminal, True
-
-def _attach_navigation_check(result: JsonDict, *, method: str, params: JsonDict) -> JsonDict:
-    if method != "Page.navigate" or not isinstance(result, dict):
-        return result
-    target_url = str(params.get("url") or "").strip()
-    if not target_url:
-        return result
-    data = _response_data(result)
-    current_url = str(data.get("url") or "").strip()
-    title = str(data.get("title") or "").strip()
-    status = "unknown"
-    hint = "Call Page.getState after the reactive load event to verify final URL before extraction."
-    if current_url:
-        status = "arrived" if _urls_same_destination(target_url, current_url) else "off_target"
-    if _looks_like_challenge_title(title):
-        status = "challenge_pending"
-        hint = (
-            "Navigation is on a challenge/interstitial surface. Do not extract target data yet;"
-            " wait for settlement, request HITL if confirmed, then verify the final URL."
-        )
-    elif status == "off_target":
-        hint = (
-            "Navigation did not report the requested destination. Re-check Page.getState,"
-            " then re-navigate or report the redirect/blocker before extracting."
-        )
-    enriched = dict(result)
-    enriched["navigationCheck"] = {
-        "status": status,
-        "targetUrl": target_url,
-        "currentUrl": current_url,
-        "title": title,
-        "hint": hint,
-    }
-    return enriched
-
-def _urls_same_destination(expected: str, current: str) -> bool:
-    try:
-        expected_parts = urlparse(expected)
-        current_parts = urlparse(current)
-    except ValueError:
-        return expected.rstrip("/") == current.rstrip("/")
-    if expected_parts.netloc and current_parts.netloc:
-        if expected_parts.netloc.lower() != current_parts.netloc.lower():
-            return False
-    expected_path = (expected_parts.path or "/").rstrip("/") or "/"
-    current_path = (current_parts.path or "/").rstrip("/") or "/"
-    if expected_path != current_path:
-        return False
-    if expected_parts.query and expected_parts.query != current_parts.query:
-        return False
-    if expected_parts.fragment and expected_parts.fragment != current_parts.fragment:
-        return False
-    return True
-
-def _looks_like_challenge_title(title: str) -> bool:
-    lowered = str(title or "").strip().lower()
-    return lowered in {"just a moment...", "just a moment", "checking your browser..."}
 
 def _attach_runtime_strategy_hints(result: JsonDict, *, method: str) -> JsonDict:
     if not isinstance(result, dict):

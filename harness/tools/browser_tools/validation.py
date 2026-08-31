@@ -346,12 +346,13 @@ def _check_scroll_param_requirements(
     method: str,
     params: JsonDict,
 ) -> Optional[JsonDict]:
-    """Reject Input.scroll shapes the platform's three-mode union will refuse.
+    """Reject Input.scroll shapes that do not express one supported mode.
 
-    The union is strict, so a flat `id`/`selector` — the pre-frame-graph shape
-    and the one most models reach for — matches no variant and comes back as a
-    bare -32602 with nothing to act on. Catching it here costs one round trip
-    less and says which mode was meant.
+    Some malformed shapes are rejected by the platform, while unknown keys are
+    permissive on ABCP 1.1.9. In particular the obsolete
+    ``viewport={direction, amount}`` object is silently ignored, after which
+    the action falls back to its top-level defaults (down, 300). Catch these
+    locally so an explicit amount=0/1200 cannot masquerade as a 300px scroll.
     """
     if method != "Input.scroll":
         return None
@@ -366,6 +367,13 @@ def _check_scroll_param_requirements(
             "tool_was_executed": False,
             "next_instruction": _SCROLL_MODE_INSTRUCTION,
         }
+
+    if "viewport" in params:
+        return invalid(
+            "Input.scroll viewport mode uses top-level direction and amount;"
+            " remove params.viewport and move those fields to params.",
+            "viewport",
+        )
 
     for key in ("id", "selector", "nodeId", "targetId"):
         if _non_empty_param(params, key):

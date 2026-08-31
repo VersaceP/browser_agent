@@ -341,11 +341,9 @@ from .navigate import (  # noqa: F401
 from .page_create import (  # noqa: F401
     FLEET_LOSS_ERROR_CODES,
     _assigned_fleet_lost_result,
-    _attach_navigation_check,
     _attach_runtime_strategy_hints,
     _fleet_loss_signal,
     _is_page_create_32005_failure,
-    _looks_like_challenge_title,
     _page_create_error_text,
     _page_create_infrastructure_classification,
     _page_create_probe_call,
@@ -355,7 +353,6 @@ from .page_create import (  # noqa: F401
     _raw_response_data,
     _recover_page_create_32005,
     _response_data,
-    _urls_same_destination,
 )
 from .progress_obs import (  # noqa: F401
     _PROGRESS_OBSERVATION_IDENTITY_KEYS,

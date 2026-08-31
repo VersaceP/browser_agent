@@ -310,7 +310,8 @@ def _scroll_was_state_probe(result: JsonDict) -> bool:
     data = _scroll_receipt_data(result)
     if data is None:
         return False
-    return str(data.get("completedReason") or "") == "amount-zero"
+    # 1.1.9 returns `state-read`; older fixtures/builds used `amount-zero`.
+    return str(data.get("completedReason") or "") in {"state-read", "amount-zero"}
 
 def _axis_magnitude(value: Any) -> Optional[float]:
     """Largest absolute axis component of a `{x, y}` delta, or None."""
