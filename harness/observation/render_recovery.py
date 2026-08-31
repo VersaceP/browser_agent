@@ -15,7 +15,11 @@ from harness.constants import (
     RENDER_RECOVERY_METHODS,
     RENDER_RECOVERY_WINDOW_SECONDS,
 )
-from harness.tool_policy import mask_params
+from harness.tool_policy import (
+    collect_sensitive_replacements,
+    redact_params_for_display,
+    redact_values,
+)
 from harness.utils import JsonDict, RunLogger, trim_large_strings
 
 
@@ -210,6 +214,26 @@ def build_render_recovery_advisory(
     }
 
 
+def _redact_transport_error(exc: ABCPTransportError, secrets: Set[str]) -> None:
+    """Scrub a raised transport error in place before it escapes this call.
+
+    JSON-RPC action failures travel as ``ABCPTransportError``, and callers
+    persist both ``str(exc)`` and ``exc.rpc_data``. Mutating the live exception
+    is what keeps every one of those call sites covered without each having to
+    remember to scrub.
+    """
+    if not secrets:
+        return
+    rpc_data = getattr(exc, "rpc_data", None)
+    if rpc_data is not None:
+        exc.rpc_data = redact_values(rpc_data, secrets)
+    receipt = getattr(exc, "receipt", None)
+    if isinstance(receipt, dict):
+        exc.receipt = redact_values(receipt, secrets)
+    if exc.args:
+        exc.args = tuple(redact_values(list(exc.args), secrets))
+
+
 async def call_with_render_recovery(
     *,
     browser: ABCPClient,
@@ -225,16 +249,33 @@ async def call_with_render_recovery(
     # the advisory uses the masked copy so a render-lost during a sensitive
     # action (e.g. Input.type of a password) never persists the value. Recovery
     # logic only reads pageId/anchor keys, which masking leaves intact.
-    safe_params = mask_params(params, redact_params)
+    # Value-based, not key-based: the advisory embeds these params in
+    # `previous_action.params` and both render-recovery logs, so a credential
+    # sitting in an undeclared `url` would survive there even after the
+    # response itself was scrubbed.
+    safe_params = redact_params_for_display(params, redact_params)
+    # Masking the request is not enough: ABCP echoes request values back in its
+    # own feedback (`Input.type` returns `data.typed`, `Page.navigate` renders
+    # the destination URL into `observation`). This is the one place where a
+    # response enters the harness, so scrub it here and every downstream
+    # surface — run log, trace, model result, offload — inherits the scrub.
+    secrets = collect_sensitive_replacements(params, redact_params)
+
+    # Forwarded so the transport event log scrubs the same values this layer
+    # does. Only when set, so runners predating the kwarg (test fakes) keep
+    # working on the ordinary non-redacted path.
+    call_kwargs = {"redact_params": redact_params} if redact_params else {}
 
     try:
-        response = await browser.call(method, params)
+        response = await browser.call(method, params, **call_kwargs)
     except ABCPTransportError as exc:
+        _redact_transport_error(exc, secrets)
         reason = detect_render_lost(str(exc))
         if not reason:
             raise
         response = {"error": str(exc)}
     else:
+        response = redact_values(response, secrets)
         reason = detect_render_lost(response)
         if not reason:
             return response, None
@@ -287,13 +328,18 @@ async def call_with_render_recovery(
             )
 
         try:
-            retry_response = await browser.call(method, params)
+            retry_response = await browser.call(method, params, **call_kwargs)
         except ABCPTransportError as exc:
+            # The retry is a second response entering the harness and needs the
+            # same scrub as the first: it is returned to the caller, folded into
+            # the advisory, and logged.
+            _redact_transport_error(exc, secrets)
             retry_reason = detect_render_lost(str(exc))
             if not retry_reason:
                 raise
             latest_original = {"error": str(exc)}
         else:
+            retry_response = redact_values(retry_response, secrets)
             retry_reason = detect_render_lost(retry_response)
             if not retry_reason:
                 recovery.outcome = "succeeded"

@@ -1044,16 +1044,6 @@ def _content_completeness_upstream_blocker(
     if status in {"failed", "loadfailed", "error", "crashed"}:
         return f"lifecycle:{status}"
 
-    navigation_check = (
-        result.get("navigationCheck")
-        if isinstance(result.get("navigationCheck"), dict) else {}
-    )
-    navigation_status = str(navigation_check.get("status") or "")
-    if navigation_status == "challenge_pending":
-        return "challenge:navigation"
-    if navigation_status == "off_target":
-        return "navigation:off_target"
-
     if isinstance(result.get("structuralChallenge"), dict):
         return "challenge:structural"
     auto_hitl = result.get("autoHitl")
@@ -1824,16 +1814,57 @@ def _invoke_result_failed(result: Any) -> bool:
         return True
     return False
 
+# The complete set of ABCP failure fields the harness will copy out of a
+# JSON-RPC `error.data`. Anything else — provider diagnostics, typed values, a
+# future free-form `details` object — is refused by omission rather than by a
+# denylist, so a new upstream field cannot leak by default.
+_PUBLIC_FAILURE_FIELDS = ("observation", "suggested_prompt")
+_PUBLIC_FAILURE_ERROR_FIELDS = ("code", "message")
+
+
+def _public_failure_projection(rpc_data: Any) -> JsonDict:
+    """Project only ABCP's public failure fields out of a JSON-RPC error data."""
+
+    if not isinstance(rpc_data, dict):
+        return {}
+    projected: JsonDict = {}
+    for key in _PUBLIC_FAILURE_FIELDS:
+        value = rpc_data.get(key)
+        if isinstance(value, str) and value.strip():
+            projected[key] = value
+    error = rpc_data.get("error")
+    if isinstance(error, dict):
+        public_error = {
+            key: error[key]
+            for key in _PUBLIC_FAILURE_ERROR_FIELDS
+            if isinstance(error.get(key), str) and error[key].strip()
+        }
+        if public_error:
+            projected["error"] = public_error
+    return trim_large_strings(projected, 4000) if projected else {}
+
+
 def _transport_error_metadata(
     method: str,
     exc: ABCPTransportError,
 ) -> JsonDict:
     """Keep machine-readable RPC failure data where recovery needs it.
 
-    ``rpcData`` is surfaced only for the select API pair. Other actions may
-    carry typed or otherwise sensitive values in provider diagnostics; their
-    numeric code/method remain useful without copying that opaque payload into
-    the model-facing result.
+    Every ABCP public failure carries its own ``observation`` and
+    ``suggested_prompt``, and dropping them for all but the select pair threw
+    away the platform's own recovery guidance on every other method. What made
+    that unsafe was copying the whole ``rpc_data`` object, which may carry
+    typed values or provider diagnostics — not the public fields themselves.
+    So project a fixed public whitelist for every method and refuse the rest.
+
+    The whitelist is exactly what ABCP 1.1.9 puts on the wire (verified live
+    against catalogRevision sha256:cfd8fb90…: an error ``data`` carries only
+    ``error{code,message}``, ``observation`` and ``suggested_prompt``).
+    ``details`` is deliberately NOT whitelisted: on this build it is always
+    absent, and it is typed ``Record<string, unknown>`` upstream, so admitting
+    the key would reopen the unbounded payload this whitelist exists to close.
+    Add it only per error code, with a field/type/depth/size bound, once a
+    build actually emits it.
     """
 
     metadata: JsonDict = {}
@@ -1873,8 +1904,9 @@ def _transport_error_metadata(
     if rpc_method:
         metadata["rpcMethod"] = rpc_method
     rpc_data = getattr(exc, "rpc_data", None)
-    if method in {"DOM.inspectSelect", "Input.select"} and rpc_data is not None:
-        metadata["rpcData"] = trim_large_strings(rpc_data, 4000)
+    public_failure = _public_failure_projection(rpc_data)
+    if public_failure:
+        metadata["rpcData"] = public_failure
     runtime = action_runtime_info(rpc_data)
     if runtime:
         # Four bounded scalars, no provider payload: whether the failure landed

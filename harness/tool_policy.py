@@ -62,6 +62,303 @@ def mask_params(params: Any, redact_params: Optional[Set[str]]) -> Any:
     }
 
 
+# Query-parameter NAMES whose value is a credential wherever it appears. ABCP
+# echoes request values back inside its own feedback — `Page.navigate` renders
+# the full destination URL into `observation`, and `Input.type` returns the
+# typed text as `data.typed` — so masking the outgoing `params` is not enough:
+# the value comes back on the response and reaches the run log, the trace and
+# the model. Matching is on the parameter name, never on the value's shape, so
+# this stays a naming contract rather than an entropy guess.
+SENSITIVE_URL_QUERY_KEYS: FrozenSet[str] = frozenset({
+    "access_token",
+    "api_key",
+    "apikey",
+    "auth",
+    "authorization",
+    "id_token",
+    "passwd",
+    "password",
+    "pwd",
+    "refresh_token",
+    "secret",
+    "session",
+    "sessionid",
+    "session_id",
+    "sig",
+    "signature",
+    "token",
+})
+
+# A short value ("1234", a 4-digit PIN or OTP) occurs inside unrelated ids and
+# URLs, so replacing it as a SUBSTRING would corrupt the response instead of
+# protecting anything. It is still a secret, so it is never discarded: below
+# this length a value is scrubbed only when a string equals it exactly, which
+# is safe and still covers `data.typed`-style whole-field echoes.
+MIN_SUBSTRING_REDACTABLE_LEN = 6
+
+
+def collect_sensitive_values(
+    params: Any,
+    redact_params: Optional[Set[str]] = None,
+) -> Set[str]:
+    """Real values that must not survive anywhere the harness persists a call.
+
+    Two sources, both declared rather than guessed: the caller's own
+    `redact_params` keys, and the values of well-known credential query
+    parameters inside any URL-shaped string in `params`. URL scanning runs
+    even without `redact_params`, because a token in a navigation URL is a
+    secret no caller had to opt into.
+
+    Values are never dropped for being short — `redact_values` decides how a
+    given length may safely be substituted.
+    """
+    secrets: Set[str] = set()
+    _walk_sensitive(params, redact_params or set(), secrets, depth=0)
+    return {s for s in secrets if s}
+
+
+def _walk_sensitive(
+    value: Any,
+    redact_params: Set[str],
+    out: Set[str],
+    *,
+    depth: int,
+) -> None:
+    if depth > 8:
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in redact_params and item is not None:
+                out.add(str(item))
+            _walk_sensitive(item, redact_params, out, depth=depth + 1)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _walk_sensitive(item, redact_params, out, depth=depth + 1)
+        return
+    if isinstance(value, str) and "?" in value and "=" in value:
+        out.update(_sensitive_query_values(value))
+
+
+def _sensitive_query_values(text: str) -> Set[str]:
+    return set(_sensitive_query_replacements(text))
+
+
+def _sensitive_query_replacements(text: str) -> Dict[str, str]:
+    """Needle → replacement for every credential carried in a URL string.
+
+    Emits three needles per hit, because one is never enough:
+      * the raw percent-encoded value — what ABCP echoes back verbatim
+      * its decoded form — what a page or a later receipt renders
+      * the whole `name=value` fragment — the only safe way to scrub a SHORT
+        credential. A bare "1234" cannot be substring-replaced without
+        rewriting unrelated ids, but `token=1234` is unambiguous, so the
+        parameter name supplies the context the value itself lacks.
+    """
+    from urllib.parse import unquote_plus, urlsplit
+
+    try:
+        parts = urlsplit(text)
+    except ValueError:
+        return {}
+    # Hash-routed SPAs carry their query inside the fragment
+    # (`https://host/#/sign-up?token=...`), where `urlsplit` reports an empty
+    # query. Scan both, plus the raw text when it is a bare query string.
+    candidates = [parts.query]
+    if "?" in parts.fragment:
+        candidates.append(parts.fragment.split("?", 1)[1])
+    if not parts.scheme and not parts.netloc:
+        candidates.append(text.split("?", 1)[-1])
+    found: Dict[str, str] = {}
+    for query in candidates:
+        if not query:
+            continue
+        for pair in query.split("&"):
+            name, sep, raw = pair.partition("=")
+            if not sep or name.strip().lower() not in SENSITIVE_URL_QUERY_KEYS:
+                continue
+            if not raw:
+                continue
+            masked = mask_token(raw)
+            found[f"{name}={raw}"] = f"{name}={masked}"
+            found[raw] = masked
+            decoded = unquote_plus(raw)
+            if decoded and decoded != raw:
+                decoded_mask = mask_token(decoded)
+                found[decoded] = decoded_mask
+                # The decoded form needs its OWN context needle. A short value
+                # that was percent-encoded on the way in ("%31%32%33%34") has a
+                # long raw form but a short decoded one, so once something
+                # echoes the decoded URL the bare needle is exact-match-only
+                # and matches nothing inside it.
+                found[f"{name}={decoded}"] = f"{name}={decoded_mask}"
+    return found
+
+
+def collect_sensitive_replacements(
+    params: Any,
+    redact_params: Optional[Set[str]] = None,
+) -> Dict[str, str]:
+    """Needle → replacement text for everything that must not survive a call.
+
+    A plain set of values cannot express "scrub `token=1234` but leave the
+    number 1234 alone elsewhere", which is exactly what a short URL credential
+    needs. Carrying the replacement alongside the needle lets a `name=value`
+    fragment be rewritten as `name=<masked len=N>` while a bare short value
+    stays restricted to whole-field matches.
+    """
+    replacements: Dict[str, str] = {}
+    for secret in collect_sensitive_values(params, redact_params):
+        replacements[secret] = mask_token(secret)
+    _walk_sensitive_replacements(params, replacements, depth=0)
+    return replacements
+
+
+def _walk_sensitive_replacements(
+    value: Any,
+    out: Dict[str, str],
+    *,
+    depth: int,
+) -> None:
+    if depth > 8:
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            _walk_sensitive_replacements(item, out, depth=depth + 1)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _walk_sensitive_replacements(item, out, depth=depth + 1)
+        return
+    if isinstance(value, str) and "?" in value and "=" in value:
+        out.update(_sensitive_query_replacements(value))
+
+
+def redact_values(value: Any, secrets: Any) -> Any:
+    """Replace every occurrence of each secret in a response tree.
+
+    The platform embeds request values inside prose (`observation`) as well as
+    in structured fields (`data.typed`), so this substitutes on the string
+    contents rather than on key names. Long values are replaced wherever they
+    appear; a short value is replaced only when a string IS that value, since
+    substring-replacing "1234" would rewrite unrelated ids. Returns the input
+    unchanged when there is nothing to scrub, so the ordinary path pays one
+    boolean.
+    """
+    if not secrets:
+        return value
+    if isinstance(secrets, dict):
+        table = dict(secrets)
+    else:
+        table = {s: mask_token(s) for s in secrets}
+    # Longest needle first, so `token=1234` is rewritten as a unit before the
+    # bare `1234` is ever considered.
+    substring = sorted(
+        ((n, r) for n, r in table.items() if len(n) >= MIN_SUBSTRING_REDACTABLE_LEN),
+        key=lambda pair: len(pair[0]),
+        reverse=True,
+    )
+    exact = {
+        n: r for n, r in table.items() if len(n) < MIN_SUBSTRING_REDACTABLE_LEN
+    }
+    return _redact_values(value, substring, exact, depth=0)
+
+
+def _redact_values(
+    value: Any,
+    substring: list,
+    exact: Dict[str, str],
+    *,
+    depth: int,
+) -> Any:
+    if depth > 24:
+        return value
+    if isinstance(value, dict):
+        return {
+            key: _redact_values(item, substring, exact, depth=depth + 1)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _redact_values(item, substring, exact, depth=depth + 1) for item in value
+        ]
+    if isinstance(value, str):
+        if value in exact:
+            return exact[value]
+        if value.strip() in exact:
+            return exact[value.strip()]
+        scrubbed = value
+        for needle, replacement in substring:
+            if needle in scrubbed:
+                scrubbed = scrubbed.replace(needle, replacement)
+        return scrubbed
+    return value
+
+
+# Transport logging budget. `log_browser_payloads` exists so a run log can be
+# debugged, not so it can hold a verbatim copy of every frame: one screenshot
+# `data` field or one API response body would otherwise land in the log at full
+# size.
+TRANSPORT_LOG_MAX_CHARS = 2000
+
+
+def sanitize_transport_payload(
+    payload: Any,
+    secrets: Any = None,
+    *,
+    max_chars: int = TRANSPORT_LOG_MAX_CHARS,
+) -> Any:
+    """Value-scrubbed, size-bounded copy of one transport frame for the run log.
+
+    `ABCPClient` emits the raw request and the raw response to its event hook,
+    which the run logger writes verbatim. That path bypasses every redaction the
+    harness applies on the model-facing side, so a password sent as
+    `Input.type.text` and echoed back as `data.typed` persisted in the log even
+    after the model-facing copy was scrubbed. The transport is the one point
+    every call passes through, so scrubbing here covers both directions at once.
+
+    Two independent controls. Known secrets - the caller's declared
+    `redact_params` plus credentials found in URL query strings - are
+    substituted by value. Every string is then bounded. Truncation is a size
+    control, not a secrecy one: an undeclared secret inside a response body is
+    not something this layer can recognise, and is projected at the tool
+    boundary instead.
+    """
+    scrubbed = redact_values(payload, secrets) if secrets else payload
+    return _bound_strings(scrubbed, max_chars, depth=0)
+
+
+def _bound_strings(value: Any, max_chars: int, *, depth: int) -> Any:
+    if depth > 24:
+        return value
+    if isinstance(value, dict):
+        return {
+            key: _bound_strings(item, max_chars, depth=depth + 1)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_bound_strings(item, max_chars, depth=depth + 1) for item in value]
+    if isinstance(value, str) and len(value) > max_chars:
+        return value[:max_chars] + f"... <truncated {len(value) - max_chars} chars>"
+    return value
+
+
+def redact_params_for_display(
+    params: Any,
+    redact_params: Optional[Set[str]] = None,
+) -> Any:
+    """Masked params for a receipt/log/trace, including in-URL credentials.
+
+    `mask_params` masks only the keys a caller declared, which leaves a token
+    sitting in a `url` parameter that nobody had to declare. This applies the
+    same value-based scrub the response goes through, so the request side and
+    the response side cannot disagree about what is secret.
+    """
+    masked = mask_params(params, redact_params)
+    secrets = collect_sensitive_replacements(params, redact_params)
+    return redact_values(masked, secrets) if secrets else masked
+
+
 def sanitize_tool_input_for_log(name: Any, tool_input: Any) -> Any:
     """Mask sensitive fields in a model tool-call input when the call opted into
     masking (mask truthy). Returns a copy; the original input is untouched."""

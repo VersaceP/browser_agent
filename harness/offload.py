@@ -214,8 +214,6 @@ def outline_large_field(value: Any, max_bytes: int = GENERIC_TOOL_RESULT_KEEP_FI
     return outline_value(value)
 
 
-SUGGESTED_PROMPT_SUCCESS_MAX_CHARS = 200
-
 # A `data:` URL carries the file's own payload inside the URL. Download.start is
 # the only way this harness can write a file, so agents legitimately submit text
 # that way — but the download ledger stores the url verbatim and Download.list
@@ -257,17 +255,31 @@ def compact_model_facing_tool_result(
         # result, so the download scope is decided once, here, and inherited by
         # every nested params/response/record below it.
         fold_data_urls = fold_data_urls or _has_data_url_payload_method(value)
+        # Decide from the ORIGINAL container, before any key is dropped, so the
+        # projection below cannot end up reading its own output. `_keep_...`
+        # answers "does this container carry an actionable signal", which is
+        # what decides whether the platform still owes the model guidance.
+        platform_prompt_present = _platform_prompt_present(value)
         compacted: JsonDict = {}
         for key, item in value.items():
             if key == "suspected_challenge" and _empty_challenge_summary(item):
                 continue
-            if key == "suggested_prompt" and not _keep_suggested_prompt(value):
-                # The skillsGuide says to read suggested_prompt on success too,
-                # so keep it — but truncated: it is platform advice, not harness
-                # truth, and full-length success chatter is token noise.
-                trimmed = _trim_success_suggested_prompt(item)
-                if trimmed:
-                    compacted[key] = trimmed
+            if key == "errorClassification" and isinstance(item, dict):
+                compacted[key] = _project_error_classification(
+                    item, platform_prompt_present=platform_prompt_present,
+                )
+                continue
+            # A dedicated 200-character cap used to truncate the success-path
+            # `suggested_prompt`. It cost more than it saved: on 1.1.9 the most
+            # informative prompts are the longest ones, and the cut landed
+            # mid-sentence on exactly the operative half — DOM.getAXTree lost
+            # "use DOM.getSemanticTree for raw DOM, Shadow DOM, or selector
+            # diagnostics" (211 chars) and Page.screenshot lost "before
+            # continuing interaction" (213), to save eleven characters. The
+            # general `max_observation_chars` budget (24,000) already bounds
+            # this field, so the platform's advice now passes through whole.
+            # An all-whitespace prompt is still dropped: it is not advice.
+            if key == "suggested_prompt" and not str(item or "").strip():
                 continue
             compacted[key] = compact_model_facing_tool_result(
                 item, fold_data_urls=fold_data_urls,
@@ -299,11 +311,55 @@ def _empty_challenge_summary(value: Any) -> bool:
     return score <= 0 and not bool(value.get("highConfidenceHit"))
 
 
-def _trim_success_suggested_prompt(item: Any) -> str:
-    text = str(item or "").strip()
-    if len(text) <= SUGGESTED_PROMPT_SUCCESS_MAX_CHARS:
-        return text
-    return text[: SUGGESTED_PROMPT_SUCCESS_MAX_CHARS - 1].rstrip() + "…"
+def _platform_prompt_present(container: Any) -> bool:
+    """Whether ABCP itself supplied a suggested_prompt anywhere in this result.
+
+    A failure envelope reaches the model as `rpcData.suggested_prompt`; a
+    success carries it at the top level. Either way, when the platform has
+    already said what to do next, the harness must not repeat it in weaker
+    words — but when it has NOT (a bare -32601, a transport reset), the
+    harness's own guidance is the only guidance there is.
+    """
+    if not isinstance(container, dict):
+        return False
+    if str(container.get("suggested_prompt") or "").strip():
+        return True
+    for key in ("rpcData", "response", "data"):
+        if _platform_prompt_present(container.get(key)):
+            return True
+    return False
+
+
+def _project_error_classification(
+    classification: JsonDict,
+    *,
+    platform_prompt_present: bool,
+) -> JsonDict:
+    """Model-facing view of `errorClassification`: facts always, advice once.
+
+    Subtractive on purpose. An allowlist that rebuilds the object silently
+    drops any field it was not told about — `sideEffectStarted`, `phase` and
+    `actionKind` come from the compatibility runtime path, and losing
+    `sideEffectStarted` would hide the one fact that says whether a failed
+    action may be replayed. So copy everything and remove exactly two things:
+    `platformSuggestedPrompt`, whose text already reaches the model as the
+    platform's own `suggested_prompt`, and a generic `suggested_action`, but
+    only when the platform actually spoke — it just restates "do what the
+    platform said" in harness vocabulary.
+
+    The internal object is untouched: compaction, spawner status classification
+    and the automatic overlay recovery all read it.
+    """
+    from harness.diagnostics.error_classification import GENERIC_SUGGESTED_ACTIONS
+
+    projected = dict(classification)
+    projected.pop("platformSuggestedPrompt", None)
+    if (
+        platform_prompt_present
+        and projected.get("suggested_action") in GENERIC_SUGGESTED_ACTIONS
+    ):
+        projected.pop("suggested_action", None)
+    return projected
 
 
 def _keep_suggested_prompt(container: JsonDict) -> bool:

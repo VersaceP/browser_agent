@@ -57,7 +57,14 @@ SELECT_FAILURE_ACTIONS = {
 # which is strictly more actionable than the "unknown" prose matching returns.
 
 _RUNTIME_CODE_TYPES = {
+    # ABCP publishes THREE distinct occlusion codes and the harness has to map
+    # every one of them: `occlusion_blocked` is what arms the automatic
+    # dismiss_overlay recovery in tools/browser_tools/auto_intercept.py, and a
+    # code that misses this table falls through to the generic family rule, so
+    # the recovery silently never fires. `target-occluded` was missing and is
+    # the one Input.click actually reports on the 1.1.9 surface.
     "occluded": ("occlusion_blocked", "refresh_dom_dismiss_overlay_then_retry_once"),
+    "target-occluded": ("occlusion_blocked", "refresh_dom_dismiss_overlay_then_retry_once"),
     "select-option-occluded": ("occlusion_blocked", "refresh_dom_dismiss_overlay_then_retry_once"),
     "renderer-lost": ("render_lost", "retry_with_render_recovery_or_rebuild_page"),
     "input-host-destroyed": ("render_lost", "retry_with_render_recovery_or_rebuild_page"),
@@ -102,6 +109,20 @@ _RUNTIME_CODE_FAMILIES = (
 )
 
 _TIMEOUT_SUFFIX = "-timeout"
+
+# The two verdicts the classifier reaches when NOTHING matched: they restate
+# "read the state and do what the platform said" and carry no information the
+# platform's own `suggested_prompt` does not already give the model. Every ABCP
+# 1.1.9 public code ships a prompt, so on the model-facing projection these are
+# duplication, not guidance. They stay in the internal classification (spawner
+# status, compaction and auto-intercept all read `errorClassification`) and are
+# hidden only from the model, and only when a platform prompt is present.
+GENERIC_PUBLIC_FALLBACK_ACTION = "inspect_page_state_then_follow_platform_guidance"
+GENERIC_RUNTIME_FALLBACK_ACTION = "inspect_page_state_then_choose_another_approach"
+GENERIC_SUGGESTED_ACTIONS = frozenset({
+    GENERIC_PUBLIC_FALLBACK_ACTION,
+    GENERIC_RUNTIME_FALLBACK_ACTION,
+})
 
 # When the browser had already begun dispatching input, no classification may
 # recommend a retry: the action may have taken effect and the receipt simply
@@ -171,7 +192,7 @@ def classify_runtime_error(runtime: Any, *, method: str = "") -> Optional[JsonDi
     if mapped is None and code.endswith(_TIMEOUT_SUFFIX):
         mapped = ("timeout", "retry_with_backoff_or_reduce_surface")
     if mapped is None:
-        mapped = ("action_runtime_error", "inspect_page_state_then_choose_another_approach")
+        mapped = ("action_runtime_error", GENERIC_RUNTIME_FALLBACK_ACTION)
 
     error_type, suggested_action = mapped
     if code.endswith(_TIMEOUT_SUFFIX) and error_type == "action_runtime_error":
@@ -216,10 +237,7 @@ def classify_public_action_failure(
     if mapped is None and code.endswith(_TIMEOUT_SUFFIX):
         mapped = ("timeout", "retry_with_backoff_or_reduce_surface")
     if mapped is None:
-        mapped = (
-            "action_failure",
-            "inspect_page_state_then_follow_platform_guidance",
-        )
+        mapped = ("action_failure", GENERIC_PUBLIC_FALLBACK_ACTION)
     error_type, suggested_action = mapped
     classification: JsonDict = {
         "type": error_type,
@@ -443,10 +461,50 @@ def attach_error_classification(result: JsonDict, *, method: str = "") -> JsonDi
     if structured is not None:
         result["errorClassification"] = structured
         return result
+    unknown_method = _unknown_method_classification(result, method=method)
+    if unknown_method is not None:
+        result["errorClassification"] = unknown_method
+        return result
     if not message:
         return result
     result["errorClassification"] = classify_browser_error(message, method=method)
     return result
+
+
+# ABCP's WebSocket transport — the one the harness uses — answers an unknown
+# method with a bare `{"code": -32601, "message": "Action failed"}`: no `data`,
+# no public code, no observation, no suggested_prompt. (Its MCP transport does
+# return a full envelope; that path is not this one.) This is the only failure
+# shape on 1.1.9 where the platform supplies no guidance at all, so it is the
+# only one where the harness must author its own. Verified live against
+# catalogRevision sha256:cfd8fb90….
+_UNKNOWN_METHOD_RPC_CODE = -32601
+
+
+def _unknown_method_classification(
+    result: JsonDict, *, method: str = ""
+) -> Optional[JsonDict]:
+    if result.get("rpcCode") != _UNKNOWN_METHOD_RPC_CODE:
+        return None
+    if public_action_failure(result):
+        # A build that does supply a public envelope owns the guidance.
+        return None
+    return {
+        "type": "method_not_found",
+        "errorCode": "harness:method-not-found",
+        "suggested_action": "refresh_capabilities_and_use_a_current_method",
+        "method": str(method or result.get("method") or ""),
+        # `source` separates this from a platform verdict. The projection uses
+        # it to decide that this suggestion is the harness's own and must be
+        # shown rather than hidden behind a (nonexistent) platform prompt.
+        "source": "harness_fallback",
+        "next_instruction": (
+            "The transport rejected this method name as unknown and returned no"
+            " platform guidance. Call System.getCapabilities to read the"
+            " current callable catalog and use a method it returns; do not"
+            " guess a name, reuse a removed one, or retry this call unchanged."
+        ),
+    }
 
 
 def _extract_error_message(result: JsonDict) -> Optional[str]:

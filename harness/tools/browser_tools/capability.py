@@ -18,7 +18,7 @@ from harness.runtime_evaluation import MAIN_WORLD_REQUIRED_PREFIX
 from harness.runtime_evaluation import RuntimeEvaluationService
 from harness.runtime_evaluation import runtime_last_resort_evidence
 from harness.task_types import resolve_task_type_fail_closed
-from harness.tool_policy import mask_params
+from harness.tool_policy import redact_params_for_display
 from harness.tools.parsers import attach_method_schema
 from harness.tools.parsers import ensure_required_purpose
 from harness.tools.parsers import parse_browser_call_params
@@ -113,7 +113,7 @@ async def _execute_browser_capability_tool(
             "tool.direct_capability_wrapped",
             {
                 "tool": method,
-                "params": agent._trim_for_log(mask_params(
+                "params": agent._trim_for_log(redact_params_for_display(
                     params,
                     {"userInput"} if method == "Page.handleDialog" else None,
                 )),
@@ -151,7 +151,10 @@ async def _execute_browser_capability_tool(
     sensitive_params = {"userInput"} if method == "Page.handleDialog" else None
 
     def shown_params() -> JsonDict:
-        return mask_params(params, sensitive_params)
+        # Value-based, not key-based: a credential can arrive inside a `url`
+        # nobody declared sensitive, and the request side must not disagree
+        # with the response side about what counts as a secret.
+        return redact_params_for_display(params, sensitive_params)
 
     if params_error:
         result = {
@@ -871,7 +874,6 @@ async def _execute_browser_capability_tool(
             " request main directly or repeat Runtime.evaluate; report this blocker."
         )
     _bt()._fleet_auth_barrier_after_call(agent, method, result)
-    result = _bt()._attach_navigation_check(result, method=method, params=params)
     result = _bt()._attach_runtime_strategy_hints(result, method=method)
     if not page_create_should_stop:
         result = await _bt()._maybe_auto_hitl_for_challenge(agent, method, params, result, step)
@@ -1046,7 +1048,7 @@ async def _invoke_browser_method(
     # and the render-recovery logs/advisory), so secrets (e.g. Input.type text
     # for a password) never hit logs or trace.
     def _shown_params(p: JsonDict) -> JsonDict:
-        return mask_params(p, redact_params)
+        return redact_params_for_display(p, redact_params)
     # Composite tools opt in with allow_rematch=True so previously-seen stale
     # ids pass through to the browser-side rematch while never-seen ids and
     # page mismatches are still blocked. Default (False) preserves the legacy
@@ -1213,7 +1215,6 @@ async def _invoke_browser_method(
     attach_error_classification(result, method=method)
     result = _bt()._apply_select_failure_guidance(agent, method, params, result)
     _bt()._fleet_auth_barrier_after_call(agent, method, result)
-    result = _bt()._attach_navigation_check(result, method=method, params=params)
     result = _bt()._attach_runtime_strategy_hints(result, method=method)
     if not internal:
         result = await _bt()._maybe_auto_hitl_for_challenge(agent, method, params, result, step)

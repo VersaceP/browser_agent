@@ -16,12 +16,29 @@ import time
 import uuid
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
 import websockets
 
 from runtime_config import ABCPClientConfig
+
+# Deferred, not top-level: `harness/__init__.py` imports render_recovery, which
+# imports this module, so any `harness.*` import here at module scope is a
+# cycle. Resolved once on first use and cached.
+_REDACTORS: Optional[Tuple[Callable[..., Any], Callable[..., Any]]] = None
+
+
+def _redactors() -> Tuple[Callable[..., Any], Callable[..., Any]]:
+    global _REDACTORS
+    if _REDACTORS is None:
+        from harness.tool_policy import (
+            collect_sensitive_replacements,
+            sanitize_transport_payload,
+        )
+
+        _REDACTORS = (collect_sensitive_replacements, sanitize_transport_payload)
+    return _REDACTORS
 
 
 JsonDict = Dict[str, Any]
@@ -379,7 +396,20 @@ class ABCPClient:
                 pass
             self._ws = None
 
-    async def call(self, method: str, params: Optional[JsonDict] = None) -> JsonDict:
+    async def call(
+        self,
+        method: str,
+        params: Optional[JsonDict] = None,
+        *,
+        redact_params: Optional[Set[str]] = None,
+    ) -> JsonDict:
+        """Send one RPC and return its unwrapped response.
+
+        `redact_params` names the param keys whose values are secret. The
+        browser still receives the real values; the keys only govern what the
+        transport event log may keep, for both the request and the response the
+        platform echoes them back in.
+        """
         if self._ws is None:
             raise ABCPTransportError(
                 "WebSocket is not connected",
@@ -405,6 +435,10 @@ class ABCPClient:
 
         request_id = str(uuid.uuid4())
         payload = self._build_payload(request_id, method, params or {})
+        # Derived once from the request: the response has to be scrubbed with
+        # the request's secrets, because the platform echoes typed values back
+        # in its own feedback fields.
+        secrets = _redactors()[0](params or {}, redact_params)
 
         async with self._call_lock:
             loop = asyncio.get_running_loop()
@@ -413,7 +447,7 @@ class ABCPClient:
             self._pending_request_id = request_id
             self._pending_method = method
             try:
-                self._emit("request", payload)
+                self._emit("request", payload, secrets)
                 try:
                     await self._ws.send(json.dumps(payload, ensure_ascii=False))
                 except Exception as exc:
@@ -441,7 +475,7 @@ class ABCPClient:
                 self._pending_method = None
 
         if "error" in raw_response and not self._is_implicit_error_envelope(raw_response):
-            self._emit("response", raw_response)
+            self._emit("response", raw_response, secrets)
             rpc_error = (
                 raw_response.get("error")
                 if isinstance(raw_response.get("error"), dict)
@@ -457,7 +491,7 @@ class ABCPClient:
                 request_sent=True,
             )
         response = self._unwrap_response(raw_response)
-        self._emit("response", response)
+        self._emit("response", response, secrets)
         return response
 
     async def wait_for_notification(
@@ -646,6 +680,27 @@ class ABCPClient:
             return f"ABCP Browser call {method} failed: {text}"
         return f"ABCP Browser call {method} failed: {error or 'unknown error'}"
 
-    def _emit(self, event_type: str, payload: JsonDict) -> None:
-        if self.on_event:
-            self.on_event(event_type, payload)
+    def _emit(
+        self,
+        event_type: str,
+        payload: JsonDict,
+        secrets: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Hand one transport frame to the event hook, scrubbed and bounded.
+
+        Nothing downstream of this re-reads the frame, so this is the last place
+        a credential can be removed before `make_browser_event_logger` writes it
+        to the run log. Every frame contributes its own URL-embedded
+        credentials, which needs no declaration from anyone; `secrets` adds the
+        keys the caller declared for this particular call, which is the only way
+        a bare `Input.type.text` password can be recognised. Notifications and
+        orphan responses arrive with no call context and rely on the first
+        source alone.
+        """
+        if not self.on_event:
+            return
+        collect, sanitize = _redactors()
+        table = dict(collect(payload))
+        if secrets:
+            table.update(secrets)
+        self.on_event(event_type, sanitize(payload, table))

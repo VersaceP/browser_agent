@@ -84,7 +84,10 @@ def public_action_failure(value: Any) -> Optional[JsonDict]:
         message = str(error.get("message") or "").strip()
         if message:
             failure["message"] = message
-        for key in ("observation", "suggested_prompt", "details", "method"):
+        # Same public whitelist the transport projection enforces. `details` is
+        # excluded on purpose: ABCP types it `Record<string, unknown>`, so
+        # copying it would readmit the unbounded payload the projection closes.
+        for key in ("observation", "suggested_prompt", "method"):
             if candidate.get(key) not in (None, "", {}):
                 failure[key] = candidate[key]
         return failure

@@ -38,3 +38,4 @@ skills/**/.create_report.json
 scratchpad/*
 worktree/harness.db
 scripts
+tests
