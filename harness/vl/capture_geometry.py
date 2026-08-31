@@ -140,7 +140,7 @@ def scroll_coverage(scroll_result: Any) -> JsonDict:
         "available": True,
         "mode": str(data.get("mode") or ""),
         "completedReason": completed,
-        "stateProbe": completed == "amount-zero",
+        "stateProbe": completed in {"state-read", "amount-zero"},
         "atBoundary": completed == "boundary-reached",
         "delta": delta,
         "position": position,

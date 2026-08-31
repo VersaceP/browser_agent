@@ -6,8 +6,8 @@ from typing import Any
 from typing import Dict
 from typing import List
 from typing import Optional
-from typing import Set
 from typing import Tuple
+from typing import Set
 import json
 from urllib.parse import urlparse
 from harness.utils import JsonDict
@@ -441,12 +441,17 @@ async def _visual_verify(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
         "element" if (selector or element_id)
         else ("fullpage" if full_page else "viewport")
     )
+    # Pair the capture with the earliest post-capture scroll observation when a
+    # promotion will follow. AXTree bboxes are `(viewport + root scroll) ×
+    # scale`, so containment needs a stable scroll offset across the model call
+    # and AXTree read. This is best-effort rather than atomic with the image.
+    promotion_wanted = (
+        mode == "visual_locate"
+        and bool(getattr(vl_config, "visual_locate_enabled", False))
+    )
     before_artifacts = set(str(path) for path in getattr(agent, "artifacts", []))
-    screenshot = await _bt()._invoke_browser_method(
-        agent,
-        "Page.screenshot",
-        screenshot_params,
-        step,
+    screenshot, capture_scroll = await _capture_bracketed(
+        agent, page_id, screenshot_params, step, bracket=promotion_wanted
     )
     image_path = _bt()._screenshot_saved_path(screenshot)
     if not image_path:
@@ -490,11 +495,12 @@ async def _visual_verify(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
             ),
         }
         before_artifacts = set(str(path) for path in getattr(agent, "artifacts", []))
-        screenshot = await _bt()._invoke_browser_method(
-            agent,
-            "Page.screenshot",
-            fallback_params,
-            step,
+        # A second capture needs its OWN bracket. Carrying the first one's
+        # forward would attach an offset that was never measured around this
+        # image, and the element capture that just failed may well have
+        # scrolled the page on its way there.
+        screenshot, capture_scroll = await _capture_bracketed(
+            agent, page_id, fallback_params, step, bracket=promotion_wanted
         )
         image_path = _bt()._screenshot_saved_path(screenshot)
         if not image_path:
@@ -539,6 +545,11 @@ async def _visual_verify(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
                 part for part in (question, str(expected.get("target") or ""))
                 if part
             ),
+            # The receipt carries the CSS-pixel size that proves the capture's
+            # scale, and the scope says whether its origin is the viewport's.
+            screenshot=screenshot,
+            screenshot_scope=screenshot_scope,
+            capture_scroll=capture_scroll,
         )
     vl_check_count = getattr(agent, "vl_check_count", 0)
     vl_force_check_count = getattr(agent, "vl_force_check_count", 0)
@@ -1192,6 +1203,79 @@ async def _maybe_reality_check(
             logger.write("vl.reality_check.error", {"error": str(exc)[:300]})
         return result
 
+async def _read_page_scroll(
+    agent: Any, page_id: str, step: int
+) -> Optional[Dict[str, float]]:
+    """The document scroll offset, or None when it cannot be read.
+
+    `Input.scroll` in viewport mode with `amount: 0` is the platform's own state
+    read: measured to answer `completedReason: "state-read"` with
+    `actualDistance: 0`, leaving the position untouched. Using a scroll action
+    to read the scroll is only defensible because of that receipt, so this
+    refuses any answer that does not carry it — a read that moved the page is
+    the one thing the surrounding bracket exists to detect, and it would be
+    detecting its own instrument.
+
+    The alternative, a Semantic Tree read, keeps the instrument independent but
+    costs an entire document to obtain two numbers, twice per promotion. This
+    matches `harness/vl/capture_geometry.py`, which already reasons from scroll
+    receipts, so the two paths agree about what a scroll receipt means.
+
+    `direction` and `amount` are TOP-LEVEL. Nested under a `viewport` object
+    they are stripped by the schema and the action runs its 300px default —
+    `validation.py` rejects that shape for exactly this reason.
+    """
+    from harness.vl.locate import _scroll_position_from_state_read
+
+    try:
+        resp = await _bt()._invoke_browser_method(
+            agent, "Input.scroll",
+            {"pageId": page_id, "direction": "down", "amount": 0,
+             "purpose": "read the scroll offset for VL coordinate mapping"},
+            step,
+            internal=True,
+        )
+    except Exception:
+        return None
+    data = _bt()._response_data(resp) or {}
+    return _scroll_position_from_state_read(data)
+
+
+async def _capture_bracketed(
+    agent: Any,
+    page_id: str,
+    params: JsonDict,
+    step: int,
+    *,
+    bracket: bool,
+) -> Tuple[JsonDict, Optional[Dict[str, float]]]:
+    """Take one screenshot together with the page's scroll offset as it stood.
+
+    The read happens immediately AFTER the capture, and is one end of a
+    stability check the promotion closes after reading the AXTree. It does not
+    make the screenshot and geometry atomic: movement between image capture and
+    this first read remains unobservable. Two reasons it is not taken
+    before: an element capture scrolls its target into view first, so a prior
+    read describes a position the image never had; and the window that actually
+    needs guarding is the whole span from image to bboxes, since the AXTree is
+    read at promotion time, after the model call.
+
+    The capture and its offset come back together, so a later capture cannot
+    inherit an earlier one's — the viewport fallback is a second, separate
+    image, and the element capture that just failed may have scrolled the page
+    on its way there.
+
+    `bracket=False` skips the read for callers that will not promote.
+    """
+    shot = await _bt()._invoke_browser_method(
+        agent, "Page.screenshot", params, step
+    )
+    at_capture = (
+        await _read_page_scroll(agent, page_id, step) if bracket else None
+    )
+    return shot, at_capture
+
+
 async def _promote_visual_locate(
     agent: Any,
     page_id: str,
@@ -1200,6 +1284,9 @@ async def _promote_visual_locate(
     step: int,
     *,
     expected_text: str = "",
+    screenshot: Optional[JsonDict] = None,
+    screenshot_scope: str = "",
+    capture_scroll: Optional[Dict[str, float]] = None,
 ) -> JsonDict:
     """Reverse-look-up the VL `point` to a canonical AXTree id via bbox containment
     (the AXTree bbox space == screenshot px space). Attaches `resolvedId` (durable)
@@ -1208,7 +1295,10 @@ async def _promote_visual_locate(
         from harness.vl.locate import (
             _screenshot_dims,
             apply_promotion_guard,
+            capture_origin,
             promote_locate,
+            screenshot_dpr,
+            scroll_bracket,
         )
 
         shot_w, shot_h = await _screenshot_dims(image_path)
@@ -1218,14 +1308,54 @@ async def _promote_visual_locate(
             step,
         )
         lines = (_bt()._response_data(ax) or {}).get("lines") or []
-        # Avoid hidden Runtime.evaluate probes. AXTree rectangles and the
-        # standard screenshot path use the same CSS-pixel coordinate contract;
-        # promotion is guarded by label/role matching before any action.
-        dpr = 1.0
-        promo = promote_locate(lines, verdict["point"], shot_w=shot_w, shot_h=shot_h, dpr=dpr)
+        # The far end of the stability check. Agreement proves no scrolling
+        # from the first post-capture read through this post-AXTree read;
+        # disagreement withholds promotion. The earlier image-to-first-read
+        # gap remains a platform-level atomicity limitation.
+        scroll = scroll_bracket(
+            capture_scroll,
+            await _read_page_scroll(agent, page_id, step),
+        )
+        # No hidden Runtime.evaluate probe is needed: `Page.screenshot` reports
+        # its size in CSS pixels while saving a device-pixel file, so the
+        # receipt proves the scale by itself. This used to be hardcoded to 1.0
+        # on the belief that the AXTree and the screenshot were both CSS
+        # pixels. They are both DEVICE pixels — so containment below is right,
+        # but every cssPoint on a HiDPI display was off by the scale factor and
+        # still reported a successful click. An unproven scale now withholds
+        # the coordinate instead of guessing.
+        shot_data = _bt()._response_data(screenshot or {}) or {}
+        dpr_receipt = screenshot_dpr(
+            png_width=shot_w,
+            png_height=shot_h,
+            reported_width=shot_data.get("width"),
+            reported_height=shot_data.get("height"),
+        )
+        # The same receipt also proves WHERE the crop started. An element
+        # capture carries the target's Semantic Tree and a region capture echoes
+        # its requested x/y, so a cropped capture no longer has to be refused —
+        # its point is translated into viewport space instead.
+        origin_receipt = capture_origin(
+            scope=screenshot_scope, shot_data=shot_data,
+        )
+        if not origin_receipt.get("scrollProven"):
+            # Containment needs the scroll offset, and an element capture's own
+            # Semantic Tree only states it when that tree is rooted at the
+            # document — for a deeply nested target it is truncated to `body`,
+            # which is not the scrolling element and reports a genuine 0.
+            origin_receipt = capture_origin(
+                scope=screenshot_scope, shot_data=shot_data, scroll=scroll,
+            )
+        promo = promote_locate(
+            lines, verdict["point"], shot_w=shot_w, shot_h=shot_h,
+            dpr_receipt=dpr_receipt, scope=screenshot_scope,
+            origin_receipt=origin_receipt,
+        )
         promo = apply_promotion_guard(
             promo, vl_label=verdict.get("control_label"),
-            expected_text=expected_text, dpr=dpr,
+            expected_text=expected_text,
+            dpr_receipt=dpr_receipt, scope=screenshot_scope,
+            origin_receipt=origin_receipt,
             logger=getattr(agent, "logger", None),
             page_id=page_id,
         )
@@ -1238,8 +1368,23 @@ async def _promote_visual_locate(
                 f" {promo.get('id')!r}. Act on that id (Input.click/DOM.getText with"
                 f" id), NOT raw coordinates."
             )
+        elif promo.get("coordinateRefused"):
+            # No durable id AND no provable pixel-to-CSS mapping. Offering a
+            # coordinate here would produce a click that lands on some other
+            # real element and reports success, so withhold it entirely.
+            out["dpr"] = promo.get("dpr")
+            out["origin"] = promo.get("origin")
+            out["coordinateRefused"] = promo.get("coordinateRefused")
+            out["next_instruction"] = (
+                "VL located the target visually, but it could not be promoted"
+                " to a durable id and the screenshot's scale/origin could not"
+                f" be proven ({promo.get('coordinateRefused')}), so no"
+                " coordinate is offered. Re-observe with DOM.getAXTree or"
+                " DOM.getSemanticTree and act on an id; do not invent a point."
+            )
         elif promo.get("promotionGuard"):
             out["cssPoint"] = promo.get("cssPoint")
+            out["dpr"] = promo.get("dpr")
             out["next_instruction"] = (
                 "VL located the target but the bbox promotion failed a sanity"
                 f" check ({promo['promotionGuard'].get('reason')}) and was demoted."
@@ -1248,6 +1393,7 @@ async def _promote_visual_locate(
             )
         else:
             out["cssPoint"] = promo.get("cssPoint")
+            out["dpr"] = promo.get("dpr")
             out["next_instruction"] = (
                 "VL located the target but no AXTree node covers it (blind spot)."
                 " If safe and not consequential, use a single coordinate action at"

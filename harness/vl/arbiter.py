@@ -130,6 +130,12 @@ def _verdict_to_action(mode: str, intent: str, vl: Dict[str, Any], verdict: str)
 
 # ── default I/O wiring ──────────────────────────────────────────────────────────
 
+async def _screenshot_with_receipt(browser: Any, page_id: str) -> Any:
+    from harness.skill.control import _default_screenshot_with_receipt as shot
+
+    return await shot(browser, page_id)
+
+
 async def _default_screenshot(browser: Any, page_id: str) -> Optional[str]:
     from harness.skill.control import _default_screenshot as shot
     return await shot(browser, page_id)
@@ -144,8 +150,12 @@ async def _default_vl_call(vl_config: Any, image_path: str, mode: str, question:
 async def _default_locate(browser: Any, page_id: str, target: str, vl_config: Any,
                           screenshot_fn: Optional[Callable[..., Awaitable[Optional[str]]]]) -> Dict[str, Any]:
     from harness.vl.locate import locate_target
+
+    # Prefer the receipt-bearing capture: without it the scale cannot be proven
+    # on this build, and Role A can promote to an id but never offer the
+    # coordinate an AXTree blind spot needs.
     return await locate_target(browser, page_id, target, vl_config=vl_config,
-                               screenshot_fn=screenshot_fn or _default_screenshot)
+                               screenshot_fn=screenshot_fn or _screenshot_with_receipt)
 
 
 def _log(logger: Any, event: str, payload: Dict[str, Any]) -> None:

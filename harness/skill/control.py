@@ -712,9 +712,16 @@ async def _default_captcha_solve(vl_config: Any, image_path: str) -> Dict[str, A
     )
 
 
-async def _default_screenshot(control: "ControlChannel", page_id: str) -> Optional[str]:
-    """Page.screenshot returns data.savedPath (encoding='file') — a path the VL
-    helper reads directly. Returns the path or None."""
+async def _default_screenshot_with_receipt(
+    control: "ControlChannel", page_id: str
+) -> Optional[Dict[str, Any]]:
+    """Capture the viewport and keep the receipt alongside the saved path.
+
+    The path alone is enough to show VL an image, but not to turn a pixel it
+    points at back into a click: `data.width`/`data.height` are the CSS-pixel
+    size that proves the capture's scale against the device-pixel file. Callers
+    that only need the image use `_default_screenshot`.
+    """
     resp = await control.call("Page.screenshot", {
         "pageId": page_id, "fullPage": False,
         "options": {"format": "file"},
@@ -722,7 +729,16 @@ async def _default_screenshot(control: "ControlChannel", page_id: str) -> Option
     })
     data = ((resp or {}).get("data") or {})
     path = data.get("savedPath") or (data.get("data") if data.get("encoding") == "file" else None)
-    return path if isinstance(path, str) and path else None
+    if not (isinstance(path, str) and path):
+        return None
+    return {"path": path, "receipt": data}
+
+
+async def _default_screenshot(control: "ControlChannel", page_id: str) -> Optional[str]:
+    """Page.screenshot returns data.savedPath (encoding='file') — a path the VL
+    helper reads directly. Returns the path or None."""
+    shot = await _default_screenshot_with_receipt(control, page_id)
+    return shot["path"] if shot else None
 
 
 async def _default_exec(control: "ControlChannel", method: str, params: Dict[str, Any]) -> Any:
