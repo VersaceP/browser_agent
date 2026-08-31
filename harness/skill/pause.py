@@ -39,10 +39,10 @@ from harness.hitl import (
 # (a progress event may carry no pageId) — both count as onset.
 _PAUSE_ONSET_TYPES = frozenset(_normalize_notification_type(item) for item in {
     "paused",
-    "workflow_paused", "Workflow.paused",
+    "workflow_paused",
     "hitl_paused", "Hitl.paused",
     "Hitl.requestPause", "hitl_requestpause",
-    "Hitl.requested", "hitl_required",
+    "hitl_required",
     "human_intervention_required",
 })
 

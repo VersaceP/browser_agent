@@ -203,9 +203,9 @@ def _pages_from_value(value: Any) -> List[JsonDict]:
 
 async def _page_create_probe_call(agent: Any, method: str, params: JsonDict) -> JsonDict:
     try:
-        runner = getattr(agent, "render_recovery_runner", None)
+        runner = getattr(agent, "browser_call_runner", None)
         if runner is not None:
-            response, _recovery = await runner.call(method, params)
+            response = await runner.call(method, params)
         else:
             response = await agent.browser.call(method, params)
         return {"ok": True, "method": method, "params": params, "response": response}

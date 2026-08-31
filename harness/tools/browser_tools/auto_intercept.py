@@ -5,7 +5,6 @@ harness.tools.browser_tools.auto_intercept - Automatic overlay interception befo
 from typing import Any
 from typing import List
 from typing import Optional
-from harness.results.call_outcome import replay_forbidden
 from harness.observation.overlay_actions import visible_layers_occluded
 from harness.utils import JsonDict
 from .axtree_state import _invalidate_axtree_snapshot
@@ -113,15 +112,14 @@ async def _maybe_auto_intercept_overlay(
     blocked_target = _blocked_target_id(params)
     # Only Input.click is auto-retry-safe; dismiss_overlay re-checks the target's
     # sensitivity before any retry and returns dismissed_pending_action otherwise.
-    # A click whose failure reports `sideEffectStarted` is NOT auto-retry-safe no
-    # matter how safe the target looks: input dispatch had already begun, so the
-    # click may have landed under the overlay and the retry would be a second
-    # one. Clear the overlay anyway — that is useful and side-effect-free — but
-    # hand back an unretried action for the caller to judge.
-    side_effect_started = replay_forbidden(result)
-    target_method = (
-        method if method == "Input.click" and not side_effect_started else ""
-    )
+    # The occlusion codes that arm this path (`occluded` / `target-occluded`) are
+    # raised by target RESOLUTION — the browser found no usable hit-test point
+    # and never dispatched a pointer event — and the platform's own prompt for
+    # them says to dismiss the covering control and re-observe before retrying.
+    # So the generic "a public failure has an unknown outcome" rule
+    # (`replay_forbidden`) deliberately does NOT gate this one retry; applying it
+    # here would disarm the recovery on every code that can arm it.
+    target_method = method if method == "Input.click" else ""
     dismiss = await _bt()._dismiss_overlay(
         agent,
         {"pageId": page_id, "targetId": blocked_target, "targetMethod": target_method},
@@ -205,10 +203,6 @@ async def _maybe_auto_intercept_overlay(
         "treeRefreshed": tree_refreshed,
         "overlay": dismiss.get("overlay"),
         "vlArbiter": dismiss.get("vlArbiter"),
-        **(
-            {"replayForbidden": True, "retrySuppressed": "side_effect_started"}
-            if side_effect_started else {}
-        ),
     }
     stale_tree_note = ""
     if cleared and method == "DOM.getAXTree" and not tree_refreshed:
@@ -229,15 +223,6 @@ async def _maybe_auto_intercept_overlay(
                 " response.data.lines was refreshed to the post-dismiss tree. Use"
                 " these ids."
             )
-        elif side_effect_started:
-            instruction = (
-                "Occlusion auto-intercept: the overlay was dismissed, but your"
-                " action was NOT retried because the platform reported that"
-                " input dispatch had already started — it may have taken effect"
-                " under the overlay. Read the page (Page.getState plus a fresh"
-                " DOM.getAXTree, or the field/row you were changing) and decide"
-                " from what you see; do not re-issue it blind."
-            ) + stale_tree_note
         else:
             instruction = (
                 "Occlusion auto-intercept: the overlay was dismissed but your action"

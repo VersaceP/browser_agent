@@ -136,26 +136,12 @@ def read_cached_capability_metadata(cache_dir: Path) -> JsonDict:
     return data if isinstance(data, dict) else {}
 
 
-def capability_action_revisions(capabilities: Any) -> Dict[str, str]:
-    """Return stable per-Action revisions advertised by the Dispatcher."""
-    revisions: Dict[str, str] = {}
-    for item in capabilities if isinstance(capabilities, list) else []:
-        if not isinstance(item, dict):
-            continue
-        method = str(item.get("method") or "").strip()
-        revision = str(item.get("actionRevision") or "").strip()
-        if method and revision:
-            revisions[method] = revision
-    return revisions
-
-
 def write_cached_capability_hash(
     cache_dir: Path,
     *,
     digest: str,
     capability_count: int,
     generation: Optional[str] = None,
-    capabilities: Any = None,
     catalog_revision: str = "",
     guide_revision: str = "",
 ) -> str:
@@ -167,11 +153,6 @@ def write_cached_capability_hash(
                 "hash": digest,
                 "capability_count": capability_count,
                 **({"generation": generation} if generation is not None else {}),
-                **(
-                    {"action_revisions": capability_action_revisions(capabilities)}
-                    if capabilities is not None
-                    else {}
-                ),
                 **({"catalog_revision": catalog_revision} if catalog_revision else {}),
                 **({"guide_revision": guide_revision} if guide_revision else {}),
             },

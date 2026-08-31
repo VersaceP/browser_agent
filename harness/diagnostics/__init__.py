@@ -55,6 +55,7 @@ from harness.constants import (
     WORKER_STATUS_STEP_BUDGET,
     WORKER_STATUS_UNKNOWN,
 )
+from harness.results.call_outcome import public_action_failure
 from harness.semantic_frames import response_node_count
 
 
@@ -487,6 +488,17 @@ def _is_api_contract_error(observation: Optional[str], error_text: Optional[str]
     return any(marker in haystack for marker in API_CONTRACT_ERROR_MARKERS)
 
 
+# The public codes that say the page can no longer run automation. Reading the
+# code is strictly better than matching prose: the failure message is a fixed
+# per-code string the platform may reword, while the code is the contract.
+PAGE_DEAD_FAILURE_CODES = frozenset({
+    "page-crashed",
+    "page-closed",
+    "page-load-failed",
+    "renderer-lost",
+})
+
+
 def _is_page_dead(
     observation: Optional[str],
     error_text: Optional[str],
@@ -494,11 +506,15 @@ def _is_page_dead(
 ) -> bool:
     """Detect that the page is functionally dead.
 
-    Sources:
+    Sources, strongest first:
+      - a public failure code that means the page/renderer is gone
       - observation / error text contains a known marker
       - Page.getState response.data.status == "crashed"
       - response.data.status == "page_load_failed" (defensive — schema varies)
     """
+    failure = public_action_failure(result)
+    if failure and str(failure.get("code") or "") in PAGE_DEAD_FAILURE_CODES:
+        return True
     haystack = " ".join(
         s for s in (observation, error_text) if isinstance(s, str)
     )

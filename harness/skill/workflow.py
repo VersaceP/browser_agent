@@ -109,7 +109,6 @@ async def run_skill_workflow(
             ),
             allow_runtime=False,
             enforce_lifecycle=True,
-            allow_legacy_listen_events=True,
         )
         if policy_error is None and isinstance(normalized, dict):
             # Preserve legacy timeout omission while executing the policy-

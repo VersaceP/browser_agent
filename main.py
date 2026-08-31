@@ -388,10 +388,10 @@ class ConsoleProgressReporter:
         if event_type == "schema.bundle.loaded":
             count = payload.get("schema_count") or 0
             req = payload.get("requires_purpose_count") or 0
-            skills = payload.get("skills_doc_chars") or 0
+            guide_chars = payload.get("agent_guide_chars") or 0
             return (
                 f"[Schema] 加载 {count} 条 method schema "
-                f"({req} 个需要 purpose)；skillsDoc {skills} 字符。"
+                f"({req} 个需要 purpose)；Agent 指南 {guide_chars} 字符。"
             )
         if event_type == "loop_guard.warn":
             tool = payload.get("tool") or "?"

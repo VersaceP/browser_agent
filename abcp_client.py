@@ -23,8 +23,8 @@ import websockets
 
 from runtime_config import ABCPClientConfig
 
-# Deferred, not top-level: `harness/__init__.py` imports render_recovery, which
-# imports this module, so any `harness.*` import here at module scope is a
+# Deferred, not top-level: `harness/__init__.py` imports observation.browser_call,
+# which imports this module, so any `harness.*` import here at module scope is a
 # cycle. Resolved once on first use and cached.
 _REDACTORS: Optional[Tuple[Callable[..., Any], Callable[..., Any]]] = None
 

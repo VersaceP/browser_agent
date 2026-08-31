@@ -425,20 +425,14 @@ HARNESS_TOOL_NAMES: FrozenSet[str] = frozenset({
 # and whether a Client process is running — NOT that any particular page is
 # usable, so the readiness barrier deliberately stays on target-scoped Page.list.
 #
-# Keeping these entries after the methods vanished from System.getCapabilities
-# has now paid for itself: `Memory.delete` is BACK in the live capability
-# surface (verified against the running dispatcher, 62 capabilities), so this
-# block is load-bearing again rather than inert — a worker could otherwise
-# destroy another phase's memory. `Hitl.getTaskSummary` / `Hitl.resumeEvent`
-# remain absent and stay listed on the same reasoning: unlike a stale
-# TASK_TYPE_ALLOWED_EXCEPTIONS entry (which silently disables a live method), a
-# stale entry here costs nothing, and each encodes the policy we would want the
-# moment the platform reintroduces the method — Hitl.* wait/resume is owned by
-# harness/hitl.py. Re-verify against the capability surface before removing any
-# of them.
+# `Memory.delete` is in the live capability surface (verified against the
+# running dispatcher, 62 capabilities), so this block is load-bearing — a worker
+# could otherwise destroy another phase's memory. Every entry must name a method
+# the catalog actually publishes: `Hitl.getTaskSummary` / `Hitl.resumeEvent`
+# were listed here long after the platform deleted them, which made the set read
+# as broader policy than it enforced. The Hitl domain is now requestPause /
+# resolvePause only, and wait/resume is owned by harness/hitl.py.
 ALWAYS_FORBIDDEN_ABCP_METHODS: FrozenSet[str] = frozenset({
-    "Hitl.getTaskSummary",
-    "Hitl.resumeEvent",
     "Memory.delete",
 })
 

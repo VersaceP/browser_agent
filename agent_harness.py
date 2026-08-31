@@ -74,16 +74,15 @@ from harness.observation.page_fingerprint import (
 )
 from harness.progress import ProgressAccountant
 from harness.pacing import merge_pacing
-from harness.observation.render_recovery import (
-    RenderRecoveryOutcome,
-    build_render_recovery_runner,
-    call_with_render_recovery,
+from harness.observation.browser_call import (
+    build_browser_call_runner,
+    call_browser_redacted,
 )
 from harness.schema_loader import (
     CapabilityBundle,
     _capability_actions_from_response,
     _capability_revisions_from_response,
-    _skills_doc_from_capabilities_response,
+    _agent_guide_from_capabilities_response,
     build_capability_digest,
     load_capability_bundle,
 )
@@ -274,22 +273,18 @@ def _effective_streak_limit(streak_kinds: List[str]) -> int:
     return TRUNCATION_STREAK_LIMIT
 
 
+# Read-only prefixes over the CURRENT catalog. A prefix that matches no live
+# method is not free: it reads as coverage the harness does not have.
 _STABLE_BROWSER_METHOD_PREFIXES = (
     "System.get",
     "System.list",
     "System.describe",
     "DOM.get",
-    "Download.get",
     "Download.list",
     "Memory.get",
     "Memory.list",
-    "Bookmark.get",
     "Bookmark.list",
-    "Bookmark.search",
-    "Bookmark.is",
-    "History.get",
     "History.list",
-    "History.search",
 )
 _STABLE_BROWSER_METHODS = {
     "Page.getState",
@@ -399,16 +394,9 @@ RUNTIME_AUTH_INTERRUPT_SOP = """- Treat login walls, QR/SMS/2FA prompts, CAPTCHA
 LEAD_AUTH_PLANNING_SOP = """   Authentication, login walls, QR/SMS/2FA prompts, CAPTCHAs, and human-verification challenges are unpredictable runtime interrupts, not default task-plan phases. Do not add a speculative pre-auth probe phase or a follow-up HITL/login phase merely because a site may require authentication. Plan the protected business work directly; the worker that encounters a decisive gate must call Hitl.requestPause, verify the resumed page, and continue its original phase. A dedicated auth phase is allowed only when authentication/session setup is itself the user's explicit deliverable, account switching is required, or a task-type boundary makes the business worker unable to perform the required auth interaction. A probe-only phase is allowed only when diagnosing whether a gate exists is itself the final user objective; never chain that probe into a second HITL worker."""
 
 
-# ABCP capability methods we strip from the BrowserAgent tool surface because
-# they have known server-side contract bugs and burn worker steps without
-# making progress. See repro_hitl_bug.py for evidence:
-#   - Hitl.getTaskSummary: "Proxied actions require a fleetId for routing"
-#     even with fleetId in params (schema/dispatch mismatch).
-#   - Hitl.resumeEvent: listed in System.getCapabilities but the dispatcher
-#     returns -32601 Method not found.
-# Wait/resume is now handled by harness/hitl.py via the notification hub +
-# Page.getState fallback (PR #4), so the model has no legitimate reason to
-# touch these methods. Once ABCP ships a fix, drop from this set.
+# ABCP capability methods stripped from the BrowserAgent tool surface because a
+# worker must never call them, not because they are broken. See
+# ALWAYS_FORBIDDEN_ABCP_METHODS for the reasoning per method.
 _BLOCKED_CAPABILITIES: Set[str] = {
     *ALWAYS_FORBIDDEN_ABCP_METHODS,
 }
@@ -912,7 +900,7 @@ class BrowserAgent:
         self.method_schemas: Dict[str, JsonDict] = {}
         self.methods_requiring_purpose: Set[str] = set()
         self.purpose_hints: Dict[str, str] = {}
-        self.skills_doc: str = ""
+        self.agent_guide: str = ""
         self.artifacts: List[str] = []
         self.file_action_evidence: List[JsonDict] = []
         self.extraction_attempt_artifacts: List[str] = []
@@ -960,8 +948,7 @@ class BrowserAgent:
         # Page of the most recently applied DOM.axTreeUpdated; suppression is
         # gated on this matching the page held before the call (page scope).
         self.axtree_event_page_id = ""
-        self._render_recovery_recent: Dict[str, float] = {}
-        self.render_recovery_runner = None
+        self.browser_call_runner = None
         self.page_lifecycle = PageLifecycleTracker()
         self.page_inventory_signal = PageInventorySignal()
         self.event_observer = BrowserEventObserver(self)
@@ -1034,11 +1021,10 @@ class BrowserAgent:
                 ),
             )
             dispatch_tool = build_browser_tool_dispatcher(self)
-            self.render_recovery_runner = build_render_recovery_runner(
+            self.browser_call_runner = build_browser_call_runner(
                 browser=self.browser,
                 logger=self.logger,
                 capability_methods=self.capability_methods,
-                recent_recoveries=self._render_recovery_recent,
             )
             # Layer-0 event observer: DOM.axTreeUpdated (browser-side stale-id
             # auto-rematch) refreshes our id snapshot without a manual
@@ -1769,7 +1755,7 @@ class BrowserAgent:
         self.method_schemas = dict(bundle.method_schemas)
         self.methods_requiring_purpose = set(bundle.methods_requiring_purpose)
         self.purpose_hints = dict(bundle.purpose_hints)
-        self.skills_doc = bundle.skills_doc
+        self.agent_guide = bundle.agent_guide
         memory_auto_reuse_eligible = getattr(
             self, "task_memory_auto_reuse_eligible", None
         )
@@ -1813,7 +1799,7 @@ class BrowserAgent:
             "capability_count": len(self.capabilities),
             "schema_count": len(self.method_schemas),
             "requires_purpose_count": len(self.methods_requiring_purpose),
-            "skills_doc_chars": len(self.skills_doc),
+            "agent_guide_chars": len(self.agent_guide),
             "fleetAssignment": fleet_assignment,
             "memory": memory_bootstrap,
             "preloaded_capability_bundle": preloaded,
@@ -2294,7 +2280,7 @@ class BrowserAgent:
             },
             methods_requiring_purpose=self.methods_requiring_purpose,
             purpose_hints=self.purpose_hints,
-            skills_doc=self.skills_doc,
+            agent_guide=self.agent_guide,
         )
         digest = build_capability_digest(bundle)
         auth_fleet_json = json.dumps(
@@ -2307,7 +2293,7 @@ class BrowserAgent:
 
 ABCP automation is performed only through browser_call and harness tools. Do not use CDP, Playwright, pixel-coordinate guessing, or undocumented params.
 
-ABCP agentGuide has been fused into this harness SOP. The legacy skillsGuide name is accepted only for older browser generations. System.skillsDoc is retained for audit/bootstrap metadata but is not injected verbatim.
+The ABCP Agent guide (System.getCapabilities `agentGuide`) has been fused into this harness SOP and is not injected verbatim.
 
 Available capabilities for this task_type (method, required params, summary; full schemas cached globally at global_schema_cache/schemas/<Method>.json):
 {digest}
@@ -2315,7 +2301,7 @@ Available capabilities for this task_type (method, required params, summary; ful
 L1. Contracts, Feedback, Memory
 - browser_call input is always {{"method":"Domain.action","params":{{...}},"reason":"..."}}. `params` must be an object; pass {{}} when empty.
 - Treat ActionFeedback `observation` and `data` as facts. Treat `suggested_prompt` as next-step advice to verify against schemas, worker_contract, and harness `next_instruction`.
-- Call shapes come from the live capability digest or cached System.describeAction `methodSchema`; on schema errors, inspect `methodSchema.inputSchema` first (`methodSchema.params` is legacy compatibility), then correct the call. A state-changing failure is not retry-safe merely because its params can be changed; follow L5 before dispatching another action.
+- Call shapes come from the live capability digest or cached System.describeAction. On a schema error read `methodSchema.inputSchema` and use it exactly as returned, including every `anyOf`/`oneOf` branch, then correct the call. describeAction also returns `resultSchema` (the business result), `outputSchema` (the success envelope) and `failureSchema` (the public failure envelope and field meanings) — read those to interpret a response rather than guessing at field names. A state-changing failure is not retry-safe merely because its params can be changed; follow L5 before dispatching another action.
 - For methods with `requiresPurpose`, the harness fills `purpose` from browser_call.reason or schema `purposeHint`; still provide a specific reason.
 - Never fabricate fleetId, pageId, canonical ids, selectors, URLs, credentials, or extracted values. They must come from response.data, worker input, current DOM/Page evidence, Memory.get task context, or record_extraction artifacts.
 - Fleet routing is coordinator-owned. Read `assignedFleetId` from `<slot_context>` and pass it explicitly to every Page.create. If omitted, the harness injects the same assignment; a different/fabricated fleetId and model-initiated Fleet.create/Fleet.close fail closed. A fresh page is not a fresh fleet. Close disposable pages with Page.close; fleet archive/retention belongs to Dispatcher.
@@ -2326,7 +2312,8 @@ L1. Contracts, Feedback, Memory
 
 L2. Perception And Evidence
 - DOM.getAXTree is the default page map for structure, labels, controls, state and canonical ids. Use DOM.getText for exact visible text and DOM.getAttribute for href/src/id/aria-/data-/value. When the live schema advertises targets, batch related reads and consume response.data.items in input order; inspect per-item success/error independently. A targets entry may carry matching id+selector for in-dispatch fallback. Canonical ids are full frameId:axNodeId:domNodeId values copied verbatim from the latest AXTree.
-- Read AXTree lines as `depth [id] role "label" flags # @x,y,w,h`. `#` marks a preferred actionable target; `@x,y,w,h` is the element's viewport rect (absent on unpositioned nodes) — use it for spatial reasoning (relative position, overlap, on/off-screen), not for deriving click coordinates; act through the canonical id or a selector, never coordinates read off the rect. Layout flags such as `hidden`, `off`, `blocked`, `scroll` (scrollable container), `sticky`, `clip`, `zN` (stacking order) may appear before the `#`/`@` markers, and can be present on non-actionable lines too. Prefer `#` targets whose line shows no `hidden`/`blocked` flag; treat `blocked` as occlusion (dismiss the blocker first) and `scroll` as the container to scroll in nested-scroll flows.
+- Read AXTree lines as `depth [id] role "label" [state] flags #|~ @x,y,w,h (+N omitted)`. `#` marks a preferred actionable target and `~` a secondary locatable candidate; `@x,y,w,h` is the element's viewport rect (absent on unpositioned nodes) — use it for spatial reasoning (relative position, overlap, on/off-screen), not for deriving click coordinates; act through the canonical id or a selector, never coordinates read off the rect. `[checked]`/`[disabled]` are control state, not layout. Layout flags such as `hidden`, `off`, `blocked`, `scroll` (scrollable container), `sticky`, `clip`, `zN` (stacking order) may appear before the `#`/`~`/`@` markers, and can be present on non-actionable lines too. Prefer `#` targets whose line shows no `hidden`/`blocked` flag; treat `blocked` as occlusion (dismiss the blocker first) and `scroll` as the container to scroll in nested-scroll flows. Depth is the node's depth in the unfiltered tree, so gaps like 0→3 are normal and consecutive lines are NOT contiguous siblings.
+- A trailing `(+N omitted)` means the panel COLLAPSED that node's dense subtree and rendered only some of its children — an AXTree read of a long list or table is therefore not an enumeration of it. Never derive a row count, a "that's all of them", or an absence claim from a line carrying `(+N omitted)`: scope a narrower DOM.getAXTree/DOM.getSemanticTree read to that container, or enumerate through batched DOM.getText/DOM.getAttribute over ids you obtained per-row.
 - AXTree ids are epoch-bound physical anchors. Any Page.navigate/reload/go, render recovery/recovered feedback, Page.create/switch/close, Runtime.evaluate, Hitl transition, or Input.* action can invalidate them. After such a change, call Page.getState as needed, then DOM.getAXTree and derive fresh ids before targeting. For same-instance multi-page workflows, track each pageId with its URL/title/purpose, switch serially with Page.switchTo, and never assume a snapshot from one page remains valid after Page.create or Page.switchTo.
 - Large DOM/text/attribute/tool results are offloaded under observations/. For an offloaded CURRENT AXTree, first use its `liveQuery` hint and call find_in_axtree: it searches the same in-memory tree by name/role without rereading the file. Use local_fs_search/local_fs_read for that AXTree only after find_in_axtree says the epoch is stale, or when you need historical line-level context that the focused query cannot express. Other offloads still use their `savedPath`, `outline`, `format`, and `query_with` normally. A snapshot-diff is directional evidence for the current tree, never proof that an unqueried target is absent. A subtree AX read can confirm a visible target but cannot prove absence elsewhere; retain the full-tree-first rule for a fresh page. If an AX response parses zero nodes while its declared nodeCount is positive, surface the browser data error instead of treating the subtree as empty.
 - A truncated search/enumeration result or a miss on one observation surface supports only a scoped "not observed here" claim. Before declaring absence, list the surfaces actually checked and separately query any available fuller surface; preserve contrary observations instead of replacing them with the latest miss.
@@ -2336,7 +2323,7 @@ L3. Lifecycle And HITL
 - Page.* handles lifecycle/navigation/dialogs/screenshots/page state. Event names such as Page.loaded, Page.dialogOpened, or Hitl.resumed are not actions.
 - Only an actual document load blocks DOM/Input. After Page.startedLoading or a response with `navigationStarted=true`, wait for Page.loaded/Page.loadFailed; if settlement times out, call Page.getState exactly once and never poll. When Page.go returns `navigationStarted=false`, no history navigation was dispatched: do not wait for a nonexistent load event and keep the existing page identity/state. Page.navigate, Page.reload, a Page.go that started navigation, and Page.recovered invalidate element ids and geometry; after settlement refresh Page.getState and DOM.getAXTree before targeting. Download state changes, Page.dialogClosed, and File.chooserClosed do not imply navigation: follow the receipt and call Page.getState once when resynchronization is required, without waiting for an unrelated Page.loaded event.
 - You never receive browser events directly. Call Page.list once to refresh handles whenever a receipt reports `pageInventoryChanged` or a click/submit that should have navigated left your current page unchanged; do not list pages after every ordinary click. A pageId remains the identity of the same page across navigation. Stop using it only after Page.close, authoritative replacement, or a successful authoritative Page.list that no longer contains it; navigation invalidates element ids and geometry, not pageId. Page.create may return ready or loading: use its returned lifecycle/status, acting immediately only when ready and waiting only when loading. Page state is one of loading / ready / failed / crashed, and only `ready` is usable for DOM or Input. A failed or crashed page reports WHY in `failure.kind` — `network` may be worth one fresh navigation, `renderer-lost` normally needs a page recreated in the SAME assigned Fleet/session, and `automation-unavailable` means navigating again changes nothing and should be reported as a blocker. After Page.crashed, discard stale targets and follow binding/routing receipts; never replace an authenticated or pinned Fleet on your own.
-- Page.getState may expose `pendingDialogs`, `latestDialogId`, and a pending count. When more than one dialog is pending, Page.handleDialog must include the intended `dialogId` copied from pendingDialogs. After resolving one dialog, call Page.getState to discover any remaining dialog. Treat Page.handleDialog.userInput as sensitive: never echo it into reasoning, traces, artifacts, or final output.
+- ABCP reports only `blockingInteractions.hasPendingDialog` (a boolean) on Page.getState; `dialogId` lives in the triggering Input action's result and in Page.dialogOpened, which you never receive. The harness therefore tracks dialogs from the event stream and adds `pendingDialogs`, `latestDialogId` and `pendingDialogCount` to the Page.getState result when it has them. When more than one dialog is pending, Page.handleDialog must include the intended `dialogId` copied from that harness-supplied list. After resolving one dialog, call Page.getState to discover any remaining dialog. Treat Page.handleDialog.userInput as sensitive: never echo it into reasoning, traces, artifacts, or final output.
 - A BrowserAgent may manage multiple tabs/pages inside its own instance. Use Page.create for additional pages and Page.switchTo/Page.list to select the active page. Control pages serially, not concurrently, and refresh Page/DOM perception after every switch before acting.
 - For a click that may navigate, save sourcePageId/sourceUrl and real href/item identity, then issue ONE click. The click gate's no_navigation_observed/ambiguous result covers only its short window and does not prove failure or no popup. Call Page.list ONCE, claim a claimable page in the assigned Fleet, and never re-click or synthesize a URL first. On the claimed destination's first Page.getState, pass navigation_context={{kind:route_recovery_claimed_page, sourcePageId:<clicked page>}}. Return from a new tab with Page.switchTo(sourcePageId), or from same-tab history with Page.go(back). Wait and refresh state+AX only when Page.go reports navigationStarted=true; when false, continue from the unchanged entry.
 - For details discovered on a live listing, preserve the source and enter through a freshly rebound card identity/href first. Return with Page.switchTo(sourcePageId) after a new-tab detail or Page.go(back, n=1) after same-tab navigation, then refresh page/DOM evidence. Use direct Page.navigate(detailUrl) only when the source is unavailable or the card cannot be reliably rebound, and verify required regions afterward.
@@ -3970,11 +3957,6 @@ class LeadAgent:
             resume_decision="extend",
         )
 
-    def _cached_abcp_methods(self) -> Set[str]:
-        return read_schema_methods_from_dirs([
-            global_schemas_dir(self.runtime.harness.worktree_dir),
-        ])
-
     def _schema_cache_status(self) -> tuple[SchemaCacheStatus, Set[str]]:
         # If this run's bootstrap failed (no browser/empty caps/lock timeout/
         # exception), a stale on-disk cache is not authoritative — it may predate
@@ -4044,7 +4026,7 @@ class LeadAgent:
                 )
                 capabilities = _capability_actions_from_response(caps_response)
                 revisions = _capability_revisions_from_response(caps_response)
-                agent_guide = _skills_doc_from_capabilities_response(caps_response)
+                agent_guide = _agent_guide_from_capabilities_response(caps_response)
                 guide_path = write_cached_agent_guide(cache_dir, agent_guide)
                 if not capabilities:
                     self.logger.write(
@@ -4077,13 +4059,10 @@ class LeadAgent:
                 )
                 if cached_digest == digest and cached_methods:
                     # Upgrade legacy hash-only manifests in place so the next
-                    # catalog change can safely use per-Action revisions.
+                    # catalog change invalidates the complete schema set.
                     if (
                         cached_metadata.get("generation")
                         != SCHEMA_CONTRACT_GENERATION
-                        or not isinstance(
-                            cached_metadata.get("action_revisions"), dict
-                        )
                         or cached_metadata.get("catalog_revision")
                         != revisions["catalogRevision"]
                         or cached_metadata.get("guide_revision")
@@ -4094,7 +4073,6 @@ class LeadAgent:
                             digest=digest,
                             capability_count=len(capabilities),
                             generation=SCHEMA_CONTRACT_GENERATION,
-                            capabilities=capabilities,
                             catalog_revision=revisions["catalogRevision"],
                             guide_revision=revisions["guideRevision"],
                         )
@@ -4198,7 +4176,6 @@ class LeadAgent:
                         digest=digest,
                         capability_count=len(capabilities),
                         generation=SCHEMA_CONTRACT_GENERATION,
-                        capabilities=capabilities,
                         catalog_revision=revisions["catalogRevision"],
                         guide_revision=revisions["guideRevision"],
                     )
@@ -5407,7 +5384,6 @@ __all__ = [
     "LLMFactory",
     "LeadAgent",
     "ModelConfig",
-    "RenderRecoveryOutcome",
     "ResumeContext",
     "RuntimeConfig",
     "RunLogger",
@@ -5418,8 +5394,8 @@ __all__ = [
     "build_lead_agent_tool_specs",
     "build_lead_tool_dispatcher",
     "build_capability_digest",
-    "build_render_recovery_runner",
-    "call_with_render_recovery",
+    "build_browser_call_runner",
+    "call_browser_redacted",
     "compact_messages_if_needed",
     "exception_payload",
     "lead_agent_model_config",

@@ -56,7 +56,7 @@ OFFLOAD_FIELDS_AS_JSON = {
     "layers",
 }
 OFFLOAD_FIELDS = OFFLOAD_FIELDS_AS_TEXT | OFFLOAD_FIELDS_AS_JSON
-SCREENSHOT_METHODS = {"Page.screenshot", "DOM.getElementScreenshot"}
+SCREENSHOT_METHODS = {"Page.screenshot"}
 
 # Fleet-routing outcomes that can reach LeadAgent. Keep the guidance text and
 # this catalog together so tests can mechanically reject undocumented additions.
@@ -124,6 +124,7 @@ GENERIC_TOOL_RESULT_KEEP_KEYS = (
     "observation",
     "suggested_prompt",
     "error",
+    "rpcData",
     "errorClassification",
     "taskId",
 )
@@ -131,56 +132,27 @@ GENERIC_TOOL_RESULT_RESPONSE_KEEP_KEYS = (
     "observation",
     "suggested_prompt",
     "error",
+    "rpcData",
     "errorClassification",
     "taskId",
 )
 GENERIC_TOOL_RESULT_KEEP_FIELD_BYTES = 2000
 
-RENDER_LOST_MARKERS = (
-    "No RenderWidgetHostView",
-    "No WebContents",
-)
-
-# Broader set used by diagnostics.classify_terminal_status for page_crashed
-# detection. Superset of RENDER_LOST_MARKERS — render_recovery.py keeps using
-# the narrower set for its active-recovery decision (transient WebContents
-# detach), while the classifier here accepts any signal that the page is
-# functionally dead. Once the notification hub lands (PR #3), the
-# System.notification page_crashed / page_load_failed events should also feed
-# into the same diagnostic, but for now we read what's already in transport
-# observations.
-PAGE_DEAD_OBSERVATION_MARKERS = RENDER_LOST_MARKERS + (
+# Used by diagnostics.classify_terminal_status for page_crashed detection.
+# `status=crashed` is what Page.getState renders into its own observation
+# (`Page state: status=..., title=..., url=...`); the rest are harness-side
+# lifecycle event names. The raw Chromium strings that used to head this list
+# ("No RenderWidgetHostView", "No WebContents") are gone: the public failure
+# envelope is rebuilt from a stable code table, so no native diagnostic text
+# reaches the harness any more. A dead renderer now arrives as the public code
+# `renderer-lost` / `input-host-destroyed`, which error_classification maps.
+PAGE_DEAD_OBSERVATION_MARKERS = (
     "status=crashed",
     "page_crashed",
     "page_load_failed",
     "Page crashed",
     "Renderer crashed",
 )
-RENDER_RECOVERY_WINDOW_SECONDS = 30.0
-RENDER_RECOVERY_METHODS = {
-    "Page.getState",
-    "Page.switchTo",
-    "Page.navigate",
-    "Page.reload",
-    "Page.go",
-}
-READ_METHODS_RETRY_AFTER_NAVIGATE = {
-    "Page.screenshot",
-    "DOM.getAXTree",
-    "DOM.getSemanticTree",
-    "DOM.getText",
-    "DOM.getAttribute",
-    "DOM.getElementScreenshot",
-}
-ACTION_METHODS = {
-    "Input.click",
-    "Input.select",
-    "Input.type",
-    "Input.press",
-    "Input.scroll",
-    "Input.drag",
-}
-ANCHOR_PARAM_KEYS = {"selector", "id", "nodeId", "toSelector", "toNodeId"}
 
 # Recoverable routing classification: the worker's immutable artifact contract
 # lacks the nested-array shape required by collect_items, so only Lead can fix

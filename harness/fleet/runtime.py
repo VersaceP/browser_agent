@@ -1115,7 +1115,7 @@ class FleetClickGate:
         """
 
         name = str(event_name or "").strip()
-        if name not in {"Hitl.paused", "Hitl.requested"} or barrier is None:
+        if name != "Hitl.paused" or barrier is None:
             return {"claimed": False, "reason": "unsupported_event"}
         event_payload = payload if isinstance(payload, dict) else {}
         page = (
@@ -1710,11 +1710,7 @@ class PageLeasedBrowserClient:
             event_page = str(event_payload.get("pageId") or "").strip()
             workflow_event_matches = (
                 method == "Workflow.execute"
-                and name in {
-                    "Hitl.paused",
-                    "Hitl.requested",
-                    "Hitl.resumed",
-                }
+                and name in {"Hitl.paused", "Hitl.resumed"}
                 and (not event_page or not page_id or event_page == page_id)
             )
             if workflow_event_matches:
@@ -1724,7 +1720,7 @@ class PageLeasedBrowserClient:
                 })
                 barrier = self._fleet_auth_barrier
                 if (
-                    name in {"Hitl.paused", "Hitl.requested"}
+                    name == "Hitl.paused"
                     and workflow_hitl_claim_task is None
                     and barrier is not None
                     and fleet_id
@@ -1751,7 +1747,7 @@ class PageLeasedBrowserClient:
                     and bool(page_id)
                     and event_page == page_id
                 )
-                or name in {"Hitl.paused", "Hitl.requested"}
+                or name == "Hitl.paused"
             )
             if relevant:
                 settlement_events.append((name, dict(event_payload)))

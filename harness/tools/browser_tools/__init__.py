@@ -42,7 +42,6 @@ from harness.evidence.extraction_artifacts import (
 )
 from harness.evidence.artifact_evidence import detect_blocker_data_rows
 from harness.results.call_outcome import (
-    action_runtime_info,
     auto_hitl_is_actionable,
     classify_call_outcome,
     evaluate_grant,
@@ -86,7 +85,7 @@ from harness.observation.verifiers import (
 from harness.offload import offload_large_tool_result
 from harness.progress import NO_ARTIFACT_DIAGNOSTIC_TOOLS, extraction_artifact_count
 from harness.pacing import wait_between_rows
-from harness.observation.render_recovery import build_render_recovery_runner
+from harness.observation.browser_call import build_browser_call_runner
 from harness.screenshot_policy import normalize_screenshot_output_params
 from harness.runtime_evaluation import (
     MAIN_WORLD_REQUIRED_PREFIX,
@@ -300,7 +299,7 @@ from .navigate import (  # noqa: F401
     NAVIGATE_VERIFIED_STATE_RECHECK_SECONDS,
     _NAVIGATION_FAILED_STATUSES,
     _NAVIGATION_IN_FLIGHT_STATUSES,
-    _SELECT_FAILURE_GUIDANCE,
+    _SELECT_FAILURE_RETRY_LIMITS,
     _URL_DEFAULT_PORTS,
     _apply_select_failure_guidance,
     _auto_hitl_is_actionable,

@@ -461,7 +461,7 @@ async def _visual_verify(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
         ]
         image_path = after_artifacts[-1] if after_artifacts else ""
     if not image_path and (selector or element_id or full_page):
-        # skillsGuide §5: if element capture fails, do not repeat it — resync
+        # Agent guide §5: if element capture fails, do not repeat it — resync
         # once with Page.getState, then fall back to a viewport screenshot. The
         # verdict consumer sees screenshotScope so it knows the crop widened.
         #

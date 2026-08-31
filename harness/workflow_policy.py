@@ -9,12 +9,16 @@ from harness.screenshot_policy import normalize_screenshot_output_params
 
 
 JsonDict = Dict[str, Any]
+# Every name here must be an event the platform actually publishes. This set
+# used to admit `Hitl.humanInput` and `Hitl.resumeEvent` — neither exists in the
+# event catalog — while the real `Hitl.resumed` was reachable only through an
+# `allow_legacy_listen_events` back door, so the contract was exactly inverted.
 LISTENABLE_EVENTS = frozenset({
     "Page.open", "Page.close", "Page.loaded", "Page.startedLoading",
     "Page.loadFailed", "Page.crashed", "Page.recovered", "Page.navigate",
     "Page.titleUpdated", "Page.dialogOpened", "Page.dialogClosed",
-    "File.chooserOpened", "File.chooserClosed", "Hitl.humanInput",
-    "Hitl.resumeEvent",
+    "File.chooserOpened", "File.chooserClosed",
+    "Hitl.paused", "Hitl.resumed",
 })
 
 
@@ -82,7 +86,6 @@ def validate_workflow_params(
     task_type: str,
     allow_runtime: bool = False,
     enforce_lifecycle: bool = True,
-    allow_legacy_listen_events: bool = False,
     max_steps: int = 100,
     max_loop_iterations: int = 50,
 ) -> Tuple[Optional[JsonDict], Optional[JsonDict]]:
@@ -111,7 +114,6 @@ def validate_workflow_params(
         task_type=task_type,
         allow_runtime=allow_runtime,
         enforce_lifecycle=enforce_lifecycle,
-        allow_legacy_listen_events=allow_legacy_listen_events,
         count=count,
         max_loop_iterations=max_loop_iterations,
     )
@@ -165,7 +167,6 @@ def _validate_sequence(
     task_type: str,
     allow_runtime: bool,
     enforce_lifecycle: bool,
-    allow_legacy_listen_events: bool,
     count: List[int],
     max_loop_iterations: int,
 ) -> None:
@@ -219,9 +220,7 @@ def _validate_sequence(
                     obligation = ""
         elif step_type == "listen":
             event = str(raw.get("event") or "")
-            if event not in LISTENABLE_EVENTS and not (
-                allow_legacy_listen_events and event == "Hitl.resumed"
-            ):
+            if event not in LISTENABLE_EVENTS:
                 errors.append(f"{step_path}: event {event!r} is not listenable")
             if enforce_lifecycle:
                 if obligation == "settlement" and event == "Page.loaded":
@@ -244,7 +243,6 @@ def _validate_sequence(
                     nested, path=f"{step_path}.{branch}", errors=errors,
                     known=known, task_type=task_type, allow_runtime=allow_runtime,
                     enforce_lifecycle=enforce_lifecycle, count=count,
-                    allow_legacy_listen_events=allow_legacy_listen_events,
                     max_loop_iterations=max_loop_iterations,
                 )
         elif step_type == "loop":
@@ -261,7 +259,6 @@ def _validate_sequence(
                     body, path=f"{step_path}.body", errors=errors,
                     known=known, task_type=task_type, allow_runtime=allow_runtime,
                     enforce_lifecycle=enforce_lifecycle, count=count,
-                    allow_legacy_listen_events=allow_legacy_listen_events,
                     max_loop_iterations=max_loop_iterations,
                 )
         elif step_type != "transform":

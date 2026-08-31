@@ -7,10 +7,9 @@ from runtime_config import HarnessConfig, RuntimeConfig, VLConfig
 from harness.local_fs import local_fs_read, local_fs_search
 from harness.model_config import browser_agent_model_config, lead_agent_model_config
 from harness.offload import offload_large_response_fields, offload_large_tool_result
-from harness.observation.render_recovery import (
-    RenderRecoveryOutcome,
-    build_render_recovery_runner,
-    call_with_render_recovery,
+from harness.observation.browser_call import (
+    build_browser_call_runner,
+    call_browser_redacted,
 )
 from harness.schema_loader import (
     CapabilityBundle,
@@ -25,13 +24,12 @@ __all__ = [
     "CapabilityBundle",
     "HarnessConfig",
     "JsonDict",
-    "RenderRecoveryOutcome",
     "RuntimeConfig",
     "VLConfig",
     "browser_agent_model_config",
     "build_capability_digest",
-    "build_render_recovery_runner",
-    "call_with_render_recovery",
+    "build_browser_call_runner",
+    "call_browser_redacted",
     "compact_messages_if_needed",
     "exception_payload",
     "lead_agent_model_config",

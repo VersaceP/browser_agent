@@ -344,7 +344,7 @@ BrowserAgent.run()  step ∈ [1, worker_max_steps]                     agent_har
 │
 ├─ _bootstrap_browser (agent_harness.py:1596)
 │    System.register(预热)、capability bundle、Memory 任务上下文初始化
-├─ build system_prompt / tool specs / dispatcher / render_recovery_runner
+├─ build system_prompt / tool specs / dispatcher / browser_call_runner
 ├─ event_observer.attach   ← Layer-0：DOM.axTreeUpdated 事件自动刷新 id 快照
 ├─ messages = [user_task + dynamic_context]
 │
@@ -812,8 +812,10 @@ is_file_control = method == "File.download" or method.startswith("Download.")
 
 ### CALL · runner.call(method, params)（capability.py:459）
 
-- **逻辑**：经 `render_recovery_runner` 调 ABCP（含 Download.start 超时对账、
-  Runtime.evaluate main-world fallback 条件触发二次 call :558）。
+- **逻辑**：经 `browser_call_runner` 调 ABCP（含 Download.start 超时对账、
+  Runtime.evaluate main-world fallback 条件触发二次 call :558）。统一的
+  `BrowserCallRunner` 只负责把浏览器响应送入 harness 前的敏感值脱敏；页面渲染
+  丢失由 ABCP 公共失败码和平台提示表达，不在 harness 重放原调用。
 - **作用**：**唯一 model-initiated 的落地点**。所有前置门都是为了保证这一刻的调用合法、
   安全、不过期、不重复、不越权；所有后置门都是为了消化这一刻的返回。
 - ⚠️ **这不是全库唯一打 ABCP 的点**。harness 自发起的调用走另一条独立链路
@@ -828,9 +830,9 @@ is_file_control = method == "File.download" or method.startswith("Download.")
 
 ```
 _execute_browser_capability_tool (capability.py)
-└─ runner = render_recovery_runner (observation/render_recovery.py:80)
-   └─ RenderRecoveryRunner.call(method, params)      (render_recovery.py:62)
-      │  包装一层渲染恢复：检测到页面渲染异常时的建议性恢复
+└─ runner = browser_call_runner (observation/browser_call.py:60)
+   └─ BrowserCallRunner.call(method, params)         (browser_call.py:45)
+      │  统一入口：对请求/响应及传输异常做敏感值脱敏
       └─ ABCPClient.call(method, params)             (abcp_client.py:353)
          └─ JSON-RPC over ABCP transport ──────────► ABCP 平台（Electron 浏览器宿主）
                                                         真正执行 Input.click /
@@ -1219,6 +1221,6 @@ BrowserAgent           Spawner                LeadAgent              main.py   �
 | 计划机械校验 / PlanValidator 独立审计 | `harness/task_control/plan_validation.py`、`harness/planning/validator.py`（review_plan_revision:1061、审计规则/证据目录/数量放宽分析）、`agent_harness.py:2263`（review_task_plan_candidate） |
 | 终态分类 | `harness/diagnostics/__init__.py`（classify_terminal_status:173） |
 | 完成回执 / 终态一致性 / 数值对账 | `harness/results/completion_receipt.py`、`harness/tools/lead_tools.py:2517` |
-| ABCP 客户端 / 渲染恢复 runner | `abcp_client.py`（ABCPClient:267）、`harness/observation/render_recovery.py`（:48/:80） |
+| ABCP 客户端 / browser-call runner | `abcp_client.py`（ABCPClient:267）、`harness/observation/browser_call.py`（:45/:60） |
 | 上下文压缩 / 卸载 | `harness/compaction.py`、`harness/offload.py` |
 | 存储层 | `harness/storage/`（sqlite/file 双后端、schema.sql） |

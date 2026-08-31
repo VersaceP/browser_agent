@@ -39,38 +39,13 @@ FAILED = "failed"
 NOT_DISPATCHED = "not_dispatched"
 
 
-# Older ABCP builds attached private ActionRuntimeErrorInfo fields. New builds
-# deliberately expose only the stable public failure envelope; keep this parser
-# solely as a compatibility path for cached/older browser generations.
-_ACTION_RUNTIME_FIELDS = ("code", "phase", "sideEffectStarted", "actionKind")
-
-
-def action_runtime_info(value: Any) -> Optional[JsonDict]:
-    """The platform's structured account of a failure, wherever it is carried.
-
-    Accepts a raw JSON-RPC error `data`, a tool result, or an already-extracted
-    metadata dict, because the same block reaches different call sites through
-    different envelopes.
-    """
-    for candidate in _runtime_candidates(value):
-        if not isinstance(candidate, dict):
-            continue
-        info = {
-            key: candidate[key]
-            for key in _ACTION_RUNTIME_FIELDS
-            if key in candidate
-        }
-        if info.get("code") or info.get("phase"):
-            return info
-    return None
-
-
 def public_action_failure(value: Any) -> Optional[JsonDict]:
     """Return ABCP's stable public ``error.code`` failure envelope.
 
     A top-level harness ``error`` is often a string, so only an object-shaped
-    error carrying a non-empty code qualifies. Observation and suggested prompt
-    are copied as bounded public guidance; private runtime fields are ignored.
+    error carrying a non-empty code qualifies. Observation, suggested prompt and
+    the public ``details`` are copied as bounded public guidance; private
+    runtime fields are not on the wire to begin with.
     """
     for candidate in _public_failure_candidates(value):
         error = candidate.get("error") if isinstance(candidate, dict) else None
@@ -84,14 +59,66 @@ def public_action_failure(value: Any) -> Optional[JsonDict]:
         message = str(error.get("message") or "").strip()
         if message:
             failure["message"] = message
-        # Same public whitelist the transport projection enforces. `details` is
-        # excluded on purpose: ABCP types it `Record<string, unknown>`, so
-        # copying it would readmit the unbounded payload the projection closes.
-        for key in ("observation", "suggested_prompt", "method"):
+        for key in ("observation", "suggested_prompt"):
             if candidate.get(key) not in (None, "", {}):
                 failure[key] = candidate[key]
+        details = public_failure_details(candidate.get("details"))
+        if details:
+            failure["details"] = details
         return failure
     return None
+
+
+# ABCP's own projection already bounds `details`: it copies only the fields a
+# code registered (`page-not-ready` -> status, `state-conflict` -> blockedBy /
+# status / restartToken, `memory-revision-conflict` -> currentRevision,
+# `invalid-params` -> issues) and only when the value is a scalar. Re-applying
+# the shape rule here keeps the harness fail-closed against a build that
+# widens it, without discarding the operative fact — "which field was invalid",
+# "what is the current revision" — that the model needs to correct its call.
+_PUBLIC_DETAIL_MAX_FIELDS = 8
+_PUBLIC_DETAIL_MAX_ISSUES = 20
+_PUBLIC_DETAIL_MAX_PATH_PARTS = 20
+_PUBLIC_DETAIL_MAX_STRING_CHARS = 300
+
+
+def public_failure_details(value: Any) -> Optional[JsonDict]:
+    """Scalar-only view of a public failure's ``details``."""
+    if not isinstance(value, dict) or not value:
+        return None
+    projected: JsonDict = {}
+    for key, item in value.items():
+        if len(projected) >= _PUBLIC_DETAIL_MAX_FIELDS:
+            break
+        name = str(key)
+        if key == "issues" and isinstance(item, list):
+            issues = []
+            for entry in item[:_PUBLIC_DETAIL_MAX_ISSUES]:
+                if not isinstance(entry, dict):
+                    continue
+                issue: JsonDict = {}
+                path = entry.get("path")
+                if isinstance(path, list):
+                    issue["path"] = [
+                        part[:_PUBLIC_DETAIL_MAX_STRING_CHARS]
+                        if isinstance(part, str) else part
+                        for part in path[:_PUBLIC_DETAIL_MAX_PATH_PARTS]
+                        if isinstance(part, (str, int, float))
+                    ]
+                code = entry.get("code")
+                if isinstance(code, str) and code.strip():
+                    issue["code"] = code[:_PUBLIC_DETAIL_MAX_STRING_CHARS]
+                if issue:
+                    issues.append(issue)
+            issues = [entry for entry in issues if entry]
+            if issues:
+                projected["issues"] = issues
+            continue
+        if isinstance(item, bool) or isinstance(item, (int, float)):
+            projected[name] = item
+        elif isinstance(item, str) and item.strip():
+            projected[name] = item[:_PUBLIC_DETAIL_MAX_STRING_CHARS]
+    return projected or None
 
 
 def _public_failure_candidates(value: Any) -> Tuple[JsonDict, ...]:
@@ -105,35 +132,40 @@ def _public_failure_candidates(value: Any) -> Tuple[JsonDict, ...]:
     return tuple(candidates)
 
 
-def _runtime_candidates(value: Any) -> Tuple[Any, ...]:
-    if not isinstance(value, dict):
-        return ()
-    nested = []
-    for key in ("runtime", "actionRuntime"):
-        if isinstance(value.get(key), dict):
-            nested.append(value[key])
-    for container_key in ("data", "response", "rpcData", "errorClassification"):
-        container = value.get(container_key)
-        if isinstance(container, dict):
-            nested.extend(_runtime_candidates(container))
-    return tuple(nested)
-
-
 def replay_forbidden(result: Any) -> bool:
-    """True when the platform says input dispatch had already started.
+    """True when a failed action's browser-side outcome is unknown.
 
-    A failed action that already moved the page is not a free retry: re-issuing
-    it can submit a form twice or double-click a control. The platform states
-    this per failure, so a composite that retries must ask rather than infer it
-    from an error string.
+    The public failure contract deliberately does NOT say whether input
+    dispatch had already started: `runtime.sideEffectStarted`, `phase` and
+    every other execution marker are stripped at the transport boundary. So a
+    dispatched action that failed may have moved the page — re-issuing it can
+    submit a form twice or double-click a control — and any public failure is
+    enough to forbid an automatic composite replay.
     """
-    info = action_runtime_info(result)
-    if info and info.get("sideEffectStarted") is True:
+    if not isinstance(result, dict):
+        return False
+    if result.get("tool_was_executed") is False:
+        return False
+    if result.get("requestSent") is False:
+        return False
+    if public_action_failure(result) is not None:
         return True
-    # The public contract intentionally no longer exposes side-effect timing.
-    # A failed dispatched action therefore has an unknown outcome and must not
-    # be replayed automatically by a composite.
-    return public_action_failure(result) is not None
+
+    # A response-free transport failure and a bare JSON-RPC failure provide no
+    # execution receipt. They still prove the request was dispatched (or that
+    # delivery is indeterminate), so a composite must not convert the unknown
+    # outcome into a second click, submit, or Escape press. A pre-dispatch
+    # guard carries tool_was_executed=False and returned above.
+    response = result.get("response")
+    response_error = response.get("error") if isinstance(response, dict) else None
+    failed = bool(result.get("error") or response_error)
+    transport_or_rpc = (
+        result.get("rpcCode") is not None
+        or bool(str(result.get("transportCode") or "").strip())
+    )
+    # An explicit successful send also makes the final action state unknown,
+    # even if a lower layer did not attach its usual transport/RPC code.
+    return failed and (transport_or_rpc or result.get("requestSent") is True)
 
 
 @dataclass(frozen=True)

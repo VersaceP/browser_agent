@@ -1114,7 +1114,7 @@ class HarnessConfig:
     # This flag is independent of the model surface and only governs the
     # HARNESS-INTERNAL auto-digest path:
     #   "off"      -> never used, even internally (current safe default)
-    #   "internal" -> harness may make a one-shot, render_recovery-wrapped call to
+    #   "internal" -> harness may make a one-shot, redaction-wrapped call to
     #                 derive a tiny structure digest (scroll containers via
     #                 isScrollable, bounds) that never enters model context. The
     #                 raw tree is digested and discarded; never per-iteration.

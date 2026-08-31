@@ -336,23 +336,43 @@ def _trace_path_from_result_levels(result_levels: JsonDict) -> Optional[str]:
 
 
 def _summarize_blocker(value: JsonDict) -> Optional[JsonDict]:
+    public_failure = value.get("rpcData")
+    public_prompt = (
+        public_failure.get("suggested_prompt")
+        if isinstance(public_failure, dict)
+        else None
+    )
+    has_public_prompt = isinstance(public_prompt, str) and bool(public_prompt.strip())
+    classification = value.get("errorClassification")
+    compact_classification = (
+        dict(classification) if isinstance(classification, dict) else classification
+    )
+    if has_public_prompt and isinstance(compact_classification, dict):
+        compact_classification.pop("suggested_action", None)
+        compact_classification.pop("platformSuggestedPrompt", None)
     status = str(value.get("status") or "")
     if status and status not in {"done", "running"}:
-        return {
+        summary = {
             "status": status,
             "workerId": value.get("workerId"),
             "phaseId": value.get("phaseId"),
             "error": str(value.get("error") or "")[:500],
-            "errorClassification": value.get("errorClassification"),
+            "errorClassification": compact_classification,
         }
-    classification = value.get("errorClassification")
-    if isinstance(classification, dict):
-        return {
+        if has_public_prompt:
+            summary["suggested_prompt"] = public_prompt
+        return summary
+    if isinstance(compact_classification, dict):
+        summary = {
             "status": value.get("status"),
-            "type": classification.get("type"),
-            "suggested_action": classification.get("suggested_action"),
+            "type": compact_classification.get("type"),
             "error": str(value.get("error") or "")[:500],
         }
+        if not has_public_prompt and compact_classification.get("suggested_action"):
+            summary["suggested_action"] = compact_classification["suggested_action"]
+        if has_public_prompt:
+            summary["suggested_prompt"] = public_prompt
+        return summary
     return None
 
 

@@ -338,78 +338,22 @@ def _project_error_classification(
     """Model-facing view of `errorClassification`: facts always, advice once.
 
     Subtractive on purpose. An allowlist that rebuilds the object silently
-    drops any field it was not told about — `sideEffectStarted`, `phase` and
-    `actionKind` come from the compatibility runtime path, and losing
-    `sideEffectStarted` would hide the one fact that says whether a failed
-    action may be replayed. So copy everything and remove exactly two things:
-    `platformSuggestedPrompt`, whose text already reaches the model as the
-    platform's own `suggested_prompt`, and a generic `suggested_action`, but
-    only when the platform actually spoke — it just restates "do what the
-    platform said" in harness vocabulary.
+    drops any field it was not told about, and this object grows whenever a new
+    classification source is added. So copy everything and remove exactly two
+    things: `platformSuggestedPrompt`, whose text already reaches the model as
+    the platform's own `suggested_prompt`, and `suggested_action` whenever the
+    platform spoke. The latter is an internal label, not a second source of
+    recovery advice; retaining it has allowed prefix fallbacks to contradict
+    the public prompt.
 
     The internal object is untouched: compaction, spawner status classification
     and the automatic overlay recovery all read it.
     """
-    from harness.diagnostics.error_classification import GENERIC_SUGGESTED_ACTIONS
-
     projected = dict(classification)
     projected.pop("platformSuggestedPrompt", None)
-    if (
-        platform_prompt_present
-        and projected.get("suggested_action") in GENERIC_SUGGESTED_ACTIONS
-    ):
+    if platform_prompt_present:
         projected.pop("suggested_action", None)
     return projected
-
-
-def _keep_suggested_prompt(container: JsonDict) -> bool:
-    for key in (
-        "error",
-        "errorClassification",
-        "warning",
-        "warnings",
-        "blocked",
-        "blocker",
-        "blockers",
-        "missingAnyOf",
-        "pausedState",
-        "autoHitl",
-        "challengeAdjudication",
-        "hitl_wait",
-    ):
-        value = container.get(key)
-        if value not in (None, "", [], {}):
-            return True
-    challenge = container.get("suspected_challenge")
-    if isinstance(challenge, dict) and not _empty_challenge_summary(challenge):
-        return True
-    status = str(container.get("status") or "").lower()
-    if status and status not in {
-        "ok",
-        "done",
-        "success",
-        "succeeded",
-        "running",
-        "loaded",
-        "ready",
-        "resumed",
-    }:
-        return True
-    observation = str(container.get("observation") or "").lower()
-    return any(
-        marker in observation
-        for marker in (
-            "error",
-            "failed",
-            "blocked",
-            "warning",
-            "paused",
-            "captcha",
-            "challenge",
-            "timeout",
-            "stale",
-        )
-    )
 
 
 def offload_large_tool_result(

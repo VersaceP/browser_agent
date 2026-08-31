@@ -13,7 +13,7 @@ from abcp_client import ABCPTransportError
 from harness.results.call_outcome import evaluate_grant
 from harness.fleet.coordinator import FleetAssignment
 from harness.fleet.coordinator import handle_records_from_value
-from harness.observation.render_recovery import extract_page_id_from_values
+from harness.observation.browser_call import extract_page_id_from_values
 from harness.utils import JsonDict
 from harness.utils import optional_int
 from harness.utils import trim_large_strings

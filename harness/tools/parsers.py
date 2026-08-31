@@ -58,8 +58,9 @@ def method_schema_summary(
     method: str,
 ) -> Optional[JsonDict]:
     """Return a compact schema summary for tool_result error annotations.
-    Reads from the describeAction cache: schemas already arrive as
-    structured dicts with method/description/params/requiresPurpose."""
+    Reads from the describeAction cache, whose entries carry method,
+    description, requiresPurpose and the input/result/output/failure
+    schemas."""
     schema = method_schemas.get(method)
     if not isinstance(schema, dict):
         return None
@@ -69,13 +70,10 @@ def method_schema_summary(
         "requiresPurpose": schema.get("requiresPurpose", False),
         "purposeHint": schema.get("purposeHint"),
     }
-    # Two describeAction generations ship different shapes: the legacy agent
-    # view (params) and JSON-Schema views (inputSchema, possibly a union).
-    # Surface whichever exists so schema recall annotations never go empty.
+    # `inputSchema` is what a caller fixes a rejected call against; it may be a
+    # union, so it is surfaced whole rather than flattened here.
     if isinstance(schema.get("inputSchema"), dict):
         summary["inputSchema"] = schema.get("inputSchema")
-    if isinstance(schema.get("params"), dict):
-        summary["params"] = schema.get("params")
     return trim_large_strings(summary, 6000)
 
 

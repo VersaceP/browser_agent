@@ -62,15 +62,12 @@ def _normalize_notification_type(value: Any) -> str:
 # Explicit HITL notifications mean the platform reported a user-driven resume.
 # Page lifecycle notifications are deliberately not resume signals: challenge
 # pages can load, fail, and retitle themselves without human intervention.
+# `Hitl.resumed` is the only resume event the platform publishes, and the
+# harness synthesizes no alias of its own; the snake_case spelling is kept
+# because the normalizer folds both into one token.
 _RESUME_NOTIFICATION_TYPES = frozenset(_normalize_notification_type(item) for item in {
     "hitl_resumed",
-    "Hitl.resumeEvent",
     "Hitl.resumed",
-    "page_resumed",
-    "Page.resumed",
-    "hitl_completed",
-    "Hitl.completed",
-    "human_intervention_completed",
 })
 _PAGE_TITLE_UPDATED_TYPES = frozenset(_normalize_notification_type(item) for item in {
     "page_title_updated",

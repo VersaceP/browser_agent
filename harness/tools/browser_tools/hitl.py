@@ -18,7 +18,7 @@ from harness.observation.challenge_detector import extract_page_id
 from harness.diagnostics.error_classification import attach_error_classification
 from harness.fleet.auth import verify_protected_auth_target
 from harness.fleet.runtime import FleetClickGateTimeout
-from harness.observation.render_recovery import build_render_recovery_runner
+from harness.observation.browser_call import build_browser_call_runner
 from harness.tools.parsers import attach_method_schema
 from harness.utils import JsonDict
 from harness.utils import exception_payload
@@ -639,16 +639,15 @@ async def _post_hitl_raw_browser_call(
     private_axtree_text = ""
     try:
         _ensure_hitl_request_reason(method, params, str(params.get("purpose") or ""))
-        runner = getattr(agent, "render_recovery_runner", None)
+        runner = getattr(agent, "browser_call_runner", None)
         if runner is None:
-            runner = build_render_recovery_runner(
+            runner = build_browser_call_runner(
                 browser=agent.browser,
                 logger=agent.logger,
                 capability_methods=agent.capability_methods,
-                recent_recoveries=agent._render_recovery_recent,
             )
-            agent.render_recovery_runner = runner
-        response, _recovery = await runner.call(method, params)
+            agent.browser_call_runner = runner
+        response = await runner.call(method, params)
         response = agent._capture_artifacts(method, response)
         record_file_action = getattr(agent, "_capture_file_action", None)
         if callable(record_file_action):
@@ -1331,7 +1330,7 @@ async def _capture_hitl_pause_snapshot(
     if not page_id:
         return
     try:
-        response, _recovery = await runner.call(
+        response = await runner.call(
             "Page.getState",
             {
                 "pageId": page_id,

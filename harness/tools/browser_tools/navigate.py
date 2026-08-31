@@ -17,11 +17,11 @@ from harness.observation.challenge_detector import extract_page_id
 from harness.observation.challenge_detector import is_lingering_loading_title
 from harness.observation.content_completeness import ContentCompletenessTracker
 from harness.observation.content_completeness import content_completeness_observation_facts
-from harness.results.call_outcome import action_runtime_info
 from harness.results.call_outcome import auto_hitl_is_actionable
 from harness.results.call_outcome import classify_call_outcome
 from harness.results.call_outcome import evaluate_grant
 from harness.results.call_outcome import page_state_evidence_ok
+from harness.results.call_outcome import public_failure_details
 from harness.observation.overlay_detector import detect_overlay_from_result
 from harness.observation.overlay_detector import title_looks_like_auth_page
 from harness.observation.page_lifecycle import AUTOMATION_UNAVAILABLE_FAILURE
@@ -1832,6 +1832,9 @@ def _public_failure_projection(rpc_data: Any) -> JsonDict:
         value = rpc_data.get(key)
         if isinstance(value, str) and value.strip():
             projected[key] = value
+    details = public_failure_details(rpc_data.get("details"))
+    if details:
+        projected["details"] = details
     error = rpc_data.get("error")
     if isinstance(error, dict):
         public_error = {
@@ -1857,14 +1860,12 @@ def _transport_error_metadata(
     typed values or provider diagnostics — not the public fields themselves.
     So project a fixed public whitelist for every method and refuse the rest.
 
-    The whitelist is exactly what ABCP 1.1.9 puts on the wire (verified live
-    against catalogRevision sha256:cfd8fb90…: an error ``data`` carries only
-    ``error{code,message}``, ``observation`` and ``suggested_prompt``).
-    ``details`` is deliberately NOT whitelisted: on this build it is always
-    absent, and it is typed ``Record<string, unknown>`` upstream, so admitting
-    the key would reopen the unbounded payload this whitelist exists to close.
-    Add it only per error code, with a field/type/depth/size bound, once a
-    build actually emits it.
+    An error ``data`` carries ``error{code,message}``, ``observation``,
+    ``suggested_prompt`` and — for the codes that register detail fields —
+    ``details``. The platform bounds ``details`` itself (per-code allowlist,
+    scalars only); ``public_failure_details`` re-applies the shape rule here so
+    a build that widens it cannot reopen the unbounded payload this whitelist
+    exists to close.
     """
 
     metadata: JsonDict = {}
@@ -1907,118 +1908,30 @@ def _transport_error_metadata(
     public_failure = _public_failure_projection(rpc_data)
     if public_failure:
         metadata["rpcData"] = public_failure
-    runtime = action_runtime_info(rpc_data)
-    if runtime:
-        # Four bounded scalars, no provider payload: whether the failure landed
-        # before or after dispatch is the one fact a retry decision needs, and
-        # inferring it from prose is guessing at something the platform states.
-        metadata["actionRuntime"] = runtime
     return metadata
 
-_SELECT_FAILURE_GUIDANCE: Dict[str, Tuple[int, str]] = {
+_SELECT_FAILURE_RETRY_LIMITS: Dict[str, int] = {
     # Rebuilt select contract (2026-08 platform generation). Retry budget is
     # 1 only for "your request did not match the CURRENT option window"
     # codes; every popup-mutation/takeover code is 0 because the platform's
     # own prompts require continuing with one generic Input.click/type/scroll
     # after re-observing, never an automatic Input.select replay.
-    "select-option-not-in-current-window": (
-        1,
-        "Call DOM.inspectSelect again, copy only option descriptors the new"
-        " optionWindow actually returned (optionIds/optionLabels for a custom"
-        " popup, nativeValues for a native select), then retry Input.select"
-        " once. After any search, scroll, or pagination, inspect again first.",
-    ),
-    "select-option-id-unavailable": (
-        1,
-        "The option carried no provable id. Re-run DOM.inspectSelect and retry"
-        " once with exact nativeValues/optionLabels instead of option ids.",
-    ),
-    "select-option-label-ambiguous": (
-        1,
-        "Multiple current options share the normalized label. Read the popup"
-        " with DOM.getSemanticTree, then retry once with the exact optionIds"
-        " entries for the intended options.",
-    ),
-    "select-agent-takeover-required": (
-        0,
-        "This control needs Agent takeover: search, remote loading,"
-        " pagination, virtualized options, or an incomplete option window."
-        " Keep the popup in its current state, re-read DOM.inspectSelect or"
-        " DOM.getSemanticTree, and continue with ONE generic Input.click /"
-        " Input.type / Input.scroll action, observing the page again after"
-        " every mutation. Do not replay Input.select automatically.",
-    ),
-    "select-popup-not-ready": (
-        0,
-        "The popup could not be observed as visible and stable. Do not repeat"
-        " Input.select; read the current control and popup with"
-        " DOM.getAXTree and DOM.getSemanticTree, then continue with one"
-        " bounded generic action.",
-    ),
-    "select-popup-not-found": (
-        0,
-        "The popup could not be bound through standard accessibility"
-        " relationships. Inspect the page with DOM.getAXTree and"
-        " DOM.getSemanticTree, then use generic Input.click/type/scroll"
-        " without repeating this Input.select request.",
-    ),
-    "select-popup-ambiguous": (
-        0,
-        "Multiple popup candidates were bound to the control. Re-observe the"
-        " page with DOM.getAXTree/DOM.getSemanticTree and continue with one"
-        " generic action; do not repeat Input.select.",
-    ),
-    "select-popup-relation-changed": (
-        0,
-        "The control no longer points to the observed popup, so old option"
-        " ids are invalid. Read DOM.getAXTree and the current popup with"
-        " DOM.getSemanticTree, then continue with one bounded generic action.",
-    ),
-    "select-option-id-proof-unavailable": (
-        0,
-        "Input may already have changed the control, but the exact option id"
-        " is no longer observable. Do not replay Input.select; read the"
-        " current control and popup state first.",
-    ),
-    "select-option-disabled": (
-        0,
-        "The requested option is disabled. Stop retrying and report that it"
-        " is unavailable; do not silently choose a different option.",
-    ),
-    "select-target-not-select": (
-        0,
-        "The target is not an ABCP-supported select control. Do not call"
-        " Input.select for it; traverse ordinary visible UI with fresh"
-        " AXTree targets and one verified Input.click per visible level.",
-    ),
-    "select-selection-mode-unknown": (
-        0,
-        "The platform could not determine the selection mode. Report this"
-        " ABCP select contract failure with the inspect receipts.",
-    ),
-    "select-multiple-unsupported": (
-        0,
-        "Multiple selection is not supported on this control. Report the"
-        " unsupported multi-select instead of retrying.",
-    ),
-    "select-control-kind-mismatch": (
-        0,
-        "The selection array does not match the control kind inspect reported"
-        " (nativeValues vs optionIds/optionLabels). Re-run DOM.inspectSelect"
-        " and use the array matching controlKind.",
-    ),
-    "select-state-restore-failed": (
-        0,
-        "ABCP could not restore the control's open/selection/scroll state"
-        " after inspection. Re-observe the control before continuing; do not"
-        " assume the pre-inspect state.",
-    ),
-    "select-final-state-unproven": (
-        0,
-        "The final selection state could not be proven. Inspect the control"
-        " with DOM.inspectSelect/DOM.getAttribute(value) before attempting"
-        " any correction - it may have partly changed.",
-    ),
+    "select-option-not-in-current-window": 1,
+    "select-option-id-unavailable": 1,
+    "select-option-label-ambiguous": 1,
+    "select-agent-takeover-required": 0,
+    "select-popup-not-ready": 0,
+    "select-popup-not-found": 0,
+    "select-popup-ambiguous": 0,
+    "select-popup-relation-changed": 0,
+    "select-option-id-proof-unavailable": 0,
+    "select-option-disabled": 0,
+    "select-target-not-select": 0,
+    "select-selection-mode-unknown": 0,
+    "select-multiple-unsupported": 0,
+    "select-control-kind-mismatch": 0,
+    "select-state-restore-failed": 0,
+    "select-final-state-unproven": 0,
 }
 
 def _apply_select_failure_guidance(
@@ -2199,10 +2112,9 @@ def _apply_select_failure_guidance(
         if isinstance(classification, dict)
         else ""
     )
-    guidance = _SELECT_FAILURE_GUIDANCE.get(error_code)
-    if guidance is None:
+    max_retries = _SELECT_FAILURE_RETRY_LIMITS.get(error_code)
+    if max_retries is None:
         return result
-    max_retries, instruction = guidance
     if not isinstance(ledger, dict):
         ledger = {}
         setattr(agent, "_select_failure_ledger", ledger)
@@ -2210,12 +2122,6 @@ def _apply_select_failure_guidance(
     failures = int(ledger.get(key) or 0) + 1
     ledger[key] = failures
     retry_allowed = failures <= max_retries
-    if max_retries and not retry_allowed:
-        instruction = (
-            "The one permitted recovery retry for this select/control/error has"
-            " already failed. Stop retrying and report an ABCP select contract"
-            " failure with the inspect and select receipts."
-        )
     result["selectRecovery"] = {
         "errorCode": error_code,
         "failureCount": failures,
@@ -2223,5 +2129,4 @@ def _apply_select_failure_guidance(
         "retryAllowed": retry_allowed,
         "controlTarget": target,
     }
-    result["next_instruction"] = instruction
     return result

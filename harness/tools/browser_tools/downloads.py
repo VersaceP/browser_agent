@@ -510,7 +510,7 @@ async def _refresh_active_download_response(
             _download_receipt_store(agent).pop(key, None)
         return None
     try:
-        listed, _recovery = await runner.call(
+        listed = await runner.call(
             "Download.list",
             {
                 "fleetId": fleet_id,
@@ -681,7 +681,7 @@ async def _reconcile_download_start_timeout(
         if check_index:
             await asyncio.sleep(DOWNLOAD_TIMEOUT_RECONCILIATION_DELAY_SECONDS)
         try:
-            list_response, _list_recovery = await runner.call(
+            list_response = await runner.call(
                 "Download.list",
                 {
                     "fleetId": fleet_id,

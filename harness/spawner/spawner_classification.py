@@ -695,5 +695,5 @@ def _clone_capability_bundle(bundle: CapabilityBundle) -> CapabilityBundle:
         method_schemas=dict(bundle.method_schemas),
         methods_requiring_purpose=set(bundle.methods_requiring_purpose),
         purpose_hints=dict(bundle.purpose_hints),
-        skills_doc=bundle.skills_doc,
+        agent_guide=bundle.agent_guide,
     )

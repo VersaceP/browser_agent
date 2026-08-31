@@ -4,7 +4,7 @@ harness.observation.semantic_index - Phase B: harness-internal SemanticTree use.
 This module is the HARNESS-INTERNAL auto-digest path, independent of the model
 tool surface (the model may now call DOM.getSemanticTree directly as a limited
 diagnostic — see tool_policy). Gated by HarnessConfig.semantic_tree == "internal",
-the harness may make a one-shot, render_recovery-wrapped call to derive a tiny
+the harness may make a one-shot, redaction-wrapped call to derive a tiny
 DIGEST that never enters model context. The raw tree is always digested and
 discarded.
 
@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from harness.observation.render_recovery import build_render_recovery_runner
+from harness.observation.browser_call import build_browser_call_runner
 from harness.semantic_frames import graph_digest, root_tree
 from harness.utils import JsonDict
 
@@ -198,7 +198,7 @@ def digest_subtree(tree: Any, *, max_repeated: int = 5) -> JsonDict:
 
 
 async def _call_semantic_tree(agent: Any, params: JsonDict) -> Optional[JsonDict]:
-    """One render_recovery-wrapped getSemanticTree call. Returns the ANCHORED
+    """One redaction-wrapped getSemanticTree call. Returns the ANCHORED
     frame's local tree or None (failed / recovery exhausted / no tree). Never
     raises into the caller.
 
@@ -206,16 +206,15 @@ async def _call_semantic_tree(agent: Any, params: JsonDict) -> Optional[JsonDict
     because a selector mined from an iframe cannot be handed back to a DOM read
     (see harness.semantic_frames). Frames left unread are logged rather than
     dropped silently, so a later "no candidates" has an explanation."""
-    runner = getattr(agent, "render_recovery_runner", None)
+    runner = getattr(agent, "browser_call_runner", None)
     if runner is None:
-        runner = build_render_recovery_runner(
+        runner = build_browser_call_runner(
             browser=agent.browser,
             logger=getattr(agent, "logger", None),
             capability_methods=getattr(agent, "capability_methods", set()),
-            recent_recoveries=getattr(agent, "_render_recovery_recent", {}),
         )
     try:
-        response, _recovery = await runner.call("DOM.getSemanticTree", params)
+        response = await runner.call("DOM.getSemanticTree", params)
     except Exception as exc:  # noqa: BLE001 - internal probe must never break the caller
         logger = getattr(agent, "logger", None)
         if logger is not None:

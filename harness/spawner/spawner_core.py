@@ -25,7 +25,7 @@ from harness.fleet.coordinator import normalize_reuse_scope
 from harness.fleet.runtime import FleetAuthBarrier
 from harness.fleet.runtime import FleetClickGate
 from harness.fleet.runtime import PageLeaseManager
-from harness.observation.render_recovery import extract_page_id_from_values
+from harness.observation.browser_call import extract_page_id_from_values
 from runtime_config import RuntimeConfig
 from harness.lifecycle import default_lifecycle_manager
 from harness.schema_loader import CapabilityBundle

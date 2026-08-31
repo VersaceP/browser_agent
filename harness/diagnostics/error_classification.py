@@ -4,12 +4,10 @@ harness.diagnostics.error_classification - Structured browser/tool error hints.
 
 from typing import Any, Optional
 
-from harness.results.call_outcome import action_runtime_info
 from harness.results.call_outcome import public_action_failure
 from harness.constants import (
     API_CONTRACT_ERROR_MARKERS,
     PAGE_DEAD_OBSERVATION_MARKERS,
-    RENDER_LOST_MARKERS,
 )
 from harness.utils import JsonDict
 
@@ -44,12 +42,14 @@ SELECT_FAILURE_ACTIONS = {
 }
 
 
-# --- Structured runtime classification -------------------------------------
+# --- Structured public failure classification -------------------------------
 #
-# Current ABCP builds expose a stable public ``error.code``. Older builds may
-# still attach ``runtime``; prose matching remains the last compatibility path.
+# Every ABCP failure now arrives as a stable public ``error.code``. The private
+# ``runtime`` block (code/phase/sideEffectStarted/actionKind) is stripped at the
+# transport boundary, so there is nothing else to read; prose matching survives
+# only for the few harness-generated errors that never had a code.
 #
-# The code enum is ~70 entries and grows with the platform, so it is NOT
+# The code enum is 263 entries and grows with the platform, so it is NOT
 # transcribed here. Only codes that change what the harness DOES get an entry;
 # everything else is classified by its family (prefix/suffix), which is a
 # property of the naming contract rather than of any one code. An unrecognized
@@ -57,17 +57,15 @@ SELECT_FAILURE_ACTIONS = {
 # which is strictly more actionable than the "unknown" prose matching returns.
 
 _RUNTIME_CODE_TYPES = {
-    # ABCP publishes THREE distinct occlusion codes and the harness has to map
-    # every one of them: `occlusion_blocked` is what arms the automatic
-    # dismiss_overlay recovery in tools/browser_tools/auto_intercept.py, and a
-    # code that misses this table falls through to the generic family rule, so
-    # the recovery silently never fires. `target-occluded` was missing and is
-    # the one Input.click actually reports on the 1.1.9 surface.
+    # ABCP publishes two occlusion codes and the harness has to map both:
+    # `occlusion_blocked` is what arms the automatic dismiss_overlay recovery in
+    # tools/browser_tools/auto_intercept.py, and a code that misses this table
+    # falls through to the generic family rule, so the recovery silently never
+    # fires. `target-occluded` is the one Input.click actually reports.
     "occluded": ("occlusion_blocked", "refresh_dom_dismiss_overlay_then_retry_once"),
     "target-occluded": ("occlusion_blocked", "refresh_dom_dismiss_overlay_then_retry_once"),
-    "select-option-occluded": ("occlusion_blocked", "refresh_dom_dismiss_overlay_then_retry_once"),
-    "renderer-lost": ("render_lost", "retry_with_render_recovery_or_rebuild_page"),
-    "input-host-destroyed": ("render_lost", "retry_with_render_recovery_or_rebuild_page"),
+    "renderer-lost": ("render_lost", "rebuild_page_in_same_fleet_then_refresh_targets"),
+    "input-host-destroyed": ("render_lost", "rebuild_page_in_same_fleet_then_refresh_targets"),
     "stale-target": ("stale_target", "refresh_ax_tree_then_retarget_once"),
     "target-not-found": ("target_not_found", "refresh_ax_tree_then_retarget_once"),
     "scroll-target-not-found": ("target_not_found", "refresh_ax_tree_then_retarget_once"),
@@ -75,7 +73,9 @@ _RUNTIME_CODE_TYPES = {
     "target-frame-not-found": ("target_frame_not_found", "refresh_ax_tree_then_retarget_once"),
     "invalid-input": ("contract_error", "switch_method_or_report_platform_contract_bug"),
     "invalid-selector": ("contract_error", "switch_method_or_report_platform_contract_bug"),
-    "selector-ambiguous": ("target_ambiguous", "narrow_the_selector_or_use_a_canonical_id"),
+    "selector-matched-multiple-elements": (
+        "target_ambiguous", "narrow_the_selector_or_use_a_canonical_id",
+    ),
     "coordinate-conversion-failed": (
         "coordinate_unavailable", "stop_using_coordinates_and_target_by_id_or_selector",
     ),
@@ -105,31 +105,19 @@ _RUNTIME_CODE_FAMILIES = (
     ("select-", "select_failure", "reinspect_select_then_follow_returned_guidance"),
     ("scroll-", "scroll_failed", "inspect_viewport_then_correct_the_scroll_request"),
     ("input-", "input_surface_unavailable", "inspect_page_state_before_retrying_input"),
-    ("semantic-tree-", "contract_error", "switch_method_or_report_platform_contract_bug"),
+    ("semantic-tree-", "semantic_tree_unavailable", "reinspect_page_state_then_retry_semantic_tree"),
 )
 
 _TIMEOUT_SUFFIX = "-timeout"
 
-# The two verdicts the classifier reaches when NOTHING matched: they restate
-# "read the state and do what the platform said" and carry no information the
-# platform's own `suggested_prompt` does not already give the model. Every ABCP
-# 1.1.9 public code ships a prompt, so on the model-facing projection these are
-# duplication, not guidance. They stay in the internal classification (spawner
-# status, compaction and auto-intercept all read `errorClassification`) and are
-# hidden only from the model, and only when a platform prompt is present.
+# The verdict the classifier reaches when NOTHING matched: it restates "read the
+# state and do what the platform said" and carries no information the platform's
+# own `suggested_prompt` does not already give the model. Every public code ships
+# a prompt, so on the model-facing projection this is duplication, not guidance.
+# It stays in the internal classification (spawner status, compaction and
+# auto-intercept all read `errorClassification`) and is hidden only from the
+# model, and only when a platform prompt is present.
 GENERIC_PUBLIC_FALLBACK_ACTION = "inspect_page_state_then_follow_platform_guidance"
-GENERIC_RUNTIME_FALLBACK_ACTION = "inspect_page_state_then_choose_another_approach"
-GENERIC_SUGGESTED_ACTIONS = frozenset({
-    GENERIC_PUBLIC_FALLBACK_ACTION,
-    GENERIC_RUNTIME_FALLBACK_ACTION,
-})
-
-# When the browser had already begun dispatching input, no classification may
-# recommend a retry: the action may have taken effect and the receipt simply
-# never arrived.
-_SIDE_EFFECT_ACTION = "inspect_page_state_and_do_not_replay"
-
-
 # These are client-generated transport codes, not ABCP action-runtime codes.
 # Keep them separate from the platform's ``runtime.code`` taxonomy: a socket
 # that has already lost its reader cannot be recovered by another browser tool
@@ -165,54 +153,6 @@ _TRANSPORT_ERROR_TYPES = {
         "follow_method_specific_error_guidance",
     ),
 }
-
-
-def classify_runtime_error(runtime: Any, *, method: str = "") -> Optional[JsonDict]:
-    """Classify a failure from the platform's structured runtime block.
-
-    Returns None when there is no usable code, so the caller can fall back to
-    prose rather than manufacturing a verdict from an empty block.
-    """
-    if not isinstance(runtime, dict):
-        return None
-    code = str(runtime.get("code") or "").strip()
-    if not code or code == "unknown":
-        return None
-    phase = str(runtime.get("phase") or "").strip()
-    side_effect_started = runtime.get("sideEffectStarted") is True
-
-    mapped = _RUNTIME_CODE_TYPES.get(code)
-    if mapped is None and code in SELECT_FAILURE_ACTIONS:
-        mapped = ("select_failure", SELECT_FAILURE_ACTIONS[code])
-    if mapped is None:
-        for prefix, error_type, action in _RUNTIME_CODE_FAMILIES:
-            if code.startswith(prefix):
-                mapped = (error_type, action)
-                break
-    if mapped is None and code.endswith(_TIMEOUT_SUFFIX):
-        mapped = ("timeout", "retry_with_backoff_or_reduce_surface")
-    if mapped is None:
-        mapped = ("action_runtime_error", GENERIC_RUNTIME_FALLBACK_ACTION)
-
-    error_type, suggested_action = mapped
-    if code.endswith(_TIMEOUT_SUFFIX) and error_type == "action_runtime_error":
-        error_type = "timeout"
-    classification: JsonDict = {
-        "type": error_type,
-        "errorCode": code,
-        "suggested_action": (
-            _SIDE_EFFECT_ACTION if side_effect_started else suggested_action
-        ),
-        "method": str(method or ""),
-        "source": "action_runtime",
-        "sideEffectStarted": side_effect_started,
-    }
-    if phase:
-        classification["phase"] = phase
-    action_kind = str(runtime.get("actionKind") or "").strip()
-    if action_kind:
-        classification["actionKind"] = action_kind
-    return classification
 
 
 def classify_public_action_failure(
@@ -380,10 +320,10 @@ def classify_browser_error(
             "suggested_action": "refresh_dom_dismiss_overlay_then_retry_once",
             "method": method_name,
         }
-    if _contains(lower, "err_render_lost") or _contains_any(text, RENDER_LOST_MARKERS):
+    if _contains(lower, "err_render_lost"):
         return {
             "type": "render_lost",
-            "suggested_action": "retry_with_render_recovery_or_rebuild_page",
+            "suggested_action": "rebuild_page_in_same_fleet_then_refresh_targets",
             "method": method_name,
         }
     if _contains_any(text, PAGE_DEAD_OBSERVATION_MARKERS):
@@ -414,7 +354,7 @@ def classify_browser_error(
 def attach_error_classification(result: JsonDict, *, method: str = "") -> JsonDict:
     """Mutate and return result with `errorClassification` when an error exists.
 
-    Structured first: when the platform stated a runtime code, that is the
+    Structured first: when the platform stated a public error code, that is the
     verdict. HITL/pause is the one exception that still wins over it — a paused
     page blocks every further action regardless of which code the interrupted
     one reported, and treating it as an ordinary action failure would send the
@@ -449,15 +389,12 @@ def attach_error_classification(result: JsonDict, *, method: str = "") -> JsonDi
         return result
     message = _extract_error_message(result)
     public_failure = public_action_failure(result)
-    runtime = action_runtime_info(result)
     if message and _contains(
         message.lower(), "err_page_paused", "paused for human intervention"
     ):
         result["errorClassification"] = classify_browser_error(message, method=method)
         return result
     structured = classify_public_action_failure(public_failure, method=method)
-    if structured is None:
-        structured = classify_runtime_error(runtime, method=method)
     if structured is not None:
         result["errorClassification"] = structured
         return result

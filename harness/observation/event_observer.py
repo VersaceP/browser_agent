@@ -110,11 +110,11 @@ class BrowserEventObserver:
                 lifecycle_state = tracker.observe_event(name, event.get("payload"))
             if name in {"Page.navigate", "Page.recovered", "Page.crashed"}:
                 self._mark_invalidated(f"lifecycle_event:{name}")
-            if name in {"Page.open", "Page.close", "Page.closed"}:
+            if name in {"Page.open", "Page.close"}:
                 self._observe_page_inventory(name, event.get("payload"))
             if lifecycle_state is not None:
                 self._log("page.lifecycle.event", tracker.receipt(lifecycle_state.page_id))
-            if name in {"Hitl.paused", "Hitl.requested"}:
+            if name == "Hitl.paused":
                 self._claim_workflow_hitl(name, event.get("payload"))
             if name in {"Download.waiting", "Download.started",
                         "Download.progressed", "Download.stateChanged"}:

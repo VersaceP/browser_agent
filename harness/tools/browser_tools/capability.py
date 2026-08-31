@@ -13,7 +13,7 @@ from harness.observation.challenge_detector import detect_structural_challenge
 from harness.diagnostics.error_classification import attach_error_classification
 from harness.fleet.runtime import FleetClickGateTimeout
 from harness.offload import offload_large_tool_result
-from harness.observation.render_recovery import build_render_recovery_runner
+from harness.observation.browser_call import build_browser_call_runner
 from harness.runtime_evaluation import MAIN_WORLD_REQUIRED_PREFIX
 from harness.runtime_evaluation import RuntimeEvaluationService
 from harness.runtime_evaluation import runtime_last_resort_evidence
@@ -488,15 +488,14 @@ async def _execute_browser_capability_tool(
     hitl_pause_succeeded = False
     page_list_shown: Optional[List[JsonDict]] = None
     try:
-        runner = getattr(agent, "render_recovery_runner", None)
+        runner = getattr(agent, "browser_call_runner", None)
         if runner is None:
-            runner = build_render_recovery_runner(
+            runner = build_browser_call_runner(
                 browser=agent.browser,
                 logger=agent.logger,
                 capability_methods=agent.capability_methods,
-                recent_recoveries=agent._render_recovery_recent,
             )
-            agent.render_recovery_runner = runner
+            agent.browser_call_runner = runner
         # Sample the event serial + held page before the call so post-action
         # invalidation can detect a same-page DOM.axTreeUpdated that landed
         # mid-call (race fix) without letting a cross-page event suppress it.
@@ -531,7 +530,7 @@ async def _execute_browser_capability_tool(
                     {"redact_params": sensitive_params}
                     if sensitive_params else {}
                 )
-                response, _recovery = await runner.call(
+                response = await runner.call(
                     method, params, **runner_kwargs
                 )
             except ABCPTransportError as exc:
@@ -632,7 +631,7 @@ async def _execute_browser_capability_tool(
                         "signal": MAIN_WORLD_REQUIRED_PREFIX,
                     },
                 )
-                response, _recovery = await runner.call(method, main_params)
+                response = await runner.call(method, main_params)
                 runtime_receipt["attempts"].append(
                     _bt()._runtime_attempt_receipt(response, "main")
                 )
@@ -1097,15 +1096,14 @@ async def _invoke_browser_method(
         return hitl_claim_guard
     hitl_pause_succeeded = False
     try:
-        runner = getattr(agent, "render_recovery_runner", None)
+        runner = getattr(agent, "browser_call_runner", None)
         if runner is None:
-            runner = build_render_recovery_runner(
+            runner = build_browser_call_runner(
                 browser=agent.browser,
                 logger=agent.logger,
                 capability_methods=agent.capability_methods,
-                recent_recoveries=agent._render_recovery_recent,
             )
-            agent.render_recovery_runner = runner
+            agent.browser_call_runner = runner
         # Only forward redact_params when set, so runners that predate the kwarg
         # (test fakes) keep working for the common non-redacted path.
         runner_kwargs = {"redact_params": redact_params} if redact_params else {}
@@ -1128,7 +1126,7 @@ async def _invoke_browser_method(
                 step,
             )
         _bt()._page_lifecycle_before_action(agent, method, params)
-        response, _recovery = await runner.call(method, params, **runner_kwargs)
+        response = await runner.call(method, params, **runner_kwargs)
         _bt()._page_lifecycle_after_action(agent, method, params, response)
         response = agent._capture_artifacts(method, response)
         structural_challenge = detect_structural_challenge(method, response)

@@ -19,7 +19,7 @@ from harness.constants import WORKER_STATUS_FAILED
 from harness.diagnostics import status_category
 from harness.diagnostics.error_classification import attach_error_classification
 from harness.fleet.coordinator import FleetAssignment
-from harness.observation.render_recovery import extract_page_id_from_values
+from harness.observation.browser_call import extract_page_id_from_values
 from harness.evidence.extraction_artifacts import field_names_from_specs
 from harness.fast_path import assess_fast_path_candidate
 from harness.results.row_ledger import row_identity

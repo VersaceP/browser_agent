@@ -141,7 +141,7 @@ agent_harness.run()  step ∈ [1, max_steps]                    agent_harness.py
       │       │
       │       │  ┌─────────────────────────────────────────┐
       │       └─►│[CALL] runner.call(method, params)        │ ← 唯一真正打ABCP的点
-      │          │   (render_recovery_runner;含Download/   │
+      │          │   (browser_call_runner;含Download/       │
       │          │    Runtime main-world fallback)          │
       │          └─────────────────────────────────────────┘
       │       ╔══════════ 后置观察/补救(runner.call 之后) ═════════╗
@@ -627,7 +627,7 @@ is_file_control = method == "File.download" or method.startswith("Download.")
 ### F. 实际调用
 
 #### CALL · runner.call(method, params)(browser_tools:2481)
-- **逻辑**:经 `render_recovery_runner` 调 ABCP。含 Download.start 超时对账、Runtime.evaluate main-world fallback(条件触发二次 call)。
+- **逻辑**:经 `browser_call_runner` 调 ABCP。含 Download.start 超时对账、Runtime.evaluate main-world fallback(条件触发二次 call)；统一入口负责响应进入 harness 前的敏感值脱敏，不再自动重放渲染恢复。
 - **作用**:**唯一 model-initiated 的落地点**。所有前置门都是为了保证这一刻的调用合法、安全、不过期、不重复、不越权;所有后置门都是为了消化这一刻的返回。
 - ⚠️ **这不是全库唯一打 ABCP 的点**。harness 自发起的调用走另一条独立链路 `_invoke_browser_method`(见 [F.bis](#fbis-内部调用路径-_invoke_browser_methodbrowser_tools2907)),带一套更薄的门,成建制地绕过 P1-P3 / P5-P10 / P13-P17。这是设计意图,但意味着门禁**不是全覆盖**的。
 

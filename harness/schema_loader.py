@@ -1,15 +1,11 @@
 """
 harness.schema_loader - Capability discovery and per-method schema loading.
 
-System.getCapabilities returns method names and descriptions but NOT the
-full parameter schema (paramsSchema is null for every method on current
-ABCP builds). To know which methods require `purpose`, what fields are
-required, and what hints to use when auto-filling, we must enumerate the
-capability list and call System.describeAction per method.
-
-Current servers return ``agentGuide`` plus catalog/guide revisions from
-System.getCapabilities. The earlier ``skillsGuide`` response and
-``System.skillsDoc`` pseudo-capability remain readable for compatibility.
+System.getCapabilities returns one compact summary per Action (method,
+description, requiresPurpose) plus the catalog/guide revisions and, on request,
+the Agent guide. It does NOT return input schemas, so to know what fields are
+required and what hints to use when auto-filling we enumerate the capability
+list and call System.describeAction per method.
 
 This module is the single source of truth for that two-call bootstrap.
 """
@@ -25,9 +21,6 @@ from abcp_client import ABCPClient, ABCPTransportError
 from harness.utils import JsonDict, RunLogger
 
 
-SKILLS_DOC_CAPABILITY = "System.skillsDoc"
-
-
 @dataclass
 class CapabilityBundle:
     """All capability/schema info derived at bootstrap. Passed by reference
@@ -38,7 +31,7 @@ class CapabilityBundle:
     method_schemas: Dict[str, JsonDict] = field(default_factory=dict)
     methods_requiring_purpose: Set[str] = field(default_factory=set)
     purpose_hints: Dict[str, str] = field(default_factory=dict)
-    skills_doc: str = ""
+    agent_guide: str = ""
     catalog_revision: str = ""
     guide_revision: str = ""
 
@@ -57,12 +50,11 @@ async def load_capability_bundle(
     """Discover all server capabilities and load their schemas.
 
     Steps:
-      1. System.getCapabilities — enumerate methods, harvest the skillsDoc
-         markdown shipped via the System.skillsDoc pseudo-capability.
-      2. For every real method (skipping the pseudo-capability and any
-         entry in `blocked_methods`), load cached System.describeAction output
-         from `schema_cache_dir` when available, otherwise call
-         System.describeAction.
+      1. System.getCapabilities — enumerate methods and harvest the Agent
+         guide markdown.
+      2. For every method not in `blocked_methods`, load cached
+         System.describeAction output from `schema_cache_dir` when available,
+         otherwise call System.describeAction.
       3. Build the indices the rest of the harness consumes.
       4. If `schemas_dir` is set, persist one JSON per method for offline
          debugging and ad-hoc local_fs_search recall.
@@ -81,7 +73,7 @@ async def load_capability_bundle(
             "System.getCapabilities", {"guide": "omit"}
         )
     raw_capabilities = _capability_actions_from_response(caps_response)
-    bundle.skills_doc = _skills_doc_from_capabilities_response(caps_response)
+    bundle.agent_guide = _agent_guide_from_capabilities_response(caps_response)
     revisions = _capability_revisions_from_response(caps_response)
     bundle.catalog_revision = revisions["catalogRevision"]
     bundle.guide_revision = revisions["guideRevision"]
@@ -94,12 +86,6 @@ async def load_capability_bundle(
             continue
         method = str(cap.get("method") or "").strip()
         if not method:
-            continue
-        if method == SKILLS_DOC_CAPABILITY:
-            # Pseudo-capability: the description IS the markdown manual.
-            description = str(cap.get("description") or "")
-            if description.strip():
-                bundle.skills_doc = description
             continue
         if method in blocked:
             continue
@@ -118,25 +104,18 @@ async def load_capability_bundle(
 
     cache_read_started = time.monotonic()
     methods_missing_cache: List[str] = []
-    capabilities_by_method = {
-        str(cap.get("method") or "").strip(): cap
-        for cap in bundle.capabilities
-        if isinstance(cap, dict) and str(cap.get("method") or "").strip()
-    }
     for method in methods_to_describe:
         cached_schema = _read_cached_schema(schema_cache_dir, method)
-        live_capability = capabilities_by_method.get(method) or {}
-        live_revision = str(live_capability.get("actionRevision") or "").strip()
-        cached_revision = str(
-            (cached_schema.get("actionRevision") or "")
+        cached_catalog_revision = str(
+            (cached_schema.get("catalogRevision") or "")
             if isinstance(cached_schema, dict)
             else ""
         ).strip()
-        # A revision mismatch is a targeted cache miss. When the live catalog
-        # does not advertise revisions (legacy Dispatcher), retain the old
-        # digest/generation-based cache behavior.
+        # The platform publishes one catalogRevision, not per-Action revisions.
+        # Once it changes, every cached descriptor belongs to the old contract.
         if cached_schema is None or (
-            live_revision and cached_revision != live_revision
+            bundle.catalog_revision
+            and cached_catalog_revision != bundle.catalog_revision
         ):
             methods_missing_cache.append(method)
             continue
@@ -162,13 +141,17 @@ async def load_capability_bundle(
             data = resp.get("data") if isinstance(resp, dict) else None
             if not isinstance(data, dict):
                 return
-            live_revision = str(
-                (capabilities_by_method.get(method) or {}).get("actionRevision")
-                or ""
-            ).strip()
-            if live_revision and not data.get("actionRevision"):
-                data = dict(data)
-                data["actionRevision"] = live_revision
+            returned_revision = str(data.get("catalogRevision") or "").strip()
+            if bundle.catalog_revision and returned_revision != bundle.catalog_revision:
+                logger.write(
+                    "schema.describeAction.stale_catalog",
+                    {
+                        "method": method,
+                        "expectedCatalogRevision": bundle.catalog_revision,
+                        "returnedCatalogRevision": returned_revision or None,
+                    },
+                )
+                return
             _ingest_method_schema(bundle, method, data)
 
         # describeAction is read-only; describe in parallel (bounded) so
@@ -191,7 +174,7 @@ async def load_capability_bundle(
             "capability_count": len(bundle.capability_methods),
             "schema_count": len(bundle.method_schemas),
             "requires_purpose_count": len(bundle.methods_requiring_purpose),
-            "skills_doc_chars": len(bundle.skills_doc),
+            "agent_guide_chars": len(bundle.agent_guide),
             "catalogRevision": bundle.catalog_revision or None,
             "guideRevision": bundle.guide_revision or None,
             "schemas_dir": str(schemas_dir) if schemas_dir else None,
@@ -208,43 +191,34 @@ async def load_capability_bundle(
 
 
 def _capability_actions_from_response(response: Any) -> List[JsonDict]:
-    """Return callable capability entries from old and new ABCP shapes.
-
-    Older builds returned ``data`` as a bare list of capability dictionaries.
-    Current builds return ``data.actions`` and put the skills guide beside it
-    as ``data.skillsGuide``. The harness must accept both shapes; otherwise the
-    schema bundle is empty and purpose auto-fill / method discovery silently
-    degrade.
-    """
+    """Return the callable capability entries from ``data.actions``."""
     if not isinstance(response, dict):
         return []
     data = response.get("data")
-    raw_actions: Any
-    if isinstance(data, list):
-        raw_actions = data
-    elif isinstance(data, dict):
-        raw_actions = data.get("actions")
-    else:
-        raw_actions = []
+    raw_actions = data.get("actions") if isinstance(data, dict) else []
     if not isinstance(raw_actions, list):
         return []
     return [item for item in raw_actions if isinstance(item, dict)]
 
 
-def _skills_doc_from_capabilities_response(response: Any) -> str:
+def _agent_guide_from_capabilities_response(response: Any) -> str:
+    """Read ``data.agentGuide`` — ``{format: 'content'|'path', value}``.
+
+    A bare string is accepted because ``guide: "path"`` and ``guide: "content"``
+    both hand back a single value the caller renders the same way.
+    """
     if not isinstance(response, dict):
         return ""
     data = response.get("data")
-    if isinstance(data, dict):
-        guide = data.get("agentGuide")
-        if guide is None:
-            guide = data.get("skillsGuide")
-        if isinstance(guide, dict):
-            value = guide.get("value")
-            if isinstance(value, str) and value.strip():
-                return value
-        if isinstance(guide, str) and guide.strip():
-            return guide
+    if not isinstance(data, dict):
+        return ""
+    guide = data.get("agentGuide")
+    if isinstance(guide, dict):
+        value = guide.get("value")
+        if isinstance(value, str) and value.strip():
+            return value
+    if isinstance(guide, str) and guide.strip():
+        return guide
     return ""
 
 
@@ -315,16 +289,12 @@ def _ingest_method_schema(
 
 
 def _schema_object_variants(schema: JsonDict) -> List[JsonDict]:
-    """Object-variant views of a describeAction schema.
+    """Object-variant views of a describeAction ``inputSchema``.
 
-    Two describeAction generations exist:
-
-    - Legacy agent view: a flat ``params`` map of per-name specs where each
-      spec carries its own ``required`` boolean.
-    - JSON-Schema views (``inputSchema`` or a bare schema): either a plain
-      object schema (``properties`` + ``required`` list) or a union whose top
-      level is ``anyOf``/``oneOf`` over object branches (e.g. Download.start's
-      direct-URL vs page-reservation variants).
+    The schema is either a plain object (``properties`` + ``required`` list) or
+    a union whose top level is ``anyOf``/``oneOf`` over object branches (e.g.
+    Download.start's direct-URL vs page-reservation variants). A bare schema is
+    accepted so a cached branch can be passed in directly.
 
     Returns one ``{properties, required}`` dict per object branch; empty for
     shapes that expose neither.
@@ -358,22 +328,14 @@ def _schema_object_variants(schema: JsonDict) -> List[JsonDict]:
 
 
 def schema_param_specs(schema: JsonDict) -> Dict[str, JsonDict]:
-    """Normalized per-parameter specs across schema generations.
+    """Normalized per-parameter specs from a describeAction ``inputSchema``.
 
     Returns ``{name: spec}`` where every spec carries a boolean ``required``.
-    For union schemas a name is required only when EVERY branch requires it
-    (mirroring the platform's own agent-view merge), and differing branch
-    specs are preserved under ``spec["anyOf"]``.
+    For union schemas a name is required only when EVERY branch requires it,
+    and differing branch specs are preserved under ``spec["anyOf"]``.
     """
     if not isinstance(schema, dict):
         return {}
-    params = schema.get("params")
-    if isinstance(params, dict) and params:
-        return {
-            str(name): dict(spec)
-            for name, spec in params.items()
-            if isinstance(spec, dict)
-        }
     variants = _schema_object_variants(schema)
     if not variants:
         return {}

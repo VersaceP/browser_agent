@@ -20,7 +20,7 @@ from harness.local_fs import local_fs_read
 from harness.local_fs import local_fs_search
 from harness.observation.page_lifecycle import PageLifecycleTracker
 from harness.pacing import wait_between_rows
-from harness.observation.render_recovery import build_render_recovery_runner
+from harness.observation.browser_call import build_browser_call_runner
 from harness.runtime_evaluation import RuntimeEvaluationService
 from harness.tool_policy import hidden_harness_tools_for_task_type
 from harness.tools.registry import ToolContext
@@ -187,17 +187,16 @@ async def _page_lifecycle_guard_before(
             "outcome": settled,
         })
         if settled == "timeout":
-            runner = getattr(agent, "render_recovery_runner", None)
+            runner = getattr(agent, "browser_call_runner", None)
             if runner is None:
-                runner = build_render_recovery_runner(
+                runner = build_browser_call_runner(
                     browser=agent.browser,
                     logger=agent.logger,
                     capability_methods=agent.capability_methods,
-                    recent_recoveries=agent._render_recovery_recent,
                 )
-                agent.render_recovery_runner = runner
+                agent.browser_call_runner = runner
             try:
-                response, _recovery = await runner.call("Page.getState", {
+                response = await runner.call("Page.getState", {
                     "pageId": page_id,
                     "purpose": "One-shot resynchronization after settlement event timeout",
                 })
