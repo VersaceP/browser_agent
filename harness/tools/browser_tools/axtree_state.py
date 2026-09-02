@@ -72,7 +72,73 @@ AXTREE_INVALIDATING_METHODS = {
     "Input.scroll",
     "Input.drag",
     "Hitl.requestPause",
+    # Inspecting a custom select can open its menu and walk it with real key
+    # presses (not always - the platform skips both when its exploration cache
+    # is still valid and the menu is already open, and select-popup-ambiguous
+    # is raised while resolving the target, before any key). The receipt does
+    # not say which happened, so this is fail-closed: exempted only on positive
+    # proof - see _inspect_select_left_page_untouched.
+    "DOM.inspectSelect",
 }
+
+
+# Both select Actions can operate a CUSTOM control by driving its menu with a
+# bounded loop of ArrowDown presses (orchestrator exploreMenu), plus an Escape
+# to restore it. A native control is handled by one dispatch instead. "Can",
+# not "does": the loop is what makes a mid-call event unusable as proof, and
+# a call that skipped it is indistinguishable from the receipt.
+_KEYBOARD_DRIVEN_SELECT_METHODS = frozenset({"DOM.inspectSelect", "Input.select"})
+
+
+def _select_control_is_native(result: JsonDict) -> bool:
+    """True only when this select Action provably ran the native single-dispatch path.
+
+    Proof is positive, never absence of evidence: `controlKind` is a required
+    field of the select RESULT, so it exists only when the Action succeeded,
+    and `native` is the one kind the platform reads or sets without opening and
+    walking a menu. A failure envelope carries error/observation and no
+    controlKind, so it never qualifies - and it must not, because a select
+    failure can arrive after keys were already sent.
+    """
+    return str(_response_data(result).get("controlKind") or "") == "native"
+
+
+def _inspect_select_left_page_untouched(result: JsonDict) -> bool:
+    """True for a DOM.inspectSelect that provably did not touch the page.
+
+    Only the native read qualifies; see _select_control_is_native. Method-gated
+    by the caller, because Input.select returns the same field and changes the
+    page even on a native control.
+    """
+    return _select_control_is_native(result)
+
+
+def _event_may_supersede_invalidation(method: str, result: JsonDict) -> bool:
+    """Whether a mid-call DOM.axTreeUpdated can stand in for this call's mutation.
+
+    The supersession argument is causal, not merely temporal: the browser
+    emitted that update BECAUSE of this action, so it describes the page after
+    it. Neither select Action can support that argument.
+
+    * A custom control is driven by a LOOP - exploreMenu presses ArrowDown up
+      to MAX_EXPLORATION_KEYS times, each press mutating the menu - so an
+      update from during the call may describe the menu several keys ago.
+    * A native control mutates once, but selectNative reads the control BEFORE
+      it writes (and skips the write when the value already matches), so an
+      update from that leading read predates the mutation.
+
+    Nothing in the receipt orders event against last side effect, so neither
+    claims supersession. The cost is one extra DOM.getAXTree on a select that
+    happened to race an event; the alternative is handing the model ids read
+    from a half-walked menu or a pre-write control.
+
+    The same question is open for every other entry in
+    AXTREE_INVALIDATING_METHODS, whose supersession rests on the same causal
+    assumption. That is a pre-existing decision about the whole set and is
+    deliberately NOT changed here - narrowing it for select is justified by
+    evidence specific to these two Actions.
+    """
+    return method not in _KEYBOARD_DRIVEN_SELECT_METHODS
 
 
 def _precompute_axtree_snapshot(
@@ -535,7 +601,11 @@ def _observe_axtree_state_after(
         return
 
     if method in AXTREE_INVALIDATING_METHODS and not (
-        method == "Runtime.evaluate" and read_only_eval
+        (method == "Runtime.evaluate" and read_only_eval)
+        or (
+            method == "DOM.inspectSelect"
+            and _inspect_select_left_page_untouched(result)
+        )
     ):
         # Message-ordering race: if a same-page DOM.axTreeUpdated arrived DURING
         # this call (notification dispatched before the action response — a legal
@@ -550,7 +620,9 @@ def _observe_axtree_state_after(
         #    observer accepts ANY page's event onto an empty baseline, so without
         #    this gate a bootstrapped other-page snapshot could suppress this
         #    page's invalidation (page_before == event page guards against it).
-        if event_serial_before is not None:
+        if event_serial_before is not None and _event_may_supersede_invalidation(
+            method, result
+        ):
             event_serial_now = int(getattr(agent, "axtree_event_serial", 0) or 0)
             event_page = str(getattr(agent, "axtree_event_page_id", "") or "")
             held_page = str(page_before or "")

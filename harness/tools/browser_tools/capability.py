@@ -1121,6 +1121,12 @@ async def _invoke_browser_method(
         lifecycle_guard = await _bt()._page_lifecycle_guard_before(agent, method, params)
         if lifecycle_guard is not None:
             return lifecycle_guard
+    # The select contract's one mechanical rule: while a control's last
+    # selection has failed, every selection on it is refused here rather than
+    # dispatched and regretted on the receipt.
+    select_replay_guard = _bt()._select_replay_guard_before(agent, method, params)
+    if select_replay_guard is not None:
+        return select_replay_guard
     _bt()._ensure_hitl_request_reason(method, params, str(params.get("purpose") or ""))
     page_create_claim_guard, page_create_takeover_claimed = (
         await _bt()._claim_ownerless_fleet_auth_barrier_for_page_create(

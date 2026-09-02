@@ -696,7 +696,14 @@ def _visual_hint_ineligible_reason(
         classification.get("type")
         if isinstance(classification, dict) else ""
     )
-    return visual_recovery_ineligible_reason(ctype)
+    # The code travels with the type. `select_failure` covers twelve codes
+    # whose answers are not all on screen, and the type alone cannot tell them
+    # apart; every other class ignores the second argument.
+    code = (
+        classification.get("errorCode")
+        if isinstance(classification, dict) else ""
+    )
+    return visual_recovery_ineligible_reason(ctype, code)
 
 
 def _attach_visual_recovery_hint(
@@ -751,16 +758,27 @@ def _attach_visual_recovery_hint(
         },
         "resultPolicy": {
             "resolvedId": (
-                "The pixel was promoted to a canonical id. Act on that id with"
-                " the ordinary Input.*/DOM.* methods — it survives a relayout"
-                " that a coordinate does not."
+                "The pixel was promoted to a canonical id: a handle on the AX"
+                " node that covered it, which survives a relayout that a"
+                " coordinate does not. It is NOT a permit for any Action."
+                " What it proves is where the node is, not what the node is,"
+                " so choose the method by what the node actually is and let"
+                " the live schema accept the id: a button takes Input.click,"
+                " a text field takes Input.type, a scrollable ancestor takes"
+                " Input.scroll, and Input.select takes the CONTROL — never an"
+                " option id, which is what a visual locate on an open menu"
+                " most often returns. Re-observe afterwards either way."
             ),
             "cssPoint": (
                 "No node covers the pixel (a genuine structured-surface blind"
                 " spot), but the capture's scale and origin were proven. This"
-                " is a viewport CSS point: ONE Input.click{pageId,x,y}, then"
-                " re-observe to verify the outcome. Never persist a coordinate"
-                " into a skill or reuse it after the page changes."
+                " is a viewport CSS point, and a point is only clickable:"
+                " ONE Input.click{pageId,x,y}, then re-observe to verify the"
+                " outcome. That is a limit of what a coordinate CAN express,"
+                " not a rule about visual recovery — a resolvedId reaches"
+                " whichever methods that node's own role supports. Never"
+                " persist a coordinate into a skill or reuse it after the"
+                " page changes."
             ),
             "coordinateRefused": (
                 "The geometry could not be proven, so no point is offered."

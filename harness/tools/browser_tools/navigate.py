@@ -23,6 +23,8 @@ from harness.results.call_outcome import domain_state_read_succeeded
 from harness.results.call_outcome import evaluate_grant
 from harness.results.call_outcome import page_state_evidence_ok
 from harness.results.call_outcome import public_failure_details
+from harness.diagnostics.error_classification import SELECT_FAILURE_GUIDANCE
+from harness.diagnostics.error_classification import SELECT_FAILURE_RETRY_LIMITS
 from harness.observation.overlay_detector import detect_overlay_from_result
 from harness.observation.overlay_detector import title_looks_like_auth_page
 from harness.observation.page_lifecycle import AUTOMATION_UNAVAILABLE_FAILURE
@@ -1932,31 +1934,384 @@ def _transport_error_metadata(
         metadata["rpcData"] = public_failure
     return metadata
 
-_SELECT_FAILURE_RETRY_LIMITS: Dict[str, int] = {
-    # Rebuilt select contract (2026-08 platform generation). Retry budget is
-    # 1 only for "your request did not match the CURRENT option window"
-    # codes; every popup-mutation/takeover code is 0 because the platform's
-    # own prompts require continuing with one generic Input.click/type/scroll
-    # after re-observing, never an automatic Input.select replay.
-    "select-option-not-in-current-window": 1,
-    "select-option-id-unavailable": 1,
-    "select-option-label-ambiguous": 1,
-    "select-agent-takeover-required": 0,
-    "select-popup-not-ready": 0,
-    "select-popup-not-found": 0,
-    "select-popup-ambiguous": 0,
-    "select-popup-relation-changed": 0,
-    "select-option-id-proof-unavailable": 0,
-    "select-option-disabled": 0,
-    "select-target-not-select": 0,
-    "select-selection-mode-unknown": 0,
-    "select-multiple-unsupported": 0,
-    "select-control-kind-mismatch": 0,
-    "select-state-restore-failed": 0,
-    "select-final-state-unproven": 0,
+# Harness next_instruction for a failed select Action, keyed by public code.
+# The platform codes are a PROJECTION of SELECT_FAILURE_POLICY - the single
+# declaration that also produces the two action maps and the retry budget - so
+# a code can no longer carry a recovery action but no prose, which is how
+# select-option-not-in-current-window silently lost both.
+#
+# The prose is method-neutral on purpose. The ladder for a given failure is the
+# same whether an inspection or a selection hit it, and Input.select failures
+# used to reach the model with a bare selectRecovery block and no ladder at all.
+#
+# The one extra key is harness-synthesized, not a platform code: ABCP can
+# return a generic -32005 with no public select reason.
+#
+# Named for the two methods it serves, not for inspect alone: it was
+# _INSPECT_SELECT_GUIDANCE while only inspect read it, and that name is part of
+# why nobody noticed Input.select failures were leaving without any prose.
+_SELECT_PLATFORM_ACTION_FAILED = "inspect-select-platform-action-failed"
+
+_SELECT_FAILURE_NEXT_INSTRUCTION: Dict[str, str] = {
+    **SELECT_FAILURE_GUIDANCE,
+    _SELECT_PLATFORM_ACTION_FAILED: (
+        "ABCP returned a generic -32005 failure without a public select"
+        " reason code. Do not repeat the same Action automatically or infer"
+        " a selector from this error text. The failed Action may still have"
+        " re-rendered or opened the control, so discard prior element ids"
+        " and re-observe first. A custom popup may be rendered through a"
+        " portal outside the control subtree: use fresh"
+        " DOM.getSemanticTree/AX evidence to relate aria-controls,"
+        " aria-owns, or aria-activedescendant to a page-wide"
+        " listbox/option surface. Only a selector independently returned by"
+        " that fresh semantic evidence may be used. Then perform at most one"
+        " generic Input.click/Input.press/Input.type action. Its success"
+        " receipt does NOT prove a popup opened: require a fresh visible"
+        " related popup before calling Input.select."
+    ),
 }
 
+
+def _select_call_locators(params: JsonDict, result: JsonDict = None) -> frozenset:
+    """Every name this call used for the control, plus the one ABCP returned.
+
+    The model may inspect by selector and select by id, so the association
+    between a failure and the inspection that clears it cannot be keyed on a
+    single field. `controlId` is added from a successful inspection because it
+    is the platform's own name for the control and the most likely bridge
+    between two differently-phrased calls.
+    """
+    names = set()
+    for key in ("id", "selector"):
+        value = str((params or {}).get(key) or "").strip()
+        if value:
+            names.add(value)
+    if isinstance(result, dict):
+        control_id = str(_bt()._response_data(result).get("controlId") or "").strip()
+        if control_id:
+            names.add(control_id)
+    return frozenset(names)
+
+
+def _select_page_epoch(agent: Any, page_id: str) -> int:
+    """The navigation epoch this control identity belongs to.
+
+    Element ids do not survive a navigation, so neither may an alias learned
+    before one. ProgressAccountant already counts these per page; reading it
+    here rather than inventing a second counter keeps one notion of "epoch" in
+    the harness.
+    """
+    progress = getattr(agent, "progress", None)
+    epochs = getattr(progress, "navigation_epochs", None)
+    if not isinstance(epochs, dict):
+        return 0
+    try:
+        return int(epochs.get(str(page_id or "") or "__global__", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _select_drop_superseded_epochs(agent: Any, page_id: str, epoch: int) -> None:
+    """Forget everything this page recorded before its current navigation.
+
+    Both stores are per (page, epoch), and neither can be consulted again once
+    the page moves on - so keeping them is growth, one set of rows per
+    navigation, for the life of the worker.
+
+    The failure ledger's staleness is not only a memory question. Its key
+    carries the epoch, so an old row can no longer block or count; but leaving
+    it there means a long task accumulates dead rows, and the prune has to run
+    somewhere that a single-locator inspection still reaches - the alias
+    learner returns early when it has fewer than two names, and doing it there
+    meant a page that navigated and was then inspected by id alone kept its old
+    rows forever.
+    """
+    for attribute in ("_select_control_aliases", "_select_failure_ledger"):
+        store = getattr(agent, attribute, None)
+        if not isinstance(store, dict):
+            continue
+        for stale in [
+            key for key in store
+            if len(key) >= 2 and key[0] == page_id and key[1] != epoch
+        ]:
+            store.pop(stale, None)
+
+
+def _select_learn_control_aliases(
+    agent: Any, page_id: str, epoch: int, locators: frozenset
+) -> None:
+    """Record that these names all denote ONE control, per the platform.
+
+    A successful DOM.inspectSelect is the only thing that can say this: the
+    caller's `id`/`selector` and the `controlId` ABCP resolved them to came
+    back from the same resolution. Without this the "control-level" block was
+    control-level in name only - the API lets a caller pass id alone or
+    selector alone, so failing by selector and then selecting by id walked
+    straight past a guard that compared raw locator sets.
+
+    What is learned here is applied at exactly one place: the moment a failure
+    is recorded, which freezes every then-known name of that control into the
+    ledger row. The guard and the clear path read those raw names.
+    """
+    if len(locators) < 2:
+        return
+    store = getattr(agent, "_select_control_aliases", None)
+    if not isinstance(store, dict):
+        store = {}
+        setattr(agent, "_select_control_aliases", store)
+    groups = store.setdefault((page_id, epoch), [])
+    merged = set(locators)
+    remaining = []
+    for group in groups:
+        if group & merged:
+            merged |= group
+        else:
+            remaining.append(group)
+    remaining.append(merged)
+    store[(page_id, epoch)] = remaining
+
+
+def _select_expand_locators(
+    agent: Any, page_id: str, epoch: int, locators: frozenset
+) -> frozenset:
+    """Every name known to denote the same control as one of these.
+
+    Only aliases learned in THIS page epoch count. Where nothing has linked two
+    names, they stay unlinked and the block does not reach across them - the
+    harness cannot prove they are the same element, and pretending otherwise
+    would be a guarantee it has no basis for.
+    """
+    store = getattr(agent, "_select_control_aliases", None)
+    if not isinstance(store, dict):
+        return locators
+    expanded = set(locators)
+    for group in store.get((page_id, epoch), []):
+        if group & expanded:
+            expanded |= group
+    return frozenset(expanded)
+
+
+def _select_failure_count(entry: Any) -> int:
+    """Failure count from a ledger entry, tolerating the pre-tuple shape."""
+    if isinstance(entry, tuple) and entry:
+        return int(entry[0] or 0)
+    return int(entry or 0)
+
+
+def _select_replay_blocked(agent: Any, params: JsonDict) -> Optional[JsonDict]:
+    """The unresolved failure that forbids selecting this control, if any.
+
+    Scoped to the CONTROL, not to the exact request. An earlier version keyed
+    this on a fingerprint of the `selections` payload so that "a different
+    option" would pass straight through, and that was wrong three ways at once:
+
+      * it contradicted the harness's own L5 rule, which the worker prompt
+        states in the same session - when a dispatched state-changing action
+        has an uncertain outcome, changing the params does NOT make a second
+        dispatch safe. A select failure never says whether keys were sent, so
+        the outcome is precisely uncertain;
+      * one ledger row held one fingerprint, so a second failure on the same
+        control overwrote the first and un-blocked it;
+      * it made the guard's own test assert the contradiction as intended
+        behaviour, which is worse than having no guard.
+
+    Blocking every selection on that control costs the model nothing it is
+    entitled to: the contract already requires a fresh DOM.inspectSelect before
+    the corrected attempt, and that inspection is what clears this.
+
+    How far "the control" reaches is bounded by what the harness can PROVE. The
+    API accepts an id alone or a selector alone, so two calls can name one
+    element with disjoint locator sets. A successful inspection links the names
+    it was given to the `controlId` ABCP resolved (see
+    _select_learn_control_aliases), and the block follows that link within the
+    same navigation epoch. Where no inspection ever linked two names, they stay
+    unlinked and this does not reach across them - which is a real limit, not a
+    hole to paper over: the harness has no evidence they are the same element,
+    and claiming otherwise would be the kind of guarantee that reads as
+    mechanical and is not.
+    """
+    ledger = getattr(agent, "_select_failure_ledger", None)
+    if not isinstance(ledger, dict):
+        return None
+    page_id = str((params or {}).get("pageId") or "")
+    epoch = _select_page_epoch(agent, page_id)
+    # Raw locators, deliberately. Expansion happens ONCE, when the failure is
+    # recorded, so the ledger already holds every name known to denote that
+    # control at that moment. Expanding again here changed no outcome - the
+    # only aliases it could add are ones learned by an inspection since, and an
+    # inspection clears the block outright - so it was a second copy of the
+    # rule that could not fail: dead code wearing a safeguard's clothes.
+    locators = _select_call_locators(params)
+    for key, entry in ledger.items():
+        if not isinstance(entry, tuple) or len(entry) < 3:
+            continue
+        blocked, failure_locators = entry[1], entry[2]
+        # The epoch is part of the key. A failure recorded before a navigation
+        # describes a page that no longer exists: its uncertain side effect
+        # cannot still be pending on the document now loaded, and the harness
+        # already forces re-observation across a navigation by other means. An
+        # earlier version compared pageId alone and called the resulting
+        # over-block "fail-closed" - which held for the BLOCK and was simply
+        # wrong for the COUNT, since a budget burnt on the old page then denied
+        # the new one its one corrected attempt.
+        if not blocked or key[:2] != (page_id, epoch):
+            continue
+        if not (locators & failure_locators):
+            continue
+        return {"errorCode": key[3], "controlTarget": key[2], "failureCount": entry[0]}
+    return None
+
+
+def _select_clear_replay_block(
+    agent: Any, page_id: str, epoch: int, locators: frozenset
+) -> List[JsonDict]:
+    """Lift the replay block this inspection has just earned, and SAY so.
+
+    An entry qualifies only when the inspection names the same control - any
+    shared locator, including the platform's own controlId. No shared name
+    means no proof and no lift: the model that inspects one element and selects
+    a different one is exactly the case a bookkeeping shortcut would get wrong.
+
+    "After the failure" needs no check of its own: this runs ONLY from a
+    successful inspection, so an inspection that happened before the failure
+    lifts nothing simply because there was no ledger entry then. An earlier
+    version carried an explicit ordering comparison that could never be true -
+    a safeguard in appearance, dead code in fact.
+
+    Two things this must keep straight, because conflating them is what the
+    previous version got wrong:
+
+      * the BLOCK is about state. It asks "is the outcome of the last
+        selection still unknown?", and a successful inspection answers that for
+        every code, including the ones whose retry budget is zero. So the block
+        lifts here regardless of budget - but it is REPORTED every single time,
+        because a permission that changes silently is how a mechanical signal
+        stops meaning anything. The zero-budget codes used to have their
+        fingerprint retired before the budget check and then be dropped from
+        the report: block gone, receipt silent.
+      * the BUDGET is about advice. `retryAllowed` says whether selecting again
+        is a licensed recovery for this code at all, and it stays False for a
+        zero-budget code even though the block is gone. The ladder in
+        next_instruction is still the recovery.
+
+    The row is kept (blocked -> False) rather than deleted, so the failure
+    COUNT survives: deleting it turned fail -> inspect -> fail -> inspect into
+    an unbounded retry loop wearing the budget's clothes.
+    """
+    ledger = getattr(agent, "_select_failure_ledger", None)
+    if not isinstance(ledger, dict):
+        return []
+    cleared: List[JsonDict] = []
+    for key, entry in list(ledger.items()):
+        if not isinstance(entry, tuple) or len(entry) < 3:
+            continue
+        failures, blocked, failure_locators = entry[0], entry[1], entry[2]
+        if not blocked or key[:2] != (page_id, epoch):
+            continue
+        if not (locators & failure_locators):
+            continue
+        ledger[key] = (failures, False, failure_locators)
+        budget = SELECT_FAILURE_RETRY_LIMITS.get(key[3], 0)
+        retry_allowed = failures <= budget
+        cleared.append({
+            "errorCode": key[3],
+            "controlTarget": key[2],
+            "replayBlockLifted": True,
+            "retryAllowed": retry_allowed,
+            "retriesRemaining": max(0, budget - failures + 1),
+            "scope": (
+                "One corrected Input.select using only fields THIS response"
+                " returned. It is not a licence to replay the previous"
+                " request."
+            ) if retry_allowed else (
+                "The state is re-observed, so this control is no longer"
+                " refused before dispatch - but this code licenses no"
+                " corrected selection. Follow next_instruction from the"
+                " failure instead of selecting again."
+            ),
+        })
+    return cleared
+
+
+def _select_replay_guard_before(
+    agent: Any, method: str, params: JsonDict
+) -> Optional[JsonDict]:
+    """Refuse any Input.select on a control whose last selection failed.
+
+    The one place the select contract is mechanically enforced rather than
+    advised. It exists because `replayForbidden=True` was a hard claim with no
+    hard backing: the model could resend the identical selection immediately,
+    and the harness would dispatch it and then explain afterwards why it should
+    not have.
+
+    Refusing before dispatch is what makes the refusal worth anything - the
+    keys are not sent, so `tool_was_executed` is False and the model can act on
+    that without compensating for a side effect. Only a fresh
+    DOM.inspectSelect lifts it; naming a different option does not, because the
+    harness's own L5 rule says changing params cannot make a second dispatch
+    safe while the first one's outcome is unknown.
+    """
+    if method != "Input.select":
+        return None
+    blocked = _select_replay_blocked(agent, params)
+    if blocked is None:
+        return None
+    error_code = str(blocked.get("errorCode") or "")
+    logger = getattr(agent, "logger", None)
+    if logger is not None and hasattr(logger, "write"):
+        logger.write("browser.call.select_replay_blocked", blocked)
+    return {
+        "status": "rejected",
+        "policy_violation": "select_replay_without_fresh_inspection",
+        "tool_was_executed": False,
+        "error": (
+            f"This control's last selection failed with {error_code} on"
+            f" {blocked.get('controlTarget')}, and that failure does not say"
+            " whether keys were sent. Changing the option does not make a"
+            " second dispatch safe while the outcome is unknown, so this"
+            " Input.select was NOT dispatched. Re-observe first."
+        ),
+        "selectRecovery": {
+            "errorCode": error_code,
+            "controlTarget": blocked.get("controlTarget"),
+            "failureCount": blocked.get("failureCount"),
+            "retryAllowed": False,
+            "retryUnlockedBy": (
+                "a successful DOM.inspectSelect on this control, whose receipt"
+                " will carry selectReplayBlockCleared. Until then no selection"
+                " on this control is dispatched, whichever option it names."
+            ),
+        },
+        "next_instruction": _SELECT_FAILURE_NEXT_INSTRUCTION.get(
+            error_code,
+            "Re-observe the control before selecting again.",
+        ),
+    }
+
+
 def _apply_select_failure_guidance(
+    agent: Any,
+    method: str,
+    params: JsonDict,
+    result: JsonDict,
+) -> JsonDict:
+    """Attach select recovery, then report the block state as it now stands.
+
+    The state has to be read AFTER the body, on every return path. The flag
+    used to be written at the top as `method == "Input.select"`, which is not a
+    state at all - it made a successful selection with an empty ledger report
+    that it was blocked, advertising a policy as if it were a fact about this
+    control right now.
+    """
+    outcome = _apply_select_failure_guidance_inner(agent, method, params, result)
+    if isinstance(outcome, dict):
+        guard = outcome.get("selectGuard")
+        if isinstance(guard, dict) and method == "Input.select":
+            guard["blockedNow"] = _select_replay_blocked(agent, params) is not None
+    return outcome
+
+
+def _apply_select_failure_guidance_inner(
     agent: Any,
     method: str,
     params: JsonDict,
@@ -1967,15 +2322,35 @@ def _apply_select_failure_guidance(
     if not isinstance(result, dict):
         return result
     if method in {"DOM.inspectSelect", "Input.select"}:
-        # This generation validates request shape and suppresses automatic
-        # select retries, but it does not yet maintain a successful-inspection
-        # ledger capable of proving that a custom popup is still the same open
-        # generation. Make that boundary explicit instead of presenting prompt
-        # guidance as a mechanical guarantee.
+        # `freshInspectAssociationEnforced` used to be a hard False while the
+        # very same receipt handed out retryAllowed=True beside a
+        # replayForbidden=True classification - three mechanical signals, two
+        # of them contradicting each other, and the tie broken only by prose.
+        # Every flag here has to name something a reader can go and find. The
+        # previous pair failed that twice over: `freshInspectAssociationEnforced`
+        # was a hard False beside a live retryAllowed=True, and then a hard
+        # True whose only backing was advisory text - `selectRetryUnlocked` was
+        # written onto an inspect receipt and read by nobody.
+        #
+        # What is enforced now is narrow and real: while a control's last
+        # selection has failed, EVERY Input.select on it is refused before
+        # dispatch (_select_replay_guard_before) - naming a different option
+        # does not help, because L5 says changing params cannot make a second
+        # dispatch safe while the first outcome is unknown. A successful
+        # DOM.inspectSelect lifts it, and says so on its receipt.
+        #
+        # Everything above that stays advisory: the harness cannot prove the
+        # popup is the same open generation - the platform's relationId is not
+        # in the public projection - so a fresh inspection proves
+        # re-observation happened, not that the menu is unchanged.
         result["selectGuardMode"] = "advisory"
         result["selectGuard"] = {
             "requestShapeValidated": method == "Input.select",
-            "freshInspectAssociationEnforced": False,
+            # POLICY, not state: this Action is subject to the pre-dispatch
+            # block. Whether it is blocked RIGHT NOW is `blockedNow`, written
+            # by the wrapper after the ledger has been updated. The two used to
+            # be one field, so a successful selection reported itself blocked.
+            "selectionBlockPolicyApplies": method == "Input.select",
             "popupVisibilityEnforced": False,
             "genericInputFallbackAvailable": True,
         }
@@ -1986,65 +2361,8 @@ def _apply_select_failure_guidance(
             if isinstance(classification, dict)
             else ""
         )
-        inspect_guidance: Dict[str, str] = {
-            "select-popup-not-found": (
-                "The popup could not be bound through standard accessibility"
-                " relationships. Refresh DOM.getAXTree, then use generic"
-                " Input.click/Input.type/Input.scroll with fresh targets; do"
-                " not retry the same inspect immediately."
-            ),
-            "select-popup-ambiguous": (
-                "Multiple popup candidates matched the control. Re-observe"
-                " with DOM.getAXTree/DOM.getSemanticTree and disambiguate"
-                " before acting."
-            ),
-            "select-popup-not-ready": (
-                "The popup could not be observed as visible and stable and was"
-                " left in its current state. Do not immediately repeat"
-                " DOM.inspectSelect; read the popup with DOM.getSemanticTree"
-                " first, then continue with one bounded generic action."
-            ),
-            "select-popup-relation-changed": (
-                "The control no longer points to the observed popup. Read"
-                " DOM.getAXTree and the current popup with"
-                " DOM.getSemanticTree, then continue with one bounded generic"
-                " action."
-            ),
-            "select-target-not-select": (
-                "This element is not an ABCP-supported select control. Do not"
-                " call Input.select for it. A visible multi-column"
-                " category/list browser is ordinary non-select UI: traverse it"
-                " with fresh AXTree targets plus one verified Input.click per"
-                " visible level."
-            ),
-            "select-selection-mode-unknown": (
-                "The platform could not determine the selection mode. Report"
-                " this ABCP select contract failure with this receipt."
-            ),
-            "select-state-restore-failed": (
-                "The control's open/selection/scroll state could not be"
-                " restored after inspection. Re-observe the control before"
-                " continuing; do not assume the pre-inspect state."
-            ),
-            "inspect-select-platform-action-failed": (
-                "ABCP returned a generic -32005 failure without a public"
-                " inspectSelect reason code. Do not repeat the same inspect"
-                " automatically or infer a selector from this error text."
-                " The failed Action may still have re-rendered or opened the"
-                " control, so discard prior element ids and re-observe first."
-                " A custom popup may be rendered through a portal outside the"
-                " control subtree: use fresh DOM.getSemanticTree/AX evidence"
-                " to relate aria-controls, aria-owns, or"
-                " aria-activedescendant to a page-wide listbox/option surface."
-                " Only a selector independently returned by that fresh"
-                " semantic evidence may be used. Then perform at most one"
-                " generic Input.click/Input.press/Input.type action. Its"
-                " success receipt does NOT prove a popup opened: require a"
-                " fresh visible related popup before calling Input.select."
-            ),
-        }
-        if error_code in inspect_guidance:
-            result["next_instruction"] = inspect_guidance[error_code]
+        if error_code in _SELECT_FAILURE_NEXT_INSTRUCTION:
+            result["next_instruction"] = _SELECT_FAILURE_NEXT_INSTRUCTION[error_code]
             result["selectRecovery"] = {
                 "errorCode": error_code,
                 "retryAllowed": False,
@@ -2052,69 +2370,64 @@ def _apply_select_failure_guidance(
             return result
         if _bt()._invoke_result_failed(result):
             return result
-        # Success path: translate the new optionWindow/popup envelope into
-        # bounded next-step facts and invalidate cached AX ids when this
-        # inspection itself changed what the page exposes.
+        # Success path. The keyboard-driven contract returns controlId /
+        # controlKind / selectionMode / options and nothing else: optionWindow,
+        # popup and expanded were all removed, and with them every signal this
+        # branch used to read. Reading them anyway did not fail loudly - it
+        # silently stopped invalidating the AX snapshot.
         data = _bt()._response_data(result)
-        option_window = (
-            data.get("optionWindow")
-            if isinstance(data.get("optionWindow"), dict) else {}
-        )
-        coverage = (
-            option_window.get("coverage")
-            if isinstance(option_window.get("coverage"), dict) else {}
-        )
-        coverage_kind = str(coverage.get("kind") or "")
-        popup = data.get("popup") if isinstance(data.get("popup"), dict) else {}
-        popup_state = str(popup.get("state") or "")
-        expanded = data.get("expanded") if isinstance(data.get("expanded"), dict) else {}
-        opened_by_action = popup.get("openedByAction") is True
-        popup_retained = (
-            popup_state == "open"
-            and str(popup.get("retainedBecause") or "") == "agent-exploration-required"
-        )
-        window_moved = (
-            expanded.get("before") != expanded.get("after")
-            or opened_by_action
-            or popup_retained
-        )
-        if window_moved:
-            # Inspection may have opened (and deliberately retained) the
-            # popup: visible DOM and option-id windows changed, so cached
-            # AX ids from the pre-inspect snapshot are no longer trustworthy.
-            # A pure native-select read changes nothing and must NOT
-            # invalidate.
-            _invalidate_axtree_snapshot(
-                agent,
-                "dom.inspect_select_opened_popup",
-                {"pageId": params.get("pageId")},
-            )
-        facts: Dict[str, Any] = {
-            "controlKind": data.get("controlKind"),
-            "selectionMode": data.get("selectionMode"),
-            "coverageKind": coverage_kind or None,
-            "popupState": popup_state or None,
-            "popupId": popup.get("id") if popup_state == "open" else None,
-            "popupOpenedByAction": opened_by_action or None,
-            "axtreeInvalidated": bool(window_moved) or None,
+        control_kind = str(data.get("controlKind") or "")
+        options = data.get("options") if isinstance(data.get("options"), list) else []
+        # Facts the result states, and nothing derived from them. A custom
+        # inspect USUALLY drives the menu with real key presses, but not always:
+        # when the platform's exploration cache is still valid and the menu was
+        # already expanded, it opens nothing, walks nothing, and restores
+        # nothing. `controlKind` is what the contract guarantees, so a
+        # "this call sent keys" flag would be an assertion the receipt cannot
+        # support - and the reader already has controlKind.
+        #
+        # The snapshot itself is handled by _observe_axtree_state_after, which
+        # runs after this and can see a mid-call DOM.axTreeUpdated that this
+        # function cannot. Invalidating here would bypass that.
+        result["selectWindow"] = {
+            "controlId": data.get("controlId"),
+            "controlKind": data.get("controlKind") or None,
+            "selectionMode": data.get("selectionMode") or None,
+            "optionCount": len(options),
         }
-        result["selectWindow"] = facts
-        if coverage_kind == "current-window":
+        # This is the event a corrected retry waits for. Matched on every name
+        # this call used plus the controlId ABCP returned, because the
+        # selection that failed may have named the control differently.
+        #
+        # Clearing the entry is what makes the lift one-shot: a second
+        # inspection re-announces nothing because there is nothing still
+        # blocked. A permission that can be re-harvested is not a permission.
+        page_id = str(params.get("pageId") or "")
+        epoch = _select_page_epoch(agent, page_id)
+        locators = _select_call_locators(params, result)
+        # Before anything else, and unconditionally: an inspection that returns
+        # only one usable name still proves this page is on a new epoch, and
+        # the alias learner would return early before pruning.
+        _select_drop_superseded_epochs(agent, page_id, epoch)
+        _select_learn_control_aliases(agent, page_id, epoch, locators)
+        cleared = _select_clear_replay_block(agent, page_id, epoch, locators)
+        if cleared:
+            result["selectReplayBlockCleared"] = cleared
+        if control_kind == "custom":
+            # The platform's own suggested_prompt carries the startOption
+            # continuation token when exploration is incomplete; it travels in
+            # the same result and must not be restated or contradicted here.
+            # This says only what the platform cannot know: which harness-held
+            # state a custom inspection may have invalidated.
             result["next_instruction"] = (
-                "This option window is incomplete (searchable, scrollable,"
-                " paginated, or virtualized) and Input.select will NOT explore"
-                " it. Keep the popup open and combine DOM.getSemanticTree"
-                " (popup.id) with ONE generic Input.type/Input.scroll/"
-                " Input.click action per step, re-inspecting after every"
-                " mutation; use only freshly returned options."
-            )
-        elif popup_state == "open":
-            result["next_instruction"] = (
-                "Use only the returned current option ids or exact labels with"
-                " Input.select. The popup is open; explore it with"
-                " DOM.getSemanticTree via popup.id, and after every mutation"
-                " inspect again - option ids are only valid for the popup"
-                " generation that exposed them."
+                "Inspecting a custom select can drive its menu with real key"
+                " presses, so element ids captured before this call may be"
+                " stale: read DOM.getAXTree again before targeting anything"
+                " else on this page. Pass a returned option id, exact label, or"
+                " explicit value straight to Input.select without converting"
+                " between those fields. If this response's suggested_prompt"
+                " asks to continue exploring, repeat this Action with the"
+                " startOption it names instead of starting over."
             )
         return result
     if method != "Input.select":
@@ -2123,9 +2436,33 @@ def _apply_select_failure_guidance(
     page_id = str(params.get("pageId") or "")
     ledger = getattr(agent, "_select_failure_ledger", None)
     if not _bt()._invoke_result_failed(result):
+        # Clear by CONTROL, matching the locator set the row carries - the same
+        # comparison the guard and the clear path already use. This was the one
+        # place still keying on the raw `target` string, so a selection that
+        # succeeded under the control's id left a failure recorded under its
+        # selector standing: the next failure counted as the second, and a
+        # budget of one was spent by a control that had meanwhile worked.
         if isinstance(ledger, dict):
-            for key in list(ledger):
-                if key[:2] == (page_id, target):
+            locators = _select_call_locators(params)
+            # Prune first, then match on the control. An epoch comparison in
+            # the loop below would change no outcome once the prune has run -
+            # a stale row can neither block nor count anywhere else - so it
+            # would be one more line that reads like a safeguard and cannot
+            # fail. The prune, by contrast, is the only thing that clears a
+            # page's rows when the worker navigates and then simply selects
+            # again without inspecting.
+            _select_drop_superseded_epochs(
+                agent, page_id, _select_page_epoch(agent, page_id)
+            )
+            for key, entry in list(ledger.items()):
+                if key[0] != page_id:
+                    continue
+                known = (
+                    entry[2]
+                    if isinstance(entry, tuple) and len(entry) >= 3
+                    else frozenset({key[2]})
+                )
+                if locators & known:
                     ledger.pop(key, None)
         return result
     classification = result.get("errorClassification")
@@ -2134,21 +2471,59 @@ def _apply_select_failure_guidance(
         if isinstance(classification, dict)
         else ""
     )
-    max_retries = _SELECT_FAILURE_RETRY_LIMITS.get(error_code)
+    max_retries = SELECT_FAILURE_RETRY_LIMITS.get(error_code)
     if max_retries is None:
         return result
+    # The same ladder the inspect path gets. A selection failure used to leave
+    # with a bare selectRecovery block - a code, a count and a boolean - while
+    # the prose explaining what to do about that code went only to inspections.
+    # `next_instruction` is set only when nothing upstream wrote one, because
+    # an earlier layer that already spoke saw more of this call than this does.
+    if error_code in _SELECT_FAILURE_NEXT_INSTRUCTION and not str(
+        result.get("next_instruction") or ""
+    ).strip():
+        result["next_instruction"] = _SELECT_FAILURE_NEXT_INSTRUCTION[error_code]
     if not isinstance(ledger, dict):
         ledger = {}
         setattr(agent, "_select_failure_ledger", ledger)
-    key = (page_id, target, error_code)
-    failures = int(ledger.get(key) or 0) + 1
-    ledger[key] = failures
-    retry_allowed = failures <= max_retries
-    result["selectRecovery"] = {
+    epoch = _select_page_epoch(agent, page_id)
+    _select_drop_superseded_epochs(agent, page_id, epoch)
+    key = (page_id, epoch, target, error_code)
+    failures = int(_select_failure_count(ledger.get(key))) + 1
+    ledger[key] = (
+        failures,
+        True,
+        _select_expand_locators(agent, page_id, epoch, _select_call_locators(params)),
+    )
+    # retryAllowed is False on the failure itself - always, for every code.
+    # The action for the retryable codes is "reinspect the current window THEN
+    # retry once", and at this instant that reinspection has not happened: the
+    # inspection the model is holding is the one whose data just turned out to
+    # be stale. Saying True here put "you may select again" on the same receipt
+    # as replayForbidden=True, and left the model to break the tie on prose.
+    #
+    # The permission is issued later, on the successful DOM.inspectSelect that
+    # actually clears the condition, as `selectRetryUnlocked`.
+    budget_left = failures <= max_retries
+    recovery: JsonDict = {
         "errorCode": error_code,
         "failureCount": failures,
         "maxRetries": max_retries,
-        "retryAllowed": retry_allowed,
+        "retryAllowed": False,
         "controlTarget": target,
     }
+    if budget_left:
+        recovery["retryUnlockedBy"] = (
+            "a successful DOM.inspectSelect on this control. Its receipt will"
+            " carry selectReplayBlockCleared. Until then no selection on this"
+            " control is dispatched, whichever option it names."
+        )
+    else:
+        recovery["retryUnlockedBy"] = (
+            "nothing - the retry budget for this code is exhausted. A fresh"
+            " DOM.inspectSelect still lifts the pre-dispatch block (the state"
+            " becomes known again) but licenses no corrected selection:"
+            " recover with the ladder in next_instruction."
+        )
+    result["selectRecovery"] = recovery
     return result

@@ -31,7 +31,9 @@ Use only the column for the active connection. Names are intentionally transport
 
 ### CLI Profile and Output
 
-Pair through stdin once, then begin discovery with `abcp actions list`.
+Pair a User invitation through stdin with `abcp pair`; it contains the local socket and writes the CLI Profile. The CLI registers automatically before normal commands.
+
+To select a runtime explicitly, pass its current `dispatcher-host.json` with `--runtime <path>` and use a Profile from the same Dispatcher.
 
 The CLI pairing Profile identifies and authenticates the Agent connection. It is not a browser fingerprint Profile. Profile selection follows this order: `--profile`, `ABCP_PROFILE`, then `~/.abcp/profiles/default.json`. Treat the Profile as a private credential and do not print, copy, or record its contents.
 
@@ -132,9 +134,9 @@ If an Input Action reports that a target cannot be used, inspect the current pag
 For select-like controls:
 
 - call `DOM.inspectSelect` when the choices or current selection mode are unknown;
-- use the returned option `value` for a native select, or the returned option `id` or exact `label` for a custom select, then call `Input.select` with the final selection set;
-- for a multiple select, submit the complete set that should remain selected;
-- after opening, clicking, or another page change, discard previous option references and inspect again;
+- preserve the returned field semantics: native selects require `value`; custom selects match `id`, exact `label`, or an explicitly returned `value` without converting between fields;
+- only when Select feedback requests continued exploration, repeat the same Action and pass back its returned `startOption` (keep the same `selections` for `Input.select`);
+- treat custom `Input.select.selected` as the choices recorded during its keyboard operation, and inspect again when later page behavior makes the state uncertain;
 - after a failure or uncertain result, inspect the current state before continuing and do not automatically replay an input that may have changed the page.
 
 For file-upload controls:

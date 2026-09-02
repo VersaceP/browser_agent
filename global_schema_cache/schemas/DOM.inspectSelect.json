@@ -1,8 +1,8 @@
 {
   "method": "DOM.inspectSelect",
-  "description": "Inspects the current select state and options without changing the selection.",
+  "description": "Inspects native options directly or explores supported custom select options with the keyboard without selecting them.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:cfd8fb90a7d277b16cad96ea1f17db4c9f7bafbbb87796e52dd73fdf68732998",
+  "catalogRevision": "sha256:4348a1a737674c20d6554ae434ea98050c0d5fee0d58837d1609a4b3e2d64b91",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -17,6 +17,49 @@
         "type": "string",
         "minLength": 1
       },
+      "startOption": {
+        "description": "Optional custom-select exploration starting point returned by a previous Select action. Native selects ignore this field.",
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "value"
+            ],
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "label"
+            ],
+            "additionalProperties": true
+          }
+        ]
+      },
       "pageId": {
         "type": "string",
         "format": "uuid",
@@ -27,7 +70,7 @@
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "string",
         "minLength": 1,
-        "description": "Inspect a select before choosing an option. Use the returned value, option ID, or exact label in Input.select."
+        "description": "Use the returned id, label, or explicit value without converting between fields. Reuse a returned startOption only when the feedback requests continued exploration."
       }
     },
     "required": [
@@ -61,30 +104,13 @@
         ],
         "description": "Whether one or multiple options may be selected."
       },
-      "expanded": {
-        "type": "object",
-        "properties": {
-          "before": {
-            "type": "boolean"
-          },
-          "after": {
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "before",
-          "after"
-        ],
-        "additionalProperties": false,
-        "description": "Select expanded state before and after inspection."
-      },
       "options": {
         "type": "array",
         "items": {
           "type": "object",
           "properties": {
             "id": {
-              "description": "Current canonical option ID when available.",
+              "description": "Stable option ID exposed by the current select menu.",
               "type": "string"
             },
             "label": {
@@ -92,7 +118,7 @@
               "description": "Normalized option label."
             },
             "value": {
-              "description": "Native option value when available.",
+              "description": "Native value or an explicit custom option value when available.",
               "type": "string"
             },
             "selected": {
@@ -118,7 +144,6 @@
       "controlId",
       "controlKind",
       "selectionMode",
-      "expanded",
       "options"
     ],
     "additionalProperties": false
@@ -159,30 +184,13 @@
             ],
             "description": "Whether one or multiple options may be selected."
           },
-          "expanded": {
-            "type": "object",
-            "properties": {
-              "before": {
-                "type": "boolean"
-              },
-              "after": {
-                "type": "boolean"
-              }
-            },
-            "required": [
-              "before",
-              "after"
-            ],
-            "additionalProperties": false,
-            "description": "Select expanded state before and after inspection."
-          },
           "options": {
             "type": "array",
             "items": {
               "type": "object",
               "properties": {
                 "id": {
-                  "description": "Current canonical option ID when available.",
+                  "description": "Stable option ID exposed by the current select menu.",
                   "type": "string"
                 },
                 "label": {
@@ -190,7 +198,7 @@
                   "description": "Normalized option label."
                 },
                 "value": {
-                  "description": "Native option value when available.",
+                  "description": "Native value or an explicit custom option value when available.",
                   "type": "string"
                 },
                 "selected": {
@@ -216,7 +224,6 @@
           "controlId",
           "controlKind",
           "selectionMode",
-          "expanded",
           "options"
         ],
         "additionalProperties": false,
@@ -272,5 +279,5 @@
     ],
     "additionalProperties": false
   },
-  "purposeHint": "Inspect a select before choosing an option. Use the returned value, option ID, or exact label in Input.select."
+  "purposeHint": "Use the returned id, label, or explicit value without converting between fields. Reuse a returned startOption only when the feedback requests continued exploration."
 }

@@ -27,6 +27,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from harness.diagnostics.error_classification import (
+    select_failure_visual_locate_useful,
+)
+
 # Failure classes visual perception genuinely cannot repair.
 #
 # Anything NOT listed here is eligible, including the generic `action_failure`
@@ -60,19 +64,42 @@ _INELIGIBLE_TYPES = frozenset({
 })
 
 
-def visual_recovery_ineligible_reason(classification_type: Any) -> str:
+def visual_recovery_ineligible_reason(
+    classification_type: Any, error_code: Any = ""
+) -> str:
     """Return why this failure class is beyond visual recovery, else "".
 
     Takes the `errorClassification.type` the harness already computed, so the
     public error code is read through one taxonomy rather than re-matched here
     against prose. An empty/missing type is eligible: an unclassified failure is
     not evidence that looking at the page is pointless.
+
+    The select codes are too coarse to answer by class. They divide into
+    families whose answers differ: "the menu exists and nothing can name it"
+    and "the option nodes could not be parsed" are textbook visual-locate
+    cases, while "the option you asked for is disabled" or "the selection mode
+    is unknown" are settled by evidence the model already holds. Hinting at
+    pixels for those sends it looking for an answer it has. That verdict is
+    declared beside the rest of each code's policy in SELECT_FAILURE_POLICY
+    and read here BY CODE, so it applies on every classification path rather
+    than only the one whose type happens to be `select_failure`.
     """
     ctype = str(classification_type or "").strip().lower()
     if ctype in _INELIGIBLE_TYPES:
         return f"class_not_visually_recoverable:{ctype}"
+    # Keyed on the CODE, not on the type. The structured path labels every
+    # select failure `select_failure`, but the prose fallback labels the same
+    # failure `select_option_disabled` (the code with hyphens swapped), and a
+    # type-gated refinement silently stopped applying on that path - the whole
+    # per-code policy was live in tests and dead in half the runtime. The code
+    # is the stable identifier across both, and across any path added later.
+    code = str(error_code or "").strip()
+    if code.startswith("select-") and not select_failure_visual_locate_useful(code):
+        return f"select_answer_is_structured_not_visual:{code}"
     return ""
 
 
-def is_visually_recoverable(classification_type: Any) -> bool:
-    return not visual_recovery_ineligible_reason(classification_type)
+def is_visually_recoverable(
+    classification_type: Any, error_code: Any = ""
+) -> bool:
+    return not visual_recovery_ineligible_reason(classification_type, error_code)

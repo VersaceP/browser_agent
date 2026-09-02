@@ -2,7 +2,7 @@
   "method": "Memory.list",
   "description": "Lists memory summaries visible to the registered Agent.",
   "requiresPurpose": false,
-  "catalogRevision": "sha256:cfd8fb90a7d277b16cad96ea1f17db4c9f7bafbbb87796e52dd73fdf68732998",
+  "catalogRevision": "sha256:4348a1a737674c20d6554ae434ea98050c0d5fee0d58837d1609a4b3e2d64b91",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",

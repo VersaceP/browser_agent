@@ -400,9 +400,13 @@ def _expected_artifact_schema() -> JsonDict:
         "type": "array",
         "minItems": 1,
         "description": (
-            "Required business controls for form_filling/form_interaction."
-            " Emit one artifact row per stable controlKey; every row must"
-            " include a non-empty filledValue read back from the page."
+            "ONLY for form_filling/form_interaction when the requested"
+            " deliverable is one artifact row per independent business"
+            " control. Every row uses a stable controlKey and a non-empty"
+            " filledValue read back from the page. Do NOT use this for"
+            " incidental search/pagination/download controls or for fields"
+            " within product/file/listing rows; use fields/required_fields"
+            " and nonempty_fields for those row contracts instead."
         ),
         "items": {
             "type": "object",
@@ -808,6 +812,167 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
         "additionalProperties": True,
     }
     return schema
+
+
+def _repair_task_plan_schema(_: Any = None) -> JsonDict:
+    """Schema for a small edit against the latest rejected plan candidate."""
+    return {
+        "type": "object",
+        "description": (
+            "Repair the latest mechanically rejected emit_task_plan candidate "
+            "without regenerating its full plan JSON. Paths are RFC 6901 JSON "
+            "Pointers relative to the plan object, for example "
+            "'/phases/0/expected_artifact/requiredControls'. set replaces an "
+            "existing value; remove deletes an existing object property, never "
+            "an array element. For remove, provide value:null because "
+            "conservative tool schemas do not express op-specific required "
+            "fields."
+        ),
+        "properties": {
+            "baseCandidateHash": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "candidateHash from the immediately preceding mechanical "
+                    "rejection; prevents applying an edit to stale plan input."
+                ),
+            },
+            "operations": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 16,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "op": {"type": "string", "enum": ["set", "remove"]},
+                        "path": {"type": "string", "minLength": 2},
+                        "value": {
+                            "description": (
+                                "Replacement for set; null placeholder for remove."
+                            ),
+                        },
+                    },
+                    "required": ["op", "path", "value"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["baseCandidateHash", "operations"],
+        "additionalProperties": False,
+    }
+
+
+def _json_pointer_parts(path: Any) -> Tuple[Optional[List[str]], Optional[str]]:
+    """Parse a deliberately small, non-root JSON Pointer for plan repair."""
+    if not isinstance(path, str) or not path.startswith("/") or path == "/":
+        return None, "path must be a non-root RFC 6901 JSON Pointer"
+    parts: List[str] = []
+    for raw_part in path[1:].split("/"):
+        if not raw_part:
+            return None, "path must not contain an empty property segment"
+        decoded: List[str] = []
+        index = 0
+        while index < len(raw_part):
+            char = raw_part[index]
+            if char != "~":
+                decoded.append(char)
+                index += 1
+                continue
+            if index + 1 >= len(raw_part) or raw_part[index + 1] not in {"0", "1"}:
+                return None, "path has an invalid RFC 6901 escape"
+            decoded.append("~" if raw_part[index + 1] == "0" else "/")
+            index += 2
+        parts.append("".join(decoded))
+    return parts, None
+
+
+def _repair_list_index(token: str, size: int) -> Optional[int]:
+    if not token.isdigit():
+        return None
+    index = int(token)
+    return index if 0 <= index < size else None
+
+
+def _apply_task_plan_repair(
+    candidate: JsonDict,
+    operations: Any,
+) -> Tuple[Optional[JsonDict], List[str]]:
+    """Apply bounded replacement/removal edits without synthesizing structure."""
+    if not isinstance(operations, list) or not operations:
+        return None, ["operations must be a non-empty array"]
+    repaired = copy.deepcopy(candidate)
+    errors: List[str] = []
+    seen_paths = set()
+    for index, operation in enumerate(operations):
+        where = f"operations[{index}]"
+        if not isinstance(operation, dict):
+            errors.append(f"{where} must be an object")
+            continue
+        op = str(operation.get("op") or "").strip()
+        if op not in {"set", "remove"}:
+            errors.append(f"{where}.op must be 'set' or 'remove'")
+            continue
+        parts, path_error = _json_pointer_parts(operation.get("path"))
+        if path_error is not None or parts is None:
+            errors.append(f"{where}.path {path_error or 'is invalid'}")
+            continue
+        path = str(operation["path"])
+        if path in seen_paths:
+            errors.append(f"{where}.path duplicates a prior repair operation")
+            continue
+        seen_paths.add(path)
+
+        parent: Any = repaired
+        invalid_parent = False
+        for part in parts[:-1]:
+            if isinstance(parent, dict):
+                if part not in parent:
+                    errors.append(f"{where}.path does not exist at {part!r}")
+                    invalid_parent = True
+                    break
+                parent = parent[part]
+            elif isinstance(parent, list):
+                list_index = _repair_list_index(part, len(parent))
+                if list_index is None:
+                    errors.append(f"{where}.path has invalid list index {part!r}")
+                    invalid_parent = True
+                    break
+                parent = parent[list_index]
+            else:
+                errors.append(f"{where}.path crosses a scalar value at {part!r}")
+                invalid_parent = True
+                break
+        if invalid_parent:
+            continue
+
+        leaf = parts[-1]
+        if isinstance(parent, dict):
+            if leaf not in parent:
+                errors.append(
+                    f"{where}.path must reference an existing value; emit a "
+                    "complete revised plan to add new structure"
+                )
+                continue
+            if op == "remove":
+                del parent[leaf]
+            else:
+                parent[leaf] = copy.deepcopy(operation.get("value"))
+        elif isinstance(parent, list):
+            list_index = _repair_list_index(leaf, len(parent))
+            if list_index is None:
+                errors.append(f"{where}.path has invalid list index {leaf!r}")
+                continue
+            if op == "remove":
+                errors.append(
+                    f"{where}.path cannot remove an array element; array "
+                    "deletion/reordering is structural and requires a materially "
+                    "changed complete plan"
+                )
+            else:
+                parent[list_index] = copy.deepcopy(operation.get("value"))
+        else:
+            errors.append(f"{where}.path parent is not an object or array")
+    return (None, errors) if errors else (repaired, [])
 
 
 def _extend_task_plan_schema(_: Any = None) -> JsonDict:
@@ -1353,7 +1518,11 @@ async def execute_lead_tool(agent: Any, tool_call: JsonDict) -> Tuple[JsonDict, 
     soft_rejected = (
         isinstance(result, dict) and result.get("tool_was_executed") is False
     )
-    return result, (action.terminal and not soft_rejected)
+    force_terminal = bool(
+        result.pop("_terminate_lead", False)
+        if isinstance(result, dict) else False
+    )
+    return result, (force_terminal or (action.terminal and not soft_rejected))
 
 
 @LEAD_TOOLS.register(
@@ -1376,9 +1545,17 @@ async def _lead_emit_task_plan(ctx: ToolContext) -> JsonDict:
     if rejection is not None:
         ctx.agent.logger.write("task_plan.rejected", rejection)
         return rejection
+    unchanged = ctx.agent.unchanged_plan_candidate_rejection(raw_plan)
+    if unchanged is not None:
+        ctx.agent.logger.write("task_plan.rejected", unchanged)
+        return unchanged
     review = await ctx.agent.review_task_plan_candidate(raw_plan)
     if review.get("status") == "mechanical_invalid":
-        result = ctx.agent.plan_schema_rejection(review.get("errors"))
+        result = ctx.agent.plan_schema_rejection(
+            review.get("errors"),
+            raw_plan=raw_plan,
+            repair_issues=review.get("repairIssues"),
+        )
         ctx.agent.logger.write("task_plan.rejected", result)
         return result
     if review.get("status") == "rejected":
@@ -1395,6 +1572,90 @@ async def _lead_emit_task_plan(ctx: ToolContext) -> JsonDict:
         return result
     return ctx.agent.accept_task_plan(
         raw_plan,
+        plan_validator_review=(
+            review
+            if review.get("status")
+            in {"approved", "operational_continuation", "error"}
+            else None
+        ),
+    )
+
+
+@LEAD_TOOLS.register(
+    name="repair_task_plan",
+    description=(
+        "Apply small set/remove JSON-Pointer edits to the latest mechanically "
+        "rejected task-plan candidate, then validate and accept the repaired "
+        "complete plan. Use after emit_task_plan reports candidateUnchanged; "
+        "never guess a baseCandidateHash or use it for semantic review findings."
+    ),
+    input_schema=_repair_task_plan_schema,
+    loop_guard=False,
+)
+async def _lead_repair_task_plan(ctx: ToolContext) -> JsonDict:
+    base_hash = str(ctx.tool_input.get("baseCandidateHash") or "").strip()
+    candidate = ctx.agent.last_mechanical_plan_candidate(base_hash)
+    if candidate is None:
+        return {
+            "status": "failed",
+            "error": "mechanically rejected plan candidate is unavailable",
+            "errorCode": "task_plan_repair_base_unavailable",
+            "candidateHash": base_hash or None,
+            "next_instruction": (
+                "Use the candidateHash from the latest task_plan_schema_invalid "
+                "or task_plan_candidate_unchanged result. If the candidate has "
+                "changed since then, emit one complete revised plan instead."
+            ),
+        }
+    repaired, patch_errors = _apply_task_plan_repair(
+        candidate,
+        ctx.tool_input.get("operations"),
+    )
+    if repaired is None:
+        return {
+            "status": "failed",
+            "error": "task_plan repair operations are invalid",
+            "errorCode": "task_plan_repair_invalid_operations",
+            "errors": patch_errors,
+            "candidateHash": base_hash,
+            "next_instruction": (
+                "Choose one complete repairOptions entry from repairIssues when "
+                "present; mustChangePaths is only a direct-field summary. set only "
+                "replaces an existing value; remove deletes an existing object "
+                "property, never an array element."
+            ),
+        }
+    rejection = ctx.agent.replan_reason_rejection(repaired)
+    if rejection is not None:
+        ctx.agent.logger.write("task_plan.rejected", rejection)
+        return rejection
+    unchanged = ctx.agent.unchanged_plan_candidate_rejection(repaired)
+    if unchanged is not None:
+        ctx.agent.logger.write("task_plan.rejected", unchanged)
+        return unchanged
+    review = await ctx.agent.review_task_plan_candidate(repaired)
+    if review.get("status") == "mechanical_invalid":
+        result = ctx.agent.plan_schema_rejection(
+            review.get("errors"),
+            raw_plan=repaired,
+            repair_issues=review.get("repairIssues"),
+        )
+        ctx.agent.logger.write("task_plan.rejected", result)
+        return result
+    if review.get("status") == "rejected":
+        result = {
+            "status": "failed",
+            "error": "independent PlanValidator rejected the repaired candidate",
+            "planValidator": review,
+            "next_instruction": (
+                "Keep the currently accepted plan unchanged. Correct the semantic "
+                "findings and emit one complete revised plan."
+            ),
+        }
+        ctx.agent.logger.write("task_plan.rejected", result)
+        return result
+    return ctx.agent.accept_task_plan(
+        repaired,
         plan_validator_review=(
             review
             if review.get("status")

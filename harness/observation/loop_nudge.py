@@ -204,6 +204,16 @@ def normalize_action_params(label: str, params: Any) -> Any:
             "key": params.get("key") if label == "Input.press" else None,
             "text": params.get("text") if label == "Input.type" else None,
             "select": select_summary,
+            # The keyboard-driven contract continues an unfinished option walk
+            # by resending the SAME selections with the startOption the
+            # platform handed back. Dropping it collapses every continuation
+            # step onto one fingerprint, so a walk the platform explicitly
+            # asked for reads as a repeated action and trips the nudge at 4.
+            # DOM.inspectSelect needs no entry: it falls through to the whole
+            # params dict, which already carries startOption.
+            "startOption": (
+                params.get("startOption") if label == "Input.select" else None
+            ),
         }
     if label in {"DOM.getText", "DOM.getAttribute"}:
         return {

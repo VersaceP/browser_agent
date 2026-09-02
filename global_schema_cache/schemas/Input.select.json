@@ -1,8 +1,8 @@
 {
   "method": "Input.select",
-  "description": "Sets the final selection on a native or supported custom select.",
+  "description": "Selects native options directly or operates supported custom select options with the keyboard.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:cfd8fb90a7d277b16cad96ea1f17db4c9f7bafbbb87796e52dd73fdf68732998",
+  "catalogRevision": "sha256:4348a1a737674c20d6554ae434ea98050c0d5fee0d58837d1609a4b3e2d64b91",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -68,13 +68,56 @@
             }
           ]
         },
-        "description": "Final selection set. Use value for native selects and id or label for custom selects."
+        "description": "Requested selection set. Native selects require value; custom selects preserve id, label, and explicit value as independent match fields."
+      },
+      "startOption": {
+        "description": "Optional custom-select exploration starting point returned by a previous Select action. Native selects ignore this field.",
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "value"
+            ],
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "properties": {
+              "label": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "label"
+            ],
+            "additionalProperties": true
+          }
+        ]
       },
       "purpose": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "string",
         "minLength": 1,
-        "description": "Inspect the select first, then submit the final selection set using the returned native values, option IDs, or exact option labels."
+        "description": "Inspect the select first, then preserve the returned option field semantics when submitting selections. Reuse a returned startOption only when the feedback requests continued exploration."
       }
     },
     "required": [
@@ -115,7 +158,7 @@
           "type": "object",
           "properties": {
             "id": {
-              "description": "Current canonical option ID when available.",
+              "description": "Stable option ID exposed by the current select menu.",
               "type": "string"
             },
             "label": {
@@ -123,7 +166,7 @@
               "description": "Normalized option label."
             },
             "value": {
-              "description": "Native option value when available.",
+              "description": "Native value or an explicit custom option value when available.",
               "type": "string"
             },
             "selected": {
@@ -142,41 +185,14 @@
           ],
           "additionalProperties": false
         },
-        "description": "Options confirmed as selected after the action."
-      },
-      "proof": {
-        "type": "string",
-        "enum": [
-          "native-state",
-          "option-state"
-        ],
-        "description": "State observation used to confirm the selection."
-      },
-      "expanded": {
-        "type": "object",
-        "properties": {
-          "before": {
-            "type": "boolean"
-          },
-          "after": {
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "before",
-          "after"
-        ],
-        "additionalProperties": false,
-        "description": "Select expanded state before and after the action."
+        "description": "Native options confirmed as selected, or custom options recorded as selected during this operation."
       }
     },
     "required": [
       "controlId",
       "controlKind",
       "selectionMode",
-      "selected",
-      "proof",
-      "expanded"
+      "selected"
     ],
     "additionalProperties": false
   },
@@ -222,7 +238,7 @@
               "type": "object",
               "properties": {
                 "id": {
-                  "description": "Current canonical option ID when available.",
+                  "description": "Stable option ID exposed by the current select menu.",
                   "type": "string"
                 },
                 "label": {
@@ -230,7 +246,7 @@
                   "description": "Normalized option label."
                 },
                 "value": {
-                  "description": "Native option value when available.",
+                  "description": "Native value or an explicit custom option value when available.",
                   "type": "string"
                 },
                 "selected": {
@@ -249,41 +265,14 @@
               ],
               "additionalProperties": false
             },
-            "description": "Options confirmed as selected after the action."
-          },
-          "proof": {
-            "type": "string",
-            "enum": [
-              "native-state",
-              "option-state"
-            ],
-            "description": "State observation used to confirm the selection."
-          },
-          "expanded": {
-            "type": "object",
-            "properties": {
-              "before": {
-                "type": "boolean"
-              },
-              "after": {
-                "type": "boolean"
-              }
-            },
-            "required": [
-              "before",
-              "after"
-            ],
-            "additionalProperties": false,
-            "description": "Select expanded state before and after the action."
+            "description": "Native options confirmed as selected, or custom options recorded as selected during this operation."
           }
         },
         "required": [
           "controlId",
           "controlKind",
           "selectionMode",
-          "selected",
-          "proof",
-          "expanded"
+          "selected"
         ],
         "additionalProperties": false,
         "description": "Validated business result returned by the Action."
@@ -338,5 +327,5 @@
     ],
     "additionalProperties": false
   },
-  "purposeHint": "Inspect the select first, then submit the final selection set using the returned native values, option IDs, or exact option labels."
+  "purposeHint": "Inspect the select first, then preserve the returned option field semantics when submitting selections. Reuse a returned startOption only when the feedback requests continued exploration."
 }

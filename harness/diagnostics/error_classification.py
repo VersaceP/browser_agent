@@ -15,34 +15,386 @@ from harness.constants import (
 from harness.utils import JsonDict
 
 
-# Rebuilt select contract (2026-08 platform generation). Two rules govern
-# every entry: (1) codes whose semantics are "the popup/option window moved"
-# must NOT license an automatic Input.select replay - the platform's own
-# suggested prompts say to continue with ONE generic Input.click/type/scroll;
-# (2) only codes that mean "your request didn't match the current window"
-# allow exactly one reinspect-then-retry.
-SELECT_FAILURE_ACTIONS = {
-    # One bounded retry: re-read the current window, then retry once with
-    # fields that window actually returned.
-    "select-option-not-in-current-window": "reinspect_current_window_then_retry_once_with_returned_fields",
-    "select-option-id-unavailable": "reinspect_current_window_then_retry_once_with_returned_fields",
-    "select-option-label-ambiguous": "read_popup_semantic_tree_then_retry_once_with_optionIds",
-    # No Input.select replay: continue with generic input actions.
-    "select-agent-takeover-required": "keep_popup_state_and_continue_with_one_generic_input_action",
-    "select-popup-not-ready": "observe_popup_with_ax_and_semantic_tree_then_one_bounded_generic_action",
-    "select-popup-not-found": "reobserve_page_then_use_generic_input_actions",
-    "select-popup-ambiguous": "reobserve_page_then_use_generic_input_actions",
-    "select-popup-relation-changed": "reobserve_control_and_popup_then_one_generic_input_action",
-    "select-option-id-proof-unavailable": "reobserve_control_state_before_any_further_input",
-    # Terminal / contract mismatches: stop and report.
-    "select-option-disabled": "stop_and_report_requested_option_unavailable",
-    "select-target-not-select": "stop_select_and_use_generic_input_actions",
-    "select-selection-mode-unknown": "stop_and_report_platform_select_contract_failure",
-    "select-multiple-unsupported": "stop_and_report_unsupported_multi_select",
-    "select-control-kind-mismatch": "stop_and_reinspect_the_control_kind",
-    "select-state-restore-failed": "reinspect_before_continuing",
-    "select-final-state-unproven": "inspect_control_before_any_correction",
+# Keyboard-driven select contract (2026-09 platform generation).
+#
+# ONE declaration per public code, and every select-facing surface is a
+# PROJECTION of it: the Input.select action map, the DOM.inspectSelect action
+# map, the retry budget, the failure-receipt guidance, and whether a visual
+# locate is honest advice for this code. Those five used to be five
+# hand-maintained tables in three modules, pinned to each other by invariants
+# of the form `set(A) == set(B)`. Such an invariant cannot fail when A and B
+# are both wrong, which is exactly how a code set that was missing
+# select-option-label-ambiguous stayed green. A projection cannot disagree
+# with its source, so the only thing left to review is this table.
+#
+# `raised_by` is DECLARED, not inferred. Nothing in the receipt or the schema
+# says which Action can produce which code, and a static scan of the platform
+# bundle cannot answer it either (codes travel as parameters, native reasons
+# are remapped by method, adapters dispatch dynamically). So it is written
+# here from a read of the 1.1.91 call graph, dated and reviewable, rather than
+# guessed by a generator whose output would be one more artifact to trust.
+#
+# `family` is the recovery LADDER shape. `visual_locate` is a separate
+# question - "is the answer on screen?" - and deliberately not derived from
+# the family: select-target-not-select is a terminal verdict for the select
+# contract and simultaneously the case where looking at the page helps most.
+#
+# The platform deleted the whole select-agent-takeover-* family plus
+# select-option-id-unavailable / select-option-id-proof-unavailable /
+# select-popup-relation-changed / select-multiple-unsupported /
+# select-control-kind-mismatch when it took over popup exploration itself.
+# Entries for codes the connected build cannot emit are not harmless: they
+# read as coverage the harness does not have, which is how Hitl.getTaskSummary
+# / Hitl.resumeEvent survived in tool_policy long after their deletion.
+
+SELECT_METHODS = frozenset({"DOM.inspectSelect", "Input.select"})
+
+_BOTH = SELECT_METHODS
+_SELECT_ONLY = frozenset({"Input.select"})
+
+# Why no automatic replay, for EVERY select code. The public envelope states
+# error/observation/suggested_prompt and explicitly does not say whether a side
+# effect started, so "the failed attempt already sent keys" is an assertion the
+# receipt cannot support - select-popup-ambiguous, for one, is raised while
+# resolving the target, before any key is dispatched. The instruction is the
+# same either way; the reason has to be the true one.
+_NO_REPLAY = (
+    "Do not replay the Action that just failed: it may already have opened or"
+    " moved the control, and this receipt does not prove that it did not."
+)
+
+# The ladder for "the menu exists somewhere but nothing can name it". Ordered
+# cheapest-and-most-durable first. VL enters only at step 3 and only LOCATES;
+# the action stays an ordinary native call, chosen to fit the control.
+_POPUP_DISCOVERY_LADDER = (
+    " Recover in this order: (1) refresh DOM.getAXTree; (2) read a page-wide"
+    " DOM.getSemanticTree and relate aria-controls / aria-owns /"
+    " aria-activedescendant to a listbox/menu/option surface, which for a"
+    " custom control is often rendered in a portal OUTSIDE the control's own"
+    " subtree; (3) only when the target is visibly on screen and no structured"
+    " surface can name it, call visual_verify mode=visual_locate - it locates,"
+    " it never acts; (4) act on what step 2 or 3 returned using whichever"
+    " ordinary Input.*/DOM.* method the control actually needs (a click, a"
+    " keypress, typing to filter, a scroll to reveal - not necessarily"
+    " Input.click), preferring a returned resolvedId over any coordinate;"
+    " (5) re-observe and verify the outcome before the next step."
+)
+
+
+class SelectFailurePolicy:
+    """One public select code and everything the harness does with it."""
+
+    __slots__ = (
+        "family", "raised_by", "action", "inspect_action",
+        "retries", "visual_locate", "guidance",
+    )
+
+    def __init__(
+        self,
+        family,
+        raised_by,
+        action,
+        retries,
+        visual_locate,
+        guidance,
+        inspect_action="",
+    ):
+        self.family = family
+        self.raised_by = frozenset(raised_by)
+        self.action = action
+        # "" means the inspect path routes exactly like the selection path.
+        self.inspect_action = inspect_action or action
+        self.retries = retries
+        self.visual_locate = visual_locate
+        self.guidance = guidance
+
+
+SELECT_FAILURE_POLICY = {
+    # --- popup_discovery: the control resolved, the menu did not ------------
+    # A retry budget of 0 throughout: the menu binding is what failed, and a
+    # second identical dispatch re-runs the same binding against a control the
+    # first one may have moved.
+    "select-popup-not-found": SelectFailurePolicy(
+        family="popup_discovery",
+        raised_by=_BOTH,
+        action="reobserve_page_then_locate_menu_by_semantic_tree_then_visual_locate",
+        retries=0,
+        visual_locate=True,
+        guidance=(
+            "The select menu could not be bound through standard accessibility"
+            " relationships. " + _NO_REPLAY + _POPUP_DISCOVERY_LADDER
+        ),
+    ),
+    "select-popup-ambiguous": SelectFailurePolicy(
+        family="popup_discovery",
+        raised_by=_BOTH,
+        action="disambiguate_control_and_menu_before_any_further_select",
+        retries=0,
+        visual_locate=True,
+        guidance=(
+            "More than one selectable control or menu matched this target."
+            " The platform raises this while RESOLVING the target, so the page"
+            " may well be untouched - but the receipt does not say so, and the"
+            " recovery does not depend on the answer: name one control"
+            " unambiguously before selecting again. " + _NO_REPLAY
+            + _POPUP_DISCOVERY_LADDER
+        ),
+    ),
+    "select-popup-not-ready": SelectFailurePolicy(
+        family="popup_discovery",
+        raised_by=_BOTH,
+        action="observe_popup_with_ax_and_semantic_tree_then_one_bounded_generic_action",
+        retries=0,
+        visual_locate=True,
+        guidance=(
+            "The menu could not be observed as visible and stable, and was"
+            " left in whatever state it reached. " + _NO_REPLAY
+            + _POPUP_DISCOVERY_LADDER
+        ),
+    ),
+    # --- option_evidence: enumeration WORKED, the request did not match -----
+    #
+    # Read this family off the raise sites, not off the receipt. The public
+    # failure envelope carries error + observation + suggested_prompt and
+    # nothing else: no select code declares `detailFields`, so a failure never
+    # ships the option list. The earlier version of this comment claimed it
+    # did, and built the whole family's visual verdict on that - a false
+    # premise about the platform, pinned by tests that only compared harness
+    # artifacts to each other.
+    #
+    # What is actually true of the three codes below is narrower and enough:
+    # the platform SUCCEEDED in enumerating the menu and then found no match
+    # (orchestrator resolveOneSelection: matches.length === 0 ->
+    # not-in-current-window, > 1 -> label-ambiguous) or found the option
+    # disabled. The option list lives in the last successful inspection the
+    # model already holds, so the recovery is to re-inspect and use a returned
+    # field. A visual locate cannot beat an enumeration that worked, which is
+    # why these carry visual_locate=False - and why select-options-incomplete,
+    # where enumeration FAILED, does not.
+    "select-option-not-in-current-window": SelectFailurePolicy(
+        family="option_evidence",
+        raised_by=_BOTH,
+        action="reinspect_current_window_then_retry_once_with_returned_fields",
+        retries=1,
+        visual_locate=False,
+        guidance=(
+            "The requested option is not among the ones the latest observation"
+            " returned. Use only an id, exact label, or explicit value from"
+            " that response, and when the walk was incomplete continue it with"
+            " the startOption the platform named rather than starting over."
+        ),
+    ),
+    "select-option-label-ambiguous": SelectFailurePolicy(
+        family="option_evidence",
+        raised_by=_BOTH,
+        action="read_popup_semantic_tree_then_retry_once_with_a_unique_option_id",
+        retries=1,
+        visual_locate=False,
+        guidance=(
+            "The label matched more than one option. Re-inspect and continue"
+            " from a unique option id returned by that inspection instead of"
+            " the label."
+        ),
+    ),
+    "select-option-disabled": SelectFailurePolicy(
+        family="option_evidence",
+        raised_by=_BOTH,
+        action="stop_and_report_requested_option_unavailable",
+        retries=0,
+        visual_locate=False,
+        guidance=(
+            "The requested option is disabled. Choose an enabled option, or"
+            " satisfy the page condition that enables it, before continuing."
+            " Clicking it by any other route does not make it selectable."
+        ),
+    ),
+    # The one option-family code where enumeration itself failed, so it is the
+    # one that keeps the visual fallback. Its eleven raise sites cover three
+    # different situations, and only the first is "your request was wrong":
+    #   * the option list is empty or absent (orchestrator, element adapter);
+    #   * the menu changed under the walk (relationId moved mid-walk);
+    #   * an option node could not be PARSED at all - antd parseOption throws
+    #     when a rendered option carries no id, no label, or no aria-selected.
+    # That last one is the textbook structured blind spot: the menu is on
+    # screen and the platform cannot name what is in it. Denying the hint here
+    # would close the exact door this ladder exists to open. It is still last,
+    # after AXTree and SemanticTree, and it still only LOCATES.
+    "select-options-incomplete": SelectFailurePolicy(
+        family="option_evidence",
+        raised_by=_BOTH,
+        action="reinspect_current_select_then_locate_options_by_semantic_tree_or_visually",
+        retries=0,
+        visual_locate=True,
+        guidance=(
+            "The platform could not establish the requested option and its"
+            " state - the option list came back empty, changed under the walk,"
+            " or an option node could not be parsed at all. " + _NO_REPLAY
+            + " Inspect the select again first and continue as normal once the"
+            " option and its state are present. If a fresh inspection still"
+            " cannot enumerate them while the menu is plainly on screen, this"
+            " is a structured blind spot rather than a wrong request:"
+            + _POPUP_DISCOVERY_LADDER
+        ),
+    ),
+    # --- control_unsupported: not a select at all ---------------------------
+    # Terminal for the select contract, wide open for everything else. Only
+    # native <select>, Ant Design and Element have adapters, so every other
+    # custom widget arrives here, and reaching it is exactly what a visual
+    # locate is for.
+    "select-target-not-select": SelectFailurePolicy(
+        family="control_unsupported",
+        raised_by=_BOTH,
+        action="stop_select_and_use_generic_input_actions",
+        retries=0,
+        visual_locate=True,
+        guidance=(
+            "This element is not an ABCP-supported select control (only native"
+            " <select>, Ant Design and Element have adapters). Stop calling"
+            " the select Actions for it and drive it as ordinary UI: enumerate"
+            " fresh AXTree targets and act one verified step per visible"
+            " level. A visible multi-column category/list browser is ordinary"
+            " UI, not a broken select. If a level is visible but no structured"
+            " surface names it, visual_verify mode=visual_locate can locate it;"
+            " act on the id it returns with whichever ordinary Input.*/DOM.*"
+            " method that level needs."
+        ),
+    ),
+    # --- surface_unavailable: nothing to talk to right now ------------------
+    # NOT "this control has no adapter" - that is select-target-not-select.
+    # The platform also maps the native surface_unavailable / frame_unavailable
+    # diagnostics onto this code for DOM.inspectSelect, so it can be a page
+    # surface or frame that is momentarily gone. Routing it to "treat as
+    # ordinary UI" would turn a transient infrastructure fault into a permanent
+    # verdict about the control, and would contradict the platform's own
+    # suggested_prompt, which the agent sees in the same envelope.
+    # visual_locate=False: when the surface itself is unavailable there is
+    # nothing trustworthy to photograph, and a screenshot that succeeds anyway
+    # would be of a different surface than the one that failed.
+    "select-capability-unavailable": SelectFailurePolicy(
+        family="surface_unavailable",
+        raised_by=_BOTH,
+        action="reobserve_page_and_control_state_then_continue_only_when_available",
+        retries=0,
+        visual_locate=False,
+        guidance=(
+            "A required capability, page surface, or frame was unavailable, so"
+            " the control could not be inspected or operated. This is not a"
+            " verdict about the control: read Page.getState and a fresh"
+            " DOM.getAXTree, and continue only once the control is observable"
+            " again. Do not reclassify it as ordinary UI on this code alone -"
+            " select-target-not-select is what says that."
+        ),
+    ),
+    # --- contract_unproven: stop and establish reality ----------------------
+    # These say the harness cannot know what happened. The recovery is
+    # verification, never a corrective dispatch, and never a visual guess:
+    # "no automatic solution" is not a reason to go clicking.
+    "select-selection-mode-unknown": SelectFailurePolicy(
+        family="contract_unproven",
+        raised_by=_BOTH,
+        action="stop_and_report_platform_select_contract_failure",
+        retries=0,
+        visual_locate=False,
+        guidance=(
+            "The platform could not determine the selection mode. This is an"
+            " ABCP select contract failure: report it with this receipt rather"
+            " than working around it."
+        ),
+    ),
+    # Only restoreSelectionMenu passes this code, and only Input.select calls
+    # it: an inspect restores with a fire-and-forget Escape that raises
+    # nothing. So it is Input.select-only, and no inspect projection is built.
+    "select-state-restore-failed": SelectFailurePolicy(
+        family="contract_unproven",
+        raised_by=_SELECT_ONLY,
+        action="reinspect_before_continuing",
+        retries=0,
+        visual_locate=False,
+        guidance=(
+            "The selection was made but the menu could not be restored to a"
+            " known state. Inspect the control again before continuing; do not"
+            " assume the menu is closed."
+        ),
+    ),
+    "select-final-state-unproven": SelectFailurePolicy(
+        family="contract_unproven",
+        raised_by=_SELECT_ONLY,
+        action="inspect_control_before_any_correction",
+        retries=0,
+        visual_locate=False,
+        guidance=(
+            "The selection was recorded during the keyboard operation but the"
+            " final control state could not be proven. Read the control's own"
+            " value (inspect it, or DOM.getAttribute) BEFORE issuing any"
+            " correction - a corrective selection against an unknown state can"
+            " undo a selection that in fact succeeded."
+        ),
+    ),
 }
+
+
+# --- Projections. Never edit these; edit SELECT_FAILURE_POLICY. -------------
+
+SELECT_FAILURE_ACTIONS = {
+    code: policy.action for code, policy in SELECT_FAILURE_POLICY.items()
+}
+
+# An inspect failure describes the menu binding or the control itself, so a few
+# codes route differently from a selection - but the KEY SET is now derived
+# from `raised_by` instead of maintained by hand, which is what let phantom
+# entries for select-popup-relation-changed and select-option-id-unavailable
+# outlive their deletion from the platform.
+INSPECT_SELECT_FAILURE_ACTIONS = {
+    code: policy.inspect_action
+    for code, policy in SELECT_FAILURE_POLICY.items()
+    if "DOM.inspectSelect" in policy.raised_by
+}
+
+SELECT_FAILURE_RETRY_LIMITS = {
+    code: policy.retries for code, policy in SELECT_FAILURE_POLICY.items()
+}
+
+SELECT_FAILURE_GUIDANCE = {
+    code: policy.guidance for code, policy in SELECT_FAILURE_POLICY.items()
+}
+
+
+def select_failure_family(code):
+    """The recovery-ladder family for one public select code, or ""."""
+    policy = SELECT_FAILURE_POLICY.get(str(code or ""))
+    return policy.family if policy is not None else ""
+
+
+def select_code_is_declared_for_method(code, method):
+    """Whether `raised_by` claims this Action can produce this code.
+
+    False is a claim about the HARNESS, not about the page: either the 1.1.91
+    call graph was read wrong here, or the platform changed. Both are worth
+    seeing, and both are invisible if the classifier just routes the code the
+    usual way - the one signal that could falsify this table gets consumed.
+
+    An unknown code answers True: `raised_by` only speaks about codes it
+    declares, and treating silence as a mismatch would flag every new platform
+    code as harness drift.
+    """
+    policy = SELECT_FAILURE_POLICY.get(str(code or ""))
+    if policy is None:
+        return True
+    name = str(method or "")
+    if name not in SELECT_METHODS:
+        return True
+    return name in policy.raised_by
+
+
+def select_failure_visual_locate_useful(code):
+    """Whether a visual locate is honest advice for this select failure.
+
+    Unknown codes answer True: a code the harness has never seen is not
+    evidence that looking at the page is pointless, and the denylist in
+    harness.vl.arbiter is built on the same default.
+    """
+    policy = SELECT_FAILURE_POLICY.get(str(code or ""))
+    return True if policy is None else policy.visual_locate
 
 
 # --- Structured public failure classification -------------------------------
@@ -158,6 +510,48 @@ _TRANSPORT_ERROR_TYPES = {
 }
 
 
+
+def select_failure_action(code: str, method: str = "") -> Optional[str]:
+    """The select recovery action for one public code, honouring the method.
+
+    DOM.inspectSelect keeps its own routing - reading the popup is the right
+    next move for an inspect and not for a selection - but it is a VIEW over
+    the same catalog, never a second catalog. Routing lived only in the prose
+    fallback for a while, so the live structured path silently served the
+    Input.select action for every inspect failure.
+    """
+    if method == "DOM.inspectSelect" and code in INSPECT_SELECT_FAILURE_ACTIONS:
+        return INSPECT_SELECT_FAILURE_ACTIONS[code]
+    # Deliberate fallback, not an oversight. A code arriving on a method that
+    # `raised_by` says cannot raise it still gets real advice, because the
+    # model is mid-task and the recovery for that code is very likely still the
+    # right one. What must NOT happen is the combination passing unremarked -
+    # that is reported as contractDrift by the callers below, so the mismatch
+    # is visible on the receipt and in the log instead of being swallowed here.
+    return SELECT_FAILURE_ACTIONS.get(code)
+
+
+def _mark_select_contract_drift(classification, code, method):
+    """Flag a select code arriving on an Action that should not raise it.
+
+    Advisory by design: the recovery action is left alone (see
+    select_failure_action) so a live task is not stranded on a harness
+    bookkeeping error. What this adds is visibility - the receipt says the
+    declaration and the platform disagree, and the reader is told not to trust
+    `raised_by` for this code until one of them is corrected.
+    """
+    if select_code_is_declared_for_method(code, method):
+        return
+    classification["contractDrift"] = "select_method_code_mismatch"
+    classification["contractDriftDetail"] = (
+        f"{method} returned {code}, which this harness declares as raised only"
+        f" by {'/'.join(sorted(SELECT_FAILURE_POLICY[code].raised_by))}."
+        " Either the declared call graph is stale or the platform changed."
+        " The recovery below is the catalog's and is still worth following;"
+        " report the mismatch."
+    )
+
+
 def classify_public_action_failure(
     failure: Any,
     *,
@@ -169,9 +563,12 @@ def classify_public_action_failure(
     code = str(failure.get("code") or "").strip()
     if not code:
         return None
+    method_name = str(method or failure.get("method") or "")
     mapped = _RUNTIME_CODE_TYPES.get(code)
-    if mapped is None and code in SELECT_FAILURE_ACTIONS:
-        mapped = ("select_failure", SELECT_FAILURE_ACTIONS[code])
+    if mapped is None:
+        select_action = select_failure_action(code, method_name)
+        if select_action is not None:
+            mapped = ("select_failure", select_action)
     if mapped is None:
         for prefix, error_type, action in _RUNTIME_CODE_FAMILIES:
             if code.startswith(prefix):
@@ -186,11 +583,12 @@ def classify_public_action_failure(
         "type": error_type,
         "errorCode": code,
         "suggested_action": suggested_action,
-        "method": str(method or failure.get("method") or ""),
+        "method": method_name,
         "source": "public_action_failure",
         # With private sideEffectStarted removed, replay safety is unknown.
         "replayForbidden": True,
     }
+    _mark_select_contract_drift(classification, code, method_name)
     platform_prompt = str(failure.get("suggested_prompt") or "").strip()
     if platform_prompt:
         classification["platformSuggestedPrompt"] = platform_prompt[:1000]
@@ -228,28 +626,26 @@ def classify_browser_error(
         }
 
     if method_name == "DOM.inspectSelect":
-        # Rebuilt inspect contract: the retired not-visible/unsupported codes
-        # are gone. The remaining inspect failures describe the popup binding
-        # or the control itself; all of them route to observation, never to an
-        # immediate repeat of the same inspect.
-        for error_code, suggested_action in (
-            ("select-popup-not-found", "reobserve_page_then_use_generic_input_actions"),
-            ("select-popup-ambiguous", "reobserve_page_then_use_generic_input_actions"),
-            ("select-popup-not-ready", "read_popup_semantic_tree_before_any_further_input"),
-            ("select-popup-relation-changed", "reobserve_control_and_popup_then_one_generic_input_action"),
-            ("select-target-not-select", "stop_select_and_use_generic_input_actions"),
-            ("select-selection-mode-unknown", "stop_and_report_platform_select_contract_failure"),
-            ("select-option-id-unavailable", "reinspect_current_window_then_retry_once_with_returned_fields"),
-            ("select-option-not-in-current-window", "reinspect_current_window_then_retry_once_with_returned_fields"),
-            ("select-state-restore-failed", "reinspect_before_continuing"),
-        ):
+        # Scan the full catalog, not just the inspect view: a code the inspect
+        # view does not override still routes through the shared table rather
+        # than falling out to the generic fallback. select_failure_action is
+        # the single routing rule the structured path uses too.
+        for error_code in SELECT_FAILURE_ACTIONS:
             if error_code in lower:
-                return {
+                classified = {
                     "type": error_code.replace("-", "_"),
                     "errorCode": error_code,
-                    "suggested_action": suggested_action,
+                    "suggested_action": select_failure_action(
+                        error_code, method_name
+                    ),
                     "method": method_name,
                 }
+                # This is the branch where drift is most likely to appear -
+                # `raised_by` excludes two codes from inspect, and this is the
+                # path an inspect failure takes - and it was the one branch of
+                # four that did not report it.
+                _mark_select_contract_drift(classified, error_code, method_name)
+                return classified
         # Some platform builds collapse an inspect implementation failure to
         # the bare JSON-RPC envelope, with no public select-* reason code.
         # This is not an unknown application error: repeating the same inspect
@@ -270,14 +666,18 @@ def classify_browser_error(
             }
 
     if method_name == "Input.select":
-        for error_code, suggested_action in SELECT_FAILURE_ACTIONS.items():
+        for error_code in SELECT_FAILURE_ACTIONS:
             if error_code in lower:
-                return {
+                classified = {
                     "type": error_code.replace("-", "_"),
                     "errorCode": error_code,
-                    "suggested_action": suggested_action,
+                    "suggested_action": select_failure_action(
+                        error_code, method_name
+                    ),
                     "method": method_name,
                 }
+                _mark_select_contract_drift(classified, error_code, method_name)
+                return classified
         # Family fallback mirrors the runtime classifier: an unrecognized
         # select code still yields a structured classification carrying the
         # code verbatim, and never recommends an automatic Input.select
