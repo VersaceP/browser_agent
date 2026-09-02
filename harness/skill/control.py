@@ -713,22 +713,63 @@ async def _default_captcha_solve(vl_config: Any, image_path: str) -> Dict[str, A
 
 
 async def _default_screenshot_with_receipt(
-    control: "ControlChannel", page_id: str
+    control: "ControlChannel", page_id: str, *,
+    capture: Optional[Dict[str, Any]] = None,
+    purpose: str = "capture the challenge for VL captcha_solve",
 ) -> Optional[Dict[str, Any]]:
-    """Capture the viewport and keep the receipt alongside the saved path.
+    """Capture a supported scope and keep the receipt beside the saved image.
 
     The path alone is enough to show VL an image, but not to turn a pixel it
     points at back into a click: `data.width`/`data.height` are the CSS-pixel
     size that proves the capture's scale against the device-pixel file. Callers
     that only need the image use `_default_screenshot`.
+
+    ``capture`` is deliberately a narrow, already-validated description of a
+    viewport, element, or region capture.  It is not an arbitrary parameter
+    pass-through: a success-contract declaration must not gain access to a new
+    browser action shape merely by adding fields to YAML.
     """
-    resp = await control.call("Page.screenshot", {
+    spec = capture if isinstance(capture, dict) else {}
+    params: Dict[str, Any] = {
         "pageId": page_id, "fullPage": False,
         "options": {"format": "file"},
-        "purpose": "capture the challenge for VL captcha_solve",
-    })
+        "purpose": purpose,
+    }
+    element_id = str(spec.get("id") or "").strip()
+    selector = str(spec.get("selector") or "").strip()
+    if element_id or selector:
+        # ABCP resolves id first and may use selector only as a stale-id
+        # fallback.  Keeping both in the receipt is important: it tells us
+        # whether an element-bound capture can actually be tied to a canonical
+        # node, rather than merely to a repeated selector.
+        if element_id:
+            params["id"] = element_id
+        if selector:
+            params["selector"] = selector
+    elif all(key in spec for key in ("x", "y", "width", "height")):
+        # The public action takes integer viewport-CSS coordinates.  Validation
+        # of a workflow's declarative capture happens in visual_contract; this
+        # defensive copy keeps this low-level helper constrained too.
+        for key in ("x", "y", "width", "height"):
+            value = spec.get(key)
+            if isinstance(value, bool) or not isinstance(value, int):
+                return None
+            params[key] = value
+    elif bool(spec.get("fullPage")):
+        params["fullPage"] = True
+
+    resp = await control.call("Page.screenshot", params)
     data = ((resp or {}).get("data") or {})
-    path = data.get("savedPath") or (data.get("data") if data.get("encoding") == "file" else None)
+    if not isinstance(data, dict):
+        return None
+    # The documented action schema calls this `path`; the current live build
+    # has also emitted `savedPath` with `encoding='file'`.  Preserve the whole
+    # receipt and accept either spelling instead of making evidence depend on a
+    # schema rollout race.
+    path = (
+        data.get("savedPath") or data.get("path")
+        or (data.get("data") if data.get("encoding") == "file" else None)
+    )
     if not (isinstance(path, str) and path):
         return None
     return {"path": path, "receipt": data}

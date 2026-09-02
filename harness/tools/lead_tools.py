@@ -42,6 +42,11 @@ from harness.task_types import (
     task_type_choices_for_error,
 )
 from harness.tool_policy import describe_task_types
+from harness.tools.argument_pipeline import SchemaIssue
+from harness.tools.argument_pipeline import apply_registered_tool_defaults
+from harness.tools.argument_pipeline import prepare_model_tool_call
+from harness.tools.argument_pipeline import tool_argument_error
+from harness.tools.argument_pipeline import validate_registered_tool_call
 from harness.tools.loop_guard import check_tool_call_loop
 from harness.tools.registry import ToolContext, ToolRegistry
 from harness.utils import (
@@ -120,6 +125,48 @@ def _normalize_optional_identifiers(
                 changed.append(f"worker_contract.{field}")
         normalized["worker_contract"] = normalized_contract
     return normalized, sorted(changed)
+
+
+def _normalize_lead_task_type_aliases(
+    tool_call: Any,
+) -> Tuple[Any, List[str]]:
+    """Canonicalise supported legacy task-type spellings before schema checks.
+
+    The model-facing schema advertises only policy-bearing canonical values.
+    Older saved prompts and lifecycle middleware may still produce an accepted
+    alias, so preparation maps known aliases before validation rather than
+    weakening the public enum. Unknown strings remain unchanged and fail
+    schema validation.
+    """
+    if not isinstance(tool_call, dict):
+        return tool_call, []
+    raw_input = tool_call.get("input")
+    if not isinstance(raw_input, dict):
+        return tool_call, []
+    prepared_input = copy.deepcopy(raw_input)
+    changed: List[str] = []
+
+    def visit(value: Any, path: Tuple[str, ...]) -> None:
+        if isinstance(value, dict):
+            raw_task_type = value.get("task_type")
+            if isinstance(raw_task_type, str):
+                canonical = normalize_task_type(raw_task_type)
+                if canonical != raw_task_type and canonical in VALID_TASK_TYPES:
+                    value["task_type"] = canonical
+                    changed.append(".".join(path + ("task_type",)))
+            for key, child in value.items():
+                if key != "task_type":
+                    visit(child, path + (str(key),))
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                visit(child, path + (str(index),))
+
+    visit(prepared_input, ())
+    if not changed:
+        return tool_call, []
+    prepared_call = dict(tool_call)
+    prepared_call["input"] = prepared_input
+    return prepared_call, changed
 
 
 def _nullable(type_name: str) -> JsonDict:
@@ -453,15 +500,24 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                     "goal": {"type": "string"},
                     "task_type": {
                         "type": "string",
-                        # Canonical names only — legacy aliases are accepted at
-                        # runtime with a warning receipt, same policy as the
-                        # validator type enum.
                         "enum": sorted(VALID_TASK_TYPES),
                         "description": (
                             "Overall classification of the task, used for"
                             " strategy selection and audit. It does NOT set"
                             " worker method access — each phase declares its"
                             " own task_type for that."
+                        ),
+                    },
+                    "replan_reason": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": (
+                            "REQUIRED once a plan has been accepted, because"
+                            " this call then REPLACES it: say why the accepted"
+                            " plan has to go. Omit it only on the first plan of"
+                            " a run. Without it the call is rejected with"
+                            " replan_reason_required and nothing changes —"
+                            " re-sending the same phases will not help."
                         ),
                     },
                     "replan_checkpoint_id": {
@@ -972,19 +1028,22 @@ def _local_fs_search_schema(_: Any = None) -> JsonDict:
         "properties": {
             "pattern": {
                 "type": "string",
+                "default": "",
                 "description": "Regex grep; pass an empty string to list matches by glob / event_type only.",
             },
             "glob": {
                 "type": "string",
+                "default": "**/*",
                 "description": "Glob relative to the current task worktree, e.g. traces/*.jsonl or observations/*.json.",
             },
             "event_type": {
                 "type": ["string", "null"],
+                "default": None,
                 "description": "JSONL-only: restrict the search to lines whose `event` matches this string; pass null when not needed.",
             },
-            "max_results": {"type": "integer", "minimum": 1, "maximum": 100},
-            "max_bytes_per_hit": {"type": "integer", "minimum": 200, "maximum": 20000},
-            "max_total_bytes": {"type": "integer", "minimum": 1000, "maximum": 200000},
+            "max_results": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+            "max_bytes_per_hit": {"type": "integer", "minimum": 200, "maximum": 20000, "default": 2000},
+            "max_total_bytes": {"type": "integer", "minimum": 1000, "maximum": 200000, "default": 20000},
         },
         "required": [
             "pattern",
@@ -1003,9 +1062,11 @@ def _local_fs_read_schema(_: Any = None) -> JsonDict:
         "type": "object",
         "properties": {
             "path": {"type": "string"},
-            "line_offset": {"type": "integer", "minimum": 0},
-            "line_limit": {"type": "integer", "minimum": 1, "maximum": 5000},
-            "max_bytes": {"type": "integer", "minimum": 1000, "maximum": 200000},
+            "line_offset": {"type": "integer", "minimum": 0, "default": 0},
+            "line_limit": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 200},
+            # The handler clamps this public default to the configured per-run
+            # cap, so omitting it keeps the existing runtime-specific limit.
+            "max_bytes": {"type": "integer", "minimum": 1000, "maximum": 200000, "default": 20000},
         },
         "required": ["path", "line_offset", "line_limit", "max_bytes"],
         "additionalProperties": False,
@@ -1102,19 +1163,136 @@ def build_lead_tool_dispatcher(agent: Any) -> LeadToolDispatcher:
     async def dispatch(tool_call: JsonDict) -> Tuple[JsonDict, bool]:
         step = getattr(agent, "_current_step", 0)
         lifecycle = lifecycle_for(agent)
-        effective_call = lifecycle.tool_pre_call(
-            LifecycleContext(actor="lead_agent", step=step),
-            tool_call,
+        context = LifecycleContext(actor="lead_agent", step=step)
+        prepared_call, prepared_fields, preparation_error = prepare_model_tool_call(
+            tool_call
         )
-        result, should_stop = await execute_lead_tool(agent, effective_call)
-        result = lifecycle.tool_post_call(
-            LifecycleContext(actor="lead_agent", step=step),
-            effective_call,
-            result,
+        if preparation_error is not None or prepared_call is None:
+            result = tool_argument_error(
+                tool_call,
+                [SchemaIssue((), "type", preparation_error or "invalid tool call")],
+                stage="prepare_arguments",
+            )
+            _record_lead_argument_rejection(agent, result)
+            return result, False
+        prepared_call, normalized_task_types = _normalize_lead_task_type_aliases(
+            prepared_call
         )
+        prepared_fields.extend(normalized_task_types)
+        prepared_call, defaulted_fields = apply_registered_tool_defaults(
+            LEAD_TOOLS, prepared_call
+        )
+        prepared_fields.extend(defaulted_fields)
+        issues = validate_registered_tool_call(LEAD_TOOLS, prepared_call)
+        if issues:
+            result = tool_argument_error(
+                prepared_call,
+                issues,
+                stage="validate_tool_arguments",
+                normalized_fields=prepared_fields,
+            )
+            _record_lead_argument_rejection(agent, result)
+            return result, False
+        effective_call = prepared_call
+        post_call_attempted = False
+        try:
+            effective_call = lifecycle.tool_pre_call(context, prepared_call)
+            effective_call, normalized_task_types = _normalize_lead_task_type_aliases(
+                effective_call
+            )
+            prepared_fields.extend(normalized_task_types)
+            effective_call, defaulted_fields = apply_registered_tool_defaults(
+                LEAD_TOOLS, effective_call
+            )
+            prepared_fields.extend(defaulted_fields)
+            issues = validate_registered_tool_call(LEAD_TOOLS, effective_call)
+            if issues:
+                result = tool_argument_error(
+                    effective_call,
+                    issues,
+                    stage="validate_after_before_tool_call",
+                    normalized_fields=prepared_fields,
+                )
+                _record_lead_argument_rejection(agent, result)
+                return result, False
+            result, should_stop = await execute_lead_tool(agent, effective_call)
+            post_call_attempted = True
+            try:
+                result = lifecycle.tool_post_call(context, effective_call, result)
+            except Exception as exc:
+                # The handler completed.  Preserve both its receipt and its
+                # terminal signal when observational middleware fails.
+                _record_lead_after_call_exception(agent, effective_call, exc)
+        except Exception as exc:
+            # Do not echo a lifecycle/handler exception: Lead tools can carry
+            # task text and artifact values.  A pre-dispatch failure is safe to
+            # retry after correcting the next action; an execution failure is
+            # deliberately marked uncertain.
+            result = {
+                "isError": True,
+                "status": "tool_exception",
+                "stage": "lead_tool_pipeline",
+                "tool": str(effective_call.get("name") or "lead_tool")
+                if isinstance(effective_call, dict) else "lead_tool",
+                "error": "Lead tool pipeline raised an exception.",
+                "exceptionType": type(exc).__name__,
+                "replayForbidden": True,
+            }
+            should_stop = False
+            _record_lead_tool_exception(agent, result)
+        if not post_call_attempted:
+            try:
+                result = lifecycle.tool_post_call(context, effective_call, result)
+            except Exception as exc:
+                # This hook observes the already-constructed fallback.  Do
+                # not overwrite the actionable original failure with another
+                # exception envelope.
+                _record_lead_after_call_exception(agent, effective_call, exc)
         return result, should_stop
 
     return dispatch
+
+
+def _record_lead_argument_rejection(agent: Any, result: JsonDict) -> None:
+    logger = getattr(agent, "logger", None)
+    write = getattr(logger, "write", None)
+    if callable(write):
+        write("lead.tool.arguments_rejected", result)
+    trace = getattr(agent, "trace", None)
+    if isinstance(trace, list):
+        trace.append({"type": "lead_tool_arguments_rejected", "result": result})
+
+
+def _record_lead_tool_exception(agent: Any, result: JsonDict) -> None:
+    logger = getattr(agent, "logger", None)
+    write = getattr(logger, "write", None)
+    if callable(write):
+        try:
+            write("lead.tool.exception", result)
+        except Exception:
+            pass
+    trace = getattr(agent, "trace", None)
+    if isinstance(trace, list):
+        trace.append({"type": "lead_tool_exception", "result": result})
+
+
+def _record_lead_after_call_exception(
+    agent: Any,
+    tool_call: Any,
+    exc: Exception,
+) -> None:
+    name = str(tool_call.get("name") or "lead_tool") if isinstance(tool_call, dict) else "lead_tool"
+    receipt = {"tool": name, "exceptionType": type(exc).__name__}
+    logger = getattr(agent, "logger", None)
+    write = getattr(logger, "write", None)
+    if callable(write):
+        try:
+            write("lead.tool.after_call_exception", receipt)
+        except Exception:
+            pass
+    trace = getattr(agent, "trace", None)
+    if isinstance(trace, list):
+        trace.append({"type": "lead_tool_after_call_exception", "result": receipt})
 
 
 async def execute_lead_tool(agent: Any, tool_call: JsonDict) -> Tuple[JsonDict, bool]:
@@ -1189,7 +1367,20 @@ async def execute_lead_tool(agent: Any, tool_call: JsonDict) -> Tuple[JsonDict, 
 )
 async def _lead_emit_task_plan(ctx: ToolContext) -> JsonDict:
     raw_plan = ctx.tool_input.get("plan")
+    # Replacing an accepted plan without a stated reason is decided
+    # mechanically, so it is answered before the PlanValidator runs. Asking it
+    # afterwards let the reason error mask the candidate's real schema errors:
+    # in task 294889c8 the Lead re-sent the same plan nine times, never seeing
+    # that its detail_save phase had a requiredControls/exact_rows conflict.
+    rejection = ctx.agent.replan_reason_rejection(raw_plan)
+    if rejection is not None:
+        ctx.agent.logger.write("task_plan.rejected", rejection)
+        return rejection
     review = await ctx.agent.review_task_plan_candidate(raw_plan)
+    if review.get("status") == "mechanical_invalid":
+        result = ctx.agent.plan_schema_rejection(review.get("errors"))
+        ctx.agent.logger.write("task_plan.rejected", result)
+        return result
     if review.get("status") == "rejected":
         result = {
             "status": "failed",

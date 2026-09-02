@@ -600,8 +600,19 @@ def _verdict_tool(
     quantity_ids = list(relaxation_ids) + lineage_ids
 
     def evidence_array_schema() -> JsonDict:
+        # No ``uniqueItems``: some OpenAI-compatible endpoints reject the
+        # keyword outright and answer the whole request with "Invalid request
+        # parameters", which took the PlanValidator offline for every review in
+        # task 294889c8 while a byte-identical request without it succeeded.
+        # Nothing downstream needs the constraint — every consumer treats these
+        # ids as set membership or an empty/non-empty test, so a repeated id
+        # changes no verdict — so it is stated to the model in prose instead.
         schema: JsonDict = {
             "type": "array",
+            "description": (
+                "Distinct evidence ids copied verbatim from"
+                " evidenceCatalog[].id."
+            ),
             "items": {
                 "type": "string",
                 **(
@@ -610,7 +621,6 @@ def _verdict_tool(
                     else {}
                 ),
             },
-            "uniqueItems": True,
         }
         if not catalogued_evidence_ids:
             schema["maxItems"] = 0

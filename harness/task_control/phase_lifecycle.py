@@ -1062,8 +1062,11 @@ def phase_start_rejection(
             "phaseStatus": status,
             "tool_was_executed": False,
             "next_instruction": (
-                "Do not spawn this phase. Emit a revised task_plan with a new"
-                " phase id/objective or final_answer with the blocker."
+                "Do not spawn this phase: it is in a terminal state. Redoing"
+                " its work takes a replacement plan — emit_task_plan with a new"
+                " phase id/objective AND a non-empty plan.replan_reason, which"
+                " is required because a plan is already accepted. Otherwise"
+                " final_answer with the blocker."
             ),
         }
     if status == "running":
