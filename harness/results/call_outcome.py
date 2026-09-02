@@ -28,7 +28,7 @@ that a generic successful RPC proves its business effect.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Optional, Tuple
 
 from harness.utils import JsonDict
 
@@ -249,6 +249,69 @@ def _error_present(value: Any) -> Tuple[bool, str]:
             text = f"error code {value.get('code')}"
         return True, text
     return True, str(value)
+
+
+# Methods whose `response.data.error` is PAGE/DOMAIN data rather than a report
+# about the call that just returned. This is a per-method contract fact, and the
+# generic layer genuinely cannot derive it: an action's `data.error` and a
+# read's `data.error` are structurally identical, so only the method's own
+# contract distinguishes them.
+#
+# `Page.getState` reports the page's LAST-NAVIGATION error there. On a
+# risk-controlled page that field never clears, which is what deadlocked task
+# 48b4d7d7 for 84 minutes when a gate whose exit condition was "re-read the
+# page" treated it as this call failing.
+#
+# Deliberately NOT extended by guesswork. `Runtime.evaluate`, `Input.*` and the
+# `DOM.*` reads all report genuine per-call failures through `data.error`
+# (see tools/browser_tools/runtime_eval._runtime_evaluation_error_text), so
+# adding a method here silently converts its real failures into successes.
+# Add one only with a receipt showing the field is page state.
+DOMAIN_ERROR_READ_METHODS: FrozenSet[str] = frozenset({"Page.getState"})
+
+
+def data_error_is_domain_state(method: Any) -> bool:
+    """True when this method's `response.data.error` describes the PAGE.
+
+    Callers that must distinguish "the page has a problem" from "this call
+    failed" — a recovery ladder, a re-perception gate, an advisory hint — ask
+    here instead of hardcoding the method name at each site.
+    """
+    return str(method or "") in DOMAIN_ERROR_READ_METHODS
+
+
+def domain_state_read_succeeded(result: Any, method: Any) -> bool:
+    """True when a DOMAIN-ERROR READ's `data.error` describes the page, not it.
+
+    The single question three separate sites were about to answer with their
+    own copy of the same two conditions: is this receipt's `data.error` a
+    report about the CALL, or about the PAGE?
+
+    BOTH halves are load-bearing and neither is sufficient:
+
+    * the method set alone would swallow a genuinely failed read — a transport
+      error or a `response.error` on Page.getState is that call failing;
+    * the call verdict alone would swallow a failed ACTION whose only signal is
+      a bare `data.error`, which is how Runtime.evaluate reports (see
+      tools/browser_tools/runtime_eval._runtime_evaluation_error_text).
+
+    WHAT THIS DOES NOT PROVE, and every caller must handle itself: that
+    `data.error` is the receipt's ONLY anomaly. `classify_call_outcome` reads
+    the structured fields, not the observation text, so a paused page whose
+    `ERR_PAGE_PAUSED` arrives through `response.observation` while its data
+    looks healthy still satisfies this predicate. Apply it to the ONE decision
+    that turns on `data.error` and leave every higher-priority signal to be
+    resolved first — a caller that used it as a whole-function early return
+    dropped exactly that pause.
+
+    Callers use this to STAY QUIET, never to grant anything. Nothing is hidden
+    from the model either way: the page's own error remains in
+    `response.data.error` where the platform put it.
+    """
+    return bool(
+        data_error_is_domain_state(method)
+        and classify_call_outcome(result).succeeded
+    )
 
 
 def _explicit_negative(mapping: Any) -> Tuple[bool, str]:

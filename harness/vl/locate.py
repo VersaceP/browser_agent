@@ -34,7 +34,8 @@ NOT covered, and not claimed: browser zoom (the Action catalog has no setter,
 so it can only be recorded); a relayout that leaves both the scroll offset and
 the target's rect unchanged; and the gap between the image being taken and the
 first geometry read, which no receipt in this catalog closes. Those are why
-`visual_locate_enabled` and `arbiter_enabled` remain off by default.
+the harness withholds a coordinate rather than trusting an unproven one, and
+why a located target still has to be verified by re-observing after the click.
 
 Promote-then-heal discipline (doc §13.2): coordinates NEVER persist into a skill
 (they rot faster than CSS selectors). A located pixel is converted to the durable
@@ -304,8 +305,18 @@ def capture_origin(
     window (a wrong node is rejected; only a moved right node slips through)
     but does not close it. Closing it needs either an atomic
     capture-plus-geometry receipt from the platform or an enforced outcome
-    check after the action; until then this is a reason to keep
-    `visual_locate_enabled` off.
+    check after the action.
+
+    CURRENT POSTURE (2026-09-01), stated plainly because the window is still
+    open: `visual_locate_enabled` now defaults ON, and the residual race is
+    handled by DISCIPLINE, not by a mechanism. A coordinate is offered to the
+    model, never executed by the harness; the model issues the single
+    Input.click itself and is instructed — in the tool receipt, the
+    `visualRecoveryHint`, and the BrowserAgent SOP — to re-observe afterwards
+    rather than assume the click landed. That converts an undetected wrong
+    click into a detected one, which is the best available answer until the
+    platform ships an atomic receipt. It is not equivalent to closing the race,
+    and nothing here should be read as claiming it is.
     """
     data = shot_data if isinstance(shot_data, dict) else {}
     # The scroll offset either comes with the capture (element captures carry a

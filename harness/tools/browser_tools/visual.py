@@ -10,6 +10,7 @@ from typing import Tuple
 from typing import Set
 import json
 from urllib.parse import urlparse
+from harness.results.call_outcome import domain_state_read_succeeded
 from harness.utils import JsonDict
 from harness.utils import optional_int
 from .axtree_state import _check_stale_axtree_target
@@ -357,14 +358,26 @@ async def _visual_verify(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
             "status": "disabled",
             "reason": "vl.enabled is false or vl config is missing",
         }
-    raw_max_checks = optional_int(
-        getattr(vl_config, "max_checks_per_worker", 2),
-        2,
-    )
-    max_checks = max(0, raw_max_checks if raw_max_checks is not None else 2)
     page_id = str(tool_input.get("pageId") or "").strip()
     if not page_id:
         return {"status": "failed", "error": "pageId is required"}
+    if (
+        str(tool_input.get("mode") or "").strip() == "visual_locate"
+        and not getattr(vl_config, "visual_locate_enabled", False)
+    ):
+        # Refuse before spending a screenshot and a VL request. The role used to
+        # run anyway with the promotion skipped, which returned a normalized
+        # 0-1000 grounding point to a model that had no way to know it was not a
+        # coordinate. A locate that cannot be translated is worse than none.
+        return {
+            "status": "disabled",
+            "reason": "vl.visual_locate_enabled is false",
+            "next_instruction": (
+                "Visual locate is turned off for this deployment. Re-observe"
+                " with DOM.getAXTree / DOM.getSemanticTree and act on a"
+                " canonical id."
+            ),
+        }
     selector = str(tool_input.get("selector") or "").strip()
     element_id = str(tool_input.get("id") or "").strip()
     requested_mode = str(tool_input.get("mode") or "action_outcome").strip()
@@ -375,20 +388,16 @@ async def _visual_verify(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
     )
     if repair_target_error is not None:
         return repair_target_error
-    # Target-bound repair evidence is a machine-enforced completion gate, so an
-    # earlier overlay/layout check must not exhaust its budget. It uses the
-    # separate forced counter and remains bounded by the worker's step limit.
+    # There is no separate per-worker visual budget (removed 2026-09-01). Every
+    # visual_verify call already costs one of the worker's steps, so
+    # `worker_max_steps` bounds visual spend the same way it bounds every other
+    # tool; the old `max_checks_per_worker=2` was a second, far tighter ceiling
+    # stacked on top of it, and it refused the third call of a task that
+    # legitimately needed to locate a control and then verify the outcome.
+    # `vl_check_count` survives as an observability counter — it is reported
+    # back so the model can see its own spend — and `_force` still marks a call
+    # the harness required rather than one the model chose.
     force_check = bool(tool_input.get("_force", False)) or bool(repair_targets)
-    if not force_check and getattr(agent, "vl_check_count", 0) >= max_checks:
-        return {
-            "status": "rejected",
-            "reason": "vl_check_limit_reached",
-            "maxChecksPerWorker": max_checks,
-            "next_instruction": (
-                "Do not keep using screenshots. Use DOM/Runtime evidence or"
-                " finalize with the blocker."
-            ),
-        }
     if repair_targets:
         mode = "repair_absence"
         question = (
@@ -445,10 +454,7 @@ async def _visual_verify(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
     # promotion will follow. AXTree bboxes are `(viewport + root scroll) ×
     # scale`, so containment needs a stable scroll offset across the model call
     # and AXTree read. This is best-effort rather than atomic with the image.
-    promotion_wanted = (
-        mode == "visual_locate"
-        and bool(getattr(vl_config, "visual_locate_enabled", False))
-    )
+    promotion_wanted = mode == "visual_locate"
     before_artifacts = set(str(path) for path in getattr(agent, "artifacts", []))
     screenshot, capture_scroll = await _capture_bracketed(
         agent, page_id, screenshot_params, step, bracket=promotion_wanted
@@ -530,27 +536,31 @@ async def _visual_verify(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
         question=question,
     )
     # VL Role A: promote a located pixel back to a durable canonical id (bbox→id),
-    # so the agent acts on a stable handle instead of raw coordinates. Gated by
-    # vl.visual_locate_enabled; best-effort (any failure leaves the raw point).
-    if (
-        mode == "visual_locate"
-        and isinstance(verdict, dict)
-        and verdict.get("verdict") == "located"
-        and verdict.get("point")
-        and bool(getattr(vl_config, "visual_locate_enabled", False))
-    ):
-        verdict = await _promote_visual_locate(
-            agent, page_id, image_path, verdict, step,
-            expected_text=" ".join(
-                part for part in (question, str(expected.get("target") or ""))
-                if part
-            ),
-            # The receipt carries the CSS-pixel size that proves the capture's
-            # scale, and the scope says whether its origin is the viewport's.
-            screenshot=screenshot,
-            screenshot_scope=screenshot_scope,
-            capture_scroll=capture_scroll,
-        )
+    # so the agent acts on a stable handle instead of raw coordinates. Promotion
+    # is best-effort, but its FAILURE MODE IS NOT: no exit of this path hands
+    # back the raw normalized point. A promotion error refuses the coordinate
+    # (`coordinateRefused: promotion_error`) and a non-located verdict is
+    # scrubbed below, because a 0-1000 grounding point has repeatedly read to a
+    # model as something clickable.
+    if mode == "visual_locate" and isinstance(verdict, dict):
+        if verdict.get("verdict") == "located" and verdict.get("point"):
+            verdict = await _promote_visual_locate(
+                agent, page_id, image_path, verdict, step,
+                expected_text=" ".join(
+                    part for part in (question, str(expected.get("target") or ""))
+                    if part
+                ),
+                # The receipt carries the CSS-pixel size that proves the capture's
+                # scale, and the scope says whether its origin is the viewport's.
+                screenshot=screenshot,
+                screenshot_scope=screenshot_scope,
+                capture_scroll=capture_scroll,
+            )
+        else:
+            # `not_found` / `uncertain`, or `located` with no usable point. The
+            # normalized point is scrubbed on this path too: there is no exit
+            # from a locate that hands the model a raw grounding coordinate.
+            verdict = _locate_model_view(verdict)
     vl_check_count = getattr(agent, "vl_check_count", 0)
     vl_force_check_count = getattr(agent, "vl_force_check_count", 0)
     result = {
@@ -562,7 +572,6 @@ async def _visual_verify(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
         "id": element_id or None,
         "vlCheckCount": vl_check_count,
         "vlForceCheckCount": vl_force_check_count,
-        "maxChecksPerWorker": max_checks,
         "forced": force_check,
         "usage_boundary": (
             "visual_verify is evidence for action/state verification only;"
@@ -616,94 +625,168 @@ async def _visual_verify(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
     )
     return result
 
-def _arbiter_error_text(result: JsonDict) -> str:
-    """Pull a failure string from a browser_call result (else '')."""
-    if not isinstance(result, dict):
-        return ""
-    if result.get("error"):
-        return str(result["error"])
-    response = result.get("response")
-    if isinstance(response, dict):
-        if response.get("error"):
-            return str(response["error"])
-        obs = response.get("observation")
-        if isinstance(obs, str) and "fail" in obs.lower():
-            return obs
-    return ""
 
-def _arbiter_next_instruction(rec: JsonDict) -> str:
-    action = rec.get("action")
-    if action == "retry_by_id":
-        return (f"VL arbiter located the target and promoted it to durable id"
-                f" {rec.get('id')!r}. Retry the failed action targeting that id"
-                f" (a durable handle — not coordinates).")
-    if action == "hitl":
-        return (f"VL arbiter assessment: {rec.get('reason', 'needs human/challenge handling')}."
-                f" Take the HITL/challenge path instead of retrying blindly.")
-    if action == "dismiss":
-        label = rec.get("label")
-        return (f"VL arbiter found a safe dismiss control{(' (' + str(label) + ')') if label else ''}."
-                f" Dismiss the overlay, then retry the action.")
-    if action == "coordinate":
-        return ("VL arbiter located the target but no AXTree node covers it; if safe and"
-                " not consequential, use one coordinate action at cssPoint (never persist coordinates).")
-    if action == "reperceive":
-        return "VL arbiter suggests re-perceiving: refresh Page.getState + DOM.getAXTree before retrying."
-    return ""
+# Which failure classes are beyond visual recovery lives in harness.vl.arbiter,
+# the module that used to auto-invoke a VL recovery from this hot path. Its
+# classification is the one reusable piece of that design and is imported rather
+# than restated, so the taxonomy has a single home.
 
-async def _maybe_vl_arbitrate(
+
+def _visual_hint_ineligible_reason(
+    result: JsonDict,
+    params: JsonDict,
+    vl_config: Any,
+    method: str = "",
+) -> str:
+    """Why this failure gets no visual hint, or "" when it should get one."""
+    if vl_config is None or not getattr(vl_config, "enabled", False):
+        return "vl_disabled"
+    # Advertising a path that answers `disabled` wastes a model step.
+    if not getattr(vl_config, "visual_locate_enabled", False):
+        return "visual_locate_disabled"
+    # Use the harness's own action-failure predicate rather than scraping a
+    # string out of the receipt. A browser-side action reports through
+    # `response.error` OR `response.data.error`, a guard refusal through
+    # `tool_was_executed=False`, and a public-envelope failure only through
+    # `rpcData` + `errorClassification` — top-level `error` is set on transport
+    # exceptions alone. A prose extractor saw the first of those and missed the
+    # rest, silently withholding the hint from most real failures.
+    #
+    # `_invoke_result_failed` is the right one of the tree's two predicates
+    # here: it answers "did the action achieve its page effect", which is what a
+    # recovery ladder asks. Its documented hazard — that nothing which GRANTS
+    # state may use it — does not apply: this attaches advisory text and grants
+    # nothing.
+    if not _bt()._invoke_result_failed(result):
+        return "no_failure"
+    # ...but that predicate also fails on `response.data.error`, and for a
+    # DOMAIN-ERROR READ that field describes the page, not this call:
+    # Page.getState carries the page's own last-navigation error there, which
+    # never clears on a risk-controlled page. A hint reading it as failure would
+    # fire on every successful read of such a page, teaching the model that a
+    # clean read is a failure. Task 48b4d7d7 is the 84-minute version of that
+    # mistake.
+    #
+    # Scoped to the declared read set rather than applied to every method,
+    # because a bare `data.error` IS a real failure for an action —
+    # Runtime.evaluate reports exactly that way (see
+    # runtime_eval._runtime_evaluation_error_text). The two other sites that met
+    # this ambiguity (bindings._observe_fleet_reperception, workflow_auth_fence)
+    # could use the call verdict unconditionally because their context was
+    # already a state read; this entry point sees actions and reads alike, so
+    # the same shortcut here would silently swallow real action failures.
+    if domain_state_read_succeeded(result, method):
+        return "call_succeeded"
+    # A page-facing failure is one the caller aimed at a page. This is the whole
+    # method filter: Memory/Fleet/File failures carry no pageId and drop out
+    # here without a list of method names that would rot as the catalog grows.
+    if not str((params or {}).get("pageId") or "").strip():
+        return "no_page_id"
+    # Do not recommend a recovery whose own first step is the call that just
+    # failed. `visual_verify` opens with Page.screenshot, so hinting it at a
+    # failed capture proposes a loop. This is a self-reference check, not a
+    # method allowlist: every other method stays eligible, including ones this
+    # catalog does not have yet.
+    if str(method or "") == "Page.screenshot":
+        return "hint_depends_on_the_failed_capability"
+    from harness.vl.arbiter import visual_recovery_ineligible_reason
+
+    classification = result.get("errorClassification")
+    ctype = (
+        classification.get("type")
+        if isinstance(classification, dict) else ""
+    )
+    return visual_recovery_ineligible_reason(ctype)
+
+
+def _attach_visual_recovery_hint(
     agent: Any,
     method: str,
     params: JsonDict,
     result: JsonDict,
     step: int,
 ) -> JsonDict:
-    """Role D auto-trigger: on a visually-related failure, route to the VL arbiter
-    and attach a recovery recommendation. Best-effort + gated (vl.arbiter_enabled);
-    bounded per worker by max_checks_per_worker. Never raises into the call path."""
-    if not isinstance(result, dict):
+    """Tell the model that a visual locate exists, once deterministic recovery
+    has had its turn and the call still failed.
+
+    This makes NO VL request, reads no page, and executes nothing: it is a
+    structured note appended to a failure receipt. The decision to spend a
+    visual call, and the decision to act on whatever it returns, both belong to
+    the model. The harness's job here is to make sure the option is known —
+    a capability the agent is never told about is a capability it never uses.
+
+    The hint goes in its OWN field rather than into `next_instruction`, which
+    already carries the deterministic recovery advice for this failure. That
+    advice comes first; this is what to try when it has been exhausted.
+    """
+    if not isinstance(result, dict) or "visualRecoveryHint" in result:
         return result
-    vl_config = getattr(getattr(getattr(agent, "runtime", None), "harness", None), "vl", None)
-    if (vl_config is None or not getattr(vl_config, "enabled", False)
-            or not getattr(vl_config, "arbiter_enabled", False)):
+    vl_config = getattr(
+        getattr(getattr(agent, "runtime", None), "harness", None), "vl", None
+    )
+    reason = _visual_hint_ineligible_reason(result, params or {}, vl_config, method)
+    if reason:
         return result
-    error_text = _arbiter_error_text(result)
-    if not error_text:
-        return result
-    classification = ""
-    cl = result.get("errorClassification")
-    if isinstance(cl, dict):
-        classification = str(cl.get("type") or "")
-    page_id = str((params or {}).get("pageId") or "")
-    browser = getattr(agent, "browser", None)
-    if not page_id or browser is None:
-        return result
-    # bound the number of arbiter VL calls per worker
-    max_checks = optional_int(getattr(vl_config, "max_checks_per_worker", 2), 2) or 2
-    if getattr(agent, "vl_arbiter_count", 0) >= max_checks:
-        return result
-    try:
-        from harness.vl.arbiter import arbitrate, is_visual_failure
-        if not is_visual_failure(classification, error_text):
-            return result
-        agent.vl_arbiter_count = getattr(agent, "vl_arbiter_count", 0) + 1
-        rec = await arbitrate(
-            browser, page_id, classification_type=classification, error_text=error_text,
-            target_description=str((params or {}).get("purpose") or ""),
-            vl_config=vl_config, logger=getattr(agent, "logger", None),
-        )
-    except Exception as exc:  # arbitration must never break the call path
-        logger = getattr(agent, "logger", None)
-        if logger is not None:
-            logger.write("vl.arbiter.error", {"method": method, "error": str(exc)})
-        return result
-    if not isinstance(rec, dict) or rec.get("action") in (None, "none"):
-        return result
-    out = {**result, "vlArbiter": rec}
-    instruction = _arbiter_next_instruction(rec)
-    if instruction:
-        out["next_instruction"] = instruction
-    return out
+    page_id = str((params or {}).get("pageId") or "").strip()
+    hint: JsonDict = {
+        "available": True,
+        "when": (
+            "Use this after the deterministic recovery this receipt already"
+            " describes has been tried and the target is still unreachable,"
+            " AND you have reason to believe the target is visible on screen"
+            " while the structured surfaces (AXTree / SemanticTree) cannot"
+            " name it. It is not a shortcut past re-observing the page."
+        ),
+        "call": {
+            "tool": "visual_verify",
+            "arguments": {
+                "pageId": page_id,
+                "selector": "",
+                "id": "",
+                "fullPage": False,
+                "mode": "visual_locate",
+                "question": "<what the target looks like and where you expect it>",
+                "expected": {"target": "<the control you are trying to reach>"},
+            },
+        },
+        "resultPolicy": {
+            "resolvedId": (
+                "The pixel was promoted to a canonical id. Act on that id with"
+                " the ordinary Input.*/DOM.* methods — it survives a relayout"
+                " that a coordinate does not."
+            ),
+            "cssPoint": (
+                "No node covers the pixel (a genuine structured-surface blind"
+                " spot), but the capture's scale and origin were proven. This"
+                " is a viewport CSS point: ONE Input.click{pageId,x,y}, then"
+                " re-observe to verify the outcome. Never persist a coordinate"
+                " into a skill or reuse it after the page changes."
+            ),
+            "coordinateRefused": (
+                "The geometry could not be proven, so no point is offered."
+                " Re-observe with DOM.getAXTree / DOM.getSemanticTree. Do not"
+                " invent a coordinate and do not reuse a point from an earlier"
+                " call."
+            ),
+        },
+        "boundary": (
+            "Locating a control visually changes what you can REACH, never what"
+            " you are allowed to DO. A target you may not act on by canonical"
+            " id is equally off-limits by coordinate."
+        ),
+    }
+    logger = getattr(agent, "logger", None)
+    if logger is not None and hasattr(logger, "write"):
+        logger.write("vl.visual_recovery_hint", {
+            "method": method,
+            "pageId": page_id,
+            "step": step,
+            "errorClassification": (
+                result.get("errorClassification", {}).get("type")
+                if isinstance(result.get("errorClassification"), dict) else None
+            ),
+        })
+    return {**result, "visualRecoveryHint": hint}
 
 def _reality_check_region(tool_input: JsonDict) -> JsonDict:
     """The region the failing tool was actually working on.
@@ -1276,6 +1359,78 @@ async def _capture_bracketed(
     return shot, at_capture
 
 
+# A VL grounding answer is a point in the 0-1000 normalized space the model
+# was never told about, and a promotion receipt additionally carries a
+# screenshot-device-pixel `pxPoint`. Neither is a coordinate `Input.click`
+# accepts — CSS viewport pixels are — and both have looked, to a model, exactly
+# like something to click. Every one of them stays in the log and none reaches
+# the model; the only coordinate ever offered is `cssPoint`, and only once the
+# capture's scale and origin have been proven.
+_LOCATE_PRIVATE_VERDICT_KEYS = ("point",)
+_LOCATE_PRIVATE_PROMOTION_KEYS = ("pxPoint",)
+
+
+def _locate_model_view(verdict: JsonDict) -> JsonDict:
+    return {
+        key: value for key, value in verdict.items()
+        if key not in _LOCATE_PRIVATE_VERDICT_KEYS
+    }
+
+
+def _promotion_model_view(promo: Any) -> Any:
+    if not isinstance(promo, dict):
+        return promo
+    return {
+        key: value for key, value in promo.items()
+        if key not in _LOCATE_PRIVATE_PROMOTION_KEYS
+    }
+
+
+_CONSEQUENTIAL_NOTE = (
+    "This target reads as a consequential action (submit / pay / delete /"
+    " sign-in class). A coordinate click cannot prove what it landed on before"
+    " it lands. Locating it visually does not authorize performing it: follow"
+    " the same rule you would follow with a canonical id, and hand login,"
+    " payment, deletion and other irreversible account or funds operations to"
+    " the user."
+)
+
+
+def _locate_consequential(verdict: Any, *labels: Any) -> Optional[JsonDict]:
+    """Mark a located target that reads as a consequential action.
+
+    TWO independent sources, because they fail in opposite directions. The VL
+    is asked directly (`is_consequential`, see harness.vl.core) and sees an
+    icon-only trash button or a localized label no keyword table lists; the
+    keyword table catches a target the VL waved through. Either is enough — the
+    field's job is to make the model look before it acts, and a false positive
+    costs a moment's attention while a false negative costs the click.
+
+    This ANNOTATES; it does not withhold. The coordinate is still offered,
+    because the harness executes nothing here: `Input.click` is a separate call
+    the model has to choose to make, and neither a keyword table nor an L4
+    visual assertion is a sound basis for the harness to overrule that choice.
+    What the model gets is the fact, stated where the decision is made.
+    """
+    from harness.observation.overlay_actions import is_sensitive_target
+
+    if isinstance(verdict, dict) and verdict.get("is_consequential"):
+        return {
+            "source": "vl_assessment",
+            "matchedLabel": str(verdict.get("control_label") or "")[:200],
+            "note": _CONSEQUENTIAL_NOTE,
+        }
+    for label in labels:
+        text = str(label or "").strip()
+        if text and is_sensitive_target("", text):
+            return {
+                "source": "label_keyword",
+                "matchedLabel": text[:200],
+                "note": _CONSEQUENTIAL_NOTE,
+            }
+    return None
+
+
 async def _promote_visual_locate(
     agent: Any,
     page_id: str,
@@ -1359,49 +1514,91 @@ async def _promote_visual_locate(
             logger=getattr(agent, "logger", None),
             page_id=page_id,
         )
-        out = {**verdict, "promotion": promo}
+        logger = getattr(agent, "logger", None)
+        if logger is not None and hasattr(logger, "write"):
+            # The full record, private coordinates included, so a bad locate can
+            # be diagnosed afterwards from the log rather than from the model's
+            # transcript.
+            logger.write("vl.locate.promotion", {
+                "pageId": page_id,
+                "scope": screenshot_scope,
+                "normalizedPoint": verdict.get("point"),
+                "promotion": promo,
+            })
+        out = _locate_model_view(verdict)
+        out["promotion"] = _promotion_model_view(promo)
+        consequential = _locate_consequential(
+            verdict, verdict.get("control_label"), expected_text,
+        )
+        if consequential is not None:
+            out["consequential"] = consequential
         if promo.get("resolved"):
             out["resolvedId"] = promo.get("id")
             out["resolvedLabel"] = promo.get("label")
             out["next_instruction"] = (
-                f"VL located the target and it was promoted to durable id"
-                f" {promo.get('id')!r}. Act on that id (Input.click/DOM.getText with"
-                f" id), NOT raw coordinates."
+                f"Located and promoted to durable id {promo.get('id')!r}. Act on"
+                f" that id (Input.click / DOM.getText with id) — it survives a"
+                f" relayout that a coordinate does not. No coordinate is needed"
+                f" or offered here."
             )
         elif promo.get("coordinateRefused"):
-            # No durable id AND no provable pixel-to-CSS mapping. Offering a
-            # coordinate here would produce a click that lands on some other
-            # real element and reports success, so withhold it entirely.
+            # No durable id AND no provable pixel-to-CSS mapping. A coordinate
+            # offered here would land on some other real element and report
+            # success, so it is withheld entirely.
             out["dpr"] = promo.get("dpr")
             out["origin"] = promo.get("origin")
             out["coordinateRefused"] = promo.get("coordinateRefused")
             out["next_instruction"] = (
-                "VL located the target visually, but it could not be promoted"
-                " to a durable id and the screenshot's scale/origin could not"
-                f" be proven ({promo.get('coordinateRefused')}), so no"
-                " coordinate is offered. Re-observe with DOM.getAXTree or"
-                " DOM.getSemanticTree and act on an id; do not invent a point."
-            )
-        elif promo.get("promotionGuard"):
-            out["cssPoint"] = promo.get("cssPoint")
-            out["dpr"] = promo.get("dpr")
-            out["next_instruction"] = (
-                "VL located the target but the bbox promotion failed a sanity"
-                f" check ({promo['promotionGuard'].get('reason')}) and was demoted."
-                " If safe and not consequential, use a single coordinate action at"
-                " cssPoint; coordinates must never be persisted into a skill."
+                "The target was located visually, but it could not be promoted"
+                " to a durable id and the capture's scale/origin could not be"
+                f" proven ({promo.get('coordinateRefused')}), so NO coordinate"
+                " is offered. Re-observe with DOM.getAXTree or"
+                " DOM.getSemanticTree and act on an id. Do not invent a point"
+                " and do not reuse one from an earlier call."
             )
         else:
             out["cssPoint"] = promo.get("cssPoint")
             out["dpr"] = promo.get("dpr")
+            demoted = promo.get("promotionGuard")
             out["next_instruction"] = (
-                "VL located the target but no AXTree node covers it (blind spot)."
-                " If safe and not consequential, use a single coordinate action at"
-                " cssPoint; coordinates must never be persisted into a skill."
+                (
+                    "The target was located, but the bbox promotion failed a"
+                    f" sanity check ({demoted.get('reason')}) and was demoted."
+                    if demoted else
+                    "The target was located and no node covers it — a genuine"
+                    " structured-surface blind spot."
+                )
+                + " cssPoint is a VIEWPORT CSS point, which is the space"
+                " Input.click takes: issue ONE Input.click{pageId,x,y} with it,"
+                " then re-observe to verify the outcome. It is valid for this"
+                " page state only — never persist a coordinate into a skill and"
+                " never reuse it after the page changes."
+                + (
+                    " This target reads as consequential; see `consequential`"
+                    " before acting." if consequential is not None else ""
+                )
             )
         return out
-    except Exception as exc:  # promotion is best-effort; keep the raw verdict
-        return {**verdict, "promotion_error": str(exc)}
+    except Exception as exc:
+        # Promotion is best-effort, but a failed promotion must not degrade into
+        # handing back the raw normalized point: that point is unusable as a
+        # coordinate and has repeatedly read as one.
+        logger = getattr(agent, "logger", None)
+        if logger is not None and hasattr(logger, "write"):
+            logger.write("vl.locate.promotion_error", {
+                "pageId": page_id,
+                "error": str(exc),
+                "normalizedPoint": verdict.get("point"),
+            })
+        out = _locate_model_view(verdict)
+        out["promotion_error"] = str(exc)
+        out["coordinateRefused"] = "promotion_error"
+        out["next_instruction"] = (
+            "The target was located visually but the geometry translation"
+            f" failed ({exc}), so no coordinate is offered. Re-observe with"
+            " DOM.getAXTree or DOM.getSemanticTree and act on an id."
+        )
+        return out
 
 def _screenshot_saved_path(result: JsonDict) -> Optional[str]:
     data = _bt()._response_data(result)

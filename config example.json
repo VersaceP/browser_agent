@@ -17,7 +17,6 @@
     "model_id": "qwen-vl-xxx",
     "base_url": "https://your-qwen-compatible-endpoint.example/v1",
     "api_key": "YOUR_VL_API_KEY",
-    "max_checks_per_worker": 5,
     "default_timeout_seconds": 60,
     "captcha_solve_timeout_seconds": 150,
     "captcha_solve_budget_seconds": 240,

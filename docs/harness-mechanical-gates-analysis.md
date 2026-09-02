@@ -163,7 +163,7 @@ agent_harness.run()  step ∈ [1, max_steps]                    agent_harness.py
       │       ├─[Q16] _observe_navigation_progress_after
       │       ├─[Q17] _observe_axtree_state_after  staleness
       │       ├─[Q18] _maybe_auto_intercept_overlay  P0/P1自动dismiss(P2/P3只建议)
-      │       ├─[Q19] _maybe_vl_arbitrate  VL Role D仲裁(每worker≤2)
+      │       ├─[Q19] _attach_visual_recovery_hint  挂visualRecoveryHint(零VL调用/不执行)
       │       ├─[Q20] offload_large_tool_result
       │       └─[Q21] _observe_progress_after
       │
@@ -742,10 +742,11 @@ model 路径(CALL)之外的**第二条真实调用链路**。harness 自发起�
 - **逻辑**:跑 `_dismiss_overlay`(button->Escape->backdrop 阶梯),每 page 上限 `AUTO_INTERCEPT_MAX_PER_PAGE`。dismiss 后:非 blocked 则 invalidate axtree snapshot(dismiss 改了页);DOM.getAXTree 调用且清掉了 overlay 则重取树。auth/paywall overlay 返 `blocked`,不自动点,保留原 error。
 - **作用**:省模型一步,自动 dismiss 遮罩。P2/P3(文本软检测)有假阳,**只建议不自动跑**。auth/paywall 永不自动点。用 `_invoke_browser_method`(非 model 路径)防递归。
 
-#### Q19 · _maybe_vl_arbitrate(browser_tools:6218 / 2883)
-- **触发**:VL `arbiter_enabled` + result 有 error_text + `is_visual_failure` + 每worker `vl_arbiter_count < max_checks_per_worker`(默认2)。
-- **逻辑**:VL 仲裁,附 `vlArbiter` recommendation(resolvedId/hitl/dismiss/reperceive)+ next_instruction。
-- **作用**:Role D 视觉仲裁,给确定性恢复救不回的视觉类失败一个 VL 第二意见。best-effort,不抛异常。
+#### Q19 · _attach_visual_recovery_hint(visual.py)
+- **触发**:`vl.enabled` + `vl.visual_locate_enabled` + result 有 error_text + params 有 `pageId` + 分类不在 `harness.vl.arbiter` 黑名单。
+- **逻辑**:挂 `visualRecoveryHint` 结构化建议。零 VL 调用、零页面读取、零执行。
+- **作用**:**这不是一道门,是一条广播。** 它不决定任何事,只保证模型知道视觉定位可用;用不用、拿到 cssPoint 点不点,由模型判断,`Input.click` 由模型自己发。
+- **历史**:取代 `_maybe_vl_arbitrate`(Role D 自动仲裁)与下拉框专用坐标 lane——本文档批评的"机械门条件过紧"的两个典型。仲裁器的 allowlist 路由表对十一个真实 public error code 只命中一个;select lane 另需 `Input.select` + canonical control id + 唯一 optionLabel + loopback fixture grant。分类逻辑反转为黑名单后保留:认不出的新 code 默认可提示,而非默认withhold。
 
 #### Q20 · offload_large_tool_result(browser_tools:2886)
 - **逻辑**:超大 result 卸盘,只留摘要给 model。

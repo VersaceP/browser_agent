@@ -219,6 +219,9 @@ success_contract:
   fields_required: [<field>, ...]
   fields_nonempty: [<field>, ...]
   visual_checks: []          # 可选：VL contract_verify，如 [{type: text_present, text: "提交成功"}]
+                             # 可给单条 check 加 capture：
+                             # {selector: "#status"}（裁剪视觉上下文）；或 {x: 0, y: 0, width: 300, height: 80}（viewport CSS 区域）。
+                             # selector-only 没有 screenshot receipt 的 canonical id + SemanticTree 几何绑定时，VL 只能给建议，不能否决成功契约。
 
 takeover:
   on_call_error:                                        # Workflow.execute 失败 = 抛异常（见 §6）

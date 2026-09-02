@@ -642,7 +642,6 @@ class VLConfig:
     model_id: str = ""
     base_url: Optional[str] = None
     api_key: Optional[str] = None
-    max_checks_per_worker: int = 2
     default_timeout_seconds: float = 60.0
     # captcha_solve: bounded solve-plan attempts before short-circuiting to HITL.
     # Behavioral-risk / unknown challenges are NEVER retried (honest short-circuit
@@ -688,20 +687,34 @@ class VLConfig:
     # The other independent controls are the per-skill `allow_auto_captcha`
     # frontmatter flag, the confidence floors, and the budgets above.
     captcha_solve_enabled: bool = True
-    # VL Role A (§13.2): locate an AXTree-blind target visually, then PROMOTE the
-    # pixel back to a durable canonical id via bbox containment. Default OFF — a
-    # caller (slow-path recovery) opts in before invoking harness.vl.locate.
-    visual_locate_enabled: bool = False
+    # VL Role A (§13.2): locate a target the structured surfaces cannot name,
+    # then PROMOTE the pixel back to a durable canonical id via bbox
+    # containment, falling back to a proven viewport CSS point when no node
+    # covers it. Default ON: this is the general visual-recovery path the
+    # BrowserAgent is told about on a failed page-facing call, and a capability
+    # nobody can reach is a capability nobody uses. It is not unguarded — the
+    # geometry fails closed (an unproven capture scale, an unprovable crop
+    # origin, or a target that moved between the two reads all withhold the
+    # coordinate rather than guess), and `enabled` remains the master switch
+    # above it. Turning this off makes `visual_verify` mode=visual_locate
+    # answer `refused` instead of silently returning an unusable raw point.
+    visual_locate_enabled: bool = True
     # VL Role B (§13.3): after a skill's variable success_contract passes, judge the
     # declared visual_checks (text_present / challenge_gone / ...) on a screenshot.
     # Low-cost confirmation, default ON; only a definitive `violated` vetoes (VL is
     # L4/weak — `uncertain` never overrides the passed variable contract).
     contract_verify_enabled: bool = True
-    # VL Role D (§13.5): auto-trigger the global visual arbiter on a visually-related
-    # browser_call failure (after deterministic recovery), routing it to the right VL
-    # role and attaching a recovery recommendation (resolvedId / hitl / dismiss / ...)
-    # to the result. Default OFF — it costs a VL call per visual failure.
-    arbiter_enabled: bool = False
+    # There is deliberately no `arbiter_enabled` and no per-framework select
+    # coordinate lane here any more (removed 2026-09-01). Both auto-invoked a
+    # recovery on the model's behalf from inside the browser_call hot path,
+    # behind trigger conditions so specific they almost never fired — the
+    # arbiter's routing table matched one of eleven live public error codes,
+    # and the select lane additionally required Input.select, a canonical
+    # control id, exactly one option label and a loopback fixture grant. What
+    # replaced them is a zero-cost structured note on the failure receipt
+    # (`visualRecoveryHint`) telling the model that `visual_verify`
+    # mode=visual_locate exists. The model decides whether to look, and issues
+    # any resulting Input.click itself.
     # Visual reality check: when perception keeps falling short of the task
     # target (a target-shortfall streak — 0 rows/matches, OR rows persisted
     # that never satisfy the phase contract; raw non-zero yield does NOT
@@ -751,9 +764,6 @@ class VLConfig:
             model_id=str(data.get("model_id", cls.model_id) or cls.model_id),
             base_url=data.get("base_url"),
             api_key=data.get("api_key"),
-            max_checks_per_worker=int(
-                data.get("max_checks_per_worker", cls.max_checks_per_worker)
-            ),
             default_timeout_seconds=float(
                 data.get("default_timeout_seconds", cls.default_timeout_seconds)
             ),
@@ -803,9 +813,6 @@ class VLConfig:
             ),
             contract_verify_enabled=bool(
                 data.get("contract_verify_enabled", cls.contract_verify_enabled)
-            ),
-            arbiter_enabled=bool(
-                data.get("arbiter_enabled", cls.arbiter_enabled)
             ),
             reality_check_enabled=bool(
                 data.get("reality_check_enabled", cls.reality_check_enabled)

@@ -19,6 +19,7 @@ from harness.observation.content_completeness import ContentCompletenessTracker
 from harness.observation.content_completeness import content_completeness_observation_facts
 from harness.results.call_outcome import auto_hitl_is_actionable
 from harness.results.call_outcome import classify_call_outcome
+from harness.results.call_outcome import domain_state_read_succeeded
 from harness.results.call_outcome import evaluate_grant
 from harness.results.call_outcome import page_state_evidence_ok
 from harness.results.call_outcome import public_failure_details
@@ -1001,12 +1002,33 @@ def _content_completeness_upstream_blocker(
     lifecycle, navigation, or infrastructure failures as route-sensitive
     suppression.  Vocabulary remains owned by the dedicated detectors; this
     adapter consumes their structured receipts only.
+
+    `_invoke_result_failed` also fails on `response.data.error`, which for a
+    domain-error read is the PAGE's own last-navigation error rather than this
+    call failing. On a risk-controlled page that field never clears, so every
+    successful Page.getState reported an `error:` blocker and suppressed
+    content-completeness observation for a page that was in fact readable.
+
+    The exemption therefore requires that the classifier ALSO found nothing.
+    `attach_error_classification` runs earlier in the same post-call chain and
+    already resolves the priority order — a transport failure and, above every
+    code, an ERR_PAGE_PAUSED observation. An exemption that ignored its verdict
+    would silently drop a pause on a page whose data looked healthy. Where a
+    classification exists, it is the answer; only its absence, on a clean read,
+    licenses staying quiet.
+
+    Either way this suppresses the ERROR branch alone — a clean read still goes
+    through the auth/challenge/lifecycle detectors below, which is the whole
+    reason this adapter reads a successful Page.getState at all.
     """
-    if _bt()._invoke_result_failed(result):
-        classification = (
-            result.get("errorClassification")
-            if isinstance(result.get("errorClassification"), dict) else {}
-        )
+    classification = (
+        result.get("errorClassification")
+        if isinstance(result.get("errorClassification"), dict) else {}
+    )
+    unclassified_clean_read = (
+        not classification and domain_state_read_succeeded(result, method)
+    )
+    if _bt()._invoke_result_failed(result) and not unclassified_clean_read:
         kind = str(classification.get("type") or "browser_call_failed").strip()
         return f"error:{kind}"
 

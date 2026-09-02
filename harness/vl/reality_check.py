@@ -16,7 +16,7 @@ passed validation, or collect_items reporting target_met) resets it.
 This module holds the pure logic (yield classification, claim synthesis,
 semantic-terminal claim detection, ledger citation check). The hot-path
 hook that executes the check lives in harness.tools.browser_tools (same
-split as harness.vl.arbiter / its _maybe_vl_arbitrate hook).
+split as harness.vl.arbiter, now a pure classifier).
 """
 from __future__ import annotations
 

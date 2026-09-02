@@ -158,18 +158,45 @@ def region_in_capture(
     region_declared: bool,
     screenshot_scope: str,
     coverage: Any,
+    receipt_bound: Optional[bool] = None,
 ) -> JsonDict:
     """Did the named region provably reach the captured frame?
 
     `unproven` is the honest default and covers most captures: a viewport or
     full-page shot may well contain the region, we simply cannot show it did.
     Only `disproven` overrides a model, so an unknown never silences one.
+
+    ``receipt_bound`` is the stronger evidence used by visual contracts.  It
+    means the *same Page.screenshot receipt* tied this crop to its requested
+    region or to a canonical element node in the receipt's Semantic Tree.  It
+    deliberately defaults to ``None`` for older callers: an element screenshot
+    remains self-evidencing under the legacy contract, while a new caller that
+    has inspected the receipt can say ``False`` and prevent a selector-shaped,
+    identity-less crop from being upgraded to proof.
     """
     facts = coverage if isinstance(coverage, dict) else {}
     if not region_declared:
         return {
             "state": CAPTURE_UNPROVEN,
             "reason": "no_region_declared",
+        }
+
+    if receipt_bound is True:
+        return {
+            "state": CAPTURE_PROVEN,
+            "reason": "screenshot_receipt_bound_region",
+        }
+
+    if receipt_bound is False and str(screenshot_scope or "") in {
+        SCOPE_ELEMENT, "region",
+    }:
+        # A selector can resolve more than one similarly shaped node over the
+        # lifetime of a page.  If this capture did not return a canonical id +
+        # matching Semantic Tree geometry, the picture is useful to VL but is
+        # not proof that it shows the declared element/region.
+        return {
+            "state": CAPTURE_UNPROVEN,
+            "reason": "screenshot_receipt_did_not_bind_region",
         }
 
     target_visible = facts.get("targetVisible")

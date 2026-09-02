@@ -17,7 +17,9 @@ success_contract:
   fields_nonempty: [__FILL__]
   visual_checks: []          # VL contract_verify（Role B，变量契约过后判可见末态）。
                              # 如 [{type: text_present, text: "提交成功"}, {type: challenge_gone}]。
-                             # 仅 VL 判 violated 才否决（uncertain/截图失败不否决=VL 是 L4 弱层）。
+                             # 可选 capture: {selector: "#status"} / {x: 0, y: 0, width: 300, height: 80}。
+                             # selector 截图可供 VL 判断，但没有回执中的 canonical id + SemanticTree 对应时只会得到 uncertain，不能否决。
+                             # 仅 VL 判 violated 且截图几何有回执佐证才否决（uncertain/截图失败不否决=VL 是 L4 弱层）。
 
 takeover:
   on_call_error:                                        # browser_call 带 error（非读引擎内部 .status）

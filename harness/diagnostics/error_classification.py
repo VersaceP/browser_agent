@@ -4,7 +4,10 @@ harness.diagnostics.error_classification - Structured browser/tool error hints.
 
 from typing import Any, Optional
 
-from harness.results.call_outcome import public_action_failure
+from harness.results.call_outcome import (
+    domain_state_read_succeeded,
+    public_action_failure,
+)
 from harness.constants import (
     API_CONTRACT_ERROR_MARKERS,
     PAGE_DEAD_OBSERVATION_MARKERS,
@@ -394,7 +397,35 @@ def attach_error_classification(result: JsonDict, *, method: str = "") -> JsonDi
     ):
         result["errorClassification"] = classify_browser_error(message, method=method)
         return result
-    structured = classify_public_action_failure(public_failure, method=method)
+    # `public_action_failure` is the ONLY path here that reads
+    # `response.data.error` — `_extract_error_message` above deliberately does
+    # not — and for a DOMAIN-ERROR READ that field is the PAGE's own
+    # last-navigation error, which never clears on a risk-controlled page.
+    # Every successful Page.getState of such a page was therefore labelled
+    # `action_failure` with `replayForbidden`, and the model-facing projection
+    # handed that verdict straight to the worker: "your read failed, inspect
+    # the page state" — answered by a read that produced the same verdict.
+    #
+    # The exemption sits HERE, not at the top of the function, so that every
+    # higher-priority signal is decided first: a transport failure above, and
+    # in particular the ERR_PAGE_PAUSED branch, which must win over any code
+    # because a paused page blocks every further action. Guarding the whole
+    # function instead dropped a pause that arrived through `observation` on a
+    # page whose data looked healthy.
+    #
+    # BOTH conditions in the predicate are load-bearing. The method set alone
+    # would swallow a genuinely failed Page.getState; the call verdict alone
+    # would swallow a failed ACTION whose only signal is a bare `data.error`,
+    # which is how Runtime.evaluate reports (see
+    # tools/browser_tools/runtime_eval._runtime_evaluation_error_text).
+    #
+    # Nothing is hidden from the model: the page's own error stays in
+    # `response.data.error` where the platform put it. What stops is the
+    # harness relabelling it as a failure of the call that read it.
+    structured = (
+        None if domain_state_read_succeeded(result, method)
+        else classify_public_action_failure(public_failure, method=method)
+    )
     if structured is not None:
         result["errorClassification"] = structured
         return result
