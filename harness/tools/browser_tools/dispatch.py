@@ -2,6 +2,7 @@
 harness.tools.browser_tools.dispatch - Tool registry, dispatcher and model-facing tool handlers.
 """
 
+import asyncio
 import copy
 import re
 import uuid
@@ -14,6 +15,8 @@ from typing import List
 from typing import Optional
 from typing import Set
 from typing import Tuple
+from abcp_client import ABCPTransportError
+from harness.diagnostics.error_classification import attach_error_classification
 from harness.lifecycle import LifecycleContext
 from harness.lifecycle import lifecycle_for
 from harness.local_fs import local_fs_read
@@ -22,7 +25,16 @@ from harness.observation.page_lifecycle import PageLifecycleTracker
 from harness.pacing import wait_between_rows
 from harness.observation.browser_call import build_browser_call_runner
 from harness.runtime_evaluation import RuntimeEvaluationService
+from harness.results.call_outcome import replay_forbidden
+from harness.tool_policy import collect_sensitive_replacements
 from harness.tool_policy import hidden_harness_tools_for_task_type
+from harness.tool_policy import redact_values
+from harness.tool_policy import sensitive_browser_method_params
+from harness.tools.argument_pipeline import SchemaIssue
+from harness.tools.argument_pipeline import apply_registered_tool_defaults
+from harness.tools.argument_pipeline import prepare_model_tool_call
+from harness.tools.argument_pipeline import tool_argument_error
+from harness.tools.argument_pipeline import validate_registered_tool_call
 from harness.tools.registry import ToolContext
 from harness.tools.registry import ToolRegistry
 from harness.utils import JsonDict
@@ -30,7 +42,6 @@ from harness.utils import optional_int
 from harness.workflow_runtime import workflow_execution_disabled_result
 from harness.workflow_runtime import workflow_execution_enabled
 from .schemas import _browser_input_schemas
-from .composites.fill_field_verified import _fill_field_verified
 
 def _bt():
     import harness.tools.browser_tools as bt
@@ -344,6 +355,132 @@ def _allowed_tool_hint(agent: Any) -> JsonDict:
         "capability_method_count": len(capability_methods),
     }
 
+
+def _browser_method_from_tool_call(agent: Any, tool_call: Any) -> str:
+    """Return the ABCP method a model tool call intended to execute, if any."""
+    if not isinstance(tool_call, dict):
+        return ""
+    name = str(tool_call.get("name") or "").strip()
+    raw_input = tool_call.get("input")
+    tool_input = raw_input if isinstance(raw_input, dict) else {}
+    if name == "browser_call":
+        return str(tool_input.get("method") or "").strip()
+    if name in getattr(agent, "capability_methods", set()):
+        return name
+    return ""
+
+
+def _sensitive_transport_metadata(metadata: JsonDict) -> JsonDict:
+    """Drop string-bearing transport fields when the call had secret input.
+
+    The normal browser-call boundary redacts a transport exception before it
+    escapes. This dispatcher fallback exists precisely for paths where that
+    guarantee may have been bypassed, so it must not forward public prose or a
+    receipt's arbitrary strings merely because they have the expected shape.
+    Error code and dispatch facts remain useful and cannot contain a supplied
+    value under the public contract.
+    """
+    safe: JsonDict = {}
+    for key in (
+        "exceptionType",
+        "transportCode",
+        "connectionFatal",
+        "requestSent",
+        "rpcCode",
+        "tool_was_executed",
+        "retryable",
+        "quarantined",
+    ):
+        if key in metadata:
+            safe[key] = metadata[key]
+    rpc_data = metadata.get("rpcData")
+    error = rpc_data.get("error") if isinstance(rpc_data, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    if isinstance(code, str) and code.strip():
+        safe["rpcData"] = {"error": {"code": code}}
+    return safe
+
+
+def _tool_exception_result(
+    agent: Any,
+    tool_call: Any,
+    exc: Exception,
+) -> JsonDict:
+    """Return a missed tool exception to the model without claiming no-op.
+
+    This is the dispatcher-level safety net, after individual tools have had
+    the chance to return their richer, domain-specific failures.  The exception
+    may have been raised at any point in a browser call, so omitting
+    ``tool_was_executed`` is deliberate: only a first-hand pre-dispatch receipt
+    can prove that an action did not happen.  The model can continue its loop,
+    but must re-observe before replaying an action whose outcome is unknown.
+    """
+    method = _browser_method_from_tool_call(agent, tool_call)
+    raw_input = tool_call.get("input") if isinstance(tool_call, dict) else {}
+    tool_name = str(tool_call.get("name") or "") if isinstance(tool_call, dict) else ""
+    declared_sensitive_params = sensitive_browser_method_params(method)
+    if declared_sensitive_params:
+        safe_message = (
+            "Exception message withheld because this call carried sensitive input."
+        )
+    else:
+        secrets = collect_sensitive_replacements(raw_input)
+        message = str(exc).strip() or "exception raised without a message"
+        safe_message = redact_values(message, secrets) if secrets else message
+    result: JsonDict = {
+        "isError": True,
+        "status": "tool_exception",
+        "error": safe_message[:1200],
+        "exceptionType": type(exc).__name__,
+        "tool": tool_name,
+    }
+    if method:
+        result["method"] = method
+
+    if isinstance(exc, ABCPTransportError):
+        # Individual capability handlers normally return this themselves.  If
+        # one misses it, retain the public failure envelope and its typed
+        # replay facts instead of flattening it into a generic exception.
+        transport_metadata = _bt()._transport_error_metadata(method, exc)
+        receipt_status = transport_metadata.pop("status", None)
+        if receipt_status is not None:
+            result["transportReceiptStatus"] = receipt_status
+        if declared_sensitive_params:
+            transport_metadata = _sensitive_transport_metadata(transport_metadata)
+        result.update(transport_metadata)
+        attach_error_classification(result, method=method)
+        result["replayForbidden"] = replay_forbidden(result)
+        event = "browser.tool.transport_exception"
+    else:
+        result["error"] = f"{type(exc).__name__}: {result['error']}"
+        result["replayForbidden"] = True
+        result["errorClassification"] = {
+            "type": "unexpected_tool_exception",
+            "exceptionType": type(exc).__name__,
+            "method": method,
+            "replayForbidden": True,
+            "suggested_action": (
+                "reobserve_state_before_retrying_or_reporting_tool_exception"
+            ),
+        }
+        event = "browser.tool.exception"
+
+    logger = getattr(agent, "logger", None)
+    write = getattr(logger, "write", None)
+    if callable(write):
+        try:
+            trim_for_log = getattr(agent, "_trim_for_log", None)
+            log_result = trim_for_log(result) if callable(trim_for_log) else result
+            write(event, log_result)
+        except Exception:
+            # The fallback itself must not fail because observability failed.
+            pass
+    trace = getattr(agent, "trace", None)
+    if isinstance(trace, list):
+        trace.append({"type": "tool_exception", "result": copy.deepcopy(result)})
+    return result
+
+
 @lru_cache(maxsize=32)
 def _browser_input_schemas_cached(capability_methods: Tuple[str, ...]) -> Dict[str, JsonDict]:
     return _browser_input_schemas(capability_methods)
@@ -351,24 +488,111 @@ def _browser_input_schemas_cached(capability_methods: Tuple[str, ...]) -> Dict[s
 def build_browser_tool_dispatcher(agent: Any) -> BrowserToolDispatcher:
     async def dispatch(tool_call: JsonDict, step: int) -> Tuple[JsonDict, bool]:
         lifecycle = lifecycle_for(agent)
-        effective_call = lifecycle.tool_pre_call(
-            LifecycleContext(
-                actor="browser_agent",
-                step=step,
-                metadata={"agent_id": getattr(getattr(agent, "runtime", None), "agent_id", "")},
-            ),
-            tool_call,
+        context = LifecycleContext(
+            actor="browser_agent",
+            step=step,
+            metadata={"agent_id": getattr(getattr(agent, "runtime", None), "agent_id", "")},
         )
-        result, should_stop = await execute_browser_tool(agent, effective_call, step)
-        result = lifecycle.tool_post_call(
-            LifecycleContext(
-                actor="browser_agent",
-                step=step,
-                metadata={"agent_id": getattr(getattr(agent, "runtime", None), "agent_id", "")},
-            ),
-            effective_call,
-            result,
+        prepared_call, prepared_fields, preparation_error = prepare_model_tool_call(
+            tool_call
         )
+        if preparation_error is not None or prepared_call is None:
+            result = tool_argument_error(
+                tool_call,
+                [SchemaIssue((), "type", preparation_error or "invalid tool call")],
+                stage="prepare_arguments",
+            )
+            _record_tool_argument_rejection(agent, result)
+            return result, False
+        prepared_call, defaulted_fields = apply_registered_tool_defaults(
+            BROWSER_TOOLS,
+            prepared_call,
+            schema_context=getattr(agent, "capability_methods", set()),
+        )
+        prepared_fields.extend(defaulted_fields)
+        issues = validate_registered_tool_call(
+            BROWSER_TOOLS,
+            prepared_call,
+            schema_context=getattr(agent, "capability_methods", set()),
+        )
+        if issues:
+            result = tool_argument_error(
+                prepared_call,
+                issues,
+                stage="validate_tool_arguments",
+                normalized_fields=prepared_fields,
+            )
+            _record_tool_argument_rejection(agent, result)
+            return result, False
+        effective_call = prepared_call
+        post_call_attempted = False
+        try:
+            # Middleware is intentionally between the two schema checks.  It
+            # may add trusted context, but cannot smuggle an invalid model call
+            # into execution by changing the arguments after validation.
+            effective_call = lifecycle.tool_pre_call(context, prepared_call)
+            effective_call, defaulted_fields = apply_registered_tool_defaults(
+                BROWSER_TOOLS,
+                effective_call,
+                schema_context=getattr(agent, "capability_methods", set()),
+            )
+            prepared_fields.extend(defaulted_fields)
+            issues = validate_registered_tool_call(
+                BROWSER_TOOLS,
+                effective_call,
+                schema_context=getattr(agent, "capability_methods", set()),
+            )
+            if issues:
+                result = tool_argument_error(
+                    effective_call,
+                    issues,
+                    stage="validate_after_before_tool_call",
+                    normalized_fields=prepared_fields,
+                )
+                _record_tool_argument_rejection(agent, result)
+                return result, False
+            result, should_stop = await execute_browser_tool(
+                agent, effective_call, step
+            )
+            post_call_attempted = True
+            try:
+                result = lifecycle.tool_post_call(context, effective_call, result)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # The tool already ran.  Keep its receipt and terminal signal;
+                # after-call middleware is observational and cannot turn a
+                # completed action into an uncertain execution.
+                _record_tool_after_call_exception(agent, effective_call, exc)
+        except asyncio.CancelledError:
+            raise
+        except ABCPTransportError as exc:
+            # A dead transport is a slot lifecycle failure.  It must reach the
+            # spawner, which owns client teardown and reconnection, rather than
+            # becoming a tool error that invites another browser call.
+            if (
+                bool(getattr(exc, "connection_fatal", False))
+                or bool(
+                    getattr(exc, "requires_spawn_acquisition_cooldown", False)
+                )
+            ):
+                raise
+            result, should_stop = _tool_exception_result(agent, effective_call, exc), False
+        except Exception as exc:
+            result, should_stop = _tool_exception_result(agent, effective_call, exc), False
+        if not post_call_attempted:
+            try:
+                # A handler exception is still a ToolResultMessage. Let the
+                # after hook observe that receipt, while avoiding a second
+                # invocation if the hook itself was the source of the error.
+                result = lifecycle.tool_post_call(context, effective_call, result)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # The fallback result still describes the earlier failure.  A
+                # second exception in an observational hook must not replace
+                # it with a misleading execution failure.
+                _record_tool_after_call_exception(agent, effective_call, exc)
         if _contains_truncated_receipt(result):
             result.setdefault(
                 "truncationNotice",
@@ -383,6 +607,36 @@ def build_browser_tool_dispatcher(agent: Any) -> BrowserToolDispatcher:
         return result, should_stop
 
     return dispatch
+
+
+def _record_tool_argument_rejection(agent: Any, result: JsonDict) -> None:
+    logger = getattr(agent, "logger", None)
+    write = getattr(logger, "write", None)
+    if callable(write):
+        write("tool.arguments.rejected", result)
+    trace = getattr(agent, "trace", None)
+    if isinstance(trace, list):
+        trace.append({"type": "tool_arguments_rejected", "result": copy.deepcopy(result)})
+
+
+def _record_tool_after_call_exception(
+    agent: Any,
+    tool_call: Any,
+    exc: Exception,
+) -> None:
+    """Record middleware failure without replacing an existing tool receipt."""
+    name = str(tool_call.get("name") or "unknown") if isinstance(tool_call, dict) else "unknown"
+    receipt = {"tool": name, "exceptionType": type(exc).__name__}
+    logger = getattr(agent, "logger", None)
+    write = getattr(logger, "write", None)
+    if callable(write):
+        try:
+            write("browser.tool.after_call_exception", receipt)
+        except Exception:
+            pass
+    trace = getattr(agent, "trace", None)
+    if isinstance(trace, list):
+        trace.append({"type": "tool_after_call_exception", "result": receipt})
 
 def _contains_truncated_receipt(value: Any) -> bool:
     if isinstance(value, dict):
@@ -977,24 +1231,6 @@ async def _browser_collect_items(ctx: ToolContext) -> JsonDict:
         result,
         ctx.step,
     )
-
-@BROWSER_TOOLS.register(
-    name="fill_field_verified",
-    description=(
-        "Type a value into a form field and verify it was actually accepted by"
-        " reading the field's live value back (handles React/controlled inputs"
-        " where the DOM attribute lags). On mismatch it clears harder and"
-        " retries once; if the field can't be uniquely located it yields"
-        " (ambiguous/field_not_found) instead of claiming success. Recovers from"
-        " an occluding overlay. Never submits the form — do that as a separate"
-        " verified action."
-    ),
-    input_schema=_browser_schema_for("fill_field_verified"),
-    contract_check=True,
-    trace_type="fill_field_verified",
-)
-async def _browser_fill_field_verified(ctx: ToolContext) -> JsonDict:
-    return await _fill_field_verified(ctx.agent, ctx.tool_input, ctx.step)
 
 @BROWSER_TOOLS.register(
     name="visual_verify",

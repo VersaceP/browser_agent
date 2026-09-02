@@ -19,23 +19,19 @@ from harness.task_types import (
 )
 
 
-# Tool input fields that carry secrets when the call opts into masking
-# (mask=true). The browser still receives the real value; these are masked at
-# every logging/trace/snapshot boundary so secrets never get persisted.
-SENSITIVE_TOOL_INPUT_FIELDS: Dict[str, FrozenSet[str]] = {
-    "fill_field_verified": frozenset({"text"}),
+# ABCP method params that carry a secret. The browser still receives the real
+# value; these are masked at every harness log/trace/result boundary, and the
+# dispatcher fallback withholds an unknown exception's text for such a call.
+SENSITIVE_BROWSER_METHOD_PARAMS: Dict[str, FrozenSet[str]] = {
+    "Page.handleDialog": frozenset({"userInput"}),
 }
 
 # Harness composite tools hidden from the model tool surface for task types
 # where they have no legitimate use — pure schema-token/choice-noise savings.
 # Mirrors the ABCP-method task_type policy: explicit general remains broad, but
 # missing/unknown values resolve to restricted web_scrape defense-in-depth.
-HARNESS_TOOLS_HIDDEN_BY_TASK_TYPE: Dict[str, FrozenSet[str]] = {
-    "web_scrape": frozenset({"fill_field_verified"}),
-    "web_search": frozenset({"fill_field_verified"}),
-    "file_download": frozenset({"fill_field_verified"}),
-    "browser_state_management": frozenset({"fill_field_verified"}),
-}
+# Empty since fill_field_verified was removed; the gate stays as the hook.
+HARNESS_TOOLS_HIDDEN_BY_TASK_TYPE: Dict[str, FrozenSet[str]] = {}
 
 
 def hidden_harness_tools_for_task_type(task_type: object) -> Set[str]:
@@ -45,6 +41,11 @@ def hidden_harness_tools_for_task_type(task_type: object) -> Set[str]:
         )
         or frozenset()
     )
+
+
+def sensitive_browser_method_params(method: Any) -> Set[str]:
+    """Declared secret-bearing parameters for one ABCP method."""
+    return set(SENSITIVE_BROWSER_METHOD_PARAMS.get(str(method or "")) or ())
 
 
 def mask_token(value: Any) -> str:
@@ -359,33 +360,6 @@ def redact_params_for_display(
     return redact_values(masked, secrets) if secrets else masked
 
 
-def sanitize_tool_input_for_log(name: Any, tool_input: Any) -> Any:
-    """Mask sensitive fields in a model tool-call input when the call opted into
-    masking (mask truthy). Returns a copy; the original input is untouched."""
-    if not isinstance(tool_input, dict):
-        return tool_input
-    fields = SENSITIVE_TOOL_INPUT_FIELDS.get(str(name or ""))
-    if not fields or not tool_input.get("mask"):
-        return tool_input
-    return mask_params(tool_input, set(fields))
-
-
-def sanitize_tool_calls_for_log(tool_calls: Any) -> Any:
-    """Sanitize a list of model tool calls ({name, input, ...}) for logging."""
-    if not isinstance(tool_calls, list):
-        return tool_calls
-    sanitized = []
-    for item in tool_calls:
-        if isinstance(item, dict):
-            sanitized.append({
-                **item,
-                "input": sanitize_tool_input_for_log(item.get("name"), item.get("input", {})),
-            })
-        else:
-            sanitized.append(item)
-    return sanitized
-
-
 HARNESS_DEFAULT_ALLOWED_TOOLS: FrozenSet[str] = frozenset({
     "final_answer",
     "record_extraction",
@@ -396,7 +370,6 @@ HARNESS_DEFAULT_ALLOWED_TOOLS: FrozenSet[str] = frozenset({
     "visual_verify",
     "dismiss_overlay",
     "collect_items",
-    "fill_field_verified",
 })
 
 HARNESS_TOOL_NAMES: FrozenSet[str] = frozenset({

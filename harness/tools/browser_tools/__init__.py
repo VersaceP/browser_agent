@@ -165,13 +165,6 @@ from .composites.collect_items import (
     _collect_overlay_recovery,
     _collect_overlay_stop_reason,
 )
-from .composites.fill_field_verified import (
-    FILL_FIELD_STOPWORDS,
-    _axtree_node_name,
-    _fill_field_action,
-    _fill_field_keywords,
-    _fill_field_verified,
-)
 
 from .auto_intercept import (  # noqa: F401
     AUTO_INTERCEPT_MAX_PER_PAGE,
@@ -216,7 +209,6 @@ from .dispatch import (  # noqa: F401
     _browser_dismiss_overlay,
     _browser_execute_browser_workflow,
     _browser_execute_selected_skill,
-    _browser_fill_field_verified,
     _browser_final_answer,
     _browser_find_in_axtree,
     _browser_input_schemas_cached,
@@ -406,7 +398,6 @@ from .validation import (  # noqa: F401
     _check_nested_id_format,
     _check_screenshot_misuse,
     _check_scroll_param_requirements,
-    _check_select_param_requirements,
     _check_target_param_requirements,
     _default_semantic_tree_shadow_dom,
     _non_empty_param,
@@ -416,12 +407,10 @@ from .validation import (  # noqa: F401
 )
 from .visual import (  # noqa: F401
     REALITY_CHECK_CAPTURE_FAILURE_LIMIT,
-    _arbiter_error_text,
-    _arbiter_next_instruction,
+    _attach_visual_recovery_hint,
     _layers_from_result,
     _log_dismiss_overlay,
     _maybe_reality_check,
-    _maybe_vl_arbitrate,
     _normalized_repair_page,
     _page_reality_check_instruction,
     _promote_visual_locate,

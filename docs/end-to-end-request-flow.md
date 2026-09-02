@@ -403,15 +403,19 @@ BrowserAgent.run()  step ∈ [1, worker_max_steps]                     agent_har
 **实现**：`harness/tools/browser_tools/dispatch.py`。
 
 ```
-build_browser_tool_dispatcher.dispatch (dispatch.py:349)
-├─[D0]  lifecycle.tool_pre_call / tool_post_call     默认 identity（扩展点）
-├─[D3]  _maybe_reality_check (dispatch 返回后)        VL 视觉现实核查，best-effort
-└─ execute_browser_tool (dispatch.py:394)
+build_browser_tool_dispatcher.dispatch (dispatch.py)
+├─[D0]  prepare_model_tool_call                       缺失/null input 规范成 {}
+├─[D1]  registry schema defaults → validate           第一次模型参数边界校验
+├─[D2]  lifecycle.tool_pre_call → defaults → validate middleware 改参后必须再次校验
+├─[D3]  execute_browser_tool                          执行并保留 should_stop
+├─[D4]  lifecycle.tool_post_call                      扩展点；异常只记录，不覆盖既有回执
+├─[D5]  _maybe_reality_check (dispatch 返回后)        VL 视觉现实核查，best-effort
+└─ execute_browser_tool (dispatch.py)
    │  ★ 现在的职责是"附上非阻断的进度观察"：
    │    ProgressAccountant 的事实算出来后作为 progressObservations/
    │    loopObservations 附到 result 和 trace receipt 上，并明文声明
    │    "它们没有决定调用是否运行"（docstring + notice 文本）
-   └─ _execute_browser_tool_impl (dispatch.py:465)
+   └─ _execute_browser_tool_impl (dispatch.py)
       ├─ terminal handler? (final_answer / lead final_answer)
       │    走终态分支；handler 可软拒(tool_was_executed=False)把调用弹回模型重做
       ├─ _observe_unrecorded_extraction_before      ← 观察（旧 extraction gate）
@@ -420,10 +424,12 @@ build_browser_tool_dispatcher.dispatch (dispatch.py:349)
       │    每次调用照常 dispatch；final_answer 豁免
       ├─ name == "browser_call" → 直通 _execute_browser_capability_tool
       │    （注册 handler 只能返 JsonDict 会丢 should_stop，直通保住
-      │     page_create_should_stop 死浏览器硬停的透传）
+      │     page_create_should_stop 死浏览器硬停的透传）；能力执行器会在
+      │     Runtime/Workflow 归一化、fleet 注入与定制参数门之后、runner.call
+      │     之前应用 live method schema defaults 并进行最终 schema 校验
       ├─ direct capability name（如直接调 Input.click 名）→ 同上
-      ├─ 注册工具（navigate_verified / collect_items / fill_field_verified /
-      │  dismiss_overlay / visual_verify / record_extraction / local_fs_* / ...）
+      ├─ 注册工具（navigate_verified / collect_items / dismiss_overlay /
+      │  visual_verify / record_extraction / local_fs_* / ...）
       │    → routing guard(fleet/page binding) → contract_check → handler
       └─ 其他 → Unknown harness tool
 ```
@@ -852,7 +858,7 @@ _execute_browser_capability_tool (capability.py)
 **第二条调用链路：`_invoke_browser_method`（capability.py:888）**
 
 harness **自发起**的浏览器调用（composites：navigate_verified / collect_items /
-fill_field_verified / dismiss_overlay；captcha autosolve；auto-intercept 的树刷新；
+dismiss_overlay；captcha autosolve；auto-intercept 的树刷新；
 post-HITL recovery）走这条减配链路，落地点 capability.py:1017：
 
 - **减配前置门**（保留的硬门只有）：screenshot 归一、internal 路径 Runtime.evaluate
@@ -1063,14 +1069,38 @@ post-HITL recovery）走这条减配链路，落地点 capability.py:1017：
 - **作用**：省模型一步，自动 dismiss 遮罩。P2/P3（文本软检测）有假阳，只建议不自动跑。
   用 `_invoke_browser_method`（非 model 路径）防递归。
 
-### Q20 · _maybe_vl_arbitrate（capability.py:866，visual.py）
+### Q20 · _attach_visual_recovery_hint（capability.py，visual.py）
 
-- **触发**：VL `arbiter_enabled` + result 有 error_text + `is_visual_failure` + 每 worker
-  `vl_arbiter_count < max_checks_per_worker`（默认 2）。
-- **逻辑**：VL 仲裁，附 `vlArbiter` recommendation（resolvedId/hitl/dismiss/reperceive）
-  + next_instruction。
-- **作用**：Role D 视觉仲裁，给确定性恢复救不回的视觉类失败一个 VL 第二意见。
-  best-effort，不抛异常。
+- **触发**：`vl.enabled` + `vl.visual_locate_enabled` + result 有 error_text + params 有
+  `pageId` + 失败分类不在 `harness.vl.arbiter` 的黑名单里。
+- **逻辑**：在回执上挂 `visualRecoveryHint`（何时该用、怎么调、三种返回各自怎么处理、
+  以及"能定位不等于能操作"的边界）。**不发 VL 请求、不读页面、不执行任何动作。**
+- **作用**：让 BrowserAgent 知道视觉定位这条路存在——是否花这一步、拿到坐标点不点，
+  都由模型决定，`Input.click` 由模型自己发。
+
+  取代了原 `_maybe_vl_arbitrate`（Role D 自动仲裁）与下拉框专用坐标 lane。两者都在
+  热路径上替模型做决定，且触发条件窄到几乎不发生：仲裁器的路由表对十一个真实公开
+  error code 只命中一个（连字符 code 匹配不上散文 marker），select lane 还额外要求
+  `Input.select` + canonical control id + 唯一 optionLabel + loopback fixture 授权。
+  分类能力保留在 `harness.vl.arbiter`，反转为黑名单：认不出的新 code 默认可提示。
+
+### Q20.1 · skill visual contract receipt binding（skill/visual_contract.py）
+
+- **触发**：workflow 的变量/行成功契约已经通过，且 `success_contract.visual_checks` 非空、
+  `vl.enabled` 和 `contract_verify_enabled` 都开。
+- **逻辑**：每组相同的 `capture` 只发一次 `Page.screenshot`，把 `path` **和完整
+  receipt** 一起交给 VL。普通 check 是 viewport 截图；单条 check 可声明元素
+  `capture: {id?, selector?}` 或区域 `capture: {x, y, width, height}`。
+  - 元素：复用 `capture_geometry.py` + `locate.capture_origin`；只有 receipt 中的
+    canonical id 能在同一 receipt 附带的 SemanticTree 找到，且 `visibleBounds` 与截图
+    尺寸一致，才叫 `receiptBound`。
+  - 区域：只有 receipt 回显的 CSS 区域与实际截图尺寸自洽，才叫 `receiptBound`。
+  - selector-only 可以给 VL 更小、更相关的画面，但当前平台不保证它返回 canonical id，
+    因而只能是 `unproven`，不能据此否决 workflow。
+- **结论**：VL 判 `violated` 且目标 crop 的几何是 `proven` 才转慢路径；几何缺失、
+  screenshot/VL 故障、或 VL `uncertain` 都 fail-open。返回的 `sameMomentProven=false`
+  是刻意的：ABCP 还没有截图、布局版本、SemanticTree 版本共用的原子版本号；receipt
+  能证明"这张裁剪图与这份回执相符"，不能声称页面在截图和树读取间从未异步变化。
 
 ### Q21 · offload_large_tool_result（capability.py:869，offload.py）
 

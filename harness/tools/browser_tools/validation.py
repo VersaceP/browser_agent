@@ -6,7 +6,6 @@ import re
 from typing import Any
 from typing import List
 from typing import Optional
-from typing import Set
 from typing import Tuple
 from pathlib import Path
 from harness.screenshot_policy import normalize_screenshot_output_params
@@ -36,171 +35,6 @@ def _non_negative_numeric_param(params: JsonDict, key: str) -> bool:
         except ValueError:
             return False
     return False
-
-def _check_select_param_requirements(
-    method: str,
-    params: JsonDict,
-) -> Optional[JsonDict]:
-    """Fail early on malformed Input.select requests for the rebuilt select
-    contract.
-
-    The current platform schema is: pageId + (id and/or selector - at least
-    one, both allowed so the id-first/selector-fallback pair keeps working)
-    plus EXACTLY ONE selection array - nativeValues, optionIds, or
-    optionLabels - which are mutually exclusive. nativeValues is for native
-    HTML selects; optionIds/optionLabels address options in the currently
-    open custom popup window. Arrays must be non-empty, duplicate-free, and
-    (for labels) non-blank and distinct after whitespace normalization.
-
-    The earlier `selections` envelope (per-item id/value/label/path cascades)
-    belonged to the retired beta contract; a request carrying it is rejected
-    with a migration hint instead of reaching the browser as an opaque
-    -32602.
-    """
-
-    if method != "Input.select":
-        return None
-
-    def invalid(param: str, detail: str, instruction: str) -> JsonDict:
-        return {
-            "method": method,
-            "params": params,
-            "status": "invalid_params",
-            "error": detail,
-            "invalidParam": param,
-            "tool_was_executed": False,
-            "next_instruction": instruction,
-        }
-
-    canonical_id = re.compile(r"^\d+:\d+:\d+$")
-    control_instruction = (
-        "Target the select control with its canonical id and/or a unique CSS"
-        " selector (at least one; both may be sent together and the platform"
-        " resolves the id first). Do not guess identifiers."
-    )
-
-    raw_id = params.get("id")
-    if raw_id is not None and (
-        not isinstance(raw_id, str)
-        or canonical_id.fullmatch(raw_id.strip()) is None
-    ):
-        return invalid(
-            "id",
-            "Input.select id is not a canonical control id"
-            " (frameId:axNodeId:domNodeId).",
-            control_instruction,
-        )
-    selector = params.get("selector")
-    if selector is not None and (not isinstance(selector, str) or not selector.strip()):
-        return invalid("selector", "Input.select selector must be a non-empty string.", control_instruction)
-    if raw_id is None and selector is None:
-        return {
-            "method": method,
-            "params": params,
-            "status": "invalid_params",
-            "error": "Input.select requires params.id and/or params.selector.",
-            "invalidParam": "id",
-            "missingAnyOf": [["id"], ["selector"]],
-            "tool_was_executed": False,
-            "next_instruction": control_instruction,
-        }
-
-    if "selections" in params or "path" in params:
-        return invalid(
-            "selections",
-            "Input.select no longer accepts the selections/path envelope.",
-            (
-                "The select contract changed: pass exactly one of"
-                " nativeValues (native HTML select), optionIds, or"
-                " optionLabels (options in the currently open custom popup),"
-                " copied from a fresh DOM.inspectSelect response. Cascading"
-                " paths and per-item id/value/label objects are gone; complex"
-                " popups return select-agent-takeover-required and must be"
-                " operated with generic Input.click/type/scroll instead."
-            ),
-        )
-
-    selection_fields = {
-        "nativeValues": "nativeValues",
-        "optionIds": "optionIds",
-        "optionLabels": "optionLabels",
-    }
-    present = [field for field in selection_fields if params.get(field) is not None]
-    if not present:
-        return {
-            "method": method,
-            "params": params,
-            "status": "invalid_params",
-            "error": (
-                "Input.select requires exactly one of nativeValues, optionIds,"
-                " or optionLabels."
-            ),
-            "invalidParam": "nativeValues",
-            "missingAnyOf": [["nativeValues"], ["optionIds"], ["optionLabels"]],
-            "tool_was_executed": False,
-            "next_instruction": (
-                "Call DOM.inspectSelect first, then copy one selection array"
-                " verbatim: nativeValues for a native select, optionIds or"
-                " optionLabels for the currently open custom popup. The three"
-                " fields are mutually exclusive."
-            ),
-        }
-    if len(present) > 1:
-        return invalid(
-            present[0],
-            f"Input.select carries {len(present)} selection fields"
-            f" ({', '.join(present)}); exactly one is allowed.",
-            (
-                "nativeValues, optionIds, and optionLabels are mutually"
-                " exclusive. Send exactly the one array that matches the"
-                " control kind DOM.inspectSelect reported."
-            ),
-        )
-
-    field = present[0]
-    values = params.get(field)
-    if not isinstance(values, list) or not values:
-        return invalid(field, f"Input.select {field} must be a non-empty array.",
-                       f"Copy the {field} entries from a fresh DOM.inspectSelect response.")
-    seen: Set[str] = set()
-    for index, value in enumerate(values):
-        if not isinstance(value, str):
-            return invalid(f"{field}[{index}]", f"Input.select {field}[{index}] must be a string.",
-                           f"Copy the {field} entries from a fresh DOM.inspectSelect response.")
-        if field == "optionIds" and canonical_id.fullmatch(value.strip()) is None:
-            return invalid(
-                f"{field}[{index}]",
-                f"Input.select {field}[{index}] is not a canonical option id.",
-                (
-                    "Option ids are only valid for the popup generation that"
-                    " exposed them. Re-run DOM.inspectSelect and copy current"
-                    " optionIds verbatim, or use optionLabels/nativeValues."
-                ),
-            )
-        if not value.strip():
-            # The live schema requires min length 1 on every array item
-            # (nativeValues included); an empty string is not a selectable
-            # native value on this contract generation.
-            return invalid(f"{field}[{index}]", f"Input.select {field}[{index}] must not be blank.",
-                           f"Copy the {field} entries from a fresh DOM.inspectSelect response.")
-        dedupe_key = (
-            re.sub(r"\s+", " ", value.strip())
-            if field == "optionLabels"
-            else value
-        )
-        if dedupe_key in seen:
-            return invalid(
-                field,
-                f"Input.select {field} contains duplicate"
-                + (" normalized labels." if field == "optionLabels" else " values."),
-                (
-                    "Duplicates are rejected by the platform. For repeated"
-                    " labels use the optionIds array instead."
-                ),
-            )
-        seen.add(dedupe_key)
-    return None
-
 
 def _check_dialog_param_requirements(
     agent: Any,
@@ -524,9 +358,12 @@ def _check_target_param_requirements(
                 " pageId/purpose or without a target element."
             ),
         }
-    select_error = _check_select_param_requirements(method, params)
-    if select_error is not None:
-        return select_error
+    # Input.select's selection payload is deliberately NOT mirrored here. Its
+    # shape belongs to the connected platform's contract generation (the
+    # `selections` envelope and the nativeValues/optionIds/optionLabels arrays
+    # are both live in the wild), so validate_schema checks it against this
+    # session's describeAction schema instead. A local mirror silently rejected
+    # the only shape the connected browser accepted; see task f1da2976.
     if method == "Input.click" and not has_selector_or_id:
         has_coordinates = (
             _non_negative_numeric_param(params, "x")

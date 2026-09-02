@@ -19,6 +19,11 @@ from harness.runtime_evaluation import RuntimeEvaluationService
 from harness.runtime_evaluation import runtime_last_resort_evidence
 from harness.task_types import resolve_task_type_fail_closed
 from harness.tool_policy import redact_params_for_display
+from harness.tool_policy import sensitive_browser_method_params
+from harness.tools.argument_pipeline import apply_required_schema_defaults
+from harness.tools.argument_pipeline import capability_argument_error
+from harness.tools.argument_pipeline import capability_input_schema
+from harness.tools.argument_pipeline import validate_schema
 from harness.tools.parsers import attach_method_schema
 from harness.tools.parsers import ensure_required_purpose
 from harness.tools.parsers import parse_browser_call_params
@@ -148,7 +153,7 @@ async def _execute_browser_capability_tool(
 
     # Dialog prompt input is a secret-bearing value. The browser receives it,
     # but every harness log/trace/result uses the masked view.
-    sensitive_params = {"userInput"} if method == "Page.handleDialog" else None
+    sensitive_params = sensitive_browser_method_params(method)
 
     def shown_params() -> JsonDict:
         # Value-based, not key-based: a credential can arrive inside a `url`
@@ -191,6 +196,8 @@ async def _execute_browser_capability_tool(
         )
         agent.trace.append({"type": "browser_call_rejected", "result": result})
         return result, False
+
+    method_input_schema = capability_input_schema(agent.method_schemas, method)
 
     params, shadow_dom_defaulted = _bt()._default_semantic_tree_shadow_dom(
         method,
@@ -424,23 +431,53 @@ async def _execute_browser_capability_tool(
         agent.trace.append({"type": "stale_axtree_target", "result": stale_target})
         return stale_target, False
 
-    _bt()._observe_progress_before(agent, method, params, step)
-
+    # The harness has completed its own parameter preparation and custom
+    # diagnostics at this point (Runtime/Workflow normalization, fleet binding,
+    # and target-specific guards).  Schema validation belongs here so it checks
+    # the actual call that will reach ABCP without masking richer guidance.
     if ensure_required_purpose(
-        agent.methods_requiring_purpose,
+        getattr(agent, "methods_requiring_purpose", set()),
         method,
         params,
         reason,
-        purpose_hints=agent.purpose_hints,
+        purpose_hints=getattr(agent, "purpose_hints", {}),
     ):
         agent.logger.write(
             "browser.call.purpose_added",
-            {
-                "method": method,
-                "purpose": params.get("purpose"),
-            },
+            {"method": method, "purpose": params.get("purpose")},
         )
     _bt()._ensure_hitl_request_reason(method, params, reason)
+    params, defaulted_fields = apply_required_schema_defaults(
+        params, method_input_schema
+    )
+    if defaulted_fields:
+        agent.logger.write(
+            "browser.call.arguments_prepared",
+            {"method": method, "defaultedFields": defaulted_fields},
+        )
+    method_issues = validate_schema(params, method_input_schema)
+    if method_issues:
+        result = capability_argument_error(
+            tool_name,
+            method,
+            method_issues,
+            normalized_fields=defaulted_fields,
+        )
+        attach_error_classification(result, method=method)
+        attach_method_schema(result, method, agent.method_schemas)
+        agent.logger.write("browser.call.schema_rejected", result)
+        _bt()._observe_progress_after(
+            agent, method or "browser_call.schema_rejected", result
+        )
+        _bt()._observe_progress_before(
+            agent, method or "browser_call", params, step,
+            charge_diagnostic=False,
+        )
+        agent.trace.append({"type": "browser_call_schema_rejected", "result": result})
+        return result, False
+
+    _bt()._observe_progress_before(agent, method, params, step)
+
     page_create_claim_guard, page_create_takeover_claimed = (
         await _bt()._claim_ownerless_fleet_auth_barrier_for_page_create(
             agent, method, params
@@ -971,12 +1008,15 @@ async def _execute_browser_capability_tool(
     # tree — never a stale snapshot marked clean.
     if not page_create_should_stop:
         result = await _bt()._maybe_auto_intercept_overlay(agent, method, params, result, step)
-    # VL Role D: if the call still failed with a visual/occlusion/challenge/locator
-    # error after deterministic recovery, auto-route it to the VL arbiter and attach
-    # a recovery recommendation (resolvedId / hitl / dismiss / reperceive). Gated by
-    # vl.arbiter_enabled; non-visual failures and disabled VL are no-ops.
+    # Deterministic recovery has now had its turn. If the call still failed on a
+    # page-facing method, tell the model that a visual locate exists — a note on
+    # the receipt, not an action: no VL request is made, no page is read, and
+    # nothing is executed. Whether to spend a visual call, and what to do with
+    # the result, are the model's decisions. This replaced an auto-invoked VL
+    # arbiter (Role D) and a bespoke Input.select coordinate lane, both of which
+    # decided FOR the model behind gates so narrow they almost never fired.
     if not page_create_should_stop:
-        result = await _bt()._maybe_vl_arbitrate(agent, method, params, result, step)
+        result = _bt()._attach_visual_recovery_hint(agent, method, params, result, step)
     agent.logger.write("browser.call.result", agent._trim_for_log(result))
     model_result = agent._clean_for_model(result)
     model_result = offload_large_tool_result(

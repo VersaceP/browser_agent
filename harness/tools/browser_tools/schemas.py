@@ -555,38 +555,6 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
             "required": ["pageId", "selector"],
             "additionalProperties": False,
         },
-        "fill_field_verified": {
-            "type": "object",
-            "properties": {
-                "pageId": {"type": "string"},
-                "id": {"type": "string", "description": "Canonical AXTree id of the field. Pass \"\" to use selector."},
-                "selector": {"type": "string", "description": "CSS selector for the field (fallback). Pass \"\" if using id."},
-                "text": {"type": "string", "description": "Value to type into the field."},
-                "verifyKeywords": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": (
-                        "Keywords used to locate the field for value read-back"
-                        " (matched against label/aria-label/placeholder/name)."
-                        " Pass [] to derive from the field's accessible name."
-                    ),
-                },
-                "mask": {
-                    "type": "boolean",
-                    "description": (
-                        "Passwords/tokens: replaces the value with `<masked"
-                        " len=N>` in this tool's receipt, in the agent trace,"
-                        " and in render-recovery logs. Known limits \u2014 it does"
-                        " NOT redact the raw JSON-RPC transport log, and it"
-                        " does not affect any later DOM/AXTree read, which"
-                        " returns the value from the live page as typed."
-                    ),
-                },
-                "maxRetries": {"type": "integer", "description": "Clear-and-retry attempts on mismatch (0-3). Pass 0 for default 1."},
-            },
-            "required": ["pageId", "text"],
-            "additionalProperties": False,
-        },
         "visual_verify": {
             "type": "object",
             "properties": {
@@ -605,7 +573,7 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                 },
                 "mode": {
                     "type": "string",
-                    "description": "action_outcome | validator_failure | overlay_check | captcha_check | layout_check | visual_locate (locate an AXTree-blind target by description; returns a durable resolvedId via bbox→id promotion — act on that id, not coordinates) | contract_verify (judge structured visual_checks in `expected.visual_checks`; returns satisfied/violated/uncertain + failed_checks). Calls with repair_targets automatically use the internal repair_absence mode and return absent/present/uncertain.",
+                    "description": "action_outcome | validator_failure | overlay_check | captcha_check | layout_check | visual_locate (locate a target the structured surfaces cannot name, described in `expected.target`. Returns ONE of: `resolvedId` — the pixel was promoted to a durable canonical id, act on that; `cssPoint` — no node covers it, so a proven viewport CSS point for a SINGLE Input.click{pageId,x,y} followed by re-observation, valid for this page state only and never persisted into a skill; or `coordinateRefused` — the capture geometry could not be proven, so re-observe and act on an id. A `consequential` field means the target reads as submit/pay/delete/sign-in: locating it does not authorize performing it) | contract_verify (judge structured visual_checks in `expected.visual_checks`; returns satisfied/violated/uncertain + failed_checks). Calls with repair_targets automatically use the internal repair_absence mode and return absent/present/uncertain.",
                 },
                 "question": {
                     "type": "string",
@@ -818,19 +786,22 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
             "properties": {
                 "pattern": {
                     "type": "string",
+                    "default": "",
                     "description": "Regex grep; pass an empty string to list matches by glob / event_type only.",
                 },
                 "glob": {
                     "type": "string",
+                    "default": "**/*",
                     "description": "Glob relative to the current task worktree, e.g. observations/*.json or **/*.json.",
                 },
                 "event_type": {
                     "type": ["string", "null"],
+                    "default": None,
                     "description": "Only for .jsonl files: restrict the search to lines whose `type` matches this string. Pass null when not needed (searching .txt offloads, listing files, plain grep). The strings \"null\"/\"none\" are treated as null.",
                 },
-                "max_results": {"type": "integer", "minimum": 1, "maximum": 100},
-                "max_bytes_per_hit": {"type": "integer", "minimum": 200, "maximum": 20000},
-                "max_total_bytes": {"type": "integer", "minimum": 1000, "maximum": 200000},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+                "max_bytes_per_hit": {"type": "integer", "minimum": 200, "maximum": 20000, "default": 2000},
+                "max_total_bytes": {"type": "integer", "minimum": 1000, "maximum": 200000, "default": 20000},
             },
             "required": [
                 "pattern",
@@ -846,9 +817,9 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
-                "line_offset": {"type": "integer", "minimum": 0},
-                "line_limit": {"type": "integer", "minimum": 1, "maximum": 5000},
-                "max_bytes": {"type": "integer", "minimum": 1000, "maximum": 200000},
+                "line_offset": {"type": "integer", "minimum": 0, "default": 0},
+                "line_limit": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 200},
+                "max_bytes": {"type": "integer", "minimum": 1000, "maximum": 200000, "default": 20000},
             },
             "required": ["path", "line_offset", "line_limit", "max_bytes"],
             "additionalProperties": False,
