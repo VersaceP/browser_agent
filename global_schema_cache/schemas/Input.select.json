@@ -1,8 +1,8 @@
 {
   "method": "Input.select",
-  "description": "Sets the final selection set of a native or custom select-like control.",
+  "description": "Sets the final selection on a native or supported custom select.",
   "requiresPurpose": true,
-  "actionRevision": "sha256:0e622f86f0d3089658390679a8380096397fc9b4eec79884b9d8aa893d2d7a96",
+  "catalogRevision": "sha256:cfd8fb90a7d277b16cad96ea1f17db4c9f7bafbbb87796e52dd73fdf68732998",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -23,42 +23,63 @@
         "type": "string",
         "minLength": 1
       },
-      "nativeValues": {
-        "description": "Exact native <select> option values. Only for native HTML select controls.",
+      "selections": {
         "minItems": 1,
         "type": "array",
         "items": {
-          "type": "string",
-          "minLength": 1
-        }
-      },
-      "optionIds": {
-        "description": "Current-window option IDs. Only for custom select popups.",
-        "minItems": 1,
-        "type": "array",
-        "items": {
-          "type": "string",
-          "pattern": "^\\d+:\\d+:\\d+$"
-        }
-      },
-      "optionLabels": {
-        "description": "Exact current-window option labels. Only for custom select popups.",
-        "minItems": 1,
-        "type": "array",
-        "items": {
-          "type": "string",
-          "minLength": 1
-        }
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "value"
+              ],
+              "additionalProperties": true
+            },
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "id"
+              ],
+              "additionalProperties": true
+            },
+            {
+              "type": "object",
+              "properties": {
+                "label": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "label"
+              ],
+              "additionalProperties": true
+            }
+          ]
+        },
+        "description": "Final selection set. Use value for native selects and id or label for custom selects."
       },
       "purpose": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "string",
         "minLength": 1,
-        "description": "Provide exactly one selection field: nativeValues for a native HTML select, or optionIds/optionLabels for options in the currently open custom popup. Do not combine the fields. After search, scrolling, or pagination, call DOM.inspectSelect or DOM.getSemanticTree again and use only the newly returned options."
+        "description": "Inspect the select first, then submit the final selection set using the returned native values, option IDs, or exact option labels."
       }
     },
     "required": [
       "pageId",
+      "selections",
       "purpose"
     ],
     "additionalProperties": true
@@ -78,7 +99,7 @@
           "native",
           "custom"
         ],
-        "description": "Whether the control is a native HTML select or a custom popup."
+        "description": "Whether the control is native HTML or custom."
       },
       "selectionMode": {
         "type": "string",
@@ -86,7 +107,7 @@
           "single",
           "multiple"
         ],
-        "description": "Whether one or multiple options may be selected."
+        "description": "Whether one or multiple options are selected."
       },
       "selected": {
         "type": "array",
@@ -94,50 +115,59 @@
           "type": "object",
           "properties": {
             "id": {
-              "description": "Current option ID when the option is represented in the popup tree.",
+              "description": "Current canonical option ID when available.",
               "type": "string"
             },
             "label": {
-              "description": "Visible option label observed after selection.",
-              "type": "string"
+              "type": "string",
+              "description": "Normalized option label."
             },
             "value": {
-              "description": "Native option value observed after selection.",
+              "description": "Native option value when available.",
               "type": "string"
+            },
+            "selected": {
+              "type": "boolean",
+              "description": "Whether the option is currently selected."
+            },
+            "disabled": {
+              "type": "boolean",
+              "description": "Whether the option is disabled."
             }
           },
-          "additionalProperties": false,
-          "description": "One option confirmed as selected."
+          "required": [
+            "label",
+            "selected",
+            "disabled"
+          ],
+          "additionalProperties": false
         },
         "description": "Options confirmed as selected after the action."
       },
       "proof": {
         "type": "string",
         "enum": [
-          "native-selected-state",
-          "open-option-selected-state",
-          "control-value",
-          "control-aria-valuetext"
+          "native-state",
+          "option-state"
         ],
-        "description": "Observation used to confirm the final selection state."
+        "description": "State observation used to confirm the selection."
       },
-      "resolutionSource": {
-        "description": "Resolution route used for the select control.",
-        "type": "string",
-        "enum": [
-          "id",
-          "snapshot-recovery",
-          "selector",
-          "selector-fallback"
-        ]
-      },
-      "recoveredTarget": {
-        "description": "Snapshot details used when a stale target was recovered.",
+      "expanded": {
         "type": "object",
-        "propertyNames": {
-          "type": "string"
+        "properties": {
+          "before": {
+            "type": "boolean"
+          },
+          "after": {
+            "type": "boolean"
+          }
         },
-        "additionalProperties": {}
+        "required": [
+          "before",
+          "after"
+        ],
+        "additionalProperties": false,
+        "description": "Select expanded state before and after the action."
       }
     },
     "required": [
@@ -145,7 +175,8 @@
       "controlKind",
       "selectionMode",
       "selected",
-      "proof"
+      "proof",
+      "expanded"
     ],
     "additionalProperties": false
   },
@@ -154,11 +185,11 @@
     "properties": {
       "observation": {
         "type": "string",
-        "description": "Factual observation of the completed Action and its current visible result."
+        "description": "Facts directly observed by the Action or returned by its declared result schema."
       },
       "suggested_prompt": {
         "type": "string",
-        "description": "Action-specific next-step guidance based on the returned result."
+        "description": "Guidance to re-observe current state and choose the next operation."
       },
       "data": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -175,7 +206,7 @@
               "native",
               "custom"
             ],
-            "description": "Whether the control is a native HTML select or a custom popup."
+            "description": "Whether the control is native HTML or custom."
           },
           "selectionMode": {
             "type": "string",
@@ -183,7 +214,7 @@
               "single",
               "multiple"
             ],
-            "description": "Whether one or multiple options may be selected."
+            "description": "Whether one or multiple options are selected."
           },
           "selected": {
             "type": "array",
@@ -191,50 +222,59 @@
               "type": "object",
               "properties": {
                 "id": {
-                  "description": "Current option ID when the option is represented in the popup tree.",
+                  "description": "Current canonical option ID when available.",
                   "type": "string"
                 },
                 "label": {
-                  "description": "Visible option label observed after selection.",
-                  "type": "string"
+                  "type": "string",
+                  "description": "Normalized option label."
                 },
                 "value": {
-                  "description": "Native option value observed after selection.",
+                  "description": "Native option value when available.",
                   "type": "string"
+                },
+                "selected": {
+                  "type": "boolean",
+                  "description": "Whether the option is currently selected."
+                },
+                "disabled": {
+                  "type": "boolean",
+                  "description": "Whether the option is disabled."
                 }
               },
-              "additionalProperties": false,
-              "description": "One option confirmed as selected."
+              "required": [
+                "label",
+                "selected",
+                "disabled"
+              ],
+              "additionalProperties": false
             },
             "description": "Options confirmed as selected after the action."
           },
           "proof": {
             "type": "string",
             "enum": [
-              "native-selected-state",
-              "open-option-selected-state",
-              "control-value",
-              "control-aria-valuetext"
+              "native-state",
+              "option-state"
             ],
-            "description": "Observation used to confirm the final selection state."
+            "description": "State observation used to confirm the selection."
           },
-          "resolutionSource": {
-            "description": "Resolution route used for the select control.",
-            "type": "string",
-            "enum": [
-              "id",
-              "snapshot-recovery",
-              "selector",
-              "selector-fallback"
-            ]
-          },
-          "recoveredTarget": {
-            "description": "Snapshot details used when a stale target was recovered.",
+          "expanded": {
             "type": "object",
-            "propertyNames": {
-              "type": "string"
+            "properties": {
+              "before": {
+                "type": "boolean"
+              },
+              "after": {
+                "type": "boolean"
+              }
             },
-            "additionalProperties": {}
+            "required": [
+              "before",
+              "after"
+            ],
+            "additionalProperties": false,
+            "description": "Select expanded state before and after the action."
           }
         },
         "required": [
@@ -242,7 +282,8 @@
           "controlKind",
           "selectionMode",
           "selected",
-          "proof"
+          "proof",
+          "expanded"
         ],
         "additionalProperties": false,
         "description": "Validated business result returned by the Action."
@@ -278,7 +319,7 @@
       },
       "observation": {
         "type": "string",
-        "description": "Factual observation that does not expose private runtime diagnostics."
+        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
       },
       "suggested_prompt": {
         "type": "string",
@@ -286,7 +327,7 @@
       },
       "details": {
         "type": "object",
-        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
         "additionalProperties": true
       }
     },
@@ -297,5 +338,5 @@
     ],
     "additionalProperties": false
   },
-  "purposeHint": "Provide exactly one selection field: nativeValues for a native HTML select, or optionIds/optionLabels for options in the currently open custom popup. Do not combine the fields. After search, scrolling, or pagination, call DOM.inspectSelect or DOM.getSemanticTree again and use only the newly returned options."
+  "purposeHint": "Inspect the select first, then submit the final selection set using the returned native values, option IDs, or exact option labels."
 }

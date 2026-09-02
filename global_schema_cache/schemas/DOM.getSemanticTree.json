@@ -2,7 +2,7 @@
   "method": "DOM.getSemanticTree",
   "description": "Returns structured semantic DOM content for the main document and accessible child frames when the accessibility tree is insufficient.",
   "requiresPurpose": true,
-  "actionRevision": "sha256:30d83f583fcdd3cdf5f7827f206382e22a530b718a553745fc0d6070bcfdc536",
+  "catalogRevision": "sha256:cfd8fb90a7d277b16cad96ea1f17db4c9f7bafbbb87796e52dd73fdf68732998",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -74,21 +74,135 @@
     "type": "object",
     "properties": {
       "rootFrameId": {
-        "description": "Frame ID of the returned document root.",
-        "type": "string"
+        "type": "string",
+        "description": "Frame ID of the returned document root."
       },
       "frames": {
-        "description": "Structured semantic trees for the root document and accessible child frames.",
         "type": "array",
-        "items": {}
+        "items": {
+          "type": "object",
+          "properties": {
+            "frameId": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Frame identity for this tree."
+            },
+            "parentFrameId": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Parent frame identity, or null for the root frame."
+            },
+            "ownerId": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Frame-owner node identity, or null when unavailable."
+            },
+            "url": {
+              "type": "string",
+              "description": "Frame URL observed by the renderer."
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "complete",
+                "truncated",
+                "unavailable"
+              ],
+              "description": "Frame tree availability."
+            },
+            "tree": {
+              "anyOf": [
+                {},
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Frame-local semantic tree when available."
+            },
+            "nodeCount": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991,
+              "description": "Number of nodes in this frame tree."
+            },
+            "truncated": {
+              "type": "boolean",
+              "description": "Whether this frame was truncated."
+            },
+            "truncatedReason": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Reason for truncation, when applicable."
+            },
+            "error": {
+              "description": "Structured failure for an unavailable frame.",
+              "type": "object",
+              "properties": {
+                "code": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Stable public frame failure code."
+                },
+                "message": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Concise public frame failure message."
+                },
+                "suggested_prompt": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Next-observation guidance for this frame."
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "suggested_prompt"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "frameId",
+            "parentFrameId",
+            "ownerId",
+            "url",
+            "status",
+            "tree",
+            "nodeCount",
+            "truncated",
+            "truncatedReason"
+          ],
+          "additionalProperties": {},
+          "description": "One frame-local semantic tree result."
+        },
+        "description": "Structured semantic trees for the root document and accessible child frames."
       },
       "summary": {
-        "description": "Node counts, truncation, and visibility summary.",
         "type": "object",
         "propertyNames": {
           "type": "string"
         },
-        "additionalProperties": {}
+        "additionalProperties": {},
+        "description": "Node counts, truncation, and visibility summary."
       },
       "resolutionSource": {
         "description": "Target resolution route used when a target was requested.",
@@ -103,39 +217,158 @@
         "additionalProperties": {}
       }
     },
-    "additionalProperties": {}
+    "required": [
+      "rootFrameId",
+      "frames",
+      "summary"
+    ],
+    "additionalProperties": false
   },
   "outputSchema": {
     "type": "object",
     "properties": {
       "observation": {
         "type": "string",
-        "description": "Factual observation of the completed Action and its current visible result."
+        "description": "Facts directly observed by the Action or returned by its declared result schema."
       },
       "suggested_prompt": {
         "type": "string",
-        "description": "Action-specific next-step guidance based on the returned result."
+        "description": "Guidance to re-observe current state and choose the next operation."
       },
       "data": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "properties": {
           "rootFrameId": {
-            "description": "Frame ID of the returned document root.",
-            "type": "string"
+            "type": "string",
+            "description": "Frame ID of the returned document root."
           },
           "frames": {
-            "description": "Structured semantic trees for the root document and accessible child frames.",
             "type": "array",
-            "items": {}
+            "items": {
+              "type": "object",
+              "properties": {
+                "frameId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Frame identity for this tree."
+                },
+                "parentFrameId": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Parent frame identity, or null for the root frame."
+                },
+                "ownerId": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Frame-owner node identity, or null when unavailable."
+                },
+                "url": {
+                  "type": "string",
+                  "description": "Frame URL observed by the renderer."
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "complete",
+                    "truncated",
+                    "unavailable"
+                  ],
+                  "description": "Frame tree availability."
+                },
+                "tree": {
+                  "anyOf": [
+                    {},
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Frame-local semantic tree when available."
+                },
+                "nodeCount": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991,
+                  "description": "Number of nodes in this frame tree."
+                },
+                "truncated": {
+                  "type": "boolean",
+                  "description": "Whether this frame was truncated."
+                },
+                "truncatedReason": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Reason for truncation, when applicable."
+                },
+                "error": {
+                  "description": "Structured failure for an unavailable frame.",
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Stable public frame failure code."
+                    },
+                    "message": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Concise public frame failure message."
+                    },
+                    "suggested_prompt": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Next-observation guidance for this frame."
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "suggested_prompt"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "required": [
+                "frameId",
+                "parentFrameId",
+                "ownerId",
+                "url",
+                "status",
+                "tree",
+                "nodeCount",
+                "truncated",
+                "truncatedReason"
+              ],
+              "additionalProperties": {},
+              "description": "One frame-local semantic tree result."
+            },
+            "description": "Structured semantic trees for the root document and accessible child frames."
           },
           "summary": {
-            "description": "Node counts, truncation, and visibility summary.",
             "type": "object",
             "propertyNames": {
               "type": "string"
             },
-            "additionalProperties": {}
+            "additionalProperties": {},
+            "description": "Node counts, truncation, and visibility summary."
           },
           "resolutionSource": {
             "description": "Target resolution route used when a target was requested.",
@@ -150,7 +383,12 @@
             "additionalProperties": {}
           }
         },
-        "additionalProperties": {},
+        "required": [
+          "rootFrameId",
+          "frames",
+          "summary"
+        ],
+        "additionalProperties": false,
         "description": "Validated business result returned by the Action."
       }
     },
@@ -184,7 +422,7 @@
       },
       "observation": {
         "type": "string",
-        "description": "Factual observation that does not expose private runtime diagnostics."
+        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
       },
       "suggested_prompt": {
         "type": "string",
@@ -192,7 +430,7 @@
       },
       "details": {
         "type": "object",
-        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
         "additionalProperties": true
       }
     },

@@ -2,7 +2,7 @@
   "method": "DOM.getText",
   "description": "Reads textContent from one or more page elements.",
   "requiresPurpose": true,
-  "actionRevision": "sha256:836245f626101a5c43f7a35ebe018731636cd1cadf8c1650e08815848d456648",
+  "catalogRevision": "sha256:cfd8fb90a7d277b16cad96ea1f17db4c9f7bafbbb87796e52dd73fdf68732998",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -54,51 +54,307 @@
     "type": "object",
     "properties": {
       "items": {
-        "description": "Text records for each matched element.",
         "type": "array",
-        "items": {}
+        "items": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "index": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991,
+                  "description": "Original zero-based target index."
+                },
+                "target": {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {},
+                  "description": "The target supplied for this batch item."
+                },
+                "ok": {
+                  "type": "boolean",
+                  "const": true,
+                  "description": "Whether the target query succeeded."
+                },
+                "info": {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {},
+                  "description": "Extracted text or attribute information."
+                }
+              },
+              "required": [
+                "index",
+                "target",
+                "ok",
+                "info"
+              ],
+              "additionalProperties": {},
+              "description": "A successful DOM query item."
+            },
+            {
+              "type": "object",
+              "properties": {
+                "index": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991,
+                  "description": "Original zero-based target index."
+                },
+                "target": {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {},
+                  "description": "The target supplied for this batch item."
+                },
+                "ok": {
+                  "type": "boolean",
+                  "const": false,
+                  "description": "Whether the target query failed."
+                },
+                "error": {
+                  "description": "Failure details for this item when a public classification is available.",
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Stable public failure code for this item."
+                    },
+                    "message": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Concise public failure message for this item."
+                    },
+                    "suggested_prompt": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Next-observation guidance for this item."
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "suggested_prompt"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "required": [
+                "index",
+                "target",
+                "ok"
+              ],
+              "additionalProperties": {},
+              "description": "A failed DOM query item."
+            }
+          ],
+          "description": "One successful or failed DOM query item."
+        },
+        "description": "Text records for each matched element; failed items include their own error and suggested_prompt."
       },
       "summary": {
-        "description": "Counts and query summary for the returned text records.",
         "type": "object",
-        "propertyNames": {
-          "type": "string"
+        "properties": {
+          "total": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Total number of requested targets."
+          },
+          "succeeded": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Number of successful targets."
+          },
+          "failed": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Number of failed targets."
+          }
         },
-        "additionalProperties": {}
+        "required": [
+          "total",
+          "succeeded",
+          "failed"
+        ],
+        "additionalProperties": false,
+        "description": "Counts and query summary for the returned text records."
       }
     },
-    "additionalProperties": {}
+    "required": [
+      "items",
+      "summary"
+    ],
+    "additionalProperties": false
   },
   "outputSchema": {
     "type": "object",
     "properties": {
       "observation": {
         "type": "string",
-        "description": "Factual observation of the completed Action and its current visible result."
+        "description": "Facts directly observed by the Action or returned by its declared result schema."
       },
       "suggested_prompt": {
         "type": "string",
-        "description": "Action-specific next-step guidance based on the returned result."
+        "description": "Guidance to re-observe current state and choose the next operation."
       },
       "data": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "properties": {
           "items": {
-            "description": "Text records for each matched element.",
             "type": "array",
-            "items": {}
+            "items": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "index": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991,
+                      "description": "Original zero-based target index."
+                    },
+                    "target": {
+                      "type": "object",
+                      "propertyNames": {
+                        "type": "string"
+                      },
+                      "additionalProperties": {},
+                      "description": "The target supplied for this batch item."
+                    },
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Whether the target query succeeded."
+                    },
+                    "info": {
+                      "type": "object",
+                      "propertyNames": {
+                        "type": "string"
+                      },
+                      "additionalProperties": {},
+                      "description": "Extracted text or attribute information."
+                    }
+                  },
+                  "required": [
+                    "index",
+                    "target",
+                    "ok",
+                    "info"
+                  ],
+                  "additionalProperties": {},
+                  "description": "A successful DOM query item."
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "index": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991,
+                      "description": "Original zero-based target index."
+                    },
+                    "target": {
+                      "type": "object",
+                      "propertyNames": {
+                        "type": "string"
+                      },
+                      "additionalProperties": {},
+                      "description": "The target supplied for this batch item."
+                    },
+                    "ok": {
+                      "type": "boolean",
+                      "const": false,
+                      "description": "Whether the target query failed."
+                    },
+                    "error": {
+                      "description": "Failure details for this item when a public classification is available.",
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Stable public failure code for this item."
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Concise public failure message for this item."
+                        },
+                        "suggested_prompt": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Next-observation guidance for this item."
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "suggested_prompt"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "index",
+                    "target",
+                    "ok"
+                  ],
+                  "additionalProperties": {},
+                  "description": "A failed DOM query item."
+                }
+              ],
+              "description": "One successful or failed DOM query item."
+            },
+            "description": "Text records for each matched element; failed items include their own error and suggested_prompt."
           },
           "summary": {
-            "description": "Counts and query summary for the returned text records.",
             "type": "object",
-            "propertyNames": {
-              "type": "string"
+            "properties": {
+              "total": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Total number of requested targets."
+              },
+              "succeeded": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Number of successful targets."
+              },
+              "failed": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Number of failed targets."
+              }
             },
-            "additionalProperties": {}
+            "required": [
+              "total",
+              "succeeded",
+              "failed"
+            ],
+            "additionalProperties": false,
+            "description": "Counts and query summary for the returned text records."
           }
         },
-        "additionalProperties": {},
+        "required": [
+          "items",
+          "summary"
+        ],
+        "additionalProperties": false,
         "description": "Validated business result returned by the Action."
       }
     },
@@ -132,7 +388,7 @@
       },
       "observation": {
         "type": "string",
-        "description": "Factual observation that does not expose private runtime diagnostics."
+        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
       },
       "suggested_prompt": {
         "type": "string",
@@ -140,7 +396,7 @@
       },
       "details": {
         "type": "object",
-        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
         "additionalProperties": true
       }
     },

@@ -2,7 +2,7 @@
   "method": "Workflow.getStatus",
   "description": "Returns the current step, variables summary, timing, and state of a workflow run.",
   "requiresPurpose": false,
-  "actionRevision": "sha256:7de5c02962eb78cd67b41ae4230265d9a24184c115010a0e52ad68b7f2104bce",
+  "catalogRevision": "sha256:cfd8fb90a7d277b16cad96ea1f17db4c9f7bafbbb87796e52dd73fdf68732998",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -24,139 +24,217 @@
     "type": "object",
     "properties": {
       "workflowId": {
-        "description": "Opaque workflow ID.",
-        "type": "string"
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Opaque workflow ID."
       },
       "status": {
-        "description": "Current workflow lifecycle status.",
+        "type": "string",
+        "enum": [
+          "running",
+          "pausing",
+          "paused",
+          "succeeded",
+          "failed"
+        ],
+        "description": "Current workflow lifecycle status."
+      },
+      "currentStepPath": {
+        "description": "Canonical path of the current workflow step.",
         "type": "string"
       },
-      "currentStep": {
-        "description": "Current step path and execution summary.",
-        "type": "object",
-        "propertyNames": {
-          "type": "string"
-        },
-        "additionalProperties": {}
-      },
-      "variables": {
-        "description": "Current workflow variables.",
-        "type": "object",
-        "propertyNames": {
-          "type": "string"
-        },
-        "additionalProperties": {}
-      },
-      "store": {
-        "description": "Current explicit workflow store.",
-        "type": "object",
-        "propertyNames": {
-          "type": "string"
-        },
-        "additionalProperties": {}
-      },
-      "storeRevision": {
-        "description": "Current explicit store revision.",
-        "type": "number"
-      },
-      "results": {
-        "description": "Ordered results for completed steps.",
+      "variableKeys": {
         "type": "array",
-        "items": {}
+        "items": {
+          "type": "string"
+        },
+        "description": "Names of currently available workflow variables, without their values."
       },
-      "error": {
-        "description": "Public workflow error summary, when failed.",
-        "type": "string"
+      "resultCount": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991,
+        "description": "Number of step results recorded so far."
       },
-      "failedStepPath": {
-        "description": "Workflow step path that failed, when failed.",
-        "type": "string"
+      "timing": {
+        "type": "object",
+        "properties": {
+          "createdAt": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Workflow creation timestamp in milliseconds."
+          },
+          "startedAt": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Workflow start timestamp in milliseconds."
+          },
+          "finishedAt": {
+            "description": "Workflow finish timestamp when terminal.",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "durationMs": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Elapsed workflow duration in milliseconds."
+          }
+        },
+        "required": [
+          "createdAt",
+          "startedAt",
+          "durationMs"
+        ],
+        "additionalProperties": false,
+        "description": "Current or terminal workflow timing summary."
       },
-      "createdAt": {
-        "description": "Workflow creation timestamp in milliseconds.",
-        "type": "number"
-      },
-      "updatedAt": {
-        "description": "Last workflow update timestamp in milliseconds.",
-        "type": "number"
+      "lastFailure": {
+        "description": "Safe summary of the latest workflow failure.",
+        "type": "object",
+        "properties": {
+          "code": {
+            "description": "Stable workflow or nested Action failure code.",
+            "type": "string"
+          },
+          "message": {
+            "description": "Safe workflow failure summary.",
+            "type": "string"
+          },
+          "stepPath": {
+            "description": "Canonical path of the failed step.",
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
       }
     },
-    "additionalProperties": {}
+    "required": [
+      "workflowId",
+      "status",
+      "variableKeys",
+      "resultCount",
+      "timing"
+    ],
+    "additionalProperties": false
   },
   "outputSchema": {
     "type": "object",
     "properties": {
       "observation": {
         "type": "string",
-        "description": "Factual observation of the completed Action and its current visible result."
+        "description": "Facts directly observed by the Action or returned by its declared result schema."
       },
       "suggested_prompt": {
         "type": "string",
-        "description": "Action-specific next-step guidance based on the returned result."
+        "description": "Guidance to re-observe current state and choose the next operation."
       },
       "data": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "properties": {
           "workflowId": {
-            "description": "Opaque workflow ID.",
-            "type": "string"
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Opaque workflow ID."
           },
           "status": {
-            "description": "Current workflow lifecycle status.",
+            "type": "string",
+            "enum": [
+              "running",
+              "pausing",
+              "paused",
+              "succeeded",
+              "failed"
+            ],
+            "description": "Current workflow lifecycle status."
+          },
+          "currentStepPath": {
+            "description": "Canonical path of the current workflow step.",
             "type": "string"
           },
-          "currentStep": {
-            "description": "Current step path and execution summary.",
-            "type": "object",
-            "propertyNames": {
-              "type": "string"
-            },
-            "additionalProperties": {}
-          },
-          "variables": {
-            "description": "Current workflow variables.",
-            "type": "object",
-            "propertyNames": {
-              "type": "string"
-            },
-            "additionalProperties": {}
-          },
-          "store": {
-            "description": "Current explicit workflow store.",
-            "type": "object",
-            "propertyNames": {
-              "type": "string"
-            },
-            "additionalProperties": {}
-          },
-          "storeRevision": {
-            "description": "Current explicit store revision.",
-            "type": "number"
-          },
-          "results": {
-            "description": "Ordered results for completed steps.",
+          "variableKeys": {
             "type": "array",
-            "items": {}
+            "items": {
+              "type": "string"
+            },
+            "description": "Names of currently available workflow variables, without their values."
           },
-          "error": {
-            "description": "Public workflow error summary, when failed.",
-            "type": "string"
+          "resultCount": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Number of step results recorded so far."
           },
-          "failedStepPath": {
-            "description": "Workflow step path that failed, when failed.",
-            "type": "string"
+          "timing": {
+            "type": "object",
+            "properties": {
+              "createdAt": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Workflow creation timestamp in milliseconds."
+              },
+              "startedAt": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Workflow start timestamp in milliseconds."
+              },
+              "finishedAt": {
+                "description": "Workflow finish timestamp when terminal.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "durationMs": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Elapsed workflow duration in milliseconds."
+              }
+            },
+            "required": [
+              "createdAt",
+              "startedAt",
+              "durationMs"
+            ],
+            "additionalProperties": false,
+            "description": "Current or terminal workflow timing summary."
           },
-          "createdAt": {
-            "description": "Workflow creation timestamp in milliseconds.",
-            "type": "number"
-          },
-          "updatedAt": {
-            "description": "Last workflow update timestamp in milliseconds.",
-            "type": "number"
+          "lastFailure": {
+            "description": "Safe summary of the latest workflow failure.",
+            "type": "object",
+            "properties": {
+              "code": {
+                "description": "Stable workflow or nested Action failure code.",
+                "type": "string"
+              },
+              "message": {
+                "description": "Safe workflow failure summary.",
+                "type": "string"
+              },
+              "stepPath": {
+                "description": "Canonical path of the failed step.",
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
           }
         },
-        "additionalProperties": {},
+        "required": [
+          "workflowId",
+          "status",
+          "variableKeys",
+          "resultCount",
+          "timing"
+        ],
+        "additionalProperties": false,
         "description": "Validated business result returned by the Action."
       }
     },
@@ -190,7 +268,7 @@
       },
       "observation": {
         "type": "string",
-        "description": "Factual observation that does not expose private runtime diagnostics."
+        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
       },
       "suggested_prompt": {
         "type": "string",
@@ -198,7 +276,7 @@
       },
       "details": {
         "type": "object",
-        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
         "additionalProperties": true
       }
     },

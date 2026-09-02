@@ -15,7 +15,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Set
+from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
 from abcp_client import ABCPClient, ABCPTransportError
 from harness.utils import JsonDict, RunLogger
@@ -400,14 +400,209 @@ def required_param_names(schema: JsonDict) -> List[str]:
     ]
 
 
+# A required parameter whose value is an array or an object cannot be built
+# from its name alone, and the digest is all the worker has before its first
+# call: naming `selections` without saying it holds `{value}|{id}|{label}`
+# items is how a worker spends steps guessing at a shape (task f1da2976).
+# Scalars stay bare - their name plus the description already say enough - and
+# a rendering longer than this budget is dropped rather than allowed to bloat
+# every prompt; the full schema is on disk for those. Sized against the
+# connected catalog: its widest parameter is Fleet.setProxy's `config` union at
+# 86 characters, and that is exactly the kind of parameter a worker cannot
+# guess, so the cap sits above it rather than below. Everything else there is
+# 46 or shorter.
+_DIGEST_SHAPE_MAX_CHARS = 96
+
+# Second, independent bound: the per-parameter cap above says nothing about how
+# MANY parameters a method has, and this text lands in every worker's system
+# prompt. The worst method in the connected catalog spends 58 characters here,
+# so this leaves roughly 3x headroom while keeping a future catalog from
+# growing the prompt without limit. Required parameter NAMES are never dropped
+# (a call cannot be built without them) - only shape annotations are, and
+# unrendered optional params are counted in a trailing marker so the worker
+# knows to go read the full schema rather than concluding they do not exist.
+_DIGEST_METHOD_SHAPE_BUDGET = 160
+
+
+def _raw_param_specs(schema: JsonDict, name: str) -> List[JsonDict]:
+    """The parameter's own schema in EVERY top-level branch, in order.
+
+    Two reasons this does not go through ``schema_param_specs``: that view
+    overwrites ``required``/``anyOf`` on each spec with its cross-branch
+    verdict (which would misread an object parameter's own required-key list),
+    and it keeps only the first branch's shape when branches differ. A union
+    action can give one name a different shape per branch, and showing the
+    first as if it were the only one hides a legal call.
+    """
+    specs: List[JsonDict] = []
+    for variant in _schema_object_variants(schema):
+        spec = variant["properties"].get(name)
+        if isinstance(spec, dict):
+            specs.append(spec)
+    return specs
+
+
+def _digest_object_shape(spec: JsonDict) -> str:
+    properties = spec.get("properties")
+    if not isinstance(properties, dict) or not properties:
+        return "{...}"
+    required_raw = spec.get("required")
+    required = {
+        str(item)
+        for item in (required_raw if isinstance(required_raw, list) else [])
+    }
+    keys = [
+        str(name) if str(name) in required else f"{name}?"
+        for name in properties
+    ]
+    return "{" + ",".join(keys) + "}"
+
+
+def _digest_value_shape(spec: Any) -> str:
+    """Compact rendering of one value: `{a,b?}`, `string`, `[...]`, unions."""
+    if not isinstance(spec, dict):
+        return "..."
+    for keyword in ("anyOf", "oneOf"):
+        branches = spec.get(keyword)
+        if isinstance(branches, list) and branches:
+            rendered: List[str] = []
+            for branch in branches:
+                shape = _digest_value_shape(branch)
+                if shape not in rendered:
+                    rendered.append(shape)
+            return "|".join(rendered)
+    kind = spec.get("type")
+    if kind == "object":
+        return _digest_object_shape(spec)
+    if kind == "array":
+        return f"[{_digest_value_shape(spec.get('items'))}]"
+    if isinstance(kind, str):
+        return kind
+    return "..."
+
+
+def _shape_of_branch(spec: Any) -> Optional[str]:
+    """One branch's shape, or None when a name alone can carry a legal call.
+
+    A parameter can be a union at its own level (``Fleet.setProxy``'s `config`
+    is a bare ``oneOf`` of objects with no top-level ``type``), so reading
+    ``type`` alone would call a complex parameter shapeless. Nested unions
+    recurse; a single scalar branch anywhere collapses the whole parameter to
+    None, because then the name really does suffice for at least one legal
+    call and a partial shape would misrepresent the others.
+    """
+    if not isinstance(spec, dict):
+        return None
+    for keyword in ("anyOf", "oneOf"):
+        branches = spec.get(keyword)
+        if isinstance(branches, list) and branches:
+            rendered: List[str] = []
+            for branch in branches:
+                shape = _shape_of_branch(branch)
+                if shape is None:
+                    return None
+                if shape not in rendered:
+                    rendered.append(shape)
+            return "|".join(rendered) if rendered else None
+    kind = spec.get("type")
+    if kind == "array":
+        return f"[{_digest_value_shape(spec.get('items'))}]"
+    if kind == "object":
+        return _digest_object_shape(spec)
+    return None
+
+
+def _render_param_shape(specs: Any) -> Optional[str]:
+    """The parameter's full shape rendering, or None when it has no shape.
+
+    None and "too long" are different answers and the callers act on them
+    differently: a parameter with no shape is one whose name already carries a
+    legal call, while a parameter whose shape does not fit is one the worker
+    still has to go look up. Length is NOT judged here.
+    """
+    if isinstance(specs, dict):
+        specs = [specs]
+    if not isinstance(specs, list):
+        return None
+    rendered: List[str] = []
+    for spec in specs:
+        if not isinstance(spec, dict):
+            continue
+        shape = _shape_of_branch(spec)
+        if shape is None:
+            return None
+        if shape not in rendered:
+            rendered.append(shape)
+    if not rendered:
+        return None
+    return "|".join(rendered)
+
+
+def _digest_param_shape(specs: Any) -> str:
+    """Shape suffix for one parameter, or "" when nothing should be shown.
+
+    Accepts one spec or the per-branch list from ``_raw_param_specs``. Branches
+    that render differently are joined with `|`, the same way a union of item
+    shapes reads; anything past the budget is dropped rather than truncated,
+    because a half-rendered shape is worse than none.
+    """
+    shape = _render_param_shape(specs)
+    if shape is None or len(shape) > _DIGEST_SHAPE_MAX_CHARS:
+        return ""
+    return shape
+
+
+def _digest_optional_shapes(
+    schema: JsonDict, required: Set[str]
+) -> Tuple[List[str], int]:
+    """Shapes for the OPTIONAL parameters a name alone cannot describe.
+
+    A contract generation can leave its whole payload optional in JSON Schema
+    and express "exactly one of these" somewhere the export does not carry -
+    ABCP's array-contract ``Input.select`` states it in ``purposeHint`` and in
+    a zod ``superRefine``, so ``required`` is just ``[pageId, purpose]``. A
+    digest built from required names alone would then name no payload field at
+    all, which is the gap that made a worker guess (task f1da2976). Scalars are
+    still skipped, so this stays a short list: on the connected build it adds
+    eight annotations across the whole catalog.
+
+    Returns the rendered entries plus a count of the optional parameters that
+    HAVE a shape but whose rendering was too long to show. Those are counted so
+    the line's trailing marker can point at them; optional scalars are omitted
+    by design and are deliberately not counted, since nothing about them was
+    withheld.
+    """
+    names: List[str] = []
+    for variant in _schema_object_variants(schema):
+        for name in variant["properties"]:
+            name = str(name)
+            if name not in required and name not in names:
+                names.append(name)
+    shaped: List[str] = []
+    oversized = 0
+    for name in names:
+        shape = _render_param_shape(_raw_param_specs(schema, name))
+        if shape is None:
+            continue
+        if len(shape) > _DIGEST_SHAPE_MAX_CHARS:
+            oversized += 1
+            continue
+        shaped.append(f"{name}{shape}")
+    return shaped, oversized
+
+
 def build_capability_digest(bundle: CapabilityBundle) -> str:
     """One-line-per-method digest for the system prompt.
 
-    Format: `- <method> (requires: a, b, c): <description>`. Required
-    fields come from the describeAction schema; description falls back to
-    the bare capability entry if describeAction didn't return for this
-    method. The full schema is on disk for the agent to recall via
-    local_fs_search/read or via tool_result error annotations.
+    Format: `- <method> (requires: a, b[{k}]; optional: c{k?}): <description>`.
+    Required fields come from the describeAction schema; the `optional:` clause
+    lists only the optional params whose value is an array or object, since a
+    generation can leave its whole payload optional. Both carry a compact,
+    LOSSY shape - item form and key names, never patterns, lengths, enums, or
+    which fields exclude one another. Description falls back to the bare
+    capability entry if describeAction didn't return for this method. The full
+    schema is on disk for the agent to recall via local_fs_search/read or via
+    tool_result error annotations, and remains the constraint source of truth.
     """
     description_by_method = {
         str(cap.get("method") or ""): str(cap.get("description") or "").strip()
@@ -419,15 +614,37 @@ def build_capability_digest(bundle: CapabilityBundle) -> str:
         schema: dict[str, Any] | None = bundle.method_schemas.get(method)
         description = ""
         required: List[str] = []
+        optional: List[str] = []
+        withheld = 0
         if isinstance(schema, dict):
             description = str(schema.get("description") or "").strip()
-            required = required_param_names(schema)
+            required_names = required_param_names(schema)
+            budget = _DIGEST_METHOD_SHAPE_BUDGET
+            for name in required_names:
+                shape = _digest_param_shape(_raw_param_specs(schema, name))
+                if shape and len(shape) <= budget:
+                    budget -= len(shape)
+                else:
+                    shape = ""
+                required.append(f"{name}{shape}")
+            entries, withheld = _digest_optional_shapes(schema, set(required_names))
+            for entry in entries:
+                if len(entry) + 2 <= budget:
+                    budget -= len(entry) + 2
+                    optional.append(entry)
+                else:
+                    withheld += 1
         if not description:
             description = description_by_method.get(method, "")
+        clauses: List[str] = []
         if required:
-            lines.append(
-                f"- {method} (requires: {', '.join(required)}): {description}"
-            )
+            clauses.append(f"requires: {', '.join(required)}")
+        if optional:
+            clauses.append(f"optional: {', '.join(optional)}")
+        if withheld:
+            clauses.append(f"+{withheld} more optional, read full schema")
+        if clauses:
+            lines.append(f"- {method} ({'; '.join(clauses)}): {description}")
         else:
             lines.append(f"- {method}: {description}")
     return "\n".join(lines)

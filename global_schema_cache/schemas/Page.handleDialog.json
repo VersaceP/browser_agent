@@ -1,8 +1,8 @@
 {
   "method": "Page.handleDialog",
-  "description": "Accepts or dismisses the active JavaScript dialog on a page.",
+  "description": "Accepts or dismisses a currently active JavaScript dialog on a page. Use dialogId from an Input Action result or Page.dialogOpened when the dialog must be identified explicitly.",
   "requiresPurpose": true,
-  "actionRevision": "sha256:caa518734d0225830384b1e2fe4a0fdbb091f77ebac499399b3e8dff9339d05d",
+  "catalogRevision": "sha256:cfd8fb90a7d277b16cad96ea1f17db4c9f7bafbbb87796e52dd73fdf68732998",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -20,6 +20,11 @@
       "userInput": {
         "description": "Optional text for prompt dialogs when accepting.",
         "type": "string"
+      },
+      "dialogId": {
+        "description": "Dialog ID from the triggering Input Action result, or from the latest Page.dialogOpened event when multiple dialogs are pending.",
+        "type": "string",
+        "minLength": 1
       },
       "purpose": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -40,65 +45,71 @@
     "type": "object",
     "properties": {
       "pageId": {
-        "description": "Page ID containing the handled dialog.",
-        "type": "string"
-      },
-      "dialogType": {
-        "description": "Native dialog type observed.",
-        "type": "string"
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Page ID containing the handled dialog."
       },
       "action": {
-        "description": "Dialog action applied.",
         "type": "string",
         "enum": [
           "accept",
           "dismiss"
-        ]
+        ],
+        "description": "Dialog action applied."
       },
       "inputProvided": {
-        "description": "Whether text input was supplied to a prompt dialog.",
-        "type": "boolean"
+        "type": "boolean",
+        "description": "Whether text input was supplied to a prompt dialog."
       }
     },
-    "additionalProperties": {}
+    "required": [
+      "pageId",
+      "action",
+      "inputProvided"
+    ],
+    "additionalProperties": false
   },
   "outputSchema": {
     "type": "object",
     "properties": {
       "observation": {
         "type": "string",
-        "description": "Factual observation of the completed Action and its current visible result."
+        "description": "Facts directly observed by the Action or returned by its declared result schema."
       },
       "suggested_prompt": {
         "type": "string",
-        "description": "Action-specific next-step guidance based on the returned result."
+        "description": "Guidance to re-observe current state and choose the next operation."
       },
       "data": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "properties": {
           "pageId": {
-            "description": "Page ID containing the handled dialog.",
-            "type": "string"
-          },
-          "dialogType": {
-            "description": "Native dialog type observed.",
-            "type": "string"
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Page ID containing the handled dialog."
           },
           "action": {
-            "description": "Dialog action applied.",
             "type": "string",
             "enum": [
               "accept",
               "dismiss"
-            ]
+            ],
+            "description": "Dialog action applied."
           },
           "inputProvided": {
-            "description": "Whether text input was supplied to a prompt dialog.",
-            "type": "boolean"
+            "type": "boolean",
+            "description": "Whether text input was supplied to a prompt dialog."
           }
         },
-        "additionalProperties": {},
+        "required": [
+          "pageId",
+          "action",
+          "inputProvided"
+        ],
+        "additionalProperties": false,
         "description": "Validated business result returned by the Action."
       }
     },
@@ -132,7 +143,7 @@
       },
       "observation": {
         "type": "string",
-        "description": "Factual observation that does not expose private runtime diagnostics."
+        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
       },
       "suggested_prompt": {
         "type": "string",
@@ -140,7 +151,7 @@
       },
       "details": {
         "type": "object",
-        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
         "additionalProperties": true
       }
     },

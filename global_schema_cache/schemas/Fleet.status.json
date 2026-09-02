@@ -1,0 +1,246 @@
+{
+  "method": "Fleet.status",
+  "description": "Returns the lifecycle, pages, pending work, profile identity, and sanitized network configuration of a Fleet.",
+  "requiresPurpose": false,
+  "catalogRevision": "sha256:cfd8fb90a7d277b16cad96ea1f17db4c9f7bafbbb87796e52dd73fdf68732998",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "fleetId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Fleet ID to inspect."
+      }
+    },
+    "required": [
+      "fleetId"
+    ],
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "fleetId": {
+        "description": "Fleet ID whose status was read.",
+        "type": "string"
+      },
+      "state": {
+        "description": "Fleet lifecycle state.",
+        "type": "string"
+      },
+      "status": {
+        "type": "string",
+        "enum": [
+          "prepared",
+          "active"
+        ],
+        "description": "Fleet runtime status."
+      },
+      "pages": {
+        "description": "Page summaries currently owned by the Fleet.",
+        "type": "array",
+        "items": {}
+      },
+      "pendingWork": {
+        "description": "Queued or pending work summary for the Fleet.",
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {}
+      },
+      "profile": {
+        "description": "Sanitized fingerprint profile summary.",
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {}
+      },
+      "network": {
+        "description": "Sanitized network and proxy summary.",
+        "type": "object",
+        "propertyNames": {
+          "type": "string"
+        },
+        "additionalProperties": {}
+      },
+      "lastFailure": {
+        "description": "Last public Fleet failure summary, when present.",
+        "type": "object",
+        "properties": {
+          "operation": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Fleet operation that failed."
+          },
+          "status": {
+            "type": "string",
+            "const": "failed",
+            "description": "Stable failed status."
+          },
+          "restartToken": {
+            "description": "Opaque restart token for observing the failed restart.",
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "operation",
+          "status"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "required": [
+      "status"
+    ],
+    "additionalProperties": {}
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Facts directly observed by the Action or returned by its declared result schema."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "fleetId": {
+            "description": "Fleet ID whose status was read.",
+            "type": "string"
+          },
+          "state": {
+            "description": "Fleet lifecycle state.",
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "prepared",
+              "active"
+            ],
+            "description": "Fleet runtime status."
+          },
+          "pages": {
+            "description": "Page summaries currently owned by the Fleet.",
+            "type": "array",
+            "items": {}
+          },
+          "pendingWork": {
+            "description": "Queued or pending work summary for the Fleet.",
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          },
+          "profile": {
+            "description": "Sanitized fingerprint profile summary.",
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          },
+          "network": {
+            "description": "Sanitized network and proxy summary.",
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          },
+          "lastFailure": {
+            "description": "Last public Fleet failure summary, when present.",
+            "type": "object",
+            "properties": {
+              "operation": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Fleet operation that failed."
+              },
+              "status": {
+                "type": "string",
+                "const": "failed",
+                "description": "Stable failed status."
+              },
+              "restartToken": {
+                "description": "Opaque restart token for observing the failed restart.",
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "operation",
+              "status"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "additionalProperties": {},
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  }
+}

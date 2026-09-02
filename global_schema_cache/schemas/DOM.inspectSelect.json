@@ -1,8 +1,8 @@
 {
   "method": "DOM.inspectSelect",
-  "description": "Inspects a select-like control without changing its final interaction state; query only filters options discovered locally.",
+  "description": "Inspects the current select state and options without changing the selection.",
   "requiresPurpose": true,
-  "actionRevision": "sha256:0a7cb8937426da36551bd5634ca44030b37cf5ff146863b0decd207b120a7893",
+  "catalogRevision": "sha256:cfd8fb90a7d277b16cad96ea1f17db4c9f7bafbbb87796e52dd73fdf68732998",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -23,23 +23,15 @@
         "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
         "description": "Page ID containing the select control."
       },
-      "maxOptions": {
-        "default": 100,
-        "description": "Maximum number of options to return from the current window.",
-        "type": "integer",
-        "minimum": 1,
-        "maximum": 500
-      },
       "purpose": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "string",
         "minLength": 1,
-        "description": "Use this to read the current option window. For a complex popup, the response may keep it open so the Agent can combine DOM.getSemanticTree, Input.type, Input.scroll, or Input.click and then inspect the new window."
+        "description": "Inspect a select before choosing an option. Use the returned value, option ID, or exact label in Input.select."
       }
     },
     "required": [
       "pageId",
-      "maxOptions",
       "purpose"
     ],
     "additionalProperties": true
@@ -49,137 +41,185 @@
     "type": "object",
     "properties": {
       "controlId": {
-        "description": "Current canonical ID of the inspected select control.",
-        "type": "string"
+        "type": "string",
+        "minLength": 1,
+        "description": "Current canonical ID of the select control."
       },
       "controlKind": {
-        "description": "Whether the control is native HTML or a custom popup.",
         "type": "string",
         "enum": [
           "native",
           "custom"
-        ]
+        ],
+        "description": "Whether the control is native HTML or custom."
       },
       "selectionMode": {
-        "description": "Whether one or multiple options may be selected.",
         "type": "string",
         "enum": [
           "single",
           "multiple"
-        ]
+        ],
+        "description": "Whether one or multiple options may be selected."
       },
       "expanded": {
-        "description": "Observed expanded/open state of the control.",
         "type": "object",
-        "propertyNames": {
-          "type": "string"
+        "properties": {
+          "before": {
+            "type": "boolean"
+          },
+          "after": {
+            "type": "boolean"
+          }
         },
-        "additionalProperties": {}
+        "required": [
+          "before",
+          "after"
+        ],
+        "additionalProperties": false,
+        "description": "Select expanded state before and after inspection."
       },
-      "popup": {
-        "description": "Observed popup identity and relationship details.",
-        "type": "object",
-        "propertyNames": {
-          "type": "string"
+      "options": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "description": "Current canonical option ID when available.",
+              "type": "string"
+            },
+            "label": {
+              "type": "string",
+              "description": "Normalized option label."
+            },
+            "value": {
+              "description": "Native option value when available.",
+              "type": "string"
+            },
+            "selected": {
+              "type": "boolean",
+              "description": "Whether the option is currently selected."
+            },
+            "disabled": {
+              "type": "boolean",
+              "description": "Whether the option is disabled."
+            }
+          },
+          "required": [
+            "label",
+            "selected",
+            "disabled"
+          ],
+          "additionalProperties": false
         },
-        "additionalProperties": {}
-      },
-      "optionWindow": {
-        "description": "Current locally observed option window and option IDs.",
-        "type": "object",
-        "propertyNames": {
-          "type": "string"
-        },
-        "additionalProperties": {}
-      },
-      "resolutionSource": {
-        "description": "Target resolution route used for the control.",
-        "type": "string"
-      },
-      "recoveredTarget": {
-        "description": "Snapshot details used when a stale target was recovered.",
-        "type": "object",
-        "propertyNames": {
-          "type": "string"
-        },
-        "additionalProperties": {}
+        "description": "Options observed for the current select."
       }
     },
-    "additionalProperties": {}
+    "required": [
+      "controlId",
+      "controlKind",
+      "selectionMode",
+      "expanded",
+      "options"
+    ],
+    "additionalProperties": false
   },
   "outputSchema": {
     "type": "object",
     "properties": {
       "observation": {
         "type": "string",
-        "description": "Factual observation of the completed Action and its current visible result."
+        "description": "Facts directly observed by the Action or returned by its declared result schema."
       },
       "suggested_prompt": {
         "type": "string",
-        "description": "Action-specific next-step guidance based on the returned result."
+        "description": "Guidance to re-observe current state and choose the next operation."
       },
       "data": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "properties": {
           "controlId": {
-            "description": "Current canonical ID of the inspected select control.",
-            "type": "string"
+            "type": "string",
+            "minLength": 1,
+            "description": "Current canonical ID of the select control."
           },
           "controlKind": {
-            "description": "Whether the control is native HTML or a custom popup.",
             "type": "string",
             "enum": [
               "native",
               "custom"
-            ]
+            ],
+            "description": "Whether the control is native HTML or custom."
           },
           "selectionMode": {
-            "description": "Whether one or multiple options may be selected.",
             "type": "string",
             "enum": [
               "single",
               "multiple"
-            ]
+            ],
+            "description": "Whether one or multiple options may be selected."
           },
           "expanded": {
-            "description": "Observed expanded/open state of the control.",
             "type": "object",
-            "propertyNames": {
-              "type": "string"
+            "properties": {
+              "before": {
+                "type": "boolean"
+              },
+              "after": {
+                "type": "boolean"
+              }
             },
-            "additionalProperties": {}
+            "required": [
+              "before",
+              "after"
+            ],
+            "additionalProperties": false,
+            "description": "Select expanded state before and after inspection."
           },
-          "popup": {
-            "description": "Observed popup identity and relationship details.",
-            "type": "object",
-            "propertyNames": {
-              "type": "string"
+          "options": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "description": "Current canonical option ID when available.",
+                  "type": "string"
+                },
+                "label": {
+                  "type": "string",
+                  "description": "Normalized option label."
+                },
+                "value": {
+                  "description": "Native option value when available.",
+                  "type": "string"
+                },
+                "selected": {
+                  "type": "boolean",
+                  "description": "Whether the option is currently selected."
+                },
+                "disabled": {
+                  "type": "boolean",
+                  "description": "Whether the option is disabled."
+                }
+              },
+              "required": [
+                "label",
+                "selected",
+                "disabled"
+              ],
+              "additionalProperties": false
             },
-            "additionalProperties": {}
-          },
-          "optionWindow": {
-            "description": "Current locally observed option window and option IDs.",
-            "type": "object",
-            "propertyNames": {
-              "type": "string"
-            },
-            "additionalProperties": {}
-          },
-          "resolutionSource": {
-            "description": "Target resolution route used for the control.",
-            "type": "string"
-          },
-          "recoveredTarget": {
-            "description": "Snapshot details used when a stale target was recovered.",
-            "type": "object",
-            "propertyNames": {
-              "type": "string"
-            },
-            "additionalProperties": {}
+            "description": "Options observed for the current select."
           }
         },
-        "additionalProperties": {},
+        "required": [
+          "controlId",
+          "controlKind",
+          "selectionMode",
+          "expanded",
+          "options"
+        ],
+        "additionalProperties": false,
         "description": "Validated business result returned by the Action."
       }
     },
@@ -213,7 +253,7 @@
       },
       "observation": {
         "type": "string",
-        "description": "Factual observation that does not expose private runtime diagnostics."
+        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
       },
       "suggested_prompt": {
         "type": "string",
@@ -221,7 +261,7 @@
       },
       "details": {
         "type": "object",
-        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
         "additionalProperties": true
       }
     },
@@ -232,5 +272,5 @@
     ],
     "additionalProperties": false
   },
-  "purposeHint": "Use this to read the current option window. For a complex popup, the response may keep it open so the Agent can combine DOM.getSemanticTree, Input.type, Input.scroll, or Input.click and then inspect the new window."
+  "purposeHint": "Inspect a select before choosing an option. Use the returned value, option ID, or exact label in Input.select."
 }

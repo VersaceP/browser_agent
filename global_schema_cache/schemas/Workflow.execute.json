@@ -2,7 +2,7 @@
   "method": "Workflow.execute",
   "description": "Starts a validated multi-step workflow containing Action, condition, loop, event-wait, and transform steps.",
   "requiresPurpose": false,
-  "actionRevision": "sha256:1402eb68b99e413a1e355b8f033dec5f310a4648d373ee22e8442ca16684b9f8",
+  "catalogRevision": "sha256:cfd8fb90a7d277b16cad96ea1f17db4c9f7bafbbb87796e52dd73fdf68732998",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -886,6 +886,20 @@
         "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
         "description": "Opaque workflow ID used with Workflow.getStatus, Workflow.pause, and Workflow.resume."
       },
+      "taskId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Dispatcher Task ID associated with this workflow execution."
+      },
+      "status": {
+        "type": "string",
+        "enum": [
+          "succeeded",
+          "failed"
+        ],
+        "description": "Terminal workflow status after execution returns."
+      },
       "results": {
         "type": "array",
         "items": {},
@@ -912,14 +926,58 @@
         "minimum": 0,
         "maximum": 9007199254740991,
         "description": "Monotonic revision of the explicit workflow store."
+      },
+      "timing": {
+        "type": "object",
+        "properties": {
+          "createdAt": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Task creation timestamp in milliseconds."
+          },
+          "startedAt": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Workflow start timestamp in milliseconds."
+          },
+          "finishedAt": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Workflow finish timestamp in milliseconds."
+          },
+          "durationMs": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Elapsed workflow execution time in milliseconds."
+          }
+        },
+        "required": [
+          "createdAt",
+          "startedAt",
+          "finishedAt",
+          "durationMs"
+        ],
+        "additionalProperties": false,
+        "description": "Terminal workflow timing summary."
+      },
+      "failedStepPath": {
+        "description": "Workflow step path that failed, when status is failed.",
+        "type": "string"
       }
     },
     "required": [
       "workflowId",
+      "taskId",
+      "status",
       "results",
       "variables",
       "store",
-      "storeRevision"
+      "storeRevision",
+      "timing"
     ],
     "additionalProperties": false
   },
@@ -928,11 +986,11 @@
     "properties": {
       "observation": {
         "type": "string",
-        "description": "Factual observation of the completed Action and its current visible result."
+        "description": "Facts directly observed by the Action or returned by its declared result schema."
       },
       "suggested_prompt": {
         "type": "string",
-        "description": "Action-specific next-step guidance based on the returned result."
+        "description": "Guidance to re-observe current state and choose the next operation."
       },
       "data": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -943,6 +1001,20 @@
             "format": "uuid",
             "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
             "description": "Opaque workflow ID used with Workflow.getStatus, Workflow.pause, and Workflow.resume."
+          },
+          "taskId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Dispatcher Task ID associated with this workflow execution."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "succeeded",
+              "failed"
+            ],
+            "description": "Terminal workflow status after execution returns."
           },
           "results": {
             "type": "array",
@@ -970,14 +1042,58 @@
             "minimum": 0,
             "maximum": 9007199254740991,
             "description": "Monotonic revision of the explicit workflow store."
+          },
+          "timing": {
+            "type": "object",
+            "properties": {
+              "createdAt": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Task creation timestamp in milliseconds."
+              },
+              "startedAt": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Workflow start timestamp in milliseconds."
+              },
+              "finishedAt": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Workflow finish timestamp in milliseconds."
+              },
+              "durationMs": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Elapsed workflow execution time in milliseconds."
+              }
+            },
+            "required": [
+              "createdAt",
+              "startedAt",
+              "finishedAt",
+              "durationMs"
+            ],
+            "additionalProperties": false,
+            "description": "Terminal workflow timing summary."
+          },
+          "failedStepPath": {
+            "description": "Workflow step path that failed, when status is failed.",
+            "type": "string"
           }
         },
         "required": [
           "workflowId",
+          "taskId",
+          "status",
           "results",
           "variables",
           "store",
-          "storeRevision"
+          "storeRevision",
+          "timing"
         ],
         "additionalProperties": false,
         "description": "Validated business result returned by the Action."
@@ -1013,7 +1129,7 @@
       },
       "observation": {
         "type": "string",
-        "description": "Factual observation that does not expose private runtime diagnostics."
+        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
       },
       "suggested_prompt": {
         "type": "string",
@@ -1021,7 +1137,7 @@
       },
       "details": {
         "type": "object",
-        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
         "additionalProperties": true
       }
     },

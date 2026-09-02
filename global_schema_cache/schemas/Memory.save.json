@@ -2,7 +2,7 @@
   "method": "Memory.save",
   "description": "Creates or updates Fleet memory with optional optimistic revision checking.",
   "requiresPurpose": false,
-  "actionRevision": "sha256:b4b6f96ce40091e8c0a13224012635cbb5db4db0b5dc2e3eb30b96e6ed180067",
+  "catalogRevision": "sha256:cfd8fb90a7d277b16cad96ea1f17db4c9f7bafbbb87796e52dd73fdf68732998",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -15,7 +15,7 @@
       "context": {
         "type": "string",
         "minLength": 1,
-        "description": "Free-text task context for this scope, such as goal, constraints, credentials notes, and current milestone."
+        "description": "Free-text task context for this scope, such as the goal, constraints, and current milestone. Do not store secrets."
       },
       "expectedRevision": {
         "description": "Revision read before editing. Omit only when creating the first record.",
@@ -38,6 +38,10 @@
         "description": "Fleet ID whose memory was saved.",
         "type": "string"
       },
+      "saved": {
+        "type": "boolean",
+        "description": "Whether the write was confirmed."
+      },
       "created": {
         "description": "Whether a new memory record was created.",
         "type": "boolean"
@@ -55,6 +59,9 @@
         "type": "number"
       }
     },
+    "required": [
+      "saved"
+    ],
     "additionalProperties": {}
   },
   "outputSchema": {
@@ -62,11 +69,11 @@
     "properties": {
       "observation": {
         "type": "string",
-        "description": "Factual observation of the completed Action and its current visible result."
+        "description": "Facts directly observed by the Action or returned by its declared result schema."
       },
       "suggested_prompt": {
         "type": "string",
-        "description": "Action-specific next-step guidance based on the returned result."
+        "description": "Guidance to re-observe current state and choose the next operation."
       },
       "data": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -75,6 +82,10 @@
           "fleetId": {
             "description": "Fleet ID whose memory was saved.",
             "type": "string"
+          },
+          "saved": {
+            "type": "boolean",
+            "description": "Whether the write was confirmed."
           },
           "created": {
             "description": "Whether a new memory record was created.",
@@ -93,6 +104,9 @@
             "type": "number"
           }
         },
+        "required": [
+          "saved"
+        ],
         "additionalProperties": {},
         "description": "Validated business result returned by the Action."
       }
@@ -127,7 +141,7 @@
       },
       "observation": {
         "type": "string",
-        "description": "Factual observation that does not expose private runtime diagnostics."
+        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
       },
       "suggested_prompt": {
         "type": "string",
@@ -135,7 +149,7 @@
       },
       "details": {
         "type": "object",
-        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
         "additionalProperties": true
       }
     },

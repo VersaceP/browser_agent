@@ -2,7 +2,7 @@
   "method": "Workflow.pause",
   "description": "Requests that an active workflow pause at the next safe orchestration boundary.",
   "requiresPurpose": false,
-  "actionRevision": "sha256:4aa4a7439838304d61981cf23fc45e972b8894a28fa169cc384e0dd4648495eb",
+  "catalogRevision": "sha256:cfd8fb90a7d277b16cad96ea1f17db4c9f7bafbbb87796e52dd73fdf68732998",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -28,57 +28,79 @@
     "type": "object",
     "properties": {
       "workflowId": {
-        "description": "Opaque workflow ID requested for pause.",
-        "type": "string"
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Opaque workflow ID requested for pause."
       },
       "status": {
-        "description": "Workflow lifecycle status after the pause request.",
-        "type": "string"
+        "type": "string",
+        "enum": [
+          "running",
+          "pausing",
+          "paused",
+          "succeeded",
+          "failed"
+        ],
+        "description": "Workflow lifecycle status after the pause request."
       },
       "requested": {
-        "description": "Whether a pause request was accepted.",
-        "type": "boolean"
-      },
-      "reason": {
-        "description": "Reason recorded for the pause request.",
-        "type": "string"
+        "type": "boolean",
+        "const": true,
+        "description": "Confirms that a pause request was accepted."
       }
     },
-    "additionalProperties": {}
+    "required": [
+      "workflowId",
+      "status",
+      "requested"
+    ],
+    "additionalProperties": false
   },
   "outputSchema": {
     "type": "object",
     "properties": {
       "observation": {
         "type": "string",
-        "description": "Factual observation of the completed Action and its current visible result."
+        "description": "Facts directly observed by the Action or returned by its declared result schema."
       },
       "suggested_prompt": {
         "type": "string",
-        "description": "Action-specific next-step guidance based on the returned result."
+        "description": "Guidance to re-observe current state and choose the next operation."
       },
       "data": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "properties": {
           "workflowId": {
-            "description": "Opaque workflow ID requested for pause.",
-            "type": "string"
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Opaque workflow ID requested for pause."
           },
           "status": {
-            "description": "Workflow lifecycle status after the pause request.",
-            "type": "string"
+            "type": "string",
+            "enum": [
+              "running",
+              "pausing",
+              "paused",
+              "succeeded",
+              "failed"
+            ],
+            "description": "Workflow lifecycle status after the pause request."
           },
           "requested": {
-            "description": "Whether a pause request was accepted.",
-            "type": "boolean"
-          },
-          "reason": {
-            "description": "Reason recorded for the pause request.",
-            "type": "string"
+            "type": "boolean",
+            "const": true,
+            "description": "Confirms that a pause request was accepted."
           }
         },
-        "additionalProperties": {},
+        "required": [
+          "workflowId",
+          "status",
+          "requested"
+        ],
+        "additionalProperties": false,
         "description": "Validated business result returned by the Action."
       }
     },
@@ -112,7 +134,7 @@
       },
       "observation": {
         "type": "string",
-        "description": "Factual observation that does not expose private runtime diagnostics."
+        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
       },
       "suggested_prompt": {
         "type": "string",
@@ -120,7 +142,7 @@
       },
       "details": {
         "type": "object",
-        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
         "additionalProperties": true
       }
     },

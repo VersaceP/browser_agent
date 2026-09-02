@@ -2,7 +2,7 @@
   "method": "Bookmark.list",
   "description": "Lists bookmarks stored for a Fleet, optionally limited by keyword, exact URL, or folder.",
   "requiresPurpose": true,
-  "actionRevision": "sha256:1495f46925c7d2a723cafd2cccccb4275a9d8729af975873bc5444329ad66f70",
+  "catalogRevision": "sha256:cfd8fb90a7d277b16cad96ea1f17db4c9f7bafbbb87796e52dd73fdf68732998",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -19,7 +19,7 @@
         "minLength": 1
       },
       "url": {
-        "description": "Optional exact URL lookup; an empty result means the URL is not bookmarked.",
+        "description": "Optional exact URL lookup.",
         "type": "string",
         "format": "uri"
       },
@@ -115,11 +115,11 @@
     "properties": {
       "observation": {
         "type": "string",
-        "description": "Factual observation of the completed Action and its current visible result."
+        "description": "Facts directly observed by the Action or returned by its declared result schema."
       },
       "suggested_prompt": {
         "type": "string",
-        "description": "Action-specific next-step guidance based on the returned result."
+        "description": "Guidance to re-observe current state and choose the next operation."
       },
       "data": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -214,7 +214,7 @@
       },
       "observation": {
         "type": "string",
-        "description": "Factual observation that does not expose private runtime diagnostics."
+        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
       },
       "suggested_prompt": {
         "type": "string",
@@ -222,7 +222,7 @@
       },
       "details": {
         "type": "object",
-        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
         "additionalProperties": true
       }
     },

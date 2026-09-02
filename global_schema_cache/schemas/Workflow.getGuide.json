@@ -1,17 +1,12 @@
 {
   "method": "Workflow.getGuide",
-  "description": "Returns the workflow-orchestration guide as inline content or a local file path.",
+  "description": "Returns the workflow-orchestration guide as inline content.",
   "requiresPurpose": false,
-  "actionRevision": "sha256:9570c036641ca54cfb8c4a3e8bd74fa11a152787839d30202eace8b726c25432",
+  "catalogRevision": "sha256:cfd8fb90a7d277b16cad96ea1f17db4c9f7bafbbb87796e52dd73fdf68732998",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
-    "properties": {
-      "skillFile": {
-        "description": "Return the workflow guide as a file path instead of inline content when true.",
-        "type": "boolean"
-      }
-    },
+    "properties": {},
     "additionalProperties": true
   },
   "resultSchema": {
@@ -27,15 +22,12 @@
         "properties": {
           "type": {
             "type": "string",
-            "enum": [
-              "content",
-              "path"
-            ],
-            "description": "Whether the guide is inline content or a local path."
+            "const": "content",
+            "description": "Guide is returned as inline content."
           },
           "value": {
             "type": "string",
-            "description": "Guide content or path according to type."
+            "description": "Workflow guide content."
           }
         },
         "required": [
@@ -44,18 +36,6 @@
         ],
         "additionalProperties": {},
         "description": "Normalized guide payload."
-      },
-      "format": {
-        "description": "Legacy or transport-specific guide format, when returned.",
-        "type": "string"
-      },
-      "content": {
-        "description": "Inline workflow guide content, when returned.",
-        "type": "string"
-      },
-      "path": {
-        "description": "Local workflow guide path, when returned.",
-        "type": "string"
       }
     },
     "additionalProperties": {}
@@ -65,11 +45,11 @@
     "properties": {
       "observation": {
         "type": "string",
-        "description": "Factual observation of the completed Action and its current visible result."
+        "description": "Facts directly observed by the Action or returned by its declared result schema."
       },
       "suggested_prompt": {
         "type": "string",
-        "description": "Action-specific next-step guidance based on the returned result."
+        "description": "Guidance to re-observe current state and choose the next operation."
       },
       "data": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -84,15 +64,12 @@
             "properties": {
               "type": {
                 "type": "string",
-                "enum": [
-                  "content",
-                  "path"
-                ],
-                "description": "Whether the guide is inline content or a local path."
+                "const": "content",
+                "description": "Guide is returned as inline content."
               },
               "value": {
                 "type": "string",
-                "description": "Guide content or path according to type."
+                "description": "Workflow guide content."
               }
             },
             "required": [
@@ -101,18 +78,6 @@
             ],
             "additionalProperties": {},
             "description": "Normalized guide payload."
-          },
-          "format": {
-            "description": "Legacy or transport-specific guide format, when returned.",
-            "type": "string"
-          },
-          "content": {
-            "description": "Inline workflow guide content, when returned.",
-            "type": "string"
-          },
-          "path": {
-            "description": "Local workflow guide path, when returned.",
-            "type": "string"
           }
         },
         "additionalProperties": {},
@@ -149,7 +114,7 @@
       },
       "observation": {
         "type": "string",
-        "description": "Factual observation that does not expose private runtime diagnostics."
+        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
       },
       "suggested_prompt": {
         "type": "string",
@@ -157,7 +122,7 @@
       },
       "details": {
         "type": "object",
-        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
         "additionalProperties": true
       }
     },

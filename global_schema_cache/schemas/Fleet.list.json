@@ -1,14 +1,14 @@
 {
   "method": "Fleet.list",
-  "description": "Lists Fleets filtered by active, prepared, or all lifecycle states.",
+  "description": "Lists non-deleted managed Fleets, including Fleets that are prepared or not currently running.",
   "requiresPurpose": false,
-  "actionRevision": "sha256:8e9b74676dbd405a4d7f54e2181db9cf54ae6388f72ca04f87593c15dfe6915c",
+  "catalogRevision": "sha256:cfd8fb90a7d277b16cad96ea1f17db4c9f7bafbbb87796e52dd73fdf68732998",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "properties": {
       "status": {
-        "description": "Optional persisted status filter. Defaults to all Fleets.",
+        "description": "Optional runtime status filter. Defaults to all non-deleted managed Fleets.",
         "type": "string",
         "enum": [
           "active",
@@ -69,11 +69,11 @@
     "properties": {
       "observation": {
         "type": "string",
-        "description": "Factual observation of the completed Action and its current visible result."
+        "description": "Facts directly observed by the Action or returned by its declared result schema."
       },
       "suggested_prompt": {
         "type": "string",
-        "description": "Action-specific next-step guidance based on the returned result."
+        "description": "Guidance to re-observe current state and choose the next operation."
       },
       "data": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -152,7 +152,7 @@
       },
       "observation": {
         "type": "string",
-        "description": "Factual observation that does not expose private runtime diagnostics."
+        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
       },
       "suggested_prompt": {
         "type": "string",
@@ -160,7 +160,7 @@
       },
       "details": {
         "type": "object",
-        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
         "additionalProperties": true
       }
     },

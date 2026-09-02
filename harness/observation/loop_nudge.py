@@ -173,12 +173,26 @@ def normalize_action_params(label: str, params: Any) -> Any:
     if label in {"Input.click", "Input.select", "Input.type", "Input.press", "Input.drag"}:
         select_summary: Optional[JsonDict] = None
         if label == "Input.select":
-            # Rebuilt contract: exactly one selection array replaces the old
-            # selections envelope.
-            for field in ("nativeValues", "optionIds", "optionLabels"):
-                if params.get(field) is not None:
-                    select_summary = {field: params.get(field)}
-                    break
+            # The selection payload's field names belong to the connected
+            # platform's contract generation: the `selections` envelope and the
+            # nativeValues/optionIds/optionLabels arrays are both live in the
+            # wild, and both schemas admit unknown keys, so one request can
+            # even carry fields from both. Every present field is read: naming
+            # one generation collapsed the other onto `select=None`, and
+            # stopping at the first hit hid a changed selection behind an
+            # unchanged sibling. Either way two different choices on the same
+            # control hashed alike and looked like a repeated action.
+            present = {
+                field: params.get(field)
+                for field in (
+                    "nativeValues",
+                    "optionIds",
+                    "optionLabels",
+                    "selections",
+                )
+                if params.get(field) is not None
+            }
+            select_summary = present or None
         return {
             "pageId": params.get("pageId"),
             "target": (

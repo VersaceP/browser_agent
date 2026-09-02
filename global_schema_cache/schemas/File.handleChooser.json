@@ -1,219 +1,79 @@
 {
   "method": "File.handleChooser",
-  "description": "Handles exactly one file flow: accept or cancel a pending native chooser, or set files directly on a resolved upload target.",
+  "description": "Injects files directly into a resolved upload control.",
   "requiresPurpose": true,
-  "actionRevision": "sha256:198d1dbcdd8a58f1997a0b2e39d2e45901715947f05d537b4fb1279573bff8d2",
+  "catalogRevision": "sha256:cfd8fb90a7d277b16cad96ea1f17db4c9f7bafbbb87796e52dd73fdf68732998",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "anyOf": [
-      {
-        "type": "object",
-        "properties": {
-          "pageId": {
-            "type": "string",
-            "format": "uuid",
-            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-            "description": "Page ID containing the upload target."
-          },
-          "files": {
-            "minItems": 1,
-            "type": "array",
-            "items": {
-              "type": "string",
-              "minLength": 1
-            },
-            "description": "Files to set on the upload target."
-          },
-          "id": {
-            "description": "Preferred canonical upload target ID.",
-            "type": "string",
-            "pattern": "^\\d+:\\d+:\\d+$"
-          },
-          "selector": {
-            "description": "Fallback CSS selector for the upload target.",
-            "type": "string",
-            "minLength": 1
-          },
-          "fileOpId": {
-            "description": "Omit fileOpId when setting files on a resolved upload target.",
-            "not": {}
-          },
-          "accept": {
-            "description": "Omit accept when setting files on a resolved upload target.",
-            "not": {}
-          },
-          "purpose": {
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "type": "string",
-            "minLength": 1,
-            "description": "Explain whether this operation uploads files through the resolved control, accepts a pending chooser, or cancels an unintended chooser."
-          }
-        },
-        "required": [
-          "pageId",
-          "files",
-          "purpose"
-        ],
-        "additionalProperties": true
+    "type": "object",
+    "properties": {
+      "pageId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Page ID containing the upload target."
       },
-      {
-        "type": "object",
-        "properties": {
-          "pageId": {
-            "type": "string",
-            "format": "uuid",
-            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-            "description": "Page ID with the pending file chooser."
-          },
-          "fileOpId": {
-            "description": "File operation ID. Required when more than one chooser is pending.",
-            "type": "string",
-            "minLength": 1
-          },
-          "accept": {
-            "type": "boolean",
-            "const": true,
-            "description": "Accept the native chooser."
-          },
-          "files": {
-            "minItems": 1,
-            "type": "array",
-            "items": {
-              "type": "string",
-              "minLength": 1
-            },
-            "description": "Files to submit through the native chooser."
-          },
-          "id": {
-            "description": "Omit id when resolving a pending native chooser.",
-            "not": {}
-          },
-          "selector": {
-            "description": "Omit selector when resolving a pending native chooser.",
-            "not": {}
-          },
-          "purpose": {
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "type": "string",
-            "minLength": 1,
-            "description": "Explain whether this operation uploads files through the resolved control, accepts a pending chooser, or cancels an unintended chooser."
-          }
+      "files": {
+        "minItems": 1,
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
         },
-        "required": [
-          "pageId",
-          "accept",
-          "files",
-          "purpose"
-        ],
-        "additionalProperties": true
+        "description": "Files to set on the upload target."
       },
-      {
-        "type": "object",
-        "properties": {
-          "pageId": {
-            "type": "string",
-            "format": "uuid",
-            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-            "description": "Page ID with the pending file chooser."
-          },
-          "fileOpId": {
-            "description": "File operation ID. Required when more than one chooser is pending.",
-            "type": "string",
-            "minLength": 1
-          },
-          "accept": {
-            "type": "boolean",
-            "const": false,
-            "description": "Cancel the native chooser."
-          },
-          "files": {
-            "description": "Omit files when cancelling a pending native chooser.",
-            "not": {}
-          },
-          "id": {
-            "description": "Omit id when resolving a pending native chooser.",
-            "not": {}
-          },
-          "selector": {
-            "description": "Omit selector when resolving a pending native chooser.",
-            "not": {}
-          },
-          "purpose": {
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "type": "string",
-            "minLength": 1,
-            "description": "Explain whether this operation uploads files through the resolved control, accepts a pending chooser, or cancels an unintended chooser."
-          }
-        },
-        "required": [
-          "pageId",
-          "accept",
-          "purpose"
-        ],
-        "additionalProperties": true
+      "id": {
+        "description": "Preferred canonical upload target ID.",
+        "type": "string",
+        "pattern": "^\\d+:\\d+:\\d+$"
+      },
+      "selector": {
+        "description": "Fallback CSS selector for the upload target.",
+        "type": "string",
+        "minLength": 1
+      },
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "Provide the local files and the upload control id or selector to inject them directly."
       }
-    ]
+    },
+    "required": [
+      "pageId",
+      "files",
+      "purpose"
+    ],
+    "additionalProperties": true
   },
   "resultSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "properties": {
-      "fileOpId": {
-        "type": "string",
-        "minLength": 1,
-        "description": "File operation ID resolved or created for this flow."
-      },
       "pageId": {
         "type": "string",
         "format": "uuid",
         "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-        "description": "Page ID containing the chooser or upload target."
-      },
-      "source": {
-        "type": "string",
-        "enum": [
-          "target",
-          "chooser"
-        ],
-        "description": "Whether the files were set on a target or submitted to a native chooser."
+        "description": "Page ID containing the upload target."
       },
       "handled": {
         "type": "boolean",
         "const": true,
-        "description": "Confirms that the requested file operation was handled."
-      },
-      "action": {
-        "type": "string",
-        "enum": [
-          "accept",
-          "cancel"
-        ],
-        "description": "Chooser action applied to this operation."
-      },
-      "state": {
-        "type": "string",
-        "enum": [
-          "completed",
-          "cancelled"
-        ],
-        "description": "Observed terminal state after handling."
+        "description": "Confirms that files were injected into the upload target."
       },
       "selectedFileCount": {
         "type": "integer",
         "minimum": 0,
         "maximum": 9007199254740991,
-        "description": "Number of file paths accepted for the operation."
+        "description": "Number of files injected."
       },
       "resolvedBy": {
         "type": "string",
-        "enum": [
-          "agent",
-          "user"
-        ],
-        "description": "Actor that supplied or resolved the operation target."
+        "const": "agent",
+        "description": "The direct injection was requested by the agent."
       },
       "targetResolvedBy": {
-        "description": "Resolution route used for a direct upload target.",
+        "description": "Resolution route used for the upload target.",
         "type": "string",
         "enum": [
           "id",
@@ -232,12 +92,8 @@
       }
     },
     "required": [
-      "fileOpId",
       "pageId",
-      "source",
       "handled",
-      "action",
-      "state",
       "selectedFileCount",
       "resolvedBy"
     ],
@@ -248,72 +104,40 @@
     "properties": {
       "observation": {
         "type": "string",
-        "description": "Factual observation of the completed Action and its current visible result."
+        "description": "Facts directly observed by the Action or returned by its declared result schema."
       },
       "suggested_prompt": {
         "type": "string",
-        "description": "Action-specific next-step guidance based on the returned result."
+        "description": "Guidance to re-observe current state and choose the next operation."
       },
       "data": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "properties": {
-          "fileOpId": {
-            "type": "string",
-            "minLength": 1,
-            "description": "File operation ID resolved or created for this flow."
-          },
           "pageId": {
             "type": "string",
             "format": "uuid",
             "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-            "description": "Page ID containing the chooser or upload target."
-          },
-          "source": {
-            "type": "string",
-            "enum": [
-              "target",
-              "chooser"
-            ],
-            "description": "Whether the files were set on a target or submitted to a native chooser."
+            "description": "Page ID containing the upload target."
           },
           "handled": {
             "type": "boolean",
             "const": true,
-            "description": "Confirms that the requested file operation was handled."
-          },
-          "action": {
-            "type": "string",
-            "enum": [
-              "accept",
-              "cancel"
-            ],
-            "description": "Chooser action applied to this operation."
-          },
-          "state": {
-            "type": "string",
-            "enum": [
-              "completed",
-              "cancelled"
-            ],
-            "description": "Observed terminal state after handling."
+            "description": "Confirms that files were injected into the upload target."
           },
           "selectedFileCount": {
             "type": "integer",
             "minimum": 0,
             "maximum": 9007199254740991,
-            "description": "Number of file paths accepted for the operation."
+            "description": "Number of files injected."
           },
           "resolvedBy": {
             "type": "string",
-            "enum": [
-              "agent",
-              "user"
-            ],
-            "description": "Actor that supplied or resolved the operation target."
+            "const": "agent",
+            "description": "The direct injection was requested by the agent."
           },
           "targetResolvedBy": {
-            "description": "Resolution route used for a direct upload target.",
+            "description": "Resolution route used for the upload target.",
             "type": "string",
             "enum": [
               "id",
@@ -332,12 +156,8 @@
           }
         },
         "required": [
-          "fileOpId",
           "pageId",
-          "source",
           "handled",
-          "action",
-          "state",
           "selectedFileCount",
           "resolvedBy"
         ],
@@ -375,7 +195,7 @@
       },
       "observation": {
         "type": "string",
-        "description": "Factual observation that does not expose private runtime diagnostics."
+        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
       },
       "suggested_prompt": {
         "type": "string",
@@ -383,7 +203,7 @@
       },
       "details": {
         "type": "object",
-        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
         "additionalProperties": true
       }
     },
@@ -394,5 +214,5 @@
     ],
     "additionalProperties": false
   },
-  "purposeHint": "Explain whether this operation uploads files through the resolved control, accepts a pending chooser, or cancels an unintended chooser."
+  "purposeHint": "Provide the local files and the upload control id or selector to inject them directly."
 }

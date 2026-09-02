@@ -1,8 +1,8 @@
 {
   "method": "Input.type",
-  "description": "Types text into a resolved editable target, optionally clearing its current value first.",
+  "description": "Types text into a resolved editable target, optionally clearing its current value first. Without a dialog interruption, the typed and length summary confirms that the requested text was dispatched. If typing triggers a page alert, it is handled without creating an interactive dialog; typed and length are omitted because the final field value is unconfirmed, so re-read the field through the DOM. If it opens a confirm, prompt, or beforeunload dialog, the action returns its dialog id, omits typed and length, and directs the caller to Page.handleDialog before re-reading the field value.",
   "requiresPurpose": true,
-  "actionRevision": "sha256:55f7d9d261f4fe262655855ff4157f3718870c103bd0957166ebb03a513a12a8",
+  "catalogRevision": "sha256:cfd8fb90a7d277b16cad96ea1f17db4c9f7bafbbb87796e52dd73fdf68732998",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -85,6 +85,46 @@
       "resolutionSource": {
         "description": "Target resolution route used by the action.",
         "type": "string"
+      },
+      "dialog": {
+        "description": "Interactive native dialog returned while typing; handled page alerts are not returned here.",
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "ID of an interactive native dialog returned for Page.handleDialog."
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "alert",
+              "confirm",
+              "prompt",
+              "beforeunload"
+            ],
+            "description": "Native dialog type."
+          },
+          "message": {
+            "type": "string",
+            "description": "Dialog message supplied by the page."
+          },
+          "defaultValue": {
+            "description": "Default value for a prompt dialog.",
+            "type": "string"
+          },
+          "truncated": {
+            "description": "Whether native dialog text was truncated.",
+            "type": "boolean",
+            "const": true
+          }
+        },
+        "required": [
+          "id",
+          "type",
+          "message"
+        ],
+        "additionalProperties": false
       }
     },
     "additionalProperties": {}
@@ -94,11 +134,11 @@
     "properties": {
       "observation": {
         "type": "string",
-        "description": "Factual observation of the completed Action and its current visible result."
+        "description": "Facts directly observed by the Action or returned by its declared result schema."
       },
       "suggested_prompt": {
         "type": "string",
-        "description": "Action-specific next-step guidance based on the returned result."
+        "description": "Guidance to re-observe current state and choose the next operation."
       },
       "data": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -131,6 +171,46 @@
           "resolutionSource": {
             "description": "Target resolution route used by the action.",
             "type": "string"
+          },
+          "dialog": {
+            "description": "Interactive native dialog returned while typing; handled page alerts are not returned here.",
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "description": "ID of an interactive native dialog returned for Page.handleDialog."
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "alert",
+                  "confirm",
+                  "prompt",
+                  "beforeunload"
+                ],
+                "description": "Native dialog type."
+              },
+              "message": {
+                "type": "string",
+                "description": "Dialog message supplied by the page."
+              },
+              "defaultValue": {
+                "description": "Default value for a prompt dialog.",
+                "type": "string"
+              },
+              "truncated": {
+                "description": "Whether native dialog text was truncated.",
+                "type": "boolean",
+                "const": true
+              }
+            },
+            "required": [
+              "id",
+              "type",
+              "message"
+            ],
+            "additionalProperties": false
           }
         },
         "additionalProperties": {},
@@ -167,7 +247,7 @@
       },
       "observation": {
         "type": "string",
-        "description": "Factual observation that does not expose private runtime diagnostics."
+        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
       },
       "suggested_prompt": {
         "type": "string",
@@ -175,7 +255,7 @@
       },
       "details": {
         "type": "object",
-        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
         "additionalProperties": true
       }
     },

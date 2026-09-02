@@ -2,7 +2,7 @@
   "method": "DOM.getImg",
   "description": "Exports image content from one or more page elements as files and optionally inline data.",
   "requiresPurpose": true,
-  "actionRevision": "sha256:3cbf9502fd85d61de028f29ae0f6baf49cef8d98e1b72acae4d98a8adcdc7d55",
+  "catalogRevision": "sha256:cfd8fb90a7d277b16cad96ea1f17db4c9f7bafbbb87796e52dd73fdf68732998",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -110,51 +110,331 @@
     "type": "object",
     "properties": {
       "items": {
-        "description": "Exported image records, including paths or inline data requested by the caller.",
         "type": "array",
-        "items": {}
+        "items": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "index": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991,
+                  "description": "Original zero-based target index."
+                },
+                "target": {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {},
+                  "description": "The target supplied for this batch item."
+                },
+                "ok": {
+                  "type": "boolean",
+                  "const": true,
+                  "description": "Whether image export succeeded."
+                },
+                "info": {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {},
+                  "description": "Exported image information."
+                }
+              },
+              "required": [
+                "index",
+                "target",
+                "ok",
+                "info"
+              ],
+              "additionalProperties": {},
+              "description": "One successful or failed image export item."
+            },
+            {
+              "type": "object",
+              "properties": {
+                "index": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991,
+                  "description": "Original zero-based target index."
+                },
+                "target": {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {},
+                  "description": "The target supplied for this batch item."
+                },
+                "ok": {
+                  "type": "boolean",
+                  "const": false,
+                  "description": "Whether image export succeeded."
+                },
+                "error": {
+                  "description": "Failure details when a public classification is available.",
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Stable public image failure code."
+                    },
+                    "message": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Concise public image failure message."
+                    },
+                    "suggested_prompt": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Next-observation guidance for the image item."
+                    },
+                    "canFallback": {
+                      "type": "boolean",
+                      "description": "Whether screenshot fallback remains available."
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "suggested_prompt",
+                    "canFallback"
+                  ],
+                  "additionalProperties": {}
+                }
+              },
+              "required": [
+                "index",
+                "target",
+                "ok"
+              ],
+              "additionalProperties": {},
+              "description": "One failed image export item."
+            }
+          ],
+          "description": "One successful or failed image export item."
+        },
+        "description": "Exported image records, including paths or inline data requested by the caller; failed items include their own suggested_prompt."
       },
       "summary": {
-        "description": "Counts and export summary for the returned images.",
         "type": "object",
-        "propertyNames": {
-          "type": "string"
+        "properties": {
+          "total": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Total number of requested image targets."
+          },
+          "succeeded": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Number of successful image exports."
+          },
+          "failed": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Number of failed image exports."
+          },
+          "fallback": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Number of exports completed through screenshot fallback."
+          }
         },
-        "additionalProperties": {}
+        "required": [
+          "total",
+          "succeeded",
+          "failed",
+          "fallback"
+        ],
+        "additionalProperties": false,
+        "description": "Counts and export summary for the returned images."
       }
     },
-    "additionalProperties": {}
+    "required": [
+      "items",
+      "summary"
+    ],
+    "additionalProperties": false
   },
   "outputSchema": {
     "type": "object",
     "properties": {
       "observation": {
         "type": "string",
-        "description": "Factual observation of the completed Action and its current visible result."
+        "description": "Facts directly observed by the Action or returned by its declared result schema."
       },
       "suggested_prompt": {
         "type": "string",
-        "description": "Action-specific next-step guidance based on the returned result."
+        "description": "Guidance to re-observe current state and choose the next operation."
       },
       "data": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "properties": {
           "items": {
-            "description": "Exported image records, including paths or inline data requested by the caller.",
             "type": "array",
-            "items": {}
+            "items": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "index": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991,
+                      "description": "Original zero-based target index."
+                    },
+                    "target": {
+                      "type": "object",
+                      "propertyNames": {
+                        "type": "string"
+                      },
+                      "additionalProperties": {},
+                      "description": "The target supplied for this batch item."
+                    },
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Whether image export succeeded."
+                    },
+                    "info": {
+                      "type": "object",
+                      "propertyNames": {
+                        "type": "string"
+                      },
+                      "additionalProperties": {},
+                      "description": "Exported image information."
+                    }
+                  },
+                  "required": [
+                    "index",
+                    "target",
+                    "ok",
+                    "info"
+                  ],
+                  "additionalProperties": {},
+                  "description": "One successful or failed image export item."
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "index": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991,
+                      "description": "Original zero-based target index."
+                    },
+                    "target": {
+                      "type": "object",
+                      "propertyNames": {
+                        "type": "string"
+                      },
+                      "additionalProperties": {},
+                      "description": "The target supplied for this batch item."
+                    },
+                    "ok": {
+                      "type": "boolean",
+                      "const": false,
+                      "description": "Whether image export succeeded."
+                    },
+                    "error": {
+                      "description": "Failure details when a public classification is available.",
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Stable public image failure code."
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Concise public image failure message."
+                        },
+                        "suggested_prompt": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Next-observation guidance for the image item."
+                        },
+                        "canFallback": {
+                          "type": "boolean",
+                          "description": "Whether screenshot fallback remains available."
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "suggested_prompt",
+                        "canFallback"
+                      ],
+                      "additionalProperties": {}
+                    }
+                  },
+                  "required": [
+                    "index",
+                    "target",
+                    "ok"
+                  ],
+                  "additionalProperties": {},
+                  "description": "One failed image export item."
+                }
+              ],
+              "description": "One successful or failed image export item."
+            },
+            "description": "Exported image records, including paths or inline data requested by the caller; failed items include their own suggested_prompt."
           },
           "summary": {
-            "description": "Counts and export summary for the returned images.",
             "type": "object",
-            "propertyNames": {
-              "type": "string"
+            "properties": {
+              "total": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Total number of requested image targets."
+              },
+              "succeeded": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Number of successful image exports."
+              },
+              "failed": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Number of failed image exports."
+              },
+              "fallback": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Number of exports completed through screenshot fallback."
+              }
             },
-            "additionalProperties": {}
+            "required": [
+              "total",
+              "succeeded",
+              "failed",
+              "fallback"
+            ],
+            "additionalProperties": false,
+            "description": "Counts and export summary for the returned images."
           }
         },
-        "additionalProperties": {},
+        "required": [
+          "items",
+          "summary"
+        ],
+        "additionalProperties": false,
         "description": "Validated business result returned by the Action."
       }
     },
@@ -188,7 +468,7 @@
       },
       "observation": {
         "type": "string",
-        "description": "Factual observation that does not expose private runtime diagnostics."
+        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
       },
       "suggested_prompt": {
         "type": "string",
@@ -196,7 +476,7 @@
       },
       "details": {
         "type": "object",
-        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
         "additionalProperties": true
       }
     },

@@ -2,7 +2,7 @@
   "method": "Page.getState",
   "description": "Returns the current lifecycle, blocking, crash, failure, and human-intervention state of a page.",
   "requiresPurpose": true,
-  "actionRevision": "sha256:0ee8a955506b64f4cec80256f963471fbbfa7e1c70e4bfacfb317b9d9e8fbebc",
+  "catalogRevision": "sha256:cfd8fb90a7d277b16cad96ea1f17db4c9f7bafbbb87796e52dd73fdf68732998",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -51,7 +51,7 @@
         "type": "string"
       },
       "blocking": {
-        "description": "Active dialog, chooser, or other blocking state.",
+        "description": "Active dialog or other blocking state.",
         "type": "object",
         "propertyNames": {
           "type": "string"
@@ -68,11 +68,86 @@
       },
       "failure": {
         "description": "Latest public page failure, when present.",
-        "type": "object",
-        "propertyNames": {
-          "type": "string"
-        },
-        "additionalProperties": {}
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "network",
+                "description": "Stable page failure category for a navigation or network failure."
+              },
+              "code": {
+                "type": "string",
+                "const": "page-load-failed",
+                "description": "Stable public page failure code."
+              },
+              "message": {
+                "type": "string",
+                "const": "The page did not reach a usable loaded state.",
+                "description": "Stable public page failure summary."
+              }
+            },
+            "required": [
+              "kind",
+              "code",
+              "message"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "automation-unavailable",
+                "description": "Stable page failure category for an unavailable automation surface."
+              },
+              "code": {
+                "type": "string",
+                "const": "page-not-ready",
+                "description": "Stable public page failure code."
+              },
+              "message": {
+                "type": "string",
+                "const": "The page did not expose a usable automation surface.",
+                "description": "Stable public page failure summary."
+              }
+            },
+            "required": [
+              "kind",
+              "code",
+              "message"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "renderer-lost",
+                "description": "Stable page failure category for a lost renderer."
+              },
+              "code": {
+                "type": "string",
+                "const": "renderer-lost",
+                "description": "Stable public page failure code."
+              },
+              "message": {
+                "type": "string",
+                "const": "The page renderer is unavailable.",
+                "description": "Stable public page failure summary."
+              }
+            },
+            "required": [
+              "kind",
+              "code",
+              "message"
+            ],
+            "additionalProperties": false
+          }
+        ]
       },
       "hitl": {
         "description": "Human-intervention pause state, when present.",
@@ -90,11 +165,11 @@
     "properties": {
       "observation": {
         "type": "string",
-        "description": "Factual observation of the completed Action and its current visible result."
+        "description": "Facts directly observed by the Action or returned by its declared result schema."
       },
       "suggested_prompt": {
         "type": "string",
-        "description": "Action-specific next-step guidance based on the returned result."
+        "description": "Guidance to re-observe current state and choose the next operation."
       },
       "data": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -121,7 +196,7 @@
             "type": "string"
           },
           "blocking": {
-            "description": "Active dialog, chooser, or other blocking state.",
+            "description": "Active dialog or other blocking state.",
             "type": "object",
             "propertyNames": {
               "type": "string"
@@ -138,11 +213,86 @@
           },
           "failure": {
             "description": "Latest public page failure, when present.",
-            "type": "object",
-            "propertyNames": {
-              "type": "string"
-            },
-            "additionalProperties": {}
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "network",
+                    "description": "Stable page failure category for a navigation or network failure."
+                  },
+                  "code": {
+                    "type": "string",
+                    "const": "page-load-failed",
+                    "description": "Stable public page failure code."
+                  },
+                  "message": {
+                    "type": "string",
+                    "const": "The page did not reach a usable loaded state.",
+                    "description": "Stable public page failure summary."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "code",
+                  "message"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "automation-unavailable",
+                    "description": "Stable page failure category for an unavailable automation surface."
+                  },
+                  "code": {
+                    "type": "string",
+                    "const": "page-not-ready",
+                    "description": "Stable public page failure code."
+                  },
+                  "message": {
+                    "type": "string",
+                    "const": "The page did not expose a usable automation surface.",
+                    "description": "Stable public page failure summary."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "code",
+                  "message"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "renderer-lost",
+                    "description": "Stable page failure category for a lost renderer."
+                  },
+                  "code": {
+                    "type": "string",
+                    "const": "renderer-lost",
+                    "description": "Stable public page failure code."
+                  },
+                  "message": {
+                    "type": "string",
+                    "const": "The page renderer is unavailable.",
+                    "description": "Stable public page failure summary."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "code",
+                  "message"
+                ],
+                "additionalProperties": false
+              }
+            ]
           },
           "hitl": {
             "description": "Human-intervention pause state, when present.",
@@ -187,7 +337,7 @@
       },
       "observation": {
         "type": "string",
-        "description": "Factual observation that does not expose private runtime diagnostics."
+        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
       },
       "suggested_prompt": {
         "type": "string",
@@ -195,7 +345,7 @@
       },
       "details": {
         "type": "object",
-        "description": "Action-specific public details; private execution diagnostics are omitted.",
+        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
         "additionalProperties": true
       }
     },
