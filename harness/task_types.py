@@ -31,7 +31,11 @@ TASK_TYPE_SCENARIOS: Dict[str, str] = {
         "legacy/unclassifiable work only; NEVER use it to combine kinds of work"
         " or bypass a restricted domain — split mixed work into phases"
     ),
-    "web_search": "query a search engine and read its result listings",
+    "web_search": (
+        "query a search engine or a site's own search UI and read its result"
+        " listings; typing the query, submitting it, and paging results are"
+        " part of the search flow when the artifact is the listings"
+    ),
     "web_scrape": (
         "read-only extraction of page content — text, attributes, links,"
         " structured rows; may export rendered page visuals (img/picture/SVG/"

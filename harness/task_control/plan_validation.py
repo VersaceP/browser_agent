@@ -1230,6 +1230,8 @@ def validate_task_plan(
     known_harness_tools: Optional[AbstractSet[str]] = None,
     user_task: str = "",
     legacy_required_controls_phase_ids: Optional[AbstractSet[str]] = None,
+    legacy_non_form_required_controls_phase_ids: Optional[AbstractSet[str]] = None,
+    repair_issues: Optional[List[JsonDict]] = None,
 ) -> Tuple[Optional[JsonDict], List[str]]:
     """Validate and normalize the v1 task plan.
 
@@ -1300,6 +1302,11 @@ def validate_task_plan(
         for item in (legacy_required_controls_phase_ids or set())
         if str(item).strip()
     }
+    legacy_non_form_required_controls_phase_ids = {
+        str(item).strip()
+        for item in (legacy_non_form_required_controls_phase_ids or set())
+        if str(item).strip()
+    }
     for index, raw_phase in enumerate(raw_phases):
         if not isinstance(raw_phase, dict):
             errors.append(f"phases[{index}] must be an object")
@@ -1353,6 +1360,8 @@ def validate_task_plan(
             errors,
             warnings,
             phase_id=phase_id,
+            phase_index=index,
+            repair_issues=repair_issues,
             # Phase-level type is the authorization boundary.  The plan-level
             # type has not yet been derived here and may describe another
             # phase, so it must not decide a form completion contract.
@@ -1360,6 +1369,9 @@ def validate_task_plan(
             stage_hint=stage_hint,
             allow_legacy_missing_required_controls=(
                 phase_id in legacy_required_controls_phase_ids
+            ),
+            allow_legacy_non_form_required_controls=(
+                phase_id in legacy_non_form_required_controls_phase_ids
             ),
         )
         validators = _tc()._normalize_validators(

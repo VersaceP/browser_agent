@@ -780,9 +780,12 @@ def _normalize_expected_artifact_contract(
     warnings: List[JsonDict],
     *,
     phase_id: str,
+    phase_index: Optional[int] = None,
+    repair_issues: Optional[List[JsonDict]] = None,
     task_type: str = "",
     stage_hint: str = "",
     allow_legacy_missing_required_controls: bool = False,
+    allow_legacy_non_form_required_controls: bool = False,
 ) -> JsonDict:
     """Recover one canonical expected-artifact shape from equivalent inputs.
 
@@ -792,18 +795,58 @@ def _normalize_expected_artifact_contract(
     receipt, then backfill only from an unambiguous contract source.
     """
     expected = dict(expected_artifact)
-    # Form phases can declare the business controls they must complete.  This
-    # is deliberately an artifact contract rather than a second state store:
+
+    def append_repair_issue(
+        *,
+        code: str,
+        paths: List[str],
+        repair_options: List[JsonDict],
+    ) -> None:
+        """Attach machine-readable repair guidance beside its validation error.
+
+        These are deliberately produced where the validator still knows the
+        failed rule and the original candidate's spelling.  Inferring repair
+        paths later from prose cannot distinguish a form receipt contract from
+        a listing collection contract.
+        """
+        if repair_issues is None:
+            return
+        repair_issues.append({
+            "code": code,
+            "phaseId": phase_id,
+            "paths": paths,
+            "repairOptions": repair_options,
+        })
+
+    phase_path = f"/phases/{phase_index}" if phase_index is not None else ""
+    task_type_path = f"{phase_path}/task_type" if phase_path else ""
+    stage_hint_path = f"{phase_path}/stage_hint" if phase_path else ""
+    # Form phases can declare the business controls they must complete. This is
+    # deliberately an artifact contract rather than a second state store:
     # workers emit one evidence row per stable controlKey and the ordinary
-    # validators below prove the exact key set.  Accept the early snake_case
-    # spelling but persist one canonical shape for replans/resume.
+    # validators below prove the exact key set. It is NOT a general list of
+    # fields within each extracted row. Accept the early snake_case spelling
+    # but persist one canonical shape for replans/resume.
+    control_key = "requiredControls" if "requiredControls" in expected else ""
     raw_controls = expected.get("requiredControls")
     if raw_controls is None:
+        if "required_controls" in expected:
+            control_key = "required_controls"
         raw_controls = expected.pop("required_controls", None)
+    controls_path = (
+        f"{phase_path}/expected_artifact/{control_key}"
+        if phase_path and control_key else ""
+    )
+    exact_rows_path = (
+        f"{phase_path}/expected_artifact/exact_rows"
+        if phase_path and "exact_rows" in expected else ""
+    )
+    is_form_interaction = (
+        task_type == "form_filling" and stage_hint == "form_interaction"
+    )
     if (
         raw_controls is None
-        and task_type == "form_filling"
-        and stage_hint == "form_interaction"
+        and is_form_interaction
     ):
         if allow_legacy_missing_required_controls:
             warnings.append({
@@ -820,9 +863,86 @@ def _normalize_expected_artifact_contract(
         else:
             errors.append(
                 f"phase {phase_id}: form_filling/form_interaction requires "
-                "expected_artifact.requiredControls with stable controlKey values"
+                "expected_artifact.requiredControls with stable controlKey values "
+                "when its artifact is a row-per-control form-completion receipt; "
+                "if controls only enable search/listing extraction, classify that "
+                "phase as web_search/collection or split the form and collection "
+                "work into separate phases"
             )
-    if raw_controls is not None:
+            append_repair_issue(
+                code="form_interaction_missing_required_controls",
+                paths=[],
+                repair_options=[{
+                    "id": "listing_collection",
+                    "description": (
+                        "Use this when the phase collects search or listing rows; "
+                        "it is not a row-per-control form-completion receipt."
+                    ),
+                    "operations": [
+                        {
+                            "op": "set",
+                            "path": task_type_path,
+                            "value": "web_search",
+                        },
+                        {
+                            "op": "set",
+                            "path": stage_hint_path,
+                            "value": "collection",
+                        },
+                    ] if task_type_path and stage_hint_path else [],
+                }, {
+                    "id": "form_control_receipts",
+                    "description": (
+                        "Use this only when the deliverable really is one receipt "
+                        "per form control. Submit a complete revised plan that adds "
+                        "a non-empty requiredControls contract."
+                    ),
+                    "requiresCompletePlan": True,
+                    "operations": [],
+                }],
+            )
+    if raw_controls is not None and not is_form_interaction:
+        if allow_legacy_non_form_required_controls:
+            warnings.append({
+                "type": "legacy_required_controls_outside_form_phase",
+                "phase": phase_id,
+                "message": (
+                    "An already accepted historical phase carries "
+                    "expected_artifact.requiredControls outside "
+                    "form_filling/form_interaction. It remains valid only as "
+                    "an immutable prefix of this extension; new or changed "
+                    "phases must remove it."
+                ),
+            })
+        else:
+            errors.append(
+                f"phase {phase_id}: expected_artifact.requiredControls is only "
+                "valid for task_type='form_filling' with "
+                "stage_hint='form_interaction'; it means one artifact row per "
+                "controlKey, not fields within each product/file/listing row. "
+                "Remove it and use fields/required_fields for required row "
+                "fields, nonempty_fields only for values that must be non-empty, "
+                "and allow_empty_with_outcome for evidence-backed omissions."
+            )
+            append_repair_issue(
+                code="required_controls_outside_form_phase",
+                paths=[controls_path] if controls_path else [],
+                repair_options=[{
+                    "id": "remove_controls_from_data_rows",
+                    "description": (
+                        "Remove requiredControls: it describes one receipt row per "
+                        "form control, not fields required within each extracted row."
+                    ),
+                    "operations": [{
+                        "op": "remove",
+                        "path": controls_path,
+                        "value": None,
+                    }] if controls_path else [],
+                }],
+            )
+    if raw_controls is not None and (
+        is_form_interaction or allow_legacy_non_form_required_controls
+    ):
         if not isinstance(raw_controls, list) or not raw_controls:
             errors.append(
                 f"phase {phase_id}: expected_artifact.requiredControls must be a non-empty array"
@@ -861,7 +981,56 @@ def _normalize_expected_artifact_contract(
                 if exact and exact != declared_count:
                     errors.append(
                         f"phase {phase_id}: exact_rows={exact} conflicts with "
-                        f"requiredControls count={declared_count}"
+                        f"requiredControls count={declared_count}; "
+                        "requiredControls makes each artifact row a form-control "
+                        "receipt keyed by controlKey. Either make exact_rows match "
+                        "the controls and emit controlKey/filledValue rows, or for "
+                        "search/listing extraction use task_type='web_search' with "
+                        "stage_hint='collection' and remove requiredControls; split "
+                        "the phases if both deliverables are independently needed."
+                    )
+                    append_repair_issue(
+                        code="required_controls_row_identity_conflict",
+                        paths=[
+                            path for path in (controls_path, exact_rows_path) if path
+                        ],
+                        repair_options=[{
+                            "id": "listing_collection",
+                            "description": (
+                                "Use this when the controls only initiate search or "
+                                "listing collection. Keep the listing row count, remove "
+                                "the form-control receipt contract, and classify the phase "
+                                "as web_search/collection."
+                            ),
+                            "operations": [
+                                {
+                                    "op": "remove",
+                                    "path": controls_path,
+                                    "value": None,
+                                },
+                                {
+                                    "op": "set",
+                                    "path": task_type_path,
+                                    "value": "web_search",
+                                },
+                                {
+                                    "op": "set",
+                                    "path": stage_hint_path,
+                                    "value": "collection",
+                                },
+                            ] if (
+                                controls_path and task_type_path and stage_hint_path
+                            ) else [],
+                        }, {
+                            "id": "form_control_receipts",
+                            "description": (
+                                "Use this only when the deliverable really is one row per "
+                                "form control. Submit a complete revised plan whose row "
+                                "identity, exact_rows, and fields match that contract."
+                            ),
+                            "requiresCompletePlan": True,
+                            "operations": [],
+                        }],
                     )
                 expected["exact_rows"] = declared_count
                 for field_key in ("fields", "required_fields"):
