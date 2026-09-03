@@ -32,6 +32,11 @@ from __future__ import annotations
 import asyncio
 from typing import Any, Callable, Optional
 
+from harness.observation.browser_reducers import (
+    BrowserEvent,
+    DialogLedgerReducer,
+    default_registry,
+)
 from harness.utils import JsonDict
 
 
@@ -60,24 +65,22 @@ class BrowserEventObserver:
         self.event_counts: dict[str, int] = {}
         self._background_tasks: set["asyncio.Task[Any]"] = set()
         # Public dialog identity only. Prompt text/default/user input are
-        # intentionally never retained in this Layer-0 ledger.
-        self._pending_dialogs: dict[str, list[JsonDict]] = {}
+        # intentionally never retained in this Layer-0 ledger. The fold itself
+        # lives in a reducer that can be tested and replayed without a client;
+        # this class keeps the readers its callers already use.
+        self._dialog_reducer = DialogLedgerReducer()
+        self._event_policies = default_registry()
 
     def pending_dialogs(self, page_id: Any) -> list[JsonDict]:
-        return [dict(item) for item in self._pending_dialogs.get(str(page_id or ""), [])]
+        return self._dialog_reducer.pending(page_id)
 
     def settle_dialog(self, page_id: Any, dialog_id: Any = "") -> None:
-        page_key = str(page_id or "")
-        pending = self._pending_dialogs.get(page_key, [])
-        target = str(dialog_id or "").strip()
-        if target:
-            pending = [item for item in pending if item.get("dialogId") != target]
-        elif pending:
-            pending = pending[:-1]
-        if pending:
-            self._pending_dialogs[page_key] = pending
-        else:
-            self._pending_dialogs.pop(page_key, None)
+        self._dialog_reducer.settle(page_id, dialog_id)
+
+    def policy_for(self, event_name: str) -> Any:
+        """What this observer is allowed to do with an event of this name."""
+
+        return self._event_policies.policy_for(event_name)
 
     def attach(self, client: Any) -> None:
         if self._unsubscribe is not None:
@@ -120,7 +123,7 @@ class BrowserEventObserver:
                         "Download.progressed", "Download.stateChanged"}:
                 self._observe_download_event(name, event.get("payload"))
             if name in {"Page.dialogOpened", "Page.dialogClosed"}:
-                self._observe_dialog_event(name, event.get("payload"))
+                self._observe_dialog_event(name, event.get("payload"), event)
             if name == "DOM.axTreeUpdated":
                 self._handle_axtree_updated(event.get("payload"))
         except Exception as exc:  # noqa: BLE001 - never break the reader
@@ -141,33 +144,57 @@ class BrowserEventObserver:
 
         _remember_download_event(self.agent, event_name, payload)
 
-    def _observe_dialog_event(self, event_name: str, payload: Any) -> None:
+    def _observe_dialog_event(
+        self, event_name: str, payload: Any, event: Any = None,
+    ) -> None:
         if not isinstance(payload, dict):
             return
-        page_id = str(payload.get("pageId") or "").strip()
-        dialog = payload.get("dialog")
-        dialog_id = str(
-            payload.get("dialogId")
-            or (dialog.get("id") if isinstance(dialog, dict) else "")
-            or ""
-        ).strip()
-        if not page_id:
+        # Built from the notification, not hand-assembled: rebuilding it here
+        # dropped the platform's own eventId, so every state transition claimed
+        # it came from nowhere.
+        browser_event = BrowserEvent.from_notification(event) if event else None
+        if browser_event is None:
+            browser_event = BrowserEvent(
+                event_name=event_name,
+                payload=payload,
+                page_id=str(payload.get("pageId") or "") or None,
+            )
+        self._apply_reducer(
+            self._dialog_reducer, browser_event, log_event="page.dialog.ledger",
+        )
+
+    def _apply_reducer(
+        self,
+        reducer: Any,
+        event: "BrowserEvent",
+        *,
+        log_event: str,
+    ) -> None:
+        """Fold one event, then publish what changed - digests, not contents.
+
+        Attribution stays ``unattributed``: this event arrived asynchronously,
+        and nothing here has the evidence to say which call produced it.
+        """
+
+        reduction = reducer.reduce(event)
+        if reduction.log is not None:
+            self._log(log_event, reduction.log)
+        if not reduction.changed:
             return
-        if event_name == "Page.dialogClosed":
-            self.settle_dialog(page_id, dialog_id)
-        elif dialog_id:
-            pending = self._pending_dialogs.setdefault(page_id, [])
-            pending[:] = [item for item in pending if item.get("dialogId") != dialog_id]
-            # Only non-sensitive routing facts cross into harness state.
-            pending.append({
-                "dialogId": dialog_id,
-                "type": str(dialog.get("type") or "") if isinstance(dialog, dict) else "",
-            })
-        self._log("page.dialog.ledger", {
-            "pageId": page_id,
-            "event": event_name,
-            "pendingDialogIds": [item["dialogId"] for item in self._pending_dialogs.get(page_id, [])],
-        })
+        recorder = getattr(self.agent, "lifecycle_events", None)
+        factory = getattr(recorder, "_factory", None) if recorder else None
+        if factory is None or not getattr(factory, "enabled", False):
+            return
+        for transition in reduction.transitions:
+            factory.browser_state_transition(
+                reducer=transition.reducer,
+                transition=transition.transition,
+                page_id=transition.page_id,
+                before_digest=transition.before_digest,
+                after_digest=transition.after_digest,
+                source_browser_event_id=event.event_id,
+                attribution=transition.attribution,
+            )
 
     def _observe_page_inventory(self, event_name: str, payload: Any) -> None:
         """Record that the fleet's page set moved, without judging why.

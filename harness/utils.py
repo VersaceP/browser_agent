@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 
+from harness.events.factory import RunEventSequencer
+
 JsonDict = Dict[str, Any]
 EventSink = Callable[[str, JsonDict], None]
 LLM_HIDDEN_FIELDS: Set[str] = set()
@@ -512,6 +514,12 @@ class RunLogger:
         # database backend. bind_context must never be used to carry it.
         self.run_id = str(run_id or "")
         self._storage = storage
+        # Every event this run produces draws from one sequence, so lead and
+        # worker events interleave into a single totally ordered stream.
+        self._sequencer = RunEventSequencer()
+        self._emitter: Optional[Any] = None
+        self._event_factory: Optional[Any] = None
+        self._storage_sink: Optional[Any] = None
 
     @property
     def storage(self) -> Any:
@@ -543,23 +551,80 @@ class RunLogger:
 
         self._storage = storage
 
-    def write(self, event_type: str, payload: JsonDict) -> None:
-        self.storage.append_event(
-            task_id=self.task_id,
-            run_id=str(self.run_id or ""),
-            event_type=event_type,
-            payload=payload,
-            worker_id=(
-                str(payload.get("workerId") or "") or None
-                if isinstance(payload, dict)
-                else None
-            ),
-        )
-        if self.on_event:
-            try:
-                self.on_event(event_type, payload)
-            except Exception:
-                pass
+    @property
+    def emitter(self) -> Any:
+        """The fan-out this logger writes through.
+
+        Built on first use because main.py attaches the real backend after
+        construction; binding the storage sink to a callable rather than an
+        object means a later attach_storage() is picked up automatically.
+        """
+
+        if self._emitter is None:
+            from harness.events.emitter import RunEventEmitter
+            from harness.events.sinks import ConsoleEventSink, StorageEventSink
+
+            emitter = RunEventEmitter()
+            # Order matters: the audit row is written before anything is
+            # printed, so a crash mid-dispatch cannot leave a line on screen
+            # that no record backs up.
+            self._storage_sink = StorageEventSink(lambda: self.storage)
+            emitter.add_sink(self._storage_sink, critical=True)
+            emitter.add_sink(
+                ConsoleEventSink(lambda event_type, payload: (
+                    self.on_event(event_type, payload) if self.on_event else None
+                )),
+                critical=False,
+            )
+            self._emitter = emitter
+        return self._emitter
+
+    def set_persist_message_content(self, enabled: bool) -> None:
+        """Let assistant text reach storage through message_end events.
+
+        Off while the legacy `agent.model` / `lead.model` events still carry
+        the same text; turning it on is what retires them.
+        """
+
+        self.emitter  # ensure the sink exists
+        if self._storage_sink is not None:
+            self._storage_sink.set_persist_message_content(enabled)
+
+    @property
+    def event_factory(self) -> Any:
+        """Typed event source for this run, sharing the logger's sequence."""
+
+        if self._event_factory is None:
+            from harness.events.factory import EventFactory
+            from harness.events.models import EventContext
+            from harness.events.publisher import CallbackPublisher
+
+            self._event_factory = EventFactory(
+                context=EventContext(
+                    task_id=self.task_id, run_id=str(self.run_id or ""),
+                ),
+                sequencer=self._sequencer,
+                publisher=CallbackPublisher(self.emitter.emit),
+            )
+        return self._event_factory
+
+    def write(
+        self,
+        event_type: str,
+        payload: JsonDict,
+        *,
+        event_context: Optional[Any] = None,
+    ) -> None:
+        factory = self.event_factory
+        context = event_context or factory.context
+        if isinstance(payload, dict) and not context.worker_id:
+            # Unbound call sites have always carried workerId in the payload;
+            # promoting it keeps the relational column filled without asking
+            # 370 call sites to change.
+            worker_id = str(payload.get("workerId") or "") or None
+            if worker_id:
+                context = context.merge(worker_id=worker_id)
+        factory.legacy(event_type, payload, context=context)
 
     def bind_context(self, **context: Any) -> "BoundRunLogger":
         """Return a logger view that injects immutable event identity.
@@ -620,9 +685,40 @@ class RunLogger:
 class BoundRunLogger:
     """Immutable per-actor view over a task-scoped :class:`RunLogger`."""
 
+    # bind_context() speaks the payload's camelCase; EventContext is the
+    # relational form of the same identity. One table, so the two can never
+    # drift into disagreeing about who wrote an event.
+    _CONTEXT_FIELDS = {
+        "workerId": "worker_id",
+        "slotId": "slot_id",
+        "agentId": "agent_id",
+        "phaseId": "phase_id",
+        "actorType": "actor_type",
+    }
+
     def __init__(self, logger: RunLogger, context: Dict[str, Any]):
         self._logger = logger
         self._context = dict(context)
+        self._event_context: Optional[Any] = None
+
+    @property
+    def event_context(self) -> Any:
+        if self._event_context is None:
+            patch = {
+                field: str(self._context[key])
+                for key, field in self._CONTEXT_FIELDS.items()
+                if self._context.get(key)
+            }
+            self._event_context = self._logger.event_factory.context.merge(**patch)
+        return self._event_context
+
+    def bound_event_factory(self) -> Any:
+        """A typed event factory carrying this view's actor identity."""
+
+        context = self.event_context
+        return self._logger.event_factory.bind(
+            **context.model_dump(exclude_none=True, exclude={"task_id", "run_id"})
+        )
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._logger, name)
@@ -633,10 +729,17 @@ class BoundRunLogger:
             {**self._context, **dict(context)},
         )
 
-    def write(self, event_type: str, payload: JsonDict) -> None:
+    def write(
+        self,
+        event_type: str,
+        payload: JsonDict,
+        *,
+        event_context: Optional[Any] = None,
+    ) -> None:
         self._logger.write(
             event_type,
             {**dict(payload or {}), **self._context},
+            event_context=event_context or self.event_context,
         )
 
     def record_llm_usage(

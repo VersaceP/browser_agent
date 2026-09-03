@@ -356,6 +356,138 @@ def _project_error_classification(
     return projected
 
 
+def _longest_string(value: Any, limit: int) -> bool:
+    """True if any string in the structure would be cut by ``limit``.
+
+    Cheaper than serialising twice: the question is only whether trimming has
+    anything to remove, and a scan stops at the first oversized string.
+    """
+
+    if isinstance(value, str):
+        return len(value) > limit
+    if isinstance(value, dict):
+        return any(_longest_string(item, limit) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_longest_string(item, limit) for item in value)
+    return False
+
+
+def preserve_complete_tool_payload(
+    *,
+    logger: RunLogger,
+    tool_name: str,
+    result: Any,
+    step: Optional[int],
+    prefix: str = "",
+    projection_limit: int,
+) -> Optional[JsonDict]:
+    """Write the complete payload to disk BEFORE anything is trimmed.
+
+    Order is the whole point. The model copy is produced by cutting every
+    string at ``max_observation_chars`` and the audit log by cutting at 8000;
+    whichever ran first, the bytes it removed were gone. Nothing held a
+    complete copy of a large browser result unless one of its fields happened
+    to be on the DOM whitelist, so `savedPath` on the model receipt could point
+    at a shortened copy while reading like the full one.
+
+    Returns None when trimming would remove nothing, because then the model
+    receipt IS the complete payload and a second copy would be waste.
+
+    "Complete" means complete as persisted. Result redaction is a no-op today
+    (parameters, not results, are the redacted surface), but the hash is named
+    for what was written rather than for the input, so it stays honest the day
+    a result-side redaction is added.
+    """
+
+    if not _longest_string(result, projection_limit):
+        return None
+
+    original_bytes = json_size_bytes(result)
+    # Computed here, in full. store_offloaded_payload's `contentHash` is a
+    # 16-character prefix for addressing; returning that under a field named
+    # persistedPayloadSha256 was a 16-character value claiming to be a SHA-256.
+    persisted_sha256 = hashlib.sha256(
+        serialized_offload_text(result).encode("utf-8")
+    ).hexdigest()
+    tool_results_dir = task_subdir(logger, "tool_results")
+    safe_tool = safe_path_component(tool_name.replace(".", "-"), "tool")
+    safe_prefix = safe_path_component(prefix, "agent") if prefix else ""
+    parts = [
+        part for part in (
+            safe_prefix, f"step{step or 0}", safe_tool, "complete",
+            uuid.uuid4().hex[:8],
+        ) if part
+    ]
+    path = tool_results_dir / ("-".join(parts) + ".json")
+    try:
+        facts = store_offloaded_payload(
+            logger, path, resource_type="tool_result_complete", content=result,
+        )
+    except Exception as exc:  # noqa: BLE001 - a failed preserve must not fail the call
+        # Reporting a savedPath that does not exist would be worse than
+        # reporting none: the model would page a file that is not there.
+        logger.write(
+            "tool_result.preserve_failed",
+            {"tool": tool_name, "step": step, "error": str(exc)[:300]},
+        )
+        return None
+
+    return {
+        "sourceComplete": True,
+        "projectionTruncated": True,
+        "savedPath": facts.get("savedPath"),
+        "persistedPayloadSha256": persisted_sha256,
+        "contentAddress": facts.get("contentHash"),
+        "sameContentAs": facts.get("sameContentAs"),
+        "lineCount": facts.get("lineCount"),
+        "originalBytes": original_bytes,
+        "projectionLimitChars": int(projection_limit),
+        "reason": "projection_trim",
+    }
+
+
+def store_received_model_output(
+    *,
+    logger: RunLogger,
+    actor: str,
+    step: Optional[int],
+    text: str,
+    stop_reason: str,
+) -> Optional[JsonDict]:
+    """Save the prefix a truncated model turn did produce.
+
+    Deliberately NOT called a full output path. When a provider stops at
+    max_tokens the rest was never generated - it exists nowhere, on no disk,
+    and no later read can recover it. What can be saved is what arrived, and
+    calling that anything else would be a lie the next reader acts on.
+    """
+
+    if not str(text or "").strip():
+        return None
+    directory = task_subdir(logger, "model_output")
+    parts = [
+        part for part in (
+            safe_path_component(actor, "agent"), f"step{step or 0}",
+            safe_path_component(stop_reason, "truncated"), uuid.uuid4().hex[:8],
+        ) if part
+    ]
+    path = directory / ("-".join(parts) + ".txt")
+    try:
+        store_offloaded(
+            logger, path, resource_type="model_output_partial",
+            content=text, media_type="text/plain",
+        )
+    except Exception:
+        return None
+    return {
+        "sourceComplete": False,
+        "providerTruncated": True,
+        "receivedOutputPath": str(path.resolve()),
+        "receivedChars": len(text),
+        "reason": stop_reason,
+    }
+
+
 def offload_large_tool_result(
     *,
     logger: RunLogger,

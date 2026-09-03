@@ -1010,6 +1010,15 @@ class HarnessConfig:
         "as the source of truth for parameters; descriptions live in System.getCapabilities."
     )
     max_observation_chars: int = 24000
+    # Typed agent/turn/message/tool lifecycle events. On by default because a
+    # lifecycle nobody emits proves nothing about the schema built for it -
+    # which is exactly how run_events.actor_type ended up a column no writer
+    # ever filled. Off is the escape hatch, not the resting state.
+    events_lifecycle_enabled: bool = True
+    # Whether message_end carries the assistant text. Off while the legacy
+    # agent.model / lead.model events still carry it: two copies of the same
+    # text is the double-write this refactor exists to remove.
+    events_persist_message_content: bool = False
     offload_threshold_bytes: int = DEFAULT_OFFLOAD_THRESHOLD_BYTES
     tool_result_offload_threshold_bytes: int = (
         DEFAULT_TOOL_RESULT_OFFLOAD_THRESHOLD_BYTES
@@ -1391,6 +1400,15 @@ class HarnessConfig:
                 cls.strategy_bank_path,
             ),
             memory_context=data.get("memory_context", cls.memory_context),
+            events_lifecycle_enabled=bool(
+                data.get("events_lifecycle_enabled", cls.events_lifecycle_enabled)
+            ),
+            events_persist_message_content=bool(
+                data.get(
+                    "events_persist_message_content",
+                    cls.events_persist_message_content,
+                )
+            ),
             max_observation_chars=int(
                 data.get("max_observation_chars", cls.max_observation_chars)
             ),

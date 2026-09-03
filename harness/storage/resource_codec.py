@@ -67,6 +67,11 @@ COMPRESSIBLE_RESOURCE_TYPES = frozenset({
     "event_payload",
     "observation",
     "tool_result",
+    # The preserved pre-trim copy of a tool result and the prefix of a
+    # truncated model turn. Both are the largest text this system stores, and
+    # both were excluded purely because they were added later.
+    "tool_result_complete",
+    "model_output_partial",
     "context_compaction",
 })
 

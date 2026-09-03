@@ -76,6 +76,25 @@ def _event_sequence_digest(rows: List[JsonDict]) -> str:
     return semantic_sha256(parts)
 
 
+def _envelope_digest_parts(row: JsonDict) -> List[str]:
+    """Envelope fields as strings, in one fixed order.
+
+    Both the write-time record and the read-time comparison go through here,
+    which is the only way they can be trusted to agree.
+    """
+
+    # Every envelope column, not a chosen few: a backend that dropped
+    # agent_id or phase_id compared as identical to one that kept them.
+    return [
+        str(row.get(name) or "")
+        for name in (
+            "event_uid", "schema_version", "sequence_no", "category",
+            "agent_id", "slot_id", "phase_id",
+            "turn_id", "message_id", "tool_call_id",
+        )
+    ]
+
+
 def _resource_fingerprint(
     task_dir: Path,
     logical_path: str,
@@ -251,6 +270,12 @@ class DualStore(Storage):
         # and cannot tell this run's data apart from a previous run's files in
         # a worktree that was never imported. Both need a ground truth.
         self._written: Dict[Tuple[str, str], Dict[str, List[Any]]] = {}
+        # Which event uids the expected ledger already accounts for. Guarded
+        # by its own reentrant lock, taken around the whole append so a uid is
+        # never observed as "first" by two threads at once. Always acquired
+        # BEFORE self._lock, never after, so the two cannot deadlock.
+        self._recorded_event_uids: set = set()
+        self._uid_lock = threading.RLock()
 
     # -- plumbing ----------------------------------------------------------
     def _count(self, task_id: str, kind: str, delta: int = 1) -> None:
@@ -391,9 +416,68 @@ class DualStore(Storage):
         ))
         self._record_written(
             task_id, run_id, "events",
-            semantic_sha256([event_type, actor_type or "", worker_id or "", payload]),
+            semantic_sha256([
+                event_type, actor_type or "", worker_id or "", payload,
+                # An untyped append carries no envelope; empty strings here are
+                # exactly what reading such a row back produces.
+                *_envelope_digest_parts({}),
+            ]),
         )
         self._count(task_id, "events")
+
+    def append_run_event(self, row: Any) -> None:
+        """Mirror one enveloped event and account for it exactly once.
+
+        Two ordering rules, both learned the hard way:
+
+        - a retried write is idempotent in both backends, so counting it twice
+          made verify() expect two rows where one exists and report a mismatch
+          against the very correctness it had just asked for;
+        - the uid may only be marked accounted-for AFTER both backends and the
+          expected ledger have succeeded. Marking it first meant a primary that
+          failed once and then succeeded on retry left the ledger empty
+          forever, so verify() reported expected=0 against a row that exists.
+
+        The whole body runs under one reentrant lock, so two threads with the
+        same uid cannot both conclude they are the first. That lock is always
+        taken before ``self._lock`` and never after, so the pair cannot
+        deadlock.
+        """
+
+        uid = str(getattr(row, "event_uid", "") or "")
+        with self._uid_lock:
+            already_accounted = bool(uid) and uid in self._recorded_event_uids
+            self.primary.append_run_event(row)
+            self._mirror(
+                "append_run_event", row.task_id,
+                lambda: self.secondary.append_run_event(row),
+            )
+            if already_accounted:
+                return
+            self._count(row.task_id, "events")
+            self._record_written(
+                row.task_id, row.run_id, "events",
+                semantic_sha256([
+                    row.event_type,
+                    row.actor_type or "",
+                    row.worker_id or "",
+                    row.payload,
+                    *_envelope_digest_parts({
+                        "event_uid": row.event_uid,
+                        "schema_version": row.schema_version,
+                        "sequence_no": row.sequence_no,
+                        "category": row.category,
+                        "agent_id": row.agent_id,
+                        "slot_id": row.slot_id,
+                        "phase_id": row.phase_id,
+                        "turn_id": row.turn_id,
+                        "message_id": row.message_id,
+                        "tool_call_id": row.tool_call_id,
+                    }),
+                ]),
+            )
+            if uid:
+                self._recorded_event_uids.add(uid)
 
     def read_events(
         self,
@@ -881,6 +965,10 @@ class DualStore(Storage):
             str(row.get("actor_type") or "") or "",
             str(row.get("worker_id") or "") or "",
             payload,
+            # Envelope identity is compared too: a backend that silently
+            # dropped the uid or the run sequence would otherwise look
+            # perfectly consistent with one that kept them.
+            *_envelope_digest_parts(row),
         ])
 
     @staticmethod

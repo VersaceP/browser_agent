@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import os
 import re
 import socket
@@ -294,6 +295,74 @@ class SqliteStore(Storage):
                     task_id, run_id, dao.utc_now_iso(), event_type,
                     actor_type, worker_id, resource_id, byte_size,
                 ),
+            )
+
+    def append_run_event(self, row: Any) -> None:
+        """Typed entry point. Same oversized-payload rule as append_event."""
+
+        payload_json = json.dumps(row.payload, ensure_ascii=False, default=str)
+        byte_size = len(payload_json.encode("utf-8"))
+        connection = self.connection
+        if byte_size <= EVENT_PAYLOAD_OFFLOAD_THRESHOLD:
+            dao.insert_run_event(
+                connection,
+                row=row,
+                payload_json=payload_json,
+                payload_byte_size=byte_size,
+            )
+            return
+        resource_id = uuid.uuid4().hex
+        encoded = encode_resource(
+            row.payload,
+            resource_type=RESOURCE_TYPE_EVENT_PAYLOAD,
+            compression=self.resource_compression,
+            min_bytes=self.resource_compression_min_bytes,
+            level=self.resource_compression_level,
+        )
+        columns = [
+            "task_id", "run_id", "event_time", "event_type", "actor_type",
+            "worker_id", "payload_json", "payload_resource_id",
+            "payload_byte_size",
+        ] + list(dao._ENVELOPE_COLUMNS)
+        try:
+            # The conflict is handled OUTSIDE this block on purpose. Resolving
+            # it inside let the transaction commit with the resource row
+            # inserted and no event pointing at it, so every benign retry of a
+            # large payload leaked one orphaned resource. Letting the error
+            # leave the block rolls the resource back first.
+            with write_transaction(connection):
+                self._insert_resource_rows(
+                    connection, row.task_id, row.run_id, resource_id,
+                    RESOURCE_TYPE_EVENT_PAYLOAD,
+                    f"events/{row.event_type}-{resource_id[:12]}.json",
+                    "application/json",
+                    {
+                        "content_json": encoded.content_json,
+                        "content_text": encoded.content_text,
+                        "content_blob": encoded.content_blob,
+                        "external_path": None,
+                    },
+                    {}, encoded.logical_byte_size, encoded.logical_sha256,
+                    encoded.stored_byte_size,
+                    content_encoding=encoded.content_encoding,
+                )
+                connection.execute(
+                    f"INSERT INTO run_events({', '.join(columns)})"
+                    f" VALUES ({', '.join('?' for _ in columns)})",
+                    (
+                        row.task_id, row.run_id, row.event_time, row.event_type,
+                        row.actor_type, row.worker_id, None, resource_id,
+                        byte_size, row.event_uid, int(row.schema_version),
+                        int(row.sequence_no), row.category, row.agent_id,
+                        row.slot_id, row.phase_id, row.turn_id, row.message_id,
+                        row.tool_call_id,
+                    ),
+                )
+        except sqlite3.IntegrityError as exc:
+            dao._resolve_event_conflict(
+                connection, row=row, payload_json=None,
+                payload_resource_id=resource_id, exc=exc,
+                payload_sha256=encoded.logical_sha256,
             )
 
     def read_events(

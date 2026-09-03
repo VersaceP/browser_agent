@@ -13,6 +13,7 @@ from harness.observation.challenge_detector import detect_structural_challenge
 from harness.diagnostics.error_classification import attach_error_classification
 from harness.fleet.runtime import FleetClickGateTimeout
 from harness.offload import offload_large_tool_result
+from harness.offload import preserve_complete_tool_payload
 from harness.observation.browser_call import build_browser_call_runner
 from harness.runtime_evaluation import MAIN_WORLD_REQUIRED_PREFIX
 from harness.runtime_evaluation import RuntimeEvaluationService
@@ -1017,6 +1018,27 @@ async def _execute_browser_capability_tool(
     # decided FOR the model behind gates so narrow they almost never fired.
     if not page_create_should_stop:
         result = _bt()._attach_visual_recovery_hint(agent, method, params, result, step)
+    # Complete payload first, then the log copy, then the model copy. Both of
+    # the copies below cut strings - the log at 8000 chars, the model at
+    # max_observation_chars - and until this call nothing held the whole
+    # result, so a large ABCP receipt lost its tail with no record that it had
+    # one.
+    complete_payload = preserve_complete_tool_payload(
+        logger=agent.logger,
+        tool_name=method or str(tool_name or "browser_call"),
+        result=result,
+        step=step,
+        prefix=agent.runtime.agent_id,
+        # Read defensively, like the rest of this module reads harness config:
+        # a preservation step must never be the reason a browser call raises.
+        projection_limit=int(
+            getattr(
+                getattr(agent.runtime, "harness", None),
+                "max_observation_chars",
+                0,
+            ) or 24000
+        ),
+    )
     agent.logger.write("browser.call.result", agent._trim_for_log(result))
     model_result = agent._clean_for_model(result)
     model_result = offload_large_tool_result(
@@ -1027,6 +1049,7 @@ async def _execute_browser_capability_tool(
         prefix=agent.runtime.agent_id,
         threshold_bytes=agent.runtime.harness.tool_result_offload_threshold_bytes,
     )
+    model_result = _attach_complete_payload(model_result, complete_payload)
     _bt()._observe_progress_after(agent, method, model_result)
     agent.trace.append({
         "type": "browser_call",
@@ -1035,6 +1058,25 @@ async def _execute_browser_capability_tool(
         "result": agent._clean_for_model(model_result),
     })
     return model_result, page_create_should_stop
+
+def _attach_complete_payload(
+    model_result: Any, complete: Optional[JsonDict],
+) -> Any:
+    """Tell the model where the untrimmed copy is, without inlining it.
+
+    Kept out of the receipt entirely when nothing was trimmed: a truncation
+    notice on a complete result would send the model paging a file for bytes
+    it already has.
+    """
+
+    if not complete or not isinstance(model_result, dict):
+        return model_result
+    model_result = dict(model_result)
+    model_result["_truncation"] = {
+        key: value for key, value in complete.items() if value is not None
+    }
+    return model_result
+
 
 _TRUSTED_COLLECTION_RUNTIME_TOKEN = object()
 
@@ -1289,8 +1331,26 @@ async def _invoke_browser_method(
             return result
         return agent._clean_for_model(result)
     agent.diagnostics.observe_browser_call(method, params, result)
+    # Same order as the model path, for the same reason: internal=True already
+    # returned above, so a result reaching here is one a caller will act on,
+    # and both copies below cut long strings.
+    complete_payload = preserve_complete_tool_payload(
+        logger=agent.logger,
+        tool_name=method or "browser_call",
+        result=result,
+        step=step,
+        prefix=getattr(agent.runtime, "agent_id", ""),
+        projection_limit=int(
+            getattr(
+                getattr(agent.runtime, "harness", None),
+                "max_observation_chars",
+                0,
+            ) or 24000
+        ),
+    )
     agent.logger.write("browser.call.result", agent._trim_for_log(result))
     model_result = agent._clean_for_model(result)
+    model_result = _attach_complete_payload(model_result, complete_payload)
     if count_progress:
         _bt()._observe_progress_after(agent, method, model_result)
     agent.trace.append({

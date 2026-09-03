@@ -90,10 +90,52 @@ MIGRATION_0003_STORED_SIZE = Migration(
     statements=["ALTER TABLE task_resources ADD COLUMN stored_byte_size INTEGER"],
 )
 
+# The envelope every event now carries. Which fields became columns was
+# decided by measuring a real run, not by copying the model: `severity` is
+# "info" on every event any writer produces today, and `parent_event_uid` is
+# populated by nothing at all, so neither gets a column. Both survive in the
+# payload if they are ever set.
+#
+# That rule exists because this table already has a counter-example.
+# `actor_type` was added as a column years ago; RunLogger never passed it, the
+# file backend read it from a `payload.actorType` key nothing writes, and it
+# has been NULL in every row ever stored. This migration finally fills it.
+MIGRATION_0004_EVENT_ENVELOPE = Migration(
+    version=4,
+    name="run_event_envelope",
+    statements=[
+        "ALTER TABLE run_events ADD COLUMN event_uid TEXT",
+        "ALTER TABLE run_events ADD COLUMN schema_version INTEGER",
+        "ALTER TABLE run_events ADD COLUMN sequence_no INTEGER",
+        "ALTER TABLE run_events ADD COLUMN category TEXT",
+        "ALTER TABLE run_events ADD COLUMN agent_id TEXT",
+        "ALTER TABLE run_events ADD COLUMN slot_id TEXT",
+        "ALTER TABLE run_events ADD COLUMN phase_id TEXT",
+        "ALTER TABLE run_events ADD COLUMN turn_id TEXT",
+        "ALTER TABLE run_events ADD COLUMN message_id TEXT",
+        "ALTER TABLE run_events ADD COLUMN tool_call_id TEXT",
+        # Partial, because every row written before this migration has NULL
+        # here and NULLs are not comparable in a UNIQUE index anyway - being
+        # explicit says the exemption is intended, not accidental.
+        "CREATE UNIQUE INDEX idx_run_events_uid"
+        " ON run_events(event_uid) WHERE event_uid IS NOT NULL",
+        "CREATE UNIQUE INDEX idx_run_events_run_sequence"
+        " ON run_events(run_id, sequence_no) WHERE sequence_no IS NOT NULL",
+        "CREATE INDEX idx_run_events_turn"
+        " ON run_events(run_id, turn_id, sequence_no) WHERE turn_id IS NOT NULL",
+        "CREATE INDEX idx_run_events_tool_call"
+        " ON run_events(run_id, tool_call_id, sequence_no)"
+        " WHERE tool_call_id IS NOT NULL",
+        "CREATE INDEX idx_run_events_category"
+        " ON run_events(task_id, category, event_id) WHERE category IS NOT NULL",
+    ],
+)
+
 MIGRATIONS: List[Migration] = [
     _load_initial_migration(),
     MIGRATION_0002_GIT_SHA,
     MIGRATION_0003_STORED_SIZE,
+    MIGRATION_0004_EVENT_ENVELOPE,
 ]
 
 SCHEMA_VERSION = max(migration.version for migration in MIGRATIONS)

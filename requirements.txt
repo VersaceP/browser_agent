@@ -2,3 +2,9 @@ anthropic>=0.40.0
 openai>=1.0.0
 websockets>=12.0
 PyYAML>=6.0.0
+# Typed events, messages and the persisted-event envelope. Pinned to the
+# tested baseline rather than to a guessed floor: 2.10.4 is what this tree's
+# suite runs against, and v3 is not assumed compatible.
+pydantic>=2.10,<3
+# Used directly (Protocol, Literal, Annotated) as well as by pydantic.
+typing-extensions>=4.12

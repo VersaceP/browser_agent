@@ -707,3 +707,41 @@ class BaseLLMProvider(ABC):
                   output, cache_diagnostics})
         """
         pass
+
+    async def generate_assistant_message(
+        self,
+        system_prompt: str,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+    ) -> Tuple[Any, Dict[str, Any]]:
+        """Typed form of :meth:`generate_response`.
+
+        Returns the assistant turn as ordered content blocks plus a usage dict
+        with the private ``_assistant_prefix_blocks`` key removed: thinking is
+        part of the message now, not a passenger in a metrics dict.
+
+        Concrete rather than abstract, and built on the four-tuple rather than
+        replacing it, because every retry, timeout, moderation and degenerate
+        response path in this class wraps ``generate_response``. Re-homing them
+        behind a streaming public API is a separate change - the one time this
+        codebase exposed a stream past that boundary, connection errors stopped
+        being retried at all.
+        """
+
+        from harness.events.recorder import assistant_message_from_parts
+
+        text, tool_calls, stop_reason, usage = await self.generate_response(
+            system_prompt=system_prompt, messages=messages, tools=tools,
+        )
+        usage = usage if isinstance(usage, dict) else {}
+        message = assistant_message_from_parts(
+            text=text,
+            tool_calls=tool_calls,
+            prefix_blocks=usage.get("_assistant_prefix_blocks"),
+            stop_reason=stop_reason,
+            usage=usage,
+        )
+        return message, {
+            key: value for key, value in usage.items()
+            if key != "_assistant_prefix_blocks"
+        }

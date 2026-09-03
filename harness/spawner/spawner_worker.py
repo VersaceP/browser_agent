@@ -556,6 +556,9 @@ class SpawnerWorkerMixin:
                 slotId=slot.slot_id,
                 agentId=slot.agent_id,
                 phaseId=str(phase_id or ""),
+                # The spawner is the only place that knows this logger belongs
+                # to a browser worker rather than to harness plumbing.
+                actorType="browser",
             )
             harness = self.browser_agent_factory(
                 provider,

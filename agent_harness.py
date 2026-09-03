@@ -65,6 +65,7 @@ from harness.offload import (
     fold_tool_results_after_moderation,
     offload_large_response_fields,
     offload_large_tool_result,
+    preserve_complete_tool_payload,
     strip_image_payload,
 )
 from harness.observation.page_fingerprint import (
@@ -473,7 +474,23 @@ def offload_tool_result_for_model(
     step: int,
 ) -> Any:
     model_result = strip_llm_hidden_fields(result)
-    return offload_large_tool_result(
+    # Two independent limits act on a tool result and they do not agree: whole
+    # results move to disk above tool_result_offload_threshold_bytes (50 KB by
+    # default), while individual strings are cut at max_observation_chars
+    # (24 K) on the way into the model message. A 30 KB string is under the
+    # first and over the second, so it used to be trimmed with no complete copy
+    # kept anywhere. Preserving first closes that band.
+    complete = preserve_complete_tool_payload(
+        logger=logger,
+        tool_name=str(tool_call.get("name") or "tool"),
+        result=model_result,
+        step=step,
+        prefix=runtime.agent_id,
+        projection_limit=int(
+            getattr(runtime.harness, "max_observation_chars", 0) or 24000
+        ),
+    )
+    projected = offload_large_tool_result(
         logger=logger,
         tool_name=str(tool_call.get("name") or "tool"),
         result=model_result,
@@ -481,6 +498,20 @@ def offload_tool_result_for_model(
         prefix=runtime.agent_id,
         threshold_bytes=runtime.harness.tool_result_offload_threshold_bytes,
     )
+    if not complete:
+        return projected
+    if isinstance(projected, dict) and "_offloaded" in projected:
+        # Already moved to disk whole; a second pointer would be noise.
+        return projected
+    notice = {key: value for key, value in complete.items() if value is not None}
+    if isinstance(projected, dict):
+        return {**projected, "_truncation": notice}
+    # A bare string or list is a legitimate tool result, and it is about to be
+    # cut at max_observation_chars. Attaching the notice to a dict was the only
+    # branch implemented, so those results were preserved on disk and the model
+    # was never told where. Wrapping is a shape change, but it only happens to
+    # a value that was going to reach the model incomplete either way.
+    return {"result": projected, "_truncation": notice}
 
 
 def _json_size_bytes(value: Any) -> int:
@@ -880,6 +911,114 @@ def _saved_paths_from_value(value: Any) -> List[str]:
     return saved_paths_from_value(value)
 
 
+def _tool_result_is_error(result: Any) -> bool:
+    """A tool result the harness itself classified as a failure."""
+    if not isinstance(result, dict):
+        return False
+    if result.get("ok") is False or result.get("success") is False:
+        return True
+    status = str(result.get("status") or "").lower()
+    return status in {"error", "failed", "rejected"} or bool(result.get("error"))
+
+
+def _tool_result_digest(result: Any) -> str:
+    from harness.events.recorder import result_digest
+
+    return result_digest(result)
+
+
+def _truncation_info(saved: Optional[JsonDict]) -> Any:
+    """Turn a saved-payload receipt into the typed TruncationInfo.
+
+    Without this the model was the only consumer that ever saw truncation
+    facts: `MessageEndEvent.truncation` had a field and no producer.
+    """
+
+    if not saved:
+        return None
+    from harness.messages.models import TruncationInfo
+
+    try:
+        return TruncationInfo(
+            source_complete=bool(saved.get("sourceComplete", False)),
+            provider_truncated=bool(saved.get("providerTruncated", False)),
+            projection_truncated=bool(saved.get("projectionTruncated", False)),
+            saved_path=saved.get("savedPath"),
+            received_output_path=saved.get("receivedOutputPath"),
+            original_bytes=saved.get("originalBytes"),
+            projected_bytes=saved.get("projectedBytes"),
+            persisted_payload_sha256=saved.get("persistedPayloadSha256"),
+            reason=saved.get("reason"),
+        )
+    except Exception:
+        return None
+
+
+def _store_received_model_output(**kwargs: Any) -> Optional[JsonDict]:
+    from harness.offload import store_received_model_output
+
+    return store_received_model_output(**kwargs)
+
+
+def _assistant_message_to_wire(message: Any) -> JsonDict:
+    from harness.messages.convert import assistant_message_to_wire
+
+    return assistant_message_to_wire(message)
+
+
+def _assistant_message_from_parts(**kwargs: Any) -> Any:
+    from harness.events.recorder import assistant_message_from_parts
+
+    return assistant_message_from_parts(**kwargs)
+
+
+def _lifecycle_recorder_for(
+    runtime: Any, logger: Any, trace: Any = None, actor_type: str = "system",
+) -> Any:
+    """A recorder bound to this actor, or an inert one when the feature is off.
+
+    The identity comes from two places and needs both: the logger carries the
+    worker/slot/phase the spawner bound, and the caller carries which KIND of
+    agent this is. Leaving the second to a default is how every event - lead,
+    worker and browser transition alike - came out labelled "system", filling
+    the formerly-NULL actor_type column with a uniformly wrong value.
+    """
+
+    from harness.events.recorder import LifecycleRecorder
+
+    harness_config = getattr(runtime, "harness", None)
+    if not bool(getattr(harness_config, "events_lifecycle_enabled", False)):
+        return LifecycleRecorder(None)
+    bind = getattr(logger, "bound_event_factory", None)
+    try:
+        factory = bind() if callable(bind) else getattr(logger, "event_factory", None)
+        if factory is not None:
+            factory = factory.bind(actor_type=actor_type)
+        setter = getattr(logger, "set_persist_message_content", None)
+        if callable(setter):
+            setter(bool(
+                getattr(harness_config, "events_persist_message_content", False)
+            ))
+    except Exception:
+        return LifecycleRecorder(None)
+    if trace is None:
+        return LifecycleRecorder(factory)
+    probe = LifecycleRecorder(factory)
+    if not probe.enabled:
+        return probe
+    from harness.events.sinks import TraceProjectionSink
+
+    context = factory.context
+    sink = TraceProjectionSink(
+        trace, agent_id=context.agent_id, worker_id=context.worker_id,
+    )
+    emitter = logger.emitter
+    emitter.add_sink(sink, critical=False)
+    return LifecycleRecorder(
+        factory, on_close=lambda: emitter.remove_sink(sink.name),
+    )
+
+
 class BrowserAgent:
     def __init__(
         self,
@@ -912,6 +1051,12 @@ class BrowserAgent:
         self.hitl_structural_challenges: Dict[str, JsonDict] = {}
         self.hitl_no_repause_until: float = 0.0
         self.lifecycle = default_lifecycle_manager()
+        # Typed lifecycle events. Built from the logger this agent was handed,
+        # so a worker's events carry the worker identity the spawner bound,
+        # not whatever the payload happened to mention.
+        self.lifecycle_events = _lifecycle_recorder_for(
+            runtime, logger, self.trace, actor_type="browser",
+        )
         self.preloaded_capability_bundle: Optional[CapabilityBundle] = None
         self.preloaded_registration: Optional[JsonDict] = None
         # Spawner-owned observability identity. These fields are injected
@@ -999,6 +1144,12 @@ class BrowserAgent:
         self._step_extension_granted_steps = 0
         self._recent_tool_outcomes = []
         self._current_step = 0
+        recorder = self.lifecycle_events
+        recorder.agent_start(
+            label=str(self.worker_id or self.runtime.agent_id),
+            max_steps=self.base_max_steps,
+            agent_id=str(self.runtime.agent_id or "") or None,
+        )
 
         try:
             bootstrap = await self._bootstrap_browser(task)
@@ -1057,6 +1208,8 @@ class BrowserAgent:
                     force_reason=force_reason,
                 )
                 self._write_agent_event("agent.step.start", {"step": step})
+                recorder.turn_start(step)
+                recorder.message_start()
                 self.lifecycle.agent_before_step(
                     LifecycleContext(
                         actor="browser_agent",
@@ -1180,6 +1333,11 @@ class BrowserAgent:
                     # drift, read cache_read=0 as a cache miss, and reset the
                     # cache state that the next real call is measured against.
                     # Only the retries it performed are real.
+                    # The message scope closes as failed rather than as an
+                    # ordinary empty turn: an audit that cannot tell "the model
+                    # said nothing" from "the call never returned" is not an
+                    # audit.
+                    recorder.message_failed(str(stop_reason or "model_call_failed"))
                     self.logger.record_llm_retries(
                         source="browser_agent", usage=usage,
                     )
@@ -1198,6 +1356,20 @@ class BrowserAgent:
                         step=step,
                         max_steps=self.effective_max_steps,
                     )
+                # Built once, in block order, and used for both the lifecycle
+                # event and the wire. The private
+                # usage["_assistant_prefix_blocks"] channel is read here and
+                # nowhere else on this path.
+                assistant_message = _assistant_message_from_parts(
+                    text=text,
+                    tool_calls=tool_calls,
+                    prefix_blocks=(
+                        usage.get("_assistant_prefix_blocks")
+                        if isinstance(usage, dict) else None
+                    ),
+                    stop_reason=stop_reason,
+                    usage=usage if isinstance(usage, dict) else None,
+                )
                 self._write_agent_event(
                     "agent.model",
                     {
@@ -1207,18 +1379,43 @@ class BrowserAgent:
                         "stop_reason": stop_reason,
                     },
                 )
-                self.trace.append({
-                    "type": "model",
-                    "step": step,
-                    "text": text,
-                    "tool_calls": [
-                        {
-                            "name": item.get("name"),
-                            "input": item.get("input", {}),
-                        }
-                        for item in tool_calls
-                    ],
-                })
+                worker_truncation = None
+                if stop_reason == "max_tokens":
+                    # One receipt per truncated turn. The no-tool-call branch
+                    # below reuses this one instead of writing the same prefix
+                    # to a second file under a second path.
+                    # Also reached when the turn DID emit tool calls: the model
+                    # was cut off mid-turn either way, and only the no-tool
+                    # branch used to notice.
+                    worker_truncation = _store_received_model_output(
+                        logger=self.logger,
+                        actor=str(self.runtime.agent_id or "browser_agent"),
+                        step=step,
+                        text=text,
+                        stop_reason=str(stop_reason),
+                    )
+                recorder.message_complete(
+                    assistant_message,
+                    stop_reason=stop_reason,
+                    truncation=_truncation_info(worker_truncation),
+                )
+                # The `model` trace entry is produced by TraceProjectionSink
+                # from the same message_end event, so it is written once. When
+                # lifecycle events are off the loop still owns it.
+                recorder.message_end()
+                if not recorder.enabled:
+                    self.trace.append({
+                        "type": "model",
+                        "step": step,
+                        "text": text,
+                        "tool_calls": [
+                            {
+                                "name": item.get("name"),
+                                "input": item.get("input", {}),
+                            }
+                            for item in tool_calls
+                        ],
+                    })
 
                 if not tool_calls:
                     # A no-tool turn is an incident (not a self-reported
@@ -1253,11 +1450,22 @@ class BrowserAgent:
                         truncation_streak += 1
                         streak_kinds.append(incident)
                         streak_limit = _effective_streak_limit(streak_kinds)
+                        # The suffix was never generated, so no file anywhere
+                        # holds it. What arrived can be saved, under a name
+                        # that says so.
+                        received = worker_truncation or _store_received_model_output(
+                            logger=self.logger,
+                            actor=str(self.runtime.agent_id or "browser_agent"),
+                            step=step,
+                            text=text,
+                            stop_reason=str(stop_reason or incident),
+                        )
                         self._write_agent_event("agent.truncated_response", {
                             "step": step,
                             "streak": truncation_streak,
                             "limit": streak_limit,
                             "strictLimit": TRUNCATION_STREAK_LIMIT,
+                            **({"truncation": received} if received else {}),
                             "infraStreak": streak_limit == INFRA_STREAK_LIMIT,
                             "kind": incident,
                             "streakKinds": list(streak_kinds),
@@ -1386,22 +1594,7 @@ class BrowserAgent:
                 truncation_streak = 0
                 streak_kinds.clear()
 
-                assistant_content: List[JsonDict] = []
-                prefix_blocks = usage.get("_assistant_prefix_blocks") if isinstance(usage, dict) else None
-                if prefix_blocks:
-                    assistant_content.extend(prefix_blocks)
-                if text:
-                    assistant_content.append({"type": "text", "text": text})
-                for tool_call in tool_calls:
-                    assistant_content.append(
-                        {
-                            "type": "tool_use",
-                            "id": tool_call["id"],
-                            "name": tool_call["name"],
-                            "input": tool_call.get("input", {}),
-                        }
-                    )
-                messages.append({"role": "assistant", "content": assistant_content})
+                messages.append(_assistant_message_to_wire(assistant_message))
 
                 tool_results: List[JsonDict] = []
                 latest_snapshot_diff: Optional[JsonDict] = None
@@ -1428,19 +1621,45 @@ class BrowserAgent:
                     runtime_batch_rejected = (
                         tool_index in mixed_runtime_indices
                     )
-                    if runtime_batch_rejected:
-                        result = _runtime_batch_boundary_rejection()
-                        should_stop = False
-                        self.trace.append({
-                            "type": "runtime_batch_boundary_rejected",
-                            "step": step,
-                            "result": result,
-                        })
-                    else:
-                        result, should_stop = await dispatch_tool(
-                            tool_call,
-                            step,
+                    recorder.tool_start(
+                        tool_call_id=str(tool_call.get("id") or ""),
+                        tool_name=str(tool_call.get("name") or "tool"),
+                        arguments=(
+                            tool_call.get("input")
+                            if isinstance(tool_call.get("input"), dict) else None
+                        ),
+                    )
+                    try:
+                        if runtime_batch_rejected:
+                            result = _runtime_batch_boundary_rejection()
+                            should_stop = False
+                            self.trace.append({
+                                "type": "runtime_batch_boundary_rejected",
+                                "step": step,
+                                "result": result,
+                            })
+                        else:
+                            result, should_stop = await dispatch_tool(
+                                tool_call,
+                                step,
+                            )
+                    except BaseException as exc:
+                        recorder.tool_failed(
+                            f"{type(exc).__name__}: {exc}",
+                            status=(
+                                "aborted"
+                                if isinstance(exc, asyncio.CancelledError)
+                                else "error"
+                            ),
                         )
+                        recorder.tool_end()
+                        raise
+                    recorder.tool_complete(
+                        is_error=_tool_result_is_error(result),
+                        result_chars=len(str(result)),
+                        result_digest=_tool_result_digest(result),
+                    )
+                    recorder.tool_end()
                     self._observe_tool_result(tool_call, result)
                     page_observation = self.page_observer.observe_result(
                         tool_call,
@@ -1669,6 +1888,11 @@ class BrowserAgent:
                     return final_answer
             raise
         finally:
+            recorder.close(
+                status=str(self.final_status or final_status or "unknown"),
+                reason=None if completed else "interrupted",
+                step_count=step,
+            )
             await self._stop_task_memory_heartbeat(task_memory_heartbeat)
             try:
                 self.event_observer.detach()
@@ -3075,6 +3299,9 @@ class LeadAgent:
             self.runtime.harness.context_file
         )
         self.lifecycle = default_lifecycle_manager()
+        self.lifecycle_events = _lifecycle_recorder_for(
+            runtime, logger, actor_type="lead",
+        )
         self.task_plan: Optional[JsonDict] = (
             dict(resume.current_plan) if resume is not None else None
         )
@@ -4595,6 +4822,12 @@ class LeadAgent:
         final_completion_receipt: JsonDict = {}
         should_finish = False
         completed = False
+        recorder = self.lifecycle_events
+        recorder.agent_start(
+            label="lead",
+            max_steps=int(self.runtime.harness.lead_max_steps or 0),
+            agent_id="lead",
+        )
         self.final_status = ""
         self.final_trigger = ""
         self.terminal_error = None
@@ -4806,6 +5039,8 @@ class LeadAgent:
                         "reason": step_reason,
                     },
                 )
+                recorder.turn_start(step)
+                recorder.message_start()
                 self._current_step = step
                 self.lifecycle.agent_before_step(
                     LifecycleContext(
@@ -5011,6 +5246,7 @@ class LeadAgent:
                     # See the worker: a call that raised carries no usage, so
                     # the normal path would invent a call and two cache-drift
                     # warnings out of its absent numbers.
+                    recorder.message_failed(str(stop_reason or "model_call_failed"))
                     self.logger.record_llm_retries(
                         source="lead_agent", usage=usage,
                     )
@@ -5029,6 +5265,16 @@ class LeadAgent:
                         step=step,
                         max_steps=self.runtime.harness.lead_max_steps,
                     )
+                assistant_message = _assistant_message_from_parts(
+                    text=text,
+                    tool_calls=tool_calls,
+                    prefix_blocks=(
+                        usage.get("_assistant_prefix_blocks")
+                        if isinstance(usage, dict) else None
+                    ),
+                    stop_reason=stop_reason,
+                    usage=usage if isinstance(usage, dict) else None,
+                )
                 self.logger.write(
                     "lead.model",
                     {
@@ -5038,6 +5284,21 @@ class LeadAgent:
                         "stop_reason": stop_reason,
                     },
                 )
+                lead_truncation = None
+                if stop_reason == "max_tokens":
+                    # Before message_end, not after: a message_complete() call
+                    # made once the scope has closed is a no-op, so the lead's
+                    # truncated turns carried no truncation at all.
+                    lead_truncation = _store_received_model_output(
+                        logger=self.logger, actor="lead", step=step,
+                        text=text, stop_reason=str(stop_reason),
+                    )
+                recorder.message_complete(
+                    assistant_message,
+                    stop_reason=stop_reason,
+                    truncation=_truncation_info(lead_truncation),
+                )
+                recorder.message_end()
 
                 if not tool_calls:
                     # A no-tool lead turn with real text is a self-reported
@@ -5055,6 +5316,15 @@ class LeadAgent:
                     if incident:
                         empty_response_streak += 1
                         pending_ids = self._pending_phase_ids()
+                        # Reuses the receipt written before the scope closed;
+                        # an empty (not truncated) turn still needs one.
+                        received = lead_truncation or _store_received_model_output(
+                            logger=self.logger,
+                            actor="lead",
+                            step=step,
+                            text=text,
+                            stop_reason=str(stop_reason or incident),
+                        )
                         self.logger.write("lead.empty_model_response", {
                             "step": step,
                             "streak": empty_response_streak,
@@ -5063,6 +5333,7 @@ class LeadAgent:
                             "stop_reason": stop_reason,
                             "text_chars": len(text or ""),
                             "pendingPhases": pending_ids,
+                            **({"truncation": received} if received else {}),
                         })
                         if empty_response_streak < TRUNCATION_STREAK_LIMIT:
                             placeholder = (
@@ -5126,24 +5397,37 @@ class LeadAgent:
                     break
                 empty_response_streak = 0
 
-                assistant_content: List[JsonDict] = []
-                prefix_blocks = usage.get("_assistant_prefix_blocks") if isinstance(usage, dict) else None
-                if prefix_blocks:
-                    assistant_content.extend(prefix_blocks)
-                if text:
-                    assistant_content.append({"type": "text", "text": text})
-                for tool_call in tool_calls:
-                    assistant_content.append({
-                        "type": "tool_use",
-                        "id": tool_call["id"],
-                        "name": tool_call["name"],
-                        "input": tool_call.get("input", {}),
-                    })
-                messages.append({"role": "assistant", "content": assistant_content})
+                messages.append(_assistant_message_to_wire(assistant_message))
 
                 tool_results: List[JsonDict] = []
                 for tool_index, tool_call in enumerate(tool_calls):
-                    result, should_stop = await dispatch_tool(tool_call)
+                    recorder.tool_start(
+                        tool_call_id=str(tool_call.get("id") or ""),
+                        tool_name=str(tool_call.get("name") or "tool"),
+                        arguments=(
+                            tool_call.get("input")
+                            if isinstance(tool_call.get("input"), dict) else None
+                        ),
+                    )
+                    try:
+                        result, should_stop = await dispatch_tool(tool_call)
+                    except BaseException as exc:
+                        recorder.tool_failed(
+                            f"{type(exc).__name__}: {exc}",
+                            status=(
+                                "aborted"
+                                if isinstance(exc, asyncio.CancelledError)
+                                else "error"
+                            ),
+                        )
+                        recorder.tool_end()
+                        raise
+                    recorder.tool_complete(
+                        is_error=_tool_result_is_error(result),
+                        result_chars=len(str(result)),
+                        result_digest=_tool_result_digest(result),
+                    )
+                    recorder.tool_end()
                     model_result = offload_tool_result_for_model(
                         logger=self.logger,
                         runtime=self.runtime,
@@ -5273,6 +5557,11 @@ class LeadAgent:
             )
             raise
         finally:
+            recorder.close(
+                status=str(final_status or "unknown"),
+                reason=None if completed else "interrupted",
+                step_count=step,
+            )
             try:
                 receipt_state = load_task_state(self.logger)
                 receipt_run_id = str(

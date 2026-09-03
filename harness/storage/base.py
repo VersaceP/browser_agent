@@ -326,6 +326,23 @@ class Storage(ABC):
     ) -> None:
         """Append one run event. run_id is a relational field, not payload."""
 
+    def append_run_event(self, row: Any) -> None:
+        """Append an enveloped event.
+
+        Concrete, not abstract: a backend that predates the envelope keeps
+        working through this fallback, and the sink prefers whichever entry
+        point the backend actually implements.
+        """
+
+        self.append_event(
+            task_id=row.task_id,
+            run_id=row.run_id,
+            event_type=row.event_type,
+            payload=row.payload,
+            actor_type=row.actor_type,
+            worker_id=row.worker_id,
+        )
+
     @abstractmethod
     def read_events(
         self,

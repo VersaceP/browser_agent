@@ -30,6 +30,24 @@ from harness.utils import JsonDict
 
 
 RUN_EVENTS_PATH = "run.jsonl"
+
+# Mirrors FileStore._ENVELOPE_KEYS. Written here rather than imported to keep
+# this module free of a dependency on the file backend, and pinned by the
+# backend-parity test that compares the two byte for byte.
+_ENVELOPE_KEYS = (
+    ("eventUid", "event_uid"),
+    ("workerId", "worker_id"),
+    ("schemaVersion", "schema_version"),
+    ("sequenceNo", "sequence_no"),
+    ("category", "category"),
+    ("actorType", "actor_type"),
+    ("agentId", "agent_id"),
+    ("slotId", "slot_id"),
+    ("phaseId", "phase_id"),
+    ("turnId", "turn_id"),
+    ("messageId", "message_id"),
+    ("toolCallId", "tool_call_id"),
+)
 STRATEGY_ATTEMPTS_PATH = "strategy_attempts.jsonl"
 TRACES_PREFIX = "traces/"
 
@@ -192,7 +210,9 @@ class VirtualTaskFs:
         while True:
             rows = self._connection.execute(
                 "SELECT event_id, run_id, event_time, event_type, payload_json,"
-                " payload_resource_id FROM run_events"
+                " payload_resource_id, event_uid, worker_id, schema_version,"
+                " sequence_no, category, actor_type, agent_id, slot_id,"
+                " phase_id, turn_id, message_id, tool_call_id FROM run_events"
                 " WHERE task_id = ? AND event_id > ? ORDER BY event_id LIMIT 500",
                 (self.task_id, cursor),
             ).fetchall()
@@ -209,6 +229,13 @@ class VirtualTaskFs:
                 }
                 if row["run_id"]:
                     event["runId"] = row["run_id"]
+                # Same keys, same order as FileStore.append_run_event: this
+                # view's whole contract is that a reader cannot tell which
+                # backend produced the bytes.
+                for key, column in _ENVELOPE_KEYS:
+                    value = row[column]
+                    if value is not None:
+                        event[key] = value
                 yield _dump(event) + "\n"
 
     def _payload_for(self, row: Any) -> Any:

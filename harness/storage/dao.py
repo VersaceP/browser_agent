@@ -436,6 +436,148 @@ def insert_event(
     return event_id
 
 
+_ENVELOPE_COLUMNS = (
+    "event_uid", "schema_version", "sequence_no", "category",
+    "agent_id", "slot_id", "phase_id", "turn_id", "message_id", "tool_call_id",
+)
+
+
+def insert_run_event(
+    connection: sqlite3.Connection,
+    *,
+    row: Any,
+    payload_json: Optional[str] = None,
+    payload_resource_id: Optional[str] = None,
+    payload_byte_size: int = 0,
+) -> int:
+    """Insert one enveloped event, idempotently on ``event_uid``.
+
+    A retried write must not become a run-killing IntegrityError, and a
+    genuine uid collision must not be silently absorbed - so the conflict is
+    resolved by comparing what is already stored: identical content is the
+    retry we expected, different content is corruption and still fails.
+    """
+
+    columns = [
+        "task_id", "run_id", "event_time", "event_type", "actor_type",
+        "worker_id", "payload_json", "payload_resource_id", "payload_byte_size",
+    ] + list(_ENVELOPE_COLUMNS)
+    values: List[Any] = [
+        row.task_id, row.run_id, row.event_time, row.event_type,
+        row.actor_type, row.worker_id, payload_json, payload_resource_id,
+        int(payload_byte_size), row.event_uid, int(row.schema_version),
+        int(row.sequence_no), row.category, row.agent_id, row.slot_id,
+        row.phase_id, row.turn_id, row.message_id, row.tool_call_id,
+    ]
+    placeholders = ", ".join("?" for _ in columns)
+    sql = (
+        f"INSERT INTO run_events({', '.join(columns)})"
+        f" VALUES ({placeholders})"
+    )
+    try:
+        with write_transaction(connection):
+            cursor = connection.execute(sql, values)
+            return int(cursor.lastrowid or 0)
+    except sqlite3.IntegrityError as exc:
+        return _resolve_event_conflict(
+            connection, row=row, payload_json=payload_json,
+            payload_resource_id=payload_resource_id, exc=exc,
+        )
+
+
+def _stored_payload_sha256(
+    connection: sqlite3.Connection, stored: Dict[str, Any],
+) -> Optional[str]:
+    """The content hash of an event's offloaded payload, if it has one."""
+
+    resource_id = stored.get("payload_resource_id")
+    if not resource_id:
+        return None
+    found = connection.execute(
+        "SELECT sha256 FROM task_resources WHERE task_id = ? AND resource_id = ?",
+        (stored.get("task_id"), resource_id),
+    ).fetchone()
+    return str(found["sha256"]) if found and found["sha256"] else None
+
+
+def _resolve_event_conflict(
+    connection: sqlite3.Connection,
+    *,
+    row: Any,
+    payload_json: Optional[str],
+    payload_resource_id: Optional[str],
+    exc: sqlite3.IntegrityError,
+    payload_sha256: Optional[str] = None,
+) -> int:
+    """Decide whether a UNIQUE violation was a retry or a real collision.
+
+    Only an event_uid conflict can be a retry. Every other constraint - a run
+    sequence already used, a missing foreign key - is a genuine error and is
+    re-raised untouched, because absorbing those is how a unique index stops
+    protecting anything.
+    """
+
+    existing = connection.execute(
+        "SELECT * FROM run_events WHERE event_uid = ?", (row.event_uid,),
+    ).fetchone()
+    if existing is None:
+        raise exc
+    stored = dict(existing)
+    # Rebuild the same row shape from what is stored, then compare identities.
+    from harness.events.models import PersistedRunEvent
+
+    payload = payload_json
+    if payload is not None:
+        try:
+            payload = json.loads(payload)
+        except (TypeError, ValueError):
+            pass
+    stored_payload = stored.get("payload_json")
+    if isinstance(stored_payload, str):
+        try:
+            stored_payload = json.loads(stored_payload)
+        except (TypeError, ValueError):
+            pass
+    rebuilt = PersistedRunEvent(
+        event_uid=str(stored.get("event_uid") or ""),
+        schema_version=int(stored.get("schema_version") or 0),
+        sequence_no=int(stored.get("sequence_no") or 0),
+        task_id=str(stored.get("task_id") or ""),
+        run_id=str(stored.get("run_id") or ""),
+        event_time=str(stored.get("event_time") or ""),
+        event_type=str(stored.get("event_type") or ""),
+        category=str(stored.get("category") or ""),
+        actor_type=stored.get("actor_type"),
+        agent_id=stored.get("agent_id"),
+        worker_id=stored.get("worker_id"),
+        slot_id=stored.get("slot_id"),
+        phase_id=stored.get("phase_id"),
+        turn_id=stored.get("turn_id"),
+        message_id=stored.get("message_id"),
+        tool_call_id=stored.get("tool_call_id"),
+        payload=stored_payload if isinstance(stored_payload, dict) else {},
+    )
+    incoming = row
+    if payload_resource_id is not None:
+        # An offloaded payload is not inline on either side, so compare the
+        # two by content hash and fold the answer into both digests. Simply
+        # substituting the stored payload - which is what this did - made the
+        # comparison blind to the payload altogether, so two different 200 KB
+        # bodies under one uid read as the same event.
+        stored_sha = _stored_payload_sha256(connection, stored)
+        rebuilt = rebuilt.model_copy(
+            update={"payload": {"__payloadSha256": stored_sha or ""}}
+        )
+        incoming = row.model_copy(
+            update={"payload": {"__payloadSha256": payload_sha256 or ""}}
+        )
+    if rebuilt.identity_digest() != incoming.identity_digest():
+        raise sqlite3.IntegrityError(
+            f"event_uid {row.event_uid} already stores a different event"
+        ) from exc
+    return int(stored.get("event_id") or 0)
+
+
 def read_events(
     connection: sqlite3.Connection,
     *,

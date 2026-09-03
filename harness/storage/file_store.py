@@ -15,6 +15,7 @@ import json
 import os
 import re
 import tempfile
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -146,6 +147,11 @@ class FileStore(Storage):
         # here because three-way merge against the file is the real guard.
         self._runs: Dict[str, List[JsonDict]] = {}
         self._revisions: Dict[Tuple[str, str], int] = {}
+        # event_uid -> identity digest of the row already on disk. Built here,
+        # not lazily: two threads racing to create the lock would each get
+        # their own and neither would exclude the other.
+        self._event_uid_digests: Dict[str, str] = {}
+        self._event_uid_lock = threading.Lock()
 
     # -- paths -------------------------------------------------------------
     def task_dir(self, task_id: str) -> Path:
@@ -278,6 +284,87 @@ class FileStore(Storage):
         with path.open("a", encoding="utf-8") as handle:
             handle.write(_dump_line(event) + "\n")
 
+    # Written after the five historical keys, never instead of them: an older
+    # reader indexes by name and keeps working, and a `run.jsonl` from before
+    # this change stays readable by the code below.
+    _ENVELOPE_KEYS = (
+        ("eventUid", "event_uid"),
+        # workerId is here as well as in the payload. The database promotes it
+        # to a column; leaving the file backend to dig it out of the payload is
+        # the same split that left actor_type dead for years, and it made a
+        # perfectly mirrored typed write read back as content drift.
+        ("workerId", "worker_id"),
+        ("schemaVersion", "schema_version"),
+        ("sequenceNo", "sequence_no"),
+        ("category", "category"),
+        ("actorType", "actor_type"),
+        ("agentId", "agent_id"),
+        ("slotId", "slot_id"),
+        ("phaseId", "phase_id"),
+        ("turnId", "turn_id"),
+        ("messageId", "message_id"),
+        ("toolCallId", "tool_call_id"),
+    )
+
+    def append_run_event(self, row: Any) -> None:
+        """Typed entry point, in RunLogger's historical key order plus envelope.
+
+        A JSONL file has no unique index, so idempotency is enforced here by
+        remembering what this process wrote. Three things that a bare uid set
+        got wrong, all of them silent:
+
+        - it dropped a same-uid event with DIFFERENT content instead of
+          reporting the collision, which is data loss disguised as a retry;
+        - it recorded the uid before the write, so a write that failed and was
+          retried was skipped and the row was lost entirely;
+        - it was unlocked, and two threads appending at once could both pass.
+
+        So the map holds uid -> identity digest, is written under a lock, and
+        is only committed once the bytes are on disk. A duplicate from an
+        EARLIER process still slips through - that is what the database's
+        unique index is for.
+        """
+
+        uid = str(getattr(row, "event_uid", "") or "")
+        digest = row.identity_digest() if uid else ""
+        if not uid:
+            self._append_run_event_line(row)
+            return
+        # One critical section for check, write and record. Splitting it - a
+        # lock to look up, an unlocked append, a lock to store - let two
+        # threads with the same uid both find it absent and both write a row,
+        # which is the exact duplicate this map exists to prevent.
+        with self._event_uid_lock:
+            previous = self._event_uid_digests.get(uid)
+            if previous is not None:
+                if previous == digest:
+                    return
+                raise StorageError(
+                    f"event_uid {uid} was already written with different content"
+                )
+            self._append_run_event_line(row)
+            # Only after the bytes land: recording first turns a transient
+            # write failure into a permanently missing row.
+            self._event_uid_digests[uid] = digest
+
+    def _append_run_event_line(self, row: Any) -> None:
+        event: JsonDict = {
+            "ts": row.event_time,
+            "taskId": row.task_id,
+            "type": row.event_type,
+            "payload": row.payload,
+        }
+        if row.run_id:
+            event["runId"] = row.run_id
+        for key, attribute in self._ENVELOPE_KEYS:
+            value = getattr(row, attribute, None)
+            if value is not None:
+                event[key] = value
+        path = self.task_dir(row.task_id) / RUN_EVENTS_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(_dump_line(event) + "\n")
+
     def read_events(
         self,
         *,
@@ -306,7 +393,7 @@ class FileStore(Storage):
                 if event_type and event.get("type") != event_type:
                     continue
                 payload = event.get("payload")
-                results.append({
+                normalized: JsonDict = {
                     "event_id": index,
                     "task_id": event.get("taskId") or task_id,
                     "run_id": event.get("runId") or "",
@@ -316,17 +403,22 @@ class FileStore(Storage):
                     # same row shape. The database promotes workerId to its own
                     # column; leaving it buried here made a dual comparison of
                     # identical writes look like content drift.
-                    "worker_id": (
-                        str(payload.get("workerId") or "") or None
-                        if isinstance(payload, dict)
-                        else None
-                    ),
-                    "actor_type": (
-                        payload.get("actorType") if isinstance(payload, dict) else None
-                    ),
                     "payload_json": _dump_line(payload),
                     "payload_resource_id": None,
-                })
+                }
+                for key, attribute in self._ENVELOPE_KEYS:
+                    # actorType used to be read out of the payload here, where
+                    # nothing ever wrote it. It is a real envelope field now,
+                    # and reading it from the same place the database stores it
+                    # is what makes the two backends comparable.
+                    normalized[attribute] = event.get(key)
+                if normalized.get("worker_id") is None and isinstance(payload, dict):
+                    # Rows written before the envelope carried worker identity
+                    # only in the payload; those still read correctly.
+                    normalized["worker_id"] = (
+                        str(payload.get("workerId") or "") or None
+                    )
+                results.append(normalized)
                 if len(results) >= limit:
                     break
         return results
