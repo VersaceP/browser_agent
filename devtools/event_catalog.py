@@ -61,7 +61,15 @@ def tracked_python_files() -> List[Path]:
         ["git", "ls-files", "-z", "*.py"],
         cwd=REPO_ROOT, capture_output=True, text=True, check=True,
     ).stdout
-    return [REPO_ROOT / name for name in out.split("\0") if name]
+    # Skip this file. Its own aggregation loops read `.event_type` off local
+    # variables, which the producer scan below reads as an event named `item`.
+    # A catalog of the catalog generator is never the intent.
+    self_path = Path(__file__).resolve()
+    return [
+        path for name in out.split("\0") if name
+        for path in [REPO_ROOT / name]
+        if path.resolve() != self_path
+    ]
 
 
 def _receiver_name(node: ast.AST) -> str:

@@ -24,6 +24,74 @@ def field_name_from_spec(value: Any) -> str:
     return str(value).strip()
 
 
+ARRAY_FIELD_TYPES = frozenset({"array", "list"})
+
+
+def resolve_required_field_specs(expected_artifact: Any) -> JsonDict:
+    """Resolve each required field to the spec that declares its type.
+
+    A contract may spell the same thing three ways, and only one of them keeps
+    the type next to the requirement:
+
+      A  required_fields=[{name, type}]
+      B  fields=[{name, type}] + required_fields=["name"]
+      C  required_fields=["name"] and no spec anywhere
+
+    B is by far the most common in practice, so any rule that reads only the
+    objects inside `required_fields` sees almost nothing: of 325 required
+    arrays across the stored plans and plan history, 309 are shaped like B.
+    Every reader of "which required fields are arrays" has to go through here,
+    or the rule and the exemption that waives it will disagree about what the
+    contract even says.
+
+    C is deliberately left unresolved rather than guessed. Nothing mechanical
+    says `reviews` is an array; inferring it from the name would be exactly the
+    site knowledge this layer must not invent.
+
+    Returns `specs` (name -> declaring spec), `unresolved` (required names with
+    no resolvable type) and `declared`, which says whether required_fields was
+    stated outright or only recovered from `fields`.
+    """
+    expected = expected_artifact if isinstance(expected_artifact, dict) else {}
+    base: JsonDict = {}
+    raw_fields = expected.get("fields")
+    for item in raw_fields if isinstance(raw_fields, list) else []:
+        if isinstance(item, dict):
+            name = field_name_from_spec(item)
+            if name:
+                base[name] = item
+
+    raw_required = expected.get("required_fields")
+    declared = isinstance(raw_required, list) and bool(raw_required)
+    if not declared:
+        raw_required = raw_fields
+
+    specs: JsonDict = {}
+    unresolved: List[str] = []
+    for item in raw_required if isinstance(raw_required, list) else []:
+        name = field_name_from_spec(item)
+        if not name or name in specs or name in unresolved:
+            continue
+        # An object in required_fields overrides the base spec; a bare name
+        # refers to it.
+        spec = item if isinstance(item, dict) and item.get("type") else base.get(name)
+        if isinstance(spec, dict) and str(spec.get("type") or "").strip():
+            specs[name] = spec
+        else:
+            unresolved.append(name)
+    return {"specs": specs, "unresolved": unresolved, "declared": declared}
+
+
+def required_array_field_specs(expected_artifact: Any) -> JsonDict:
+    """The resolved required fields whose declared type is an array."""
+    resolved = resolve_required_field_specs(expected_artifact)
+    resolved["specs"] = {
+        name: spec for name, spec in resolved["specs"].items()
+        if str(spec.get("type") or "").strip().lower() in ARRAY_FIELD_TYPES
+    }
+    return resolved
+
+
 def field_names_from_specs(value: Any) -> List[str]:
     if not isinstance(value, list):
         return []

@@ -1267,6 +1267,147 @@ def next_pending_phase(plan: Optional[JsonDict], logger: RunLogger) -> Optional[
         _tc().write_task_state(logger, state)
     return None
 
+def schedule_snapshot(
+    plan: Optional[JsonDict], logger: RunLogger,
+) -> JsonDict:
+    """Classify every phase for the Lead, without touching task state.
+
+    `next_pending_phase` answers a different question and answers it by
+    writing: it stamps blocked_by_dependency and current_phase as it walks.
+    A snapshot is read into an error payload, so it must be able to run when
+    the Lead is being told why its spawn failed without itself changing what
+    happens next.
+
+    The distinction the Lead could not make from the old generic
+    "no pending phase" is between "wait", "spawn something else", "replan" and
+    "report": task eb939033 read it as "phase not found" and re-spawned the
+    same blocked phase twice.
+    """
+    ready: List[str] = []
+    running: List[str] = []
+    waiting: List[JsonDict] = []
+    terminal: List[JsonDict] = []
+    exhausted: List[JsonDict] = []
+    snapshot: JsonDict = {
+        "readyPhases": ready,
+        "runningPhases": running,
+        "waitingPhases": waiting,
+        "terminalPhases": terminal,
+        "exhaustedPhases": exhausted,
+        "recommendedActions": [],
+        "recommendedAction": "",
+    }
+    if not plan:
+        return snapshot
+    state = _tc().load_task_state(logger)
+    raw_phases_state = state.get("phases")
+    phases: JsonDict = raw_phases_state if isinstance(raw_phases_state, dict) else {}
+    raw_plan_phases = plan.get("phases")
+    plan_phases = raw_plan_phases if isinstance(raw_plan_phases, list) else []
+    prior_ids: List[str] = []
+    blocked = 0
+    for phase in plan_phases:
+        if not isinstance(phase, dict):
+            continue
+        phase_id = str(phase.get("id") or "")
+        raw_phase_state = phases.get(phase_id)
+        phase_state: JsonDict = (
+            raw_phase_state if isinstance(raw_phase_state, dict) else {}
+        )
+        status = str(phase_state.get("status") or "pending")
+        prior_ids.append(phase_id)
+        if status in _tc().TERMINAL_PHASE_STATUSES:
+            terminal.append({"phaseId": phase_id, "status": status})
+            continue
+        if status == "running":
+            running.append(phase_id)
+            continue
+        blocker = _dependency_blocker(phase, phases, prior_ids[:-1])
+        if blocker is not None:
+            waiting.append({
+                "phaseId": phase_id,
+                "status": status,
+                "dependencyPhaseId": blocker.get("dependencyPhaseId"),
+                "dependencyStatus": blocker.get("dependencyStatus"),
+                "blocking": bool(blocker.get("blocking")),
+            })
+            if blocker.get("blocking"):
+                blocked += 1
+            continue
+        # Same attempt budget the spawn path enforces, computed without
+        # writing. The ordinary spawn runs an exhaustion normalizer first and
+        # would correct a wrong answer here, but the repeated-invalid-replan
+        # path reads this snapshot directly — it would have told the Lead to
+        # spawn a phase the very next call rejects as exhausted.
+        attempts = phase_state.get("attempts")
+        max_attempts = (
+            _tc()._positive_int(phase.get("max_attempts"), default=1)
+            if phase.get("max_attempts") is not None
+            else None
+        )
+        if (
+            max_attempts is not None
+            and _count_budgeted_phase_attempts(attempts) >= max_attempts
+            and status in _tc().RETRYABLE_PHASE_FAILURE_STATUSES
+        ):
+            exhausted.append({
+                "phaseId": phase_id,
+                "status": status,
+                "attempts": _count_budgeted_phase_attempts(attempts),
+                "maxAttempts": max_attempts,
+            })
+            continue
+        ready.append(phase_id)
+
+    # Composable, because these categories coexist. A single "Every remaining
+    # phase ..." line is only true when exactly one of them is populated, and
+    # it was wrong the moment a blocked phase and an exhausted one appeared
+    # together: acting on it would fix the dependency and leave the other
+    # phase just as stuck.
+    actions: List[str] = []
+    if ready:
+        actions.append(
+            "Spawn " + ", ".join(ready) + " with an explicit phase_id;"
+            " independent ready phases may be spawned in the same turn."
+        )
+    if running:
+        actions.append(
+            "Wait for " + ", ".join(running) + " with wait_browser_agents."
+        )
+    if blocked:
+        blocked_ids = [
+            str(item["phaseId"]) for item in waiting if item.get("blocking")
+        ]
+        actions.append(
+            ", ".join(blocked_ids)
+            + " depend on a phase that ended in a terminal failure: replace"
+            " that dependency in a revised plan, or report the blocker."
+        )
+    if exhausted:
+        actions.append(
+            ", ".join(str(item["phaseId"]) for item in exhausted)
+            + " used the declared worker-attempt budget: raise max_attempts"
+            " without changing the objective, or report the blocker."
+        )
+    stalled = [
+        str(item["phaseId"]) for item in waiting if not item.get("blocking")
+    ]
+    if stalled and not ready and not running:
+        actions.append(
+            ", ".join(stalled)
+            + " are waiting on dependencies that are neither running nor"
+            " validated; re-check task_state before spawning."
+        )
+    if not actions:
+        actions.append(
+            "No phase remains startable. Call final_answer with the results"
+            " already validated and any unresolved blocker."
+        )
+    snapshot["recommendedActions"] = actions
+    snapshot["recommendedAction"] = " ".join(actions)
+    return snapshot
+
+
 def find_phase(plan: Optional[JsonDict], phase_id: Optional[str]) -> Optional[JsonDict]:
     if not plan or not phase_id:
         return None

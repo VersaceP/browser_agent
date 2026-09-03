@@ -172,6 +172,7 @@ from .phase_lifecycle import (  # noqa: F401
     mark_phase_result,
     mark_phase_running,
     next_pending_phase,
+    schedule_snapshot,
     phase_pacing_remaining_seconds,
     phase_prior_artifact_paths,
     phase_start_rejection,

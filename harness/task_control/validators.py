@@ -933,6 +933,13 @@ def _normalize_expected_artifact_contract(
                         "Remove requiredControls: it describes one receipt row per "
                         "form control, not fields required within each extracted row."
                     ),
+                    # The only repair the controller applies without asking. The
+                    # field is inert outside a form phase, so removing it changes
+                    # nothing the plan could have meant; every other option here
+                    # picks between two readings of the deliverable and stays with
+                    # the model. Auto-application is opt-in per option, never
+                    # inferred from an operation list's shape.
+                    "autoApplicable": True,
                     "operations": [{
                         "op": "remove",
                         "path": controls_path,

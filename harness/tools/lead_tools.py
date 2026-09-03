@@ -975,6 +975,58 @@ def _apply_task_plan_repair(
     return (None, errors) if errors else (repaired, [])
 
 
+def _auto_applicable_repairs(repair_issues: Any) -> Tuple[List[JsonDict], List[str]]:
+    """Collect the repairs the controller may apply without asking the model.
+
+    Auto-application is opt-in per option (``autoApplicable``) because the
+    validator is the only layer that still knows whether an edit picks between
+    two readings of the deliverable or removes something inert. Inferring it
+    here from the operation list's shape would silently enrol every future
+    single-option repair, including one that rewrites a semantic field.
+
+    Issues without such an option are simply skipped: their errors survive into
+    the rejection, so the model still sees them.
+
+    Operations and their originating codes come out of the same pass. Reading
+    the codes off the full issue list instead made a mixed candidate claim the
+    controller had repaired an issue it had only reported.
+    """
+    if not isinstance(repair_issues, list):
+        return [], []
+    operations: List[JsonDict] = []
+    codes: List[str] = []
+    for issue in repair_issues:
+        if not isinstance(issue, dict):
+            continue
+        options = issue.get("repairOptions")
+        if not isinstance(options, list) or len(options) != 1:
+            continue
+        option = options[0]
+        if not isinstance(option, dict):
+            continue
+        if option.get("autoApplicable") is not True:
+            continue
+        if option.get("requiresCompletePlan"):
+            continue
+        raw_operations = option.get("operations")
+        if not isinstance(raw_operations, list) or not raw_operations:
+            continue
+        applied: List[JsonDict] = []
+        for operation in raw_operations:
+            if not isinstance(operation, dict):
+                return [], []
+            if str(operation.get("op") or "") not in {"set", "remove"}:
+                return [], []
+            if not str(operation.get("path") or "").strip():
+                return [], []
+            applied.append(dict(operation))
+        operations.extend(applied)
+        code = str(issue.get("code") or "").strip()
+        if code and code not in codes:
+            codes.append(code)
+    return operations, sorted(codes)
+
+
 def _extend_task_plan_schema(_: Any = None) -> JsonDict:
     plan_schema = _emit_task_plan_schema()["properties"]["plan"]["properties"]
     return {
@@ -1017,8 +1069,14 @@ def _spawn_browser_agent_schema(_: Any = None) -> JsonDict:
                 "description": "BrowserAgent name; pass null to auto-name.",
             },
             "phase_id": {
-                **_nullable("string"),
-                "description": "The task_plan phase id this worker executes. Pass null to use the next pending phase.",
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "The accepted task_plan phase id this worker executes."
+                    " Required: naming it is how a plan with several startable"
+                    " phases gets them spawned in parallel instead of one"
+                    " guessed phase at a time."
+                ),
             },
             "task": {"type": "string"},
             "context": {
@@ -1156,6 +1214,7 @@ def _spawn_browser_agent_schema(_: Any = None) -> JsonDict:
                 ),
             },
         },
+        "required": ["phase_id"],
         "additionalProperties": False,
     }
 
@@ -1550,12 +1609,45 @@ async def _lead_emit_task_plan(ctx: ToolContext) -> JsonDict:
         ctx.agent.logger.write("task_plan.rejected", unchanged)
         return unchanged
     review = await ctx.agent.review_task_plan_candidate(raw_plan)
+    auto_repair: Optional[JsonDict] = None
     if review.get("status") == "mechanical_invalid":
+        # One bounded controller repair, never a loop: the repaired candidate is
+        # revalidated once and whatever it still gets wrong is reported as an
+        # ordinary rejection. Task eb939033 rejected the same requiredControls
+        # four times while carrying the exact remove operation in every reply,
+        # and spent the Lead run doing it. A deterministic edit the harness can
+        # name is not a decision worth a round trip.
+        operations, applied_codes = _auto_applicable_repairs(
+            review.get("repairIssues")
+        )
+        repaired = None
+        if operations:
+            repaired, _ = _apply_task_plan_repair(raw_plan, operations)
+        if repaired is not None:
+            auto_repair = {
+                "originalCandidateHash": ctx.agent.raw_plan_candidate_hash(raw_plan),
+                "operations": operations,
+                "appliedIssueCodes": applied_codes,
+            }
+            raw_plan = repaired
+            review = await ctx.agent.review_task_plan_candidate(raw_plan)
+            auto_repair["repairedCandidateHash"] = (
+                ctx.agent.raw_plan_candidate_hash(raw_plan)
+            )
+            auto_repair["resolvedAllMechanicalErrors"] = (
+                review.get("status") != "mechanical_invalid"
+            )
+            ctx.agent.logger.write("task_plan.auto_repaired", auto_repair)
+    if review.get("status") == "mechanical_invalid":
+        # The base for any follow-up repair is the repaired candidate, so a
+        # manual fix cannot reintroduce a field the controller just removed.
         result = ctx.agent.plan_schema_rejection(
             review.get("errors"),
             raw_plan=raw_plan,
             repair_issues=review.get("repairIssues"),
         )
+        if auto_repair is not None:
+            result["autoRepaired"] = auto_repair
         ctx.agent.logger.write("task_plan.rejected", result)
         return result
     if review.get("status") == "rejected":
@@ -1570,7 +1662,7 @@ async def _lead_emit_task_plan(ctx: ToolContext) -> JsonDict:
         }
         ctx.agent.logger.write("task_plan.rejected", result)
         return result
-    return ctx.agent.accept_task_plan(
+    accepted = ctx.agent.accept_task_plan(
         raw_plan,
         plan_validator_review=(
             review
@@ -1579,6 +1671,9 @@ async def _lead_emit_task_plan(ctx: ToolContext) -> JsonDict:
             else None
         ),
     )
+    if auto_repair is not None and isinstance(accepted, dict):
+        accepted["autoRepaired"] = auto_repair
+    return accepted
 
 
 @LEAD_TOOLS.register(
@@ -1586,8 +1681,9 @@ async def _lead_emit_task_plan(ctx: ToolContext) -> JsonDict:
     description=(
         "Apply small set/remove JSON-Pointer edits to the latest mechanically "
         "rejected task-plan candidate, then validate and accept the repaired "
-        "complete plan. Use after emit_task_plan reports candidateUnchanged; "
-        "never guess a baseCandidateHash or use it for semantic review findings."
+        "complete plan. Available after ANY mechanical rejection — use the "
+        "candidateHash that rejection returned; never guess a baseCandidateHash "
+        "or use it for semantic review findings."
     ),
     input_schema=_repair_task_plan_schema,
     loop_guard=False,
@@ -1884,6 +1980,27 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
                     " worker_contract.task_type assertion."
                 ),
             }
+    exhausted_match = _matching_exhaustion(exhausted, phase_id)
+    if exhausted_match is not None:
+        # An exhausted phase reports its budget the same way whether the Lead
+        # named it or the resolver reached it. Requiring an explicit phase_id
+        # must not cost the attempts/classification receipt: naming the phase
+        # you meant is not new information the harness can charge for.
+        return {
+            "status": "phase_exhausted",
+            "phaseId": exhausted_match.get("phaseId"),
+            "attempts": exhausted_match.get("attempts"),
+            "max_attempts": exhausted_match.get("max_attempts"),
+            "last_failure": exhausted_match.get("last_failure"),
+            "classification": exhausted_match.get("classification"),
+            "next_instruction": (
+                "The phase's explicitly declared worker-attempt resource"
+                " budget is used. If more global budget should be allocated,"
+                " update max_attempts without changing the objective;"
+                " otherwise report the raw blocker. This receipt does not"
+                " imply the target is absent or infeasible."
+            ),
+        }
     if phase is None:
         # Pass the structured rejection through verbatim: it carries the real
         # status (dependency_not_ready / blocked_by_dependency /
@@ -1893,26 +2010,11 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
         # phase twice.
         if rejection is not None:
             return rejection
-        exhausted_match = _matching_exhaustion(exhausted, phase_id)
-        if exhausted_match is not None:
-            return {
-                "status": "phase_exhausted",
-                "phaseId": exhausted_match.get("phaseId"),
-                "attempts": exhausted_match.get("attempts"),
-                "max_attempts": exhausted_match.get("max_attempts"),
-                "last_failure": exhausted_match.get("last_failure"),
-                "classification": exhausted_match.get("classification"),
-                "next_instruction": (
-                    "The phase's explicitly declared worker-attempt resource"
-                    " budget is used. If more global budget should be allocated,"
-                    " update max_attempts without changing the objective;"
-                    " otherwise report the raw blocker. This receipt does not"
-                    " imply the target is absent or infeasible."
-                ),
-            }
         return {
             "status": "failed",
-            "error": f"phase not found or no pending phase: {phase_id}",
+            "error": f"phase not found in the accepted plan: {phase_id}",
+            "errorCode": "phase_not_found",
+            "scheduleSnapshot": agent.phase_schedule_snapshot(),
         }
     # The automatic input-binding proof reads only this reviewed-plan view.
     # Spawn overrides remain available for routing/session purposes, but must

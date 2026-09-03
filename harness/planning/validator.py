@@ -6,7 +6,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from harness.utils import storage_for_logger
 
@@ -593,8 +593,10 @@ def _verdict_tool(
     evidence_ids: Iterable[str],
     relaxation_ids: Iterable[str],
     ambiguity_ids: Iterable[str],
+    collection_fact_ids: Iterable[str] = (),
 ) -> JsonDict:
     ids = list(objective_ids)
+    collection_ids = list(collection_fact_ids)
     catalogued_evidence_ids = list(evidence_ids)
     lineage_ids = list(ambiguity_ids)
     quantity_ids = list(relaxation_ids) + lineage_ids
@@ -670,6 +672,35 @@ def _verdict_tool(
                             "evidenceIds",
                             "reason",
                         ],
+                        "additionalProperties": False,
+                    },
+                },
+                "collectionContractChecks": {
+                    "type": "array",
+                    "description": (
+                        "One entry per requiredCollectionFacts item. The"
+                        " harness computed what the contract DOES with an empty"
+                        " collection; judge that against what the user asked"
+                        " for. underconstrained/overconstrained/ambiguous are"
+                        " incompatible with decision=approve."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "factId": {"type": "string", "enum": collection_ids},
+                            "assessment": {
+                                "type": "string",
+                                "enum": [
+                                    "aligned",
+                                    "underconstrained",
+                                    "overconstrained",
+                                    "not_a_collection",
+                                    "ambiguous",
+                                ],
+                            },
+                            "reason": {"type": "string"},
+                        },
+                        "required": ["factId", "assessment", "reason"],
                         "additionalProperties": False,
                     },
                 },
@@ -805,6 +836,49 @@ def _verdict_tool(
     }
 
 
+_COLLECTION_REJECT_ASSESSMENTS = frozenset({
+    "underconstrained", "overconstrained", "ambiguous",
+})
+
+
+def _collection_contract_review(
+    raw: Any, collection_facts: List[JsonDict], decision: str,
+) -> Tuple[List[JsonDict], bool, List[str]]:
+    """Check the reviewer's collection judgment for self-consistency only.
+
+    Two things are decidable here and neither is a business judgment: an entry
+    may not cite a factId the harness did not publish, and a reviewer cannot
+    call a contract underconstrained and approve it in the same breath.
+
+    Coverage is REPORTED, never required. Making the checks mandatory would put
+    a reviewer's output format in the path of every plan: a model that omits
+    the field would fail every candidate, which is a gate on the auditor rather
+    than on the plan. Incomplete coverage lowers `completed` and the facts
+    travel to the Lead in the receipt instead.
+    """
+    errors: List[str] = []
+    checks = raw.get("collectionContractChecks") if isinstance(raw, dict) else None
+    checks = [item for item in (checks or []) if isinstance(item, dict)]
+    known = {str(item.get("factId") or "") for item in collection_facts}
+    seen: Set[str] = set()
+    for check in checks:
+        fact_id = str(check.get("factId") or "")
+        if fact_id not in known:
+            errors.append(
+                f"validator cited unknown collection fact id: {fact_id!r}"
+            )
+            continue
+        seen.add(fact_id)
+        assessment = str(check.get("assessment") or "")
+        if decision == "approve" and assessment in _COLLECTION_REJECT_ASSESSMENTS:
+            errors.append(
+                f"collection fact {fact_id} was assessed {assessment!r}, which"
+                " cannot be approved; decide reject or reassess it"
+            )
+    completed = bool(known) and known.issubset(seen)
+    return checks, (completed if known else True), errors
+
+
 def _validate_verdict(
     raw: Any,
     *,
@@ -813,6 +887,7 @@ def _validate_verdict(
     evidence: List[JsonDict],
     relaxations: List[JsonDict],
     lineage_ambiguities: List[JsonDict],
+    collection_facts: Optional[List[JsonDict]] = None,
 ) -> Tuple[Optional[JsonDict], List[str]]:
     errors: List[str] = []
     if not isinstance(raw, dict):
@@ -1129,6 +1204,10 @@ def _validate_verdict(
                 "weakened/removed objectives require harness evidence ids or"
                 " an explicit higher-priority user-objective authorization"
             )
+    collection_checks, collection_completed, collection_errors = (
+        _collection_contract_review(raw, collection_facts or [], decision)
+    )
+    errors.extend(collection_errors)
     findings = raw.get("semanticFindings")
     findings = findings if isinstance(findings, list) else []
     for finding in findings:
@@ -1155,6 +1234,8 @@ def _validate_verdict(
         "decision": decision,
         "summary": str(raw.get("summary") or ""),
         "objectiveChecks": checks,
+        "collectionContractChecks": collection_checks,
+        "collectionContractReviewCompleted": collection_completed,
         "semanticFindings": findings,
         "quantityDecisions": quantity_decisions,
         "quantityLineageDecisions": lineage_decisions,
@@ -1174,7 +1255,9 @@ async def review_plan_revision(
     replan_reason: str,
     provider_name: str,
     model_id: str,
+    collection_facts: Optional[List[JsonDict]] = None,
 ) -> JsonDict:
+    collection_facts = list(collection_facts or [])
     candidate_digest = plan_candidate_hash(candidate_plan, replan_reason)
     objectives = objective_catalog(
         user_task=user_task,
@@ -1226,6 +1309,10 @@ async def review_plan_revision(
         "workerHandoffs": worker_handoffs[-10:],
         "quantityRelaxations": relaxations,
         "quantityLineageAmbiguities": lineage_ambiguities,
+        # What the contract actually does with an empty collection. Facts,
+        # so that judging them against the request is a decision this
+        # reviewer can make rather than one it has to notice.
+        "requiredCollectionFacts": collection_facts,
     }
     try:
         text, tool_calls, stop_reason, usage = await provider.generate_response(
@@ -1251,6 +1338,7 @@ async def review_plan_revision(
                     for item in lineage_ambiguities
                     if item.get("ambiguityId")
                 ),
+                (item["factId"] for item in collection_facts),
             )],
         )
         if hasattr(logger, "record_llm_usage"):
@@ -1296,6 +1384,7 @@ async def review_plan_revision(
         evidence=evidence,
         relaxations=relaxations,
         lineage_ambiguities=lineage_ambiguities,
+        collection_facts=collection_facts,
     )
     if verdict is None:
         # The critic DID answer and its answer was rejected by the guards in

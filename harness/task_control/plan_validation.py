@@ -25,6 +25,7 @@ from harness.observation.content_completeness import content_completeness_config
 from harness.observation.content_completeness import normalize_content_completeness_config
 from harness.evidence.extraction_artifacts import field_name_from_spec
 from harness.evidence.extraction_artifacts import field_names_from_specs
+from harness.evidence.extraction_artifacts import required_array_field_specs
 from harness.evidence.artifact_evidence import FILE_VALIDATOR_TYPES
 from harness.evidence.artifact_evidence import _BLOCKER_TEMPLATE_SEARCH_RE
 from harness.evidence.artifact_evidence import _PLACEHOLDER_LITERAL_RE
@@ -335,6 +336,114 @@ def _instruction_assigns_blocker_to_business_field(
                 return field
     return None
 
+def required_collection_facts(
+    phase_id: str,
+    expected: JsonDict,
+    validators: List[JsonDict],
+) -> List[JsonDict]:
+    """State what this phase's contract does with an empty collection.
+
+    Facts, not verdicts. Whether a collection is allowed to come back empty
+    depends on what the user asked for, so the harness computes the contract's
+    actual behaviour and the independent reviewer judges it against the request.
+    In task eb939033 the reviewer approved a plan whose `reviews` field
+    accepted zero rows while reporting that no quantity had been relaxed — it
+    was not wrong so much as uninformed.
+
+    Read from the NORMALIZED validators, never from the raw declaration. The
+    same effective policy can be written as a top-level nonempty_fields, an
+    inline flag on a field spec, or a field_nonempty validator; reading the raw
+    keys produced three mutually inconsistent answers before this was
+    centralised here, one of which was shipped in a commit message.
+    """
+
+    resolved = required_array_field_specs(expected)
+    nonempty = _nonempty_validator_fields(validators)
+    allow_empty = _allow_empty_fields(expected)
+    outcome_map = expected.get("allow_empty_with_outcome")
+    outcome_fields = set(outcome_map) if isinstance(outcome_map, dict) else set()
+    for key in ("fields", "required_fields"):
+        for spec in (expected.get(key) or []):
+            if isinstance(spec, dict) and spec.get("allow_empty_with_outcome"):
+                name = field_name_from_spec(spec)
+                if name:
+                    outcome_fields.add(name)
+
+    facts: List[JsonDict] = []
+    for name, spec in sorted(resolved["specs"].items()):
+        if name in nonempty and name in outcome_fields:
+            policy = "evidence_required"
+        elif name in nonempty:
+            policy = "nonempty"
+        elif name in allow_empty:
+            policy = "allow_empty"
+        else:
+            policy = "unspecified"
+        facts.append({
+            "factId": f"collection:{phase_id}:{name}",
+            "phaseId": phase_id,
+            "field": name,
+            "declaredType": str(spec.get("type") or "").strip().lower(),
+            "typeResolution": "resolved",
+            "effectiveEmptyPolicy": policy,
+        })
+    for name in sorted(resolved["unresolved"]):
+        # No type anywhere, so the harness cannot say whether this is a
+        # collection at all. Reading it off the field name would be the site
+        # knowledge this layer must not invent; the reviewer can read the
+        # objective and decide.
+        facts.append({
+            "factId": f"collection:{phase_id}:{name}",
+            "phaseId": phase_id,
+            "field": name,
+            "declaredType": "",
+            "typeResolution": "unresolved",
+            "effectiveEmptyPolicy": "unspecified",
+        })
+    return facts
+
+
+def _reject_inert_empty_allowance(
+    *,
+    phase_id: str,
+    expected: JsonDict,
+    validators: List[JsonDict],
+    errors: List[str],
+) -> None:
+    """Reject an empty-value allowance that cannot allow anything.
+
+    `allow_empty_with_outcome` filters the non-empty rule, so on a field that
+    was never required non-empty it filters nothing: the plan says an empty
+    value needs evidence while the contract already accepts one silently.
+    That is the declaration contradicting itself, decidable without knowing
+    what the user asked for — which is the only part of this area the harness
+    should be deciding.
+
+    Whether a given collection ought to allow empty at all is NOT decided here.
+    It depends entirely on the request, so it is published as a fact for the
+    independent reviewer instead (`required_collection_facts`).
+    """
+
+    nonempty = _nonempty_validator_fields(validators)
+    outcome_map = expected.get("allow_empty_with_outcome")
+    outcome_fields = set(outcome_map) if isinstance(outcome_map, dict) else set()
+    for key in ("fields", "required_fields"):
+        for spec in (expected.get(key) or []):
+            if isinstance(spec, dict) and spec.get("allow_empty_with_outcome"):
+                name = field_name_from_spec(spec)
+                if name:
+                    outcome_fields.add(name)
+
+    inert = sorted(outcome_fields - nonempty)
+    if inert:
+        errors.append(
+            f"phase {phase_id}: allow_empty_with_outcome names {inert} which"
+            " are not required non-empty, so it filters nothing and the fields"
+            " already accept an empty value silently. Add them to"
+            " nonempty_fields, or drop the allowance and declare allow_empty."
+        )
+
+
 def _reject_phase_execution_integrity(
     *,
     phase_id: str,
@@ -345,6 +454,13 @@ def _reject_phase_execution_integrity(
     validators: List[JsonDict],
     errors: List[str],
 ) -> None:
+    _reject_inert_empty_allowance(
+        phase_id=phase_id,
+        expected=expected,
+        validators=validators,
+        errors=errors,
+    )
+
     conflicts = sorted(_allow_empty_fields(expected) & _nonempty_validator_fields(validators))
     if conflicts:
         errors.append(
@@ -564,6 +680,11 @@ def _validate_pacing(value: Any, errors: List[str], *, where: str) -> JsonDict:
     }
 
 _ROW_SELECTION_LIMITS = {"probe": 1, "validation": 2}
+
+# Roles that only exist as the next rung of a validated confidence ladder.
+# `probe` opens one, `remediation` reruns an explicit failed-row set, and
+# neither binds an active checkpoint.
+_CHECKPOINT_ADVANCING_ROLES = frozenset({"validation", "bulk", "continuation"})
 
 def _adapt_cohort_row_selection(
     worker_contract: JsonDict, errors: List[str], *, phase_id: str,
@@ -966,6 +1087,25 @@ def _validate_execution_role_dependencies(
             contract.get("replan_checkpoint_id") or ""
         ).strip()
 
+        if role in _CHECKPOINT_ADVANCING_ROLES and not checkpoint_id:
+            # One root cause, no derived findings.  Every check below assumes
+            # the role itself is legitimate, so a missing checkpoint used to
+            # report four consequences at once: no row input, no
+            # row_independent, no max_rows_per_phase, plus the checkpoint.  In
+            # task eb939033 that taught the Lead to repair the consequences and
+            # resend the same role, and the same four came back.  An ordinary
+            # downstream batch has no checkpoint because it needs none: the way
+            # out is to drop the role, not to satisfy its ladder.
+            errors.append(
+                f"phase {phase_id}: execution_role={role} is a"
+                " checkpoint-advancing confidence role and requires an active"
+                " worker_contract.replan_checkpoint_id recorded by a validated"
+                " predecessor. An ordinary downstream phase consuming one"
+                " upstream artifact must omit execution_role entirely — the"
+                " harness derives the cohort at spawn."
+            )
+            continue
+
         if not isinstance(source, dict) and not has_explicit_rows:
             errors.append(
                 f"phase {phase_id}: execution_role={role} requires"
@@ -989,14 +1129,9 @@ def _validate_execution_role_dependencies(
                 f"phase {phase_id}: execution_role=probe may select at most 1 row"
             )
         elif role == "validation":
-            if not checkpoint_id:
-                errors.append(
-                    f"phase {phase_id}: execution_role=validation is conditional"
-                    " and requires worker_contract.replan_checkpoint_id from a"
-                    " validated predecessor whose checkpoint requires validation;"
-                    " do not pre-create it as a fixed ladder stage"
-                )
-            if checkpoint_id and not declared_deps:
+            # The guard above already returned for a missing checkpoint, so
+            # every check here may assume an active one.
+            if not declared_deps:
                 errors.append(
                     f"phase {phase_id}: execution_role=validation must explicitly"
                     " declare depends_on with the phase recorded by its replan"
@@ -1008,14 +1143,7 @@ def _validate_execution_role_dependencies(
                     f"phase {phase_id}: execution_role=validation may select at most 2 rows"
                 )
         elif role == "bulk":
-            if not checkpoint_id:
-                errors.append(
-                    f"phase {phase_id}: execution_role=bulk is conditional and"
-                    " requires worker_contract.replan_checkpoint_id from validated"
-                    " confidence evidence; do not pre-create it as a fixed ladder"
-                    " stage"
-                )
-            if checkpoint_id and not declared_deps:
+            if not declared_deps:
                 errors.append(
                     f"phase {phase_id}: execution_role=bulk must explicitly"
                     " declare depends_on with the phase recorded by its replan"
@@ -1035,14 +1163,7 @@ def _validate_execution_role_dependencies(
                     " batch_policy.max_rows_per_phase"
                 )
         elif role == "continuation":
-            if not checkpoint_id:
-                errors.append(
-                    f"phase {phase_id}: execution_role=continuation requires an"
-                    " active worker_contract.replan_checkpoint_id; it is emitted"
-                    " only when the preceding checkpoint requires slow-path"
-                    " continuation"
-                )
-            elif not declared_deps:
+            if not declared_deps:
                 errors.append(
                     f"phase {phase_id}: execution_role=continuation must explicitly"
                     " declare depends_on with the phase recorded by its replan"
@@ -1232,6 +1353,7 @@ def validate_task_plan(
     legacy_required_controls_phase_ids: Optional[AbstractSet[str]] = None,
     legacy_non_form_required_controls_phase_ids: Optional[AbstractSet[str]] = None,
     repair_issues: Optional[List[JsonDict]] = None,
+    collection_facts: Optional[List[JsonDict]] = None,
 ) -> Tuple[Optional[JsonDict], List[str]]:
     """Validate and normalize the v1 task plan.
 
@@ -1390,6 +1512,14 @@ def validate_task_plan(
             validators=validators,
             errors=errors,
         )
+        if collection_facts is not None:
+            # Out-of-band like repair_issues: these belong in the review and
+            # acceptance receipts, never in the plan body, where they would
+            # move the candidate hash and the review scope signature and make
+            # an unchanged plan look like a replan.
+            collection_facts.extend(
+                required_collection_facts(phase_id, expected_artifact, validators)
+            )
 
         worker_contract = raw_phase.get("worker_contract")
         if worker_contract is not None and not isinstance(worker_contract, dict):
