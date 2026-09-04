@@ -29,6 +29,8 @@ from harness.events.models import (
     AgentOutcome,
     AgentStartEvent,
     BrowserStateTransitionEvent,
+    CompactionEndEvent,
+    CompactionStartEvent,
     EventContext,
     LegacyLogEvent,
     MessageEndEvent,
@@ -298,6 +300,40 @@ class EventFactory:
             attribution=attribution,
         )
 
+    @contextmanager
+    def compaction_scope(
+        self,
+        *,
+        reason: str,
+        trigger_detail: Optional[str] = None,
+        estimated_tokens_before: int,
+        threshold_tokens: int,
+        message_count_before: int,
+    ) -> Iterator["CompactionScope"]:
+        """Emit a paired compaction event even though it sits between turns."""
+        compaction_id = _short_id("compaction")
+        state = _ScopeState(scope_id=compaction_id)
+        scope = CompactionScope(self, self.context, state, reason, trigger_detail)
+        start = self._emit(
+            CompactionStartEvent,
+            self.context,
+            compaction_id=compaction_id,
+            reason=reason,
+            trigger_detail=trigger_detail,
+            estimated_tokens_before=estimated_tokens_before,
+            threshold_tokens=threshold_tokens,
+            message_count_before=message_count_before,
+        )
+        if start is not None:
+            scope._parent_event_uid = start.event_uid
+        try:
+            yield scope
+        except BaseException as exc:
+            scope.fail(type(exc).__name__, status="aborted")
+            raise
+        finally:
+            scope.close()
+
     # -- scopes ------------------------------------------------------------
 
     @contextmanager
@@ -323,6 +359,62 @@ class EventFactory:
         finally:
             scope.close()
             self._agent_scope = None
+
+
+class CompactionScope:
+    def __init__(
+        self, factory: EventFactory, context: EventContext, state: _ScopeState,
+        reason: str, trigger_detail: Optional[str],
+    ) -> None:
+        self._factory = factory
+        self.context = context
+        self._state = state
+        self._reason = reason
+        self._trigger_detail = trigger_detail
+        self._status = "completed"
+        self._error: Optional[str] = None
+        self._message_count_after = 0
+        self._estimated_tokens_after = 0
+        self._checkpoint_ref: Optional[str] = None
+        self._summary_mode = "semantic"
+        self._summary_error: Optional[str] = None
+        self._parent_event_uid: Optional[uuid.UUID] = None
+
+    def complete(
+        self, *, message_count_after: int, estimated_tokens_after: int,
+        checkpoint_ref: Optional[str] = None,
+        summary_mode: str = "semantic",
+        summary_error: Optional[str] = None,
+    ) -> None:
+        self._message_count_after = int(message_count_after)
+        self._estimated_tokens_after = int(estimated_tokens_after)
+        self._checkpoint_ref = checkpoint_ref
+        self._summary_mode = summary_mode
+        self._summary_error = summary_error
+
+    def fail(self, error: str, *, status: str = "error") -> None:
+        self._status = status
+        self._error = str(error)[:1000]
+
+    def close(self) -> None:
+        if self._state.closed:
+            return
+        self._state.closed = True
+        self._factory._emit(
+            CompactionEndEvent,
+            self.context,
+            parent_event_uid=self._parent_event_uid,
+            compaction_id=self._state.scope_id,
+            reason=self._reason,
+            trigger_detail=self._trigger_detail,
+            status=self._status,
+            message_count_after=self._message_count_after,
+            estimated_tokens_after=self._estimated_tokens_after,
+            checkpoint_ref=self._checkpoint_ref,
+            summary_mode=self._summary_mode,
+            summary_error=self._summary_error,
+            error=self._error,
+        )
 
 
 class AgentScope:

@@ -2,6 +2,7 @@
 
 from harness.events.factory import (
     AgentScope,
+    CompactionScope,
     EventFactory,
     EventScopeError,
     MessageScope,
@@ -18,6 +19,8 @@ from harness.events.models import (
     AgentOutcome,
     AgentStartEvent,
     BrowserStateTransitionEvent,
+    CompactionEndEvent,
+    CompactionStartEvent,
     CanonicalEvent,
     EVENT_TYPE_NAMES,
     EventContext,
@@ -49,6 +52,9 @@ __all__ = [
     "AgentScope",
     "AgentStartEvent",
     "BrowserStateTransitionEvent",
+    "CompactionEndEvent",
+    "CompactionStartEvent",
+    "CompactionScope",
     "CallbackPublisher",
     "CanonicalEvent",
     "EVENT_TYPE_NAMES",

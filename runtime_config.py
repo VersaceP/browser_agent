@@ -1035,8 +1035,18 @@ class HarnessConfig:
     local_fs_max_read_bytes: int = DEFAULT_LOCAL_FS_READ_BYTES
     model_context_window_tokens: int = 262144
     context_compaction_threshold_ratio: float = 0.85
+    # Complete initial message groups permanently retained before the
+    # checkpoint.  In the one-shot harness the first group holds the only
+    # verbatim user task, so this prevents summary-of-summary drift.
     context_compaction_keep_head_pairs: int = 1
     context_compaction_keep_tail_pairs: int = 3
+    # Token budget retained from the newest complete turns.  The legacy tail
+    # pair count remains readable for existing config files; head pairs pin
+    # the original task and therefore intentionally remain active.
+    context_compaction_keep_recent_tokens: int = 24000
+    # Separate bound for the checkpoint itself; otherwise accumulated facts
+    # can consume the same budget reserved for recent raw turns.
+    context_compaction_checkpoint_max_tokens: int = 12000
     cache_pressure_uncached_input_threshold: int = 10000
     cache_pressure_consecutive_steps: int = 2
     cache_pressure_min_remaining_steps: int = 2
@@ -1493,6 +1503,18 @@ class HarnessConfig:
                 data.get(
                     "context_compaction_keep_tail_pairs",
                     cls.context_compaction_keep_tail_pairs,
+                )
+            ),
+            context_compaction_keep_recent_tokens=int(
+                data.get(
+                    "context_compaction_keep_recent_tokens",
+                    cls.context_compaction_keep_recent_tokens,
+                )
+            ),
+            context_compaction_checkpoint_max_tokens=int(
+                data.get(
+                    "context_compaction_checkpoint_max_tokens",
+                    cls.context_compaction_checkpoint_max_tokens,
                 )
             ),
             log_browser_payloads=bool(

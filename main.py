@@ -300,6 +300,26 @@ class ConsoleProgressReporter:
             print(message, flush=True)
 
     def _format(self, event_type: str, payload: Dict[str, Any]) -> Optional[str]:
+        if event_type == "lifecycle.compaction.start":
+            return (
+                "[Compaction] 开始: "
+                f"reason={payload.get('reason')} "
+                f"tokens≈{payload.get('estimatedTokensBefore')}"
+            )
+        if event_type == "lifecycle.compaction.end":
+            status = payload.get("status") or "completed"
+            if status == "completed":
+                fallback = (
+                    "（机械降级摘要）"
+                    if payload.get("summaryMode") == "mechanical_fallback"
+                    else ""
+                )
+                return (
+                    "[Compaction] 完成: "
+                    f"tokens≈{payload.get('estimatedTokensAfter')} "
+                    f"checkpoint={payload.get('checkpointRef') or '-'}{fallback}"
+                )
+            return f"[Compaction] {status}: {self._short_text(payload.get('error'), 160)}"
         if event_type == "lead.step.start":
             return f"[LeadAgent] 第 {payload.get('step')} 步：请求模型..."
         if event_type == "agent.step.start":

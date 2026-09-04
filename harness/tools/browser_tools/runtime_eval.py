@@ -56,7 +56,11 @@ async def _invoke_trusted_collection_template(
     page_id: str,
     step: int,
 ) -> Any:
-    """Execute one registered, read-only ``collect_items`` template.
+    """Execute one registered, read-only harness template.
+
+    Two families are registered: the ``collect_items`` evidence templates and
+    the overlay ladder's element hit test. The function name still says
+    collection for compatibility with its call sites and tests.
 
     This is the only harness-internal Runtime exception.  The caller cannot
     supply JavaScript: the verifier registry renders a fixed source template
@@ -95,7 +99,9 @@ async def _invoke_trusted_collection_template(
             "pageId": page_id,
             "expression": expression,
             "world": "isolated",
-            "purpose": f"collect_items fixed read-only template: {template_id}",
+            # The registry now serves two families; naming the wrong one in the
+            # audit purpose would misattribute the call.
+            "purpose": f"harness fixed read-only template: {template_id}",
         },
         step,
         count_progress=False,

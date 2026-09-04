@@ -30,6 +30,7 @@ from harness.fleet.task_reuse import (
     task_text_from_memory_entry,
 )
 from harness.compaction import compact_messages_if_needed, validate_tool_pairing
+from harness.messages.convert import to_model_messages
 from runtime_config import (
     ABCPClientConfig,
     ClaimExtractorConfig,
@@ -463,10 +464,11 @@ async def generate_response_surviving_moderation(
     """
     folds = 0
     while True:
+        model_messages = to_model_messages(messages)
         try:
             return await provider.generate_response(
                 system_prompt=system_prompt,
-                messages=messages,
+                messages=model_messages,
                 tools=tools,
             )
         except Exception as exc:
@@ -895,7 +897,7 @@ def update_cache_pressure_state(
     return CachePressureState(streak), None
 
 
-def compact_and_track_prefix_rebuild(
+async def compact_and_track_prefix_rebuild(
     agent: Any,
     *,
     actor: str,
@@ -914,7 +916,7 @@ def compact_and_track_prefix_rebuild(
     main loop does, and a detector that only knows about some of the rebuilds
     goes back to counting its own splash on the others.
     """
-    rebuilt = compact_messages_if_needed(
+    rebuilt = await compact_messages_if_needed(
         logger=agent.logger,
         actor=actor,
         step=step,
@@ -924,6 +926,7 @@ def compact_and_track_prefix_rebuild(
         config=agent.runtime.harness,
         lifecycle=agent.lifecycle,
         force_reason=force_reason,
+        provider=agent.provider,
     )
     if rebuilt is not messages:
         agent._cache_pressure = CachePressureState(awaiting_prefix_reuse=True)
@@ -1231,7 +1234,7 @@ class BrowserAgent:
                 self._current_step = step
                 force_reason = self._forced_compaction_reason
                 self._forced_compaction_reason = None
-                messages = compact_and_track_prefix_rebuild(
+                messages = await compact_and_track_prefix_rebuild(
                     self,
                     actor="browser_agent",
                     step=step,
@@ -5248,7 +5251,7 @@ class LeadAgent:
             for step in range(1, self.runtime.harness.lead_max_steps + 1):
                 force_reason = self._forced_compaction_reason
                 self._forced_compaction_reason = None
-                messages = compact_and_track_prefix_rebuild(
+                messages = await compact_and_track_prefix_rebuild(
                     self,
                     actor="lead_agent",
                     step=step,
@@ -5381,7 +5384,7 @@ class LeadAgent:
                                 "triggerAttempt": model_attempt,
                             },
                         )
-                        messages = compact_and_track_prefix_rebuild(
+                        messages = await compact_and_track_prefix_rebuild(
                             self,
                             actor="lead_agent",
                             step=step,
@@ -5433,7 +5436,7 @@ class LeadAgent:
                                 "triggerAttempt": model_attempt,
                             },
                         )
-                        messages = compact_and_track_prefix_rebuild(
+                        messages = await compact_and_track_prefix_rebuild(
                             self,
                             actor="lead_agent",
                             step=step,
@@ -5468,7 +5471,7 @@ class LeadAgent:
                         if not will_retry:
                             raise
                         reason = "llm_protocol_step_retry"
-                        messages = compact_and_track_prefix_rebuild(
+                        messages = await compact_and_track_prefix_rebuild(
                             self,
                             actor="lead_agent",
                             step=step,

@@ -46,7 +46,8 @@ def store_offloaded(
     resource_type: str,
     content: Any,
     media_type: str = "application/json",
-) -> None:
+    metadata: Optional[JsonDict] = None,
+) -> JsonDict:
     """Hand an offloaded payload to the configured backend.
 
     ``path`` stays the address the model is given, because it is also the key
@@ -60,13 +61,14 @@ def store_offloaded(
         logical_path = str(path.resolve().relative_to(logger.task_dir.resolve()))
     except (OSError, ValueError):
         logical_path = path.name
-    storage.save_resource(
+    return storage.save_resource(
         task_id=task_id,
         run_id=str(getattr(logger, "run_id", "") or ""),
         resource_type=resource_type,
         logical_path=logical_path,
         content=content,
         media_type=media_type,
+        metadata=metadata,
     )
 
 

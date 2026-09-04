@@ -40,7 +40,7 @@ ActorType = Literal["lead", "browser", "system", "browser_platform"]
 Severity = Literal["debug", "info", "warning", "error"]
 Category = Literal[
     "agent", "turn", "message", "tool", "browser",
-    "storage", "diagnostic", "legacy",
+    "storage", "diagnostic", "compaction", "legacy",
 ]
 ScopeStatus = Literal["completed", "error", "aborted", "truncated"]
 
@@ -149,6 +149,38 @@ class TurnEndEvent(EventEnvelope):
     status: ScopeStatus = "completed"
     assistant_message_id: Optional[str] = None
     tool_call_ids: List[str] = Field(default_factory=list)
+    error: Optional[str] = None
+
+
+class CompactionStartEvent(EventEnvelope):
+    """A compaction attempt started outside a model turn."""
+
+    type: Literal["compaction_start"] = "compaction_start"
+    category: Category = "compaction"
+    compaction_id: str
+    reason: Literal[
+        "manual", "threshold", "overflow", "cache_pressure", "provider_recovery",
+    ]
+    trigger_detail: Optional[str] = None
+    estimated_tokens_before: int = 0
+    threshold_tokens: int = 0
+    message_count_before: int = 0
+
+
+class CompactionEndEvent(EventEnvelope):
+    type: Literal["compaction_end"] = "compaction_end"
+    category: Category = "compaction"
+    compaction_id: str
+    reason: Literal[
+        "manual", "threshold", "overflow", "cache_pressure", "provider_recovery",
+    ]
+    trigger_detail: Optional[str] = None
+    status: Literal["completed", "skipped", "error", "aborted"] = "completed"
+    message_count_after: int = 0
+    estimated_tokens_after: int = 0
+    checkpoint_ref: Optional[str] = None
+    summary_mode: Literal["semantic", "mechanical_fallback"] = "semantic"
+    summary_error: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -263,6 +295,8 @@ CanonicalEvent = Annotated[
         AgentEndEvent,
         TurnStartEvent,
         TurnEndEvent,
+        CompactionStartEvent,
+        CompactionEndEvent,
         MessageStartEvent,
         MessageUpdateEvent,
         MessageEndEvent,
@@ -280,6 +314,8 @@ AgentEvent = Annotated[
         AgentEndEvent,
         TurnStartEvent,
         TurnEndEvent,
+        CompactionStartEvent,
+        CompactionEndEvent,
         MessageStartEvent,
         MessageUpdateEvent,
         MessageEndEvent,
@@ -300,6 +336,8 @@ EVENT_TYPE_NAMES: Dict[str, str] = {
     "agent_end": "lifecycle.agent.end",
     "turn_start": "lifecycle.turn.start",
     "turn_end": "lifecycle.turn.end",
+    "compaction_start": "lifecycle.compaction.start",
+    "compaction_end": "lifecycle.compaction.end",
     "message_start": "lifecycle.message.start",
     "message_update": "lifecycle.message.update",
     "message_end": "lifecycle.message.end",
@@ -417,6 +455,8 @@ __all__ = [
     "BrowserStateTransitionEvent",
     "CanonicalEvent",
     "Category",
+    "CompactionEndEvent",
+    "CompactionStartEvent",
     "EVENT_TYPE_NAMES",
     "EventContext",
     "EventEnvelope",

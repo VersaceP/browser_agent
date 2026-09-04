@@ -5,6 +5,8 @@ from typing import Any, List, Optional, Tuple
 
 from harness.results.call_outcome import replay_forbidden
 from harness.observation.overlay_actions import (
+    backdrop_click_is_safe,
+    compute_backdrop_point,
     find_close_control,
     is_sensitive_method,
     is_sensitive_target,
@@ -15,6 +17,9 @@ from harness.observation.verifiers import (
     CONFIDENCE_LOW,
     CONFIDENCE_MEDIUM,
     VerifierResult,
+    build_overlay_probe_oracle,
+    probe_occluder_trusted,
+    probe_viewport_metrics_trusted,
 )
 from harness.utils import JsonDict, optional_int
 
@@ -215,6 +220,20 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
         # attempt. Coordinate backdrop clicks are deliberately unavailable:
         # ABCP has no independent native hit-test with which to prove safety.
 
+    backdrop_meta: Optional[JsonDict] = None
+    if not success and not policy_subtype:
+        # Not for auth_prompt / paywall: those refuse by policy before any
+        # click, and a backdrop click on a login wall is still an interaction
+        # with a login wall.
+        if asyncio.get_running_loop().time() < deadline:
+            backdrop_ok, backdrop_meta = await _backdrop_dismiss(agent, page_id, step)
+            attempts.append({"attempt": "backdrop", **backdrop_meta})
+            if backdrop_ok:
+                success = True
+        else:
+            backdrop_meta = {"rung": "backdrop", "skipped": "deadline_exceeded"}
+            attempts.append({"attempt": "backdrop", **backdrop_meta})
+
     vl_arbiter_meta: Optional[JsonDict] = None
     if not success:
         # Keep an explicit capability receipt for callers that previously
@@ -248,6 +267,7 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
                 "occludedFrameCount": len(occluded_frames),
                 "attempts": attempts[-3:],
                 "vlArbiter": vl_arbiter_meta,
+                "backdrop": backdrop_meta,
                 "next_instruction": (
                     "Safe non-submit rungs (close control, Escape) ran and did"
                     " not clear this auth/paywall overlay; login, provider and"
@@ -273,6 +293,7 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
             "occludedFrameCount": len(occluded_frames),
             "attempts": attempts[-3:],
             "vlArbiter": vl_arbiter_meta,
+                "backdrop": backdrop_meta,
             "next_instruction": (
                 "Native close-control and Escape attempts did not clear the"
                 " overlay. Coordinate backdrop and VL clicks were not attempted"
@@ -295,6 +316,107 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
         "overlay": overlay,
         "attempts": attempts[-3:],
         **{k: v for k, v in retry.items() if k != "status"},
+    }
+
+
+def _dialog_rect_from_stack(stack: Any, viewport: JsonDict) -> Optional[JsonDict]:
+    """The dialog box sitting on the mask, read off the centre hit-test stack.
+
+    Walking down from the top, the first element materially smaller than the
+    viewport is the dialog; everything above it is mask/wrapper. Returning None
+    is meaningful rather than a failure - `compute_backdrop_point` documents its
+    own no-known-rect behaviour, and the safety gate still has to pass.
+    """
+    vw = float(viewport.get("width") or 0)
+    vh = float(viewport.get("height") or 0)
+    if not isinstance(stack, list) or vw <= 0 or vh <= 0:
+        return None
+    for element in stack:
+        rect = element.get("rect") if isinstance(element, dict) else None
+        if not isinstance(rect, dict):
+            continue
+        try:
+            w = float(rect.get("w") or 0)
+            h = float(rect.get("h") or 0)
+        except (TypeError, ValueError):
+            continue
+        if w <= 0 or h <= 0:
+            continue
+        if w < vw * 0.9 or h < vh * 0.9:
+            return {"x": rect.get("x") or 0, "y": rect.get("y") or 0, "w": w, "h": h}
+    return None
+
+
+async def _backdrop_dismiss(
+    agent: Any,
+    page_id: str,
+    step: int,
+) -> Tuple[bool, JsonDict]:
+    """Rung 3: click the modal's own backdrop, proven by an element hit test.
+
+    The rung that was missing. Rung 1 needs a close control the AX tree can
+    name and rung 2 needs the page to honour Escape; a promotional mask whose
+    close X is not in the AX tree satisfies neither, and the ladder then had
+    nothing left. This clicks the overlay itself, which is the one target whose
+    safety can be established without identifying anything: the hit test says
+    what is actually under the point, and `backdrop_click_is_safe` requires it
+    to be the inert full-viewport overlay and nothing else.
+
+    Every failure path returns a reason rather than a click.
+    """
+    oracle = build_overlay_probe_oracle(agent, page_id, step)
+    viewport_probe = await probe_viewport_metrics_trusted(overlay_oracle=oracle)
+    if viewport_probe.get("status") != "done":
+        return False, {"rung": "backdrop",
+                       "skipped": str(viewport_probe.get("reason") or "viewport_unavailable")}
+    viewport = {"width": viewport_probe["width"], "height": viewport_probe["height"]}
+
+    centre = await probe_occluder_trusted(
+        overlay_oracle=oracle,
+        x=viewport["width"] / 2.0,
+        y=viewport["height"] / 2.0,
+    )
+    if centre.get("status") != "done":
+        return False, {"rung": "backdrop",
+                       "skipped": str(centre.get("reason") or "hit_test_unavailable")}
+
+    point = compute_backdrop_point(
+        _dialog_rect_from_stack(centre.get("stack"), viewport), viewport
+    )
+    if point is None:
+        return False, {"rung": "backdrop", "skipped": "dialog_fills_viewport"}
+    bx, by = point
+
+    at_point = await probe_occluder_trusted(overlay_oracle=oracle, x=bx, y=by)
+    if at_point.get("status") != "done":
+        return False, {"rung": "backdrop", "point": {"x": bx, "y": by},
+                       "skipped": str(at_point.get("reason") or "hit_test_unavailable")}
+
+    safe, gate = backdrop_click_is_safe(at_point.get("stack"), viewport)
+    if not safe:
+        return False, {"rung": "backdrop", "point": {"x": bx, "y": by}, **gate}
+
+    click = await _invoke_browser_method(
+        agent,
+        "Input.click",
+        {"pageId": page_id, "x": bx, "y": by,
+         "purpose": "dismiss_overlay: click the proven modal backdrop"},
+        step,
+        count_progress=False,
+    )
+    interrupt = _loop_interrupt_from_result(click)
+    if interrupt:
+        return False, {"rung": "backdrop", "point": {"x": bx, "y": by},
+                       "interrupted": True}
+    if _invoke_result_failed(click):
+        return False, {"rung": "backdrop", "point": {"x": bx, "y": by},
+                       "skipped": "click_failed"}
+    verdict = await _verify_overlay_gone_native(agent, page_id, step)
+    return bool(verdict.ok), {
+        "rung": "backdrop",
+        "point": {"x": bx, "y": by},
+        "element": gate,
+        "verified": bool(verdict.ok),
     }
 
 

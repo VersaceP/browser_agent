@@ -260,6 +260,12 @@ class CompactionSummaryMessage(BaseModel):
     role: Literal["compactionSummary"] = "compactionSummary"
     content: str = ""
     replaced_message_count: int = 0
+    # Mechanical checkpoint details travel beside the model-facing text.  They
+    # are deliberately structured so a later compaction can union facts such
+    # as file references without asking an LLM to remember them verbatim.
+    details: Dict[str, Any] = Field(default_factory=dict)
+    checkpoint_id: Optional[str] = None
+    tokens_before: Optional[int] = None
 
 
 AgentMessage = Annotated[

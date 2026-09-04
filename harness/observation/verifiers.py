@@ -35,6 +35,12 @@ TrustedCollectionEval = Callable[[str, Dict[str, Any]], Awaitable[Any]]
 COLLECTION_TEMPLATE_ITEMS_COUNT = "collection.items_count.v1"
 COLLECTION_TEMPLATE_ROWS = "collection.rows.v1"
 COLLECTION_TEMPLATE_STATE = "collection.state.v1"
+# The trusted-template registry is no longer collection-only. These two are
+# the overlay ladder's element-level hit test: without them a mask with no
+# accessible close control has no rung at all, which is how a Taobao
+# red-packet popMask cost one run ~60 steps and a step extension.
+OVERLAY_TEMPLATE_OCCLUDER = "overlay.occluder.v1"
+OVERLAY_TEMPLATE_VIEWPORT = "overlay.viewport.v1"
 
 
 @dataclass(frozen=True)
@@ -123,6 +129,34 @@ def build_collection_oracle(
     it accepts a registered template id plus JSON bindings, never arbitrary
     source.  The browser-tools boundary owns the registry lookup, Runtime
     authorization token, audit record, and JSON decoding.
+    """
+
+    async def run(template_id: str, bindings: Dict[str, Any]) -> Any:
+        import harness.tools.browser_tools as browser_tools
+
+        return await browser_tools._invoke_trusted_collection_template(
+            agent,
+            template_id=template_id,
+            bindings=dict(bindings),
+            page_id=page_id,
+            step=step,
+        )
+
+    return run
+
+
+def build_overlay_probe_oracle(
+    agent: Any,
+    page_id: str,
+    step: int,
+) -> TrustedCollectionEval:
+    """The narrow executor for the overlay ladder's hit test.
+
+    Same shape and same authorization boundary as ``build_collection_oracle``:
+    a registered template id plus JSON bindings, never arbitrary source. It
+    exists because ``build_read_only_oracle`` is a fail-closed stub, which is
+    what made ``probe_occluder`` unreachable and left the dismiss ladder with
+    no way to prove what a coordinate would hit.
     """
 
     async def run(template_id: str, bindings: Dict[str, Any]) -> Any:
@@ -356,6 +390,48 @@ async def probe_occluder(*, oracle: OracleEval, x: float, y: float) -> JsonDict:
     if not isinstance(payload, dict):
         return {"status": "oracle_unavailable", "reason": "non-object payload"}
     return {"status": "done", **payload}
+
+
+async def probe_occluder_trusted(
+    *,
+    overlay_oracle: TrustedCollectionEval,
+    x: float,
+    y: float,
+) -> JsonDict:
+    """probe_occluder through the registered-template boundary.
+
+    Same payload as ``probe_occluder``; the difference is which executor is
+    authorized. The string oracle it takes is disabled, so that one always
+    reports oracle_unavailable.
+    """
+    payload = await overlay_oracle(
+        OVERLAY_TEMPLATE_OCCLUDER,
+        {"x": round(float(x), 1), "y": round(float(y), 1)},
+    )
+    error = _oracle_error(payload)
+    if error:
+        return {"status": "oracle_unavailable", "reason": error}
+    if not isinstance(payload, dict):
+        return {"status": "oracle_unavailable", "reason": "non-object payload"}
+    return {"status": "done", **payload}
+
+
+async def probe_viewport_metrics_trusted(
+    *,
+    overlay_oracle: TrustedCollectionEval,
+) -> JsonDict:
+    """probe_viewport_metrics through the registered-template boundary."""
+    payload = await overlay_oracle(OVERLAY_TEMPLATE_VIEWPORT, {})
+    error = _oracle_error(payload)
+    if error:
+        return {"status": "oracle_unavailable", "reason": error}
+    if not isinstance(payload, dict):
+        return {"status": "oracle_unavailable", "reason": "non-object payload"}
+    width = float(payload.get("width") or 0)
+    height = float(payload.get("height") or 0)
+    if width <= 0 or height <= 0:
+        return {"status": "oracle_unavailable", "reason": "viewport not laid out"}
+    return {"status": "done", "width": width, "height": height}
 
 
 ACTIVE_ELEMENT_PROBE_JS = r"""
@@ -693,6 +769,12 @@ def render_trusted_collection_template(
             COLLECTION_STATE_JS,
             {"item_selector", "container_selector", "load_more_selector"},
         ),
+        # Overlay ladder. Both are strictly read-only: elementsFromPoint and
+        # window metrics. They take no selector and no model-supplied text -
+        # the occluder probe's only bindings are two numbers this harness
+        # computed itself from the viewport and the dialog rect.
+        OVERLAY_TEMPLATE_OCCLUDER: (OCCLUDER_PROBE_JS, {"x", "y"}),
+        OVERLAY_TEMPLATE_VIEWPORT: (VIEWPORT_METRICS_JS, set()),
     }
     spec = specs.get(str(template_id or ""))
     if spec is None:

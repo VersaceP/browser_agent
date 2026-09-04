@@ -382,6 +382,68 @@ def _element_is_actionable(element: Any) -> bool:
     return tag in {"button", "a", "input", "select", "textarea"} or role in ACTIONABLE_ROLES
 
 
+def backdrop_click_is_safe(
+    occluder_stack: Any,
+    viewport: Any,
+) -> Tuple[bool, JsonDict]:
+    """Fail-closed gate for clicking a modal's BACKDROP rather than a control.
+
+    This is a different safety argument from `vl_dismiss_target_is_safe`, and a
+    stronger one. That gate has to decide whether some control is a dismiss
+    control, which needs a positive whitelist over labels because a "×" can be
+    "Close position". Here nothing is being identified: the click only lands if
+    the element under the point IS the full-viewport overlay itself - inert,
+    unnamed, covering the page. A backdrop that is still there is exactly what
+    a stale click cannot hurt, and once the overlay is gone the top element is
+    ordinary page content with an ordinary rect, so the gate refuses.
+
+    Every condition is necessary and all of them must hold:
+      * a stack was actually returned (an unavailable probe is not a pass);
+      * the TOP element - the one the click will reach - is not actionable;
+      * no identity field on it reads consequential or sensitive, so an
+        overlay that paints itself onto a submit/pay control is refused;
+      * it is positioned fixed/absolute, as a mask is;
+      * its rect covers essentially the whole viewport. A small inert div is
+        page content, not a backdrop.
+    """
+    if not isinstance(occluder_stack, list) or not occluder_stack:
+        return False, {"refused": "no_occluder_stack"}
+    top = occluder_stack[0]
+    if not isinstance(top, dict):
+        return False, {"refused": "top_element_unreadable"}
+    if _element_is_actionable(top):
+        return False, {"refused": "top_element_actionable",
+                       "tag": str(top.get("tag") or "")}
+    role = str(top.get("role") or "")
+    for identity in _element_identity_fields(top):
+        if is_never_click(identity) or is_sensitive_target(role, identity):
+            return False, {"refused": "consequential_identity",
+                           "identity": identity[:60]}
+    position = str(top.get("position") or "").lower()
+    if position not in {"fixed", "absolute"}:
+        return False, {"refused": "not_overlay_positioned", "position": position}
+    rect = top.get("rect") if isinstance(top.get("rect"), dict) else {}
+    try:
+        vw = float((viewport or {}).get("width") or 0)
+        vh = float((viewport or {}).get("height") or 0)
+        rw = float(rect.get("w") or 0)
+        rh = float(rect.get("h") or 0)
+    except (TypeError, ValueError):
+        return False, {"refused": "geometry_unreadable"}
+    if vw <= 0 or vh <= 0:
+        return False, {"refused": "viewport_unknown"}
+    if rw < vw * 0.9 or rh < vh * 0.9:
+        return False, {"refused": "not_full_viewport",
+                       "rect": {"w": rw, "h": rh},
+                       "viewport": {"w": vw, "h": vh}}
+    return True, {
+        "tag": str(top.get("tag") or ""),
+        "cls": str(top.get("cls") or "")[:60],
+        "position": position,
+        "rect": {"w": rw, "h": rh},
+    }
+
+
 def captcha_point_is_safe(occluder_stack: Any) -> Tuple[bool, JsonDict]:
     """Negative safety gate for a VL-proposed CAPTCHA solve point.
 

@@ -816,10 +816,34 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
         "local_fs_read": {
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
-                "line_offset": {"type": "integer", "minimum": 0, "default": 0},
-                "line_limit": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 200},
-                "max_bytes": {"type": "integer", "minimum": 1000, "maximum": 200000, "default": 20000},
+                "path": {"type": "string", "description": "savedPath from the offloaded receipt."},
+                "line_offset": {
+                    "type": "integer", "minimum": 0, "default": 0,
+                    "description": (
+                        "First line to read. Continue a paged read from the"
+                        " previous receipt's nextLineOffset; do not re-derive it."
+                    ),
+                },
+                "line_limit": {
+                    "type": "integer", "minimum": 1, "maximum": 5000, "default": 200,
+                    "description": (
+                        "Lines to ask for. This is a ceiling, not a budget: the"
+                        " read stops at line_limit OR max_bytes, whichever comes"
+                        " first, so max_bytes is what actually bounds the"
+                        " response. Ask for the whole region you need (up to"
+                        " totalLines - line_offset) and let the byte budget cut"
+                        " it; the receipt reports truncated and nextLineOffset"
+                        " so you never have to guess how many lines fit. A small"
+                        " fixed window here just turns one read into five."
+                    ),
+                },
+                "max_bytes": {
+                    "type": "integer", "minimum": 1000, "maximum": 200000, "default": 20000,
+                    "description": (
+                        "The real bound on one read. Raise it for a large region"
+                        " instead of lowering line_limit and paging repeatedly."
+                    ),
+                },
             },
             "required": ["path", "line_offset", "line_limit", "max_bytes"],
             "additionalProperties": False,
