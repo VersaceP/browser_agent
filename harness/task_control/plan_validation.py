@@ -453,6 +453,7 @@ def _reject_phase_execution_integrity(
     expected: JsonDict,
     validators: List[JsonDict],
     errors: List[str],
+    warnings: List[JsonDict],
 ) -> None:
     _reject_inert_empty_allowance(
         phase_id=phase_id,
@@ -490,15 +491,28 @@ def _reject_phase_execution_integrity(
             " runtime interrupts for the worker that encounters them"
         )
 
+    # Advisory, not a rejection. The trigger is a per-field regex over bilingual
+    # verb lists, so it both misses phrasings its author did not anticipate and
+    # fires on ones that meant nothing of the kind. The harm it guards against —
+    # blocker or placeholder text sitting in a business field — is decidable on
+    # the artifact itself by the placeholder and provenance validators, which
+    # read the delivered value instead of guessing at the instruction's wording.
     assigned_field = _instruction_assigns_blocker_to_business_field(
         worker_task,
         _business_fields_from_expected(expected),
     )
     if assigned_field:
-        errors.append(
-            f"phase {phase_id}: worker_task assigns blocker/placeholder text to"
-            f" business field {assigned_field!r}; record the blocker separately"
-        )
+        warnings.append({
+            "type": "worker_task_blocker_field_review",
+            "phaseId": phase_id,
+            "field": assigned_field,
+            "message": (
+                f"phase {phase_id}: worker_task may assign blocker/placeholder"
+                f" text to business field {assigned_field!r}. Record the blocker"
+                " separately if so; this is a prose reading, not a contract"
+                " violation."
+            ),
+        })
 
 def _validate_task_type_capability_match(
     *,
@@ -1511,6 +1525,7 @@ def validate_task_plan(
             expected=expected_artifact,
             validators=validators,
             errors=errors,
+            warnings=warnings,
         )
         if collection_facts is not None:
             # Out-of-band like repair_issues: these belong in the review and

@@ -3,6 +3,7 @@ harness.utils - Shared helpers for ABCP agent harness modules.
 """
 
 import hashlib
+from html import escape
 import json
 import re
 import traceback
@@ -151,21 +152,141 @@ def _resolve_context_file(context_file: Optional[str]) -> Optional[Path]:
     return path
 
 
+def _project_context_specs(
+    context_file: Optional[str],
+    project_context_files: Optional[Any],
+) -> List[JsonDict]:
+    """Normalize trusted, static project-instruction configuration.
+
+    ``context_file`` is retained as the legacy one-file spelling.  The newer
+    list deliberately preserves configured order: that order is the only
+    precedence signal exposed to the model, rather than an inferred filesystem
+    hierarchy or the process working directory.
+    """
+
+    specs: List[JsonDict] = []
+    if context_file and str(context_file).strip():
+        specs.append({
+            "path": str(context_file).strip(),
+            "scope": "legacy_context_file",
+        })
+    if not isinstance(project_context_files, list):
+        return specs
+    for item in project_context_files:
+        if isinstance(item, str) and item.strip():
+            specs.append({"path": item.strip(), "scope": "project"})
+            continue
+        if not isinstance(item, dict):
+            continue
+        raw_path = item.get("path")
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            continue
+        raw_scope = item.get("scope", "project")
+        scope = (
+            str(raw_scope).strip()
+            if isinstance(raw_scope, str) and str(raw_scope).strip()
+            else "project"
+        )
+        specs.append({"path": raw_path.strip(), "scope": scope})
+    return specs
+
+
 def build_static_context_block(
     context_file: Optional[str],
+    *,
+    project_context_files: Optional[Any] = None,
+    append_system_prompt: Optional[str] = None,
 ) -> Tuple[str, Optional[str]]:
-    path = _resolve_context_file(context_file)
-    if path is None:
-        return "", None
-    try:
-        content = path.read_text(encoding="utf-8")
-    except OSError:
-        return "", None
-    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-    block = (
-        "\n\n<context source=\"context_file\" "
-        f"sha256=\"{digest}\">\n{content}\n</context>"
+    """Build the stable deployment/project portion of a system prompt.
+
+    Files are operator-configured, read once at agent construction and emitted
+    as escaped XML.  They are project-scoped instructions, not executable
+    prompt syntax; escaping prevents a file body from closing or manufacturing
+    prompt sections.  Relative paths are retained in the visible ``path``
+    attribute so a machine-specific current working directory never leaks into
+    the prompt.
+    """
+
+    project_entries: List[JsonDict] = []
+    seen_paths: Set[str] = set()
+    for spec in _project_context_specs(context_file, project_context_files):
+        raw_path = str(spec["path"])
+        path = _resolve_context_file(raw_path)
+        if path is None:
+            continue
+        try:
+            resolved_key = str(path.resolve())
+            content = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        # The same configured source is never injected twice through the
+        # legacy and list forms.  First occurrence wins, matching list order.
+        if resolved_key in seen_paths:
+            continue
+        seen_paths.add(resolved_key)
+        project_entries.append({
+            "path": raw_path,
+            "scope": str(spec["scope"]),
+            "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+            "content": content,
+        })
+
+    append_text = (
+        append_system_prompt.strip()
+        if isinstance(append_system_prompt, str)
+        else ""
     )
+    rendered: List[str] = []
+    if append_text:
+        append_digest = hashlib.sha256(append_text.encode("utf-8")).hexdigest()
+        rendered.extend([
+            f'<append_system_prompt sha256="{append_digest}">',
+            "Deployment-specific static instructions. They remain subject to "
+            "the surrounding system policy and live tool schemas.",
+            escape(append_text),
+            "</append_system_prompt>",
+        ])
+    if project_entries:
+        rendered.extend([
+            '<project_context version="1">',
+            "Project-specific instructions and guidelines. Earlier entries "
+            "are broader context; later entries may refine them for their "
+            "declared scope, but none override surrounding system policy or "
+            "live tool schemas.",
+        ])
+        for entry in project_entries:
+            rendered.extend([
+                "<project_instructions "
+                f'path="{escape(entry["path"], quote=True)}" '
+                f'scope="{escape(entry["scope"], quote=True)}" '
+                f'sha256="{entry["sha256"]}">',
+                escape(entry["content"]),
+                "</project_instructions>",
+            ])
+        rendered.append("</project_context>")
+    if not rendered:
+        return "", None
+    block = "\n\n" + "\n".join(rendered)
+    fingerprint_payload = {
+        "version": 1,
+        "appendSystemPrompt": append_text,
+        "projectInstructions": [
+            {
+                "path": entry["path"],
+                "scope": entry["scope"],
+                "sha256": entry["sha256"],
+            }
+            for entry in project_entries
+        ],
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     return block, digest
 
 

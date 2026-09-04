@@ -3,6 +3,7 @@ harness.results.worker_result - Stable L1/L2/L3 worker result envelopes.
 """
 
 import json
+import math
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -159,6 +160,39 @@ def build_worker_result_levels(
     }
 
 
+
+
+def _safe_text(value: Any) -> str:
+    """Text for a prose field, without trusting the value to be prose.
+
+    The bare `str()` here ran during projection CONSTRUCTION, before any size
+    check, so a drifting goal could raise CPython's integer conversion error
+    and take down the reduction meant to absorb exactly that.
+    """
+
+    if isinstance(value, str):
+        return value
+    if not value:
+        return ""
+    return _bounded_scalar(value, limit=4000) or ""
+
+
+def _fits_budget(value: Any) -> bool:
+    """Whether `value` is inside the handoff budget, and serializable at all.
+
+    A value that cannot be measured is not "small": `json.dumps` refuses an
+    integer past CPython's 4300-digit conversion limit outright, so a drifting
+    field could raise here and abort the reduction whose whole job was to keep
+    this function's answer true. An unmeasurable projection is over budget by
+    definition, which sends it down the same path as an oversized one.
+    """
+
+    try:
+        return json_size_bytes(value) <= MAX_HANDOFF_BYTES
+    except (ValueError, TypeError, RecursionError, OverflowError):
+        return False
+
+
 def build_worker_handoff_projection(
     result: Any,
     *,
@@ -208,6 +242,13 @@ def build_worker_handoff_projection(
                     "observations": unresolved_pages,
                 },
             ]
+    # Lexical artifact advisories reach the Lead here or nowhere. Everything
+    # else in `artifactValidation` is a verdict the Lead can act on from the
+    # status alone; an advisory only means something if the Lead can read WHICH
+    # rows and fields were flagged, and a large worker result is offloaded to
+    # disk with only this projection surviving in context.
+    artifact_advisories = _artifact_advisories(levels)
+
     claim: JsonDict = {
         "source": "worker_claim_unverified",
         "answer": answer.get("parsed") if answer.get("format") == "json" else answer.get("raw"),
@@ -216,7 +257,9 @@ def build_worker_handoff_projection(
     projection: JsonDict = {
         "workerId": l1.get("workerId") or result.get("workerId"),
         "phaseId": l1.get("phaseId") or result.get("phaseId"),
-        "originalGoal": str(original_goal or result.get("phaseObjective") or ""),
+        "originalGoal": _safe_text(
+            original_goal or result.get("phaseObjective") or ""
+        ),
         "rawReceipts": {
             "status": l1.get("status") or result.get("status"),
             # A worker execution outcome and an artifact's schema result are
@@ -249,6 +292,7 @@ def build_worker_handoff_projection(
             ),
             "latestPageStats": trace_summary.get("latestPageStats"),
             "contentCompletenessObservations": completeness_observations,
+            "artifactAdvisories": artifact_advisories,
         },
         "workerClaims": trim_large_strings(claim, MAX_HANDOFF_SECTION_CHARS),
         "unresolvedCounterevidence": trim_large_strings(
@@ -263,7 +307,7 @@ def build_worker_handoff_projection(
             "offloadedFiles": (evidence.get("offloadedFiles") or [])[:10],
         },
     }
-    if json_size_bytes(projection) <= MAX_HANDOFF_BYTES:
+    if _fits_budget(projection):
         return projection
 
     # Keep the six-section ownership shape, but make the exceptional oversized
@@ -272,6 +316,9 @@ def build_worker_handoff_projection(
     projection["rawReceipts"]["artifacts"] = projection["rawReceipts"][
         "artifacts"
     ][:5]
+    advisories = projection["rawReceipts"].get("artifactAdvisories")
+    if isinstance(advisories, list):
+        projection["rawReceipts"]["artifactAdvisories"] = advisories[:3]
     methods = projection["rawReceipts"].get("methods")
     if isinstance(methods, dict):
         projection["rawReceipts"]["methods"] = dict(list(methods.items())[:10])
@@ -293,7 +340,7 @@ def build_worker_handoff_projection(
         "evidencePaths"
     ]["offloadedFiles"][:5]
     fitted = trim_large_strings(projection, 400)
-    if json_size_bytes(fitted) <= MAX_HANDOFF_BYTES:
+    if _fits_budget(fitted):
         return fitted
     unresolved = fitted["unresolvedCounterevidence"]
     experiments = fitted["suggestedNextExperiment"]
@@ -315,7 +362,181 @@ def build_worker_handoff_projection(
         "reason": "handoff_size_budget",
     }
     fitted["originalGoal"] = trim_large_strings(fitted["originalGoal"], 200)
-    return trim_large_strings(fitted, 200)
+    return _shed_observations_to_fit(trim_large_strings(fitted, 200))
+
+
+def _shed_observations_to_fit(projection: JsonDict) -> JsonDict:
+    """Make MAX_HANDOFF_BYTES an enforced bound, not a declared one.
+
+    Every earlier stage caps a section by COUNT, which bounds nothing when the
+    entries themselves are large: five lexical advisories over five fields
+    each produced an 11.5KB handoff against a 3.5KB budget, and the final
+    return shipped it unchecked. The three observation lists are the only
+    sections that grow with page and row count, so they are shed here in
+    increasing order of value, each step deterministic so two identical runs
+    produce identical handoffs.
+    """
+
+    receipts = projection.get("rawReceipts")
+    if not isinstance(receipts, dict):
+        return projection
+
+    def _cap(key: str, limit: int) -> bool:
+        value = receipts.get(key)
+        if isinstance(value, list) and len(value) > limit:
+            receipts[key] = value[:limit]
+            return True
+        return False
+
+    def _summarize(key: str) -> bool:
+        value = receipts.get(key)
+        if isinstance(value, list) and value:
+            receipts[key] = [{
+                "omitted": len(value),
+                "reason": "handoff_size_budget",
+                "type": (
+                    value[0].get("type") if isinstance(value[0], dict) else None
+                ),
+            }]
+            return True
+        return False
+
+    # Advisories shed first: they are a word-list reading, and the Lead can
+    # still see the flagged rows in the artifact itself.
+    steps = (
+        lambda: _cap("artifactAdvisories", 2),
+        lambda: _cap("progressObservations", 3),
+        lambda: _cap("contentCompletenessObservations", 3),
+        lambda: _cap("artifactAdvisories", 1),
+        lambda: _summarize("artifactAdvisories"),
+        lambda: _cap("progressObservations", 1),
+        lambda: _summarize("contentCompletenessObservations"),
+        lambda: _summarize("progressObservations"),
+    )
+    for step in steps:
+        if _fits_budget(projection):
+            return projection
+        step()
+    if _fits_budget(projection):
+        return projection
+    return _minimal_handoff(projection)
+
+
+def _minimal_handoff(projection: JsonDict) -> JsonDict:
+    """The last resort, whose size does not depend on any particular field.
+
+    Every earlier stage names the sections it shrinks, so the budget held only
+    for the growth the author happened to anticipate: a long
+    `advertisedMethodsNeverCalled` walked straight past all of them and shipped
+    a 16KB handoff against a 3.5KB budget. This keeps a fixed set of keys and
+    then shortens what is left until it fits, so the bound follows from the
+    shape rather than from a list of known offenders.
+    """
+
+    receipts = projection.get("rawReceipts")
+    receipts = receipts if isinstance(receipts, dict) else {}
+    evidence = projection.get("evidencePaths")
+    evidence = evidence if isinstance(evidence, dict) else {}
+    advisories = receipts.get("artifactAdvisories")
+    artifacts = receipts.get("artifacts")
+
+    # Scalarized, not merely selected. A fixed key set is not a fixed size:
+    # these positions hold identifiers by contract, but a drifting producer
+    # that puts a dict in one of them walks past `trim_large_strings`, which
+    # shortens strings and cannot bound a mapping's key count.
+    minimal: JsonDict = {
+        "workerId": _bounded_scalar(projection.get("workerId")),
+        "phaseId": _bounded_scalar(projection.get("phaseId")),
+        "originalGoal": str(projection.get("originalGoal") or "")[:200],
+        "rawReceipts": {
+            "status": _bounded_scalar(receipts.get("status")),
+            "artifactSchemaStatus": _bounded_scalar(
+                receipts.get("artifactSchemaStatus")
+            ),
+            "artifactCount": len(artifacts) if isinstance(artifacts, list) else 0,
+            "totalExtractedRows": _bounded_int(receipts.get("totalExtractedRows")),
+            "artifactAdvisoryCount": (
+                len(advisories) if isinstance(advisories, list) else 0
+            ),
+            "reduced": "handoff_size_budget",
+        },
+        "workerClaims": {
+            "source": "worker_claim_unverified",
+            "reduced": "handoff_size_budget",
+        },
+        "unresolvedCounterevidence": [],
+        "suggestedNextExperiment": [],
+        "evidencePaths": {
+            "tracePath": evidence.get("tracePath"),
+            "artifacts": (evidence.get("artifacts") or [])[:2],
+            "offloadedFiles": (evidence.get("offloadedFiles") or [])[:2],
+        },
+    }
+    # Paths are the one part that can still be arbitrarily long.
+    for limit in (200, 100, 50):
+        if _fits_budget(minimal):
+            return minimal
+        minimal = trim_large_strings(minimal, limit)
+    if not _fits_budget(minimal):
+        minimal["evidencePaths"] = {"reduced": "handoff_size_budget"}
+    if _fits_budget(minimal):
+        return minimal
+    # Nothing above depends on a value the caller supplied, so this always
+    # fits. Reached only if a producer breaks the scalar contract in a way the
+    # bounds above did not anticipate - the Lead gets a truthful "unreadable"
+    # rather than a handoff that blows its own budget.
+    return {
+        "workerId": _bounded_scalar(minimal.get("workerId")),
+        "phaseId": _bounded_scalar(minimal.get("phaseId")),
+        "originalGoal": "",
+        "rawReceipts": {"reduced": "handoff_size_budget_emergency"},
+        "workerClaims": {"source": "worker_claim_unverified"},
+        "unresolvedCounterevidence": [],
+        "suggestedNextExperiment": [],
+        "evidencePaths": {"reduced": "handoff_size_budget_emergency"},
+    }
+
+
+def _bounded_scalar(value: Any, limit: int = 120) -> Optional[str]:
+    """An identifier position, forced to an identifier-sized string."""
+
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, int):
+        # `str()` on a large enough int raises the same conversion-limit error
+        # this function is meant to absorb, so magnitude is checked first.
+        return str(value)[:limit] if abs(value) < 10 ** 30 else "<int>"
+    if isinstance(value, float):
+        return str(value)[:limit] if math.isfinite(value) else "<float>"
+    if isinstance(value, str):
+        return value[:limit]
+    return f"<{type(value).__name__}>"
+
+
+# A row count. Anything past this is drift, not a tally, and a bignum can be
+# arbitrarily many digits of JSON on its own.
+MAX_SAFE_COUNT = 1_000_000_000
+
+
+def _bounded_int(value: Any) -> Optional[int]:
+    """A count position, forced to a plausible count.
+
+    This function exists to absorb contract drift, so it may not itself throw
+    on drifting input: `int(float("inf"))` raises OverflowError and
+    `int(float("nan"))` raises ValueError, and either one aborted the very
+    fallback that was supposed to keep an oversized handoff inside its budget.
+    """
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 0 <= value <= MAX_SAFE_COUNT else None
+    if isinstance(value, float) and math.isfinite(value):
+        converted = int(value)
+        return converted if 0 <= converted <= MAX_SAFE_COUNT else None
+    return None
 
 
 def worker_handoff_projections(value: Any) -> List[JsonDict]:
@@ -507,6 +728,52 @@ def _semantic_trace_summary(trace_summary: JsonDict) -> JsonDict:
         "contentCompletenessPages": trace_summary.get("contentCompletenessPages", []),
     }
 
+
+
+def _artifact_advisories(levels: JsonDict) -> List[JsonDict]:
+    """Bounded projection of artifact warnings that are observations, not verdicts.
+
+    Only entries that mark themselves ``severity: advisory`` travel. A warning
+    without that mark is either already reflected in the artifact status or is
+    a verdict in its own right, and neither needs re-stating to the Lead as
+    something to judge.
+    """
+
+    l3 = levels.get("l3") if isinstance(levels.get("l3"), dict) else {}
+    validation = (
+        l3.get("artifactValidation")
+        if isinstance(l3.get("artifactValidation"), dict)
+        else {}
+    )
+    warnings = validation.get("warnings")
+    if not isinstance(warnings, list):
+        return []
+    out: List[JsonDict] = []
+    for item in warnings:
+        if not isinstance(item, dict) or item.get("severity") != "advisory":
+            continue
+        raw_fields = item.get("fields")
+        fields = []
+        for spec in (raw_fields if isinstance(raw_fields, list) else [])[:3]:
+            if not isinstance(spec, dict):
+                continue
+            # The matched regex is the observer's own internals: it is bulky,
+            # it is not something the Lead can act on, and printing a pattern
+            # invites reading the word list as the rule.
+            fields.append({
+                "field": spec.get("field"),
+                "value": str(spec.get("value") or "")[:80],
+            })
+        out.append({
+            "type": item.get("type"),
+            "source": "lexical_observer_not_verdict",
+            "row": item.get("row"),
+            "fields": fields,
+            "message": item.get("message"),
+        })
+        if len(out) >= 5:
+            break
+    return out
 
 def _content_completeness_observations(trace_summary: JsonDict) -> List[JsonDict]:
     """Project tracker output as attributed facts, never as a verdict.

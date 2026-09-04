@@ -233,7 +233,12 @@ DashScope compatible-mode），且不会像 `true` 那样在 Anthropic 路上额
     "hitl_poll_interval_seconds": 2,
     "hitl_wait_timeout_seconds": 600,
     "worktree_dir": "worktree",
-    "context_file": null
+    "context_file": null,
+    "project_context_files": [
+      {"path": "ORG_INSTRUCTIONS.md", "scope": "organization"},
+      {"path": "CLAUDE.md", "scope": "project"}
+    ],
+    "append_system_prompt": ""
   }
 }
 ```
@@ -256,7 +261,9 @@ DashScope compatible-mode），且不会像 `true` 那样在 Anthropic 路上额
 - `hitl_poll_interval_seconds`: `Hitl.requestPause` 后轮询恢复状态的间隔。
 - `hitl_wait_timeout_seconds`: 等待人工介入的最长时间。
 - `worktree_dir`: 运行日志和 artifacts 的根目录。
-- `context_file`: 可选静态 prompt 上下文文件。任务期间应保持稳定，否则会降低 prompt cache 复用率。
+- `context_file`: 兼容保留的单个静态 prompt 上下文文件。新配置优先使用 `project_context_files`。
+- `project_context_files`: 有序的静态项目指令文件；每项可为路径字符串，或 `{ "path": "...", "scope": "..." }`。Harness 会按顺序以转义后的 `<project_context><project_instructions ...>` XML 注入；重复文件只注入一次。只应放稳定文件。
+- `append_system_prompt`: 受部署方信任的静态 prompt 尾部，位于项目上下文之前并包装为转义后的 `<append_system_prompt>`。仅用于稳定策略补充，不可放任务事实。
 
 ## 运行任务
 
@@ -332,7 +339,7 @@ Harness 会记录 provider 返回的单次调用 cache 指标：
 
 `estimated_cost_usd` 当前预留为 `null`；后续可以通过配置模型价格启用成本估算。
 
-`harness.context_file` 默认关闭。启用后，文件内容会注入静态 system prompt，并在 usage diagnostics 中记录 sha256。只建议用于稳定上下文；变化快的上下文应由调用方追加到动态上下文末尾。
+静态 prompt 上下文字段默认关闭。最终 XML 会连同 guide manifest 一起进入完整 prompt 指纹，并记录在 usage diagnostics 中。任务期间保持稳定才能复用 prefix cache；不要把当前日期、cwd 或任务过程观察放进这些字段。
 
 ## Lead Agent 工具
 
@@ -342,6 +349,7 @@ Harness 会记录 provider 返回的单次调用 cache 指标：
 - `wait_browser_agents`: 等待一个或多个 browser worker。
 - `list_browser_agents`: 查看当前 worker 状态。
 - `lead_save_artifact`: 基于可信 extraction 证据保存 LeadAgent 重塑后的结构化行。
+- `read_harness_guide`: 当复杂回执或恢复规则相关时，从 prompt 内的轻量 guide 索引按页读取带版本的操作指南。
 - `final_answer`: 结束 LeadAgent 运行。
 
 LeadAgent 应通过 BrowserAgent phase 编排任务。BrowserAgent 的 `browser_call` 使用：

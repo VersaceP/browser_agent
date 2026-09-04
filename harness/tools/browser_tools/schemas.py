@@ -824,4 +824,49 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
             "required": ["path", "line_offset", "line_limit", "max_bytes"],
             "additionalProperties": False,
         },
+        "read_harness_guide": {
+            "type": "object",
+            "properties": {
+                "guide_id": {
+                    "type": "string",
+                    "description": (
+                        "An id from <available_harness_guides>. This reads a "
+                        "versioned Harness operating guide, not a task file."
+                    ),
+                },
+                "line_offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
+                },
+                "line_limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 500,
+                    "default": 200,
+                },
+            },
+            "required": ["guide_id", "line_offset", "line_limit"],
+            "additionalProperties": False,
+        },
+        "search_harness_guides": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Plain text: an error/reason code from a receipt, a "
+                        "method name, or a phrase in any language. Not a regex."
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 5,
+                    "default": 5,
+                },
+            },
+            "required": ["query", "limit"],
+            "additionalProperties": False,
+        },
     }

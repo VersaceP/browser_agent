@@ -15,6 +15,8 @@ from harness.utils import JsonDict
 LOCAL_FS_TOOLS = {"local_fs_search", "local_fs_read"}
 NO_ARTIFACT_DIAGNOSTIC_TOOLS = frozenset({
     "find_in_axtree",
+    "read_harness_guide",
+    "search_harness_guides",
     "visual_verify",
     "DOM.getAXTree",
     "DOM.getSemanticTree",
@@ -283,9 +285,13 @@ class ProgressAccountant:
                     f"{int(mandatory_recovery_generation)}:{tool_name}"
                 )
             if recovery_key and recovery_key not in self.mandatory_recovery_credits_used:
-                # PageLifecycleTracker, not model input, authorizes this one-shot
-                # crossing.  Consume on dispatch (success or failure) so a broken
-                # page cannot turn the mandatory recovery into an infinite bypass.
+                # Not a permission: nothing here grants or withholds execution
+                # any more, and the tool runs either way. What the credit buys
+                # is SILENCE - a recovery step the lifecycle gate compelled
+                # must not come back as a "spinning without artifacts" note
+                # about the model's own choices. Consumed on dispatch (success
+                # or failure) so a broken page cannot mute the observation
+                # forever.
                 self.mandatory_recovery_credits_used.add(recovery_key)
                 self.last_mandatory_recovery_allowance = {
                     "tool": tool_name,

@@ -199,7 +199,10 @@ SELECT_FAILURE_POLICY = {
     "select-option-disabled": SelectFailurePolicy(
         family="option_evidence",
         raised_by=_BOTH,
-        action="stop_and_report_requested_option_unavailable",
+        action=(
+            "choose_an_enabled_option"
+            "_or_satisfy_the_page_condition_that_enables_it"
+        ),
         retries=0,
         visual_locate=False,
         guidance=(
@@ -244,14 +247,22 @@ SELECT_FAILURE_POLICY = {
     "select-target-not-select": SelectFailurePolicy(
         family="control_unsupported",
         raised_by=_BOTH,
-        action="stop_select_and_use_generic_input_actions",
+        action=(
+            "refresh_ax_then_choose_supported_select"
+            "_or_use_generic_input_if_unsupported"
+        ),
         retries=0,
         visual_locate=True,
         guidance=(
             "This element is not an ABCP-supported select control (only native"
-            " <select>, Ant Design and Element have adapters). Stop calling"
-            " the select Actions for it and drive it as ordinary UI: enumerate"
-            " fresh AXTree targets and act one verified step per visible"
+            " <select>, Ant Design and Element have adapters). Two different"
+            " situations reach this code, so settle which one first: refresh"
+            " DOM.getAXTree and check whether the real select control is a"
+            " different node you simply did not target. If it is, target that"
+            " one. If the page genuinely has no supported select here, stop"
+            " calling the select Actions for it and drive it as ordinary UI:"
+            " enumerate fresh AXTree targets and act one verified step per"
+            " visible"
             " level. A visible multi-column category/list browser is ordinary"
             " UI, not a broken select. If a level is visible but no structured"
             " surface names it, visual_verify mode=visual_locate can locate it;"
@@ -292,13 +303,17 @@ SELECT_FAILURE_POLICY = {
     "select-selection-mode-unknown": SelectFailurePolicy(
         family="contract_unproven",
         raised_by=_BOTH,
-        action="stop_and_report_platform_select_contract_failure",
+        action="reinspect_to_confirm_mode_then_report_if_still_unproven",
         retries=0,
         visual_locate=False,
         guidance=(
-            "The platform could not determine the selection mode. This is an"
-            " ABCP select contract failure: report it with this receipt rather"
-            " than working around it."
+            "The platform could not confirm whether the control takes one"
+            " option or a final set of options. Do not send another"
+            " Input.select and do not guess the mode: inspect the control"
+            " again and read the mode off that observation, which is what the"
+            " platform's own suggested_prompt asks for. Only when a fresh"
+            " inspection still cannot confirm it is this an ABCP select"
+            " contract failure to report with the receipt."
         ),
     ),
     # Only restoreSelectionMenu passes this code, and only Input.select calls
@@ -313,7 +328,7 @@ SELECT_FAILURE_POLICY = {
         guidance=(
             "The selection was made but the menu could not be restored to a"
             " known state. Inspect the control again before continuing; do not"
-            " assume the menu is closed."
+            " assume the menu is closed, and do not assume it is open either."
         ),
     ),
     "select-final-state-unproven": SelectFailurePolicy(

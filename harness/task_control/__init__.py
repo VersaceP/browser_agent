@@ -54,6 +54,7 @@ from harness.evidence.artifact_evidence import (
     detect_blocker_data_rows,
     detect_near_stub_rows,
     detect_placeholder_rows,
+    observe_placeholder_text_rows,
     detect_stub_rows,
 )
 from harness.fleet.auth import normalize_auth_verification_contract

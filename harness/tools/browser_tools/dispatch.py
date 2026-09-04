@@ -21,6 +21,8 @@ from harness.lifecycle import LifecycleContext
 from harness.lifecycle import lifecycle_for
 from harness.local_fs import local_fs_read
 from harness.local_fs import local_fs_search
+from harness.prompts import read_harness_guide
+from harness.prompts import search_harness_guides
 from harness.observation.page_lifecycle import PageLifecycleTracker
 from harness.pacing import wait_between_rows
 from harness.observation.browser_call import build_browser_call_runner
@@ -47,23 +49,6 @@ def _bt():
     import harness.tools.browser_tools as bt
 
     return bt
-
-SCREENSHOT_MISUSE_RE = re.compile(
-    r"\b("
-    r"identify|selector|selectors|read|text|understand|layout|structure|"
-    r"card|cards|extract|view\s+the\s+current\s+page|figure\s+out"
-    r")\b",
-    re.I,
-)
-
-SCREENSHOT_ALLOWED_PURPOSE_RE = re.compile(
-    r"\b("
-    r"visual_verify|visual verification|human audit|human review|audit evidence|"
-    r"before navigation|after navigation|before/after|before-and-after|"
-    r"visual evidence|evidence screenshot"
-    r")\b",
-    re.I,
-)
 
 def _prepare_runtime_evaluation(
     agent: Any,
@@ -163,10 +148,115 @@ def _lifecycle_page_id(agent: Any, params: Any) -> str:
         return str(params.get("pageId") or "").strip()
     return str(getattr(agent, "axtree_page_id", "") or "").strip()
 
+def target_independent_document_read(method: str, params: Any) -> bool:
+    """True for a read that names no element and therefore cannot go stale.
+
+    Deliberately one method, not a rule about a missing `target` key. Locators
+    are not uniform across the protocol - `id`, `selector`, `targets`,
+    `target`, `container`, `toId`, `toSelector` all appear - so "no target
+    field" is not a decidable property of an arbitrary call. `DOM.getText`
+    cannot even be expressed without one. `DOM.getSemanticTree` is the case
+    the schema defines: omitting both `id` and `selector` IS the document-root
+    request, so there is no prior element for a navigation to invalidate.
+    """
+
+    if method != "DOM.getSemanticTree" or not isinstance(params, dict):
+        return False
+    return not str(params.get("id") or "").strip() and not str(
+        params.get("selector") or ""
+    ).strip()
+
+
+def _take_pending_ax_bypass(agent: Any) -> Optional[JsonDict]:
+    """Pop the token the lifecycle guard issued when it approved a bypass.
+
+    The snapshot used to be taken by the CALLER, before the guard ran. That
+    read a state the guard was still free to change: a page that begins
+    `loading` yields no snapshot, then the guard's own one-shot Page.getState
+    settles it and approves the read - and the annotation, holding `None`,
+    attached nothing. The exemption went out silently, which is the one thing
+    it is not allowed to do. Issuing the token inside the decision makes the
+    approval and the state it was based on a single act.
+    """
+
+    token = getattr(agent, "_ax_refresh_bypass_pending", None)
+    agent._ax_refresh_bypass_pending = None
+    return token if isinstance(token, dict) else None
+
+
+def _annotate_target_independent_read(
+    agent: Any,
+    method: str,
+    params: Any,
+    response: Any,
+    before: Optional[JsonDict],
+) -> None:
+    """Record that the AX-refresh obligation was bypassed, and still stands.
+
+    The bypass buys one page-wide look at structure. It does NOT clear
+    `requires_ax_refresh`: every id in the returned tree is as unrefreshed as
+    it was a moment ago, so the next target-bound call must still refresh.
+    Saying so on the receipt is the whole reason this exemption is confined to
+    the model path.
+    """
+
+    if not before or not isinstance(response, dict):
+        return
+    tracker = getattr(agent, "page_lifecycle", None)
+    if not isinstance(tracker, PageLifecycleTracker):
+        return
+    page_id = str(before.get("pageId") or "")
+    state = tracker.state(page_id)
+    generation = int(getattr(state, "generation", -1) or 0) if state else -1
+    status = getattr(state, "status", "") if state else ""
+    resync_now = bool(getattr(state, "requires_state_resync", True)) if state else True
+    # Generation is the coarse signal; the obligations are the fine one. A
+    # change can re-establish a resync duty without advancing the generation,
+    # and that alone makes the tree unsafe to record. `requires_ax_refresh` is
+    # deliberately NOT compared: this read never discharges it, so it standing
+    # or being discharged elsewhere says nothing about this tree's stability.
+    stable = (
+        state is not None
+        and generation == before.get("generation")
+        and status == before.get("status")
+        and status == "settled"
+        and not resync_now
+    )
+    response["pageLifecycle"] = tracker.receipt(page_id)
+    response["axRefreshBypass"] = {
+        "reason": "target_independent_document_read",
+        "doesNotClearAXRefresh": True,
+        "note": (
+            "A document-root read needs no prior element, so it ran without the"
+            " AXTree refresh. The refresh obligation is unchanged: call"
+            " DOM.getAXTree before any call that names a target."
+        ),
+        "stableEvidence": bool(stable),
+    }
+    if not stable:
+        # Executed, so not a rejection - but the tree may describe a document
+        # the model was not asking about.
+        response["status"] = "page_changed_during_read"
+        response["stableEvidence"] = False
+        response["next_instruction"] = (
+            "The page lifecycle moved while this document-root tree was read."
+            " Do not record it as evidence; re-observe the settled page."
+        )
+    agent.logger.write("page.lifecycle.ax_refresh_bypass", {
+        "method": method,
+        "pageId": page_id,
+        "generationBefore": before.get("generation"),
+        "generationAfter": generation,
+        "stableEvidence": bool(stable),
+    })
+
+
 async def _page_lifecycle_guard_before(
     agent: Any,
     method: str,
     params: JsonDict,
+    *,
+    allow_target_independent_document_read: bool = False,
 ) -> Optional[JsonDict]:
     """Event-driven pre-call gate.
 
@@ -174,6 +264,8 @@ async def _page_lifecycle_guard_before(
     Page.getState call.  Re-perception obligations are then exposed as explicit
     guards so the model cannot continue with stale DOM handles.
     """
+    # Cleared first so a token can only ever describe THIS decision.
+    agent._ax_refresh_bypass_pending = None
     tracker = getattr(agent, "page_lifecycle", None)
     if not isinstance(tracker, PageLifecycleTracker):
         return None
@@ -275,6 +367,26 @@ async def _page_lifecycle_guard_before(
         and method not in {*lifecycle_recovery_methods, "DOM.getAXTree"}
         and not is_file_control
     ):
+        # The gate's own reason is that navigation invalidated every prior DOM
+        # target. A document-root read holds no prior target, so the reason
+        # does not reach it. The exemption is opt-in per call site rather than
+        # applied here for everyone: the caller has to be one that renders the
+        # bypass and the post-call lifecycle state back to the model, which
+        # the internal composite path does not.
+        if (
+            allow_target_independent_document_read
+            and state.status == "settled"
+            and not state.requires_state_resync
+            and target_independent_document_read(method, params)
+        ):
+            agent._ax_refresh_bypass_pending = {
+                "pageId": page_id,
+                "generation": int(getattr(state, "generation", 0) or 0),
+                "status": state.status,
+                "requiresStateResync": bool(state.requires_state_resync),
+                "requiresAXTreeRefresh": bool(state.requires_ax_refresh),
+            }
+            return None
         return {
             "status": "page_axtree_refresh_required",
             "tool_was_executed": False,
@@ -1415,6 +1527,43 @@ async def _browser_local_fs_read(ctx: ToolContext) -> JsonDict:
             ) or ctx.agent.runtime.harness.local_fs_max_read_bytes,
             ctx.agent.runtime.harness.local_fs_max_read_bytes,
         ),
+    )
+
+
+@BROWSER_TOOLS.register(
+    name="read_harness_guide",
+    description=(
+        "Read a paged, versioned Harness operating guide listed in "
+        "<available_harness_guides>. Use it when its topic is useful for "
+        "reasoning about a complex tool receipt or recovery path."
+    ),
+    input_schema=_browser_schema_for("read_harness_guide"),
+    trace_type="read_harness_guide",
+)
+async def _browser_read_harness_guide(ctx: ToolContext) -> JsonDict:
+    return read_harness_guide(
+        guide_id=str(ctx.tool_input.get("guide_id") or ""),
+        audience="browser",
+        line_offset=optional_int(ctx.tool_input.get("line_offset"), 0) or 0,
+        line_limit=optional_int(ctx.tool_input.get("line_limit"), 200) or 200,
+    )
+
+
+@BROWSER_TOOLS.register(
+    name="search_harness_guides",
+    description=(
+        "Find candidate Harness operating guides by an error/reason code from "
+        "a receipt, a method name, or a phrase in any language. Returns ids and "
+        "why each matched; read one with read_harness_guide when it helps."
+    ),
+    input_schema=_browser_schema_for("search_harness_guides"),
+    trace_type="search_harness_guides",
+)
+async def _browser_search_harness_guides(ctx: ToolContext) -> JsonDict:
+    return search_harness_guides(
+        query=str(ctx.tool_input.get("query") or ""),
+        audience="browser",
+        limit=optional_int(ctx.tool_input.get("limit"), 5) or 5,
     )
 
 def build_browser_agent_tool_specs(

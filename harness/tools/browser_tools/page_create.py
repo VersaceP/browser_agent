@@ -485,13 +485,17 @@ def _attach_runtime_strategy_hints(result: JsonDict, *, method: str) -> JsonDict
         "trigger": "occlusion_blocked",
         "method": method,
         "preferredTool": "dismiss_overlay",
+        # Directly callable, with every schema-required field. targetMethod is
+        # the REAL method: the tool reads an empty one as Input.click, so "" on
+        # a blocked Input.type asked for a click rather than the
+        # dismissed_pending_action this comment has always promised.
         "call": {
             "tool": "dismiss_overlay",
             "pageId": params.get("pageId") or "",
             "targetId": blocked_target,
-            # Only Input.click is auto-retried after dismissal; for any other
-            # blocked method the tool returns dismissed_pending_action.
-            "targetMethod": method if method == "Input.click" else "",
+            "targetMethod": method,
+            "maxAttempts": 0,
+            "maxDurationMs": 0,
         },
         "safetyBoundary": (
             "dismiss_overlay never auto-clicks login/payment/provider buttons"

@@ -16,6 +16,8 @@ from harness.evidence.artifact_evidence import VALIDATOR_TYPES
 from harness.fleet.coordinator import VALID_PAGE_POLICIES, VALID_REUSE_SCOPES
 from harness.lifecycle import LifecycleContext, lifecycle_for
 from harness.local_fs import local_fs_read, local_fs_search
+from harness.prompts import read_harness_guide
+from harness.prompts import search_harness_guides
 from harness.strategy_bank import render_strategy_guidance
 from harness.task_control import (
     EXECUTION_ROLES,
@@ -1293,6 +1295,45 @@ def _local_fs_read_schema(_: Any = None) -> JsonDict:
             "max_bytes": {"type": "integer", "minimum": 1000, "maximum": 200000, "default": 20000},
         },
         "required": ["path", "line_offset", "line_limit", "max_bytes"],
+        "additionalProperties": False,
+    }
+
+
+def _read_harness_guide_schema(_: Any = None) -> JsonDict:
+    return {
+        "type": "object",
+        "properties": {
+            "guide_id": {
+                "type": "string",
+                "description": (
+                    "An id from <available_harness_guides>. This reads a "
+                    "versioned Harness operating guide, not a task file."
+                ),
+            },
+            "line_offset": {"type": "integer", "minimum": 0, "default": 0},
+            "line_limit": {
+                "type": "integer", "minimum": 1, "maximum": 500, "default": 200,
+            },
+        },
+        "required": ["guide_id", "line_offset", "line_limit"],
+        "additionalProperties": False,
+    }
+
+
+def _search_harness_guides_schema(_: Any = None) -> JsonDict:
+    return {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": (
+                    "Plain text: an error/reason code from a receipt, a tool "
+                    "name, or a phrase in any language. Not a regex."
+                ),
+            },
+            "limit": {"type": "integer", "minimum": 1, "maximum": 5, "default": 5},
+        },
+        "required": ["query", "limit"],
         "additionalProperties": False,
     }
 
@@ -2651,6 +2692,41 @@ async def _lead_local_fs_read(ctx: ToolContext) -> JsonDict:
             ) or ctx.agent.runtime.harness.local_fs_max_read_bytes,
             ctx.agent.runtime.harness.local_fs_max_read_bytes,
         ),
+    )
+
+
+@LEAD_TOOLS.register(
+    name="read_harness_guide",
+    description=(
+        "Read a paged, versioned Harness operating guide listed in "
+        "<available_harness_guides>. Use it when its topic is useful for "
+        "reasoning about a complex orchestration receipt or recovery path."
+    ),
+    input_schema=_read_harness_guide_schema,
+)
+async def _lead_read_harness_guide(ctx: ToolContext) -> JsonDict:
+    return read_harness_guide(
+        guide_id=str(ctx.tool_input.get("guide_id") or ""),
+        audience="lead",
+        line_offset=optional_int(ctx.tool_input.get("line_offset"), 0) or 0,
+        line_limit=optional_int(ctx.tool_input.get("line_limit"), 200) or 200,
+    )
+
+
+@LEAD_TOOLS.register(
+    name="search_harness_guides",
+    description=(
+        "Find candidate Harness operating guides by an error/reason code from "
+        "a receipt, a tool name, or a phrase in any language. Returns ids and "
+        "why each matched; read one with read_harness_guide when it helps."
+    ),
+    input_schema=_search_harness_guides_schema,
+)
+async def _lead_search_harness_guides(ctx: ToolContext) -> JsonDict:
+    return search_harness_guides(
+        query=str(ctx.tool_input.get("query") or ""),
+        audience="lead",
+        limit=optional_int(ctx.tool_input.get("limit"), 5) or 5,
     )
 
 

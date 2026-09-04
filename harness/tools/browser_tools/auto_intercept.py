@@ -18,8 +18,70 @@ AUTO_INTERCEPT_MAX_PER_PAGE = 3
 
 def _auto_intercept_mode(agent: Any) -> str:
     harness = getattr(getattr(agent, "runtime", None), "harness", None)
-    mode = str(getattr(harness, "auto_intercept", "p0p1") or "p0p1")
-    return mode if mode in {"off", "suggest", "p0", "p0p1"} else "p0p1"
+    # An unreadable or misspelt mode falls back to the least intrusive setting
+    # that still reports what was seen, not to the one that acts on the page.
+    mode = str(getattr(harness, "auto_intercept", "suggest") or "suggest")
+    return mode if mode in {"off", "suggest", "p0", "p0p1"} else "suggest"
+
+
+def _attach_overlay_observation(
+    agent: Any,
+    method: str,
+    params: JsonDict,
+    result: JsonDict,
+) -> JsonDict:
+    """Report an occlusion signal in `suggest` mode without acting on it.
+
+    Handing the decision back to the model is only an improvement if the model
+    still learns what was seen. The P1 signal - an AX layer reporting
+    occlusionState=occluded with no error classification - reaches the receipt
+    by no other route, so dropping the automatic dismissal without this would
+    drop the observation along with it, which is a worse trade than the
+    automation it replaces.
+    """
+
+    p0 = _bt()._result_occlusion_blocked(result)
+    p1 = bool(visible_layers_occluded(_bt()._layers_from_result(result)))
+    if not (p0 or p1):
+        return result
+    page_id = (
+        str(params.get("pageId") or "").strip() if isinstance(params, dict) else ""
+    )
+    trigger = "occlusion_blocked" if p0 else "occluded_layers"
+    enriched = dict(result)
+    enriched["overlayObservation"] = {
+        "trigger": trigger,
+        "mode": "suggest",
+        "fact": (
+            "An overlay signal was observed on this page. Nothing was dismissed"
+            " and nothing was retried; the harness reports the signal and the"
+            " next action is yours."
+        ),
+        # A candidate action must be directly callable: every field the
+        # dismiss_overlay schema requires is present, and targetMethod carries
+        # the REAL method. An empty targetMethod is read by the tool as
+        # Input.click, so a blocked Input.type copied verbatim from here would
+        # have clicked the element instead of declining the replay.
+        "candidateActions": [{
+            "tool": "dismiss_overlay",
+            "pageId": page_id,
+            "targetId": _blocked_target_id(params),
+            "targetMethod": method,
+            "maxAttempts": 0,
+            "maxDurationMs": 0,
+        }],
+        "safetyBoundary": (
+            "dismiss_overlay never auto-clicks login/payment/provider buttons"
+            " and never auto-retries consequential targets."
+        ),
+    }
+    _record_microloop_telemetry(
+        agent,
+        "auto_intercept",
+        "suggested",
+        {"pageId": page_id or None, "trigger": trigger},
+    )
+    return enriched
 
 def _blocked_target_id(params: Any) -> str:
     if not isinstance(params, dict):
@@ -76,8 +138,10 @@ async def _maybe_auto_intercept_overlay(
     if not isinstance(result, dict):
         return result
     mode = _auto_intercept_mode(agent)
-    if mode in {"off", "suggest"}:
+    if mode == "off":
         return result
+    if mode == "suggest":
+        return _attach_overlay_observation(agent, method, params, result)
 
     p0 = _bt()._result_occlusion_blocked(result)
     p1 = False
@@ -119,10 +183,15 @@ async def _maybe_auto_intercept_overlay(
     # So the generic "a public failure has an unknown outcome" rule
     # (`replay_forbidden`) deliberately does NOT gate this one retry; applying it
     # here would disarm the recovery on every code that can arm it.
-    target_method = method if method == "Input.click" else ""
+    # Pass the real method. `dismiss_overlay` reads an EMPTY targetMethod as
+    # "Input.click" (its own default), so sending "" for a blocked Input.type
+    # or Input.press asked it to auto-click the target instead of declining the
+    # replay — the opposite of what the comment above promises. With the true
+    # method, `is_sensitive_method` refuses every non-click and the tool
+    # returns dismissed_pending_action, which is the intended contract.
     dismiss = await _bt()._dismiss_overlay(
         agent,
-        {"pageId": page_id, "targetId": blocked_target, "targetMethod": target_method},
+        {"pageId": page_id, "targetId": blocked_target, "targetMethod": method},
         step,
     )
     dismiss_status = str(dismiss.get("status") or "")

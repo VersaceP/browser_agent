@@ -365,6 +365,8 @@ HARNESS_DEFAULT_ALLOWED_TOOLS: FrozenSet[str] = frozenset({
     "record_extraction",
     "local_fs_search",
     "local_fs_read",
+    "read_harness_guide",
+    "search_harness_guides",
     "find_in_axtree",
     "navigate_verified",
     "visual_verify",

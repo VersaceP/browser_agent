@@ -20,6 +20,7 @@ from harness.evidence.artifact_evidence import FILE_VALIDATOR_TYPES
 from harness.evidence.artifact_evidence import detect_blocker_data_rows
 from harness.evidence.artifact_evidence import detect_near_stub_rows
 from harness.evidence.artifact_evidence import detect_placeholder_rows
+from harness.evidence.artifact_evidence import observe_placeholder_text_rows
 from harness.evidence.artifact_evidence import detect_stub_rows
 from harness.utils import JsonDict
 from harness.utils import RunLogger
@@ -211,7 +212,9 @@ def validate_worker_artifacts(
                 })
         for validator in row_validators:
             cand_failures.extend(_tc()._run_validator(validator, cand_rows))
-        cand_failures.extend(detect_placeholder_rows(cand_rows))
+        cand_failures.extend(
+            detect_placeholder_rows(cand_rows, expected_artifact=expected)
+        )
         cand_failures.extend(detect_blocker_data_rows(cand_rows, expected))
         return cand_failures, cand_rows
 
@@ -230,6 +233,12 @@ def validate_worker_artifacts(
                 break
     failures.extend(selected_failures)
     warnings = _empty_array_observations(rows, expected)
+    # Word-list placeholder readings inform the Lead; they do not fail the
+    # phase. The reader has the page evidence and the user's request, which
+    # is what deciding this actually takes.
+    warnings.extend(
+        observe_placeholder_text_rows(rows, expected_artifact=expected)
+    )
 
     cumulative = False
     cumulative_sources: List[str] = []
@@ -259,6 +268,12 @@ def validate_worker_artifacts(
             rows = cumulative_rows
             failures = []
             warnings = _empty_array_observations(rows, expected)
+            # Word-list placeholder readings inform the Lead; they do not fail the
+            # phase. The reader has the page evidence and the user's request, which
+            # is what deciding this actually takes.
+            warnings.extend(
+        observe_placeholder_text_rows(rows, expected_artifact=expected)
+    )
             cumulative = True
 
     file_failures: List[JsonDict] = []

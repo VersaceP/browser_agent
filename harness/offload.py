@@ -666,6 +666,21 @@ def offload_large_response_fields(
     return copied if copied is not None else response
 
 
+SCREENSHOT_VISIBILITY_NOTICE: JsonDict = {
+    "modelVisible": False,
+    # Split along what is true of EVERY receipt versus only a successful one:
+    # this function also shapes failures and responses with no data, where no
+    # path exists to point at.
+    "fact": (
+        "Screenshot pixels are not model-visible in this receipt, so nothing in"
+        " the image can be read from here. On success, Page.screenshot exposes"
+        " a saved file path instead."
+    ),
+    "forVisualJudgement": "visual_verify",
+    "forPageContent": ["DOM.getAXTree", "DOM.getText", "DOM.getAttribute"],
+}
+
+
 def strip_image_payload(
     *,
     logger: RunLogger,
@@ -678,6 +693,12 @@ def strip_image_payload(
         return response
 
     copied = copy.deepcopy(response)
+    # Stated on every screenshot receipt rather than guessed from the caller's
+    # wording. The protocol fact is fixed; the caller's intent is not, and the
+    # regex that used to reject "misuse" fired on words as ordinary as "read"
+    # or "text" while missing any phrasing its author had not anticipated.
+    # Spend is bounded by HEAVY_DIAGNOSTIC_LIMITS, which is arithmetic.
+    copied["screenshotVisibility"] = dict(SCREENSHOT_VISIBILITY_NOTICE)
     payload = copied.get("data")
     if not isinstance(payload, dict):
         return copied

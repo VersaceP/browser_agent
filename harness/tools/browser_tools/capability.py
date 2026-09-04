@@ -381,7 +381,18 @@ async def _execute_browser_capability_tool(
         agent, method
     )
 
-    lifecycle_guard = await _bt()._page_lifecycle_guard_before(agent, method, params)
+    # Model path only. The internal composite path keeps the strict gate: it
+    # does not render the bypass or the post-call lifecycle state back to the
+    # model, so an exemption there would be silent.
+    lifecycle_guard = await _bt()._page_lifecycle_guard_before(
+        agent,
+        method,
+        params,
+        allow_target_independent_document_read=True,
+    )
+    # Issued by the guard at the moment it approved, so the token describes the
+    # state the decision was actually made on rather than one read beforehand.
+    ax_bypass_before = _bt()._take_pending_ax_bypass(agent)
     if lifecycle_guard is not None:
         agent.logger.write("browser.call.lifecycle_gated", lifecycle_guard)
         agent.trace.append({
@@ -390,12 +401,6 @@ async def _execute_browser_capability_tool(
             "result": lifecycle_guard,
         })
         return lifecycle_guard, False
-
-    screenshot_guard = _bt()._check_screenshot_misuse(method, params, reason)
-    if screenshot_guard is not None:
-        agent.logger.write("browser.call.screenshot_rejected", screenshot_guard)
-        agent.trace.append({"type": "screenshot_guard", "result": screenshot_guard})
-        return screenshot_guard, False
 
     dialog_guard = _bt()._check_dialog_param_requirements(agent, method, params)
     if dialog_guard is not None:
@@ -1050,6 +1055,14 @@ async def _execute_browser_capability_tool(
         threshold_bytes=agent.runtime.harness.tool_result_offload_threshold_bytes,
     )
     model_result = _attach_complete_payload(model_result, complete_payload)
+    # After the offload, deliberately. DOM.getSemanticTree is in OFFLOAD_METHODS
+    # and is the heaviest read on the surface, so a document-root tree is
+    # essentially always replaced by a stub here - annotating the pre-offload
+    # response put the bypass receipt on an object the model never sees, which
+    # is the same silent exemption in a different place.
+    _bt()._annotate_target_independent_read(
+        agent, method, params, model_result, ax_bypass_before,
+    )
     _bt()._observe_progress_after(agent, method, model_result)
     agent.trace.append({
         "type": "browser_call",

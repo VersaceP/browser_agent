@@ -1,0 +1,110 @@
+{
+  "sourceTask": "18754ae96f3a4161946d511f7c5b93ef",
+  "note": "Stable fallback snapshot of the five polluted historical row shapes. The test reads the original worktree artifacts when present.",
+  "expectedArtifact": {
+    "name": "taobao_hanfu_details",
+    "fields": ["rank", "productTitle", "unitPrice", "reviewScore", "reviews"]
+  },
+  "cases": [
+    {
+      "sourceArtifact": "taobao_hanfu_details-4a1685a4.json",
+      "sourceRow": 0,
+      "row": {
+        "pageUrl": "https://h5.m.taobao.com/awp/core/detail.htm?id=904253790656",
+        "pageUrlEvidenceText": "Mobile detail URL observed",
+        "productTitle": "挽春阁原创汉服【挽华裳】",
+        "productTitleEvidenceText": "Title came from the validated collection artifact",
+        "rank": 19,
+        "rankEvidenceText": "Rank came from the validated collection artifact",
+        "reviewScore": "login_blocked",
+        "reviews": ["Login wall blocked individual reviews - fresh fleet without Taobao session; desktop item.taobao.com and rate.tmall.com API both redirected to login.taobao.com"],
+        "sourceSelectorOrAxId": "6:117:117",
+        "sourceSelectorOrAxIdEvidenceText": "Observed AX node",
+        "sourceTool": "DOM.getAXTree",
+        "sourceToolEvidenceText": "Observed by DOM.getAXTree",
+        "unitPrice": "¥605.4",
+        "unitPriceEvidenceText": "Observed price label"
+      }
+    },
+    {
+      "sourceArtifact": "taobao_hanfu_details-4a1685a4.json",
+      "sourceRow": 1,
+      "row": {
+        "pageUrl": "https://h5.m.taobao.com/awp/core/detail.htm?id=898225906342",
+        "pageUrlEvidenceText": "Mobile detail URL observed",
+        "productTitle": "花汐记【无尽芳菲】原创汉服",
+        "productTitleEvidenceText": "Title came from the validated collection artifact",
+        "rank": 20,
+        "rankEvidenceText": "Rank came from the validated collection artifact",
+        "reviewScore": "login_blocked",
+        "reviews": ["Login wall blocked individual reviews - fresh fleet without Taobao session; desktop item.taobao.com and rate.tmall.com API both redirected to login.taobao.com"],
+        "sourceSelectorOrAxId": "6:425:425",
+        "sourceSelectorOrAxIdEvidenceText": "Observed AX node",
+        "sourceTool": "DOM.getAXTree",
+        "sourceToolEvidenceText": "Observed by DOM.getAXTree",
+        "unitPrice": "¥605.4",
+        "unitPriceEvidenceText": "Observed price label"
+      }
+    },
+    {
+      "sourceArtifact": "taobao_hanfu_details-72f9b5eb.json",
+      "sourceRow": 0,
+      "row": {
+        "pageUrl": "https://h5.m.taobao.com/awp/core/detail.htm?id=904253790656",
+        "pageUrlEvidenceText": "Mobile detail URL observed",
+        "productTitle": "挽春阁原创汉服【挽华裳】",
+        "productTitleEvidenceText": "Title came from the validated collection artifact",
+        "rank": 19,
+        "rankEvidenceText": "Rank came from the validated collection artifact",
+        "reviewScore": "",
+        "reviews": ["Login wall blocked individual reviews - fresh fleet without Taobao session; desktop item.taobao.com and rate.tmall.com API both redirected to login.taobao.com"],
+        "sourceSelectorOrAxId": "6:117:117",
+        "sourceSelectorOrAxIdEvidenceText": "Observed AX node",
+        "sourceTool": "DOM.getAXTree",
+        "sourceToolEvidenceText": "Observed by DOM.getAXTree",
+        "unitPrice": "¥605.4",
+        "unitPriceEvidenceText": "Observed price label"
+      }
+    },
+    {
+      "sourceArtifact": "taobao_hanfu_details-72f9b5eb.json",
+      "sourceRow": 1,
+      "row": {
+        "pageUrl": "https://h5.m.taobao.com/awp/core/detail.htm?id=898225906342",
+        "pageUrlEvidenceText": "Mobile detail URL observed",
+        "productTitle": "花汐记【无尽芳菲】原创汉服",
+        "productTitleEvidenceText": "Title came from the validated collection artifact",
+        "rank": 20,
+        "rankEvidenceText": "Rank came from the validated collection artifact",
+        "reviewScore": "",
+        "reviews": ["Login wall blocked individual reviews - fresh fleet without Taobao session; desktop item.taobao.com and rate.tmall.com API both redirected to login.taobao.com"],
+        "sourceSelectorOrAxId": "6:425:425",
+        "sourceSelectorOrAxIdEvidenceText": "Observed AX node",
+        "sourceTool": "DOM.getAXTree",
+        "sourceToolEvidenceText": "Observed by DOM.getAXTree",
+        "unitPrice": "¥605.4",
+        "unitPriceEvidenceText": "Observed price label"
+      }
+    },
+    {
+      "sourceArtifact": "taobao_hanfu_details-beed2131.json",
+      "sourceRow": 0,
+      "row": {
+        "pageUrl": "https://h5.m.taobao.com/awp/core/detail.htm?id=904253790656",
+        "pageUrlEvidenceText": "Mobile detail URL observed",
+        "productTitle": "挽春阁原创汉服【挽华裳】",
+        "productTitleEvidenceText": "Title came from the validated collection artifact",
+        "rank": 19,
+        "rankEvidenceText": "Rank came from the validated collection artifact",
+        "reviewScore": "N/A",
+        "reviews": ["CAPTCHA blocked individual reviews - login wall on fresh fleet redirected item.taobao.com to login.taobao.com"],
+        "sourceSelectorOrAxId": "6:117:117",
+        "sourceSelectorOrAxIdEvidenceText": "Observed AX node",
+        "sourceTool": "DOM.getAXTree",
+        "sourceToolEvidenceText": "Observed by DOM.getAXTree",
+        "unitPrice": "¥605.4",
+        "unitPriceEvidenceText": "Observed price label"
+      }
+    }
+  ]
+}

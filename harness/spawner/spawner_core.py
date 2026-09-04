@@ -189,7 +189,13 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                 },
             )
         self.static_context_block, self.static_context_hash = build_static_context_block(
-            self.runtime.harness.context_file
+            self.runtime.harness.context_file,
+            project_context_files=getattr(
+                self.runtime.harness, "project_context_files", None,
+            ),
+            append_system_prompt=getattr(
+                self.runtime.harness, "append_system_prompt", None,
+            ),
         )
         self.lifecycle = default_lifecycle_manager()
         self._capability_bundle: Optional[CapabilityBundle] = None

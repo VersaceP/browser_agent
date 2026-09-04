@@ -1587,7 +1587,7 @@ def _validate_cumulative_artifacts(
     failures: List[JsonDict] = []
     for validator in validators:
         failures.extend(_run_validator(validator, rows))
-    failures.extend(detect_placeholder_rows(rows))
+    failures.extend(detect_placeholder_rows(rows, expected_artifact=expected))
     failures.extend(detect_blocker_data_rows(rows, expected))
     return rows, source_paths, [*schema_failures, *failures], provenance
 
@@ -1642,7 +1642,14 @@ def _cumulative_row_quality(
         if validator_type in {"min_rows", "max_rows", "exact_rows", "unique", "set_equals"}:
             continue
         row_failures.extend(_run_validator(validator, [row]))
-    row_failures.extend(detect_placeholder_rows([row]))
+    row_failures.extend(detect_placeholder_rows([row], expected_artifact=expected))
+    # The lexical observer is deliberately NOT counted here. `-len(row_failures)`
+    # is the first element of the tuple below, so a word-list hit outranks
+    # evidence, provenance and completeness combined: a fully evidenced row
+    # whose real value is "Coming Soon" loses its slot to an evidence-free row
+    # that merely avoided the vocabulary. Deciding which duplicate survives a
+    # merge is authoritative - it destroys the other row - so it belongs to
+    # facts that can be checked, not to a phrase list.
     row_failures.extend(detect_blocker_data_rows([row], expected))
 
     expected_fields = field_names_from_specs(

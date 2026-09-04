@@ -136,6 +136,8 @@ from harness.planning.validator import (
     review_plan_revision,
     write_plan_review_audit,
 )
+from harness.prompts import guide_manifest
+from harness.prompts import guide_registry_errors
 from harness.results.completion_receipt import (
     build_completion_receipt,
     persist_completion_receipt,
@@ -180,6 +182,26 @@ from llm import (
     input_moderation_rejection,
     retry_usage_from_attempts,
 )
+
+
+def _guide_manifest_for(audience: str, logger: Any) -> str:
+    """Render the manifest, and say so when the guide corpus is degraded.
+
+    A guide that fails to load drops out of the manifest silently, so without
+    this the only symptom is a model that never reads guidance it was supposed
+    to have. The count goes to the run log rather than into the prompt: the
+    model cannot repair a guide file, and a person can.
+    """
+
+    errors = guide_registry_errors()
+    if errors and logger is not None and hasattr(logger, "write"):
+        logger.write("prompt.guides.degraded", {
+            "audience": audience,
+            "invalidCount": len(errors),
+            "errors": errors[:5],
+        })
+    return guide_manifest(audience)
+
 
 
 # Consecutive degenerate model responses (max_tokens truncation OR empty
@@ -1105,7 +1127,13 @@ class BrowserAgent:
         self._recent_tool_outcomes: List[JsonDict] = []
         self._current_step = 0
         self.static_context_block, self.static_context_hash = build_static_context_block(
-            self.runtime.harness.context_file
+            self.runtime.harness.context_file,
+            project_context_files=getattr(
+                self.runtime.harness, "project_context_files", None,
+            ),
+            append_system_prompt=getattr(
+                self.runtime.harness, "append_system_prompt", None,
+            ),
         )
 
     def _agent_event_payload(
@@ -1162,6 +1190,9 @@ class BrowserAgent:
                 ).strip(),
             )
             system_prompt = self._build_system_prompt()
+            self.prompt_context_hash = hashlib.sha256(
+                system_prompt.encode("utf-8")
+            ).hexdigest()
             tools = build_browser_agent_tool_specs(
                 self._visible_capability_methods(),
                 task_type=self._contract_task_type(),
@@ -1351,7 +1382,11 @@ class BrowserAgent:
                         usage=usage,
                         step=step,
                         conversation_id=f"browser:{self.runtime.agent_id}",
-                        context_hash=self.static_context_hash,
+                        context_hash=getattr(
+                            self,
+                            "prompt_context_hash",
+                            self.static_context_hash,
+                        ),
                     )
                     self._observe_cache_pressure(
                         usage_payload,
@@ -2536,7 +2571,7 @@ L2. Perception And Evidence
 - Read AXTree lines as `depth [id] role "label" [state] flags #|~ @x,y,w,h (+N omitted)`. `#` marks a preferred actionable target and `~` a secondary locatable candidate; `@x,y,w,h` is the element's viewport rect (absent on unpositioned nodes) — use it for spatial reasoning (relative position, overlap, on/off-screen), not for deriving click coordinates; act through the canonical id or a selector, never coordinates read off the rect. `[checked]`/`[disabled]` are control state, not layout. The one sanctioned coordinate source is visual_verify mode=visual_locate: it proves the capture's scale and origin before returning a `cssPoint` in viewport CSS pixels, and withholds the point entirely when it cannot. That is a different quantity from the rect on this line — do not try to derive one from the other. Layout flags such as `hidden`, `off`, `blocked`, `scroll` (scrollable container), `sticky`, `clip`, `zN` (stacking order) may appear before the `#`/`~`/`@` markers, and can be present on non-actionable lines too. Prefer `#` targets whose line shows no `hidden`/`blocked` flag; treat `blocked` as occlusion (dismiss the blocker first) and `scroll` as the container to scroll in nested-scroll flows. Depth is the node's depth in the unfiltered tree, so gaps like 0→3 are normal and consecutive lines are NOT contiguous siblings.
 - A trailing `(+N omitted)` means the panel COLLAPSED that node's dense subtree and rendered only some of its children — an AXTree read of a long list or table is therefore not an enumeration of it. Never derive a row count, a "that's all of them", or an absence claim from a line carrying `(+N omitted)`: scope a narrower DOM.getAXTree/DOM.getSemanticTree read to that container, or enumerate through batched DOM.getText/DOM.getAttribute over ids you obtained per-row.
 - AXTree ids are epoch-bound physical anchors. Any Page.navigate/reload/go, render recovery/recovered feedback, Page.create/switch/close, Runtime.evaluate, Hitl transition, or Input.* action can invalidate them. After such a change, call Page.getState as needed, then DOM.getAXTree and derive fresh ids before targeting. For same-instance multi-page workflows, track each pageId with its URL/title/purpose, switch serially with Page.switchTo, and never assume a snapshot from one page remains valid after Page.create or Page.switchTo.
-- Large DOM/text/attribute/tool results are offloaded under observations/. For an offloaded CURRENT AXTree, first use its `liveQuery` hint and call find_in_axtree: it searches the same in-memory tree by name/role without rereading the file. Use local_fs_search/local_fs_read for that AXTree only after find_in_axtree says the epoch is stale, or when you need historical line-level context that the focused query cannot express. Other offloads still use their `savedPath`, `outline`, `format`, and `query_with` normally. A snapshot-diff is directional evidence for the current tree, never proof that an unqueried target is absent. A subtree AX read can confirm a visible target but cannot prove absence elsewhere; retain the full-tree-first rule for a fresh page. If an AX response parses zero nodes while its declared nodeCount is positive, surface the browser data error instead of treating the subtree as empty.
+- Large DOM/text/attribute/tool results can be offloaded. Their savedPath/outline/query metadata is evidence rather than live page state; use the matching guide when you need the current paging, AXTree or local_fs semantics.
 - A truncated search/enumeration result or a miss on one observation surface supports only a scoped "not observed here" claim. Before declaring absence, list the surfaces actually checked and separately query any available fuller surface; preserve contrary observations instead of replacing them with the latest miss.
 - Screenshots produce a `savedPath` only. You cannot see the image from Page.screenshot output. Do not call Page.screenshot to read text, understand layout, identify selectors, or extract data. Use visual_verify only for bounded visual checks after visual uncertainty, overlays/CAPTCHA, canvas/image UI, layout mismatch, or DOM/visual disagreement. When the element can be located, prefer a cropped element check (visual_verify with selector or canonical id, fullPage=false) over viewport/fullpage capture.
 
@@ -2556,16 +2591,16 @@ L3. Lifecycle And HITL
 
 L4. Actions, Verification, Data
 - Prefer Input.* and current canonical ids. If a schema accepts id+selector together, they must identify the SAME element: id is primary and selector is the in-dispatch fallback; never invent the pair or issue a second action as a fallback. A receipt resolvedBy=selector-fallback/snapshot-recovery makes the source AX snapshot stale. Keep Input.click force=false unless current evidence makes the occlusion intentional. Standard Input actions already focus, scroll and stabilize; add manual scrolling only for nested/lazy discovery.
-- Select workflow: when choices are unknown, call DOM.inspectSelect once with pageId and the control id and/or selector. It returns controlId, controlKind, selectionMode and the options observed so far; there is no option-window or popup envelope to read. Inspecting a custom select can drive its menu with real key presses, so a successful inspect may already have changed the page: treat element ids captured before it as suspect and re-read DOM.getAXTree before targeting anything else. Pass a returned option id, exact label, or explicit value straight to Input.select in the `selections` array without converting between those fields; native selects require value. When the response's suggested_prompt asks to keep exploring, repeat the SAME Action with the startOption it names (Input.select keeps the same selections) rather than starting over. Input.select on a custom control reports the choices recorded during its keyboard operation, not a proven final state: when later behavior depends on the selection, inspect again or read the control's own value. Only native <select>, Ant Design and Element controls have select adapters: select-target-not-select means this control is ordinary UI, so stop calling Input.select for it and traverse fresh visible AX targets with one verified click per level. select-capability-unavailable is different - a capability, page surface, or frame was unavailable, so re-read Page.getState and DOM.getAXTree and continue once the control is observable again rather than reclassifying it. Never replay a failed select Action: the receipt does not say whether a side effect started, so treat the control as possibly already moved. Recover by failure family. Menu-binding failures (select-popup-not-found, select-popup-ambiguous, select-popup-not-ready) go DOM.getAXTree -> a page-wide DOM.getSemanticTree relating aria-controls/aria-owns/aria-activedescendant to a listbox/menu/option surface, which for a custom control often sits in a portal outside the control's own subtree -> only when the target is visibly on screen and no structured surface can name it, visual_verify mode=visual_locate, which LOCATES and never acts -> act on the id it returns with whichever ordinary Input.*/DOM.* method that control actually needs (a click, a keypress, typing to filter, a scroll to reveal), preferring a resolvedId over any coordinate -> re-observe. Option failures (select-option-not-in-current-window, select-option-label-ambiguous, select-option-disabled) mean the platform DID enumerate the menu and your request did not match it - a failure receipt carries no option list, so re-inspect and use a field THAT inspection returned, or continue with the startOption it named; the answer is not in a screenshot. select-options-incomplete is the opposite case - enumeration itself failed - so inspect again first, and fall back to the menu-binding ladder above when the menu is plainly on screen and still cannot be enumerated. A select failure never carries a retry permit: selectRecovery.retryAllowed is false on every failure, and while it stands the harness REFUSES every Input.select on that control before dispatch (tool_was_executed=false; selectGuard.blockedNow reports whether a control is blocked right now, and the block follows the control across id/selector as far as a successful inspection has linked those names in this navigation epoch) - naming a different option does not help, because the failure does not say whether keys were sent and changing params cannot make a second dispatch safe under an unknown outcome. A successful DOM.inspectSelect on that control lifts the block and reports it as selectReplayBlockCleared; read its retryAllowed, which is true only when that code's budget licenses one corrected selection using fields THAT response returned, and false when the block is merely lifted and the ladder is still the recovery. errorClassification.contractDrift=select_method_code_mismatch means the code arrived on an Action this harness does not expect to raise it: follow the recovery anyway and report the mismatch. On select-final-state-unproven or any public failure, inspect before correcting because state may have partly changed. A bare -32005 is a platform inspection failure: do not repeat it, do not infer a selector from the error text, and assume the failed Action may still have re-rendered or opened the control. Treat inspect option ids as opaque descriptors valid only for the menu generation that returned them.
+- Select workflow is stateful: inspect unfamiliar controls first, copy options only from live inspection, and never treat a failed select as automatically replay-safe. Consult the guide index when the receipt needs detailed select recovery.
 - Input.drag requires source and destination in the same document. Cross-frame/document endpoints are unsupported; an iframe source needs canonical ids for both endpoints because coordinate or relative destinations have ambiguous frame ownership.
 - Verify every state-changing action with the cheapest reliable signal: ActionFeedback, Page.getState for navigation/lifecycle, refreshed DOM.getAXTree, DOM.getText, or DOM.getAttribute(value).
 - Extraction priority: use DOM.getAXTree to enumerate stable canonical ids, then one native batched DOM.getText and one native batched DOM.getAttribute for related targets; repeat only after bounded collection growth and preserve target/item order. Use DOM.getSemanticTree(includeShadowDom=true) only when the connected schema advertises it and AXTree is insufficient. Call record_extraction after validation.
-- Runtime.evaluate is a read-only last resort. The current page epoch must already contain one structure read and one targeted native read; Page.getState satisfies neither. Supply runtime_policy (intent, effect, valid reason_kind, why structured tools are insufficient, cross_check_plan) and world=isolated. Never request main/auto, mutate state, bypass permissions, or replace Input/File actions. Only non_dom_state may trigger the harness-controlled strict-main retry, and only through the documented ABCP_MAIN_WORLD_REQUIRED:<global> ReferenceError. JSON mode requires a serializable value expression/invoked IIFE; use runtime_policy.record_name when that value is already the rows to persist.
+- Runtime.evaluate is a read-only last resort after current-epoch structural and targeted native evidence. Follow its live schema and policy receipt; never use it to mutate state or bypass native actions.
 - Use DOM.getImg for page-rendered visual assets when advertised. Batch up to 32 actual visual-node targets and provide options.path; prefer imageFormat=auto. Read each response.data.items entry independently: info.savedPath is the artifact, mimeType/extension/method say what was written, and fallbackReason explains screenshot fallback. Do not replay a whole batch for one failed item or target a wrapper when the asset node is available. Native export size follows the source asset, so verify width/height and naturalWidth/naturalHeight.
 {workflow_rule}
 - Any reusable data handed to LeadAgent must go through record_extraction. Row keys must match expected_artifact fields exactly. Critical fields need sourceTool, sourceSelectorOrAxId, pageUrl, and canonical <field>EvidenceText evidence fields such as rankEvidenceText where applicable.
 - An empty value is not evidence that a page has nothing. When a field listed in worker_contract's allow_empty_with_outcome really is absent, say so positively: write the field empty AND attach <field>Absence = {{"outcome":"confirmed_absent","regionId":...,"regionMaterialized":true,"overlayClear":true,"enumerationExhausted":true,"selectorCalibratedBy":"<a page of the same kind where this selector DID match>","sourceTool":...,"sourceSelectorOrAxId":...,"evidenceText":"<what the region shows instead>","navigationEpoch":<current>}}. Every flag must describe what you actually did in the CURRENT page epoch: a zero count taken before the region was revealed, behind an overlay, or with a selector never seen to match anything proves nothing, and the validator will return the obligations still outstanding. If you cannot discharge them, leave the field unset rather than declaring absence.
-- Reject empty, guessed, order-only, placeholder, sample, or template values. If the page truly shows absence/placeholder content, set `placeholderDetected: true` so validation can classify it. Never write a failure narrative (e.g. "未获取", "未明确展示", "located in an iframe", "not in the main DOM", "N/A") into a data field — that is a placeholder and validation rejects it; either obtain the real value or report a blocker.
+- Reject empty, guessed, order-only, sample, or template values. Never write YOUR OWN failure narrative (e.g. "未获取", "未明确展示", "located in an iframe", "not in the main DOM") into a data field: an explanation of why you could not read something is not the value of that field. Obtain the real value or report a blocker. This is about the origin of the text, not its wording — if the page itself displays "N/A", "暂无数据" or "Coming Soon" AS the value of the requested field, that IS the value: record it verbatim with its normal evidence and do not blank it, invent a substitute, or drop the row. A harness word list flags such values for Lead review; it does not reject them, so a truthful page reading is never the wrong answer. `placeholderDetected: true` is different and stronger: it is your own structured statement that this row holds placeholder content rather than data, so set it only when that is what you mean — validation treats it as fact and fails the row.
 - A selector returning no target is NOT proof the content is absent. Tabbed/sectioned detail pages (e.g. 包装信息 / 商品详情 / Reviews / Specs) only render their content after the tab/section is activated, and many images are lazy-loaded (real URL in data-src/srcset, revealed on scroll). Before concluding absence: click the relevant tab/heading, refresh Page.getState + DOM.getAXTree, scroll the section into view, enumerate the relevant canonical ids, then batch DOM.getText/DOM.getAttribute (include src, lazy-load data attributes, and srcset when needed). Content inside an iframe surfaces through frame-aware canonical ids (DOM.getAXTree / DOM.getSemanticTree emit frameId:axNodeId:domNodeId across frames) — try targeting those ids; there is no frame-switch action (Page.switchTo changes tabs/pages, not frames), so if the frame's content cannot be reached with the available DOM tools, report a blocker instead of assuming absence. Only report absence after these steps.
 
 L5. Recovery
@@ -2574,11 +2609,11 @@ L5. Recovery
 - Input.scroll has no top-level id/selector. Target mode uses target={{id?,selector?}} (optional real ancestor container) to reveal an element and requires targetVisible=true. Container mode uses a visible container plus direction/amount; reveal that container first. Viewport mode has neither locator. amount=0 is a read-only state check only for container/viewport. Read layers[].delta and completedReason; boundary-reached forbids repeating the same direction. A failure may still have moved the page, so inspect state and fresh AX instead of replaying.
 - If the target stays invisible after target mode, locate the nearest scrollable parent container (the AXTree `scroll` flag marks scrollable containers) and pass it as `container`, not the window.
 - If an action is occluded by a dismissible business overlay, call dismiss_overlay once with the blocked target instead of manually reproducing its native close-control/Escape ladder. dismiss_overlay itself has no backdrop-coordinate rung: it needs an independent native point hit-test it does not have, so it acts only through native close controls and Escape. Respect its blocked result for auth/paywall surfaces and retry the original action only when its structured result permits it.
-- When a page-facing call fails and the deterministic recovery for that failure has been tried without success, the receipt may carry `visualRecoveryHint`. It means a visual locate is available, not that you should use it: reach for it when you have reason to believe the target is on screen while DOM.getAXTree / DOM.getSemanticTree cannot name it (canvas, text baked into an image, a purely visual control, a framework that renders options with no addressable node). Call visual_verify with mode=visual_locate and describe the target in `expected.target`. A `resolvedId` is a durable handle on the AX node that covered the pixel: it says WHERE the node is, not WHAT it is, so it is not a permit for an arbitrary Action. Pick the method by the node's own role and let the live schema accept the id — a button takes Input.click, a text field takes Input.type, a scrollable ancestor takes Input.scroll, and Input.select takes the CONTROL, never an option id, which is what a locate on an open menu usually returns. Re-observe afterwards. A `cssPoint` is a viewport CSS point for ONE Input.click{{pageId,x,y}}, after which you re-observe to verify what happened; it is valid for this page state only, must never be persisted into a skill, and must never be reused once the page changes. A `coordinateRefused` means the geometry could not be proven: re-observe and act on an id, never invent or reuse a point. A located target carrying `consequential` is still governed by L0.
+- A visualRecoveryHint makes visual location available after structured recovery; it does not authorize an action or waive L0. Do not estimate coordinates, persist a visual handle, or act without fresh post-action evidence.
 - Use DOM.getSemanticTree when AXTree is insufficient and you need tag hierarchy, complete local bounds, Shadow DOM, selector debugging, or target text proven to exist only on the semantic DOM surface. It is heavy and offloaded; prefer DOM.getAXTree + focused DOM.getText/DOM.getAttribute for routine perception. DOM.getAXTree / DOM.getSemanticTree return canonical ids: frameId:axNodeId:domNodeId.
 - URL/title/page-shell success is not proof that task content is complete. `contentCompleteness` contains attributed observations only: marker matches, missing regions, collection counts/states, exhaustion receipts and actions attempted. Compare those facts with the user goal and other observation surfaces; decide the next falsifiable experiment yourself. Do not treat the tracker, a single surface miss, or a worker classification as a completion or absence verdict.
 - A section heading, drawer shell, loading skeleton, or preview rows do not satisfy an explicit repeated-record target. For a repeated collection, identify one scroll container OR one load-more control, then run a bounded native cycle: refresh AXTree, enumerate row/field ids, batch text/attributes, deduplicate locally, materialize once, and repeat. Nested lists, multiple scroll layers, and next-page pagination require a probed slow-path decomposition. A persistent skeleton with zero target records is materialization failure, not success and not target_absent. If task-declared suppression_signals match hidden request evidence, report blocked_content_suppression; request HITL only when an interactive login/CAPTCHA surface actually requires the user.
-- local_fs_* inspects offloaded evidence; it is not live page state. If repeated local_fs searches return the same evidence, pivot to fresh DOM/Page/Input perception or finalize with a blocker.
+- local_fs_* inspects offloaded evidence, not live page state. Do not turn repeated unchanged file reads into a page-state conclusion.
 - Visual reality check before giving up: whenever your DOM evidence contradicts the task's expectation — an expected row/rank/field/section/value is missing, a collection returns 0 rows repeatedly, or scrolling/searching keeps finding nothing — bring the region into view with Input.scroll target mode, then visual_verify with a claim describing ONE page's ONE region (e.g. "the reviews section of this product page"), never the whole phase's expectation. A screenshot can only answer a question about what it depicts: asking a detail page whether the cohort's 16 items exist gets a truthful "no" that says nothing about the field you are missing. Persist the observation via record_extraction and cite that savedPath alongside your other evidence.
 - A visual verdict is an advisory model assertion, not a measurement: it may send you back to look again, but it never closes a field. "I cannot see it" is not "it is not there" — a region that is off-screen, behind a tab/accordion, or not yet mounted produces the same picture as an empty one. To record a field as confirmed_absent you still owe the mechanical obligations (region materialized in this navigation epoch, overlay clear, enumeration exhausted, selector calibrated against a peer that HAS the content, the page's own empty-state text captured, source tool/selector recorded). Never conclude something is absent from DOM probing alone, and never from a screenshot alone.
 - If a needed method is blocked by task_type policy, final_answer with status="incomplete" and include {{"classification":"blocked_cross_task_type_required","method":"...","task_type":"...","reason":"..."}} for LeadAgent replan.
@@ -2591,7 +2626,7 @@ L6. Termination
 - final_answer.status must be one of the tool schema values: done, partial, incomplete, extraction_inconclusive.
 - final_answer.answer must be JSON shaped like {{"outcome":"done|partial|blocked|failed","data":{{}},"evidence":[],"blockers":[],"next_steps":[]}}. Put large rows in record_extraction artifacts and reference their savedPath, not inline data.
 - Before you finalize: a task you could only have completed by signing in, paying, ordering, transferring, or deleting on the user's behalf is not a task you completed. Report it as blocked with the specific action that needs the person, and say what you did verify. Reporting the boundary honestly is the successful outcome for those tasks; it is never a failure to be worked around.
-""" + self.static_context_block
+""" + _guide_manifest_for("browser", getattr(self, "logger", None)) + self.static_context_block
 
     def _contract_task_type(self) -> str:
         contract = getattr(self, "worker_contract", None)
@@ -3328,7 +3363,13 @@ class LeadAgent:
             pinned_browser_context
         )
         self.static_context_block, self.static_context_hash = build_static_context_block(
-            self.runtime.harness.context_file
+            self.runtime.harness.context_file,
+            project_context_files=getattr(
+                self.runtime.harness, "project_context_files", None,
+            ),
+            append_system_prompt=getattr(
+                self.runtime.harness, "append_system_prompt", None,
+            ),
         )
         self.lifecycle = default_lifecycle_manager()
         self.lifecycle_events = _lifecycle_recorder_for(
@@ -5184,6 +5225,9 @@ class LeadAgent:
         )
         dispatch_tool = build_lead_tool_dispatcher(self)
         system_prompt = self._build_system_prompt()
+        self.prompt_context_hash = hashlib.sha256(
+            system_prompt.encode("utf-8")
+        ).hexdigest()
         try:
             lead_timeout_step_retries = max(
                 0,
@@ -5449,7 +5493,11 @@ class LeadAgent:
                         usage=usage,
                         step=step,
                         conversation_id=f"lead:{self.runtime.agent_id}",
-                        context_hash=self.static_context_hash,
+                        context_hash=getattr(
+                            self,
+                            "prompt_context_hash",
+                            self.static_context_hash,
+                        ),
                     )
                     self._observe_cache_pressure(
                         usage_payload,
@@ -6022,13 +6070,12 @@ Trust boundary: the original user task is the authoritative objective. Accepted 
 Lead state flow:
 0. First call emit_task_plan with a complete v1 phase plan. Every phase needs its own task_type, objective, worker_task, stage_hint and expected_artifact; max_attempts is only for an intentional hard attempt budget. requiredControls is ONLY for a form_filling/form_interaction phase whose deliverable is one receipt row per independently requested business control: it contains stable {controlKey,label,section?} objects—never AX ids—and every artifact row carries the same controlKey plus a page-read non-empty filledValue. The harness derives exact_rows, set_equals(controlKey), unique(controlKey), and non-empty key/value checks. Never use requiredControls for incidental search/pagination/download controls or for fields within each product/file/listing row: use fields/required_fields for presence, nonempty_fields only when a value must be non-empty, and allow_empty_with_outcome for evidence-backed omissions. Every required_fields entry of type array must state what an empty array means: list it in nonempty_fields (never empty), in allow_empty (empty needs no evidence), or in BOTH nonempty_fields and allow_empty_with_outcome (empty only with an evidence-backed outcome) — allow_empty_with_outcome alone filters nothing and silently accepts an empty array. If entering a query merely enables collecting search results, use web_search with stage_hint=collection; split it from a genuine form-completion deliverable when both are independently requested. Any mechanical rejection returns a candidateHash: fix it with repair_task_plan and small JSON-Pointer edits rather than resending a full plan, and never resend a candidate whose errors you have not changed. repair_task_plan may set an existing value or remove an object property only; adding/removing/reordering phase or field array elements is structural and requires a materially changed complete plan.
    A phase's task_type decides which ABCP method domains its worker can call, and it is NOT inherited from the plan: classify each phase by what that phase does. A goal like "search a site and collect listings, then save the images and video" is a web_search phase followed by a file_download phase — typing the query, submitting it, and paging the site's results belong to web_search when the artifact is the listings. Labelling the export phase web_scrape removes the Download domain and the worker will report the files as impossible to save. The emit_task_plan receipt lists the disabled domains per phase; if a phase needs a domain shown as disabled, fix that phase's task_type and re-emit before spawning.
-   Phase scheduling is driven by depends_on: OMITTING it means the phase implicitly depends on ALL phases listed before it (strict serial order); depends_on=[] declares an independent phase; depends_on=["p1"] lists the exact data dependencies. Declare only true data dependencies — e.g. every detail phase depends only on the collection phase, not on its sibling detail phases — so independent phases can run in parallel. A spawn whose dependencies are not yet validated_done is rejected with dependency_not_ready; wait for the dependency instead of retrying. A replan is a COMPLETE replacement: first wait for all live workers, then include every currently known remediation phase in the same emit_task_plan call. Because it replaces the accepted plan, every replan MUST carry a non-empty plan.replan_reason; without that field the call is rejected as replan_reason_required and nothing changes, so re-sending the same phases cannot help.
+   depends_on declares the plan's real data dependencies: omitting it means serial dependency on earlier phases, [] means independent, and an explicit list names exact producers. A replan replaces the accepted plan and needs a non-empty replan_reason. Cohort and checkpoint details are mechanically validated; consult the guide index when shaping or replacing one.
    If the user requests spacing between batch rows or dependent phases, set plan/phase pacing with row_interval_seconds or phase_interval_seconds plus optional jitter_ratio. Row pacing keeps the warm tab; phase pacing waits before slot reservation. Do not invent task-level pacing.
-   For repeated homogeneous rows, do not create one detail phase per row. An initial ordinary downstream phase consuming one upstream artifact must declare input_artifacts=[{phase_id, artifact_name}] and the same producer in depends_on. When that validated source has matching exact count and preserves the downstream unique identity, omit execution_role/batch_source/cohort_source/row_selection/batch_rows: the harness derives the cohort at spawn. Use an explicit cohort contract for joins, semantic subsets, per-row isolation, HITL/checkpoints, or multiple inputs. Direct batch_rows are allowed only for identities explicit in the user instruction and require batch_rows_provenance={source:user_instruction, identity_fields:[...]}. For checkpoint/replan or a bounded slice, use cohort_source plus row_selection with source_indices. Never guess a source from plan order or similar field names; a confidence role with an unbounded selector is rejected.
-   The confidence ladder is CONDITIONAL, not a phase template: use probe (at most 1 row) only when the reusable path is unknown, then obey the checkpoint's requiredNextRole. A continuation that newly proves a reusable candidate upgrades to validation; a validated bulk whose trace no longer proves the candidate downgrades to continuation. Use bulk only when requiredNextRole=bulk and set row_independent=true. Do not pre-create validation/bulk solely because multiple rows exist, and do not invent empty ladder stages. Inside an active checkpoint cohort, failed or remaining rows MUST use checkpoint-bound continuation. Use remediation only for an explicit failed-row set outside every active checkpoint; remediation cannot bind a checkpoint.
+   For repeated homogeneous rows, use an upstream validated artifact and its real producer dependency rather than guessing a cohort from phase order. Direct batch_rows are allowed only for user-explicit identities with provenance. The confidence ladder is conditional: do not invent probe/validation/bulk phases merely because several rows exist.
 """ + lead_bulk_execution_rule + """
    If every row truly requires a separate identity/session boundary, set batch_policy.requires_isolation_per_row=true and explain that boundary; needs_isolated_session alone isolates the worker, not each row. Never batch heterogeneous rows, per-row isolation boundaries, HITL/visual flows, or rows whose decisions depend on earlier results.
-   A validated result's replanCheckpoint is a mechanical confidence boundary. The bound successor must use requiredNextRole, the exact checkpoint id(s), the same cohort and merged artifact shape, and preserve or strengthen all non-slice validators; selector identity range/set/unique obligations may follow remainingSourceIndices. HARD REQUIREMENT: retain the checkpoint's validated predecessor in the replacement plan and list its exact phase id in successor depends_on. Bind exactly one successor per active checkpoint and never cross-bind cohorts. A continuation that newly proves a reusable candidate upgrades to validation; a bulk trace that loses proof downgrades to continuation. Do not repeat validated indices or create horizontal single-row exploration. Initial plans must not invent checkpoint ids; the legacy singular id is only for one active checkpoint. fastPathReceiptCandidate is audit-only and must not be executed.
+   A validated checkpoint is a mechanical confidence boundary. Preserve its predecessor, cohort, artifact contract and non-slice validators in any successor; never cross-bind cohorts or execute an audit-only candidate.
    validators is an ARRAY of typed objects, never a name-keyed dict. Use only the advertised VALIDATOR_TYPES. Core shapes include exact_rows, range, set_equals for exact identities, unique, url_pattern, required_fields and field_nonempty; use dedicated download_completed/file_integrity, upload_selected/upload_confirmed, and image_exported evidence validators for file effects. A numeric range cannot express a sparse set. Keep file_download and file_upload separate and never invent validator names.
    A field that some target pages legitimately do not carry (a product with no written reviews, an item with no pros/cons section) must be declared emptiable, or the phase demands data that does not exist and burns every attempt against a page that will not change. Declare it as expected_artifact.allow_empty_with_outcome={"reviews":["confirmed_absent"]}. That is a licence to prove absence, not to skip the field: the row must still carry <field>Absence with regionMaterialized, overlayClear, enumerationExhausted, selectorCalibratedBy, sourceTool, sourceSelectorOrAxId, evidenceText and navigationEpoch, and an incomplete proof still fails. Declare it only for fields the target genuinely may omit, never as a blanket relaxation.
    When the user asks to save page-rendered visual assets (img/picture/SVG/canvas) and DOM.getImg is present in the live capability set exposed for that phase's task_type, keep the export in the page-owning phase and instruct one batched DOM.getImg call (up to 32 targets) before leaving the page. Do not mechanically split that image export into an image-URL artifact followed by a separate Download.start phase. Validate the returned savedPath items with image_exported and file_integrity.
@@ -6063,14 +6110,9 @@ Lead state flow:
 13. Before each action, distinguish established receipts, unverified claims and counterevidence. After repeated failure, state the last hypothesis, what falsified it, and the smallest changed experiment; use the global run budget deliberately.
 14. Stay within runtime_limits. Never exceed runtime_limits.max_browser_agent_instances live BrowserAgent slots, even if max_browser_agents is higher. Do not create a fresh slot just to visit another URL/listing/detail page. Put related page work inside one worker, or spawn a continuation with reuse_from_worker_id/preferred_slot_id so it reuses the prior idle slot and may see prior page candidates. Use separate slots only for deliberate parallelism, different task_type/session/account, or a hard reset after page_crashed / hitl_* terminal status; never as blind batch fan-out.
 
-BrowserAgent terminal-status decision table:
-- done: advance only when required artifacts and phase validation are done; raw worker status alone is not completion proof.
-- partial: only rows/artifacts explicitly shown as validated are reusable. Continue the uncovered obligations in the same phase when its durable contract is unchanged; never advance dependencies or claim completion from raw partial status.
-- step_budget_exhausted: check resultLevels.l2 data/evidence and extraction artifacts first. If usable, continue narrowly; otherwise change strategy.
-- context_limit_exceeded: do not retry verbatim; spawn with narrower task boundaries and a slimmer result_contract.
-- page_crashed: recreate a page in the SAME assigned Fleet/session when routing receipts permit it. Never replace a pinned, named, or authenticated Fleet merely because one renderer/page crashed. If exact unsaved page-local state was required, distinguish page_continuation_lost from a recoverable page recreation.
-- extraction_inconclusive: switch probing strategy; for visual uncertainty, use BrowserAgent visual_verify guidance, not raw screenshot interpretation.
-- hitl_waiting, hitl_timeout, page_settled_after_hitl, stale_pause_deadlock, still_challenge_after_hitl, browser_error_after_hitl: do not auto-spawn the same task and never escape a bound login/session by silently choosing a fresh Fleet. Follow the structured routing/HITL next_instruction; surface the blocker when an operator action or reset is required.
+Worker terminal status is a receipt, not completion proof. Reuse only artifacts
+whose validation and evidence meet the phase contract; consult the guide index
+when a status or continuation route needs detailed interpretation.
 """ + LEAD_FLEET_ROUTING_DECISION_GUIDANCE + """
 - browser_api_contract_error: switch method or report the platform-side bug.
 - blocked_cross_task_type_required: replan a new phase with the appropriate task_type.
@@ -6091,7 +6133,7 @@ Before choosing done, reread the original goal against the attributed receipts,
 worker claims, unresolved obligations and counterevidence in context.  If any
 requested deliverable remains unsupported, say partial/incomplete and name it;
 do not upgrade an artifact path or a worker claim into completion evidence.
-""" + self.static_context_block
+""" + _guide_manifest_for("lead", getattr(self, "logger", None)) + self.static_context_block
 
 
 __all__ = [

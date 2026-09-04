@@ -425,37 +425,6 @@ def _annotate_dom_batch_response(method: str, response: Any) -> Any:
     }
     return copied
 
-def _check_screenshot_misuse(
-    method: str,
-    params: JsonDict,
-    reason: str = "",
-) -> Optional[JsonDict]:
-    if method != "Page.screenshot":
-        return None
-    text = " ".join(
-        str(value or "")
-        for value in (
-            reason,
-            params.get("purpose") if isinstance(params, dict) else "",
-        )
-    )
-    if _bt().SCREENSHOT_ALLOWED_PURPOSE_RE.search(text):
-        return None
-    if not _bt().SCREENSHOT_MISUSE_RE.search(text):
-        return None
-    return {
-        "status": "rejected",
-        "reason": "page_screenshot_not_model_visible",
-        "method": method,
-        "tool_was_executed": False,
-        "next_instruction": (
-            "Page.screenshot returns only a savedPath; the model cannot inspect"
-            " that image from this tool result. Use DOM.getAXTree,"
-            " DOM.getText, DOM.getAttribute, or"
-            " visual_verify for bounded visual arbitration."
-        ),
-    }
-
 def _default_semantic_tree_shadow_dom(
     method: str,
     params: JsonDict,

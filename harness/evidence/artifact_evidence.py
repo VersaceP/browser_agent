@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from harness.evidence.extraction_artifacts import field_name_from_spec, field_names_from_specs
 from harness.utils import JsonDict
@@ -209,15 +209,40 @@ def _row_has_blocker_explanation(row: JsonDict) -> bool:
     return False
 
 
-def _row_self_reports_placeholder(row: JsonDict) -> bool:
-    for key in (
-        "placeholderDetected",
-        "placeholder_detected",
-        "isPlaceholder",
-        "is_placeholder",
-        "dataPlaceholder",
-        "data_placeholder",
-    ):
+# Control metadata a row may set to confess that it is a stub. These are plain
+# top-level names, so a task whose OWN deliverable is a field by one of these
+# names collides with them - auditing form controls and reporting
+# `{"field": "email", "isPlaceholder": true}` is a correct answer, not a row
+# admitting it holds nothing.
+PLACEHOLDER_SELF_REPORT_KEYS = (
+    "placeholderDetected",
+    "placeholder_detected",
+    "isPlaceholder",
+    "is_placeholder",
+    "dataPlaceholder",
+    "data_placeholder",
+)
+
+
+def _self_report_keys_for(expected_artifact: Optional[JsonDict]) -> Tuple[str, ...]:
+    """Control keys still readable as metadata under THIS artifact contract.
+
+    A name the plan declares as a business field means what the plan says it
+    means. Reading it as a placeholder confession would let the harness fail a
+    phase for delivering exactly what it was asked for.
+    """
+
+    expected = expected_artifact if isinstance(expected_artifact, dict) else {}
+    declared = set(field_names_from_specs(expected.get("fields") or []))
+    declared.update(field_names_from_specs(expected.get("required_fields") or []))
+    return tuple(key for key in PLACEHOLDER_SELF_REPORT_KEYS if key not in declared)
+
+
+def _row_self_reports_placeholder(
+    row: JsonDict,
+    keys: Tuple[str, ...] = PLACEHOLDER_SELF_REPORT_KEYS,
+) -> bool:
+    for key in keys:
         if row.get(key) is True:
             return True
         value = row.get(key)
@@ -308,16 +333,49 @@ def detect_blocker_data_rows(
 def detect_placeholder_rows(
     rows: List[JsonDict],
     *,
+    expected_artifact: Optional[JsonDict] = None,
     limit: Optional[int] = DIAGNOSTIC_FAILURE_LIMIT,
 ) -> List[JsonDict]:
+    """Placeholder rows that the ROW ITSELF declares. Decidable, so it fails.
+
+    The vocabulary half moved to :func:`observe_placeholder_text_rows`. A hand
+    written list of site empty-state copy cannot carry a verdict: it misses
+    every phrasing its author did not anticipate ("Be the first ONE to review"
+    slips past "be the first to"), and it condemns a legitimate value that
+    happens to read like one — a product actually named "Coming Soon", a field
+    whose true answer is "N/A". A row asserting ``isPlaceholder: true`` involves
+    no such guess.
+    """
+
+    keys = _self_report_keys_for(expected_artifact)
     bad: List[JsonDict] = []
     for index, row in enumerate(rows):
-        if _row_self_reports_placeholder(row):
+        if _row_self_reports_placeholder(row, keys):
             bad.append({
                 "type": "data_placeholder",
                 "row": index,
                 "reason": "row_self_reported_placeholder",
             })
+    return _capped(bad, limit)
+
+
+def observe_placeholder_text_rows(
+    rows: List[JsonDict],
+    *,
+    expected_artifact: Optional[JsonDict] = None,
+    limit: Optional[int] = DIAGNOSTIC_FAILURE_LIMIT,
+) -> List[JsonDict]:
+    """Values that READ like site empty-state copy. Advisory, never a verdict.
+
+    Reported so the Lead can look, not so the harness can decide. The reader
+    has the page evidence and the user's request; this function has a word
+    list.
+    """
+
+    keys = _self_report_keys_for(expected_artifact)
+    seen: List[JsonDict] = []
+    for index, row in enumerate(rows):
+        if _row_self_reports_placeholder(row, keys):
             continue
         matched_fields: List[JsonDict] = []
         for field, value in row.items():
@@ -334,12 +392,19 @@ def detect_placeholder_rows(
                     "pattern": pattern,
                 })
         if matched_fields:
-            bad.append({
-                "type": "data_placeholder",
+            seen.append({
+                "type": "placeholder_text_suspected",
+                "severity": "advisory",
                 "row": index,
                 "fields": matched_fields[:5],
+                "message": (
+                    "These values match known empty-state phrasings. That is a"
+                    " word-list reading, not a verdict: confirm against the page"
+                    " evidence whether the row holds the real value, whether the"
+                    " content never loaded, or whether absence needs proving."
+                ),
             })
-    return _capped(bad, limit)
+    return _capped(seen, limit)
 
 
 def detect_stub_rows(

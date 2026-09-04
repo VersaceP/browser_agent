@@ -1002,7 +1002,16 @@ class HarnessConfig:
     fleet_slot_manual_reset_after_failures: int = 3
     worktree_dir: str = "worktree"
     runs_dir: str = "runs"
+    # Legacy single-file project instructions. Prefer project_context_files for
+    # ordered, source-labelled XML project context in new configurations.
     context_file: Optional[str] = None
+    # Stable project-instruction files injected into the system prompt in list
+    # order. Entries accept either a path string or {"path": ..., "scope":
+    # ...}; scope is a model-visible provenance label, not a permission grant.
+    project_context_files: List[JsonDict] = field(default_factory=list)
+    # A trusted deployment-owned, stable system-prompt suffix. Dynamic task
+    # facts do not belong here because they would defeat prefix cache reuse.
+    append_system_prompt: str = ""
     strategy_bank_path: str = "strategy_bank/strategy_bank.json"
     memory_context: str = (
         "ABCP agent harness: drive the browser only through ABCP atomic capabilities. "
@@ -1122,7 +1131,11 @@ class HarnessConfig:
     #                (observation keywords) remain suggest-only because soft
     #                text signals have false positives (a cookies article hits
     #                "we use cookies") and auto-clicking them is unacceptable.
-    auto_intercept: str = "p0p1"
+    # `suggest` reports the overlay signal and candidate tool call; it does
+    # not click or press Escape on the page. Automatic dismissal is the
+    # harness choosing and performing a page action on the model's behalf,
+    # which is a different thing from a mechanical check, so it is opt-in.
+    auto_intercept: str = "suggest"
     # DOM.getSemanticTree usage policy (Phase B). The MODEL may now call it
     # directly as a diagnostic (un-banned in tool_policy; the model prompt limits
     # it to local diagnostics when AXTree is insufficient). It is still 3.65x
@@ -1395,6 +1408,16 @@ class HarnessConfig:
             worktree_dir=data.get("worktree_dir", cls.worktree_dir),
             runs_dir=data.get("runs_dir", cls.runs_dir),
             context_file=data.get("context_file"),
+            project_context_files=(
+                list(data.get("project_context_files"))
+                if isinstance(data.get("project_context_files"), list)
+                else []
+            ),
+            append_system_prompt=(
+                str(data.get("append_system_prompt"))
+                if isinstance(data.get("append_system_prompt"), str)
+                else ""
+            ),
             strategy_bank_path=data.get(
                 "strategy_bank_path",
                 cls.strategy_bank_path,

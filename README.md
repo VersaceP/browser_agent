@@ -257,7 +257,12 @@ Common harness options:
     "hitl_poll_interval_seconds": 2,
     "hitl_wait_timeout_seconds": 600,
     "worktree_dir": "worktree",
-    "context_file": null
+    "context_file": null,
+    "project_context_files": [
+      {"path": "ORG_INSTRUCTIONS.md", "scope": "organization"},
+      {"path": "CLAUDE.md", "scope": "project"}
+    ],
+    "append_system_prompt": ""
   }
 }
 ```
@@ -280,7 +285,9 @@ Common harness options:
 - `hitl_poll_interval_seconds`: polling interval after `Hitl.requestPause`.
 - `hitl_wait_timeout_seconds`: maximum wait time for human intervention.
 - `worktree_dir`: root directory for run logs and artifacts.
-- `context_file`: optional static prompt context file. Keep it stable during a task, or it can reduce prompt-cache reuse.
+- `context_file`: legacy optional single static prompt-context file. It remains supported; prefer `project_context_files` for new configuration.
+- `project_context_files`: ordered static project-instruction files. An item is either a path string or `{ "path": "...", "scope": "..." }`. The harness emits them as escaped `<project_context><project_instructions ...>` XML in that order; duplicate files are injected once. Use stable files only.
+- `append_system_prompt`: trusted deployment-owned static suffix, emitted before project context as escaped `<append_system_prompt>`. It is for stable policy additions, never task-specific facts.
 
 ## Running Tasks
 
@@ -373,7 +380,7 @@ The harness records per-call cache metrics returned by the provider:
 
 `estimated_cost_usd` is currently reserved as `null`; model pricing can be added later through configuration.
 
-`harness.context_file` is disabled by default. If enabled, its contents are injected into the static system prompt and its sha256 is recorded in usage diagnostics. Use it only for stable context. Fast-changing context should be appended dynamically by the caller instead.
+The static prompt-context fields are disabled by default. Their rendered XML is hashed as part of the full prompt fingerprint recorded in usage diagnostics; the guide manifest is included in that fingerprint too. Keep these fields stable within a task to preserve prefix-cache reuse. Do not place current date, cwd, or task-specific observations here.
 
 ## Lead Agent Tools
 
@@ -383,6 +390,7 @@ The harness records per-call cache metrics returned by the provider:
 - `wait_browser_agents`: wait for one or more browser workers.
 - `list_browser_agents`: inspect active workers.
 - `lead_save_artifact`: persist LeadAgent-reshaped rows from trusted extraction evidence.
+- `read_harness_guide`: load a paged, versioned operating guide from the prompt's compact guide index when a detailed receipt/recovery rule is relevant.
 - `final_answer`: finish the LeadAgent run.
 
 LeadAgent should use BrowserAgent phases. BrowserAgent's `browser_call` uses:
