@@ -70,7 +70,7 @@ async def load_capability_bundle(
     # delayed System.getCapabilities request after the slot is already active.
     if caps_response is None:
         caps_response = await browser.call(
-            "System.getCapabilities", {"guide": "omit"}
+            "System.getCapabilities", {"guide": "content"}
         )
     raw_capabilities = _capability_actions_from_response(caps_response)
     bundle.agent_guide = _agent_guide_from_capabilities_response(caps_response)

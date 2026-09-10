@@ -2,7 +2,7 @@
   "method": "Page.screenshot",
   "description": "Captures the full page, viewport, rectangular region, or resolved element as an image; element captures also return the target Semantic Tree.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:4348a1a737674c20d6554ae434ea98050c0d5fee0d58837d1609a4b3e2d64b91",
+  "catalogRevision": "sha256:46c89baed493789bfb9424bc488513360a2f0047f2a530a729933a4bbe4aff12",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -130,6 +130,11 @@
             "minimum": 0,
             "description": "Captured height in pixels."
           },
+          "scaleFactor": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "System display scale factor used for the capture."
+          },
           "target": {
             "type": "object",
             "propertyNames": {
@@ -161,6 +166,7 @@
           "mimeType",
           "width",
           "height",
+          "scaleFactor",
           "target",
           "mode"
         ],
@@ -194,6 +200,11 @@
             "type": "number",
             "minimum": 0,
             "description": "Captured height in pixels."
+          },
+          "scaleFactor": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "System display scale factor used for the capture."
           },
           "target": {
             "type": "object",
@@ -226,6 +237,7 @@
           "mimeType",
           "width",
           "height",
+          "scaleFactor",
           "target",
           "mode"
         ],
@@ -259,6 +271,11 @@
             "type": "number",
             "minimum": 0,
             "description": "Captured height in pixels."
+          },
+          "scaleFactor": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "System display scale factor used for the capture."
           },
           "target": {
             "type": "object",
@@ -291,6 +308,7 @@
           "mimeType",
           "width",
           "height",
+          "scaleFactor",
           "target",
           "mode"
         ],
@@ -324,6 +342,11 @@
             "type": "number",
             "minimum": 0,
             "description": "Captured height in pixels."
+          },
+          "scaleFactor": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "System display scale factor used for the capture."
           },
           "target": {
             "type": "object",
@@ -389,7 +412,7 @@
                               "type": "null"
                             }
                           ],
-                          "description": "Frame-owner node identity, or null when unavailable."
+                          "description": "Frame-owner node identity. Cross-origin or opaque child frames may keep this null even when status is complete; use parentFrameId and frameId for cross-frame routing."
                         },
                         "url": {
                           "type": "string",
@@ -518,6 +541,7 @@
           "mimeType",
           "width",
           "height",
+          "scaleFactor",
           "target",
           "mode",
           "semanticTree"
@@ -569,6 +593,11 @@
                 "minimum": 0,
                 "description": "Captured height in pixels."
               },
+              "scaleFactor": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description": "System display scale factor used for the capture."
+              },
               "target": {
                 "type": "object",
                 "propertyNames": {
@@ -600,6 +629,7 @@
               "mimeType",
               "width",
               "height",
+              "scaleFactor",
               "target",
               "mode"
             ],
@@ -633,6 +663,11 @@
                 "type": "number",
                 "minimum": 0,
                 "description": "Captured height in pixels."
+              },
+              "scaleFactor": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description": "System display scale factor used for the capture."
               },
               "target": {
                 "type": "object",
@@ -665,6 +700,7 @@
               "mimeType",
               "width",
               "height",
+              "scaleFactor",
               "target",
               "mode"
             ],
@@ -698,6 +734,11 @@
                 "type": "number",
                 "minimum": 0,
                 "description": "Captured height in pixels."
+              },
+              "scaleFactor": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description": "System display scale factor used for the capture."
               },
               "target": {
                 "type": "object",
@@ -730,6 +771,7 @@
               "mimeType",
               "width",
               "height",
+              "scaleFactor",
               "target",
               "mode"
             ],
@@ -763,6 +805,11 @@
                 "type": "number",
                 "minimum": 0,
                 "description": "Captured height in pixels."
+              },
+              "scaleFactor": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description": "System display scale factor used for the capture."
               },
               "target": {
                 "type": "object",
@@ -828,7 +875,7 @@
                                   "type": "null"
                                 }
                               ],
-                              "description": "Frame-owner node identity, or null when unavailable."
+                              "description": "Frame-owner node identity. Cross-origin or opaque child frames may keep this null even when status is complete; use parentFrameId and frameId for cross-frame routing."
                             },
                             "url": {
                               "type": "string",
@@ -957,6 +1004,7 @@
               "mimeType",
               "width",
               "height",
+              "scaleFactor",
               "target",
               "mode",
               "semanticTree"

@@ -1,8 +1,8 @@
 {
   "method": "Input.scroll",
-  "description": "Scrolls the page viewport, a visible container, or a target into view and reports the actual movement and boundary state.",
+  "description": "Scrolls a target into view or moves a visible container by a distance or to a physical axis boundary, with actual movement and boundary state reported.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:4348a1a737674c20d6554ae434ea98050c0d5fee0d58837d1609a4b3e2d64b91",
+  "catalogRevision": "sha256:46c89baed493789bfb9424bc488513360a2f0047f2a530a729933a4bbe4aff12",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "anyOf": [
@@ -30,7 +30,7 @@
               }
             },
             "additionalProperties": true,
-            "description": "Element to reveal through Blink native scrolling."
+            "description": "Element to reveal through browser target preparation."
           },
           "container": {
             "description": "Optional hard boundary; only ancestors at or below this container may scroll.",
@@ -48,6 +48,14 @@
               }
             },
             "additionalProperties": true
+          },
+          "axis": {
+            "description": "Not accepted in this scroll form.",
+            "not": {}
+          },
+          "edge": {
+            "description": "Not accepted in this scroll form.",
+            "not": {}
           },
           "purpose": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -87,10 +95,81 @@
               }
             },
             "additionalProperties": true,
-            "description": "Visible scrollable container that receives wheel input."
+            "description": "Visible container to scroll to a boundary."
+          },
+          "edge": {
+            "type": "string",
+            "enum": [
+              "start",
+              "end"
+            ],
+            "description": "Boundary on the selected axis: start or end."
+          },
+          "axis": {
+            "default": "vertical",
+            "description": "Physical scroll axis. Defaults to vertical.",
+            "type": "string",
+            "enum": [
+              "vertical",
+              "horizontal"
+            ]
+          },
+          "target": {
+            "description": "Not accepted in this scroll form.",
+            "not": {}
           },
           "direction": {
-            "description": "Wheel direction. Defaults to down.",
+            "description": "Not accepted in this scroll form.",
+            "not": {}
+          },
+          "amount": {
+            "description": "Not accepted in this scroll form.",
+            "not": {}
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "Describe the intent for this action."
+          }
+        },
+        "required": [
+          "pageId",
+          "container",
+          "edge",
+          "axis",
+          "purpose"
+        ],
+        "additionalProperties": true
+      },
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Page ID whose content should be scrolled."
+          },
+          "container": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "description": "Preferred canonical target ID from the latest DOM observation.",
+                "type": "string",
+                "pattern": "^\\d+:\\d+:\\d+$"
+              },
+              "selector": {
+                "description": "Fallback CSS selector for the scroll target.",
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": true,
+            "description": "Visible container to move with Blink native programmatic scrolling."
+          },
+          "direction": {
+            "description": "Physical scroll direction. Defaults to down.",
             "type": "string",
             "enum": [
               "up",
@@ -100,9 +179,17 @@
             ]
           },
           "amount": {
-            "description": "Wheel distance in CSS pixels. Defaults to 300; zero reads state without input.",
+            "description": "Programmatic scroll distance in CSS pixels. Defaults to 300; zero reads state without scrolling.",
             "type": "number",
             "minimum": 0
+          },
+          "axis": {
+            "description": "Not accepted in this scroll form.",
+            "not": {}
+          },
+          "edge": {
+            "description": "Not accepted in this scroll form.",
+            "not": {}
           },
           "purpose": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -117,43 +204,6 @@
           "purpose"
         ],
         "additionalProperties": true
-      },
-      {
-        "type": "object",
-        "properties": {
-          "pageId": {
-            "type": "string",
-            "format": "uuid",
-            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-            "description": "Page ID whose content should be scrolled."
-          },
-          "direction": {
-            "description": "Primary viewport scroll direction. Defaults to down.",
-            "type": "string",
-            "enum": [
-              "up",
-              "down",
-              "left",
-              "right"
-            ]
-          },
-          "amount": {
-            "description": "Viewport distance in CSS pixels. Defaults to 300; zero reads current state without scrolling.",
-            "type": "number",
-            "minimum": 0
-          },
-          "purpose": {
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "type": "string",
-            "minLength": 1,
-            "description": "Describe the intent for this action."
-          }
-        },
-        "required": [
-          "pageId",
-          "purpose"
-        ],
-        "additionalProperties": true
       }
     ]
   },
@@ -162,7 +212,7 @@
     "type": "object",
     "properties": {
       "scope": {
-        "description": "Scroll scope used: viewport, container, or target.",
+        "description": "Scroll scope used: container or target.",
         "type": "string"
       },
       "requestedDelta": {
@@ -245,7 +295,7 @@
         "type": "object",
         "properties": {
           "scope": {
-            "description": "Scroll scope used: viewport, container, or target.",
+            "description": "Scroll scope used: container or target.",
             "type": "string"
           },
           "requestedDelta": {

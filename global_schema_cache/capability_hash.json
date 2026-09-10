@@ -1,7 +1,7 @@
 {
-  "hash": "7a38dd70895ce3ec8c62c3ca83ae53d6300910332dc17f768cfe798d79faa8c2",
-  "capability_count": 62,
+  "hash": "c5ade4c9a8a0b5aab160804cbed04737cf061769f38aa7358ca40967ef4e2087",
+  "capability_count": 64,
   "generation": "2026-08-select-download-rebuild",
-  "catalog_revision": "sha256:4348a1a737674c20d6554ae434ea98050c0d5fee0d58837d1609a4b3e2d64b91",
-  "guide_revision": "sha256:b2c4aef972253c9e8babcdc915f49cd6261135f7ca76eae978dda80a807a9814"
+  "catalog_revision": "sha256:46c89baed493789bfb9424bc488513360a2f0047f2a530a729933a4bbe4aff12",
+  "guide_revision": "sha256:967560a8390230290e81c9d40b8112ecc0ca69ed5b83d2bc6982230eb670208b"
 }

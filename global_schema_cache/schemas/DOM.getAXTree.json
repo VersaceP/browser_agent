@@ -1,8 +1,8 @@
 {
   "method": "DOM.getAXTree",
-  "description": "Returns a compact accessibility-tree page map for locating interactive and semantic elements.",
+  "description": "Returns a compact accessibility-tree page map with actionable targets, generic AX states, and layout flags.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:4348a1a737674c20d6554ae434ea98050c0d5fee0d58837d1609a4b3e2d64b91",
+  "catalogRevision": "sha256:46c89baed493789bfb9424bc488513360a2f0047f2a530a729933a4bbe4aff12",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -27,7 +27,7 @@
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "string",
         "minLength": 1,
-        "description": "Describe why you need the current page map, e.g., understanding page structure, locating an actionable target, checking enabled/checked/layout state, or refreshing canonical element ids"
+        "description": "Describe why you need the current page map, e.g., understanding page structure, locating an actionable target, checking generic AX or layout state, or refreshing canonical element ids"
       }
     },
     "required": [
@@ -41,7 +41,7 @@
     "type": "object",
     "properties": {
       "lines": {
-        "description": "Compact accessibility-tree lines for the current page and included frames.",
+        "description": "Compact accessibility-tree lines with target markers, applicable AX state values, and sparse layout flags for the current page and included frames.",
         "type": "array",
         "items": {
           "type": "string"
@@ -60,7 +60,7 @@
         "type": "boolean"
       },
       "truncatedReason": {
-        "description": "Stable public reason for a bounded page-map truncation, when available.",
+        "description": "Stable public reason for a bounded page-map truncation or partial child-frame observation, when available.",
         "anyOf": [
           {
             "type": "string"
@@ -101,7 +101,7 @@
         "type": "object",
         "properties": {
           "lines": {
-            "description": "Compact accessibility-tree lines for the current page and included frames.",
+            "description": "Compact accessibility-tree lines with target markers, applicable AX state values, and sparse layout flags for the current page and included frames.",
             "type": "array",
             "items": {
               "type": "string"
@@ -120,7 +120,7 @@
             "type": "boolean"
           },
           "truncatedReason": {
-            "description": "Stable public reason for a bounded page-map truncation, when available.",
+            "description": "Stable public reason for a bounded page-map truncation or partial child-frame observation, when available.",
             "anyOf": [
               {
                 "type": "string"
@@ -196,5 +196,5 @@
     ],
     "additionalProperties": false
   },
-  "purposeHint": "Describe why you need the current page map, e.g., understanding page structure, locating an actionable target, checking enabled/checked/layout state, or refreshing canonical element ids"
+  "purposeHint": "Describe why you need the current page map, e.g., understanding page structure, locating an actionable target, checking generic AX or layout state, or refreshing canonical element ids"
 }

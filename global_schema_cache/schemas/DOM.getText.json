@@ -1,8 +1,8 @@
 {
   "method": "DOM.getText",
-  "description": "Reads textContent from one or more page elements.",
+  "description": "Reads textContent from one or more page elements. Each target returns an independent success or failure item, so a transport-level success can still contain failed targets.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:4348a1a737674c20d6554ae434ea98050c0d5fee0d58837d1609a4b3e2d64b91",
+  "catalogRevision": "sha256:46c89baed493789bfb9424bc488513360a2f0047f2a530a729933a4bbe4aff12",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -158,7 +158,7 @@
           ],
           "description": "One successful or failed DOM query item."
         },
-        "description": "Text records for each matched element; failed items include their own error and suggested_prompt."
+        "description": "One result per requested target. Check each item's ok field; ok=false is a target-level failure even when the Action call returns a result."
       },
       "summary": {
         "type": "object",
@@ -188,7 +188,7 @@
           "failed"
         ],
         "additionalProperties": false,
-        "description": "Counts and query summary for the returned text records."
+        "description": "Counts for the batch. A failed count greater than zero means the returned batch is partial, even when the Action call completed successfully."
       }
     },
     "required": [
@@ -317,7 +317,7 @@
               ],
               "description": "One successful or failed DOM query item."
             },
-            "description": "Text records for each matched element; failed items include their own error and suggested_prompt."
+            "description": "One result per requested target. Check each item's ok field; ok=false is a target-level failure even when the Action call returns a result."
           },
           "summary": {
             "type": "object",
@@ -347,7 +347,7 @@
               "failed"
             ],
             "additionalProperties": false,
-            "description": "Counts and query summary for the returned text records."
+            "description": "Counts for the batch. A failed count greater than zero means the returned batch is partial, even when the Action call completed successfully."
           }
         },
         "required": [

@@ -2,7 +2,7 @@
   "method": "History.remove",
   "description": "Removes a history item, all records for an origin, or all history for a Fleet.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:4348a1a737674c20d6554ae434ea98050c0d5fee0d58837d1609a4b3e2d64b91",
+  "catalogRevision": "sha256:46c89baed493789bfb9424bc488513360a2f0047f2a530a729933a4bbe4aff12",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",

@@ -1,6 +1,6 @@
 {
-  "method": "Input.press",
-  "description": "Dispatches a keyboard key with optional modifiers to the page or a resolved target. If it triggers a page alert, it is handled without creating an interactive dialog and the success feedback reports the alert message. If it opens a confirm, prompt, or beforeunload dialog, the action returns its dialog id and directs the caller to Page.handleDialog; if it activates a file chooser, the native chooser is cancelled automatically and the prompt directs the caller to direct File.handleChooser injection.",
+  "method": "Page.click",
+  "description": "Dispatches one or more physical clicks at a page-viewport CSS coordinate. Coordinates do not scroll, resolve semantic targets, or recover stale targets; two clicks use the native double-click gesture and larger counts run bounded sequential clicks.",
   "requiresPurpose": true,
   "catalogRevision": "sha256:46c89baed493789bfb9424bc488513360a2f0047f2a530a729933a4bbe4aff12",
   "inputSchema": {
@@ -11,46 +11,37 @@
         "type": "string",
         "format": "uuid",
         "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-        "description": "Page ID that should receive the key press."
+        "description": "Page ID that receives the click sequence."
       },
-      "key": {
-        "type": "string",
-        "minLength": 1,
-        "description": "Key value to press, such as \"Enter\", \"Escape\", or \"a\"."
+      "x": {
+        "type": "number",
+        "minimum": 0,
+        "description": "Horizontal page-viewport coordinate in CSS pixels."
       },
-      "modifiers": {
-        "description": "Optional modifier keys held while pressing the main key.",
-        "type": "array",
-        "items": {
-          "type": "string",
-          "enum": [
-            "Control",
-            "Shift",
-            "Alt",
-            "Meta"
-          ]
-        }
+      "y": {
+        "type": "number",
+        "minimum": 0,
+        "description": "Vertical page-viewport coordinate in CSS pixels."
       },
-      "selector": {
-        "description": "Optional CSS selector to focus before pressing the key.",
-        "type": "string",
-        "minLength": 1
-      },
-      "id": {
-        "description": "Optional canonical element ID to focus before pressing the key.",
-        "type": "string",
-        "pattern": "^\\d+:\\d+:\\d+$"
+      "clickCount": {
+        "default": 1,
+        "description": "Number of clicks to dispatch, from 1 to 100.",
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
       },
       "purpose": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "string",
         "minLength": 1,
-        "description": "Describe why this key is needed, e.g., pressing Enter to submit, Escape to close an overlay, Tab to move focus, or a shortcut with modifiers"
+        "description": "Describe the intended page effect at this exact viewport coordinate, such as activating a visual control that has no stable locator."
       }
     },
     "required": [
       "pageId",
-      "key",
+      "x",
+      "y",
+      "clickCount",
       "purpose"
     ],
     "additionalProperties": true
@@ -59,35 +50,39 @@
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "properties": {
-      "key": {
-        "description": "Keyboard key dispatched.",
-        "type": "string"
+      "pageId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Page that received the click sequence."
       },
-      "modifiers": {
-        "description": "Modifier keys held during dispatch.",
-        "type": "array",
-        "items": {
-          "type": "string"
-        }
+      "point": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "number",
+            "description": "Horizontal page-viewport coordinate in CSS pixels."
+          },
+          "y": {
+            "type": "number",
+            "description": "Vertical page-viewport coordinate in CSS pixels."
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "additionalProperties": false,
+        "description": "Coordinate used for every dispatched click."
       },
-      "target": {
-        "description": "Target identity used for the key dispatch.",
-        "type": "string"
-      },
-      "resolvedBy": {
-        "description": "Actor or resolution mode that selected the target.",
-        "type": "string"
-      },
-      "repeat": {
-        "description": "Number of repeated key dispatches.",
-        "type": "number"
-      },
-      "resolutionSource": {
-        "description": "Target resolution route used by the action.",
-        "type": "string"
+      "clickCount": {
+        "description": "Requested click count, present only when the full sequence completed.",
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
       },
       "dialog": {
-        "description": "Interactive native dialog returned by this key press; handled page alerts are not returned here.",
+        "description": "Interactive native dialog returned while dispatching the sequence.",
         "type": "object",
         "properties": {
           "id": {
@@ -127,6 +122,10 @@
         "additionalProperties": false
       }
     },
+    "required": [
+      "pageId",
+      "point"
+    ],
     "additionalProperties": {}
   },
   "outputSchema": {
@@ -144,35 +143,39 @@
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "properties": {
-          "key": {
-            "description": "Keyboard key dispatched.",
-            "type": "string"
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Page that received the click sequence."
           },
-          "modifiers": {
-            "description": "Modifier keys held during dispatch.",
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
+          "point": {
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "number",
+                "description": "Horizontal page-viewport coordinate in CSS pixels."
+              },
+              "y": {
+                "type": "number",
+                "description": "Vertical page-viewport coordinate in CSS pixels."
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "additionalProperties": false,
+            "description": "Coordinate used for every dispatched click."
           },
-          "target": {
-            "description": "Target identity used for the key dispatch.",
-            "type": "string"
-          },
-          "resolvedBy": {
-            "description": "Actor or resolution mode that selected the target.",
-            "type": "string"
-          },
-          "repeat": {
-            "description": "Number of repeated key dispatches.",
-            "type": "number"
-          },
-          "resolutionSource": {
-            "description": "Target resolution route used by the action.",
-            "type": "string"
+          "clickCount": {
+            "description": "Requested click count, present only when the full sequence completed.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
           },
           "dialog": {
-            "description": "Interactive native dialog returned by this key press; handled page alerts are not returned here.",
+            "description": "Interactive native dialog returned while dispatching the sequence.",
             "type": "object",
             "properties": {
               "id": {
@@ -212,6 +215,10 @@
             "additionalProperties": false
           }
         },
+        "required": [
+          "pageId",
+          "point"
+        ],
         "additionalProperties": {},
         "description": "Validated business result returned by the Action."
       }
@@ -265,5 +272,5 @@
     ],
     "additionalProperties": false
   },
-  "purposeHint": "Describe why this key is needed, e.g., pressing Enter to submit, Escape to close an overlay, Tab to move focus, or a shortcut with modifiers"
+  "purposeHint": "Describe the intended page effect at this exact viewport coordinate, such as activating a visual control that has no stable locator."
 }

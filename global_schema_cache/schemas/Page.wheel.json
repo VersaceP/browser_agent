@@ -1,0 +1,532 @@
+{
+  "method": "Page.wheel",
+  "description": "Dispatches a native wheel gesture at a page-viewport coordinate and reports the resulting scroll state.",
+  "requiresPurpose": true,
+  "catalogRevision": "sha256:46c89baed493789bfb9424bc488513360a2f0047f2a530a729933a4bbe4aff12",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "pageId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Page ID to receive the wheel input."
+      },
+      "x": {
+        "description": "Horizontal coordinate in page viewport CSS pixels. Defaults to 0.",
+        "type": "number",
+        "minimum": 0
+      },
+      "y": {
+        "description": "Vertical coordinate in page viewport CSS pixels. Defaults to 0.",
+        "type": "number",
+        "minimum": 0
+      },
+      "scrollX": {
+        "description": "Horizontal scroll delta in CSS pixels. Positive values scroll right. Defaults to 0.",
+        "type": "number"
+      },
+      "scrollY": {
+        "description": "Vertical scroll delta in CSS pixels. Positive values scroll down. Defaults to 0.",
+        "type": "number"
+      },
+      "axis": {
+        "description": "Axis used by edge scrolling. Defaults to vertical.",
+        "type": "string",
+        "enum": [
+          "vertical",
+          "horizontal"
+        ]
+      },
+      "edge": {
+        "description": "Scrolls the hit scroll area to the start or end boundary on the selected axis.",
+        "type": "string",
+        "enum": [
+          "start",
+          "end"
+        ]
+      },
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "Describe the page coordinate and the scroll delta or boundary that should receive the wheel gesture."
+      }
+    },
+    "required": [
+      "pageId",
+      "purpose"
+    ],
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "mode": {
+        "type": "string",
+        "enum": [
+          "delta",
+          "edge"
+        ],
+        "description": "Wheel request mode: explicit delta or scroll-to-edge."
+      },
+      "point": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "number",
+            "description": "Horizontal page-viewport coordinate."
+          },
+          "y": {
+            "type": "number",
+            "description": "Vertical page-viewport coordinate."
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "additionalProperties": false,
+        "description": "Coordinate that selected the wheel target."
+      },
+      "requestedDelta": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "number",
+            "description": "Requested horizontal scroll distance."
+          },
+          "y": {
+            "type": "number",
+            "description": "Requested vertical scroll distance."
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "additionalProperties": false,
+        "description": "Effective delta used for the wheel transaction."
+      },
+      "observedDelta": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "number",
+            "description": "Observed horizontal visual movement in page viewport CSS pixels."
+          },
+          "y": {
+            "type": "number",
+            "description": "Observed vertical visual movement in page viewport CSS pixels."
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "additionalProperties": false,
+        "description": "Effective movement selected from a stable visual reference or the physical scroll target."
+      },
+      "position": {
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "number",
+            "description": "Final horizontal scroll position."
+          },
+          "y": {
+            "type": "number",
+            "description": "Final vertical scroll position."
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "additionalProperties": false,
+        "description": "Final position of the dispatch target."
+      },
+      "extent": {
+        "type": "object",
+        "properties": {
+          "width": {
+            "type": "number",
+            "description": "Scrollable horizontal extent."
+          },
+          "height": {
+            "type": "number",
+            "description": "Scrollable vertical extent."
+          }
+        },
+        "required": [
+          "width",
+          "height"
+        ],
+        "additionalProperties": false,
+        "description": "Scrollable extent of the dispatch target."
+      },
+      "completedReason": {
+        "type": "string",
+        "enum": [
+          "state-read",
+          "distance-reached",
+          "boundary-reached",
+          "partial-progress"
+        ],
+        "description": "Reason the wheel transaction completed."
+      },
+      "frameDepth": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991,
+        "description": "Number of child-document boundaries entered by the coordinate."
+      },
+      "layers": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "element",
+                "frame-viewport",
+                "viewport"
+              ],
+              "description": "Type of scroll layer."
+            },
+            "id": {
+              "description": "Canonical DOM ID of the layer, when available.",
+              "type": "string"
+            },
+            "position": {
+              "type": "object",
+              "properties": {
+                "x": {
+                  "type": "number",
+                  "description": "Final horizontal layer position."
+                },
+                "y": {
+                  "type": "number",
+                  "description": "Final vertical layer position."
+                }
+              },
+              "required": [
+                "x",
+                "y"
+              ],
+              "additionalProperties": false,
+              "description": "Final layer position."
+            },
+            "extent": {
+              "type": "object",
+              "properties": {
+                "width": {
+                  "type": "number",
+                  "description": "Layer horizontal extent."
+                },
+                "height": {
+                  "type": "number",
+                  "description": "Layer vertical extent."
+                }
+              },
+              "required": [
+                "width",
+                "height"
+              ],
+              "additionalProperties": false,
+              "description": "Scrollable extent of the layer."
+            }
+          },
+          "required": [
+            "kind",
+            "position",
+            "extent"
+          ],
+          "additionalProperties": false
+        },
+        "description": "Target and propagated scroll layers affected by the wheel."
+      }
+    },
+    "required": [
+      "mode",
+      "point",
+      "requestedDelta",
+      "observedDelta",
+      "position",
+      "extent",
+      "completedReason",
+      "frameDepth",
+      "layers"
+    ],
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Facts directly observed by the Action or returned by its declared result schema."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "delta",
+              "edge"
+            ],
+            "description": "Wheel request mode: explicit delta or scroll-to-edge."
+          },
+          "point": {
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "number",
+                "description": "Horizontal page-viewport coordinate."
+              },
+              "y": {
+                "type": "number",
+                "description": "Vertical page-viewport coordinate."
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "additionalProperties": false,
+            "description": "Coordinate that selected the wheel target."
+          },
+          "requestedDelta": {
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "number",
+                "description": "Requested horizontal scroll distance."
+              },
+              "y": {
+                "type": "number",
+                "description": "Requested vertical scroll distance."
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "additionalProperties": false,
+            "description": "Effective delta used for the wheel transaction."
+          },
+          "observedDelta": {
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "number",
+                "description": "Observed horizontal visual movement in page viewport CSS pixels."
+              },
+              "y": {
+                "type": "number",
+                "description": "Observed vertical visual movement in page viewport CSS pixels."
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "additionalProperties": false,
+            "description": "Effective movement selected from a stable visual reference or the physical scroll target."
+          },
+          "position": {
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "number",
+                "description": "Final horizontal scroll position."
+              },
+              "y": {
+                "type": "number",
+                "description": "Final vertical scroll position."
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "additionalProperties": false,
+            "description": "Final position of the dispatch target."
+          },
+          "extent": {
+            "type": "object",
+            "properties": {
+              "width": {
+                "type": "number",
+                "description": "Scrollable horizontal extent."
+              },
+              "height": {
+                "type": "number",
+                "description": "Scrollable vertical extent."
+              }
+            },
+            "required": [
+              "width",
+              "height"
+            ],
+            "additionalProperties": false,
+            "description": "Scrollable extent of the dispatch target."
+          },
+          "completedReason": {
+            "type": "string",
+            "enum": [
+              "state-read",
+              "distance-reached",
+              "boundary-reached",
+              "partial-progress"
+            ],
+            "description": "Reason the wheel transaction completed."
+          },
+          "frameDepth": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Number of child-document boundaries entered by the coordinate."
+          },
+          "layers": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "element",
+                    "frame-viewport",
+                    "viewport"
+                  ],
+                  "description": "Type of scroll layer."
+                },
+                "id": {
+                  "description": "Canonical DOM ID of the layer, when available.",
+                  "type": "string"
+                },
+                "position": {
+                  "type": "object",
+                  "properties": {
+                    "x": {
+                      "type": "number",
+                      "description": "Final horizontal layer position."
+                    },
+                    "y": {
+                      "type": "number",
+                      "description": "Final vertical layer position."
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y"
+                  ],
+                  "additionalProperties": false,
+                  "description": "Final layer position."
+                },
+                "extent": {
+                  "type": "object",
+                  "properties": {
+                    "width": {
+                      "type": "number",
+                      "description": "Layer horizontal extent."
+                    },
+                    "height": {
+                      "type": "number",
+                      "description": "Layer vertical extent."
+                    }
+                  },
+                  "required": [
+                    "width",
+                    "height"
+                  ],
+                  "additionalProperties": false,
+                  "description": "Scrollable extent of the layer."
+                }
+              },
+              "required": [
+                "kind",
+                "position",
+                "extent"
+              ],
+              "additionalProperties": false
+            },
+            "description": "Target and propagated scroll layers affected by the wheel."
+          }
+        },
+        "required": [
+          "mode",
+          "point",
+          "requestedDelta",
+          "observedDelta",
+          "position",
+          "extent",
+          "completedReason",
+          "frameDepth",
+          "layers"
+        ],
+        "additionalProperties": false,
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
+  "purposeHint": "Describe the page coordinate and the scroll delta or boundary that should receive the wheel gesture."
+}

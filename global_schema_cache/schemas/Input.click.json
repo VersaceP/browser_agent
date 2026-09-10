@@ -1,8 +1,8 @@
 {
   "method": "Input.click",
-  "description": "Dispatches a physical click to a resolved page target. If it triggers a page alert, it is handled without creating an interactive dialog and the success feedback reports the alert message. If it opens a confirm, prompt, or beforeunload dialog, the action returns its dialog id and directs the caller to Page.handleDialog; if it activates a file chooser, the native chooser is cancelled automatically and the prompt directs the caller to direct File.handleChooser injection.",
+  "description": "Dispatches one or more physical clicks to a resolved page target; one click uses Native leftClick, two use Native doubleClick, and larger counts run sequential leftClick calls with bounded randomized intervals. If it triggers a page alert, it is handled without creating an interactive dialog and the success feedback reports the alert message. If it opens a confirm, prompt, or beforeunload dialog, the action returns its dialog id and directs the caller to Page.handleDialog; if it activates a file chooser, the native chooser is cancelled automatically and the prompt directs the caller to direct File.handleChooser injection.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:4348a1a737674c20d6554ae434ea98050c0d5fee0d58837d1609a4b3e2d64b91",
+  "catalogRevision": "sha256:46c89baed493789bfb9424bc488513360a2f0047f2a530a729933a4bbe4aff12",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -23,25 +23,17 @@
         "type": "string",
         "pattern": "^\\d+:\\d+:\\d+$"
       },
-      "x": {
-        "description": "Fallback X coordinate for coordinate-based clicking.",
-        "type": "number"
-      },
-      "y": {
-        "description": "Fallback Y coordinate for coordinate-based clicking.",
-        "type": "number"
-      },
       "force": {
         "default": false,
-        "description": "Dispatch even when the resolved element is occluded. Normal browser hit testing still applies, so delivery to the requested target is not guaranteed. Ignored for coordinate-based clicks.",
+        "description": "Dispatch even when the resolved element is occluded. Normal browser hit testing still applies, so delivery to the requested target is not guaranteed.",
         "type": "boolean"
       },
       "clickCount": {
         "default": 1,
-        "description": "Number of clicks to dispatch: 1 or 2.",
+        "description": "Number of clicks to dispatch, from 1 to 100.",
         "type": "integer",
         "minimum": 1,
-        "maximum": 2
+        "maximum": 100
       },
       "purpose": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -83,8 +75,10 @@
         "type": "string"
       },
       "clickCount": {
-        "description": "Number of click events dispatched.",
-        "type": "number"
+        "description": "Requested click count, present only when the full sequence completed.",
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
       },
       "point": {
         "description": "CSS-pixel point used for the click.",
@@ -177,8 +171,10 @@
             "type": "string"
           },
           "clickCount": {
-            "description": "Number of click events dispatched.",
-            "type": "number"
+            "description": "Requested click count, present only when the full sequence completed.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
           },
           "point": {
             "description": "CSS-pixel point used for the click.",
