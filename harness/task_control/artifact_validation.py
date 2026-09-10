@@ -17,6 +17,9 @@ from harness.constants import WORKER_STATUS_HITL_WAITING
 from harness.constants import WORKER_STATUS_PAGE_CRASHED
 from harness.constants import WORKER_STATUS_PAGE_SETTLED_AFTER_HITL
 from harness.evidence.artifact_evidence import FILE_VALIDATOR_TYPES
+from harness.evidence.extraction_artifacts import ARRAY_FIELD_TYPES
+from harness.evidence.extraction_artifacts import NON_NUMERIC_CONTAINER_FIELD_TYPES
+from harness.evidence.extraction_artifacts import field_name_from_spec
 from harness.evidence.artifact_evidence import detect_blocker_data_rows
 from harness.evidence.artifact_evidence import detect_near_stub_rows
 from harness.evidence.artifact_evidence import detect_placeholder_rows
@@ -52,6 +55,101 @@ def _empty_array_observations(
         *detect_stub_rows(rows, expected),
         *detect_near_stub_rows(rows, expected),
     ]
+
+
+_UNIT_GLOBAL_VALIDATORS = frozenset({
+    "artifact_required",
+    "min_rows",
+    "max_rows",
+    "exact_rows",
+    "unique",
+    "set_equals",
+})
+
+
+def _required_control_unit_receipt(
+    expected: JsonDict,
+    validators: List[JsonDict],
+    rows: List[JsonDict],
+) -> Optional[JsonDict]:
+    """Describe independently proven form controls without relaxing completion.
+
+    ``requiredControls`` is the one existing contract whose rows already carry
+    stable, business-level unit identities. A partial attempt cannot satisfy
+    its plan-wide set/count validators, but an individual row can still be
+    checked against every row-local requirement. This receipt makes that
+    distinction explicit for a direct continuation: it never declares the
+    phase done, and it never treats a row count or worker prose as completion.
+    The normal, full validator set remains authoritative when the accumulated
+    artifacts are finally accepted.
+    """
+    raw_controls = expected.get("requiredControls")
+    if not isinstance(raw_controls, list) or not raw_controls:
+        return None
+    control_keys = [
+        str(item.get("controlKey") or "").strip()
+        for item in raw_controls
+        if isinstance(item, dict) and str(item.get("controlKey") or "").strip()
+    ]
+    if not control_keys:
+        return None
+
+    declared = set(control_keys)
+    rows_by_key: dict[str, List[JsonDict]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = str(row.get("controlKey") or "").strip()
+        if key in declared:
+            rows_by_key.setdefault(key, []).append(row)
+
+    row_validators = [
+        validator for validator in validators
+        if isinstance(validator, dict)
+        and str(validator.get("type") or "") not in _UNIT_GLOBAL_VALIDATORS
+    ]
+    completed: List[str] = []
+    invalid: List[JsonDict] = []
+    for key in control_keys:
+        unit_id = f"control:{key}"
+        candidates = rows_by_key.get(key, [])
+        if len(candidates) != 1:
+            invalid.append({
+                "unitId": unit_id,
+                "reason": "missing_control_row" if not candidates else "duplicate_control_rows",
+            })
+            continue
+        row = candidates[0]
+        failures: List[JsonDict] = []
+        for validator in row_validators:
+            failures.extend(_tc()._run_validator(validator, [row]))
+        failures.extend(detect_placeholder_rows([row], expected_artifact=expected))
+        failures.extend(detect_blocker_data_rows([row], expected))
+        if failures:
+            invalid.append({
+                "unitId": unit_id,
+                "reason": "row_validation_failed",
+                "failureTypes": sorted({
+                    str(item.get("type") or "")
+                    for item in failures if isinstance(item, dict)
+                    and str(item.get("type") or "")
+                }),
+            })
+            continue
+        completed.append(unit_id)
+
+    completed_set = set(completed)
+    declared_ids = [f"control:{key}" for key in control_keys]
+    return {
+        "kind": "required_controls",
+        "coverage": "row_validated",
+        "declaredUnitIds": declared_ids,
+        "completedUnitIds": completed,
+        "remainingUnitIds": [
+            unit_id for unit_id in declared_ids if unit_id not in completed_set
+        ],
+        "invalidUnits": invalid[:20],
+    }
 
 def validate_worker_artifacts(
     *,
@@ -423,6 +521,20 @@ def validate_worker_artifacts(
         "fileEvidenceCount": len(file_evidence or []),
         "failures": failures,
     }
+    # A failed full-contract validation may still contain independently valid
+    # form-control receipts. Keep this separate from ``validExtractionArtifacts``:
+    # it is a bounded-continuation aid, never an upstream validated artifact.
+    unit_rows = merged_rows if merged_rows else rows
+    unit_receipt = _required_control_unit_receipt(
+        expected,
+        row_validators,
+        unit_rows,
+    )
+    if unit_receipt is not None:
+        unit_receipt["sourceArtifactPaths"] = list(
+            merged_sources if merged_rows else result_artifacts
+        )
+        result["enumeratedUnitReceipt"] = unit_receipt
     if cumulative:
         result["cumulative"] = True
         result["sourceArtifactCount"] = len(cumulative_sources)
@@ -447,7 +559,18 @@ def classify_artifact_validation_failures(
         for item in failures
         if isinstance(item, dict)
     }
-    if "data_placeholder" in failure_types:
+    range_container_fields = _range_container_contract_conflicts(
+        failures, expected_artifact,
+    )
+    if range_container_fields:
+        category = "contract_invalid"
+        hint = (
+            "The plan applies numeric range to declared non-numeric container "
+            f"field(s) {', '.join(range_container_fields)}. Replan with a "
+            "compatible validator (array fields use array_length); do not "
+            "re-scrape unchanged data."
+        )
+    elif "data_placeholder" in failure_types:
         category = "data_placeholder"
         hint = "Observed rows look like placeholder or stub content; reveal/load the real content or report absence."
     elif "artifact_required" in failure_types:
@@ -489,6 +612,31 @@ def classify_artifact_validation_failures(
             else ""
         ),
     }
+
+
+def _range_container_contract_conflicts(
+    failures: List[JsonDict],
+    expected_artifact: Optional[JsonDict],
+) -> List[str]:
+    """Return provable legacy range/container contradictions from a receipt."""
+    expected = expected_artifact if isinstance(expected_artifact, dict) else {}
+    container_fields = set()
+    for key in ("fields", "required_fields"):
+        values = expected.get(key)
+        for spec in values if isinstance(values, list) else []:
+            if not isinstance(spec, dict):
+                continue
+            name = field_name_from_spec(spec)
+            field_type = str(spec.get("type") or "").strip().lower()
+            if name and field_type in NON_NUMERIC_CONTAINER_FIELD_TYPES:
+                container_fields.add(name)
+    return sorted({
+        str(item.get("field") or "").strip()
+        for item in failures
+        if isinstance(item, dict)
+        and item.get("type") == "range"
+        and str(item.get("field") or "").strip() in container_fields
+    })
 
 def classification_for_worker_status(status: str) -> Optional[JsonDict]:
     text = str(status or "")

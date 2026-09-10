@@ -17,6 +17,8 @@ from typing import Optional
 from typing import Set
 from typing import Tuple
 from urllib.parse import urlparse
+from harness.evidence.extraction_artifacts import ARRAY_FIELD_TYPES
+from harness.evidence.extraction_artifacts import NON_NUMERIC_CONTAINER_FIELD_TYPES
 from harness.evidence.extraction_artifacts import field_name_from_spec
 from harness.evidence.extraction_artifacts import field_names_from_specs
 from harness.evidence.artifact_evidence import VALIDATOR_TYPES
@@ -27,6 +29,7 @@ from harness.evidence.file_evidence import saved_paths_from_value
 from harness.tools.browser_tools.downloads import _download_records
 from harness.tools.browser_tools.downloads import _normalize_download_record
 from harness.results.row_ledger import ROW_OUTCOMES
+from harness.results.row_ledger import OUTCOME_CONFIRMED_ABSENT
 from harness.results.row_ledger import field_absence_accepted
 from harness.utils import JsonDict
 from harness.utils import RunLogger
@@ -46,6 +49,36 @@ def run_row_validator(validator: JsonDict, rows: List[JsonDict]) -> List[JsonDic
     into a private name.
     """
     return _run_validator(validator, rows)
+
+
+def _invalid_value_summary(value: Any) -> JsonDict:
+    """Return bounded structural context for a malformed validator value.
+
+    Validation receipts are surfaced to the Lead and persisted in task state.
+    They must explain the wrong *shape* without echoing a large extraction
+    field (or potentially sensitive text) back into either channel.
+    """
+    if value is None:
+        return {"kind": "null"}
+    if isinstance(value, str):
+        return {
+            "kind": "string",
+            "length": len(value),
+            "nonWhitespace": bool(value.strip()),
+        }
+    if isinstance(value, list):
+        item_types = sorted({type(item).__name__ for item in value})[:8]
+        return {
+            "kind": "array",
+            "length": len(value),
+            "itemTypes": item_types,
+        }
+    if isinstance(value, dict):
+        return {
+            "kind": "object",
+            "keyCount": len(value),
+        }
+    return {"kind": type(value).__name__}
 
 def _run_validator(validator: JsonDict, rows: List[JsonDict]) -> List[JsonDict]:
     validator_type = str(validator.get("type") or "").strip()
@@ -301,16 +334,54 @@ def _run_validator(validator: JsonDict, rows: List[JsonDict]) -> List[JsonDict]:
         for index, row in enumerate(rows):
             raw_value = row.get(field)
             if raw_value is None:
-                bad.append({"row": index, "value": raw_value, "reason": "not numeric"})
+                bad.append({
+                    "row": index,
+                    "valueSummary": _invalid_value_summary(raw_value),
+                    "reason": "not numeric",
+                })
                 continue
             try:
                 value = float(raw_value)
             except (TypeError, ValueError):
-                bad.append({"row": index, "value": raw_value, "reason": "not numeric"})
+                bad.append({
+                    "row": index,
+                    "valueSummary": _invalid_value_summary(raw_value),
+                    "reason": "not numeric",
+                })
                 continue
             if min_value is not None and value < float(min_value):
                 bad.append({"row": index, "value": value, "reason": "below min"})
             if max_value is not None and value > float(max_value):
+                bad.append({"row": index, "value": value, "reason": "above max"})
+        if bad:
+            failures.append({"type": validator_type, "field": field, "bad": bad[:20]})
+        return failures
+
+    if validator_type == "array_length":
+        field = str(validator.get("field") or "").strip()
+        min_value = validator.get("min")
+        max_value = validator.get("max")
+        bad = []
+        for index, row in enumerate(rows):
+            raw_value = row.get(field)
+            if not isinstance(raw_value, list):
+                bad.append({
+                    "row": index,
+                    "valueSummary": _invalid_value_summary(raw_value),
+                    "reason": "not array",
+                })
+                continue
+            value = len(raw_value)
+            allowance = validator.get("allow_empty_with_outcome")
+            if value == 0 and isinstance(allowance, dict):
+                verdict = field_absence_accepted(
+                    row, field, allowed_outcomes=allowance.get(field),
+                )
+                if verdict["accepted"]:
+                    continue
+            if min_value is not None and value < min_value:
+                bad.append({"row": index, "value": value, "reason": "below min"})
+            if max_value is not None and value > max_value:
                 bad.append({"row": index, "value": value, "reason": "above max"})
         if bad:
             failures.append({"type": validator_type, "field": field, "bad": bad[:20]})
@@ -786,6 +857,8 @@ def _normalize_expected_artifact_contract(
     stage_hint: str = "",
     allow_legacy_missing_required_controls: bool = False,
     allow_legacy_non_form_required_controls: bool = False,
+    allow_legacy_empty_outcomes: bool = False,
+    validate_empty_outcomes: bool = True,
 ) -> JsonDict:
     """Recover one canonical expected-artifact shape from equivalent inputs.
 
@@ -821,6 +894,119 @@ def _normalize_expected_artifact_contract(
     phase_path = f"/phases/{phase_index}" if phase_index is not None else ""
     task_type_path = f"{phase_path}/task_type" if phase_path else ""
     stage_hint_path = f"{phase_path}/stage_hint" if phase_path else ""
+    declared_empty_outcomes = expected.get("allow_empty_with_outcome")
+    empty_outcome_path = (
+        f"{phase_path}/expected_artifact/allow_empty_with_outcome"
+        if phase_path else "/expected_artifact/allow_empty_with_outcome"
+    )
+    if validate_empty_outcomes and declared_empty_outcomes is not None:
+        is_current_shape = (
+            isinstance(declared_empty_outcomes, dict)
+            and bool(declared_empty_outcomes)
+            and all(
+                isinstance(raw, list)
+                and bool(raw)
+                and all(
+                    isinstance(item, str)
+                    and item.strip() == OUTCOME_CONFIRMED_ABSENT
+                    for item in raw
+                )
+                for raw in declared_empty_outcomes.values()
+            )
+        )
+        if allow_legacy_empty_outcomes:
+            if not is_current_shape:
+                warnings.append({
+                    "type": "legacy_empty_outcome_contract_preserved",
+                    "phase": phase_id,
+                    "path": empty_outcome_path,
+                    "message": (
+                        "An immutable accepted extension prefix carries a"
+                        " historical empty-value outcome declaration. It"
+                        " remains byte-for-byte unchanged so its contract hash"
+                        " and validated evidence are preserved; new or changed"
+                        " phases must use confirmed_absent only."
+                    ),
+                })
+        elif isinstance(declared_empty_outcomes, dict):
+            canonical_outcomes: JsonDict = {}
+            for raw_name, raw_outcomes in declared_empty_outcomes.items():
+                field = str(raw_name or "").strip()
+                pointer_name = field.replace("~", "~0").replace("/", "~1")
+                normalized_outcomes = _tc()._validate_empty_value_license_outcomes(
+                    raw_outcomes,
+                    phase_id=phase_id,
+                    field=field,
+                    path=f"{empty_outcome_path}/{pointer_name}",
+                    errors=errors,
+                    repair_issues=repair_issues,
+                )
+                if normalized_outcomes is not None:
+                    canonical_outcomes[field] = normalized_outcomes
+            expected["allow_empty_with_outcome"] = canonical_outcomes
+        elif isinstance(declared_empty_outcomes, list):
+            # Historical plans represented the field/outcome mapping as a list
+            # of field specs. New or generally replanned candidates may still
+            # submit that shape, so read its named outcome before validating
+            # rather than comparing the whole object with a string.
+            canonical_outcomes = {}
+            structurally_valid = bool(declared_empty_outcomes)
+            for index, item in enumerate(declared_empty_outcomes):
+                item_path = f"{empty_outcome_path}/{index}"
+                if not isinstance(item, dict):
+                    errors.append(
+                        f"phase {phase_id}: {item_path} must be an object with"
+                        " name and outcome"
+                    )
+                    structurally_valid = False
+                    continue
+                field = field_name_from_spec(item)
+                raw_outcome = item.get("outcome")
+                if not field or raw_outcome is None:
+                    errors.append(
+                        f"phase {phase_id}: {item_path} requires non-empty name"
+                        " and outcome"
+                    )
+                    structurally_valid = False
+                    continue
+                if item.get("allow_empty") is False:
+                    errors.append(
+                        f"phase {phase_id}: {item_path} contradicts itself:"
+                        " allow_empty is false inside allow_empty_with_outcome"
+                    )
+                    structurally_valid = False
+                    continue
+                raw_values = (
+                    raw_outcome if isinstance(raw_outcome, list)
+                    else [raw_outcome]
+                )
+                normalized_outcomes = _tc()._validate_empty_value_license_outcomes(
+                    raw_values,
+                    phase_id=phase_id,
+                    field=field,
+                    path=f"{item_path}/outcome",
+                    errors=errors,
+                    repair_issues=repair_issues,
+                    repair_value=(
+                        [OUTCOME_CONFIRMED_ABSENT]
+                        if isinstance(raw_outcome, list)
+                        else OUTCOME_CONFIRMED_ABSENT
+                    ),
+                )
+                if normalized_outcomes is None:
+                    structurally_valid = False
+                    continue
+                existing = canonical_outcomes.setdefault(field, [])
+                for outcome in normalized_outcomes:
+                    if outcome not in existing:
+                        existing.append(outcome)
+            if structurally_valid:
+                expected["allow_empty_with_outcome"] = canonical_outcomes
+        else:
+            errors.append(
+                f"phase {phase_id}: {empty_outcome_path} must be an object"
+                " keyed by field name or a legacy array of named outcome specs"
+            )
     # Form phases can declare the business controls they must complete. This is
     # deliberately an artifact contract rather than a second state store:
     # workers emit one evidence row per stable controlKey and the ordinary
@@ -1257,6 +1443,7 @@ def _normalize_validators(
     if not isinstance(fields, list) or not fields:
         fields = expected_artifact.get("fields")
     field_names = field_names_from_specs(fields)
+    declared_field_types = _declared_field_types(expected_artifact)
     if field_names:
         normalized.append({"type": "required_fields", "fields": field_names})
         nonempty_fields = _nonempty_fields_from_expected(expected_artifact, fields)
@@ -1325,6 +1512,26 @@ def _normalize_validators(
             )
         normalized_validator = dict(validator)
         normalized_validator["type"] = validator_type
+        if validator_type in {"range", "array_length"}:
+            _validate_range_validator_compatibility(
+                validator=normalized_validator,
+                validator_index=index,
+                declared_field_types=declared_field_types,
+                errors=errors,
+                phase_id=phase_id,
+            )
+        if (
+            validator_type == "array_length"
+            and isinstance(normalized_validator.get("min"), int)
+            and not isinstance(normalized_validator.get("min"), bool)
+            and normalized_validator.get("min", 0) > 0
+        ):
+            target_field = str(normalized_validator.get("field") or "").strip()
+            allowance = _allow_empty_with_outcome_from_expected(
+                expected_artifact, fields, [target_field] if target_field else [],
+            )
+            if allowance:
+                normalized_validator["allow_empty_with_outcome"] = allowance
         if validator_type == "upload_confirmed":
             confirmation_field = str(normalized_validator.get("field") or "").strip()
             if not confirmation_field:
@@ -1381,6 +1588,85 @@ def _normalize_validators(
         phase_id=phase_id,
         warnings=warnings,
     )
+
+
+def _declared_field_types(expected_artifact: JsonDict) -> Dict[str, str]:
+    """Return only explicit field types; bare names remain intentionally unknown."""
+    declared: Dict[str, str] = {}
+    for key in ("fields", "required_fields"):
+        values = expected_artifact.get(key)
+        for spec in values if isinstance(values, list) else []:
+            if not isinstance(spec, dict):
+                continue
+            name = field_name_from_spec(spec)
+            field_type = str(spec.get("type") or "").strip().lower()
+            if name and field_type:
+                declared[name] = field_type
+    return declared
+
+
+def _validate_range_validator_compatibility(
+    *,
+    validator: JsonDict,
+    validator_index: int,
+    declared_field_types: Dict[str, str],
+    errors: List[str],
+    phase_id: str,
+) -> None:
+    """Reject only provable validator/schema contradictions.
+
+    A bare field name has no mechanically knowable type, so it is left to the
+    semantic reviewer.  An explicit schema type, however, makes a mismatch
+    objectively impossible to satisfy and must fail before workers run.
+    """
+    validator_type = str(validator.get("type") or "")
+    field = str(validator.get("field") or "").strip()
+    if not field:
+        errors.append(
+            f"phase {phase_id}: validators[{validator_index}] {validator_type} requires field"
+        )
+        return
+
+    if validator_type == "array_length":
+        minimum = validator.get("min")
+        maximum = validator.get("max")
+        if minimum is None and maximum is None:
+            errors.append(
+                f"phase {phase_id}: validators[{validator_index}] array_length requires min or max"
+            )
+        for label, value in (("min", minimum), ("max", maximum)):
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                errors.append(
+                    f"phase {phase_id}: validators[{validator_index}] array_length {label} must be a non-negative integer"
+                )
+        if (
+            isinstance(minimum, int) and not isinstance(minimum, bool)
+            and isinstance(maximum, int) and not isinstance(maximum, bool)
+            and minimum > maximum
+        ):
+            errors.append(
+                f"phase {phase_id}: validators[{validator_index}] array_length min must not exceed max"
+            )
+
+    declared_type = declared_field_types.get(field)
+    if not declared_type:
+        return
+    is_array = declared_type in ARRAY_FIELD_TYPES
+    is_non_numeric_container = declared_type in NON_NUMERIC_CONTAINER_FIELD_TYPES
+    if validator_type == "range" and is_non_numeric_container:
+        if is_array:
+            repair = "use array_length to constrain cardinality, or target a numeric field"
+        else:
+            repair = "target a numeric field"
+        errors.append(
+            f"phase {phase_id}: validators[{validator_index}] range targets declared non-numeric container field {field!r} ({declared_type}); {repair}"
+        )
+    elif validator_type == "array_length" and not is_array:
+        errors.append(
+            f"phase {phase_id}: validators[{validator_index}] array_length targets declared non-array field {field!r}; use range for numeric values"
+        )
 
 def _allow_empty_with_outcome_from_expected(
     expected_artifact: JsonDict, fields: Any, nonempty_fields: List[str],

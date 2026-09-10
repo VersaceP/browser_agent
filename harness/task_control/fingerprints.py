@@ -198,6 +198,7 @@ def execution_contract_fingerprint(phase: Optional[JsonDict]) -> str:
         "workerTask": phase.get("worker_task"),
         "stageHint": phase.get("stage_hint"),
         "stageHintReason": phase.get("stage_hint_reason"),
+        "dispatchWave": phase.get("dispatch_wave"),
         "workerContract": phase.get("worker_contract"),
     }
     canonical = json.dumps(

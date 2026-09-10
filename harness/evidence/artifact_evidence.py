@@ -27,6 +27,7 @@ VALIDATOR_SCOPE: Dict[str, str] = {
     "cross_field_contains": "row",
     "action_outcome": "row",
     "range": "row",
+    "array_length": "row",
     "min_rows": "aggregate",
     "max_rows": "aggregate",
     "exact_rows": "aggregate",

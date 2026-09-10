@@ -724,6 +724,8 @@ def _semantic_trace_summary(trace_summary: JsonDict) -> JsonDict:
         "latestPageStats": trace_summary.get("latestPageStats"),
         "snapshotDiffs": trace_summary.get("snapshotDiffs", []),
         "snapshotDiffCount": trace_summary.get("snapshotDiffCount", 0),
+        "targetRecoveryHistory": trace_summary.get("targetRecoveryHistory", {}),
+        "stepExtension": trace_summary.get("stepExtension"),
         "suspectedChallengePages": trace_summary.get("suspectedChallengePages", []),
         "contentCompletenessPages": trace_summary.get("contentCompletenessPages", []),
     }

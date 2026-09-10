@@ -82,6 +82,56 @@ def cancel_phase_running_reservation(
         phase_state["status"] = "pending"
     _tc().write_task_state(logger, state)
 
+
+def reactivate_resumable_hitl_phases(
+    logger: RunLogger,
+    *,
+    plan: Optional[JsonDict],
+) -> List[str]:
+    """Reopen HITL-interrupted phases after an explicit keep-plan resume.
+
+    The previous attempt remains in the audit trail. Only execution state is
+    reset: the accepted phase id, evidence contract, dependencies and artifact
+    lineage are unchanged, so rebuilding the plan would add no authorization
+    or semantic review value.
+    """
+
+    if not isinstance(plan, dict):
+        return []
+    plan_ids = {
+        str(phase.get("id") or "")
+        for phase in plan.get("phases") or []
+        if isinstance(phase, dict) and str(phase.get("id") or "")
+    }
+    resumable_statuses = {
+        "blocked_by_challenge",
+        "hitl_required",
+        "hitl_timeout",
+        "page_settled_after_hitl",
+    }
+    state = _tc().load_task_state(logger)
+    phases = state.get("phases") if isinstance(state.get("phases"), dict) else {}
+    reactivated: List[str] = []
+    for phase_id in sorted(plan_ids):
+        phase_state = phases.get(phase_id)
+        if not isinstance(phase_state, dict):
+            continue
+        prior_status = str(phase_state.get("status") or "")
+        if prior_status not in resumable_statuses:
+            continue
+        phase_state["status"] = "pending"
+        phase_state["resume_reset_from"] = prior_status
+        reactivated.append(phase_id)
+    if not reactivated:
+        return []
+    state["current_phase"] = _tc()._first_active_phase_id(plan, phases)
+    _tc().write_task_state(logger, state)
+    logger.write("resume.hitl_phases_reactivated", {
+        "phaseIds": reactivated,
+        "reason": "explicit_keep_plan_resume",
+    })
+    return reactivated
+
 def mark_phase_result(
     logger: RunLogger,
     *,

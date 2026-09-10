@@ -178,6 +178,7 @@ from .phase_lifecycle import (  # noqa: F401
     phase_prior_artifact_paths,
     phase_start_rejection,
     prepare_resume_state,
+    reactivate_resumable_hitl_phases,
 )
 from .plan_validation import (  # noqa: F401
     AXTREE_ID_ANYWHERE_RE,
@@ -228,6 +229,7 @@ from .plan_validation import (  # noqa: F401
     _singleton_range_feature,
     _tc,
     _validate_execution_role_dependencies,
+    _validate_empty_value_license_outcomes,
     _validate_pacing,
     _validate_task_type_capability_match,
     _validate_worker_contract_methods,

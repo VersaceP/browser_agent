@@ -7,7 +7,7 @@ cannot set or override any field in it.
 import json
 import hashlib
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from harness.utils import JsonDict
 
@@ -130,8 +130,17 @@ def _file_sha256(path: str) -> str:
     return digest.hexdigest()
 
 
-def _apply_supersessions(state: JsonDict, paths: List[str]) -> List[str]:
-    """Apply valid merge edges to the current active artifact generation.
+def artifact_generation_view(
+    state: JsonDict, paths: List[str],
+) -> Tuple[List[str], Dict[str, Set[str]]]:
+    """Return the active delivered generation and each known artifact lineage.
+
+    The same projection is needed when writing a new reference merge: a merge
+    may cite an active prior deliverable even though raw ``state['artifacts']``
+    intentionally retains only source artifacts for downstream consumers.
+    Keeping this reducer shared prevents the writer and receipt from deciding
+    what "active" means differently. Apply valid merge edges to the current
+    active artifact generation.
 
     A Lead `reference_merge` that copies every row of its sources verbatim is
     a new generation of the same data, not an addition to it. Until this ran,
@@ -141,30 +150,48 @@ def _apply_supersessions(state: JsonDict, paths: List[str]) -> List[str]:
     data it had just dropped.
 
     Supersession records are historical evidence, not an independent active
-    ledger.  Apply them in order and only while every absorbed input is still
-    active and the deliverable file still exists.  Consequently, removing any
-    producer during resume invalidation also disables its downstream merge;
-    an old record cannot resurrect a retired deliverable.
+    ledger. Apply them in order while every absorbed leaf is represented by
+    the active generation and the deliverable file still has valid integrity
+    evidence. Consequently, removing any producer during resume invalidation
+    also disables its downstream merge; an old record cannot resurrect a
+    retired deliverable.
     """
     entries = state.get("artifact_supersessions")
     if not isinstance(entries, list) or not entries:
-        return paths
+        identities = {_resolved(path): {_resolved(path)} for path in paths}
+        return paths, identities
 
     active = list(paths)
+    # Every active artifact represents a set of leaf source generations. A
+    # later reference_merge may cite those original leaves even after an
+    # earlier merge replaced them in the active view. Track that lineage so a
+    # chain A+B -> M1, then A+B+C -> M2 can advance to M2 without resurrecting
+    # or double-counting A/B.
+    lineage: Dict[str, Set[str]] = {
+        _resolved(path): {_resolved(path)} for path in active
+    }
     for entry in entries:
         if not isinstance(entry, dict):
             continue
         deliverable = str(entry.get("deliverable") or "").strip()
         deliverable_identity = _resolved(deliverable)
-        retired = {
+        absorbed_identities = {
             _resolved(item)
             for item in (entry.get("absorbed") or [])
             if str(item or "").strip()
         }
-        if not deliverable or not retired:
+        if not deliverable or not absorbed_identities:
             continue
+        # An edge may cite either original source files or a prior merged
+        # deliverable. Normalize both spellings to the same leaf generation.
+        retired: Set[str] = set()
+        for identity in absorbed_identities:
+            retired.update(lineage.get(identity, {identity}))
         active_identities = {_resolved(path) for path in active}
-        if not retired.issubset(active_identities):
+        covered_leaves: Set[str] = set()
+        for identity in active_identities:
+            covered_leaves.update(lineage.get(identity, {identity}))
+        if not retired.issubset(covered_leaves):
             continue
         # A recorded digest is durable proof that the merge output existed
         # when the edge was committed. Legacy supersessions predate digests,
@@ -190,12 +217,29 @@ def _apply_supersessions(state: JsonDict, paths: List[str]) -> List[str]:
             if actual_digest != expected_digest:
                 continue
 
-        # Remove every spelling of an absorbed path.  If the deliverable is
-        # already represented in the active ledger, retain that spelling;
-        # otherwise append the path certified by this applicable merge edge.
-        active = [path for path in active if _resolved(path) not in retired]
+        # Retire active generations wholly covered by the cited leaves. A
+        # partially overlapping active generation cannot be replaced safely:
+        # doing so would silently discard leaves the new merge never cited.
+        replaceable = {
+            identity for identity in active_identities
+            if lineage.get(identity, {identity}).issubset(retired)
+        }
+        overlap = {
+            identity for identity in active_identities
+            if lineage.get(identity, {identity}) & retired
+        }
+        if overlap - replaceable:
+            continue
+        active = [path for path in active if _resolved(path) not in replaceable]
+        lineage[deliverable_identity] = set(retired)
         if deliverable_identity not in {_resolved(path) for path in active}:
             active.append(deliverable)
+    return active, lineage
+
+
+def _apply_supersessions(state: JsonDict, paths: List[str]) -> List[str]:
+    """Apply valid merge edges to the current active artifact generation."""
+    active, _lineage = artifact_generation_view(state, paths)
     return active
 
 

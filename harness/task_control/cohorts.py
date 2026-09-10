@@ -364,6 +364,27 @@ def materialize_batch_rows_from_source(
     """
 
     source = worker_contract.get("batch_source")
+    accepted_contract = phase.get("worker_contract")
+    accepted_source = (
+        accepted_contract.get("batch_source")
+        if isinstance(accepted_contract, dict) else None
+    )
+    if isinstance(accepted_source, dict):
+        # Spawn-time operational overrides cannot remove or replace the source
+        # and selection authorized by the accepted plan. Internal path pins
+        # are checked against the producer ledger below, not as model fields.
+        def public_source(value):
+            return {k: v for k, v in value.items() if k != "_artifact_path"}
+        if not isinstance(source, dict) or public_source(source) != public_source(accepted_source):
+            return {
+                "status": "batch_source_contract_mismatch",
+                "phaseId": str(phase.get("id") or ""),
+                "tool_was_executed": False,
+                "next_instruction": (
+                    "Keep the accepted batch_source at spawn time. Changing or"
+                    " removing its source or selection requires a reviewed replan."
+                ),
+            }
     if not isinstance(source, dict):
         return None
     artifact_name = str(source.get("artifact_name") or "").strip()
@@ -378,6 +399,50 @@ def materialize_batch_rows_from_source(
     ledger_paths = [
         str(path) for path in state.get("artifacts") or [] if str(path).strip()
     ]
+    references = phase.get("input_artifacts")
+    references = references if isinstance(references, list) else []
+    producers = sorted({
+        str(ref.get("phase_id") or "").strip()
+        for ref in references if isinstance(ref, dict)
+        and str(ref.get("artifact_name") or "").strip() == artifact_name
+        and str(ref.get("phase_id") or "").strip()
+    })
+    binding_mode = "legacy_unique_name"
+    if references:
+        # batch_source names an artifact contract, while input_artifacts names
+        # its producer. A row source must have one producer identity; choosing
+        # between multiple declared producers would be a semantic guess.
+        if len(producers) != 1:
+            return {
+                "status": "batch_source_provenance_ambiguous",
+                "phaseId": str(phase.get("id") or ""),
+                "artifactName": artifact_name,
+                "producerPhaseIds": producers,
+                "tool_was_executed": False,
+                "next_instruction": (
+                    "Make worker_contract.batch_source.artifact_name resolve to"
+                    " exactly one input_artifacts producer phase in a reviewed"
+                    " replan. The runtime will not choose a producer by plan"
+                    " order, filename, or recency."
+                ),
+            }
+        binding_mode = "declared_producer"
+        producer = producers[0]
+        producer_state = (state.get("phases") or {}).get(producer) or {}
+        # Explicit provenance is authoritative. Start from this producer's
+        # validated receipt and intersect it with the task ledger; never scan
+        # other producers merely because their payload uses the same name.
+        if producer_state.get("status") != "validated_done":
+            ledger_paths = []
+        else:
+            validated_paths = {
+                str(Path(path).expanduser().resolve())
+                for path in _latest_validated_extraction_paths(logger, producer)
+            }
+            ledger_paths = [
+                path for path in ledger_paths
+                if str(Path(path).expanduser().resolve()) in validated_paths
+            ]
     extraction_root = (logger.task_dir / "artifacts" / "extractions").resolve()
     matches: List[Tuple[Path, JsonDict, str]] = []
     for raw_path in ledger_paths:
@@ -412,12 +477,14 @@ def materialize_batch_rows_from_source(
             "status": "batch_source_not_ready",
             "phaseId": str(phase.get("id") or ""),
             "artifactName": artifact_name,
+            "producerPhaseIds": producers,
+            "bindingMode": binding_mode,
             "matchCount": len(matches),
             "tool_was_executed": False,
             "next_instruction": (
-                "Wait for the declared upstream artifact to become uniquely"
-                " validated, or replan batch_source.artifact_name. Do not copy"
-                " unvalidated rows into batch_rows manually."
+                "Resolve the declared producer phase and artifact name against"
+                " its validated output. Check producerPhaseIds and matchCount;"
+                " do not rename or copy files to manufacture validated provenance."
             ),
         }
     path, payload, source_artifact_generation = matches[0]
@@ -550,6 +617,9 @@ def materialize_batch_rows_from_source(
     worker_contract["batch_rows"] = rows
     worker_contract["_batch_source_receipt"] = {
         "artifactName": artifact_name,
+        "bindingMode": binding_mode,
+        "producerPhaseId": producers[0] if len(producers) == 1 else None,
+        "producerPhaseIds": producers,
         "artifactPath": str(path),
         "sourceArtifactGeneration": source_artifact_generation,
         "rowCount": len(rows),

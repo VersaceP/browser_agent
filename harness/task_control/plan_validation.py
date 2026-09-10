@@ -34,6 +34,7 @@ from harness.evidence.artifact_evidence import _normalized_semantic_token
 from harness.fleet.auth import normalize_auth_verification_contract
 from harness.fleet.coordinator import normalize_page_policy
 from harness.fleet.coordinator import normalize_reuse_scope
+from harness.results.row_ledger import OUTCOME_CONFIRMED_ABSENT
 from harness.storage.base import SNAPSHOT_KEY_CURRENT_PLAN
 from harness.storage.base import SNAPSHOT_KEY_TASK_STATE
 from harness.pacing import MAX_PACING_INTERVAL_SECONDS
@@ -85,11 +86,15 @@ class _TaskStateSnapshot(dict):
         self._task_state_revision = 0
 
 SEMANTIC_TERMINAL_CLASSIFICATIONS = frozenset({
+    # This is an objective validator/schema type contradiction. A retry cannot
+    # change it; the recovery is a replacement plan with a compatible contract.
+    "contract_invalid",
 })
 
 TERMINAL_PHASE_STATUSES = frozenset({
     "validated_done",
     "phase_failed",
+    "contract_invalid",
     "blocked_by_challenge",
     "hitl_required",
     "hitl_timeout",
@@ -129,6 +134,109 @@ EXECUTION_ROLES = frozenset({
     "remediation",
 })
 
+EMPTY_VALUE_LICENSE_OUTCOMES = frozenset({OUTCOME_CONFIRMED_ABSENT})
+
+
+def _validate_empty_value_license_outcomes(
+    raw_outcomes: Any,
+    *,
+    phase_id: str,
+    field: str,
+    path: str,
+    errors: List[str],
+    repair_issues: Optional[List[JsonDict]] = None,
+    repair_value: Any = None,
+    forbid_operations: Optional[List[JsonDict]] = None,
+) -> Optional[List[str]]:
+    """Validate the fixed runtime vocabulary for an empty-value licence.
+
+    This is a protocol check, not a judgment about whether the requested field
+    may be empty. The runtime currently grants that licence only when
+    ``confirmed_absent`` is declared; other row outcomes and absence-proof
+    obligations cannot authorize an empty value.
+    """
+
+    outcomes = (
+        [str(item).strip() for item in raw_outcomes]
+        if isinstance(raw_outcomes, list)
+        and raw_outcomes
+        and all(isinstance(item, str) and item.strip() for item in raw_outcomes)
+        else []
+    )
+    unsupported = sorted(set(outcomes) - EMPTY_VALUE_LICENSE_OUTCOMES)
+    if outcomes and not unsupported:
+        return list(dict.fromkeys(outcomes))
+
+    rendered = raw_outcomes if isinstance(raw_outcomes, list) else type(raw_outcomes).__name__
+    explanation = (
+        f"phase {phase_id}: output field {field!r} declares"
+        f" allow_empty_with_outcome {rendered!r} at {path}. The only value"
+        " the runtime accepts as an emptiness licence is"
+        f" {OUTCOME_CONFIRMED_ABSENT!r}."
+    )
+    if "enumeration_exhausted" in unsupported:
+        explanation += (
+            " enumerationExhausted is an obligation inside each row's"
+            " absence proof, not an outcome: declare ['confirmed_absent']"
+            " here, and the worker must still discharge"
+            " enumerationExhausted in the row itself."
+        )
+    elif "blocked" in unsupported:
+        explanation += (
+            " blocked is a retryable row outcome, not permission to deliver"
+            " the requested field empty."
+        )
+    elif not outcomes:
+        explanation += " Declare a non-empty array of outcome strings."
+    else:
+        explanation += " Other values do not create a runtime empty-value licence."
+    errors.append(explanation)
+
+    if repair_issues is not None and path:
+        issue = next((
+            item for item in repair_issues
+            if item.get("code") == "unsupported_empty_value_license_outcome"
+            and item.get("paths") == [path]
+        ), None)
+        if issue is None:
+            repair_issues.append({
+                "code": "unsupported_empty_value_license_outcome",
+                "phaseId": phase_id,
+                "affectedPhases": [phase_id],
+                "paths": [path],
+                "repairOptions": [{
+                    "id": "allow_confirmed_absence",
+                    "description": (
+                        "Use this only when the requested field may be empty"
+                        " after the worker completes the full absence proof."
+                    ),
+                    "autoApplicable": False,
+                    "operations": [{
+                        "op": "set",
+                        "path": path,
+                        "value": (
+                            [OUTCOME_CONFIRMED_ABSENT]
+                            if repair_value is None else repair_value
+                        ),
+                    }],
+                }, {
+                    "id": "forbid_empty_value",
+                    "description": (
+                        "Use this when an empty value cannot satisfy the user"
+                        " request; remove this field's emptiness licence."
+                    ),
+                    "autoApplicable": False,
+                    **(
+                        {"operations": copy.deepcopy(forbid_operations)}
+                        if forbid_operations else
+                        {"requiresCompletePlan": True, "operations": []}
+                    ),
+                }],
+            })
+        elif phase_id not in issue.get("affectedPhases", []):
+            issue.setdefault("affectedPhases", []).append(phase_id)
+    return None
+
 AXTREE_ID_ANYWHERE_RE = re.compile(r"\b\d+:-?\d+:-?\d+\b")
 
 VOLATILE_HANDLE_KEYS = {
@@ -152,6 +260,69 @@ VALID_STAGE_HINTS = {
     "computed_relationship",
     "generic",
 }
+
+# Row count above which a role-less detail phase is FLAGGED for the auditor.
+#
+# Advisory, not a limit. Across three runs of one seven-product scrape, every
+# detail phase declaring one row finished in a single worker (4 of 4), while
+# phases declaring more needed a continuation in 4 of 6 cases -- three rows
+# took three workers, four rows took two -- at roughly 52 steps per row against
+# a ceiling of 50 plus 15 of extension. That is a strong signal from ONE site,
+# which is exactly why it is triage rather than a gate: "one worker cannot
+# finish N detail rows" has no unique answer at plan time, so it belongs to the
+# semantic auditor, with these numbers in front of it.
+DETAIL_PHASE_SPLIT_ADVISORY_ROWS = 1
+
+# Read-only task types are the only ones whose per-row work is a page read.
+# A per-row download or upload is a different stage question entirely.
+_ROWWISE_SHAPE_TASK_TYPES = frozenset({"web_search", "web_scrape"})
+
+
+def _upstream_rowwise_shape(
+    raw_phase: JsonDict,
+    raw_phases: Any,
+) -> Optional[JsonDict]:
+    """Is this phase, by its OWN declarations, one output row per upstream row?
+
+    Plan-side only: the same shape `assess_batch_source_binding` later proves
+    against the real artifact, minus everything that needs the artifact to
+    exist. Nothing here reads a field name or a URL, so it carries no site or
+    schema knowledge -- only the plan's own wiring.
+    """
+    if normalize_task_type(raw_phase.get("task_type")) not in _ROWWISE_SHAPE_TASK_TYPES:
+        return None
+    references = raw_phase.get("input_artifacts")
+    if not isinstance(references, list) or len(references) != 1:
+        return None
+    reference = references[0]
+    if not isinstance(reference, dict):
+        return None
+    source_id = str(reference.get("phase_id") or "").strip()
+    if not source_id:
+        return None
+    depends_on = raw_phase.get("depends_on")
+    if not isinstance(depends_on, list) or source_id not in {
+        str(item).strip() for item in depends_on if isinstance(item, str)
+    }:
+        return None
+    expected = raw_phase.get("expected_artifact")
+    rows = (expected or {}).get("exact_rows") if isinstance(expected, dict) else None
+    if not isinstance(rows, int) or isinstance(rows, bool) or rows <= 0:
+        return None
+    for candidate in raw_phases if isinstance(raw_phases, list) else []:
+        if not isinstance(candidate, dict):
+            continue
+        if str(candidate.get("id") or "").strip() != source_id:
+            continue
+        source_expected = candidate.get("expected_artifact")
+        source_rows = (
+            source_expected.get("exact_rows")
+            if isinstance(source_expected, dict) else None
+        )
+        if source_rows == rows:
+            return {"sourcePhaseId": source_id, "rows": rows}
+        return None
+    return None
 
 SENSITIVE_PROVENANCE_FIELD_MARKERS = {
     "rank",
@@ -303,9 +474,18 @@ def _allow_empty_fields(expected: JsonDict) -> Set[str]:
 def _nonempty_validator_fields(validators: List[JsonDict]) -> Set[str]:
     out: Set[str] = set()
     for validator in validators:
-        if str(validator.get("type") or "") != "field_nonempty":
-            continue
-        out.update(field_names_from_specs(validator.get("fields") or []))
+        validator_type = str(validator.get("type") or "")
+        if validator_type == "field_nonempty":
+            out.update(field_names_from_specs(validator.get("fields") or []))
+        elif (
+            validator_type == "array_length"
+            and isinstance(validator.get("min"), int)
+            and not isinstance(validator.get("min"), bool)
+            and validator.get("min", 0) > 0
+        ):
+            field = str(validator.get("field") or "").strip()
+            if field:
+                out.add(field)
     return out
 
 def _instruction_assigns_blocker_to_business_field(
@@ -1251,7 +1431,7 @@ def _reject_singleton_phase_fragmentation(
     errors: List[str],
     warnings: List[JsonDict],
 ) -> None:
-    """Detect rank-like one-row fanout without guessing how to merge roles."""
+    """Report rank-like one-row fanout without choosing a business split."""
 
     cohorts: Dict[Tuple[str, str], List[Tuple[str, Any]]] = {}
     for index, phase in enumerate(phases):
@@ -1284,23 +1464,17 @@ def _reject_singleton_phase_fragmentation(
         if len(members) < 3 or len(distinct) < 3:
             continue
         phase_ids = [phase_id for phase_id, _ in members]
-        errors.append(
-            "fragmentation_candidate: homogeneous singleton phases"
-            f" {phase_ids} split only by {range_field!r}. Declare a mechanically"
-            " evidence-driven cohort structure and bind each role to validated"
-            " rows via worker_contract.batch_source. Start with probe only when"
-            " the path is unknown; use validation/bulk only after the checkpoint"
-            " authorizes them, otherwise use continuation for the remaining slow"
-            " path rows; or"
-            " use batch_rows only for targets explicit in the user instruction."
-            " If rows truly require separate identity/session boundaries, declare"
-            " batch_policy.requires_isolation_per_row=true; otherwise do not"
-            " create one worker phase per row."
-        )
         warnings.append({
             "code": "fragmentation_candidate",
             "phaseIds": phase_ids,
             "rangeField": range_field,
+            "message": (
+                "Homogeneous singleton phases may be an intentional reliability"
+                " choice or an avoidable fanout. The plan is structurally valid;"
+                " compare observed per-row cost, available concurrency, session"
+                " boundaries, and the user's requested scheduling policy before"
+                " deciding whether to merge them."
+            ),
         })
 
 
@@ -1358,6 +1532,500 @@ def _normalize_input_artifacts(
         })
     return normalized
 
+
+def _deep_merge_contract(base: JsonDict, override: JsonDict) -> JsonDict:
+    """Merge a source contract with one phase's explicit overrides.
+
+    Output contracts are declarative data, not an inheritance language.  Dicts
+    merge recursively so a phase can change only its row constraint; arrays are
+    replaced because silently appending fields or identity values would change
+    what the phase promises to deliver.
+    """
+    merged = copy.deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_contract(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _compile_output_contract(
+    raw_contract: Any,
+    *,
+    phase_id: str,
+    errors: List[str],
+    source_path: str = "",
+    field_source_paths: Optional[Dict[str, str]] = None,
+    repair_issues: Optional[List[JsonDict]] = None,
+    allow_legacy_empty_outcomes: bool = False,
+    warnings: Optional[List[JsonDict]] = None,
+) -> Tuple[JsonDict, List[JsonDict]]:
+    """Compile concise output syntax to the existing artifact/validator form.
+
+    Legacy ``expected_artifact`` remains valid.  The compact form only removes
+    duplicate declarations; it deliberately does not infer field meaning or
+    empty-value policy from a site.
+    """
+    if not isinstance(raw_contract, dict):
+        errors.append(f"phase {phase_id}: output contract must be an object")
+        return {}, []
+    contract = copy.deepcopy(raw_contract)
+    additional: List[JsonDict] = []
+    rows = contract.pop("rows", None)
+    if rows is not None:
+        if not isinstance(rows, dict):
+            errors.append(f"phase {phase_id}: output.rows must be an object")
+        else:
+            exact = rows.get("exact")
+            minimum = rows.get("min")
+            maximum = rows.get("max")
+            if exact is not None:
+                contract["exact_rows"] = exact
+            else:
+                if minimum is not None:
+                    contract["min_rows"] = minimum
+                if maximum is not None:
+                    contract["max_rows"] = maximum
+            identity = rows.get("identity")
+            if identity is not None:
+                if not isinstance(identity, dict):
+                    errors.append(
+                        f"phase {phase_id}: output.rows.identity must be an object"
+                    )
+                else:
+                    field = str(identity.get("field") or "").strip()
+                    values = identity.get("values")
+                    if not field or not isinstance(values, list) or not values:
+                        errors.append(
+                            f"phase {phase_id}: output.rows.identity requires"
+                            " non-empty field and values"
+                        )
+                    else:
+                        additional.append({
+                            "type": "set_equals", "field": field,
+                            "values": copy.deepcopy(values),
+                        })
+                        if identity.get("unique", True) is not False:
+                            additional.append({"type": "unique", "fields": [field]})
+
+    fields = contract.get("fields")
+    if isinstance(fields, dict):
+        compiled_fields: List[JsonDict] = []
+        nonempty: List[str] = []
+        provenance: List[str] = []
+        top_level_outcomes = contract.get("allow_empty_with_outcome")
+        if top_level_outcomes is None:
+            top_level_outcomes = {}
+        elif not isinstance(top_level_outcomes, dict):
+            errors.append(
+                f"phase {phase_id}: {source_path or 'output_contract'}"
+                "/allow_empty_with_outcome must be an object keyed by field name"
+            )
+            top_level_outcomes = {}
+        canonical_outcomes = copy.deepcopy(top_level_outcomes)
+        for raw_name, raw_outcomes in top_level_outcomes.items():
+            name = str(raw_name or "").strip()
+            pointer_name = name.replace("~", "~0").replace("/", "~1")
+            outcome_path = (
+                f"{source_path}/allow_empty_with_outcome/{pointer_name}"
+                if source_path else
+                f"/allow_empty_with_outcome/{pointer_name}"
+            )
+            raw_spec = fields.get(raw_name)
+            field_path = (field_source_paths or {}).get(name) or (
+                f"{source_path}/fields/{pointer_name}"
+                if source_path else f"/fields/{pointer_name}"
+            )
+            forbid_operations = (
+                [
+                    {"op": "set", "path": f"{field_path}/empty", "value": "forbid"},
+                    {"op": "remove", "path": outcome_path, "value": None},
+                ]
+                if isinstance(raw_spec, dict)
+                and raw_spec.get("empty") == "with_evidence"
+                else None
+            )
+            if allow_legacy_empty_outcomes:
+                if not (
+                    isinstance(raw_outcomes, list)
+                    and raw_outcomes
+                    and all(
+                        isinstance(item, str)
+                        and item.strip() == OUTCOME_CONFIRMED_ABSENT
+                        for item in raw_outcomes
+                    )
+                ) and warnings is not None:
+                    warnings.append({
+                        "type": "legacy_empty_outcome_contract_preserved",
+                        "phase": phase_id,
+                        "path": outcome_path,
+                        "message": (
+                            "An immutable accepted extension prefix carries an"
+                            " empty-value outcome declaration that the current"
+                            " runtime vocabulary would reject. It remains"
+                            " unchanged for compatibility; new or changed"
+                            " phases must use confirmed_absent only."
+                        ),
+                    })
+                continue
+            normalized_outcomes = _validate_empty_value_license_outcomes(
+                raw_outcomes,
+                phase_id=phase_id,
+                field=name,
+                path=outcome_path,
+                errors=errors,
+                repair_issues=repair_issues,
+                forbid_operations=forbid_operations,
+            )
+            if normalized_outcomes is not None:
+                canonical_outcomes[raw_name] = normalized_outcomes
+        for raw_name, raw_spec in fields.items():
+            name = str(raw_name or "").strip()
+            if not name:
+                errors.append(f"phase {phase_id}: output.fields contains an empty name")
+                continue
+            spec = copy.deepcopy(raw_spec) if isinstance(raw_spec, dict) else {}
+            if raw_spec is not None and not isinstance(raw_spec, dict):
+                errors.append(
+                    f"phase {phase_id}: output.fields.{name} must be an object"
+                )
+                continue
+            pointer_name = name.replace("~", "~0").replace("/", "~1")
+            field_path = (field_source_paths or {}).get(name) or (
+                f"{source_path}/fields/{pointer_name}"
+                if source_path else f"/fields/{pointer_name}"
+            )
+            required = spec.pop("required", True)
+            if required is not True:
+                # The existing row-artifact protocol has one coherent concept:
+                # every declared field is present, while its value can be empty
+                # under an explicit policy.  Do not pretend an optional key has
+                # been compiled when the executor cannot validate it.
+                errors.append(
+                    f"phase {phase_id}: output field {name!r} must be required;"
+                    " use empty='allow' or empty='with_evidence' for optional values"
+                )
+            empty = spec.pop("empty", None)
+            if empty is not None:
+                if empty == "allow":
+                    spec["allow_empty"] = True
+                elif empty == "forbid":
+                    spec["nonempty"] = True
+                elif empty == "with_evidence":
+                    spec["nonempty"] = True
+                    inline_outcomes = spec.get("allow_empty_with_outcome")
+                    if inline_outcomes is not None:
+                        if allow_legacy_empty_outcomes:
+                            if not (
+                                isinstance(inline_outcomes, list)
+                                and inline_outcomes
+                                and all(
+                                    isinstance(item, str)
+                                    and item.strip() == OUTCOME_CONFIRMED_ABSENT
+                                    for item in inline_outcomes
+                                )
+                            ) and warnings is not None:
+                                warnings.append({
+                                    "type": "legacy_empty_outcome_contract_preserved",
+                                    "phase": phase_id,
+                                    "path": (
+                                        f"{field_path}/allow_empty_with_outcome"
+                                    ),
+                                    "message": (
+                                        "An immutable accepted extension prefix"
+                                        " carries an empty-value outcome"
+                                        " declaration that the current runtime"
+                                        " vocabulary would reject. It remains"
+                                        " unchanged for compatibility; new or"
+                                        " changed phases must use"
+                                        " confirmed_absent only."
+                                    ),
+                                })
+                        else:
+                            normalized_inline = (
+                                _validate_empty_value_license_outcomes(
+                                    inline_outcomes,
+                                    phase_id=phase_id,
+                                    field=name,
+                                    path=(
+                                        f"{field_path}/"
+                                        "allow_empty_with_outcome"
+                                    ),
+                                    errors=errors,
+                                    repair_issues=repair_issues,
+                                    forbid_operations=[
+                                        {
+                                            "op": "set",
+                                            "path": f"{field_path}/empty",
+                                            "value": "forbid",
+                                        },
+                                        {
+                                            "op": "remove",
+                                            "path": f"{field_path}/allow_empty_with_outcome",
+                                            "value": None,
+                                        },
+                                    ],
+                                )
+                            )
+                            if normalized_inline is not None:
+                                inline_outcomes = normalized_inline
+                    mapped_outcomes = canonical_outcomes.get(name)
+                    outcomes = inline_outcomes or mapped_outcomes
+                    if not isinstance(outcomes, list) or not outcomes:
+                        errors.append(
+                            f"phase {phase_id}: output field {name!r} with"
+                            " empty='with_evidence' requires a non-empty outcome"
+                            f" list at {field_path}/allow_empty_with_outcome;"
+                            " for example [\"confirmed_absent\"]"
+                        )
+                        if repair_issues is not None:
+                            issue = next((
+                                item for item in repair_issues
+                                if item.get("code") == "empty_with_evidence_missing_outcome"
+                                and item.get("paths") == [
+                                    f"{field_path}/allow_empty_with_outcome"
+                                ]
+                            ), None)
+                            if issue is None:
+                                repair_issues.append({
+                                    "code": "empty_with_evidence_missing_outcome",
+                                    "phaseId": phase_id,
+                                    "affectedPhases": [phase_id],
+                                    "paths": [
+                                        f"{field_path}/allow_empty_with_outcome"
+                                    ],
+                                    "repairOptions": [{
+                                        "id": "allow_confirmed_absence",
+                                        "description": (
+                                            "Allow an evidence-backed empty value when"
+                                            " the page positively proves absence."
+                                        ),
+                                        "operations": [{
+                                            "op": "add",
+                                            "path": (
+                                                f"{field_path}/"
+                                                "allow_empty_with_outcome"
+                                            ),
+                                            "value": ["confirmed_absent"],
+                                        }],
+                                    }],
+                                })
+                            elif phase_id not in issue["affectedPhases"]:
+                                issue["affectedPhases"].append(phase_id)
+                    else:
+                        canonical_outcomes[name] = copy.deepcopy(outcomes)
+                        spec["allow_empty_with_outcome"] = copy.deepcopy(outcomes)
+                else:
+                    errors.append(
+                        f"phase {phase_id}: output field {name!r}.empty must be"
+                        " 'allow', 'forbid', or 'with_evidence'"
+                    )
+            if spec.pop("provenance", False) is True:
+                provenance.append(name)
+            array_min = spec.pop("minItems", None)
+            array_max = spec.pop("maxItems", None)
+            if array_min is not None or array_max is not None:
+                array_check: JsonDict = {
+                    "type": "array_length", "field": name,
+                    **({"min": array_min} if array_min is not None else {}),
+                    **({"max": array_max} if array_max is not None else {}),
+                }
+                outcomes = canonical_outcomes.get(name)
+                if (
+                    isinstance(array_min, int)
+                    and not isinstance(array_min, bool)
+                    and array_min > 0
+                    and isinstance(outcomes, list)
+                    and outcomes
+                ):
+                    array_check["allow_empty_with_outcome"] = {
+                        name: copy.deepcopy(outcomes)
+                    }
+                additional.append(array_check)
+            pattern = spec.pop("pattern", None)
+            if pattern is not None:
+                additional.append({"type": "field_pattern", "field": name, "pattern": pattern})
+            domains = spec.pop("allowedDomains", None)
+            if domains is not None:
+                additional.append({"type": "allowed_domain", "field": name, "domains": domains})
+            spec["name"] = name
+            compiled_fields.append(spec)
+            if spec.get("nonempty") is True:
+                nonempty.append(name)
+        contract["fields"] = compiled_fields
+        if nonempty:
+            contract["nonempty_fields"] = nonempty
+        if provenance:
+            contract["provenance_required"] = provenance
+        if canonical_outcomes:
+            contract["allow_empty_with_outcome"] = canonical_outcomes
+    return contract, additional
+
+
+def _compile_phase_plan_shorthand(
+    raw_phase: JsonDict,
+    *,
+    output_contracts: Dict[str, JsonDict],
+    phase_id: str,
+    phase_index: int,
+    errors: List[str],
+    repair_issues: Optional[List[JsonDict]] = None,
+    allow_legacy_empty_outcomes: bool = False,
+    warnings: Optional[List[JsonDict]] = None,
+) -> JsonDict:
+    """Expand the concise Lead-facing plan syntax before normal validation."""
+    phase = copy.deepcopy(raw_phase)
+    task = str(phase.get("task") or "").strip()
+    if task:
+        if not str(phase.get("objective") or "").strip():
+            phase["objective"] = task
+        if not str(phase.get("worker_task") or "").strip():
+            phase["worker_task"] = task
+
+    compact_checks = phase.get("additional_checks")
+    legacy_checks = phase.get("validators")
+    if compact_checks is not None and legacy_checks is not None:
+        errors.append(
+            f"phase {phase_id}: use additional_checks or legacy validators, not both"
+        )
+    explicit_checks = compact_checks if compact_checks is not None else legacy_checks
+    if explicit_checks is None:
+        explicit_checks = []
+    if not isinstance(explicit_checks, list):
+        field_name = "additional_checks" if compact_checks is not None else "validators"
+        errors.append(f"phase {phase_id}: {field_name} must be an array")
+        explicit_checks = []
+    phase["validators"] = copy.deepcopy(explicit_checks)
+
+    output_ref = str(phase.get("output_ref") or "").strip()
+    output_override = phase.get("output_contract")
+    expected_override = phase.get("expected_artifact")
+    if output_ref:
+        template = output_contracts.get(output_ref)
+        if template is None:
+            errors.append(
+                f"phase {phase_id}: output_ref {output_ref!r} is not declared"
+            )
+            template = {}
+        merged = copy.deepcopy(template)
+        if output_override is not None:
+            if isinstance(output_override, dict):
+                merged = _deep_merge_contract(merged, output_override)
+            else:
+                errors.append(f"phase {phase_id}: output_contract must be an object")
+        if expected_override is not None:
+            if isinstance(expected_override, dict):
+                merged = _deep_merge_contract(merged, expected_override)
+            else:
+                errors.append(f"phase {phase_id}: expected_artifact must be an object")
+        output_fields = output_override.get("fields") if isinstance(output_override, dict) else None
+        legacy_fields = expected_override.get("fields") if isinstance(expected_override, dict) else None
+        template_fields = template.get("fields") if isinstance(template, dict) else None
+        pointer_ref = output_ref.replace("~", "~0").replace("/", "~1")
+        all_field_names = set()
+        for declared in (template_fields, output_fields, legacy_fields):
+            if isinstance(declared, dict):
+                all_field_names.update(str(name) for name in declared)
+        field_source_paths: Dict[str, str] = {}
+        for name in all_field_names:
+            pointer_name = name.replace("~", "~0").replace("/", "~1")
+            if isinstance(legacy_fields, dict) and name in legacy_fields:
+                field_source_paths[name] = (
+                    f"/phases/{phase_index}/expected_artifact/fields/{pointer_name}"
+                )
+            elif isinstance(output_fields, dict) and name in output_fields:
+                field_source_paths[name] = (
+                    f"/phases/{phase_index}/output_contract/fields/{pointer_name}"
+                )
+            else:
+                field_source_paths[name] = (
+                    f"/output_contracts/{pointer_ref}/fields/{pointer_name}"
+                )
+        contract_source_path = (
+            f"/phases/{phase_index}/expected_artifact"
+            if isinstance(legacy_fields, dict) and legacy_fields
+            else f"/phases/{phase_index}/output_contract"
+            if isinstance(output_fields, dict) and output_fields
+            else f"/output_contracts/{pointer_ref}"
+        )
+        expected, generated_checks = _compile_output_contract(
+            merged, phase_id=phase_id, errors=errors,
+            source_path=contract_source_path,
+            field_source_paths=field_source_paths,
+            repair_issues=repair_issues,
+            allow_legacy_empty_outcomes=allow_legacy_empty_outcomes,
+            warnings=warnings,
+        )
+        phase["expected_artifact"] = expected
+        phase["validators"] = [*generated_checks, *copy.deepcopy(explicit_checks)]
+        phase["_empty_outcomes_prevalidated"] = True
+    elif output_override is not None:
+        expected, generated_checks = _compile_output_contract(
+            output_override, phase_id=phase_id, errors=errors,
+            source_path=f"/phases/{phase_index}/output_contract",
+            repair_issues=repair_issues,
+            allow_legacy_empty_outcomes=allow_legacy_empty_outcomes,
+            warnings=warnings,
+        )
+        phase["expected_artifact"] = expected
+        phase["validators"] = [*generated_checks, *copy.deepcopy(explicit_checks)]
+        phase["_empty_outcomes_prevalidated"] = True
+
+    inputs = phase.get("inputs")
+    if inputs is not None:
+        if not isinstance(inputs, dict):
+            errors.append(f"phase {phase_id}: inputs must be an object")
+            return phase
+        if phase.get("input_artifacts") is not None:
+            errors.append(
+                f"phase {phase_id}: use inputs.artifact or legacy input_artifacts, not both"
+            )
+        contract = phase.get("worker_contract")
+        contract = copy.deepcopy(contract) if isinstance(contract, dict) else {}
+        artifact = inputs.get("artifact")
+        direct = inputs.get("direct")
+        if artifact is not None and direct is not None:
+            errors.append(f"phase {phase_id}: inputs.artifact and inputs.direct are mutually exclusive")
+        if isinstance(artifact, dict):
+            source_phase = str(artifact.get("phase_id") or "").strip()
+            artifact_name = str(artifact.get("artifact_name") or "").strip()
+            if not source_phase or not artifact_name:
+                errors.append(
+                    f"phase {phase_id}: inputs.artifact requires phase_id and artifact_name"
+                )
+            else:
+                phase["input_artifacts"] = [{
+                    "phase_id": source_phase, "artifact_name": artifact_name,
+                }]
+                selector = artifact.get("selector")
+                if selector is not None:
+                    contract["batch_source"] = {
+                        "artifact_name": artifact_name,
+                        "selector": copy.deepcopy(selector),
+                        **({"identity_field": artifact["identity_field"]}
+                           if artifact.get("identity_field") is not None else {}),
+                    }
+        elif artifact is not None:
+            errors.append(f"phase {phase_id}: inputs.artifact must be an object")
+        if isinstance(direct, dict):
+            rows = direct.get("rows")
+            identities = direct.get("identity_fields")
+            if not isinstance(rows, list) or not isinstance(identities, list) or not identities:
+                errors.append(
+                    f"phase {phase_id}: inputs.direct requires rows and non-empty identity_fields"
+                )
+            else:
+                contract["batch_rows"] = copy.deepcopy(rows)
+                contract["batch_rows_provenance"] = {
+                    "source": "user_instruction",
+                    "identity_fields": copy.deepcopy(identities),
+                }
+        elif direct is not None:
+            errors.append(f"phase {phase_id}: inputs.direct must be an object")
+        phase["worker_contract"] = contract
+    return phase
+
 def validate_task_plan(
     raw_plan: Any,
     *,
@@ -1366,6 +2034,7 @@ def validate_task_plan(
     user_task: str = "",
     legacy_required_controls_phase_ids: Optional[AbstractSet[str]] = None,
     legacy_non_form_required_controls_phase_ids: Optional[AbstractSet[str]] = None,
+    legacy_empty_outcome_phase_ids: Optional[AbstractSet[str]] = None,
     repair_issues: Optional[List[JsonDict]] = None,
     collection_facts: Optional[List[JsonDict]] = None,
 ) -> Tuple[Optional[JsonDict], List[str]]:
@@ -1385,6 +2054,11 @@ def validate_task_plan(
         return None, ["plan must be a JSON object"]
 
     warnings: List[JsonDict] = []
+    legacy_empty_outcome_phase_ids = {
+        str(item).strip()
+        for item in (legacy_empty_outcome_phase_ids or set())
+        if str(item).strip()
+    }
     plan_pacing = _validate_pacing(raw_plan.get("pacing"), errors, where="pacing")
     goal = str(raw_plan.get("goal") or "").strip()
     if not goal:
@@ -1400,6 +2074,47 @@ def validate_task_plan(
     if not isinstance(raw_phases, list) or not raw_phases:
         errors.append("phases must be a non-empty array")
         raw_phases = []
+
+    raw_output_contracts = raw_plan.get("output_contracts")
+    output_contracts: Dict[str, JsonDict] = {}
+    if raw_output_contracts is not None:
+        if not isinstance(raw_output_contracts, dict):
+            errors.append("output_contracts must be an object keyed by contract name")
+        else:
+            for raw_name, raw_contract in raw_output_contracts.items():
+                name = str(raw_name or "").strip()
+                if not name:
+                    errors.append("output_contracts contains an empty contract name")
+                elif not isinstance(raw_contract, dict):
+                    errors.append(f"output_contracts.{name} must be an object")
+                else:
+                    output_contracts[name] = copy.deepcopy(raw_contract)
+
+    # Compact syntax is expanded before any validator reads phase fields.  The
+    # rest of this function intentionally remains the single authority for
+    # mechanical plan checks, so source and compiled plans cannot diverge.
+    expanded_raw_phases: List[Any] = []
+    for index, item in enumerate(raw_phases):
+        if not isinstance(item, dict):
+            expanded_raw_phases.append(item)
+            continue
+        phase_id = safe_path_component(
+            str(item.get("id") or f"phase_{index + 1}").strip(),
+            fallback=f"phase_{index + 1}",
+        )
+        expanded_raw_phases.append(_compile_phase_plan_shorthand(
+            item,
+            output_contracts=output_contracts,
+            phase_id=phase_id,
+            phase_index=index,
+            errors=errors,
+            repair_issues=repair_issues,
+            allow_legacy_empty_outcomes=(
+                phase_id in legacy_empty_outcome_phase_ids
+            ),
+            warnings=warnings,
+        ))
+    raw_phases = expanded_raw_phases
 
     raw_checkpoint_ids = raw_plan.get("replan_checkpoint_ids")
     checkpoint_ids: List[str] = []
@@ -1490,6 +2205,9 @@ def validate_task_plan(
         if validators is not None and not isinstance(validators, list):
             errors.append(f"phase {phase_id}: validators must be an array")
             validators = []
+        empty_outcomes_prevalidated = bool(
+            raw_phase.get("_empty_outcomes_prevalidated")
+        )
         expected_artifact = _tc()._normalize_expected_artifact_contract(
             expected_artifact if isinstance(expected_artifact, dict) else {},
             validators,
@@ -1509,7 +2227,101 @@ def validate_task_plan(
             allow_legacy_non_form_required_controls=(
                 phase_id in legacy_non_form_required_controls_phase_ids
             ),
+            allow_legacy_empty_outcomes=(
+                phase_id in legacy_empty_outcome_phase_ids
+            ),
+            validate_empty_outcomes=not empty_outcomes_prevalidated,
         )
+        # `generic` is the fallback stage, and this phase's own declared shape
+        # says a more specific one applies.
+        #
+        # Unlike the row-count question below, this IS decidable: a read-only
+        # phase that names exactly one input artifact, depends on that
+        # artifact's producer, and claims the same row count has declared a
+        # row-wise transformation of an upstream collection. Nothing else in
+        # the stage vocabulary describes that, so while the rule cannot say
+        # WHICH specific stage applies, it can say the fallback does not.
+        #
+        # It matters because stage_hint is a dispatch key, not a label. In task
+        # b9a91fd2 all seven phases were `generic`, which silently disabled
+        # skill matching (a skill declaring a stage cannot match a phase
+        # declaring another), guidance health accounting, strategy-bank reuse,
+        # detail-phase sizing triage, and half the pathfinder/sibling grouping
+        # -- none of which reports a failure when it simply never fires.
+        if str(raw_phase.get("stage_hint") or "").strip() == "generic":
+            shape = _upstream_rowwise_shape(raw_phase, raw_phases)
+            if shape is not None:
+                errors.append(
+                    f"phase {phase_id}: stage_hint='generic', but this phase"
+                    " declares a row-wise transformation of phase"
+                    f" {shape['sourcePhaseId']!r}'s artifact -- one input"
+                    " artifact reference, that phase as a dependency, and the"
+                    f" same {shape['rows']} rows. A read-only phase of that"
+                    " shape is detail_sections, attribute_links or"
+                    " computed_relationship; 'generic' is the fallback and it"
+                    " is a dispatch key, so declaring it silently disables"
+                    " skill matching, strategy reuse, pathfinder grouping and"
+                    " phase sizing for this phase."
+                )
+                if repair_issues is not None:
+                    repair_issues.append({
+                        "code": "generic_stage_hint_on_rowwise_phase",
+                        "phaseId": phase_id,
+                        "paths": [f"/phases/{index}/stage_hint"],
+                        "repairOptions": [{
+                            "action": "set_specific_stage_hint",
+                            "candidates": [
+                                "detail_sections",
+                                "attribute_links",
+                                "computed_relationship",
+                            ],
+                            "sourcePhaseId": shape["sourcePhaseId"],
+                            "rows": shape["rows"],
+                        }],
+                    })
+
+        # Detail-phase sizing is REPORTED, never refused here.
+        #
+        # An earlier revision made this a hard rejection at more than one row.
+        # That was overreach: whether one worker can finish N detail rows has
+        # no unique answer at plan time. It depends on the site, on how much of
+        # the row a fast path can satisfy, and on the budget the phase actually
+        # gets. The measurements behind it came from one site and one task
+        # shape, so encoding them as a global gate would put a Taobao-derived
+        # constant in the generic layer and refuse plans that could well
+        # succeed. Mechanical triage states the facts; the plan auditor decides.
+        declared_rows = expected_artifact.get("exact_rows")
+        raw_worker_contract = raw_phase.get("worker_contract")
+        declared_role = str(
+            raw_phase.get("execution_role")
+            or (
+                raw_worker_contract.get("execution_role")
+                if isinstance(raw_worker_contract, dict) else ""
+            )
+            or ""
+        ).strip()
+        if (
+            stage_hint == "detail_sections"
+            and not declared_role
+            and isinstance(declared_rows, int)
+            and not isinstance(declared_rows, bool)
+            and declared_rows > DETAIL_PHASE_SPLIT_ADVISORY_ROWS
+        ):
+            warnings.append(
+                f"phase {phase_id}: stage_hint=detail_sections claims"
+                f" {declared_rows} entities with no execution_role. Measured on"
+                " one repeated scrape, detail phases of a single row finished"
+                " in one worker 4 times out of 4, while phases of 2 or more"
+                " needed a continuation in 4 of 6 cases, at roughly 52 steps"
+                " per row against a 50+15 ceiling. That is a reference point"
+                " from one site, not a law: a cheaper page or a fast path may"
+                " well finish all of them. If it will not, the remedy depends"
+                " on facts this warning does not have -- splitting per entity,"
+                " resizing the budget, batching, or an explicit continuation"
+                " are all legitimate, and a split has to keep whatever real"
+                " dependencies hold between the entities."
+            )
+
         validators = _tc()._normalize_validators(
             expected_artifact,
             validators,
@@ -1699,6 +2511,15 @@ def validate_task_plan(
                 f"phase {phase_id}: execution_role must be one of"
                 f" {sorted(EXECUTION_ROLES)}; got {execution_role!r}"
             )
+        dispatch_wave = raw_phase.get("dispatch_wave")
+        if dispatch_wave is not None and (
+            not isinstance(dispatch_wave, int)
+            or isinstance(dispatch_wave, bool)
+            or dispatch_wave < 1
+        ):
+            errors.append(
+                f"phase {phase_id}: dispatch_wave must be a positive integer"
+            )
 
         # phase_contract consumes phase.task_type (contract > phase > plan),
         # but normalization used to drop it silently — a per-phase override
@@ -1755,9 +2576,20 @@ def validate_task_plan(
             "task_type": phase_task_type or None,
             "objective": objective,
             "worker_task": worker_task,
+            **(
+                {"output_ref": str(raw_phase.get("output_ref") or "").strip()}
+                if str(raw_phase.get("output_ref") or "").strip() else {}
+            ),
             "stage_hint": stage_hint,
             "stage_hint_reason": stage_hint_reason,
             "execution_role": execution_role or None,
+            **(
+                {"dispatch_wave": dispatch_wave}
+                if isinstance(dispatch_wave, int)
+                and not isinstance(dispatch_wave, bool)
+                and dispatch_wave >= 1
+                else {}
+            ),
             "context": str(raw_phase.get("context") or ""),
             "max_steps": raw_phase.get("max_steps"),
             # None (omitted) and [] (explicitly independent) mean DIFFERENT
@@ -1808,6 +2640,18 @@ def validate_task_plan(
                     f" id {dep_id!r}"
                 )
 
+    declared_waves = sorted({
+        int(phase["dispatch_wave"])
+        for phase in phases
+        if isinstance(phase.get("dispatch_wave"), int)
+        and not isinstance(phase.get("dispatch_wave"), bool)
+    })
+    if declared_waves and declared_waves != list(range(1, max(declared_waves) + 1)):
+        errors.append(
+            "dispatch_wave values must start at 1 and be contiguous; got "
+            f"{declared_waves}"
+        )
+
     phase_positions = {
         str(phase.get("id") or ""): index
         for index, phase in enumerate(phases)
@@ -1819,7 +2663,8 @@ def validate_task_plan(
     for phase in phases:
         phase_id = str(phase.get("id") or "")
         dependencies = _tc()._phase_dependency_ids(phase)
-        for index, reference in enumerate(phase.get("input_artifacts") or []):
+        input_artifacts = phase.get("input_artifacts") or []
+        for index, reference in enumerate(input_artifacts):
             if not isinstance(reference, dict):
                 continue
             where = f"phase {phase_id}: input_artifacts[{index}]"
@@ -1847,6 +2692,30 @@ def validate_task_plan(
                     f"{where}.phase_id must also appear in depends_on so the "
                     "source is validated before this phase starts"
                 )
+        worker_contract = phase.get("worker_contract")
+        worker_contract = (
+            worker_contract if isinstance(worker_contract, dict) else {}
+        )
+        batch_source = worker_contract.get("batch_source")
+        if input_artifacts and isinstance(batch_source, dict):
+            batch_artifact_name = str(
+                batch_source.get("artifact_name") or ""
+            ).strip()
+            source_phase_ids = sorted({
+                str(reference.get("phase_id") or "").strip()
+                for reference in input_artifacts
+                if isinstance(reference, dict)
+                and str(reference.get("artifact_name") or "").strip()
+                == batch_artifact_name
+                and str(reference.get("phase_id") or "").strip()
+            })
+            if len(source_phase_ids) != 1:
+                errors.append(
+                    f"phase {phase_id}: worker_contract.batch_source.artifact_name "
+                    f"{batch_artifact_name!r} must resolve to exactly one "
+                    "input_artifacts producer phase; matched "
+                    f"{source_phase_ids}"
+                )
 
     _validate_execution_role_dependencies(phases, errors)
     _reject_singleton_phase_fragmentation(phases, errors, warnings)
@@ -1868,12 +2737,28 @@ def validate_task_plan(
         "goal": goal,
         "task_type": task_type,
         "pacing": plan_pacing,
+        **(
+            {"output_contracts": copy.deepcopy(output_contracts)}
+            if output_contracts else {}
+        ),
         "replan_checkpoint_id": (
             str(raw_plan.get("replan_checkpoint_id") or "").strip() or None
         ),
         "replan_checkpoint_ids": checkpoint_ids,
         "phases": phases,
     }
+    # ``direct_worker`` is a control-plane routing hint emitted by the compact
+    # direct plan tool.  It does not change phase validation or worker policy,
+    # but must survive normalization so the runtime can select the bounded
+    # single-worker path after the same approval gate.  Ordinary plans omit it.
+    execution_mode = str(raw_plan.get("execution_mode") or "").strip()
+    if execution_mode:
+        if execution_mode not in {"direct_worker", "lead_orchestration"}:
+            errors.append(
+                "execution_mode must be 'direct_worker' or 'lead_orchestration'"
+            )
+        else:
+            normalized["execution_mode"] = execution_mode
     if warnings:
         normalized["warnings"] = warnings
     if errors:
@@ -2140,6 +3025,8 @@ def accept_task_plan(
     validator_review: Optional[JsonDict],
     preserve_from: Optional[JsonDict] = None,
     extension_decision: Optional[JsonDict] = None,
+    user_approval: Optional[JsonDict] = None,
+    source_plan: Optional[JsonDict] = None,
 ) -> Tuple[str, JsonDict, JsonDict]:
     """Publish one plan generation: version record, alias and reset state.
 
@@ -2157,6 +3044,7 @@ def accept_task_plan(
         replan_reason=replan_reason,
         user_task=user_task,
         validator_review=validator_review,
+        source_plan=source_plan,
     )
     if extension_decision is not None and isinstance(preserve_from, dict):
         # Recorded before the state is built so it lands inside the same
@@ -2176,6 +3064,7 @@ def accept_task_plan(
         preserve_from=preserve_from,
         replan_reason=replan_reason,
         plan_version=record,
+        user_approval=user_approval,
         persist=False,
     )
     storage, task_id = storage_for_logger(logger)
@@ -2218,6 +3107,7 @@ def initialize_task_state(
     preserve_from: Optional[JsonDict] = None,
     replan_reason: str = "",
     plan_version: Optional[JsonDict] = None,
+    user_approval: Optional[JsonDict] = None,
     persist: bool = True,
 ) -> JsonDict:
     previous_phases_raw = preserve_from.get("phases") if isinstance(preserve_from, dict) else None
@@ -2330,7 +3220,18 @@ def initialize_task_state(
         "artifact_supersessions": copy.deepcopy(
             (preserve_from or {}).get("artifact_supersessions") or []
         ),
+        # Runtime-owned direct dispatches are preserved across a replan as an
+        # audit ledger. Their keys include planVersion, so no replacement plan
+        # can accidentally claim an old attempt as its own.
+        "direct_dispatches": copy.deepcopy(
+            (preserve_from or {}).get("direct_dispatches") or {}
+        ),
     }
+    # Approval is bound to the immutable candidate hash and committed with the
+    # plan generation.  It is control-plane state, not part of the plan body:
+    # adding it to the plan would change the very candidate the user approved.
+    if isinstance(user_approval, dict):
+        state["plan_user_approval"] = copy.deepcopy(user_approval)
     if preserve_from is not None:
         state["replans"] = list((preserve_from or {}).get("replans") or [])
         state["replans"].append(replan_audit or {})

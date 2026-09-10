@@ -25,6 +25,16 @@ def field_name_from_spec(value: Any) -> str:
 
 
 ARRAY_FIELD_TYPES = frozenset({"array", "list"})
+# These schema types denote structured containers rather than one numeric
+# scalar. A numeric ``range`` against one is objectively unsatisfiable: the
+# runtime would have to coerce the container itself to float. Keep this set
+# deliberately narrow; a declared string may legitimately encode a number.
+NON_NUMERIC_CONTAINER_FIELD_TYPES = frozenset({
+    *ARRAY_FIELD_TYPES,
+    "object",
+    "map",
+    "dict",
+})
 
 
 def resolve_required_field_specs(expected_artifact: Any) -> JsonDict:
