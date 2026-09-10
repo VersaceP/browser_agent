@@ -127,15 +127,29 @@ trees, never across a frame boundary), so work from the frame named by
 `frameId:axNodeId:domNodeId` (three segments) — copy them verbatim and never
 truncate to two segments.
 
-Read AXTree lines as `depth [id] role "label" flags # @x,y,w,h`: `#` marks a
-preferred actionable target, `@x,y,w,h` is the element's viewport rect (absent
-on unpositioned nodes), and flags such as `hidden`, `off`, `blocked`, `scroll`,
-`sticky`, `clip`, or `zN` describe compact layout state. Use `rect` for spatial
-reasoning only (relative position, overlap, on/off-screen), not for deriving
-click coordinates — act through the canonical id or a selector. Prefer `#`
-targets without `hidden`/`blocked`; treat `blocked` as occlusion (dismiss the
-blocker first) and `scroll` as a scrollable container. (The pixel space of
-`@x,y,w,h` is a pending live probe — see the maintainer note below.)
+Read AXTree lines as `depth [id] role "label" [flags...] #|~ @x,y,w,h
+(+N omitted)`: `#` marks a preferred actionable target, `~` a secondary
+candidate needing extra evidence, and `@x,y,w,h` is the element's viewport rect
+(absent on unpositioned nodes). Use `rect` for spatial reasoning only (relative
+position, overlap, on/off-screen), not for deriving click coordinates — act
+through the canonical id or a selector. (The pixel space of `@x,y,w,h` is a
+pending live probe — see the maintainer note below.)
+
+Every flag shares ONE bracket group in a fixed order — `[checked enabled]`,
+`[enabled collapsed single popup]`, `[off]` — not a group per flag. Generic AX
+state comes first and is explicit in both directions: `checked`/`unchecked`/
+`mixed`, `enabled`/`disabled` (with `inert` for native inertness),
+`selected`/`unselected`, `expanded`/`collapsed`, `multi`/`single`, and `popup`
+only when true. An absent state means AX does not expose it for that node — not
+the negative, which is exactly why the negative forms are emitted. Layout flags
+come last: `hidden`, `off`, `blocked`, `scroll`, `sticky`, `clip`, `zN`. They
+are SPARSE: a missing `blocked`/`hidden` does not prove the target is clear, so
+their absence is not a clearance check. Prefer `#` targets without
+`hidden`/`blocked`; treat `blocked` as occlusion (dismiss the blocker first)
+and `scroll` as a scrollable container. `[off]` needs no pre-scroll — a
+locator-based Input Action reveals such a target itself. Flags never change
+`#`/`~` confidence and never substitute for `DOM.inspectSelect`: `popup`,
+`expanded` and `multi` carry no `controlKind`, `selectionMode`, or options.
 
 Selector priority: canonical AXTree id > semantic attributes (`aria-label`,
 `name`) > stable CSS selector. Avoid dynamic hash classes. When you hold BOTH an
@@ -218,6 +232,10 @@ the page viewport. `amount:0` reads scroll state without dispatching input and
 is valid only for container/viewport mode. In the receipt, `layers[].delta` is
 the per-surface truth and `totalDelta` only a summary; after
 `completedReason="boundary-reached"` do not repeat the same direction.
+These output facts follow measured ABCP receipts rather than `resultSchema`
+alone: the current `Input.scroll` result schema omits `totalDelta`,
+`completedReason`, `requestedDistance`, and `actualDistance`, and leaves each
+`layers` item opaque even though runtime receipts include `layers[].delta`.
 
 `Input.drag` needs both endpoints in the same document. Cross-frame and
 cross-document drags are unsupported, and an iframe source cannot use a
@@ -242,26 +260,16 @@ large row sets.
 
 ## JavaScript Fallback
 
-The only model-facing JavaScript path is
-`browser_call({method:"Runtime.evaluate", ...})`. It is a trace-gated last resort for
-computed geometry, cross-node relationships, shadow DOM traversal, cross-frame
-aggregation, non-DOM state, or legacy cases with no DOM equivalent. Supply the
-harness-only `runtime_policy` with intent, effect, a valid `reason_kind`,
-`why_structured_tools_insufficient`, `cross_check_plan`, and `result_mode`. The
-current page epoch must contain actual attempts of every available structured
-alternative (`Page.getState`, AX/Semantic tree, batched text, and batched
-attributes); prose claims do not satisfy this gate.
+The model-facing JavaScript path is `browser_call({method:"Runtime.evaluate",
+...})`. It accepts arbitrary page JavaScript, including writes. The live ABCP
+schema defines its parameters and supports `isolated`, `main`, and `auto`
+execution worlds; `auto` is resolved by ABCP. Harness records the requested and
+platform-reported execution world and invalidates stale targeting state after
+the call. Re-observe any state that later actions depend on.
 
-The live Runtime schema must advertise strict `isolated` and `main` worlds, while
-every model-authored call must explicitly request `world="isolated"`. Direct
-`main`, `auto`, implicit/legacy worlds, and all state-changing scripts are
-rejected. Only `non_dom_state` may authorize one harness-controlled strict main
-retry: throw `ReferenceError("ABCP_MAIN_WORLD_REQUIRED:<global>")` when the
-required page global is absent in isolated world. Ordinary JavaScript errors,
-timeouts, and empty successful results never authorize main. With
-`result_mode="json"`, pass a JSON-serializable value expression or an invoked
-IIFE, never a function body containing top-level `return` or an uninvoked
-function value.
+`runtime_policy` is optional legacy metadata, not an authorization boundary.
+`result_mode="json"` and `record_name` keep the existing JSON extraction envelope
+for older callers; new calls can omit it.
 
 Do not use JavaScript for ordinary visible text or attributes that
 `DOM.getText`/`DOM.getAttribute` can read. Never use it to bypass permissions,
@@ -346,8 +354,17 @@ automation is built on them:
    screenshots stay physical px, `harness/vl/locate.py` bbox→id promotion needs
    a DPR conversion. Probe: compare one element's AXTree bbox,
    `getBoundingClientRect`, and screenshot dimensions.
-2. **Per-flag semantics** — `off`/`clip`/`zN` meanings are undocumented; pin
-   them down before find_in_axtree filtering or auto_intercept uses them.
+2. **Per-flag semantics** — partly settled by the 2026-09-10 live probe. `off`
+   means out of the current viewport and is NOT a problem to route around: the
+   platform's own feedback says `[off]` can be revealed by a locator-based
+   Input Action, while `[hidden]` is diagnostic only and must not be operated.
+   `clip`/`zN` remain unpinned. The same probe found layout flags far sparser
+   than the vocabulary suggests: on a page with a `position:fixed` full-screen
+   `z-index:9999` overlay covering a button, an `overflow-y:auto` container and
+   a `position:sticky` bar, the only layout flag emitted anywhere was `off` —
+   no `blocked`, `scroll`, `sticky`, `clip` or `zN`. Treat their absence as no
+   evidence, never as a clearance check, and do not build a filter that assumes
+   `blocked` will be there when a target is genuinely covered.
 3. **getSemanticTree shadow-root traversal** — the new guide lists Shadow DOM
    as a valid use, but the 2026-06 probe found `includeShadowDOM` had no
    effect (abcp-panel-quirks #8). Retest on the current build.

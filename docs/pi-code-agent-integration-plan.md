@@ -1,5 +1,11 @@
 # pi 代码 agent 接入实施计划（Option A）
 
+> 2026-09-06 范围更新：独立 Hybrid Skill Builder 改用 Tau Python Agent 核心，详见
+> [Tau Skill Builder Agent Loop 设计](tau-skill-builder-agent-loop-plan.md)。该新设计覆盖
+> `/skill-create` 的工具生命周期、停止协议以及 Agent 修复页面后重新运行 Workflow。
+> 本文其余内容保留为 2026-08-08 的通用宽落盘 `code_agent` 历史方案，不作为 Builder
+> 的 SDK 选型依据；§10 关于 RPC 未文档化等表述仅代表当时判断，不代表当前能力。
+
 - 日期：2026-08-08
 - 状态：待 review，未落代码
 - 关联：`docs/execution-integrity-and-fast-path-plan.md`（Stage 5b/5c 落盘上下文）、`skills/1688-to-pdd-draft/`（宽落盘真实范例）
