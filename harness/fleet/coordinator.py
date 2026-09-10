@@ -95,7 +95,14 @@ def resolve_fleet_reference(
                 "fleet_id must be an existing Fleet UUID or a hexadecimal"
                 " UUID prefix of at least 8 characters"
             ),
-            details={"fleetReference": reference},
+            # The model cannot recover from a format error if the only valid
+            # addresses stay hidden. These are identifiers from the freshly
+            # synchronized authoritative inventory, not labels or guessed
+            # replacements; it may select one exact id or a unique prefix.
+            details={
+                "fleetReference": reference,
+                "candidateFleetIds": candidates,
+            },
         )
 
     lowered = reference.lower()
@@ -107,7 +114,10 @@ def resolve_fleet_reference(
         raise FleetRoutingError(
             "fleet_reference_not_found",
             f"fleet_id reference {reference!r} matched no active Fleet",
-            details={"fleetReference": reference},
+            details={
+                "fleetReference": reference,
+                "candidateFleetIds": candidates,
+            },
         )
     if len(matches) > 1:
         raise FleetRoutingError(

@@ -453,7 +453,9 @@ class SpawnerWorkerMixin:
             agent_id=slot.agent_id,
             harness=replace(
                 self.runtime.harness,
-                max_steps=max_steps or self.runtime.harness.worker_max_steps,
+                # All entry points, including legacy callers, use the operator's
+                # configured budget. Model-authored plans cannot override it.
+                max_steps=self.runtime.harness.worker_max_steps,
             ),
         )
         provider = LLMFactory.create_provider(
@@ -1395,12 +1397,48 @@ class SpawnerWorkerMixin:
         page_stats_events: List[JsonDict] = []
         snapshot_diffs: List[JsonDict] = []
         step_extension: JsonDict = {}
+        recovery_observations: List[JsonDict] = []
         tool_calls = 0
         max_step = 0
-        for item in trace:
+        for trace_index, item in enumerate(trace):
             if not isinstance(item, dict):
                 continue
             max_step = max(max_step, optional_int(item.get("step"), 0) or 0)
+            receipt = item.get("result")
+            if isinstance(receipt, dict):
+                facts: JsonDict = {}
+                target_recovery = receipt.get("targetRecovery")
+                if isinstance(target_recovery, dict):
+                    facts["targetRecovery"] = {
+                        key: target_recovery[key] for key in (
+                            "method", "pageId", "requestedTarget", "errorCode",
+                            "identityResolution", "currentAXTarget",
+                            "visibilityWithinScrollAncestors", "interactability",
+                            "dispatchPosition",
+                        ) if key in target_recovery
+                    }
+                scroll_recovery = receipt.get("scrollRecoveryObservation")
+                if isinstance(scroll_recovery, dict):
+                    facts["scrollRecoveryObservation"] = {
+                        key: scroll_recovery[key] for key in (
+                            "mode", "completedReason", "requestedDistance",
+                            "actualDistance", "position", "extent", "resolution",
+                        ) if key in scroll_recovery
+                    }
+                for key in (
+                    "selectIdentityRecovery", "selectIdentityRecoveryCleared",
+                    "selectIdentityConflict",
+                ):
+                    if key in receipt:
+                        facts[key] = receipt[key]
+                if facts:
+                    recovery_observations.append({
+                        "traceEventIndex": trace_index,
+                        "method": item.get("method") or receipt.get("method"),
+                        "params": {key: value for key, value in (item.get("params") or {}).items()
+                                   if key in {"pageId", "id", "selector", "target", "container"}},
+                        "facts": facts,
+                    })
             if item.get("type") == "browser_call":
                 tool_calls += 1
                 method = str(item.get("method") or "unknown")
@@ -1534,6 +1572,17 @@ class SpawnerWorkerMixin:
             "snapshotDiffs": snapshot_diffs[-5:],
             "snapshotDiffCount": len(snapshot_diffs),
             "stepExtension": step_extension or None,
+            "targetRecoveryHistory": {
+                "observations": recovery_observations[-12:],
+                "selectIdentityObservations": [row for row in recovery_observations
+                    if "selectIdentityRecovery" in row["facts"]
+                    or "selectIdentityRecoveryCleared" in row["facts"]][-4:],
+                "totalCount": len(recovery_observations),
+                "note": "Historical receipts, not current bindings. Preserve refresh-after-failure "
+                        "facts; a stale error does not mean no fresh AX was read. Do not merge "
+                        "identities across workers without new binding evidence. Consult the trace "
+                        "for earlier observations and successful actions/readbacks.",
+            },
             "offloadedFiles": sorted(set(offloaded))[:100],
         }
         return summary

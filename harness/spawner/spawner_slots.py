@@ -299,7 +299,25 @@ class SpawnerSlotsMixin:
         session_key: str,
         worker_id: str,
         needs_isolated_session: bool,
+        fleet_reference: str = "",
     ) -> str:
+        """Which workers should be held to ONE fleet.
+
+        A group exists so several workers can share a coordinator-owned fleet
+        with relayed notifications. Workers the caller routed to DIFFERENT
+        fleets are the opposite of that, so an explicit reference has to be part
+        of the key: without it the task-wide group bound itself to whichever
+        fleet spawned first and refused every later spawn naming the other one
+        as `fleet_routing_conflict`. Task 9d490dc3 lost four of its seven
+        products that way, on an instruction that named two fleets.
+
+        The reference is used verbatim rather than resolved to a UUID, because
+        resolution needs a slot this decision runs before. Two spellings of one
+        fleet therefore land in two groups — that costs those workers the
+        multiworker relay and nothing else, whereas collapsing distinct fleets
+        into one key would resurrect the conflict this fixes. The failure mode
+        has to be a lost optimisation, never a refused spawn.
+        """
         if not getattr(
             self.runtime.harness, "same_fleet_multiworker_enabled", False
         ):
@@ -309,6 +327,9 @@ class SpawnerSlotsMixin:
             return f"session:{key}"
         if needs_isolated_session:
             return f"isolated:{worker_id}"
+        reference = str(fleet_reference or "").strip().lower()
+        if reference:
+            return f"task:{self.logger.task_id}:fleet:{reference}"
         return f"task:{self.logger.task_id}"
 
     @asynccontextmanager
@@ -421,6 +442,24 @@ class SpawnerSlotsMixin:
         explicit_rejection = self._explicit_slot_rejection(
             preferred_slot_id=preferred_slot_id,
             reuse_from_worker_id=reuse_from_worker_id,
+            capacity={
+                # Three separate facts, because one number cannot answer "can
+                # another worker start now?". An earlier revision sent only
+                # `max_slots - live_slots`, which is capacity NEVER CREATED: in
+                # the ordinary mid-run state of six live slots with five idle
+                # it reads zero and tells the Lead to wait while five slots sit
+                # free. Reusing an idle slot and creating a new one are both
+                # routes to parallelism, and max_browser_agents caps both.
+                "idleSlots": sum(
+                    1 for slot in self._slots.values() if slot.status == "idle"
+                ),
+                "uncreatedSlotCapacity": max(0, max_slots - len(live_slots)),
+                "concurrencyHeadroom": max(
+                    0,
+                    int(self.runtime.harness.max_browser_agents or 0)
+                    - len(running_slots),
+                ),
+            },
         )
         if explicit_rejection is not None:
             return explicit_rejection
@@ -665,6 +704,7 @@ class SpawnerSlotsMixin:
         *,
         preferred_slot_id: Optional[str],
         reuse_from_worker_id: Optional[str],
+        capacity: Optional[JsonDict] = None,
     ) -> Optional[JsonDict]:
         preferred = str(preferred_slot_id or "").strip()
         if preferred:
@@ -703,16 +743,57 @@ class SpawnerSlotsMixin:
                     "slots": [self._slot_summary(item) for item in self._slots.values()],
                 }
             if slot.status != "idle":
-                return {
+                # Two different situations wear this same error, and telling
+                # the caller to wait is right for only one of them. In task
+                # fae5a7b6 the Lead sent two spawns in one turn -- the correct
+                # fan-out shape -- and the second was a SIBLING that merely
+                # carried reuse_from_worker_id out of habit. It was refused
+                # with "wait", the Lead obeyed, and the remaining six phases
+                # ran strictly one at a time through a single slot while five
+                # slots in the pool were never created at all.
+                facts = capacity if isinstance(capacity, dict) else {}
+                idle_slots = max(0, int(facts.get("idleSlots") or 0))
+                uncreated = max(0, int(facts.get("uncreatedSlotCapacity") or 0))
+                concurrency = max(0, int(facts.get("concurrencyHeadroom") or 0))
+                startable = min(idle_slots + uncreated, concurrency)
+                rejection: JsonDict = {
                     "status": "rejected",
                     "error": f"slot for reuse_from_worker_id is not idle: {reuse_worker}",
                     "workerId": reuse_worker,
                     "slot": self._slot_summary(slot),
-                    "next_instruction": (
+                    "idleSlots": idle_slots,
+                    "uncreatedSlotCapacity": uncreated,
+                    "concurrencyHeadroom": concurrency,
+                    "startableNow": startable,
+                }
+                if startable > 0:
+                    where = (
+                        f"{idle_slots} idle slot(s) and room for {uncreated}"
+                        " more"
+                        if idle_slots and uncreated else
+                        f"{idle_slots} idle slot(s)" if idle_slots else
+                        f"room for {uncreated} more slot(s)"
+                    )
+                    rejection["next_instruction"] = (
+                        f"Slot {slot.slot_id} is busy, but the pool has {where}"
+                        f" and can run {startable} more worker(s) right now."
+                        " reuse_from_worker_id asks to CONTINUE inside"
+                        f" {reuse_worker}'s own page, and one page serves one"
+                        " worker at a time -- that pin is what serialises this"
+                        " spawn, not the pool. If this phase is a parallel"
+                        " SIBLING (a different entity of the same stage) it"
+                        " does not need that page: drop reuse_from_worker_id"
+                        " and page_policy=existing, keep the same fleet_id,"
+                        " and re-send it now together with every other pending"
+                        " sibling. Wait only if this spawn must genuinely"
+                        f" resume {reuse_worker}'s unfinished page."
+                    )
+                else:
+                    rejection["next_instruction"] = (
                         "Wait for the related worker/slot to finish before"
                         " spawning this continuation."
-                    ),
-                }
+                    )
+                return rejection
         return None
 
     def _select_idle_slot(
@@ -912,7 +993,7 @@ class SpawnerSlotsMixin:
             stage_started = time.monotonic()
             caps_response = await client.call(
                 "System.getCapabilities",
-                {"guide": "omit"},
+                {"guide": "content"},
             )
             timings["getCapabilitiesMs"] = int(
                 (time.monotonic() - stage_started) * 1000
@@ -1033,7 +1114,7 @@ class SpawnerSlotsMixin:
                 )
                 caps_response = await client.call(
                     "System.getCapabilities",
-                    {"guide": "omit"},
+                    {"guide": "content"},
                 )
                 await self._capability_bundle_for_worker(
                     client,
@@ -1493,6 +1574,16 @@ class SpawnerSlotsMixin:
                 assignment_reason="explicit_fleet_reference",
                 reuse_scope=reuse_scope,
                 page_policy=page_policy,
+                # Forward the key, or a named fleet cannot be re-entered by
+                # reference. bind_assignment refuses a fleet whose record holds
+                # a session_key the request does not name, so omitting it here
+                # made every continuation of a named session fail as
+                # `fleet_session_conflict` -- the last leg of the 69cab1c4 ring,
+                # and the one no routing-level test could see because it lives
+                # past slot registration. A caller may only reach this path
+                # with both values when a task session binding supplied them,
+                # since fleet_id and session_key are otherwise exclusive.
+                session_key=session_key,
                 allowed_fleet_ids=[resolved_fleet_id],
                 created_for_worker=False,
                 owner_slot_id=stable_owner_slot_id,
@@ -1797,9 +1888,12 @@ class SpawnerSlotsMixin:
         return assignment
 
     @staticmethod
-    def _fleet_ready_notification(message: Any, fleet_id: str) -> bool:
+    def _fleet_readiness_notification(message: Any, fleet_id: str) -> bool:
         event = unwrap_notification(message)
-        if event is None or str(event.get("event") or "") != "Fleet.ready":
+        if event is None or str(event.get("event") or "") not in {
+            "Fleet.ready",
+            "Fleet.stopped",
+        }:
             return False
         payload = event.get("payload")
         return bool(
@@ -1835,10 +1929,12 @@ class SpawnerSlotsMixin:
         wait_for_notification = getattr(client, "wait_for_notification", None)
         if callable(wait_for_notification):
             predicate = (
-                lambda message: self._fleet_ready_notification(message, fleet_id)
+                lambda message: self._fleet_readiness_notification(
+                    message, fleet_id
+                )
             )
 
-            async def wait_for_ready_event() -> Optional[JsonDict]:
+            async def wait_for_readiness_event() -> Optional[JsonDict]:
                 try:
                     return await wait_for_notification(
                         predicate,
@@ -1850,7 +1946,7 @@ class SpawnerSlotsMixin:
                     # clients lacking replay-window keyword support.
                     return await wait_for_notification(predicate, timeout)
 
-            event_waiter = asyncio.create_task(wait_for_ready_event())
+            event_waiter = asyncio.create_task(wait_for_readiness_event())
         self.logger.write("spawner.fleet.readiness_started", {
             "fleetId": fleet_id,
             "ownerSlotId": owner_slot.slot_id,
@@ -1934,13 +2030,14 @@ class SpawnerSlotsMixin:
                 return ready_receipt("page_list")
 
             event = None
+            event_name = ""
             if event_waiter is not None:
                 remaining = max(0.0, deadline - time.monotonic())
                 if remaining > 0:
-                    # Fleet.ready is a wake-up hint, not readiness proof. Keep
-                    # its wait short because session restore may complete with
-                    # no corresponding event, then always perform one terminal
-                    # live probe.
+                    # Fleet.ready is a wake-up hint, while Fleet.stopped is a
+                    # terminal failure. Keep the wait short because session
+                    # restore may complete without either event; a ready hint
+                    # is always followed by one terminal live probe.
                     event_wait_seconds = min(5.0, remaining / 2.0)
                     try:
                         event = await asyncio.wait_for(
@@ -1949,6 +2046,28 @@ class SpawnerSlotsMixin:
                         )
                     except asyncio.TimeoutError:
                         event = None
+
+            if event is not None:
+                notification = unwrap_notification(event)
+                if notification is not None:
+                    event_name = str(notification.get("event") or "")
+            if event_name == "Fleet.stopped":
+                failure = {
+                    "fleetId": fleet_id,
+                    "ownerSlotId": owner_slot.slot_id,
+                    "workerId": worker_id,
+                    "elapsedMs": int((time.monotonic() - started) * 1000),
+                    "error": "Fleet.stopped was observed during readiness wait",
+                }
+                self.logger.write("spawner.fleet.readiness_failed", failure)
+                raise FleetReadinessError(
+                    (
+                        f"Fleet {fleet_id} stopped before worker startup; "
+                        "no readiness retry was attempted"
+                    ),
+                    fleet_id=fleet_id,
+                    owner_slot_id=owner_slot.slot_id,
+                )
 
             # Restore completion can be eventless. Retry exactly once even if
             # no Fleet.ready notification arrived. Do not cancel an in-flight
@@ -1964,7 +2083,7 @@ class SpawnerSlotsMixin:
                 "target Page.list did not verify Fleet readiness"
                 + (f": {page_list_error}" if page_list_error else "")
                 + (
-                    "; Fleet.ready was not observed"
+                    "; no Fleet.ready or Fleet.stopped event was observed"
                     if event is None else
                     "; Fleet.ready was observed but live verification still failed"
                 )

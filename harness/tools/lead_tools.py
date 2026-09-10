@@ -5,6 +5,7 @@ harness.tools.lead_tools - LeadAgent tool schemas and dispatch factory.
 import copy
 import hashlib
 import json
+import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -21,17 +22,28 @@ from harness.prompts import search_harness_guides
 from harness.strategy_bank import render_strategy_guidance
 from harness.task_control import (
     EXECUTION_ROLES,
+    VALID_STAGE_HINTS,
     assess_batch_source_binding,
+    contract_hash_for_phase,
     direct_batch_rows_provenance_errors,
+    find_phase,
     mark_phase_exhausted_if_needed,
     materialize_batch_rows_from_source,
+    phase_contract,
+    reactivate_resumable_hitl_phases,
     replan_checkpoint_spawn_rejection,
     load_task_state,
     write_task_state,
 )
 from harness.results.completion_receipt import (
+    artifact_generation_view,
     build_completion_receipt,
     terminal_consistency_contradictions,
+)
+from harness.evidence.field_semantics import (
+    array_fields_without_semantic_evidence,
+    build_field_semantic_worklist,
+    review_field_semantics,
 )
 from harness.numeric_facts import (
     build_numeric_fact_index,
@@ -195,8 +207,12 @@ def _auth_verification_schema() -> JsonDict:
                 "minItems": 1,
                 "description": (
                     "Stable visible AX nodes that prove authentication. Match"
-                    " is exact; ordinary page text and hidden/blocked nodes do"
-                    " not count."
+                    " is exact on role+name; ordinary page text does not count,"
+                    " and a node whose AXTree line carries a hidden or blocked"
+                    " layout flag is rejected. Those flags are sparse, so their"
+                    " absence is not a visibility guarantee — choose markers"
+                    " that are genuinely on screen when signed in, not ones"
+                    " that merely exist in the tree."
                 ),
                 "items": {
                     "type": "object",
@@ -302,10 +318,16 @@ def _validator_item_schema() -> JsonDict:
             "type": {
                 "type": "string",
                 "enum": sorted(VALIDATOR_TYPES),
+                "description": (
+                    "Validator kind. range is for numeric scalar values; "
+                    "array_length is for the number of items in an array field. "
+                    "For an up-to-N request, set max=N only unless the user "
+                    "explicitly requires a minimum or exact count."
+                ),
             },
             "field": {
                 "type": "string",
-                "description": "Target field for single-field validators (range/url_pattern/field_pattern).",
+                "description": "Target field for single-field validators (range/array_length/url_pattern/field_pattern).",
             },
             "fields": {
                 "type": "array",
@@ -318,8 +340,14 @@ def _validator_item_schema() -> JsonDict:
                 "description": "Row count for exact_rows (aliases value/exact accepted).",
             },
             "value": {"type": "integer", "minimum": 1},
-            "min": {"type": "number"},
-            "max": {"type": "number"},
+            "min": {
+                "type": "number",
+                "description": "Inclusive bound for range; array_length requires a non-negative integer.",
+            },
+            "max": {
+                "type": "number",
+                "description": "Inclusive bound for range; array_length requires a non-negative integer.",
+            },
             "pattern": {
                 "type": "string",
                 "description": "Regex for url_pattern/field_pattern.",
@@ -543,6 +571,16 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                         ),
                     },
                     "pacing": pacing_schema,
+                    "output_contracts": {
+                        "type": "object",
+                        "description": (
+                            "Reusable output contracts. A phase references one with"
+                            " output_ref and declares only its row range or identity."
+                            " The harness expands the reference before review and"
+                            " execution, so do not repeat common fields per phase."
+                        ),
+                        "additionalProperties": {"type": "object"},
+                    },
                     "phases": {
                         "type": "array",
                         "items": {
@@ -561,6 +599,14 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                         " and a file_download phase, and each"
                                         " must say so itself. "
                                         + describe_task_types()
+                                    ),
+                                },
+                                "task": {
+                                    "type": "string",
+                                    "description": (
+                                        "Compact phase instruction. When objective and"
+                                        " worker_task are omitted, the harness uses this"
+                                        " one statement for both."
                                     ),
                                 },
                                 "objective": {"type": "string"},
@@ -595,8 +641,44 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                         " validation/bulk phases merely to complete a ladder."
                                     ),
                                 },
+                                "dispatch_wave": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                    "description": (
+                                        "Optional operator-visible scheduling wave."
+                                        " A phase in wave N is not dispatched until"
+                                        " every declared lower-wave phase is"
+                                        " validated_done. Use this for the one-page"
+                                        " first sample followed by concurrent sibling"
+                                        " groups; do not encode this scheduling wait"
+                                        " as a false data dependency."
+                                    ),
+                                },
                                 "expected_artifact": {
                                     **_expected_artifact_schema(),
+                                },
+                                "output_ref": {
+                                    "type": "string",
+                                    "description": (
+                                        "Name of a plan.output_contracts entry. The phase"
+                                        " may add output_contract row-specific overrides."
+                                    ),
+                                },
+                                "output_contract": {
+                                    "type": "object",
+                                    "description": (
+                                        "Compact output contract or override. It supports"
+                                        " rows:{exact|min|max,identity} and fields keyed by"
+                                        " field name with required, type, empty, provenance,"
+                                        " minItems/maxItems, pattern, or allowedDomains. For"
+                                        " empty='with_evidence', declare a non-empty"
+                                        " allow_empty_with_outcome list in that field spec,"
+                                        " e.g. fields.reviews={type:'array',empty:"
+                                        "'with_evidence',allow_empty_with_outcome:"
+                                        "['confirmed_absent']}. The legacy contract-level"
+                                        " map is also accepted."
+                                    ),
+                                    "additionalProperties": True,
                                 },
                                 "depends_on": {
                                     "type": "array",
@@ -633,6 +715,16 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                         "additionalProperties": False,
                                     },
                                 },
+                                "inputs": {
+                                    "type": "object",
+                                    "description": (
+                                        "Compact input source. Use artifact:{phase_id,"
+                                        "artifact_name,selector?} for a validated upstream"
+                                        " artifact, or direct:{rows,identity_fields} only"
+                                        " for user-supplied targets."
+                                    ),
+                                    "additionalProperties": True,
+                                },
                                 "pacing": pacing_schema,
                                 "validators": {
                                     "type": "array",
@@ -641,6 +733,14 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                         " that cannot be derived from"
                                         " expected_artifact. Common field and"
                                         " row validators are derived."
+                                    ),
+                                    "items": _validator_item_schema(),
+                                },
+                                "additional_checks": {
+                                    "type": "array",
+                                    "description": (
+                                        "Only checks that cannot be derived from output_contract."
+                                        " Prefer this compact name for new plans."
                                     ),
                                     "items": _validator_item_schema(),
                                 },
@@ -711,6 +811,11 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                                     "properties": {
                                                         "field": {"type": "string"},
                                                         "values": {"type": "array"},
+                                                        "indices": {
+                                                            "type": "array",
+                                                            "items": {"type": "integer", "minimum": 0},
+                                                            "minItems": 1,
+                                                        },
                                                         "offset": {"type": "integer", "minimum": 0},
                                                         "limit": {"type": "integer", "minimum": 1},
                                                     },
@@ -783,12 +888,7 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                 },
                                 "max_attempts": {"type": "integer", "minimum": 1},
                             },
-                            "required": [
-                                "id",
-                                "task_type",
-                                "objective",
-                                "expected_artifact",
-                            ],
+                            "required": ["id", "task_type"],
                             "additionalProperties": True,
                         },
                     },
@@ -800,20 +900,954 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
         "required": ["plan"],
         "additionalProperties": False,
     }
-    phase_properties = schema["properties"]["plan"]["properties"]["phases"][
-        "items"
-    ]["properties"]
-    phase_properties["worker_contract"] = {
+    return schema
+
+
+def _direct_task_plan_schema(_: Any = None) -> JsonDict:
+    """Small external contract for a single coherent BrowserAgent task.
+
+    The runtime compiles this declaration to the normal one-phase v1 plan, so
+    all existing mechanical checks, independent review and operator approval
+    still apply.  Keeping the phase/scheduling scaffolding out of this tool is
+    intentional: the Lead chooses the route, while the harness owns the
+    executable representation.
+    """
+    return {
         "type": "object",
         "description": (
-            "Optional exceptional execution overrides only (session/auth,"
-            " pacing, batch source, explicit method policy, or content"
-            " observation markers). Ordinary task, artifact, validator, and"
-            " tactic fields are derived from the phase and prior handoff."
+            "Submit a compact direct-worker plan for one coherent browser task. "
+            "The harness expands it to one canonical browser_worker phase, runs "
+            "the same PlanValidator and operator approval, then dispatches and "
+            "waits without asking Lead to copy spawn arguments. Use this only "
+            "when no second phase, cross-worker merge, or parallel coordination "
+            "is required."
         ),
-        "additionalProperties": True,
+        "properties": {
+            "goal": {"type": "string", "minLength": 1},
+            "task_type": {
+                "type": "string",
+                "enum": sorted(VALID_TASK_TYPES),
+            },
+            "stage_hint": {
+                "type": "string",
+                "enum": sorted(VALID_STAGE_HINTS),
+            },
+            "task": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Complete worker instruction for this one task.",
+            },
+            "output_contract": {
+                **_expected_artifact_schema(),
+                "description": (
+                    "The compact deliverable contract. Use fields/rows and "
+                    "provenance requirements exactly as in emit_task_plan."
+                ),
+            },
+            "worker_contract": {
+                "type": "object",
+                "additionalProperties": True,
+                "description": (
+                    "Optional routing/session and worker policy details. "
+                    "Do not put a second objective or alternate artifact here."
+                ),
+            },
+            "additional_checks": {
+                "type": "array",
+                "items": {"type": "object", "additionalProperties": True},
+                "description": "Optional checks the output contract cannot express.",
+            },
+            "max_steps": {"type": "integer", "minimum": 1},
+            "max_attempts": {"type": "integer", "minimum": 1, "maximum": 8},
+        },
+        "required": [
+            "goal", "task_type", "stage_hint", "task", "output_contract",
+        ],
+        "additionalProperties": False,
     }
-    return schema
+
+
+def _compile_direct_task_plan(raw: Any) -> Tuple[Optional[JsonDict], Optional[JsonDict]]:
+    """Compile the compact direct declaration to the canonical plan shape."""
+    if not isinstance(raw, dict):
+        return None, {
+            "status": "failed",
+            "error": "direct plan must be an object",
+            "tool_was_executed": False,
+        }
+    goal = str(raw.get("goal") or "").strip()
+    task = str(raw.get("task") or "").strip()
+    task_type = normalize_task_type(raw.get("task_type"))
+    stage_hint = str(raw.get("stage_hint") or "").strip()
+    contract = raw.get("output_contract")
+    if not goal or not task or task_type not in VALID_TASK_TYPES:
+        return None, {
+            "status": "failed",
+            "error": "goal, task and a canonical task_type are required",
+            "tool_was_executed": False,
+        }
+    if stage_hint not in VALID_STAGE_HINTS:
+        return None, {
+            "status": "failed",
+            "error": f"stage_hint must be one of {sorted(VALID_STAGE_HINTS)}",
+            "tool_was_executed": False,
+        }
+    if not isinstance(contract, dict):
+        return None, {
+            "status": "failed",
+            "error": "output_contract must be an object",
+            "tool_was_executed": False,
+        }
+    phase: JsonDict = {
+        "id": "direct_worker",
+        "type": "browser_worker",
+        "task_type": task_type,
+        "objective": goal,
+        "worker_task": task,
+        "stage_hint": stage_hint,
+        "depends_on": [],
+        "expected_artifact": copy.deepcopy(contract),
+        "worker_contract": copy.deepcopy(
+            raw.get("worker_contract")
+            if isinstance(raw.get("worker_contract"), dict) else {}
+        ),
+    }
+    if isinstance(raw.get("additional_checks"), list):
+        phase["additional_checks"] = copy.deepcopy(raw["additional_checks"])
+    # Make the bounded continuation budget visible in the approved canonical
+    # phase.  The direct external contract may omit it, but the user should be
+    # able to review the exact retry ceiling before execution begins.
+    phase["max_attempts"] = 3
+    for key in ("max_steps", "max_attempts"):
+        value = raw.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            phase[key] = value
+    return {
+        "version": "v1",
+        "execution_mode": "direct_worker",
+        "goal": goal,
+        "task_type": task_type,
+        "phases": [phase],
+    }, None
+
+
+def _direct_row_count(result: Any) -> int:
+    if not isinstance(result, dict):
+        return 0
+    digest = result.get("attemptDigest")
+    if isinstance(digest, dict):
+        try:
+            return max(0, int(digest.get("rowCount") or 0))
+        except (TypeError, ValueError):
+            pass
+    validation = result.get("artifactValidation")
+    if isinstance(validation, dict):
+        try:
+            return max(0, int(validation.get("rowCount") or 0))
+        except (TypeError, ValueError):
+            pass
+    progress = result.get("progressSnapshot")
+    if isinstance(progress, dict):
+        try:
+            return max(0, int(progress.get("rowCount") or 0))
+        except (TypeError, ValueError):
+            pass
+    return 0
+
+
+def _direct_failure_signature(result: Any) -> Tuple[str, ...]:
+    if not isinstance(result, dict):
+        return ("invalid_result",)
+    digest = result.get("attemptDigest")
+    if isinstance(digest, dict) and isinstance(digest.get("failureSignature"), list):
+        values = tuple(str(item or "")[:160] for item in digest["failureSignature"])
+        if any(values):
+            return values
+    classification = result.get("errorClassification")
+    category = (
+        classification.get("category")
+        if isinstance(classification, dict) else ""
+    )
+    return (
+        str(result.get("status") or "unknown"),
+        str(result.get("statusCategory") or "unknown"),
+        str(category or ""),
+    )
+
+
+def _direct_dispatch_manifest(agent: Any, phase: JsonDict, attempt: int) -> JsonDict:
+    """Stable, mechanical identity for one runtime-owned direct dispatch."""
+    state = load_task_state(agent.logger)
+    plan_version = int(state.get("plan_version") or 0)
+    plan_hash = str(state.get("plan_hash") or "")
+    phase_id = str(phase.get("id") or "direct_worker")
+    worker_contract = (
+        agent.build_worker_contract(phase)
+        if hasattr(agent, "build_worker_contract") else phase_contract(phase)
+    )
+    contract_hash = contract_hash_for_phase(phase, worker_contract)
+    return {
+        "planVersion": plan_version,
+        "planHash": plan_hash,
+        "phaseId": phase_id,
+        "attempt": int(attempt),
+        "contractHash": contract_hash,
+        "taskType": str(phase.get("task_type") or ""),
+    }
+
+
+def _direct_continuation_receipt(
+    phase: JsonDict, result: JsonDict, dispatch_identity: JsonDict,
+) -> JsonDict:
+    """Expose only mechanically enumerable units; unknown coverage stays unknown."""
+    validation = result.get("artifactValidation")
+    unit_receipt = (
+        validation.get("enumeratedUnitReceipt")
+        if isinstance(validation, dict) else None
+    )
+    if (
+        isinstance(unit_receipt, dict)
+        and unit_receipt.get("kind") == "required_controls"
+        and unit_receipt.get("coverage") == "row_validated"
+        and isinstance(unit_receipt.get("completedUnitIds"), list)
+        and isinstance(unit_receipt.get("remainingUnitIds"), list)
+    ):
+        return {
+            "protocol": "direct-v1",
+            "sourcePlanVersion": dispatch_identity["planVersion"],
+            "sourceContractHash": dispatch_identity["contractHash"],
+            "unitKind": "required_controls",
+            "completedUnitIds": list(unit_receipt["completedUnitIds"]),
+            "remainingUnitIds": list(unit_receipt["remainingUnitIds"]),
+            "coverage": "row_validated",
+            "sourceArtifactPaths": list(
+                unit_receipt.get("sourceArtifactPaths") or []
+            ),
+            "invalidUnits": list(unit_receipt.get("invalidUnits") or []),
+        }
+    contract = phase.get("worker_contract")
+    rows = contract.get("batch_rows") if isinstance(contract, dict) else None
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        return {
+            "protocol": "direct-v1",
+            "sourcePlanVersion": dispatch_identity["planVersion"],
+            "sourceContractHash": dispatch_identity["contractHash"],
+            "completedUnitIds": [],
+            "remainingUnitIds": [],
+            "coverage": "not_enumerable",
+        }
+    units = [
+        "row:" + hashlib.sha256(json.dumps(
+            row, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
+        ).encode("utf-8")).hexdigest()[:16]
+        for row in rows
+    ]
+    # A partial artifact is deliberately not in the validated-artifact ledger,
+    # so its rows cannot be removed from the next worker's contract. The receipt
+    # says that explicitly instead of guessing from a row count or worker prose.
+    validated_done = (
+        str(result.get("status") or "").lower() == "done"
+        and str(result.get("validatedStatus") or "").lower() == "validated_done"
+    )
+    return {
+        "protocol": "direct-v1",
+        "sourcePlanVersion": dispatch_identity["planVersion"],
+        "sourceContractHash": dispatch_identity["contractHash"],
+        "completedUnitIds": units if validated_done else [],
+        "remainingUnitIds": [] if validated_done else units,
+        "coverage": "validated" if validated_done else "declared_units_unproven",
+    }
+
+
+def _direct_continuation_context(base_context: str, receipt: Any) -> str:
+    """Give a direct retry an auditable unit boundary without changing its plan.
+
+    The worker keeps the approved, complete output contract. It emits only the
+    newly completed control rows; artifact validation merges those rows with
+    prior persisted evidence and still applies the original full contract.
+    """
+    if not isinstance(receipt, dict):
+        return base_context
+    if (
+        receipt.get("unitKind") != "required_controls"
+        or receipt.get("coverage") != "row_validated"
+    ):
+        return base_context
+    remaining = [
+        str(item)[len("control:"):]
+        for item in receipt.get("remainingUnitIds") or []
+        if isinstance(item, str) and item.startswith("control:")
+    ]
+    completed = [
+        str(item)[len("control:"):]
+        for item in receipt.get("completedUnitIds") or []
+        if isinstance(item, str) and item.startswith("control:")
+    ]
+    if not remaining:
+        return base_context
+    guidance = (
+        "DIRECT CONTINUATION RECEIPT: The following form controls already have "
+        "individually validated persisted rows and must not be re-entered: "
+        f"{json.dumps(completed, ensure_ascii=False)}. Complete only these remaining "
+        "controls: "
+        f"{json.dumps(remaining, ensure_ascii=False)}. Record only the newly completed "
+        "control rows. The harness will merge them with the prior persisted rows and "
+        "validate the original complete output contract."
+    )
+    return f"{base_context}\n\n{guidance}".strip()
+
+
+def _direct_dispatch_key(manifest: JsonDict) -> str:
+    return ":".join([
+        str(manifest.get("planVersion") or 0),
+        str(manifest.get("phaseId") or "direct_worker"),
+        str(manifest.get("attempt") or 0),
+    ])
+
+
+def _reserve_direct_dispatch(
+    agent: Any, phase: JsonDict, attempt: int,
+) -> Tuple[Optional[JsonDict], JsonDict]:
+    """Atomically reserve one direct attempt before it can create a worker."""
+    state = load_task_state(agent.logger)
+    manifest = _direct_dispatch_manifest(agent, phase, attempt)
+    key = _direct_dispatch_key(manifest)
+    ledger = state.setdefault("direct_dispatches", {})
+    if not isinstance(ledger, dict):
+        return {
+            "status": "direct_dispatch_identity_invalid",
+            "tool_was_executed": False,
+            "error": "task_state.direct_dispatches must be an object",
+        }, manifest
+    existing = ledger.get(key)
+    if isinstance(existing, dict):
+        comparable = {name: existing.get(name) for name in manifest}
+        if comparable != manifest:
+            return {
+                "status": "direct_dispatch_identity_conflict",
+                "tool_was_executed": False,
+                "dispatchIdentity": manifest,
+                "existingDispatch": existing,
+                "next_instruction": (
+                    "The saved direct attempt belongs to a different plan or "
+                    "contract. Do not reuse or spawn it automatically."
+                ),
+            }, manifest
+        return {
+            "status": "direct_dispatch_already_reserved",
+            "tool_was_executed": False,
+            "dispatchIdentity": manifest,
+            "existingDispatch": existing,
+            "next_instruction": (
+                "This exact direct attempt was already reserved. Reattach its "
+                "worker or reconcile the reservation; do not spawn a duplicate."
+            ),
+        }, manifest
+    ledger[key] = {
+        **manifest,
+        "status": "reserved",
+        "reservedAt": time.time(),
+        "dispatchedBy": "runtime_direct_initial" if attempt == 1
+        else "runtime_direct_continuation",
+    }
+    write_task_state(agent.logger, state)
+    return None, manifest
+
+
+def _update_direct_dispatch(agent: Any, manifest: JsonDict, **updates: Any) -> None:
+    state = load_task_state(agent.logger)
+    ledger = state.setdefault("direct_dispatches", {})
+    if not isinstance(ledger, dict):
+        return
+    key = _direct_dispatch_key(manifest)
+    record = ledger.get(key)
+    if not isinstance(record, dict):
+        return
+    record.update({name: value for name, value in updates.items() if value is not None})
+    write_task_state(agent.logger, state)
+
+
+def _release_direct_dispatch(agent: Any, manifest: JsonDict) -> None:
+    """A rejected spawn created no worker, so its logical attempt may be retried."""
+    state = load_task_state(agent.logger)
+    ledger = state.get("direct_dispatches")
+    if not isinstance(ledger, dict):
+        return
+    ledger.pop(_direct_dispatch_key(manifest), None)
+    write_task_state(agent.logger, state)
+
+
+def _direct_page_crash_continuation_rejection(
+    agent: Any, phase: JsonDict, attempt: int, status: str,
+) -> Optional[JsonDict]:
+    """Keep page-crash recovery narrow enough to preserve browser continuity."""
+    if status != "page_crashed" or attempt <= 1:
+        return None
+    state = load_task_state(agent.logger)
+    ledger = state.get("direct_dispatches")
+    prior = (
+        ledger.get(_direct_dispatch_key(_direct_dispatch_manifest(agent, phase, attempt - 1)))
+        if isinstance(ledger, dict) else None
+    )
+    if not isinstance(prior, dict):
+        return {
+            "status": "direct_continuation_identity_missing",
+            "tool_was_executed": False,
+            "next_instruction": "The prior page-crash attempt has no durable dispatch identity.",
+        }
+    binding = prior.get("taskSessionBinding")
+    # Dispatch records persist TaskSessionBinding.to_dict(), whose canonical
+    # serialized distinction is bindingScope (requires_exact_page is only the
+    # in-memory dataclass property). An exact page cannot be replaced after a
+    # crash; hand the routing decision back to Lead before any new spawn.
+    if isinstance(binding, dict) and binding.get("bindingScope") == "page":
+        return {
+            "status": "direct_continuation_requires_lead",
+            "tool_was_executed": False,
+            "dispatchIdentity": prior,
+            "next_instruction": (
+                "This task requires its exact prior page. A page crash cannot "
+                "automatically switch to a new page; preserve the blocker for Lead review."
+            ),
+        }
+    return None
+
+
+def _direct_continuation_identity_rejection(
+    agent: Any, phase: JsonDict, attempt: int,
+) -> Optional[JsonDict]:
+    """A continuation may advance only the exact prior direct contract."""
+    if attempt <= 1:
+        return None
+    state = load_task_state(agent.logger)
+    ledger = state.get("direct_dispatches")
+    current = _direct_dispatch_manifest(agent, phase, attempt)
+    prior_key = _direct_dispatch_key({**current, "attempt": attempt - 1})
+    prior = ledger.get(prior_key) if isinstance(ledger, dict) else None
+    if not isinstance(prior, dict):
+        return {
+            "status": "direct_continuation_identity_missing",
+            "tool_was_executed": False,
+            "next_instruction": "The prior direct attempt has no durable dispatch identity.",
+        }
+    identity_fields = ("planVersion", "planHash", "phaseId", "contractHash", "taskType")
+    if any(prior.get(name) != current.get(name) for name in identity_fields):
+        return {
+            "status": "direct_continuation_identity_conflict",
+            "tool_was_executed": False,
+            "priorDispatch": prior,
+            "dispatchIdentity": current,
+            "next_instruction": (
+                "The accepted plan, contract, task type or phase changed after "
+                "the prior attempt. Do not automatically continue it."
+            ),
+        }
+    binding = getattr(getattr(agent, "spawner", None), "_task_session_binding", None)
+    current_binding = binding.to_dict() if hasattr(binding, "to_dict") else None
+    prior_binding = prior.get("taskSessionBinding")
+    if isinstance(current_binding, dict):
+        if current_binding.get("state") == "stale":
+            return {
+                "status": "direct_continuation_session_stale",
+                "tool_was_executed": False,
+                "next_instruction": "The task session binding is stale; do not replace its Fleet automatically.",
+            }
+        if (
+            isinstance(prior_binding, dict)
+            and prior_binding.get("fleetId")
+            and current_binding.get("fleetId")
+            and prior_binding.get("fleetId") != current_binding.get("fleetId")
+        ):
+            return {
+                "status": "direct_continuation_fleet_conflict",
+                "tool_was_executed": False,
+                "priorDispatch": prior,
+                "next_instruction": "The task Fleet changed after the prior attempt.",
+            }
+    return None
+
+
+def _direct_continuation_decision(
+    result: Any,
+    *,
+    previous_result: Optional[JsonDict],
+    attempt_number: int,
+    max_attempts: int,
+    continuation_receipt: Optional[JsonDict] = None,
+) -> JsonDict:
+    """Return a conservative, receipt-only continuation decision.
+
+    This is deliberately a runtime safety policy rather than a business
+    semantic verdict.  It never turns a challenge, validation contradiction or
+    unknown outcome into an automatic retry.
+    """
+    if not isinstance(result, dict):
+        return {"continue": False, "reason": "worker_result_missing"}
+    status = str(result.get("status") or "unknown").strip().lower()
+    challenge = result.get("challengeReceipt")
+    unresolved_challenge = (
+        isinstance(challenge, dict) and bool(challenge.get("unresolved"))
+    )
+    if unresolved_challenge or status in {
+        "blocked_by_challenge", "hitl_required", "hitl_waiting", "hitl_timeout",
+        "page_settled_after_hitl", "stale_pause_deadlock", "session_fleet_lost",
+        "page_continuation_lost",
+    }:
+        return {"continue": False, "reason": "human_or_session_blocker"}
+    if status not in {
+        "partial", "step_budget_exhausted", "context_limit_exceeded",
+        "incomplete", "page_crashed", "fleet_assignment_lost",
+    }:
+        return {"continue": False, "reason": "status_requires_lead_review"}
+    if attempt_number >= max_attempts:
+        return {"continue": False, "reason": "attempt_budget_reached"}
+    if (
+        isinstance(continuation_receipt, dict)
+        and continuation_receipt.get("unitKind") == "required_controls"
+        and continuation_receipt.get("coverage") == "row_validated"
+        and isinstance(continuation_receipt.get("remainingUnitIds"), list)
+        and not continuation_receipt["remainingUnitIds"]
+    ):
+        return {
+            "continue": False,
+            "reason": "no_remaining_enumerated_units",
+        }
+    current_rows = _direct_row_count(result)
+    previous_rows = _direct_row_count(previous_result)
+    signature = _direct_failure_signature(result)
+    previous_signature = _direct_failure_signature(previous_result)
+    repeated_no_progress = (
+        previous_result is not None
+        and current_rows <= previous_rows
+        and signature == previous_signature
+    )
+    if repeated_no_progress:
+        return {
+            "continue": False,
+            "reason": "repeated_no_progress_same_signature",
+            "currentRows": current_rows,
+            "previousRows": previous_rows,
+            "failureSignature": list(signature),
+        }
+    return {
+        "continue": True,
+        "reason": "bounded_receipt_continuation",
+        "currentRows": current_rows,
+        "previousRows": previous_rows,
+        "failureSignature": list(signature),
+    }
+
+
+async def _direct_finalize_from_worker(
+    ctx: ToolContext,
+    result: JsonDict,
+    *,
+    attempts: int,
+    max_attempts: int,
+    decision: Optional[JsonDict] = None,
+) -> JsonDict:
+    status = str(result.get("status") or "incomplete").strip().lower()
+    phase_state = load_task_state(ctx.agent.logger)
+    phase_states = phase_state.get("phases") if isinstance(phase_state, dict) else {}
+    phase_state = phase_states.get("direct_worker") if isinstance(phase_states, dict) else {}
+    validated_done = (
+        isinstance(phase_state, dict)
+        and str(phase_state.get("status") or "") == "validated_done"
+    )
+    if status == "done" and validated_done:
+        final_status = "done"
+    elif status == "partial" or _direct_row_count(result) > 0:
+        final_status = "partial"
+    else:
+        final_status = "incomplete"
+    answer = str(result.get("answer") or "").strip()
+    if not answer:
+        answer = json.dumps(
+            {
+                "outcome": final_status,
+                "data": {},
+                "evidence": result.get("artifacts") or [],
+                "blockers": [result.get("reason") or result.get("error") or status],
+                "next_steps": [],
+            },
+            ensure_ascii=False,
+        )
+    final_result = await _lead_final_answer(
+        ToolContext(
+            agent=ctx.agent,
+            tool_call={"name": "final_answer", "id": "direct-final"},
+            tool_input={
+                "status": final_status,
+                "answer": answer,
+                "reason": (
+                    "direct worker bounded continuation ended after "
+                    f"{attempts}/{max_attempts} attempt(s)"
+                    if final_status != "done" else ""
+                ),
+            },
+            step=ctx.step,
+        )
+    )
+    if not isinstance(final_result, dict):
+        return {"status": "failed", "error": "direct finalization returned no receipt"}
+    if final_result.get("tool_was_executed") is False:
+        return final_result
+    final_result["directExecution"] = {
+        "mode": "direct_worker",
+        "attempts": attempts,
+        "maxAttempts": max_attempts,
+        "workerId": result.get("workerId"),
+        "workerStatus": status,
+        "continuation": decision or {"continue": False, "reason": "completed"},
+    }
+    final_result["_terminate_lead"] = True
+    return final_result
+
+
+def _direct_live_worker_id(agent: Any) -> str:
+    """Return the one live direct worker, if a prior invocation already owns it."""
+    spawner = getattr(agent, "spawner", None)
+    handles = getattr(spawner, "_handles", None)
+    if not isinstance(handles, dict):
+        return ""
+    for handle in reversed(list(handles.values())):
+        if (
+            str(getattr(handle, "phase_id", "") or "") == "direct_worker"
+            and not handle.async_task.done()
+        ):
+            return str(getattr(handle, "worker_id", "") or "").strip()
+    return ""
+
+
+async def _direct_attach_or_recover(ctx: ToolContext) -> Optional[JsonDict]:
+    """Attach a replayed direct call to its existing phase without spawning."""
+    agent = ctx.agent
+    state = load_task_state(agent.logger)
+    phases = state.get("phases") if isinstance(state, dict) else {}
+    phase_state = phases.get("direct_worker") if isinstance(phases, dict) else {}
+    status = str(phase_state.get("status") or "") if isinstance(phase_state, dict) else ""
+    worker_id = _direct_live_worker_id(agent)
+    if worker_id:
+        waited = await agent.spawner.wait_browser_agents(
+            worker_ids=[worker_id], mode="all",
+        )
+        completed = waited.get("completed") if isinstance(waited, dict) else None
+        result = completed[-1] if isinstance(completed, list) and completed else None
+        if not isinstance(result, dict):
+            return waited if isinstance(waited, dict) else {
+                "status": "failed", "error": "attached direct worker produced no result",
+            }
+        return {
+            "_direct_attached_result": result,
+            "_direct_attached_worker_id": worker_id,
+        }
+    if status == "running":
+        return {
+            "status": "direct_worker_recovery_required",
+            "phaseId": "direct_worker",
+            "tool_was_executed": False,
+            "next_instruction": (
+                "The direct phase is recorded as running but has no live local "
+                "worker handle. Reconcile the prior worker before any new spawn; "
+                "do not create a duplicate worker."
+            ),
+        }
+    if status == "validated_done":
+        return {
+            "status": "direct_worker_finalization_required",
+            "phaseId": "direct_worker",
+            "tool_was_executed": False,
+            "next_instruction": (
+                "The direct phase is already validated_done. Use its stored "
+                "completion receipt to finalize; do not replan or spawn it again."
+            ),
+        }
+    return None
+
+
+async def _run_direct_worker(ctx: ToolContext) -> JsonDict:
+    """Run one approved direct phase, retrying only structured continuations."""
+    agent = ctx.agent
+    phase = find_phase(agent.task_plan, "direct_worker") if agent.task_plan else None
+    if not isinstance(phase, dict):
+        return {
+            "status": "failed",
+            "error": "compiled direct phase is missing",
+            "tool_was_executed": False,
+        }
+    max_attempts = optional_int(phase.get("max_attempts"), 3) or 3
+    max_attempts = max(1, min(max_attempts, 8))
+    attached_result: Optional[JsonDict] = None
+    attached_worker_id = ""
+    spawn_input: JsonDict = {
+        "phase_id": "direct_worker",
+        "task": str(phase.get("worker_task") or ""),
+        "context": str(phase.get("context") or ""),
+        "name": "direct_worker",
+    }
+    base_context = str(spawn_input["context"])
+    previous: Optional[JsonDict] = None
+    last_decision: Optional[JsonDict] = None
+    attached_or_recovery = await _direct_attach_or_recover(ctx)
+    if isinstance(attached_or_recovery, dict) and isinstance(
+        attached_or_recovery.get("_direct_attached_result"), dict
+    ):
+        attached_result = attached_or_recovery["_direct_attached_result"]
+        attached_worker_id = str(
+            attached_or_recovery.get("_direct_attached_worker_id") or ""
+        )
+    elif attached_or_recovery is not None:
+        return attached_or_recovery
+    start_attempt = 1
+    if attached_result is not None:
+        state = load_task_state(agent.logger)
+        phase_states = state.get("phases") if isinstance(state, dict) else {}
+        phase_record = (
+            phase_states.get("direct_worker")
+            if isinstance(phase_states, dict) else {}
+        )
+        completed_attempts = len(phase_record.get("attempts") or []) \
+            if isinstance(phase_record, dict) else 1
+        completed_attempts = max(1, completed_attempts)
+        attached_status = str(attached_result.get("status") or "unknown").lower()
+        if attached_status == "done" and isinstance(phase_record, dict) \
+                and phase_record.get("status") == "validated_done":
+            return await _direct_finalize_from_worker(
+                ctx, attached_result, attempts=completed_attempts,
+                max_attempts=max_attempts,
+            )
+        attached_identity = _direct_dispatch_manifest(agent, phase, completed_attempts)
+        attached_receipt = _direct_continuation_receipt(
+            phase, attached_result, attached_identity,
+        )
+        _update_direct_dispatch(
+            agent,
+            attached_identity,
+            status="completed",
+            workerStatus=attached_status,
+            workerId=attached_worker_id,
+            continuationReceipt=attached_receipt,
+        )
+        attached_decision = _direct_continuation_decision(
+            attached_result,
+            previous_result=None,
+            attempt_number=completed_attempts,
+            max_attempts=max_attempts,
+            continuation_receipt=attached_receipt,
+        )
+        if not attached_decision.get("continue"):
+            if attached_status in {"partial", "step_budget_exhausted", "context_limit_exceeded"}:
+                return await _direct_finalize_from_worker(
+                    ctx, attached_result, attempts=completed_attempts,
+                    max_attempts=max_attempts, decision=attached_decision,
+                )
+            return {
+                **attached_result,
+                "directExecution": {
+                    "mode": "direct_worker",
+                    "attachedExistingWorker": True,
+                    "workerId": attached_worker_id,
+                    "attempts": completed_attempts,
+                    "maxAttempts": max_attempts,
+                    "continuation": attached_decision,
+                },
+            }
+        previous = attached_result
+        last_decision = attached_decision
+        spawn_input["context"] = _direct_continuation_context(
+            base_context, attached_receipt,
+        )
+        spawn_input["reuse_from_worker_id"] = attached_worker_id
+        if attached_status == "page_crashed":
+            spawn_input["reuse_scope"] = "connection"
+            spawn_input["page_policy"] = "new"
+        elif attached_status == "fleet_assignment_lost":
+            spawn_input.pop("reuse_from_worker_id", None)
+        else:
+            spawn_input["reuse_scope"] = "page"
+            spawn_input["page_policy"] = "existing"
+        start_attempt = completed_attempts + 1
+    for attempt_number in range(start_attempt, max_attempts + 1):
+        identity_rejection = _direct_continuation_identity_rejection(
+            agent, phase, attempt_number,
+        )
+        if identity_rejection is not None:
+            return identity_rejection
+        page_crash_rejection = _direct_page_crash_continuation_rejection(
+            agent, phase, attempt_number,
+            str(previous.get("status") or "").lower() if isinstance(previous, dict) else "",
+        )
+        if page_crash_rejection is not None:
+            return page_crash_rejection
+        reservation_rejection, dispatch_identity = _reserve_direct_dispatch(
+            agent, phase, attempt_number,
+        )
+        if reservation_rejection is not None:
+            return reservation_rejection
+        dispatch_origin = (
+            "runtime_direct_initial" if attempt_number == 1
+            else "runtime_direct_continuation"
+        )
+        agent.logger.write("lead.direct_worker.attempt", {
+            "attempt": attempt_number,
+            "maxAttempts": max_attempts,
+            "phaseId": "direct_worker",
+            "dispatchIdentity": dispatch_identity,
+            "dispatchedBy": dispatch_origin,
+            "reuseFromWorkerId": spawn_input.get("reuse_from_worker_id"),
+            "reuseScope": spawn_input.get("reuse_scope"),
+            "pagePolicy": spawn_input.get("page_policy"),
+        })
+        spawned = await _lead_spawn_browser_agent(
+            ToolContext(
+                agent=agent,
+                tool_call={"name": "spawn_browser_agent", "id": f"direct-spawn-{attempt_number}"},
+                tool_input={
+                    **spawn_input,
+                    "_runtime_dispatch_origin": dispatch_origin,
+                    "_runtime_dispatch_identity": dispatch_identity,
+                },
+                step=ctx.step,
+            )
+        )
+        if not isinstance(spawned, dict) or spawned.get("status") != "running":
+            _release_direct_dispatch(agent, dispatch_identity)
+            return spawned if isinstance(spawned, dict) else {
+                "status": "failed", "error": "direct worker spawn returned no receipt",
+            }
+        worker_id = str(spawned.get("workerId") or "").strip()
+        _update_direct_dispatch(
+            agent, dispatch_identity,
+            status="running",
+            workerId=worker_id,
+            taskSessionBinding=spawned.get("taskSessionBinding"),
+            fleetAssignment=spawned.get("fleetAssignment"),
+        )
+        waited = await agent.spawner.wait_browser_agents(
+            worker_ids=[worker_id] if worker_id else None,
+            mode="all",
+        )
+        completed = waited.get("completed") if isinstance(waited, dict) else None
+        result = completed[-1] if isinstance(completed, list) and completed else None
+        if not isinstance(result, dict):
+            _update_direct_dispatch(agent, dispatch_identity, status="wait_incomplete")
+            return waited if isinstance(waited, dict) else {
+                "status": "failed", "error": "direct worker produced no result",
+            }
+        status = str(result.get("status") or "unknown").strip().lower()
+        continuation_receipt = _direct_continuation_receipt(
+            phase, result, dispatch_identity,
+        )
+        _update_direct_dispatch(
+            agent, dispatch_identity,
+            status="completed",
+            workerStatus=status,
+            workerId=str(result.get("workerId") or worker_id),
+            continuationReceipt=continuation_receipt,
+        )
+        phase_state = load_task_state(agent.logger)
+        phase_states = phase_state.get("phases") if isinstance(phase_state, dict) else {}
+        phase_record = phase_states.get("direct_worker") if isinstance(phase_states, dict) else {}
+        if status == "done" and isinstance(phase_record, dict) and phase_record.get("status") == "validated_done":
+            return await _direct_finalize_from_worker(
+                ctx, result, attempts=attempt_number, max_attempts=max_attempts,
+            )
+        decision = _direct_continuation_decision(
+            result,
+            previous_result=previous,
+            attempt_number=attempt_number,
+            max_attempts=max_attempts,
+            continuation_receipt=continuation_receipt,
+        )
+        last_decision = decision
+        agent.logger.write("lead.direct_worker.continuation", {
+            "attempt": attempt_number,
+            "workerId": result.get("workerId"),
+            "status": status,
+            "enumeratedUnitCoverage": continuation_receipt.get("coverage"),
+            "remainingUnitCount": len(
+                continuation_receipt.get("remainingUnitIds") or []
+            ),
+            **decision,
+        })
+        if not decision.get("continue"):
+            # A bounded partial can be delivered safely.  A semantic or
+            # routing uncertainty remains a Lead decision and is returned as a
+            # normal non-terminal receipt for the model to inspect.
+            if status in {"partial", "step_budget_exhausted", "context_limit_exceeded"}:
+                return await _direct_finalize_from_worker(
+                    ctx, result, attempts=attempt_number,
+                    max_attempts=max_attempts, decision=decision,
+                )
+            return {
+                **result,
+                "directExecution": {
+                    "mode": "direct_worker",
+                    "attempts": attempt_number,
+                    "maxAttempts": max_attempts,
+                    "continuation": decision,
+                },
+            }
+        previous = result
+        spawn_input["context"] = _direct_continuation_context(
+            base_context, continuation_receipt,
+        )
+        spawn_input["reuse_from_worker_id"] = worker_id
+        if status == "page_crashed":
+            spawn_input["reuse_scope"] = "connection"
+            spawn_input["page_policy"] = "new"
+        elif status == "fleet_assignment_lost":
+            spawn_input.pop("reuse_from_worker_id", None)
+        else:
+            spawn_input["reuse_scope"] = "page"
+            spawn_input["page_policy"] = "existing"
+    if previous is not None:
+        return await _direct_finalize_from_worker(
+            ctx, previous, attempts=max_attempts,
+            max_attempts=max_attempts, decision=last_decision,
+        )
+    return {"status": "failed", "error": "direct worker ended without attempts"}
+
+
+@LEAD_TOOLS.register(
+    name="emit_direct_task_plan",
+    description=(
+        "Submit a compact one-worker plan. The harness compiles it into one "
+        "canonical phase, applies the same mechanical validation, independent "
+        "PlanValidator review and operator approval as emit_task_plan, then "
+        "dispatches/waits and performs bounded receipt-based continuation. "
+        "Choose this only for one coherent task with no cross-worker merge or "
+        "parallel coordination."
+    ),
+    input_schema=_direct_task_plan_schema,
+    loop_guard=False,
+)
+async def _lead_emit_direct_task_plan(ctx: ToolContext) -> JsonDict:
+    plan, error = _compile_direct_task_plan(ctx.tool_input)
+    if plan is None:
+        return error or {"status": "failed", "error": "invalid direct plan"}
+    current = getattr(ctx.agent, "task_plan", None)
+    if (
+        isinstance(current, dict)
+        and current.get("execution_mode") == "direct_worker"
+        and ctx.agent.raw_plan_candidate_hash(current)
+        == ctx.agent.raw_plan_candidate_hash(plan)
+    ):
+        approval_rejection = ctx.agent.task_plan_user_approval_rejection()
+        if approval_rejection is not None:
+            return approval_rejection
+        return await _run_direct_worker(ctx)
+    accepted = await _lead_emit_task_plan(
+        ToolContext(
+            agent=ctx.agent,
+            tool_call=ctx.tool_call,
+            tool_input={"plan": plan},
+            step=ctx.step,
+        )
+    )
+    if not isinstance(accepted, dict) or accepted.get("status") != "done":
+        return accepted
+    return await _run_direct_worker(ctx)
 
 
 def _repair_task_plan_schema(_: Any = None) -> JsonDict:
@@ -825,7 +1859,8 @@ def _repair_task_plan_schema(_: Any = None) -> JsonDict:
             "without regenerating its full plan JSON. Paths are RFC 6901 JSON "
             "Pointers relative to the plan object, for example "
             "'/phases/0/expected_artifact/requiredControls'. set replaces an "
-            "existing value; remove deletes an existing object property, never "
+            "existing value; add creates one missing object property whose parent "
+            "already exists; remove deletes an existing object property, never "
             "an array element. For remove, provide value:null because "
             "conservative tool schemas do not express op-specific required "
             "fields."
@@ -846,11 +1881,11 @@ def _repair_task_plan_schema(_: Any = None) -> JsonDict:
                 "items": {
                     "type": "object",
                     "properties": {
-                        "op": {"type": "string", "enum": ["set", "remove"]},
+                        "op": {"type": "string", "enum": ["add", "set", "remove"]},
                         "path": {"type": "string", "minLength": 2},
                         "value": {
                             "description": (
-                                "Replacement for set; null placeholder for remove."
+                                "Value for add/set; null placeholder for remove."
                             ),
                         },
                     },
@@ -899,7 +1934,7 @@ def _apply_task_plan_repair(
     candidate: JsonDict,
     operations: Any,
 ) -> Tuple[Optional[JsonDict], List[str]]:
-    """Apply bounded replacement/removal edits without synthesizing structure."""
+    """Apply bounded object-property edits without synthesizing containers."""
     if not isinstance(operations, list) or not operations:
         return None, ["operations must be a non-empty array"]
     repaired = copy.deepcopy(candidate)
@@ -911,8 +1946,8 @@ def _apply_task_plan_repair(
             errors.append(f"{where} must be an object")
             continue
         op = str(operation.get("op") or "").strip()
-        if op not in {"set", "remove"}:
-            errors.append(f"{where}.op must be 'set' or 'remove'")
+        if op not in {"add", "set", "remove"}:
+            errors.append(f"{where}.op must be 'add', 'set', or 'remove'")
             continue
         parts, path_error = _json_pointer_parts(operation.get("path"))
         if path_error is not None or parts is None:
@@ -949,6 +1984,14 @@ def _apply_task_plan_repair(
 
         leaf = parts[-1]
         if isinstance(parent, dict):
+            if op == "add":
+                if leaf in parent:
+                    errors.append(
+                        f"{where}.path already exists; use set to replace it"
+                    )
+                    continue
+                parent[leaf] = copy.deepcopy(operation.get("value"))
+                continue
             if leaf not in parent:
                 errors.append(
                     f"{where}.path must reference an existing value; emit a "
@@ -960,6 +2003,12 @@ def _apply_task_plan_repair(
             else:
                 parent[leaf] = copy.deepcopy(operation.get("value"))
         elif isinstance(parent, list):
+            if op == "add":
+                errors.append(
+                    f"{where}.path cannot add an array element; array insertion"
+                    " is structural and requires a materially changed complete plan"
+                )
+                continue
             list_index = _repair_list_index(leaf, len(parent))
             if list_index is None:
                 errors.append(f"{where}.path has invalid list index {leaf!r}")
@@ -1091,10 +2140,6 @@ def _spawn_browser_agent_schema(_: Any = None) -> JsonDict:
             "result_contract": {
                 "type": "string",
                 "description": "Structure / fields you expect the BrowserAgent to put in `answer`; pass an empty string when there are no extra requirements.",
-            },
-            "max_steps": {
-                **_nullable("integer"),
-                "description": "Override the worker's max step count; pass null to use the default.",
             },
             "preferred_slot_id": {
                 **_nullable("string"),
@@ -1415,7 +2460,7 @@ def _final_answer_schema(_: Any = None) -> JsonDict:
         "properties": {
             "status": {
                 "type": "string",
-                "enum": ["done", "blocked", "failed"],
+                "enum": ["done", "partial", "blocked", "failed"],
             },
             "answer": {"type": "string"},
         },
@@ -1703,7 +2748,23 @@ async def _lead_emit_task_plan(ctx: ToolContext) -> JsonDict:
         }
         ctx.agent.logger.write("task_plan.rejected", result)
         return result
-    accepted = ctx.agent.accept_task_plan(
+    if (
+        review.get("status") == "error"
+        and review.get("errorKind") == "verdict_invalid"
+    ):
+        result = {
+            "status": "failed",
+            "error": "independent PlanValidator returned an invalid verdict",
+            "planValidator": review,
+            "next_instruction": (
+                "Keep the candidate plan unchanged. The reviewer made a"
+                " self-contradictory or out-of-catalog decision; do not"
+                " rewrite the plan to repair the reviewer protocol."
+            ),
+        }
+        ctx.agent.logger.write("task_plan.rejected", result)
+        return result
+    accepted = await ctx.agent.approve_and_accept_task_plan(
         raw_plan,
         plan_validator_review=(
             review
@@ -1718,9 +2779,134 @@ async def _lead_emit_task_plan(ctx: ToolContext) -> JsonDict:
 
 
 @LEAD_TOOLS.register(
+    name="approve_current_task_plan",
+    description=(
+        "Display the existing accepted plan for operator approval on a resumed"
+        " task. It never rewrites phases, contracts, artifacts, or state other"
+        " than the approval receipt."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    },
+    loop_guard=False,
+)
+async def _lead_approve_current_task_plan(ctx: ToolContext) -> JsonDict:
+    return await ctx.agent.approve_current_task_plan()
+
+
+@LEAD_TOOLS.register(
+    name="begin_task_plan_draft",
+    description=(
+        "Start an inert task-plan draft for a large plan. Add complete phase"
+        " chunks with append_task_plan_draft, then submit once for whole-plan"
+        " validation, independent review, and operator approval."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "draft_id": {"type": "string", "minLength": 1},
+            "plan": {
+                "type": "object",
+                "description": (
+                    "Plan-level fields only: goal is required; task_type,"
+                    " output_contracts, pacing, and replan metadata are optional."
+                    " Do not include phases here."
+                ),
+                "properties": {
+                    "goal": {"type": "string", "minLength": 1},
+                    "task_type": {"type": "string", "enum": sorted(VALID_TASK_TYPES)},
+                    "output_contracts": {"type": "object"},
+                    "pacing": {"type": "object"},
+                    "replan_reason": {"type": "string"},
+                    "replan_checkpoint_id": {"type": "string"},
+                    "replan_checkpoint_ids": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["goal"],
+                "additionalProperties": False,
+            },
+        },
+        "required": ["draft_id", "plan"],
+        "additionalProperties": False,
+    },
+    loop_guard=False,
+)
+async def _lead_begin_task_plan_draft(ctx: ToolContext) -> JsonDict:
+    return ctx.agent.begin_task_plan_draft(
+        str(ctx.tool_input.get("draft_id") or ""),
+        ctx.tool_input.get("plan"),
+    )
+
+
+@LEAD_TOOLS.register(
+    name="append_task_plan_draft",
+    description=(
+        "Append one complete, small group of phases to an inert plan draft."
+        " This does not validate, approve, or execute the draft."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "draft_id": {"type": "string", "minLength": 1},
+            "phases": {
+                "type": "array", "minItems": 1, "maxItems": 8,
+                "items": {"type": "object"},
+            },
+        },
+        "required": ["draft_id", "phases"],
+        "additionalProperties": False,
+    },
+    loop_guard=False,
+)
+async def _lead_append_task_plan_draft(ctx: ToolContext) -> JsonDict:
+    return ctx.agent.append_task_plan_draft(
+        str(ctx.tool_input.get("draft_id") or ""),
+        ctx.tool_input.get("phases"),
+    )
+
+
+@LEAD_TOOLS.register(
+    name="submit_task_plan_draft",
+    description=(
+        "Submit the complete accumulated draft. This is equivalent to"
+        " emit_task_plan for validation, independent review, user approval,"
+        " and acceptance; only an accepted draft may dispatch workers."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {"draft_id": {"type": "string", "minLength": 1}},
+        "required": ["draft_id"],
+        "additionalProperties": False,
+    },
+    loop_guard=False,
+)
+async def _lead_submit_task_plan_draft(ctx: ToolContext) -> JsonDict:
+    draft_id = str(ctx.tool_input.get("draft_id") or "")
+    plan = ctx.agent.task_plan_draft(draft_id)
+    if plan is None:
+        return {
+            "status": "failed",
+            "error": "task-plan draft is unavailable",
+            "draftId": draft_id or None,
+        }
+    result = await _lead_emit_task_plan(
+        ToolContext(
+            agent=ctx.agent,
+            tool_call=ctx.tool_call,
+            tool_input={"plan": plan},
+            step=ctx.step,
+        )
+    )
+    if isinstance(result, dict) and result.get("status") == "done":
+        ctx.agent.discard_task_plan_draft(draft_id)
+    return result
+
+
+@LEAD_TOOLS.register(
     name="repair_task_plan",
     description=(
-        "Apply small set/remove JSON-Pointer edits to the latest mechanically "
+        "Apply small add/set/remove JSON-Pointer edits to the latest mechanically "
         "rejected task-plan candidate, then validate and accept the repaired "
         "complete plan. Available after ANY mechanical rejection — use the "
         "candidateHash that rejection returned; never guess a baseCandidateHash "
@@ -1758,8 +2944,9 @@ async def _lead_repair_task_plan(ctx: ToolContext) -> JsonDict:
             "next_instruction": (
                 "Choose one complete repairOptions entry from repairIssues when "
                 "present; mustChangePaths is only a direct-field summary. set only "
-                "replaces an existing value; remove deletes an existing object "
-                "property, never an array element."
+                "replaces an existing value; add creates one missing object "
+                "property under an existing object; remove deletes an existing "
+                "object property, never an array element."
             ),
         }
     rejection = ctx.agent.replan_reason_rejection(repaired)
@@ -1791,7 +2978,23 @@ async def _lead_repair_task_plan(ctx: ToolContext) -> JsonDict:
         }
         ctx.agent.logger.write("task_plan.rejected", result)
         return result
-    return ctx.agent.accept_task_plan(
+    if (
+        review.get("status") == "error"
+        and review.get("errorKind") == "verdict_invalid"
+    ):
+        result = {
+            "status": "failed",
+            "error": "independent PlanValidator returned an invalid verdict",
+            "planValidator": review,
+            "next_instruction": (
+                "Keep the repaired candidate unchanged. The reviewer made a"
+                " self-contradictory or out-of-catalog decision; do not"
+                " rewrite the plan to repair the reviewer protocol."
+            ),
+        }
+        ctx.agent.logger.write("task_plan.rejected", result)
+        return result
+    accepted = await ctx.agent.approve_and_accept_task_plan(
         repaired,
         plan_validator_review=(
             review
@@ -1800,6 +3003,7 @@ async def _lead_repair_task_plan(ctx: ToolContext) -> JsonDict:
             else None
         ),
     )
+    return accepted
 
 
 @LEAD_TOOLS.register(
@@ -1870,15 +3074,26 @@ async def _lead_resume_keep_plan(ctx: ToolContext) -> JsonDict:
             },
         )
     agent._resume_instruction_pending = False
+    reactivated_phase_ids = reactivate_resumable_hitl_phases(
+        agent.logger,
+        plan=getattr(agent, "task_plan", None),
+    )
     agent.logger.write(
         "resume.instruction.reviewed",
-        decision,
+        {**decision, "reactivatedPhaseIds": reactivated_phase_ids},
     )
     return {
         "status": "done",
         "decision": "keep_plan",
         "reason": reason,
-        "next_instruction": "Continue from the next pending phase.",
+        "reactivatedPhaseIds": reactivated_phase_ids,
+        "next_instruction": (
+            "Resume the reactivated HITL-interrupted phases under their"
+            " accepted contracts. Re-observe live browser state and request"
+            " HITL again if the challenge is still present."
+            if reactivated_phase_ids else
+            "Continue from the next pending phase."
+        ),
     }
 
 
@@ -1940,9 +3155,10 @@ def _resume_instruction_gate_rejection(agent: Any) -> Optional[JsonDict]:
         " reuse_scope=page plus"
         " reuse_from_worker_id or preferred_slot_id only when prior pages must"
         " be exposed."
-        " Keep BrowserAgent slots scarce; when related work only needs additional"
-        " pages/tabs, put that into one worker as serial Page.create and"
-        " Page.switchTo work instead of fan-out."
+        " Use one worker for the serial rows assigned to one phase. Independent"
+        " sibling phases may deliberately run in separate slots within runtime"
+        " limits; omit reuse_from_worker_id for those siblings because that pin"
+        " serializes them."
         " The task/context should state which fields to collect and how to derive dynamic"
         " params from the original user instruction, accepted plan artifacts,"
         " authoritative routing receipts, or current browser evidence"
@@ -1967,6 +3183,9 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
             "error": "LeadAgent must call emit_task_plan successfully before spawning BrowserAgents.",
             "next_instruction": "Emit a valid task_plan with phases, expected_artifact, and validators.",
         }
+    approval_rejection = agent.task_plan_user_approval_rejection()
+    if approval_rejection is not None:
+        return approval_rejection
     exhausted = mark_phase_exhausted_if_needed(agent.task_plan, agent.logger)
     phase_id = tool_input.get("phase_id")
     # The override contract must reach the pre-check: a spawn that genuinely
@@ -2057,6 +3276,38 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
             "errorCode": "phase_not_found",
             "scheduleSnapshot": agent.phase_schedule_snapshot(),
         }
+    dispatch_wave = phase.get("dispatch_wave")
+    if isinstance(dispatch_wave, int) and not isinstance(dispatch_wave, bool):
+        lower_wave_ids = [
+            str(item.get("id") or "")
+            for item in (agent.task_plan.get("phases") or [])
+            if isinstance(item, dict)
+            and isinstance(item.get("dispatch_wave"), int)
+            and not isinstance(item.get("dispatch_wave"), bool)
+            and int(item.get("dispatch_wave")) < dispatch_wave
+            and str(item.get("id") or "")
+        ]
+        state = load_task_state(agent.logger)
+        phase_states = state.get("phases") if isinstance(state, dict) else {}
+        phase_states = phase_states if isinstance(phase_states, dict) else {}
+        waiting_for = [
+            prior_id for prior_id in lower_wave_ids
+            if not isinstance(phase_states.get(prior_id), dict)
+            or phase_states[prior_id].get("status") != "validated_done"
+        ]
+        if waiting_for:
+            return {
+                "status": "dispatch_wave_not_ready",
+                "phaseId": str(phase.get("id") or ""),
+                "dispatchWave": dispatch_wave,
+                "waitingForPhaseIds": waiting_for,
+                "tool_was_executed": False,
+                "next_instruction": (
+                    "Wait for the declared earlier scheduling wave to become"
+                    " validated_done. This is the operator-approved dispatch"
+                    " order, separate from artifact data dependencies."
+                ),
+            }
     # The automatic input-binding proof reads only this reviewed-plan view.
     # Spawn overrides remain available for routing/session purposes, but must
     # not rewrite the expected artifact or validators used as proof.
@@ -2132,6 +3383,12 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
         if isinstance(digest, dict) and isinstance(digest.get("handoff"), dict):
             prior_handoff = digest["handoff"]
             break
+    # Route exploration is a Lead dispatch decision. Only declared
+    # dependencies impose ordering; a similar running phase is not a blocker.
+    sibling_handoff = (
+        _sibling_phase_handoff(agent, state, phase)
+        if prior_handoff is None else None
+    )
     direct_batch_errors = direct_batch_rows_provenance_errors(
         worker_contract,
         user_task=str(getattr(agent, "original_user_task", "") or ""),
@@ -2173,6 +3430,30 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
     ]
     base_task = str(tool_input.get("task") or phase.get("worker_task") or "")
     base_context = str(tool_input.get("context") or phase.get("context") or "")
+    if isinstance(sibling_handoff, dict):
+        # `context` is a separate spawn argument and never lands in the
+        # spawner.browser.spawn payload, so without this line "did the route
+        # actually get attached?" is unanswerable from the run log — which is
+        # exactly the question the first run after this feature raised.
+        agent.logger.write("spawn.sibling_route_attached", {
+            "phaseId": str(phase.get("id") or ""),
+            "sourcePhaseId": sibling_handoff["sourcePhaseId"],
+            "sourceOutcome": sibling_handoff["sourceOutcome"],
+        })
+        base_context = (
+            f"{base_context}\n\nSIBLING PHASE ROUTE from"
+            f" {sibling_handoff['sourcePhaseId']}"
+            f" ({sibling_handoff['sourceOutcome']}; same stage and task_type,"
+            " different entity). Its receipts and claims retain their stated"
+            " ownership and describe ANOTHER page: reuse what worked, avoid"
+            " what did not, and verify every target on your own:\n"
+            + json.dumps(
+                sibling_handoff["handoff"],
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            )
+        ).strip()
     if isinstance(prior_handoff, dict):
         base_context = (
             f"{base_context}\n\nPREVIOUS WORKER HANDOFF (receipts and claims"
@@ -2263,7 +3544,6 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
         task=base_task,
         context=base_context,
         name=tool_input.get("name") or None,
-        max_steps=tool_input.get("max_steps"),
         result_contract=str(tool_input.get("result_contract") or ""),
         phase_id=str(phase.get("id") or ""),
         worker_contract=worker_contract,
@@ -2275,6 +3555,14 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
         fleet_id=tool_input.get("fleet_id"),
         session_key=tool_input.get("session_key"),
         page_policy=tool_input.get("page_policy"),
+        dispatch_origin=str(
+            tool_input.get("_runtime_dispatch_origin") or "lead_model"
+        ),
+        dispatch_identity=(
+            tool_input.get("_runtime_dispatch_identity")
+            if isinstance(tool_input.get("_runtime_dispatch_identity"), dict)
+            else None
+        ),
     )
 
 
@@ -3090,20 +4378,50 @@ def _record_artifact_supersession(
     if not deliverable:
         return []
     state = _lead_task_state(agent)
-    ledger_entries = {
+    raw_ledger_paths = [
         _resolved_path_text(path)
         for path in (state.get("artifacts") or [])
         if str(path or "").strip()
-    }
-    absorbed_resolved = {_resolved_path_text(path) for path in absorbed}
-    cited_in_ledger = [
-        resolved for resolved in (
-            _resolved_path_text(path) for path in cited
-        ) if resolved in ledger_entries
     ]
-    if not cited_in_ledger:
+    active_paths, lineages = artifact_generation_view(
+        state, raw_ledger_paths,
+    )
+    active_identities = {_resolved_path_text(path) for path in active_paths}
+
+    def _leaves(paths: List[str]) -> set[str]:
+        leaves: set[str] = set()
+        for path in paths:
+            identity = _resolved_path_text(path)
+            leaves.update(lineages.get(identity, {identity}))
+        return leaves
+
+    # A source outside the raw ledger or current active generation is an
+    # auxiliary citation, not a new lineage leaf. Ignore it here exactly as
+    # the reader does, so it cannot prevent a complete known merge.
+    known_references = set(raw_ledger_paths) | set(lineages)
+    cited_leaves = _leaves([
+        path for path in cited
+        if _resolved_path_text(path) in known_references
+    ])
+    absorbed_leaves = _leaves([
+        path for path in absorbed
+        if _resolved_path_text(path) in known_references
+    ])
+    if not cited_leaves or not cited_leaves.issubset(absorbed_leaves):
         return []
-    if any(resolved not in absorbed_resolved for resolved in cited_in_ledger):
+    # An active merge may represent multiple source leaves. It can be retired
+    # only when every one of those leaves survives into this deliverable. This
+    # handles a source reference to M1 just like a reference to M1's original
+    # leaves, without allowing a reference to only one half of M1 to discard
+    # the other half.
+    touched = {
+        identity for identity in active_identities
+        if lineages.get(identity, {identity}) & absorbed_leaves
+    }
+    if not touched or any(
+        not lineages.get(identity, {identity}).issubset(absorbed_leaves)
+        for identity in touched
+    ):
         return []
 
     supersessions = state.get("artifact_supersessions")
@@ -3111,7 +4429,9 @@ def _record_artifact_supersession(
         supersessions = []
     supersessions.append({
         "deliverable": _resolved_path_text(deliverable),
-        "absorbed": cited_in_ledger,
+        # Store leaf identities. A later write need not know whether an earlier
+        # merge was cited by name or its sources were listed again.
+        "absorbed": sorted(absorbed_leaves),
         "mode": "reference_merge",
     })
     state["artifact_supersessions"] = supersessions
@@ -3133,9 +4453,9 @@ def _record_artifact_supersession(
     if logger is not None and hasattr(logger, "write"):
         logger.write("lead.artifact_supersession", {
             "deliverable": _resolved_path_text(deliverable),
-            "absorbed": cited_in_ledger,
+            "absorbed": sorted(absorbed_leaves),
         })
-    return cited_in_ledger
+    return sorted(absorbed_leaves)
 
 
 def _lead_task_state(agent: Any) -> JsonDict:
@@ -3310,6 +4630,47 @@ async def _lead_final_answer(ctx: ToolContext) -> JsonDict:
     rejection = _numeric_reconciliation_rejection(reconciliation)
     if rejection is not None:
         return rejection
+    field_review: JsonDict = {}
+    if final_status == "done":
+        field_review = await _review_final_field_semantics(ctx.agent, state)
+    if field_review.get("mismatches"):
+        ctx.agent.logger.write("lead.field_semantic_mismatch", field_review)
+        if final_status == "done":
+            rejection_count = _record_field_semantic_rejection(
+                ctx.agent, state, field_review,
+            )
+            if rejection_count > 2:
+                # The evidence, user request and reviewer verdict are all the
+                # same as the previous attempts. Asking the Lead to retry done
+                # again cannot create new evidence; settle as partial and make
+                # the mismatch a structured disclosure instead of a loop.
+                final_status = "partial"
+                answer = _append_field_semantic_disclosure(answer, field_review)
+                field_review = {
+                    **field_review,
+                    "boundedDisclosure": {
+                        "rejectionCount": rejection_count,
+                        "reason": "unchanged_semantic_mismatch",
+                    },
+                }
+            else:
+                return {
+                    "status": "rejected",
+                    "error": "field_semantic_mismatch",
+                    "tool_was_executed": False,
+                    "fieldSemanticReview": field_review,
+                    "completionReceipt": receipt,
+                    "next_instruction": (
+                        "The semantic reviewer found delivered field values whose"
+                        " evidence describes a different subject or unit than the"
+                        " original request. Inspect the listed rows. Correct them"
+                        " from validated evidence and re-issue done, continue"
+                        " collection if the requested value remains obtainable,"
+                        " or return a truthful non-done status that discloses the"
+                        " unresolved requested fields. Do not rename a substitute"
+                        " value as the requested field."
+                    ),
+                }
     ctx.agent.logger.write("lead.completion_receipt", receipt)
     result: JsonDict = {
         "status": final_status,
@@ -3322,7 +4683,253 @@ async def _lead_final_answer(ctx: ToolContext) -> JsonDict:
             key: value for key, value in reconciliation.items()
             if key != "claims"
         }
+    if field_review:
+        result["fieldSemanticReview"] = field_review
     return result
+
+
+async def _review_final_field_semantics(agent: Any, state: Any) -> JsonDict:
+    """Review fields whose evidence may describe a different requested value.
+
+    Mechanical validators prove shape and provenance. The semantic reviewer
+    alone decides subject/unit alignment; only its explicit mismatch verdicts
+    can stop a `done` answer. Ambiguity and reviewer availability remain
+    visible facts and are not promoted to mismatches.
+    """
+    provider = getattr(agent, "claim_extractor_provider", None)
+    logger = getattr(agent, "logger", None)
+    if provider is None:
+        return {}
+    try:
+        index = build_numeric_fact_index(
+            state, task_dir=getattr(logger, "task_dir", None),
+        )
+        entries = build_field_semantic_worklist(
+            index, allowed_fields=_semantic_output_fields(agent),
+        )
+        array_evidence_gaps = array_fields_without_semantic_evidence(
+            index, allowed_fields=_semantic_output_fields(agent),
+        )
+        if not entries:
+            return (
+                {"status": "ok", "arrayEvidenceGaps": array_evidence_gaps}
+                if array_evidence_gaps else {}
+            )
+        cache_key = hashlib.sha256(json.dumps(
+            {
+                "userTask": str(getattr(agent, "original_user_task", "") or ""),
+                "entries": entries,
+                "arrayEvidenceGaps": array_evidence_gaps,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        cached = getattr(agent, "_field_semantic_review_cache", None)
+        if (
+            isinstance(cached, dict)
+            and cached.get("key") == cache_key
+            and isinstance(cached.get("review"), dict)
+        ):
+            if logger is not None and hasattr(logger, "write"):
+                logger.write("field_semantic_review.cache_hit", {
+                    "entriesSupplied": len(entries),
+                    "cacheKey": cache_key,
+                })
+            return dict(cached["review"])
+        review = await review_field_semantics(
+            provider,
+            user_task=str(getattr(agent, "original_user_task", "") or ""),
+            entries=entries,
+            logger=logger,
+            provider_name=str(getattr(agent, "claim_extractor_provider_name", "")),
+            model_id=str(getattr(agent, "claim_extractor_model", "")),
+        )
+        if array_evidence_gaps:
+            review = {**review, "arrayEvidenceGaps": array_evidence_gaps}
+        if review.get("status") == "reviewed" and not review.get("coverageErrors"):
+            agent._field_semantic_review_cache = {
+                "key": cache_key,
+                "review": dict(review),
+            }
+        return review
+    except Exception as exc:  # noqa: BLE001 - an advisory review never fails a run
+        return {
+            "status": "unavailable",
+            "reason": "field_semantic_review_failed",
+            "error": str(exc)[:300],
+            "mismatches": [],
+        }
+
+
+def _semantic_output_fields(agent: Any) -> Optional[set[str]]:
+    """Fields declared as task deliverables, excluding provenance plumbing."""
+    plan = getattr(agent, "task_plan", None)
+    phases = plan.get("phases") if isinstance(plan, dict) else None
+    if not isinstance(phases, list):
+        return None
+    fields: set[str] = set()
+    for phase in phases:
+        expected = phase.get("expected_artifact") if isinstance(phase, dict) else None
+        if not isinstance(expected, dict):
+            continue
+        for item in expected.get("fields") or expected.get("required_fields") or []:
+            if isinstance(item, str) and item.strip():
+                fields.add(item.strip())
+            elif isinstance(item, dict) and str(item.get("name") or "").strip():
+                fields.add(str(item["name"]).strip())
+    return fields or None
+
+
+def _record_field_semantic_rejection(
+    agent: Any, state: Any, review: JsonDict,
+) -> int:
+    """Persist bounded retries for one unchanged semantic-review input.
+
+    The cache key includes the task and every reviewed evidence entry. It is a
+    stable identity for the question, not a verdict: changed evidence receives
+    a fresh review and a fresh retry budget. The state record survives resume,
+    preventing a process restart from recreating the same terminal loop.
+    """
+    cached = getattr(agent, "_field_semantic_review_cache", None)
+    key = str(cached.get("key") or "") if isinstance(cached, dict) else ""
+    if not key:
+        mismatches = review.get("mismatches") if isinstance(review, dict) else None
+        stable_findings = [
+            {
+                "entryId": str(item.get("entryId") or ""),
+                "assessment": str(item.get("assessment") or ""),
+                "field": str(item.get("field") or ""),
+                "value": str(item.get("value") or ""),
+                "artifact": str(item.get("artifact") or ""),
+            }
+            for item in mismatches if isinstance(item, dict)
+        ] if isinstance(mismatches, list) else []
+        if stable_findings:
+            key = hashlib.sha256(json.dumps(
+                sorted(stable_findings, key=lambda item: (
+                    item["entryId"], item["field"], item["artifact"], item["assessment"],
+                )),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+    if not key or not isinstance(state, dict):
+        return 1
+    attempts = state.get("field_semantic_rejections")
+    attempts = dict(attempts) if isinstance(attempts, dict) else {}
+    previous = attempts.get(key)
+    count = int(previous.get("count") or 0) + 1 if isinstance(previous, dict) else 1
+    attempts[key] = {"count": count}
+    # Bound durable bookkeeping: only current/recent evidence keys can affect
+    # terminal behavior, while older keys are merely stale diagnostics.
+    if len(attempts) > 20:
+        attempts = dict(list(attempts.items())[-20:])
+    state["field_semantic_rejections"] = attempts
+    write_task_state(getattr(agent, "logger", None), state)
+    return count
+
+
+def _append_field_semantic_disclosure(answer: str, review: JsonDict) -> str:
+    """Make a system-forced partial result truthful to a human reader."""
+    marker = "## System delivery disclosure"
+    if marker in answer:
+        return answer
+    lines = [
+        "",
+        marker,
+        "Status: partial. The following delivered values have evidence that does not match the requested subject or unit:",
+    ]
+    for item in (review.get("mismatches") or [])[:8]:
+        if not isinstance(item, dict):
+            continue
+        lines.append(
+            "- field={field}; value={value}; requested={requested}; evidence={evidence}; affectedRows={rows}".format(
+                field=str(item.get("field") or ""),
+                value=str(item.get("value") or ""),
+                requested=str(item.get("requestedSubject") or ""),
+                evidence=str(item.get("evidenceSubject") or ""),
+                rows=int(item.get("affectedRows") or 0),
+            )
+        )
+    lines.append("See fieldSemanticReview for the complete structured evidence.")
+    return answer.rstrip() + "\n" + "\n".join(lines)
+
+
+def _sibling_phase_handoff(
+    agent: Any, state: Any, phase: JsonDict,
+) -> Optional[JsonDict]:
+    """The route a sibling entity phase already proved, when this one has none.
+
+    `prior_handoff` is indexed by phaseId, so it only ever replays a phase into
+    itself. Splitting a stage into one phase per entity — which is what keeps a
+    worker inside its step budget — therefore made every sibling start from
+    zero: in task 9d490dc3 three detail workers explored the same product-page
+    layout independently at 21, 17 and 30 steps, and the two that finished
+    later learned nothing from the one that finished first.
+
+    Nothing in the plan connects them explicitly, but `stage_hint` plus
+    `task_type` already says mechanically that they do the same kind of work,
+    so the harness can hand the route over instead of hoping the Lead thinks to
+    copy it into spawn context.
+
+    A FAILED sibling is carried too, and ranked below a successful one rather
+    than discarded. "This entry led nowhere" is often the cheapest thing a
+    worker can be told: browser-008 spent eight steps enumerating a region its
+    page never rendered, and the next worker on the same layout had no way to
+    know that had already been tried. Only the handoff travels — rows keep
+    their own artifact lineage.
+    """
+    plan = getattr(agent, "task_plan", None)
+    if not isinstance(plan, dict) or not isinstance(state, dict):
+        return None
+    phase_id = str(phase.get("id") or "")
+    stage = str(phase.get("stage_hint") or "").strip()
+    task_type = str(phase.get("task_type") or "").strip()
+    if not stage or not task_type:
+        return None
+    phases_state = state.get("phases")
+    if not isinstance(phases_state, dict):
+        return None
+    best: Optional[Tuple[Tuple[int, str], str, JsonDict, bool]] = None
+    for candidate in plan.get("phases") or []:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_id = str(candidate.get("id") or "")
+        if not candidate_id or candidate_id == phase_id:
+            continue
+        if str(candidate.get("stage_hint") or "").strip() != stage:
+            continue
+        if str(candidate.get("task_type") or "").strip() != task_type:
+            continue
+        candidate_state = phases_state.get(candidate_id)
+        if not isinstance(candidate_state, dict):
+            continue
+        succeeded = str(candidate_state.get("status") or "") == "validated_done"
+        for attempt in reversed(candidate_state.get("attempts") or []):
+            if not isinstance(attempt, dict):
+                continue
+            if not str(attempt.get("finished_at") or ""):
+                continue
+            digest = attempt.get("attemptDigest")
+            if not isinstance(digest, dict):
+                continue
+            handoff = digest.get("handoff")
+            if not isinstance(handoff, dict):
+                continue
+            # Rank on outcome first, recency second: a proven route always
+            # beats a fresher dead end, but a dead end still beats nothing.
+            rank = (1 if succeeded else 0, str(attempt.get("finished_at") or ""))
+            if best is None or rank > best[0]:
+                best = (rank, candidate_id, handoff, succeeded)
+            break
+    if best is None:
+        return None
+    return {
+        "sourcePhaseId": best[1],
+        "handoff": best[2],
+        "sourceOutcome": "succeeded" if best[3] else "did_not_complete",
+    }
 
 
 async def _reconcile_final_answer_numbers(
@@ -3352,7 +4959,20 @@ async def _reconcile_final_answer_numbers(
             provider_name=str(getattr(agent, "claim_extractor_provider_name", "")),
             model_id=str(getattr(agent, "claim_extractor_model", "")),
         )
-        if str(extracted.get("status")) != "ok":
+        extraction_status = str(extracted.get("status") or "")
+        if extraction_status == "partial":
+            report = reconcile_numeric_claims(
+                list(extracted.get("claims") or []),
+                answer=answer,
+                index=index,
+                spans=extracted.get("spans"),
+                enforce_coverage=False,
+            )
+            if report.get("status") not in {"failed", "span_validation_failed"}:
+                report["status"] = "inconclusive"
+            report["extractorErrors"] = str(extracted.get("error") or "")[:300]
+            report["repairAttempted"] = bool(extracted.get("repairAttempted"))
+        elif extraction_status != "ok":
             # Carry the extractor's own distinction through: `unavailable`
             # (could not reach it) is not a finding about the answer, while
             # `extractor_unusable` (reached it, got nothing usable back) means
@@ -3384,6 +5004,10 @@ async def _reconcile_final_answer_numbers(
                 {"verdicts": _verdict_histogram(report.get("claims"))}
                 if isinstance(report.get("claims"), list) else {}
             ),
+            **(
+                {"unresolvedReasons": _unresolved_reason_histogram(report.get("claims"))}
+                if isinstance(report.get("claims"), list) else {}
+            ),
         })
     return report
 
@@ -3394,6 +5018,17 @@ def _verdict_histogram(claims: Any) -> JsonDict:
     for claim in claims if isinstance(claims, list) else []:
         verdict = str((claim or {}).get("verdict") or "unknown")
         histogram[verdict] = histogram.get(verdict, 0) + 1
+    return dict(sorted(histogram.items()))
+
+
+def _unresolved_reason_histogram(claims: Any) -> JsonDict:
+    """Expose why otherwise valid numeric bindings could not be resolved."""
+    histogram: Dict[str, int] = {}
+    for claim in claims if isinstance(claims, list) else []:
+        if str((claim or {}).get("verdict") or "") != "unresolved":
+            continue
+        reason = str((claim or {}).get("reason") or "unspecified")[:160]
+        histogram[reason] = histogram.get(reason, 0) + 1
     return dict(sorted(histogram.items()))
 
 
@@ -3452,14 +5087,42 @@ def _matching_exhaustion(exhausted: List[JsonDict], phase_id: Any) -> Any:
     return exhausted[-1]
 
 
-RESUME_ONLY_LEAD_TOOLS = frozenset({"resume_keep_plan", "extend_task_plan"})
+RESUME_ONLY_LEAD_TOOLS = frozenset({
+    "resume_keep_plan", "extend_task_plan", "approve_current_task_plan",
+})
 
 
-def build_lead_agent_tool_specs(*, include_resume: bool = False) -> List[JsonDict]:
+PLANNING_LEAD_TOOLS = frozenset({
+    "emit_task_plan",
+    "emit_direct_task_plan",
+    "begin_task_plan_draft",
+    "append_task_plan_draft",
+    "submit_task_plan_draft",
+    "repair_task_plan",
+    "local_fs_search",
+    "local_fs_read",
+    "read_harness_guide",
+    "search_harness_guides",
+    # Needed to report an operator cancellation or terminal harness failure.
+    # It records an auditable completion receipt; it does not prove that a plan
+    # was completed. A planning-stage done with validatedPhases=0 remains
+    # visible in that receipt, is not refused, and still ends the run completed.
+    "final_answer",
+})
+
+
+def build_lead_agent_tool_specs(
+    *, include_resume: bool = False, stage: str = "all",
+) -> List[JsonDict]:
     specs = LEAD_TOOLS.tool_specs()
-    if include_resume:
-        return specs
-    return [
+    if not include_resume:
+        specs = [
         spec for spec in specs
         if spec.get("name") not in RESUME_ONLY_LEAD_TOOLS
-    ]
+        ]
+    if stage == "planning":
+        return [
+            spec for spec in specs
+            if spec.get("name") in PLANNING_LEAD_TOOLS
+        ]
+    return specs

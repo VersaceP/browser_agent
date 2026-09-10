@@ -16,16 +16,13 @@ from pathlib import Path
 from typing import Iterable, List, Optional
 from urllib.parse import urlparse
 
+from harness.axtree_format import parse_axtree_line
 from harness.utils import JsonDict
 
 
 AUTH_FLEET_MEMORY_SCOPE = "auth_fleet_sessions_v1"
 AUTH_FLEET_MEMORY_KIND = "auth_fleet_session_index"
 
-_AUTH_AXTREE_LINE_RE = re.compile(
-    r'^(?:\d+\s+)?\s*\[(?P<id>\d+:-?\d+:-?\d+)\]\s+'
-    r'(?P<role>[^\s"]+)(?:\s+"(?P<name>.*?)")?(?P<rest>.*)$'
-)
 _AUTH_AXTREE_REJECTED_FLAGS = frozenset({"hidden", "blocked"})
 _AUTH_MARKER_ROLE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 
@@ -151,18 +148,24 @@ def _normalized_accessible_name(value: str) -> str:
 
 
 def _visible_auth_nodes(tree_text: str) -> list[JsonDict]:
+    """AX nodes eligible to prove authentication, minus the unrenderable ones.
+
+    The flag tail is parsed by the shared AXTree parser rather than split here.
+    This module used to own a second copy of that split, and when the panel
+    moved every flag into one `[...]` group both copies broke the same way -
+    except this one failed OPEN, admitting `[hidden]` nodes as proof that a
+    session is live. One parser means the next format change is caught once.
+    """
     nodes: list[JsonDict] = []
     for line in str(tree_text or "").splitlines():
-        match = _AUTH_AXTREE_LINE_RE.match(line)
-        if not match:
+        parsed = parse_axtree_line(line)
+        if parsed is None:
             continue
-        rest = str(match.group("rest") or "")
-        flags = set(rest.replace("#", " ").split())
-        if flags & _AUTH_AXTREE_REJECTED_FLAGS:
+        if set(parsed["flags"]) & _AUTH_AXTREE_REJECTED_FLAGS:
             continue
         nodes.append({
-            "role": str(match.group("role") or "").casefold(),
-            "name": str(match.group("name") or ""),
+            "role": str(parsed["role"] or "").casefold(),
+            "name": str(parsed["name"] or ""),
         })
     return nodes
 

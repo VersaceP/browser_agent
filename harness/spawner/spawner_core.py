@@ -580,6 +580,7 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
             phase_id=phase_id,
             fleet_id=assignment.fleet_id,
             page_id=page_id,
+            session_key=str(getattr(assignment, "session_key", "") or "").strip(),
             session_generation=max(
                 0,
                 int(payload.get("sessionGeneration") or assignment.session_generation or 0),
@@ -1141,6 +1142,8 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
         fleet_id: Optional[str] = None,
         session_key: Optional[str] = None,
         page_policy: Optional[str] = None,
+        dispatch_origin: str = "lead_model",
+        dispatch_identity: Optional[JsonDict] = None,
     ) -> JsonDict:
         effective_contract = worker_contract or {}
         pinned = self.pinned_browser_context
@@ -1308,6 +1311,7 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
         effective_fleet_reference = (
             direct_fleet_reference or contract_fleet_reference
         )
+        binding_supplied_routing = False
         if task_session_binding is not None:
             if (
                 effective_fleet_reference
@@ -1324,10 +1328,22 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                     "taskSessionBinding": task_session_binding.to_dict(),
                     "tool_was_executed": False,
                 }
-            if effective_session_key:
+            if (
+                effective_session_key
+                and effective_session_key != task_session_binding.session_key
+            ):
+                # Only a DIFFERENT key is a violation. Repeating the bound key
+                # is the caller asking for exactly what the binding permits,
+                # and refusing it was one side of the loop below.
                 return {
                     "status": "task_session_binding_violation",
                     "error": (
+                        "A task-local browser-continuity binding is active on"
+                        f" session_key {task_session_binding.session_key!r};"
+                        " pass that key or omit session_key so the exact bound"
+                        " Fleet/Page can continue."
+                    )
+                    if task_session_binding.session_key else (
                         "A task-local browser-continuity binding is active;"
                         " omit session_key so the exact bound Fleet/Page can"
                         " continue."
@@ -1345,7 +1361,24 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                     "taskSessionBinding": task_session_binding.to_dict(),
                     "tool_was_executed": False,
                 }
+            # From here the fleet address is the BINDING's, not the
+            # caller's, and any session_key beside it belongs to the same
+            # recorded address. The mutual-exclusion rule below guards against
+            # a caller naming two possibly-different fleets; applying it to one
+            # binding's own two halves would just replace one leg of the
+            # 69cab1c4 cycle with another. Both checks above have already
+            # proven the caller's own values agree with the binding.
+            binding_supplied_routing = True
             effective_fleet_reference = task_session_binding.fleet_id
+            # Adopt the bound key when the caller omitted one. Without this the
+            # instruction above ("omit session_key") sends the spawn straight
+            # into the coordinator's `fleet_session_conflict`, because an
+            # unnamed request cannot attach to a fleet reserved for a named
+            # session. Every escape the Lead tried in task 69cab1c4 -- naming
+            # the key, omitting it, reusing the worker -- landed on one of the
+            # three refusals in that cycle.
+            if not effective_session_key and task_session_binding.session_key:
+                effective_session_key = task_session_binding.session_key
         if (
             effective_fleet_reference
             and not getattr(
@@ -1362,7 +1395,11 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                 ),
                 "tool_was_executed": False,
             }
-        if effective_fleet_reference and effective_session_key:
+        if (
+            effective_fleet_reference
+            and effective_session_key
+            and not binding_supplied_routing
+        ):
             return {
                 "status": "invalid_fleet_routing",
                 "error": "fleet_id and session_key are mutually exclusive",
@@ -1535,6 +1572,7 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                 needs_isolated_session=bool(
                     effective_contract.get("needs_isolated_session", False)
                 ),
+                fleet_reference=effective_fleet_reference,
             )
             # Slot reservation/registration remains concurrent. The narrower
             # fleet decision lock lives inside _assign_fleet_for_worker.
@@ -1990,7 +2028,7 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                 name=agent_name,
                 task=task,
                 context=context,
-                max_steps=optional_int(max_steps),
+                max_steps=self.runtime.harness.worker_max_steps,
                 result_contract=result_contract,
                 phase_id=phase_id,
                 worker_contract=effective_contract,
@@ -2045,6 +2083,8 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                 "phaseId": phase_id,
                 "workerContract": trim_large_strings(effective_contract, 2000),
                 "contractHash": current_contract_hash,
+                "dispatchedBy": dispatch_origin,
+                "dispatchIdentity": dispatch_identity,
             },
         )
         return {
@@ -2065,6 +2105,8 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
             ),
             "fleetAssignment": assignment.to_dict() if assignment else None,
             "fleetReadiness": readiness_receipt,
+            "dispatchedBy": dispatch_origin,
+            "dispatchIdentity": dispatch_identity,
         }
 
     async def wait_browser_agents(

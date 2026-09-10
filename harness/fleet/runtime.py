@@ -565,7 +565,7 @@ def workflow_contains_navigating_action(steps: Any) -> bool:
     workflow validator; this helper only answers the positive capability
     question and never tries to infer navigation intent.
 
-    A submitting key press counts alongside ``Input.click``: a form submitted
+    A submitting key press counts alongside either click Action: a form submitted
     with Enter opens its result in a new tab exactly as often as a clicked link.
     """
 
@@ -575,7 +575,7 @@ def workflow_contains_navigating_action(steps: Any) -> bool:
         if not isinstance(raw, dict):
             continue
         action = str(raw.get("action") or "").strip()
-        if action == "Input.click":
+        if action in {"Input.click", "Page.click"}:
             return True
         if _is_submitting_key_press(action, raw.get("params")) or (
             action == "Input.press"
@@ -1640,7 +1640,7 @@ class PageLeasedBrowserClient:
             else self._client
         )
         gated = (
-            method == "Input.click"
+            method in {"Input.click", "Page.click"}
             or _is_submitting_key_press(method, payload)
             or (
                 method == "Workflow.execute"
@@ -1679,7 +1679,7 @@ class PageLeasedBrowserClient:
         settlement_class = "conservative"
         settlement_seconds = gate.soft_settlement_seconds
         classifier = self._click_settlement_classifier
-        if method == "Input.click" and callable(classifier):
+        if method in {"Input.click", "Page.click"} and callable(classifier):
             try:
                 classified = str(classifier(method, payload) or "")
             except Exception:

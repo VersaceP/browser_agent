@@ -314,6 +314,15 @@ class TaskSessionBinding:
     phase_id: str
     fleet_id: str
     page_id: str = ""
+    # The session_key the bound Fleet was reserved under, when it had one.
+    #
+    # Without it the binding is unusable for the thing it exists to permit. A
+    # continuation that names the key is refused ("omit session_key so the
+    # exact bound Fleet/Page can continue"), and one that omits it reaches the
+    # coordinator as an unnamed request for a named fleet and is refused again
+    # ("fleet ... is already bound to another session_key"). Task 69cab1c4 rode
+    # that loop for 38 Lead steps and ended blocked with the page still open.
+    session_key: str = ""
     session_generation: int = 0
     source: str = "hitl_resume"
     binding_scope: str = "page"
@@ -365,6 +374,9 @@ class TaskSessionBinding:
             phase_id=resolved_phase_id,
             fleet_id=fleet_id,
             page_id=page_id,
+            session_key=str(
+                value.get("sessionKey") or value.get("session_key") or ""
+            ).strip(),
             session_generation=max(0, generation),
             source=str(value.get("source") or "hitl_resume").strip() or "hitl_resume",
             binding_scope=binding_scope,
@@ -399,6 +411,7 @@ class TaskSessionBinding:
             "phaseId": self.phase_id,
             "fleetId": self.fleet_id,
             "pageId": self.page_id,
+            "sessionKey": self.session_key or None,
             "sessionGeneration": self.session_generation,
             "source": self.source,
             "bindingScope": self.binding_scope,

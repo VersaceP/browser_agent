@@ -85,29 +85,8 @@ LEAD_FLEET_ROUTING_DECISION_CODES = (
     "task_fleet_limit_reached",
 )
 
-LEAD_FLEET_ROUTING_DECISION_GUIDANCE = """- session_fleet_lost: the named fleet disappeared from the owner inventory and is effectively terminal until explicit reset/re-authentication. Mark the auth session stale and follow the auth-interrupt/login recovery flow; never retry or silently rebind the same session_key.
-- page_continuation_lost: an authoritative Page.list confirmed that the exact page carrying unfinished page-local state has disappeared. The unsaved page state cannot be recovered. Do not claim a fresh page resumes it; report the loss or request an operator reset only to deliberately restart.
-- fleet_assignment_lost: stop the worker and request a fresh coordinator assignment; do not retry calls against the lost fleetId.
-- fleet_auth_gated: another worker is resolving login/CAPTCHA for the shared fleet. Wait; do not create another fleet or continue account actions.
-  - reasonKind=fleet_auth_resolver_required: the gate is closed but currently has no resolver. Spawn or continue exactly one worker on the same fleet/session to refresh Page.getState and DOM.getAXTree, then explicitly call Hitl.requestPause to claim resolution. Do not create another fleet and do not wait without assigning a resolver.
-- fleet_reperception_required: shared auth state changed. The worker must call Page.getState and DOM.getAXTree before any further action.
-
-Fleet routing rejection table for spawn_browser_agent:
-- session_transport_unavailable: the original owner socket could not be restored; retry later without changing the session/fleet binding.
-- session_manual_reset_required: repeated owner-socket recovery failed. Stop retrying. A host/operator must restore the transport or explicitly reset the exact fleet/generation; the Lead must never release or silently rebind it.
-- session_slot_busy: when multi-worker fleet reuse is disabled, wait for the worker using that named session; never route the session to another fleet.
-- fleet_owner_unavailable: wait for the owner slot to reconnect; do not replace the task/session fleet.
-- fleet_reference_invalid: copy an existing Fleet UUID or a hexadecimal UUID prefix of at least eight characters into fleet_id; never put it in session_key.
-- fleet_reference_not_found: refresh the authoritative Fleet inventory or ask the user for the current Fleet; never create a replacement.
-- fleet_inventory_temporarily_unavailable: Fleet.list did not answer, so existence was not disproved. Retry later with the same fleet/session reference; never create a replacement.
-- ambiguous_fleet_reference: use a longer Fleet UUID prefix that uniquely identifies one existing Fleet.
-- reuse_fleet_lost: drop reuse_from_worker_id and request a fresh coordinator assignment.
-- reuse_session_conflict: keep the source worker's session_key, or start a fresh named session without inheriting that worker.
-- session_isolation_conflict: start a fresh fleet whose needs_isolated_session contract matches the request.
-- fleet_routing_conflict: session_key, preferred_slot_id, and reuse_from_worker_id disagree; remove the conflicting selectors instead of retrying them unchanged.
-- session_binding_conflict / fleet_session_conflict / released_fleet_conflict: fail closed and follow next_instruction; these protect an existing or released cookie jar from reassignment.
-- task_fleet_limit_reached: the task already occupies runtime_limits.max_task_fleets fleets and this spawn cannot be served from them — it demanded a separate identity (needs_isolated_session or a new session_key), or every task fleet is bound to a named session and none may be lent to a generic worker. An ordinary fleetless spawn is normally NOT rejected here; it silently reuses a task fleet. Waiting does not clear this rejection: the harness never closes a fleet, so a finished worker still holds its own, and a named session stays bound after its worker ends. Continue on a fleet the task already has (drop needs_isolated_session, or pass the exact session_key already bound to it), release a session binding through the auth-recovery flow, or ask the operator to raise harness.max_task_fleets. Never retry it as a fresh fleet.
-"""
+LEAD_FLEET_ROUTING_DECISION_GUIDANCE = """- Fleet/session routing outcomes reach the Lead on a worker result or a spawn rejection, and every one of them carries its own next_instruction naming the offending reference, whether the tool ran, and whether a retry is permitted. Follow that receipt; it knows which reference failed and this prompt cannot. When a rejection needs more than its instruction, read_harness_guide("lead.fleet-session-continuity") carries the background, and search_harness_guides resolves any of these codes to it - notably session_fleet_lost and page_continuation_lost, which are terminal for the affected session or page state, fleet_auth_gated whose fleet_auth_resolver_required variant requires you to ASSIGN a resolver rather than wait, and task_fleet_limit_reached, which waiting never clears because the harness never closes a fleet.
+- Never answer a routing rejection by creating a replacement fleet, releasing a named session binding, or rebinding a session_key that the receipt did not release."""
 
 GENERIC_TOOL_RESULT_KEEP_KEYS = (
     "method",
@@ -139,6 +118,10 @@ GENERIC_TOOL_RESULT_KEEP_KEYS = (
     # be what decides whether the agent knows it has that option.
     "visualRecoveryHint",
     "taskId",
+    # Compact receipt emitted by the direct-worker controller. Keep it when a
+    # large worker result is offloaded so Lead can distinguish an automatic
+    # continuation from a normal orchestration tool response.
+    "directExecution",
 )
 GENERIC_TOOL_RESULT_RESPONSE_KEEP_KEYS = (
     "observation",
@@ -155,6 +138,7 @@ GENERIC_TOOL_RESULT_RESPONSE_KEEP_KEYS = (
     "rpcData",
     "errorClassification",
     "taskId",
+    "directExecution",
 )
 GENERIC_TOOL_RESULT_KEEP_FIELD_BYTES = 2000
 

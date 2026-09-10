@@ -16,6 +16,11 @@ from harness.results.call_outcome import classify_call_outcome
 from harness.fleet.auth import canonical_origin
 from harness.results.row_ledger import identity_fields_from_contract
 from harness.schema_loader import CapabilityBundle
+from harness.scroll_receipt import (
+    STATE_READ_REASONS,
+    axis_magnitude,
+    scroll_delta_magnitude,
+)
 from harness.utils import JsonDict
 from .spawner_helpers import BrowserAgentSlot, URL_RE  # noqa: F401
 
@@ -301,68 +306,41 @@ def _scroll_receipt_data(result: JsonDict) -> Optional[JsonDict]:
     return data if isinstance(data, dict) else None
 
 def _scroll_was_state_probe(result: JsonDict) -> bool:
-    """True when the receipt says no wheel input was dispatched at all.
+    """True when the receipt says no scroll input was dispatched at all.
 
-    `amount: 0` reads the scroll state without moving anything, so such a call
-    is neither a traversal nor a failed traversal — counting it either way
-    corrupts the ledger that guards `target_absent`.
+    A zero request — `Input.scroll` `amount: 0`, `Page.wheel` `scrollX/scrollY: 0`
+    — reads the scroll state without moving anything, so such a call is neither
+    a traversal nor a failed traversal; counting it either way corrupts the
+    ledger that guards `target_absent`.
     """
     data = _scroll_receipt_data(result)
     if data is None:
         return False
-    # 1.1.9 returns `state-read`; older fixtures/builds used `amount-zero`.
-    return str(data.get("completedReason") or "") in {"state-read", "amount-zero"}
+    return str(data.get("completedReason") or "") in STATE_READ_REASONS
 
 def _axis_magnitude(value: Any) -> Optional[float]:
-    """Largest absolute axis component of a `{x, y}` delta, or None."""
-    if not isinstance(value, dict):
-        return None
-    magnitude: Optional[float] = None
-    for axis in ("x", "y"):
-        raw = value.get(axis)
-        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-            continue
-        magnitude = max(magnitude or 0.0, abs(float(raw)))
-    return magnitude
+    """Largest absolute axis component of a `{x, y}` delta, or None.
+
+    Kept as this module's exported name; the implementation is shared so the
+    receipt shapes are described in exactly one place.
+    """
+    return axis_magnitude(value)
 
 def _scroll_delta_applied(result: JsonDict) -> Optional[float]:
-    """Pixels an `Input.scroll` actually moved, or None when unreported.
+    """Pixels a scroll action actually moved, or None when unreported.
 
-    None and 0 must stay distinct: None means this platform build ships no
-    scroll receipt, while 0 is a positive report that the page did not move.
+    None and 0 must stay distinct: None means no movement receipt was found,
+    while 0 is a positive report that the page did not move.
 
-    Two receipt shapes are accepted on purpose. Current builds return
-    `AbcpScrollActionResult` with a `totalDelta {x, y}` plus per-surface
-    `layers[].delta`; older builds returned a scalar `deltaApplied`. Reading
-    only one of them silently degrades `scrollEffectEvidence` to "unavailable"
-    on the other build, which is exactly how a wheel event that travelled zero
-    pixels gets to look like a real traversal.
+    The shapes live in harness.scroll_receipt because `Input.scroll` and
+    `Page.wheel` name their delta differently - reading only `totalDelta` made
+    every `Page.wheel` answer None, and None here means "cannot prove it moved",
+    so no wheel could ever count as traversal or set `scrollEffectEvidence`.
     """
     data = _scroll_receipt_data(result)
     if data is None:
         return None
-
-    total = _axis_magnitude(data.get("totalDelta"))
-    if total is not None:
-        return total
-
-    layers = data.get("layers")
-    if isinstance(layers, list):
-        magnitudes = [
-            magnitude
-            for layer in layers
-            if isinstance(layer, dict)
-            and (magnitude := _axis_magnitude(layer.get("delta"))) is not None
-        ]
-        if magnitudes:
-            return max(magnitudes)
-
-    if "deltaApplied" not in data:
-        return None
-    raw = data.get("deltaApplied")
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-        return None
-    return abs(float(raw))
+    return scroll_delta_magnitude(data)
 
 def _page_traversal_evidence(trace: Optional[List[JsonDict]]) -> JsonDict:
     """Did this worker ever move past the first screenful?
@@ -376,15 +354,17 @@ def _page_traversal_evidence(trace: Optional[List[JsonDict]]) -> JsonDict:
     own ledger holds.
 
     Two signals count, both decidable from the trace:
-      * an `Input.scroll` that moved the page — we asked, and the page obeyed
+      * an `Input.scroll` or `Page.wheel` that moved the page — we asked, and
+        the page obeyed
       * a collection exhaustion proof — we enumerated a container to its end
 
     "Moved the page" needs the platform's scroll receipt, because a wheel event
     dispatched into a page that ignores it still returns a success envelope: a
     worker can scroll three times, travel zero pixels, and look fully traversed.
-    When `deltaApplied` is present it decides the question; builds that do not
-    report it leave `scrollEffectEvidence="unavailable"` and keep the older,
-    weaker reading, so this gate never fabricates evidence in either direction.
+    When an observed-delta field is present it decides the question. Older
+    `Input.scroll` builds without a receipt keep the weaker historical reading;
+    `Page.wheel` has a required movement receipt, so a missing one cannot prove
+    traversal.
 
     The two branches below verify success DIFFERENTLY on purpose, and the
     asymmetry is load-bearing rather than an oversight. `classify_call_outcome`
@@ -408,7 +388,8 @@ def _page_traversal_evidence(trace: Optional[List[JsonDict]]) -> JsonDict:
         result = item.get("result")
         if not isinstance(result, dict):
             continue
-        if str(item.get("method") or "") == "Input.scroll":
+        method = str(item.get("method") or "")
+        if method in {"Input.scroll", "Page.wheel"}:
             if not classify_call_outcome(result).succeeded:
                 continue
             if _scroll_was_state_probe(result):
@@ -417,11 +398,12 @@ def _page_traversal_evidence(trace: Optional[List[JsonDict]]) -> JsonDict:
                 continue
             delta = _scroll_delta_applied(result)
             if delta is None:
-                # No scroll receipt in this ABCP build. The success envelope
-                # proves only that the wheel event was dispatched, so keep
-                # counting it and record that the effect is unproven rather
-                # than inventing evidence either way.
-                scrolls += 1
+                # Old Input.scroll builds shipped no movement receipt, so keep
+                # their weaker historical reading. Page.wheel's current schema
+                # REQUIRES its delta field, so a wheel receipt without one is
+                # malformed and cannot prove that the page moved.
+                if method == "Input.scroll":
+                    scrolls += 1
                 continue
             scroll_effect_evidence = "receipt"
             if delta > 0:
