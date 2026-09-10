@@ -7,7 +7,6 @@ from typing import Any
 from typing import List
 from typing import Optional
 import json
-from harness.runtime_evaluation import MAIN_WORLD_REQUIRED_PREFIX
 from harness.utils import JsonDict
 
 def _bt():
@@ -225,15 +224,13 @@ def _runtime_attempt_receipt(response: Any, requested_world: str) -> JsonDict:
 
 def _runtime_response_world_verified(response: Any, expected_world: str) -> bool:
     metadata = _runtime_execution_metadata(response)
-    return (
-        str(metadata.get("requestedWorld") or "") == expected_world
-        and str(metadata.get("executedWorld") or "") == expected_world
-    )
-
-def _runtime_main_fallback_signaled(response: Any) -> bool:
-    return MAIN_WORLD_REQUIRED_PREFIX in _runtime_evaluation_error_text(
-        {"response": response}
-    )
+    requested_world = str(metadata.get("requestedWorld") or "")
+    executed_world = str(metadata.get("executedWorld") or "")
+    if requested_world != expected_world:
+        return False
+    if expected_world == "auto":
+        return executed_world in {"isolated", "main"}
+    return executed_world == expected_world
 
 def _rows_from_eval_value(value: Any) -> Optional[List[JsonDict]]:
     if isinstance(value, list) and all(isinstance(item, dict) for item in value):

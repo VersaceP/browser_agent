@@ -162,6 +162,8 @@ def normalize_action_params(label: str, params: Any) -> Any:
         return {
             "pageId": params.get("pageId"),
             "direction": params.get("direction"),
+            "edge": params.get("edge"),
+            "axis": params.get("axis"),
             "containerId": (
                 _locator(params.get("container"))
                 or params.get("id")
@@ -170,7 +172,7 @@ def normalize_action_params(label: str, params: Any) -> Any:
             ),
             "targetId": _locator(params.get("target")),
         }
-    if label in {"Input.click", "Input.select", "Input.type", "Input.press", "Input.drag"}:
+    if label in {"Input.click", "Page.click", "Input.select", "Input.type", "Input.press", "Input.drag"}:
         select_summary: Optional[JsonDict] = None
         if label == "Input.select":
             # The selection payload's field names belong to the connected
@@ -200,6 +202,10 @@ def normalize_action_params(label: str, params: Any) -> Any:
                 or params.get("nodeId")
                 or params.get("targetId")
                 or params.get("selector")
+                or (
+                    {"x": params.get("x"), "y": params.get("y")}
+                    if label == "Page.click" else None
+                )
             ),
             "key": params.get("key") if label == "Input.press" else None,
             "text": params.get("text") if label == "Input.type" else None,
@@ -214,6 +220,14 @@ def normalize_action_params(label: str, params: Any) -> Any:
             "startOption": (
                 params.get("startOption") if label == "Input.select" else None
             ),
+        }
+    if label == "Page.wheel":
+        return {
+            "pageId": params.get("pageId"),
+            "point": {"x": params.get("x"), "y": params.get("y")},
+            "delta": {"x": params.get("scrollX"), "y": params.get("scrollY")},
+            "edge": params.get("edge"),
+            "axis": params.get("axis"),
         }
     if label in {"DOM.getText", "DOM.getAttribute"}:
         return {
@@ -238,10 +252,10 @@ def nudge_threshold_for_action(label: str) -> Optional[int]:
         # ProgressAccountant already has a dedicated local_fs repeated-result
         # intervention. Duplicating that as a page-stall nudge creates noise.
         return None
-    if label == "Input.scroll":
+    if label in {"Input.scroll", "Page.wheel"}:
         return 8
     if label in {"DOM.getAXTree", "Page.getState"}:
         return 5
-    if label in {"Input.click", "Input.select", "Input.type", "Input.press"}:
+    if label in {"Input.click", "Page.click", "Input.select", "Input.type", "Input.press"}:
         return 4
     return 5

@@ -10,9 +10,10 @@ import json
 import mimetypes
 import os
 import re
+import struct
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional, Set, Tuple
 
 from runtime_config import VLConfig
 from harness.utils import JsonDict
@@ -85,6 +86,46 @@ def build_visual_verify_prompt(
             "- control_label: short visible text/label on the chosen control\n"
             "- is_consequential: boolean, true if the control could log in, pay,"
             " subscribe, or otherwise act on the user's behalf\n"
+            "- confidence: number from 0 to 1\n"
+            "- visible_evidence: short array of visible screenshot observations\n"
+            "- reason: one short sentence\n"
+        )
+    if mode == "overlay_adjudicate":
+        return (
+            "A browser action was rejected because its intended target was"
+            " occluded. Inspect this screenshot to determine what is currently"
+            " blocking that target and whether a human must act before the"
+            " original task can continue. This is a visual assessment of the"
+            " CURRENT page only; do not infer that background content is usable"
+            " merely because it is visible behind a cover.\n"
+            f"question: {question or '(none)'}\n"
+            f"expected: {json.dumps(expected or {}, ensure_ascii=False, default=str)}\n\n"
+            "Classify two separate dimensions. `surface` describes presentation:"
+            " modal, mask, page_cover, inline, none, or uncertain. A login"
+            " modal may also have mask_present=true. `purpose` describes what"
+            " the surface asks for: authentication, verification, routine,"
+            " paywall, or unknown.\n"
+            "Only choose target_access=blocked when the cover prevents the"
+            " attempted target from receiving the action. Choose"
+            " can_continue_without_user_action=no only when the page visibly"
+            " requires authentication or verification and no safe dismissal can"
+            " make the target usable. A visible header sign-in link or an"
+            " unobtrusive embedded login panel is not enough.\n"
+            "recommended_action=safe_dismiss is allowed only for a routine"
+            " blocking surface that can be safely dismissed."
+            " recommended_action=hitl is allowed only for an authentication or"
+            " verification surface that blocks the target and requires a human."
+            " For a paywall, an unclear relationship to the target, a failed"
+            " crop, or any uncertainty, choose observe. Never recommend clicking"
+            " login, sign-up, provider, payment, subscribe, purchase, or"
+            " checkout controls.\n"
+            "Return exactly one JSON object with keys:\n"
+            "- surface: modal | mask | page_cover | inline | none | uncertain\n"
+            "- mask_present: boolean or null\n"
+            "- purpose: authentication | verification | routine | paywall | unknown\n"
+            "- target_access: blocked | not_blocked | uncertain\n"
+            "- can_continue_without_user_action: yes | no | uncertain\n"
+            "- recommended_action: safe_dismiss | hitl | observe\n"
             "- confidence: number from 0 to 1\n"
             "- visible_evidence: short array of visible screenshot observations\n"
             "- reason: one short sentence\n"
@@ -297,7 +338,107 @@ def _encoded_image_over_endpoint_limit(
     }
 
 
+# PNG colour types mapped to samples per pixel, per the PNG spec. Indexed
+# colour (3) stores one sample but a decoder expands it to a palette entry, so
+# the sample count understates what a consumer allocates; this table describes
+# the FILE, and every consumer of `imageSamples` has to know that.
+_PNG_SAMPLES_PER_PIXEL = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
+
+
+def png_geometry(path: Path) -> Optional[JsonDict]:
+    """Read a PNG's declared geometry from its header. Facts only, no policy.
+
+    Nothing here refuses anything. It exists because task fae5a7b6 could not
+    answer a basic question from its own logs — how big were the captures that
+    failed? — and the answer had to be recovered by measuring leftover files in
+    /tmp afterwards. The three failing modes there (a local byte refusal at
+    48.9 MB, a server `illegal image format` on a 2448x77912 capture, and a 60s
+    timeout) are indistinguishable in the record without the geometry beside
+    them, and one of the eight failures turned out to be a 2560x1600 capture
+    that had nothing to do with size at all.
+
+    Only the 33-byte header is read: `read_bytes()` would allocate the whole
+    file, which is the cost the preflight above this exists to avoid. IHDR is
+    fixed-position and fixed-width, so no chunk walking is needed.
+
+    `imagePixels` is exact. `imageSamples` is the file's own sample count and
+    is NOT a decode-memory figure: indexed colour expands, sub-byte depths pack
+    several pixels per byte, and a decoder's working buffer is its own business.
+    Anything that later wants a budget has to define it against measurements,
+    not against this number.
+    """
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(33)
+    except OSError:
+        return None
+    if (
+        len(header) < 26
+        or header[:8] != b"\x89PNG\r\n\x1a\n"
+        or header[12:16] != b"IHDR"
+    ):
+        return None
+    try:
+        width, height = struct.unpack(">II", header[16:24])
+    except struct.error:
+        return None
+    bit_depth = header[24]
+    colour_type = header[25]
+    samples = _PNG_SAMPLES_PER_PIXEL.get(colour_type)
+    geometry: JsonDict = {
+        "imageWidth": width,
+        "imageHeight": height,
+        "imagePixels": width * height,
+        "imageBitDepth": bit_depth,
+        "imageColourType": colour_type,
+    }
+    if samples:
+        geometry["imageSamples"] = width * height * samples
+    return geometry
+
+
 async def visual_verify_image(
+    *,
+    config: VLConfig,
+    image_path: str,
+    expected: JsonDict,
+    mode: str = "action_outcome",
+    question: str = "",
+) -> JsonDict:
+    """Verify a screenshot, and state the geometry of the image that was used.
+
+    The geometry rides on EVERY outcome — verdict, refusal, transport failure,
+    timeout — because it is the field that separates them after the fact. In
+    task fae5a7b6 eight automatic checks failed and the record could not say
+    why: recovering the sizes meant measuring leftover files in /tmp, and only
+    then did it emerge that six failures carried captures of 22-190 megapixels
+    while one was an ordinary 2560x1600 frame that had simply timed out. No
+    policy is applied here; the facts are recorded so a policy can later be
+    argued from measurements instead of from a handful of anecdotes.
+    """
+    facts: JsonDict = {}
+    try:
+        path = Path(image_path)
+        facts["fileBytes"] = int(path.stat().st_size)
+        if (mimetypes.guess_type(str(path))[0] or "") == "image/png":
+            facts.update(png_geometry(path) or {})
+    except OSError:
+        facts = {}
+    result = await _visual_verify_image(
+        config=config,
+        image_path=image_path,
+        expected=expected,
+        mode=mode,
+        question=question,
+    )
+    if isinstance(result, dict):
+        # The call's own report wins any key collision: a refusal already
+        # naming `fileBytes` computed it for the decision it made.
+        return {**facts, **result}
+    return result
+
+
+async def _visual_verify_image(
     *,
     config: VLConfig,
     image_path: str,
@@ -397,6 +538,8 @@ async def visual_verify_image(
     verdict = str(parsed.get("verdict") or "uncertain").strip().lower()
     if mode == "overlay_classify":
         return _finalize_overlay_classify(parsed, usage)
+    if mode == "overlay_adjudicate":
+        return _finalize_overlay_adjudicate(parsed, usage)
     if mode == "captcha_solve":
         return _finalize_captcha_solve(parsed, usage)
     if mode == "visual_locate":
@@ -569,6 +712,70 @@ def _finalize_overlay_classify(parsed: JsonDict, usage: JsonDict) -> JsonDict:
         "dismiss_point": point,
         "control_label": str(parsed.get("control_label") or "")[:200],
         "is_consequential": bool(parsed.get("is_consequential", False)),
+        "visible_evidence": [str(item)[:300] for item in evidence[:8]],
+        "reason": str(parsed.get("reason") or "")[:500],
+        "usage": usage,
+    }
+
+
+def _finalize_overlay_adjudicate(parsed: JsonDict, usage: JsonDict) -> JsonDict:
+    """Normalize semantic VL facts for a safe occlusion recovery decision.
+
+    The mechanical layer validates only vocabulary and self-contradictions.
+    The visual model decides what the surface means; incomplete evidence is
+    normalized to ``observe`` and never becomes an automatic page action.
+    """
+    surface = str(parsed.get("surface") or "uncertain").strip().lower()
+    if surface not in {"modal", "mask", "page_cover", "inline", "none", "uncertain"}:
+        surface = "uncertain"
+    purpose = str(parsed.get("purpose") or "unknown").strip().lower()
+    if purpose not in {"authentication", "verification", "routine", "paywall", "unknown"}:
+        purpose = "unknown"
+    target_access = str(parsed.get("target_access") or "uncertain").strip().lower()
+    if target_access not in {"blocked", "not_blocked", "uncertain"}:
+        target_access = "uncertain"
+    continuation = str(
+        parsed.get("can_continue_without_user_action") or "uncertain"
+    ).strip().lower()
+    if continuation not in {"yes", "no", "uncertain"}:
+        continuation = "uncertain"
+    action = str(parsed.get("recommended_action") or "observe").strip().lower()
+    if action not in {"safe_dismiss", "hitl", "observe"}:
+        action = "observe"
+
+    if action == "hitl" and not (
+        purpose in {"authentication", "verification"}
+        and target_access == "blocked"
+        and continuation == "no"
+    ):
+        action = "observe"
+    if action == "safe_dismiss" and not (
+        purpose == "routine"
+        and target_access == "blocked"
+        and continuation == "yes"
+    ):
+        action = "observe"
+
+    raw_mask = parsed.get("mask_present")
+    mask_present = raw_mask if isinstance(raw_mask, bool) else None
+    try:
+        confidence = float(parsed.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(confidence, 1.0))
+    evidence = parsed.get("visible_evidence")
+    if not isinstance(evidence, list):
+        evidence = []
+    return {
+        "status": "done",
+        "mode": "overlay_adjudicate",
+        "surface": surface,
+        "maskPresent": mask_present,
+        "purpose": purpose,
+        "targetAccess": target_access,
+        "canContinueWithoutUserAction": continuation,
+        "recommendedAction": action,
+        "confidence": confidence,
         "visible_evidence": [str(item)[:300] for item in evidence[:8]],
         "reason": str(parsed.get("reason") or "")[:500],
         "usage": usage,
@@ -787,6 +994,85 @@ def _finalize_captcha_solve(parsed: JsonDict, usage: JsonDict) -> JsonDict:
 # splatting them into the SDK call would raise TypeError.
 _THINKING_CONTROL_KEYS = ("thinking", "reasoning_effort", "effort")
 
+# Endpoints that answered an explicit "thinking off" request with a parameter
+# refusal.  This is a property of the deployed model rather than of the SDK —
+# Ark's glm-5.3-flash replies `thinking.type "disabled" is not supported by this
+# model` — so it is keyed by (base_url, model).  One refusal is remembered
+# because re-sending the switch on every later call would pay a round trip to
+# be told the same thing.
+_THINKING_OFF_REFUSED: Set[Tuple[str, str]] = set()
+
+
+def _endpoint_identity(config: VLConfig) -> Tuple[str, str]:
+    return (str(config.base_url or ""), str(config.model_id or ""))
+
+
+def _requested_thinking_off(params: JsonDict) -> bool:
+    """Whether this request carries an explicit no-thinking switch."""
+    candidates = [params.get("thinking")]
+    extra_body = params.get("extra_body")
+    if isinstance(extra_body, dict):
+        candidates.append(extra_body.get("thinking"))
+    for value in candidates:
+        if value is False:
+            return True
+        if (
+            isinstance(value, dict)
+            and str(value.get("type") or "").strip().lower() == "disabled"
+        ):
+            return True
+    return False
+
+
+def _drop_thinking_request(params: JsonDict) -> None:
+    """Remove every spelling of the thinking switch from a built request."""
+    for key in _THINKING_CONTROL_KEYS:
+        params.pop(key, None)
+    extra_body = params.get("extra_body")
+    if isinstance(extra_body, dict):
+        for key in _THINKING_CONTROL_KEYS:
+            extra_body.pop(key, None)
+        if not extra_body:
+            params.pop("extra_body", None)
+
+
+def _thinking_switch_unsupported(exc: BaseException) -> bool:
+    text = str(exc or "").lower()
+    return "thinking" in text and (
+        "not supported" in text
+        or "not support" in text
+        or "unsupported" in text
+    )
+
+
+async def _send_allowing_thinking_refusal(
+    send: Callable[[], Awaitable[Any]],
+    *,
+    config: VLConfig,
+    params: JsonDict,
+) -> Tuple[Any, Tuple[str, ...]]:
+    """Send the request; survive an endpoint that cannot be asked to stop thinking.
+
+    Dropping the key is not a portable "off" switch, so the harness asks
+    explicitly — but a model that has no off switch must stay usable rather than
+    fail every ordinary visual check with a 400.  The request is resent once
+    without the switch and the refusal is recorded, so the cost is one round
+    trip per endpoint instead of one per call.
+    """
+    try:
+        return await send(), ()
+    except Exception as exc:
+        if not _requested_thinking_off(params):
+            raise
+        if not _thinking_switch_unsupported(exc):
+            raise
+        _THINKING_OFF_REFUSED.add(_endpoint_identity(config))
+        _drop_thinking_request(params)
+        return await send(), (
+            "endpoint rejected an explicit thinking:disabled request;"
+            " resent without it and stopped asking this endpoint",
+        )
+
 
 def _merged_vl_extra_params(
     config: VLConfig,
@@ -807,6 +1093,17 @@ def _merged_vl_extra_params(
         for key in _THINKING_CONTROL_KEYS:
             merged.pop(key, None)
     merged.update(role_extra_params or {})
+    if (
+        not inherit_base_thinking
+        and "thinking" not in merged
+        and _endpoint_identity(config) not in _THINKING_OFF_REFUSED
+    ):
+        # Removing an inherited request key is not a portable "off" switch:
+        # some Anthropic-compatible endpoints apply their server default when
+        # it is absent. Ordinary verification needs an explicit, observable
+        # no-thinking request; CAPTCHA roles retain their configured policy.
+        # Endpoints that have already refused the switch are not asked again.
+        merged["thinking"] = {"type": "disabled"}
     return merged
 
 
@@ -882,7 +1179,11 @@ async def _call_openai_compatible(
     params.update(_passthrough_extra_params(merged))
     params.update(thinking_top)
     _merge_extra_body(params, thinking_extra_body)
-    response = await client.chat.completions.create(**params)
+    response, refusal_warnings = await _send_allowing_thinking_refusal(
+        lambda: client.chat.completions.create(**params),
+        config=config,
+        params=params,
+    )
     text = response.choices[0].message.content or ""
     usage = getattr(response, "usage", None)
     meta: JsonDict = {
@@ -890,8 +1191,10 @@ async def _call_openai_compatible(
         "model": config.model_id,
         "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0,
         "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0) if usage else 0,
+        "stop_reason": str(getattr(response.choices[0], "finish_reason", "") or ""),
+        "content_block_types": ["text"] if text else [],
     }
-    warnings = (*intent.warnings, *thinking_warnings)
+    warnings = (*intent.warnings, *thinking_warnings, *refusal_warnings)
     if warnings:
         meta["thinking_warnings"] = list(warnings)
     return text, meta
@@ -956,10 +1259,17 @@ async def _call_anthropic_compatible(
     )
     params.update(_passthrough_extra_params(merged))
     params.update(thinking_native)
-    response = await client.messages.create(**params)
+    response, refusal_warnings = await _send_allowing_thinking_refusal(
+        lambda: client.messages.create(**params),
+        config=config,
+        params=params,
+    )
     text = ""
+    block_types = []
     for block in response.content:
-        if getattr(block, "type", None) == "text":
+        block_type = str(getattr(block, "type", "") or "unknown")
+        block_types.append(block_type)
+        if block_type == "text":
             text += getattr(block, "text", "") or ""
     usage = getattr(response, "usage", None)
     meta: JsonDict = {
@@ -967,8 +1277,14 @@ async def _call_anthropic_compatible(
         "model": config.model_id,
         "input_tokens": int(getattr(usage, "input_tokens", 0) or 0) if usage else 0,
         "output_tokens": int(getattr(usage, "output_tokens", 0) or 0) if usage else 0,
+        "stop_reason": str(getattr(response, "stop_reason", "") or ""),
+        "content_block_types": block_types,
+        "thinking_block_count": sum(
+            1 for block_type in block_types
+            if block_type in {"thinking", "redacted_thinking"}
+        ),
     }
-    warnings = (*intent.warnings, *thinking_warnings)
+    warnings = (*intent.warnings, *thinking_warnings, *refusal_warnings)
     if warnings:
         meta["thinking_warnings"] = list(warnings)
     return text, meta

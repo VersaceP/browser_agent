@@ -25,9 +25,27 @@ from harness.utils import JsonDict
 AXTREE_ID_RE = re.compile(r"\b\d+:-?\d+:-?\d+\b")
 # Accepts both the legacy indent-based line format and the current
 # depth-prefixed one (`3 [3:426:426] link "TAAFT" # @10,0,106,94`).
+#
+# DELIBERATELY not harness.axtree_format.parse_axtree_line, which is the shared
+# parser everywhere a line's FLAGS or RECT matter. This needs only id/role/name
+# and runs over every line of every observation - measured ~8x the cost of this
+# regex per line, for fields it would then discard.
+#
+# The name capture is GREEDY on purpose. `[^"]*` stopped at the first quote
+# inside an accessible name, and a truncated name is not merely imprecise here:
+# `Status "pending"` and `Status "complete"` both collapsed to `Status `, so a
+# real content change produced an identical fingerprint and `semanticChanged`
+# stayed False. A fingerprint has to DISCRIMINATE as well as be stable.
+# Greedy is exactly right because nothing in the tail grammar that follows the
+# name (flags, `#`/`~`, `@rect`, `(+N omitted)`) contains a quote, so the last
+# quote on the line is always the name's closing one.
+#
+# The moment this needs a flag or a rect, that trade stops holding: switch to
+# the shared parser rather than teaching this regex the tail grammar, which is
+# how the format came to be parsed wrongly in two places at once.
 AXTREE_LINE_RE = re.compile(
     r"^(?:\d+\s+)?\s*\[(?P<id>\d+:-?\d+:-?\d+)\]\s+"
-    r"(?P<role>[\w-]+)(?:\s+\"(?P<name>[^\"]*)\")?"
+    r"(?P<role>[\w-]+)(?:\s+\"(?P<name>.*)\")?"
 )
 ACTIONABLE_ROLES = {
     "button",

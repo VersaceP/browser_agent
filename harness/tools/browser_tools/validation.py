@@ -71,6 +71,28 @@ def _check_dialog_param_requirements(
         }
     return None
 
+
+def _check_forced_interaction_requirements(
+    method: str,
+    params: JsonDict,
+) -> Optional[JsonDict]:
+    """Keep the WebCross coverage contract independent of page semantics."""
+    if method != "Input.click" or params.get("force") is not True:
+        return None
+    return {
+        "method": method,
+        "params": params,
+        "status": "invalid_params",
+        "error": "Input.click force=true cannot bypass coverage checks.",
+        "invalidParam": "force",
+        "tool_was_executed": False,
+        "next_instruction": (
+            "Keep force=false. Re-observe the current page, dismiss an eligible "
+            "overlay when it blocks the requested target, then use a fresh "
+            "target; request HITL when coverage remains uncertain."
+        ),
+    }
+
 def _check_nested_id_format(method: str, params: JsonDict) -> Optional[JsonDict]:
     """Same canonical-id check for locators that do not sit at the top level.
 
@@ -166,14 +188,17 @@ def _check_id_param_format(
 DOM_GET_IMG_MAX_TARGETS = 32
 
 _SCROLL_MODE_INSTRUCTION = (
-    "Input.scroll has three modes and no top-level locator. Target mode:"
+    "Input.scroll has three schema branches and no top-level locator. Target mode:"
     " target={id?,selector?} (plus optional container) with amount as the"
     " per-step cap and NO direction — the browser derives it and success means"
-    " targetVisible=true. Container mode: container={id?,selector?} with"
-    " direction and amount, for a container that is already visible. Viewport"
-    " mode: neither locator, just direction and amount. Read layers[].delta for"
-    " the real movement, and do not repeat the same direction after"
-    " completedReason=boundary-reached."
+    " targetVisible=true. Container-distance mode: container={id?,selector?}"
+    " with direction and amount. Container-edge mode: container={id?,selector?}"
+    " with edge=start|end and axis=vertical|horizontal (vertical by default)."
+    " Root-viewport scrolling is Page.wheel with current in-viewport x/y and"
+    " explicit scrollX/scrollY (positive = right/down) or edge/axis. Page.wheel"
+    " reports movement as observedDelta against requestedDelta — NOT as"
+    " totalDelta, which is Input.scroll's name for it. Read that field plus"
+    " completedReason before deciding whether another wheel action is needed."
 )
 
 def _check_scroll_param_requirements(
@@ -204,8 +229,8 @@ def _check_scroll_param_requirements(
 
     if "viewport" in params:
         return invalid(
-            "Input.scroll viewport mode uses top-level direction and amount;"
-            " remove params.viewport and move those fields to params.",
+            "Input.scroll does not support root viewport mode; use Page.wheel"
+            " with current in-viewport coordinates instead.",
             "viewport",
         )
 
@@ -219,6 +244,7 @@ def _check_scroll_param_requirements(
 
     target = params.get("target")
     container = params.get("container")
+    edge = params.get("edge")
     for key, locator in (("target", target), ("container", container)):
         if locator is None:
             continue
@@ -235,22 +261,49 @@ def _check_scroll_param_requirements(
         if isinstance(amount, (int, float)) and not isinstance(amount, bool)
         else None
     )
+    if numeric_amount is not None and numeric_amount < 0:
+        return invalid("Input.scroll amount must not be negative.", "amount")
+    if target is None and container is None:
+        return invalid(
+            "Input.scroll requires target reveal or an explicit container; use"
+            " Page.wheel for root viewport scrolling.",
+            "container",
+        )
     if target is not None:
+        if edge is not None or _non_empty_param(params, "axis"):
+            return invalid(
+                "Input.scroll target mode does not accept edge or axis.",
+                "edge" if edge is not None else "axis",
+            )
         if _non_empty_param(params, "direction"):
             return invalid(
                 "Input.scroll target mode derives its own direction; drop"
-                " params.direction or switch to container/viewport mode.",
+                " params.direction or switch to container mode.",
                 "direction",
             )
         if numeric_amount is not None and numeric_amount <= 0:
             return invalid(
                 "Input.scroll target mode needs a positive amount (the cap on"
                 " each smooth-scroll step). amount=0 reads state and is valid"
-                " only for container or viewport mode.",
+                " only for container mode.",
                 "amount",
             )
-    if numeric_amount is not None and numeric_amount < 0:
-        return invalid("Input.scroll amount must not be negative.", "amount")
+    if edge is not None:
+        if container is None:
+            return invalid(
+                "Input.scroll edge mode requires a container locator.",
+                "container",
+            )
+        if _non_empty_param(params, "direction") or amount is not None:
+            return invalid(
+                "Input.scroll container-edge mode does not accept direction or amount.",
+                "direction" if _non_empty_param(params, "direction") else "amount",
+            )
+    elif _non_empty_param(params, "axis"):
+        return invalid(
+            "Input.scroll axis is accepted only with container-edge mode.",
+            "axis",
+        )
     return None
 
 def _check_target_param_requirements(
@@ -260,6 +313,9 @@ def _check_target_param_requirements(
 ) -> Optional[JsonDict]:
     if not isinstance(params, dict):
         return None
+    forced_interaction_error = _check_forced_interaction_requirements(method, params)
+    if forced_interaction_error is not None:
+        return forced_interaction_error
     scroll_error = _check_scroll_param_requirements(method, params)
     if scroll_error is not None:
         return scroll_error
@@ -365,25 +421,43 @@ def _check_target_param_requirements(
     # session's describeAction schema instead. A local mirror silently rejected
     # the only shape the connected browser accepted; see task f1da2976.
     if method == "Input.click" and not has_selector_or_id:
+        schema = method_schemas.get(method) if isinstance(method_schemas, dict) else None
+        schema_param_names = set(schema_param_specs(schema)) if isinstance(schema, dict) else set()
+        # Without a descriptor, preserve the old permissive compatibility path
+        # and let ABCP decide. Once a live schema is present, it is authoritative.
+        coordinate_click_supported = (
+            not schema_param_names
+            or {"x", "y"}.issubset(schema_param_names)
+        )
         has_coordinates = (
             _non_negative_numeric_param(params, "x")
             and _non_negative_numeric_param(params, "y")
         )
-        if not has_coordinates:
+        if not (coordinate_click_supported and has_coordinates):
+            current_contract = bool(schema_param_names) and not coordinate_click_supported
             return {
                 "method": method,
                 "params": params,
                 "status": "invalid_params",
                 "error": (
-                    "Input.click requires selector/id or both non-negative x and y"
-                    " coordinates."
+                    "Input.click requires selector or id under the connected schema."
+                    if current_contract else
+                    "Input.click requires selector/id or both schema-supported"
+                    " non-negative x and y coordinates."
                 ),
                 "tool_was_executed": False,
-                "missingAnyOf": [["selector"], ["id"], ["x", "y"]],
+                "missingAnyOf": (
+                    [["selector"], ["id"]]
+                    if current_contract else
+                    [["selector"], ["id"], ["x", "y"]]
+                ),
                 "next_instruction": (
+                    "Use Input.click with a current DOM.getAXTree id or selector."
+                    " For a verified viewport CSS coordinate, use Page.click"
+                    " with pageId, x, y, clickCount, and purpose."
+                    if current_contract else
                     "Prefer a current DOM.getAXTree id for Input.click. Use x/y"
-                    " only for a verified coordinate fallback such as a backdrop"
-                    " click."
+                    " only when the connected Input.click schema exposes them."
                 ),
             }
     # Canonical id format guard: catch a malformed id here (clear, actionable
@@ -405,10 +479,17 @@ def _annotate_dom_batch_response(method: str, response: Any) -> Any:
     if not isinstance(items, list):
         return response
     succeeded = sum(
-        1 for item in items
+        1
+        for item in items
         if isinstance(item, dict)
-        and item.get("error") is None
-        and isinstance(item.get("info"), dict)
+        and (
+            item.get("ok") is True
+            or (
+                "ok" not in item
+                and item.get("error") is None
+                and isinstance(item.get("info"), dict)
+            )
+        )
     )
     failed = len(items) - succeeded
     # Only the outer envelope and data mapping change. Keep the potentially

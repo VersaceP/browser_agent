@@ -87,11 +87,7 @@ from harness.progress import NO_ARTIFACT_DIAGNOSTIC_TOOLS, extraction_artifact_c
 from harness.pacing import wait_between_rows
 from harness.observation.browser_call import build_browser_call_runner
 from harness.screenshot_policy import normalize_screenshot_output_params
-from harness.runtime_evaluation import (
-    MAIN_WORLD_REQUIRED_PREFIX,
-    RuntimeEvaluationService,
-    runtime_last_resort_evidence,
-)
+from harness.runtime_evaluation import RuntimeEvaluationService
 from harness.task_control import (
     phase_prior_artifact_paths,
     validate_worker_artifacts,
@@ -122,7 +118,7 @@ from harness.workflow_runtime import (
     workflow_execution_disabled_result,
     workflow_execution_enabled,
 )
-from .schemas import EVAL_JS_REASON_KINDS, _browser_input_schemas
+from .schemas import _browser_input_schemas
 from .axtree_state import (
     AXTREE_INVALIDATING_METHODS,
     _apply_recovered_target,
@@ -295,6 +291,7 @@ from .navigate import (  # noqa: F401
     SELECT_FAILURE_RETRY_LIMITS,
     _URL_DEFAULT_PORTS,
     _apply_select_failure_guidance,
+    _select_identity_recovery_for_locators,
     _select_replay_guard_before,
     _auto_hitl_is_actionable,
     _cancel_waiter,
@@ -386,7 +383,6 @@ from .runtime_eval import (  # noqa: F401
     _runtime_attempt_receipt,
     _runtime_evaluation_error_text,
     _runtime_execution_metadata,
-    _runtime_main_fallback_signaled,
     _runtime_response_world_metadata_supplied,
     _runtime_response_world_verified,
 )

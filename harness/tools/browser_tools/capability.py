@@ -15,9 +15,7 @@ from harness.fleet.runtime import FleetClickGateTimeout
 from harness.offload import offload_large_tool_result
 from harness.offload import preserve_complete_tool_payload
 from harness.observation.browser_call import build_browser_call_runner
-from harness.runtime_evaluation import MAIN_WORLD_REQUIRED_PREFIX
 from harness.runtime_evaluation import RuntimeEvaluationService
-from harness.runtime_evaluation import runtime_last_resort_evidence
 from harness.task_types import resolve_task_type_fail_closed
 from harness.tool_policy import redact_params_for_display
 from harness.tool_policy import sensitive_browser_method_params
@@ -247,33 +245,30 @@ async def _execute_browser_capability_tool(
         )
 
     if method == "Runtime.evaluate":
-        prepared, policy_error = _bt()._prepare_runtime_evaluation(
+        prepared, preparation_error = _bt()._prepare_runtime_evaluation(
             agent,
             params,
             runtime_policy,
             origin="model_browser_call" if tool_name == "browser_call" else "model_direct_capability",
         )
-        if policy_error is not None:
-            attach_method_schema(policy_error, method, agent.method_schemas)
-            agent.logger.write("runtime.evaluate.rejected", policy_error)
-            agent.trace.append({"type": "runtime_policy_rejected", "result": policy_error})
-            return policy_error, False
-        escalation, escalation_error = runtime_last_resort_evidence(
-            agent,
-            page_id=str(params.get("pageId") or ""),
-        )
-        if escalation_error is not None:
-            attach_method_schema(escalation_error, method, agent.method_schemas)
-            agent.logger.write("runtime.evaluate.escalation_rejected", escalation_error)
+        if preparation_error is not None:
+            attach_method_schema(preparation_error, method, agent.method_schemas)
+            agent.logger.write("runtime.evaluate.rejected", preparation_error)
             agent.trace.append({
-                "type": "runtime_escalation_rejected",
-                "result": escalation_error,
+                "type": "runtime_evaluation_rejected",
+                "result": preparation_error,
             })
-            return escalation_error, False
+            return preparation_error, False
         params = dict(prepared.params)
         runtime_receipt = dict(prepared.receipt)
-        runtime_receipt["lastResortEvidence"] = escalation
-        agent.logger.write("runtime.evaluate.escalation_authorized", escalation)
+        agent.logger.write(
+            "runtime.evaluate.prepared",
+            {
+                "pageId": str(params.get("pageId") or ""),
+                "requestedWorld": runtime_receipt["requestedWorld"],
+                "legacyPolicySupplied": runtime_receipt["legacyPolicySupplied"],
+            },
+        )
         if runtime_receipt.get("resultMode") == "json":
             runtime_json_expression = _bt()._build_runtime_json_expression(
                 str(params.get("expression") or "")
@@ -433,6 +428,9 @@ async def _execute_browser_capability_tool(
         allow_rematch=_browser_side_rematch_mode(agent) == "on",
     )
     if stale_target is not None:
+        stale_target = _bt()._apply_select_failure_guidance(
+            agent, method, params, stale_target,
+        )
         agent.logger.write("browser.call.stale_axtree_target", stale_target)
         agent.trace.append({"type": "stale_axtree_target", "result": stale_target})
         return stale_target, False
@@ -657,28 +655,10 @@ async def _execute_browser_capability_tool(
                     **data,
                 })
         if method == "Runtime.evaluate" and runtime_receipt:
+            requested_world = str(params.get("world") or "auto").strip() or "auto"
             runtime_receipt["attempts"] = [
-                _bt()._runtime_attempt_receipt(response, "isolated")
+                _bt()._runtime_attempt_receipt(response, requested_world)
             ]
-            if (
-                _bt()._invoke_result_failed({"method": method, "response": response})
-                and runtime_receipt.get("mainFallbackAuthorized") is True
-                and _bt()._runtime_main_fallback_signaled(response)
-            ):
-                main_params = {**params, "world": "main"}
-                agent.logger.write(
-                    "runtime.evaluate.main_fallback_authorized",
-                    {
-                        "pageId": str(params.get("pageId") or ""),
-                        "reasonKind": runtime_receipt.get("reasonKind"),
-                        "signal": MAIN_WORLD_REQUIRED_PREFIX,
-                    },
-                )
-                response = await runner.call(method, main_params)
-                runtime_receipt["attempts"].append(
-                    _bt()._runtime_attempt_receipt(response, "main")
-                )
-
             final_attempt = runtime_receipt["attempts"][-1]
             runtime_receipt["executedWorld"] = final_attempt.get("executedWorld")
             expected_world = str(final_attempt.get("requestedWorld") or "")
@@ -713,7 +693,6 @@ async def _execute_browser_capability_tool(
                         "runtime.evaluate.world_evidence_degraded",
                         {
                             "pageId": str(params.get("pageId") or ""),
-                            "reasonKind": runtime_receipt.get("reasonKind"),
                             "dispatchedWorld": expected_world,
                             "evidence": "harness_dispatched_world",
                             "resultAccepted": True,
@@ -885,36 +864,10 @@ async def _execute_browser_capability_tool(
     attach_error_classification(result, method=method)
     result = _bt()._apply_select_failure_guidance(agent, method, params, result)
     if method == "Runtime.evaluate" and _bt()._invoke_result_failed(result):
-        attempts = list(runtime_receipt.get("attempts") or [])
-        attempted_main = any(
-            item.get("requestedWorld") == "main"
-            for item in attempts if isinstance(item, dict)
-        )
-        signaled = any(
-            MAIN_WORLD_REQUIRED_PREFIX in str(item.get("error") or "")
-            for item in attempts if isinstance(item, dict)
-        )
-        classification = (
-            "runtime_execution_world_unverified"
-            if attempts and attempts[-1].get("failureKind") == "world_evidence_mismatch"
-            else "runtime_main_evaluation_failed" if attempted_main
-            else "runtime_isolated_context_blocked"
-            if signaled
-            else "runtime_isolated_evaluation_failed"
-        )
-        result["status"] = "blocked"
-        result["runtimeBlocker"] = {
-            "classification": classification,
-            "attempts": attempts,
+        result["runtimeEvaluationFailure"] = {
+            "attempts": list(runtime_receipt.get("attempts") or []),
             "error": _bt()._runtime_evaluation_error_text(result)[:2000],
-            "final": True,
         }
-        result["next_instruction"] = (
-            "The guarded Runtime evaluation exhausted its authorized strict"
-            " world attempts or received invalid/mismatched platform world"
-            " evidence. Do not"
-            " request main directly or repeat Runtime.evaluate; report this blocker."
-        )
     _bt()._fleet_auth_barrier_after_call(agent, method, result)
     result = _bt()._attach_runtime_strategy_hints(result, method=method)
     if not page_create_should_stop:
@@ -1153,6 +1106,9 @@ async def _invoke_browser_method(
             agent, method, params, allow_rematch=True
         )
         if stale_target is not None:
+            stale_target = _bt()._apply_select_failure_guidance(
+                agent, method, params, stale_target,
+            )
             logger = getattr(agent, "logger", None)
             if logger is not None:
                 logger.write("browser.call.stale_axtree_target", stale_target)

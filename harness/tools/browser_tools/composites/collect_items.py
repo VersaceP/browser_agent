@@ -10,6 +10,7 @@ from harness.results.call_outcome import replay_forbidden
 from harness.constants import COLLECTION_CONTRACT_REPLAN_REQUIRED
 from harness.observation.overlay_detector import detect_overlay_from_result
 from harness.observation.verifiers import probe_collection_state
+from harness.scroll_receipt import scroll_dispatch_target
 from harness.utils import JsonDict, optional_int
 
 
@@ -29,6 +30,10 @@ def _loop_interrupt_from_result(result: Any) -> Optional[JsonDict]:
 
 def _invoke_result_failed(result: Any) -> bool:
     return _bt()._invoke_result_failed(result)
+
+
+def _response_data(result: Any) -> JsonDict:
+    return _bt()._response_data(result) or {}
 
 
 def _result_occlusion_blocked(result: Any) -> bool:
@@ -595,6 +600,20 @@ def _collect_contract_warning(
     return warning
 
 
+def _wheel_axis_and_sign(direction: str) -> tuple:
+    """Map a compass direction onto the Page.wheel delta field and its sign.
+
+    Positive `scrollX` scrolls right and positive `scrollY` scrolls down, per
+    the live Action schema, so up/left are the negative directions.
+    """
+    return {
+        "down": ("scrollY", 1.0),
+        "up": ("scrollY", -1.0),
+        "right": ("scrollX", 1.0),
+        "left": ("scrollX", -1.0),
+    }.get(str(direction or "").strip().lower(), ("scrollY", 1.0))
+
+
 async def _collect_items_materialize(
     agent: Any,
     *,
@@ -646,33 +665,65 @@ async def _collect_items_materialize(
 
     # default: scroll. A stale container id must still go through the seen-id
     # rematch guard (Phase 2), not bypass it -> allow_rematch=True.
-    # Input.scroll is a STRICT three-mode union (target / container / viewport).
-    # A container locator must be nested under `container`; a flat id/selector
-    # matches no variant and the platform rejects the whole call. Viewport mode
-    # must carry no locator at all, which is what the no-container branch emits.
-    params = {"pageId": page_id, "direction": direction or "down",
-              "amount": amount, "purpose": "collect_items: scroll"}
+    #
+    # Input.scroll now REQUIRES a locator on every branch (target reveal,
+    # container distance, container edge). Its root-viewport mode is gone, so
+    # the no-container case must go to Page.wheel instead — the old locator-less
+    # shape matches no branch and the platform rejects the whole call, which
+    # made page-level collection unable to scroll at all.
     container: JsonDict = {}
     if container_id:
         container["id"] = container_id
     if container_selector:
         container["selector"] = container_selector
+
     if container:
-        params["container"] = container
+        method = "Input.scroll"
+        params = {"pageId": page_id, "direction": direction or "down",
+                  "amount": amount, "container": container,
+                  "purpose": "collect_items: scroll"}
+    else:
+        # Page.wheel is a real wheel gesture at a point, so it needs one inside
+        # the viewport and it moves whichever surface hit-testing picks — native
+        # propagation carries it to the nearest scrollable ancestor.
+        method = "Page.wheel"
+        axis, sign = _wheel_axis_and_sign(direction or "down")
+        params = {"pageId": page_id, "x": 0, "y": 0, "scrollX": 0, "scrollY": 0,
+                  "purpose": "collect_items: scroll"}
+        params[axis] = sign * float(amount)
     result = await _invoke_browser_method(
-        agent, "Input.scroll", params, step, count_progress=False,
+        agent, method, params, step, count_progress=False,
         allow_rematch=bool(container_id),
     )
     interrupt = _loop_interrupt_from_result(result)
     if interrupt:
         return {"ok": False, "exhausted": False, "interrupt": interrupt}
     failed = _invoke_result_failed(result)
-    return {
+    outcome: JsonDict = {
         "ok": not failed,
         "exhausted": False,
         "detail": "scrolled",
         "replayForbidden": failed and replay_forbidden(result),
     }
+    # Where the gesture landed, reported as an observation and used for
+    # NOTHING here. A point-aimed wheel can land on a sidebar or a nested list
+    # instead of the document, and that is worth surfacing - but it must not
+    # become a progress rule:
+    #   * the receipt reports each layer's final position and no per-layer
+    #     delta, so a layer appearing here is not proof that it moved;
+    #   * scrolling an element is not "no progress" - a virtual list lives
+    #     inside one, and this composite already decides progress by counting
+    #     deduplicated new rows, which is the fact that actually matters;
+    #   * a mis-hit container must not be adopted as the next target on its
+    #     own, or the collection would just scroll the wrong surface more
+    #     reliably.
+    # So it travels outward for the model to weigh against its collection
+    # goal; the inner loop has no model in it and makes no such judgment.
+    if method == "Page.wheel" and not failed:
+        surface = scroll_dispatch_target(_response_data(result) or {})
+        if surface:
+            outcome["scrollSurface"] = surface
+    return outcome
 
 
 async def _collect_overlay_recovery(
@@ -864,6 +915,9 @@ async def _collect_items(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
     accumulator: Dict[str, JsonDict] = {}
     rounds_log: List[JsonDict] = []
     overlay_encountered: Optional[JsonDict] = None
+    # Which layer the page-level wheel was dispatched into on the last scroll
+    # round. Reported outward, never consulted here - see _collect_items_materialize.
+    scroll_surface: Optional[JsonDict] = None
     exhaustion_evidence: Optional[JsonDict] = None
     successful_load_more_clicks = 0
     truncated = False
@@ -966,6 +1020,11 @@ async def _collect_items(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
                 mode=mode, selector=selector, rounds_log=rounds_log,
                 started_at=started_at, step=step,
             )
+        # Observation only, recorded before any branch can exit the loop, so a
+        # collection that stalls still reports which surface its scrolls were
+        # landing on. Nothing below reads it.
+        if action.get("scrollSurface"):
+            scroll_surface = dict(action["scrollSurface"])
         if action.get("occlusion"):
             # The expansion control is covered by an overlay — recover rather
             # than mistaking it for exhaustion, then retry on the next round.
@@ -1165,6 +1224,23 @@ async def _collect_items(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
         "sample": collected[:3],
         "overlayEncountered": overlay_encountered,
     }
+    if scroll_surface:
+        result["scrollSurface"] = scroll_surface
+        if scroll_surface.get("kind") != "viewport":
+            # Stated, not enforced. Scrolling an element is legitimate - a
+            # virtual list lives in one - so this never contradicts the row
+            # counts above; it only says the page-level wheel was landing
+            # somewhere other than the document, which is worth knowing when
+            # the rows stopped coming.
+            result["scrollSurfaceNote"] = (
+                "Page-level scrolling was dispatched into a"
+                f" {scroll_surface.get('kind')} layer rather than the document"
+                " viewport, because a wheel goes to whatever sits under its"
+                " coordinate. That is not a fault by itself. If the row count"
+                " stalled, decide from the page whether this layer is the one"
+                " holding the items: pass it as `containerId`/`containerSelector`"
+                " if it is, or pick the surface that is."
+            )
     if truncated:
         result["next_step"] = (
             "More matched items exist than were harvested (raise harvestLimit or"

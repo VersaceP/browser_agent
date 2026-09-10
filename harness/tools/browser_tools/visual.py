@@ -52,19 +52,32 @@ def _log_dismiss_overlay(
     status: str,
     overlay: Optional[JsonDict],
     attempts: List[JsonDict],
+    retry: Optional[JsonDict] = None,
 ) -> None:
+    """Record the ladder's result AND what the retry measured.
+
+    The retry is the only direct check that the target became reachable, and
+    for a long time its outcome existed only in the tool's return value. Task
+    b9a91fd2 logged six `dismissed` verdicts across two runs with nothing to
+    contradict them, while the traces showed the retried click coming back
+    with the same `-32005 target is covered` as the original. Whether a
+    dismissal actually worked has to be answerable from the log alone.
+    """
     logger = getattr(agent, "logger", None)
-    if logger is not None:
-        logger.write(
-            "dismiss_overlay.result",
-            {
-                "pageId": page_id,
-                "status": status,
-                "subtype": (overlay or {}).get("subtype"),
-                "attemptCount": len(attempts),
-                "attempts": attempts,
-            },
-        )
+    if logger is None:
+        return
+    payload: JsonDict = {
+        "pageId": page_id,
+        "status": status,
+        "subtype": (overlay or {}).get("subtype"),
+        "attemptCount": len(attempts),
+        "attempts": attempts,
+    }
+    if isinstance(retry, dict):
+        for key in ("retried", "stillOccluded", "retryTarget", "reason"):
+            if key in retry:
+                payload[key] = retry[key]
+    logger.write("dismiss_overlay.result", payload)
 
 def _repair_identity_text(value: Any) -> str:
     return str(value).strip() if value is not None else ""
@@ -773,7 +786,7 @@ def _attach_visual_recovery_hint(
                 "No node covers the pixel (a genuine structured-surface blind"
                 " spot), but the capture's scale and origin were proven. This"
                 " is a viewport CSS point, and a point is only clickable:"
-                " ONE Input.click{pageId,x,y}, then re-observe to verify the"
+                " ONE Page.click{pageId,x,y}, then re-observe to verify the"
                 " outcome. That is a limit of what a coordinate CAN express,"
                 " not a rule about visual recovery — a resolvedId reaches"
                 " whichever methods that node's own role supports. Never"
@@ -901,12 +914,39 @@ def _reality_check_summary(row: JsonDict) -> JsonDict:
         "mayTerminate": row.get("mayTerminate"),
         "claimScope": row.get("claimScope"),
     }
+    # `claimScope` says what was being judged; `screenshotScope` says what was
+    # actually photographed. Dropping the second one let a viewport crop be
+    # read as a statement about a whole page. The row has carried it since
+    # build_reality_check_row; only this whitelist withheld it.
     for key in ("rowKey", "verdictClass", "claimedClass", "overrideReason",
-                "regionInCapture", "itemCount", "armedBy",
+                "regionInCapture", "itemCount", "armedBy", "screenshotScope",
                 "turnsSinceArtifactProgress"):
         if key in row:
             summary[key] = row[key]
     return summary
+
+def _capture_scope_caveat(screenshot_scope: str) -> str:
+    """State what the capture did NOT cover, for either claim scope.
+
+    A viewport capture is bounded by the window; everything above or below the
+    fold is unobserved, not absent. The distinction matters more here than
+    elsewhere because this check is once per worker (`reality_check_count >= 1`
+    gates re-arming, and the counter is consumed on every verdict including an
+    uncertain one) — so a worker that reads a partial frame as a whole-page
+    fact has no second reading to correct it.
+    """
+    scope = str(screenshot_scope or "").strip()
+    if scope not in {"viewport", "viewport_fallback"}:
+        return ""
+    return (
+        "SCOPE: this verdict was reached from a VIEWPORT capture, so content"
+        " above or below the current fold was never photographed — it is"
+        " unobserved, not absent. Do not generalize it to the whole page or to"
+        " a region you have not scrolled into view. This worker's automatic"
+        " reality check is now spent; if you need a wider or different frame,"
+        " scroll or bind a locator and call visual_verify yourself. "
+    )
+
 
 def _page_reality_check_instruction(evidence_path: str) -> str:
     """Instruction for the page-scoped fallback (no assigned row matched this
@@ -938,6 +978,7 @@ def _reality_check_instruction(
     grading: Optional[JsonDict],
     capture: JsonDict,
     evidence_path: str,
+    screenshot_scope: str = "",
 ) -> str:
     """What the worker should do with this verdict, given its standing.
 
@@ -945,7 +986,27 @@ def _reality_check_instruction(
     is stated as an instruction. Everything else is reported as an observation
     that does not close anything, because an advisory model claim that ends a
     row is the failure this whole path exists to prevent.
+
+    The scope caveat wraps every branch rather than the page-scoped one alone:
+    a row-scoped verdict read off a viewport crop is exactly as partial, and
+    `CLASS_EXPLICIT_EMPTY` in particular is the branch where "I did not see it"
+    is most likely to be mistaken for "it is not there".
     """
+    return _capture_scope_caveat(screenshot_scope) + _reality_check_verdict_body(
+        reconciled=reconciled,
+        grading=grading,
+        capture=capture,
+        evidence_path=evidence_path,
+    )
+
+
+def _reality_check_verdict_body(
+    *,
+    reconciled: Optional[JsonDict],
+    grading: Optional[JsonDict],
+    capture: JsonDict,
+    evidence_path: str,
+) -> str:
     from harness.vl.capture_geometry import (
         CAPTURE_DISPROVEN,
         CLASS_AUTH_OVERLAY,
@@ -982,9 +1043,11 @@ def _reality_check_instruction(
         return (
             "The visual check reports a login/paywall overlay over this page."
             " That is a fact about THIS page epoch, not about the content"
-            " behind it and not about any other item: run the safe dismiss"
-            " ladder, re-navigate, and re-observe before recording a blocker,"
-            f" citing {citation}."
+            " behind it and not about any other item. If a current browser"
+            " action is occluded, the runtime overlay adjudicator determines"
+            " whether a safe dismissal or HITL is appropriate; do not infer"
+            " either one from this region verdict alone. Re-observe before"
+            f" recording a blocker, citing {citation}."
         )
     if resolved == CLASS_EXPLICIT_EMPTY:
         if not grading.get("directsWork"):
@@ -1160,7 +1223,18 @@ async def _maybe_reality_check(
         elif region.get("selector"):
             capture_request["selector"] = region["selector"]
         else:
-            capture_request["fullPage"] = True
+            # A capture whose height is the DOCUMENT's has no upper bound. In
+            # task fae5a7b6 this line produced 2448x77912 on a Taobao detail
+            # page: a structurally perfect PNG (every chunk CRC verified,
+            # 12.79 MB of IDAT) that the endpoint refused as an illegal image,
+            # four times across three workers. Two more captures on the same
+            # path were refused locally at 48.9 MB. Scaled to model input a
+            # strip that tall is unreadable even when accepted, so the widest
+            # capture was never the most honest one -- it was an unbounded bet.
+            # Viewport is bounded by the window; the caller is told the frame
+            # was partial via `screenshotScope`, and an explicit full-page
+            # capture is still available to anyone who asks for one.
+            capture_request["fullPage"] = False
         verdict = await _bt()._visual_verify(agent, capture_request, step)
         if not isinstance(verdict, dict) or verdict.get("status") in {
             "disabled",
@@ -1185,9 +1259,23 @@ async def _maybe_reality_check(
                     "triggerTool": name,
                     "armedBy": armed_by,
                     "pageId": page_id,
-                    "captureScope": (
+                    # Two facts, because they can disagree. `requestedScope`
+                    # is what this call asked for; `effectiveScope` is what the
+                    # capture actually produced, and the screenshot's own
+                    # report wins when it has one -- an element capture that
+                    # fell back to the viewport is not an element failure. The
+                    # single hardcoded field these replace said "fullPage" for
+                    # every locator-less check, so after the default moved to
+                    # viewport it would have counted viewport timeouts as
+                    # full-page failures and hidden whether the change worked.
+                    "requestedScope": (
                         "element" if (region.get("id") or region.get("selector"))
-                        else "fullPage"
+                        else ("fullPage" if capture_request.get("fullPage")
+                              else "viewport")
+                    ),
+                    "effectiveScope": (
+                        str((verdict or {}).get("screenshotScope") or "")
+                        if isinstance(verdict, dict) else ""
                     ),
                     "status": str(
                         (verdict or {}).get("status") or "no_verdict"
@@ -1280,6 +1368,7 @@ async def _maybe_reality_check(
                 grading=row_grading,
                 capture=capture,
                 evidence_path="",
+                screenshot_scope=str(row.get("screenshotScope") or ""),
             )
             return out
         reality: JsonDict = {
@@ -1296,6 +1385,7 @@ async def _maybe_reality_check(
             grading=row_grading,
             capture=capture,
             evidence_path=reality["evidenceSavedPath"],
+            screenshot_scope=str(row.get("screenshotScope") or ""),
         )
         return out
     except Exception as exc:  # reality check must never break the call path
@@ -1309,29 +1399,32 @@ async def _read_page_scroll(
 ) -> Optional[Dict[str, float]]:
     """The document scroll offset, or None when it cannot be read.
 
-    `Input.scroll` in viewport mode with `amount: 0` is the platform's own state
+    `Page.wheel` with a zero delta is the platform's own root-viewport state
     read: measured to answer `completedReason: "state-read"` with
-    `actualDistance: 0`, leaving the position untouched. Using a scroll action
-    to read the scroll is only defensible because of that receipt, so this
-    refuses any answer that does not carry it — a read that moved the page is
-    the one thing the surrounding bracket exists to detect, and it would be
-    detecting its own instrument.
+    `observedDelta: {x: 0, y: 0}` and the current `position`, leaving the page
+    untouched. Using a scroll action to read the scroll is only defensible
+    because of that receipt, so this refuses any answer that does not carry it —
+    a read that moved the page is the one thing the surrounding bracket exists
+    to detect, and it would be detecting its own instrument.
+
+    This used to send `Input.scroll` in viewport mode. That mode no longer
+    exists: the Action now requires `target` or `container` on every branch, so
+    the call failed `invalid-params` and this returned None for every capture,
+    silently disabling cssPoint promotion. `Page.wheel` is where root-viewport
+    scrolling went, and `x`/`y` must be inside the viewport, so the capture's
+    own origin is used rather than a fixed guess.
 
     The alternative, a Semantic Tree read, keeps the instrument independent but
     costs an entire document to obtain two numbers, twice per promotion. This
     matches `harness/vl/capture_geometry.py`, which already reasons from scroll
     receipts, so the two paths agree about what a scroll receipt means.
-
-    `direction` and `amount` are TOP-LEVEL. Nested under a `viewport` object
-    they are stripped by the schema and the action runs its 300px default —
-    `validation.py` rejects that shape for exactly this reason.
     """
     from harness.vl.locate import _scroll_position_from_state_read
 
     try:
         resp = await _bt()._invoke_browser_method(
-            agent, "Input.scroll",
-            {"pageId": page_id, "direction": "down", "amount": 0,
+            agent, "Page.wheel",
+            {"pageId": page_id, "x": 0, "y": 0, "scrollX": 0, "scrollY": 0,
              "purpose": "read the scroll offset for VL coordinate mapping"},
             step,
             internal=True,
@@ -1371,6 +1464,12 @@ async def _capture_bracketed(
     shot = await _bt()._invoke_browser_method(
         agent, "Page.screenshot", params, step
     )
+    if isinstance(shot, dict) and bracket:
+        shot["captureObservation"] = {
+            "step": step,
+            "axtreeEpoch": getattr(agent, "axtree_epoch", None),
+            "axtreePageId": getattr(agent, "axtree_page_id", None),
+        }
     at_capture = (
         await _read_page_scroll(agent, page_id, step) if bracket else None
     )
@@ -1379,7 +1478,7 @@ async def _capture_bracketed(
 
 # A VL grounding answer is a point in the 0-1000 normalized space the model
 # was never told about, and a promotion receipt additionally carries a
-# screenshot-device-pixel `pxPoint`. Neither is a coordinate `Input.click`
+# screenshot-device-pixel `pxPoint`. Neither is a coordinate `Page.click`
 # accepts — CSS viewport pixels are — and both have looked, to a model, exactly
 # like something to click. Every one of them stays in the log and none reaches
 # the model; the only coordinate ever offered is `cssPoint`, and only once the
@@ -1401,6 +1500,17 @@ def _promotion_model_view(promo: Any) -> Any:
     return {
         key: value for key, value in promo.items()
         if key not in _LOCATE_PRIVATE_PROMOTION_KEYS
+    }
+
+
+def _promotion_model_view_without_identity(promo: Any) -> Any:
+    """Project a visual promotion without re-advertising a disputed AX id."""
+    projected = _promotion_model_view(promo)
+    if not isinstance(projected, dict):
+        return projected
+    return {
+        key: value for key, value in projected.items()
+        if key not in {"id", "label", "bbox"}
     }
 
 
@@ -1489,20 +1599,17 @@ async def _promote_visual_locate(
             capture_scroll,
             await _read_page_scroll(agent, page_id, step),
         )
-        # No hidden Runtime.evaluate probe is needed: `Page.screenshot` reports
-        # its size in CSS pixels while saving a device-pixel file, so the
-        # receipt proves the scale by itself. This used to be hardcoded to 1.0
-        # on the belief that the AXTree and the screenshot were both CSS
-        # pixels. They are both DEVICE pixels — so containment below is right,
-        # but every cssPoint on a HiDPI display was off by the scale factor and
-        # still reported a successful click. An unproven scale now withholds
-        # the coordinate instead of guessing.
+        # No hidden Runtime.evaluate probe is needed: the encoded PNG dimensions
+        # divided by Page.screenshot's CSS dimensions measure the scale.
+        # scaleFactor corroborates that measurement; disagreement withholds the
+        # coordinate because the platform may silently default that field to 1.
         shot_data = _bt()._response_data(screenshot or {}) or {}
         dpr_receipt = screenshot_dpr(
             png_width=shot_w,
             png_height=shot_h,
             reported_width=shot_data.get("width"),
             reported_height=shot_data.get("height"),
+            scale_factor=shot_data.get("scaleFactor"),
         )
         # The same receipt also proves WHERE the crop started. An element
         # capture carries the target's Semantic Tree and a region capture echoes
@@ -1532,6 +1639,15 @@ async def _promote_visual_locate(
             logger=getattr(agent, "logger", None),
             page_id=page_id,
         )
+        identity_recovery: Optional[JsonDict] = None
+        if promo.get("resolved") and str(promo.get("id") or ""):
+            recovery_lookup = getattr(
+                _bt(), "_select_identity_recovery_for_locators", None,
+            )
+            if callable(recovery_lookup):
+                identity_recovery = recovery_lookup(
+                    agent, page_id, frozenset({str(promo["id"])}),
+                )
         logger = getattr(agent, "logger", None)
         if logger is not None and hasattr(logger, "write"):
             # The full record, private coordinates included, so a bad locate can
@@ -1544,13 +1660,71 @@ async def _promote_visual_locate(
                 "promotion": promo,
             })
         out = _locate_model_view(verdict)
-        out["promotion"] = _promotion_model_view(promo)
+        out["visualTargetEvidence"] = {
+            "captureObservation": (screenshot or {}).get("captureObservation"),
+            "promotionObservation": {
+                "axtreeEpoch": getattr(agent, "axtree_epoch", None),
+                "axtreePageId": getattr(agent, "axtree_page_id", None),
+            },
+            "axMatch": bool(promo.get("resolved")),
+            "interactabilityAtClick": "not_verified",
+            "stateContinuity": "not_verified",
+            "note": "AX epochs identify observations, not atomic screenshot/click state. "
+                    "Scroll agreement does not prove a popup remained open or an inner "
+                    "scroll ancestor stayed unchanged.",
+        }
+        out["promotion"] = (
+            _promotion_model_view_without_identity(promo)
+            if identity_recovery is not None
+            else _promotion_model_view(promo)
+        )
         consequential = _locate_consequential(
             verdict, verdict.get("control_label"), expected_text,
         )
         if consequential is not None:
             out["consequential"] = consequential
-        if promo.get("resolved"):
+        if promo.get("resolved") and identity_recovery is not None:
+            # A bbox proves where the pixels landed, but cannot prove that the
+            # native select path can resolve this identity now.  Do not route a
+            # visual escape straight back to an id whose same control has
+            # already exhausted the observed native recovery pass.
+            from harness.vl.locate import _coordinate_fallback
+
+            point = promo.get("pxPoint") if isinstance(promo.get("pxPoint"), dict) else {}
+            coordinate = _coordinate_fallback(
+                float(point.get("x") or 0.0),
+                float(point.get("y") or 0.0),
+                reason="select_identity_repeated",
+                dpr_receipt=promo.get("dpr") if isinstance(promo.get("dpr"), dict) else dpr_receipt,
+                scope=screenshot_scope,
+                origin_receipt=promo.get("origin") if isinstance(promo.get("origin"), dict) else origin_receipt,
+            )
+            out["selectIdentityConflict"] = identity_recovery
+            out["dpr"] = coordinate.get("dpr")
+            out["origin"] = coordinate.get("origin")
+            if isinstance(coordinate.get("cssPoint"), dict):
+                out["cssPoint"] = coordinate["cssPoint"]
+                out["next_instruction"] = (
+                    "Visual location matched a control whose native select"
+                    " identity repeatedly failed after re-observation. The"
+                    " match does not prove that id is usable, so it is not"
+                    " returned. Prefer a separately verified selector and the"
+                    " ordinary UI ladder. If no such target is available, use"
+                    " this cssPoint only as ONE Page.click after current evidence"
+                    " supports that the target is still usable, then re-observe"
+                    " and verify the resulting menu or value."
+                )
+            else:
+                out["coordinateRefused"] = coordinate.get("coordinateRefused")
+                out["next_instruction"] = (
+                    "Visual location matched a control whose native select"
+                    " identity repeatedly failed after re-observation. The"
+                    " match does not prove that id is usable, so it is not"
+                    " returned; and this capture cannot prove a coordinate."
+                    " Continue from fresh structured evidence with the"
+                    " ordinary UI ladder; do not invent a point."
+                )
+        elif promo.get("resolved"):
             out["resolvedId"] = promo.get("id")
             out["resolvedLabel"] = promo.get("label")
             out["next_instruction"] = (
@@ -1583,18 +1757,29 @@ async def _promote_visual_locate(
                     "The target was located, but the bbox promotion failed a"
                     f" sanity check ({demoted.get('reason')}) and was demoted."
                     if demoted else
-                    "The target was located and no node covers it — a genuine"
-                    " structured-surface blind spot."
+                    "The target was located in the screenshot but the later AX"
+                    " observation has no matching bbox. This can be a structured"
+                    " blind spot or a change of state between observations."
                 )
                 + " cssPoint is a VIEWPORT CSS point, which is the space"
-                " Input.click takes: issue ONE Input.click{pageId,x,y} with it,"
-                " then re-observe to verify the outcome. It is valid for this"
+                " Page.click takes. After checking current evidence for whether"
+                " the target is still usable, it may support at most ONE"
+                " Page.click{pageId,x,y}; then re-observe to verify the outcome."
+                " It is valid for this"
                 " page state only — never persist a coordinate into a skill and"
                 " never reuse it after the page changes."
                 + (
                     " This target reads as consequential; see `consequential`"
                     " before acting." if consequential is not None else ""
                 )
+            )
+        if isinstance(out.get("cssPoint"), dict):
+            out["next_instruction"] += (
+                " Coordinate mapping is proven, not target interactability or hit identity. "
+                "If current evidence shows the related menu closed, the target hidden, or "
+                "another element receiving the point, restore/re-observe the target before "
+                "deciding an action. Do not infer that mounted option nodes are an open menu. "
+                "Consider a verified keyboard target; read back the selected value afterwards."
             )
         return out
     except Exception as exc:

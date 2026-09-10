@@ -1308,7 +1308,7 @@ class ContentCompletenessTracker:
                 state.navigation_kind = "same_page_history"
                 state.navigation_outcome = "history_return"
 
-        if method == "Input.click" and not upstream_blocker:
+        if method in {"Input.click", "Page.click"} and not upstream_blocker:
             self._apply_click_gate_receipt(
                 state,
                 params,
@@ -1374,7 +1374,7 @@ class ContentCompletenessTracker:
                 returnMethod=state.navigation_kind,
             )
 
-        if method == "Input.scroll":
+        if method in {"Input.scroll", "Page.wheel"}:
             state.materialization_attempts.add("scroll")
         if method == "DOM.getAXTree":
             state.materialization_attempts.add("axtree")

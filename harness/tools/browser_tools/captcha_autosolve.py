@@ -509,22 +509,28 @@ def _promote_input_params(
     method: str,
     params: JsonDict,
     promoted_targets: Dict[Tuple[float, float], str],
-) -> JsonDict:
-    """Replace a VL source coordinate with its freshly resolved canonical id."""
+) -> Tuple[str, JsonDict]:
+    """Promote a VL coordinate call to its freshly resolved canonical id.
+
+    Page.click has no element-id shape, so a successful promotion changes both
+    the method and its params to Input.click. Input.drag and legacy coordinate
+    Input.click calls keep their method.
+    """
     out = dict(params)
-    if method not in {"Input.click", "Input.drag"}:
-        return out
+    if method not in {"Input.click", "Page.click", "Input.drag"}:
+        return method, out
     try:
         key = (float(out.get("x")), float(out.get("y")))
     except (TypeError, ValueError):
-        return out
+        return method, out
     target_id = promoted_targets.pop(key, "")
     if not target_id:
-        return out
+        return method, out
     out.pop("x", None)
     out.pop("y", None)
     out["id"] = target_id
-    return out
+    promoted_method = "Input.click" if method == "Page.click" else method
+    return promoted_method, out
 
 
 async def _drive_input(
@@ -793,9 +799,15 @@ async def maybe_autosolve_captcha(
         )
 
     async def exec_fn(method: str, params: JsonDict) -> None:
-        promoted = _promote_input_params(method, params, promoted_targets)
+        promoted_method, promoted_params = _promote_input_params(
+            method, params, promoted_targets
+        )
         await _drive_input(
-            agent, method, promoted, step, evidence=point_safety_evidence
+            agent,
+            promoted_method,
+            promoted_params,
+            step,
+            evidence=point_safety_evidence,
         )
 
     async def verify_fn() -> Optional[bool]:

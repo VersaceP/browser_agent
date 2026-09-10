@@ -1195,6 +1195,7 @@ async def _request_hitl_for_challenge(
     *,
     reason: str,
     trigger_result: Optional[JsonDict] = None,
+    gate_kind: str = "challenge",
 ) -> JsonDict:
     # Checked here as well as at the dispatch guard, because this path claims
     # the barrier BEFORE dispatching: a pause nobody will answer must not shut
@@ -1206,6 +1207,9 @@ async def _request_hitl_for_challenge(
     admission = _hitl_admission(agent, page_id)
     if admission is not None:
         return await _refuse_hitl(agent, admission, page_id, trigger_method)
+    gate_kind = str(gate_kind or "challenge").strip().lower()
+    if gate_kind not in {"challenge", "authentication", "verification"}:
+        gate_kind = "challenge"
     structural_evidence = (
         trigger_result.get("structuralChallenge")
         if isinstance(trigger_result, dict)
@@ -1253,6 +1257,7 @@ async def _request_hitl_for_challenge(
         {
             "pageId": page_id,
             "triggerMethod": trigger_method,
+            "gateKind": gate_kind,
             "reason": reason,
             "structuralEvidence": structural_evidence,
             "pauseSnapshot": snapshot,
@@ -1271,7 +1276,10 @@ async def _request_hitl_for_challenge(
             {
                 "pageId": page_id,
                 "purpose": (
-                    "Anti-bot verification or CAPTCHA-like challenge was"
+                    "Authentication or verification gate was detected; pause"
+                    " for user intervention."
+                    if gate_kind in {"authentication", "verification"}
+                    else "Anti-bot verification or CAPTCHA-like challenge was"
                     " detected; pause for user intervention."
                 ),
                 "reason": reason,
@@ -1285,6 +1293,7 @@ async def _request_hitl_for_challenge(
         pause_result["resumeCheckpoint"] = {
             "pageId": page_id,
             "triggerMethod": trigger_method,
+            "gateKind": gate_kind,
             "challengeReason": reason,
             "structuralEvidence": structural_evidence,
             "requiredSequence": [
@@ -1295,7 +1304,11 @@ async def _request_hitl_for_challenge(
                 "validate_requested_record_count",
             ],
             "successCondition": (
-                "The challenge frame is absent and the original task-required"
+                "The access gate no longer blocks the original target and the"
+                " original task-required content or requested record count is"
+                " materialized."
+                if gate_kind in {"authentication", "verification"}
+                else "The challenge frame is absent and the original task-required"
                 " content or requested record count is materialized."
             ),
             "doNotAccept": [

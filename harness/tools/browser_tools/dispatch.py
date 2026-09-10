@@ -1396,8 +1396,12 @@ async def _browser_final_answer(ctx: ToolContext) -> JsonDict:
         " completed within the requested extra steps. List the concrete"
         " remaining actions and the evidence supporting that estimate. The"
         " harness may deny the request because of timing, loop, failure, HITL,"
-        " routing, or hard-limit guards. Call this tool alone and read its"
-        " receipt before taking another action."
+        " routing, or hard-limit guards. An estimate above the configured"
+        " maximum is denied outright and locks this run against any further"
+        " request, so report the honest number: when the remaining work does"
+        " not fit, skip this tool and spend the remaining steps persisting"
+        " rows and stating the remaining range in final_answer. Call this tool"
+        " alone and read its receipt before taking another action."
     ),
     input_schema={
         "type": "object",
@@ -1407,8 +1411,11 @@ async def _browser_final_answer(ctx: ToolContext) -> JsonDict:
                 "minimum": 1,
                 "maximum": 50,
                 "description": (
-                    "Extra model turns needed to finish this phase; the"
-                    " configured harness maximum is authoritative."
+                    "Extra model turns needed to finish this phase — turns,"
+                    " not individual actions, since one turn may carry several"
+                    " tool calls. The configured harness maximum is"
+                    " authoritative and exceeding it is denied, never trimmed"
+                    " to fit."
                 ),
             },
             "remaining_actions": {
@@ -1461,12 +1468,15 @@ async def _browser_record_extraction(ctx: ToolContext) -> JsonDict:
         "Search the current DOM.getAXTree snapshot by role/name/text and return"
         " complete canonical AXTree ids with line context. Use this instead of"
         " grepping offloaded AXTree text when locating an element in a large"
-        " accessibility tree. Matches include layout `flags`"
-        " (hidden/off/blocked/scroll/sticky/clip/zN) and the `rect` viewport"
-        " box when the line carries them — avoid hidden/blocked targets; use"
-        " `rect` for spatial reasoning only, not for deriving click coordinates"
-        " (act on the id). It is read-only and requires a fresh current"
-        " DOM.getAXTree snapshot."
+        " accessibility tree. Matches include the line's `flags` and its `rect`"
+        " viewport box when present. `flags` carries both generic AX state"
+        " (checked/unchecked/mixed, enabled/disabled, inert,"
+        " selected/unselected, expanded/collapsed, multi/single, popup) and"
+        " layout state (hidden/off/blocked/scroll/sticky/clip/zN) — avoid"
+        " hidden/blocked targets, but note layout flags are sparse, so their"
+        " ABSENCE does not prove a target is clear. Use `rect` for spatial"
+        " reasoning only, not for deriving click coordinates (act on the id)."
+        " It is read-only and requires a fresh current DOM.getAXTree snapshot."
     ),
     input_schema=_browser_schema_for("find_in_axtree"),
     contract_check=True,

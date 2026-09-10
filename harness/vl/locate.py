@@ -44,46 +44,49 @@ caller fall back to a one-shot coordinate action.
 """
 from __future__ import annotations
 
-import math
 import re
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-# `[<canonical id>] <role> "<name>" ... # @x,y,w,h`  (id like 3:13:13 or uuid:.:.)
-_AX_LINE = re.compile(
-    r"\[([0-9a-fA-F:\-]+)\]\s+(\S+)(?:\s+\"([^\"]*)\")?.*?@(-?\d+),(-?\d+),(\d+),(\d+)"
-)
+from harness.axtree_format import parse_axtree_line
+from harness.scroll_receipt import STATE_READ_REASONS, scroll_state_read_position
+
 # Page-level containers are never a useful click target — resolving a pixel to one
 # of them means "no specific element here" → coords fallback (AXTree blind spot).
 _NON_PROMOTABLE_ROLES = frozenset({"rootwebarea", "webarea", "document"})
-
-
-# Leading depth prefix of the current line format (`3 [3:426:426] link ...`);
-# legacy indent-based lines have no prefix → depth stays None.
-_AX_DEPTH = re.compile(r"^\s*(\d+)\s+\[")
 
 # Sentinel: "resolve the main frame from the bboxes themselves".
 MAIN_FRAME = "auto"
 
 
 def parse_axtree_bboxes(lines: List[Any]) -> List[Dict[str, Any]]:
-    """Parse `# @x,y,w,h`-bearing AXTree lines into
+    """Parse rect-bearing AXTree lines into
     {id, frame, depth, role, name, x, y, w, h, area}. `frame` is the first
     canonical-id segment: nodes from embedded iframes carry a DIFFERENT frame seq
     and their bbox is FRAME-LOCAL (starts at 0,0 inside the iframe), not
-    screen-space. `depth` is the leading original-tree depth when present."""
+    screen-space. `depth` is the leading original-tree depth when present.
+
+    Reads the line through the shared parser rather than a local regex. The
+    local one searched for the first `@x,y,w,h` ANYWHERE after the name, and an
+    accessible name is free text the formatter does not escape - so a label
+    reading `Read "@0,0,100,100" manual` handed this function a rectangle from
+    the label instead of the element's own. That is not a cosmetic error here:
+    these boxes are what a located pixel is tested against, so a phantom box
+    promotes a VL point to an element it never touched.
+    """
     out: List[Dict[str, Any]] = []
     for ln in lines or []:
-        if not isinstance(ln, str):
+        parsed = parse_axtree_line(ln) if isinstance(ln, str) else None
+        if parsed is None:
             continue
-        m = _AX_LINE.search(ln)
-        if not m:
+        rect = parsed["rect"]
+        if not isinstance(rect, dict):
             continue
-        gid, role, name, x, y, w, h = m.groups()
-        x, y, w, h = int(x), int(y), int(w), int(h)
-        depth_m = _AX_DEPTH.match(ln)
+        gid = str(parsed["id"])
+        x, y = int(rect["x"]), int(rect["y"])
+        w, h = int(rect["w"]), int(rect["h"])
         out.append({"id": gid, "frame": gid.split(":", 1)[0],
-                    "depth": int(depth_m.group(1)) if depth_m else None,
-                    "role": role, "name": name or "",
+                    "depth": parsed["depth"],
+                    "role": parsed["role"], "name": parsed["name"],
                     "x": x, "y": y, "w": w, "h": h, "area": max(0, w) * max(0, h)})
     return out
 
@@ -732,6 +735,7 @@ async def locate_target(
             png_width=dims[0], png_height=dims[1],
             reported_width=shot_receipt.get("width"),
             reported_height=shot_receipt.get("height"),
+            scale_factor=shot_receipt.get("scaleFactor"),
         )
     if receipt is None:
         receipt = await _viewport_dpr(browser, page_id)
@@ -933,44 +937,13 @@ async def _default_visual_locate(vl_config: Any, image_path: str, target: str) -
     )
 
 
-# 1.1.9 answers `state-read`; older builds and fixtures used `amount-zero`.
-# Anything else means the call moved the page and is not a reading of it.
-_STATE_READ_REASONS = frozenset({"state-read", "amount-zero"})
-
-
-def _scroll_position_from_state_read(
-    data: Any,
-) -> Optional[Dict[str, float]]:
-    """Return a certified scroll position, or ``None``.
-
-    Every field is required and must have the JSON type the contract promises.
-    In particular, a missing distance or axis is not zero, and booleans are not
-    numbers even though Python's ``bool`` subclasses ``int``.  This parser is
-    shared by both VL call paths so neither can silently manufacture geometry.
-    """
-    if not isinstance(data, dict):
-        return None
-    if str(data.get("completedReason") or "") not in _STATE_READ_REASONS:
-        return None
-    distance = data.get("actualDistance")
-    position = data.get("position")
-    if (
-        isinstance(distance, bool)
-        or not isinstance(distance, (int, float))
-        or not math.isfinite(float(distance))
-        or float(distance) != 0.0
-        or not isinstance(position, dict)
-    ):
-        return None
-    axes = (position.get("x"), position.get("y"))
-    if any(
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(float(value))
-        for value in axes
-    ):
-        return None
-    return {"x": float(axes[0]), "y": float(axes[1])}
+# Kept as this module's exported names. The certification itself lives in
+# harness.scroll_receipt, which knows both zero-movement shapes: `Input.scroll`
+# proves it with a scalar `actualDistance`, `Page.wheel` with a two-axis
+# `observedDelta`. Reading only the scalar made every wheel state read fail
+# certification and return None, which silently disabled cssPoint promotion.
+_STATE_READ_REASONS = STATE_READ_REASONS
+_scroll_position_from_state_read = scroll_state_read_position
 
 
 def _is_state_read(data: Any) -> bool:
@@ -1010,28 +983,30 @@ async def read_scroll(browser: Any, page_id: str) -> Optional[Dict[str, float]]:
     """Read the document scroll offset, the one piece of geometry no capture
     receipt reliably carries.
 
-    Uses `Input.scroll` in viewport mode with `amount: 0`, which the platform
-    documents and was measured to treat as a state read: it answers
-    `completedReason: "state-read"`, `actualDistance: 0`, and leaves the
-    position untouched. That receipt is why a scroll ACTION is acceptable as a
-    read here — it states that it did not scroll, so a read that silently moved
-    the page cannot be mistaken for one that did not, and this refuses anything
-    that does not say so.
+    Uses `Page.wheel` with a zero delta, which the platform documents and was
+    measured to treat as a state read: it answers `completedReason:
+    "state-read"` with `observedDelta: {x: 0, y: 0}` and the current
+    `position`, leaving the page untouched. That receipt is why a scroll ACTION
+    is acceptable as a read here — it states that it did not scroll, so a read
+    that silently moved the page cannot be mistaken for one that did not, and
+    this refuses anything that does not say so.
 
-    `direction` and `amount` are TOP-LEVEL fields. Nesting them under a
-    `viewport` object — the shape this code used to send — matches the union's
-    viewport variant with no fields at all, because the schema strips unknown
-    keys, and the action then runs its 300px default. That is how "amount has
-    no effect" came to be believed; `validation.py` now rejects the shape.
+    This used to send `Input.scroll` in viewport mode. That mode was removed:
+    every branch of the Action now requires `target` or `container`, so the
+    call came back `invalid-params` and this returned None for every capture.
+    Root-viewport scrolling moved to `Page.wheel`, whose `x`/`y` must be inside
+    the viewport.
 
     `Page.getState` carries no scroll field on this build, and a Semantic Tree
     read costs a whole document.
     """
     try:
-        resp = await browser.call("Input.scroll", {
+        resp = await browser.call("Page.wheel", {
             "pageId": page_id,
-            "direction": "down",
-            "amount": 0,
+            "x": 0,
+            "y": 0,
+            "scrollX": 0,
+            "scrollY": 0,
             "purpose": "read the scroll offset for VL coordinate mapping",
         })
     except Exception:
@@ -1060,6 +1035,9 @@ _MAX_PROVABLE_DPR = 8.0
 # The two axes must agree; a capture whose axes scale differently is not a
 # uniform rescale and no single ratio can map it back to CSS pixels.
 _DPR_AXIS_TOLERANCE = 0.02
+# The two independent signals should normally be identical. Leave a small
+# margin for integer image dimensions and capture metadata rounding.
+_DPR_SIGNAL_TOLERANCE = 0.01
 
 
 def screenshot_dpr(
@@ -1068,27 +1046,47 @@ def screenshot_dpr(
     png_height: float,
     reported_width: Any,
     reported_height: Any,
+    scale_factor: Any = None,
 ) -> Dict[str, Any]:
     """Prove the capture's device-pixel ratio from the screenshot receipt.
 
-    `Page.screenshot` reports `data.width`/`data.height` in CSS pixels while
-    the file it saves is in device pixels, so their ratio IS the scale factor —
-    no JS probe, no page-state field. This matters because `Page.getState` on
-    ABCP 1.1.9 carries no `deviceScaleFactor` at all (verified live against
-    catalogRevision sha256:cfd8fb90…), so the old reader always fell back to
-    1.0 and every coordinate fallback on a HiDPI display landed at twice the
-    intended point while still reporting success.
+    `Page.screenshot` reports CSS dimensions while the encoded file contains
+    device pixels, so their ratio is the measured scale. Current ABCP also
+    returns `scaleFactor`, but that field can silently fall back to 1 when
+    display metrics are unavailable. Treat it as corroboration, never as a
+    substitute for the image-to-receipt measurement.
 
     Returns ``{"dpr", "source", "proven"}``. When the ratio cannot be proven
     the caller must refuse a coordinate action rather than assume 1.0.
     """
     receipt: Dict[str, Any] = {"dpr": 1.0, "source": "unproven", "proven": False}
+    explicit: Optional[float] = None
+    if scale_factor is not None:
+        try:
+            explicit = (
+                None if isinstance(scale_factor, bool) else float(scale_factor)
+            )
+        except (TypeError, ValueError):
+            explicit = None
+        if (
+            explicit is None
+            or not (_MIN_PROVABLE_DPR <= explicit <= _MAX_PROVABLE_DPR)
+        ):
+            receipt["source"] = "invalid_screenshot_scale_factor"
+            receipt["scaleFactor"] = scale_factor
+            return receipt
     try:
         css_w = float(reported_width or 0.0)
         css_h = float(reported_height or 0.0)
     except (TypeError, ValueError):
+        if explicit is not None:
+            receipt["source"] = "scale_factor_without_pixel_ratio"
+            receipt["scaleFactor"] = explicit
         return receipt
     if css_w <= 0 or css_h <= 0 or png_width <= 0 or png_height <= 0:
+        if explicit is not None:
+            receipt["source"] = "scale_factor_without_pixel_ratio"
+            receipt["scaleFactor"] = explicit
         return receipt
     ratio_x = float(png_width) / css_w
     ratio_y = float(png_height) / css_h
@@ -1100,7 +1098,27 @@ def screenshot_dpr(
     if not (_MIN_PROVABLE_DPR <= ratio_x <= _MAX_PROVABLE_DPR):
         receipt["source"] = "out_of_range"
         receipt["ratioX"] = round(ratio_x, 4)
+        if explicit is not None:
+            receipt["scaleFactor"] = explicit
         return receipt
+    if explicit is not None:
+        if abs(ratio_x - explicit) > _DPR_SIGNAL_TOLERANCE * max(
+            ratio_x, explicit
+        ):
+            return {
+                "dpr": 1.0,
+                "source": "scale_factor_disagrees_with_pixel_ratio",
+                "proven": False,
+                "ratio": round(ratio_x, 4),
+                "scaleFactor": explicit,
+            }
+        return {
+            "dpr": ratio_x,
+            "source": "screenshot_receipt+scale_factor",
+            "proven": True,
+            "ratio": round(ratio_x, 4),
+            "scaleFactor": explicit,
+        }
     return {
         "dpr": ratio_x,
         "source": "screenshot_receipt",
@@ -1111,9 +1129,8 @@ def screenshot_dpr(
 async def _viewport_dpr(browser: Any, page_id: str) -> Dict[str, Any]:
     """Read an optional native page-state scale factor without executing JS.
 
-    Kept as a last-resort compatibility path for builds that do expose a scale
-    factor. ABCP 1.1.9 does not, so `screenshot_dpr` is the real source and
-    this returns an explicitly unproven receipt rather than a bare 1.0.
+    Kept as a last-resort compatibility path for builds that expose a scale
+    factor through page state but not the screenshot receipt.
     """
     try:
         resp = await browser.call("Page.getState", {

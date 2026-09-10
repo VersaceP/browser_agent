@@ -144,11 +144,11 @@ def solve_plan_to_input_calls(
                                          "toX": tx, "toY": ty, "purpose": purpose}))
         elif action == "click":  # grid / click_target
             x, y = _norm_to_css(step.get("at"), w, h)
-            calls.append(("Input.click", {"pageId": page_id, "x": x, "y": y,
+            calls.append(("Page.click", {"pageId": page_id, "x": x, "y": y,
                                           "clickCount": 1, "purpose": purpose}))
         elif action == "type":  # text_ocr: focus then type
             x, y = _norm_to_css(step.get("into"), w, h)
-            calls.append(("Input.click", {"pageId": page_id, "x": x, "y": y,
+            calls.append(("Page.click", {"pageId": page_id, "x": x, "y": y,
                                           "clickCount": 1, "purpose": purpose}))
             calls.append(("Input.type", {"pageId": page_id, "text": step.get("text", ""),
                                          "clear": True, "delay": 40, "purpose": purpose}))
@@ -476,7 +476,7 @@ async def run_captcha_solve_loop(
             for method, params in calls:
                 # Only coordinate-bearing calls go through the live safety gate.
                 # A coordinate-less Input.type (text_ocr: focus-then-type) follows
-                # an already-checked Input.click; gating it on absent x/y would
+                # an already-checked Page.click; gating it on absent x/y would
                 # abort every OCR solve.
                 x, y = params.get("x"), params.get("y")
                 if x is not None and y is not None and not await safety_fn(x, y):

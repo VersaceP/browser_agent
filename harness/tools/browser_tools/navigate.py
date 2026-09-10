@@ -1971,6 +1971,33 @@ _SELECT_FAILURE_NEXT_INSTRUCTION: Dict[str, str] = {
     ),
 }
 
+# These codes describe failure to bind the requested control to a current page
+# identity.  They are deliberately separate from SELECT_FAILURE_POLICY: the
+# latter owns select-operation failures and the replay block, while these
+# records only say that native select resolution could not get started or stay
+# bound.  A public failure does not state how far a custom control operation
+# got, so an identity code is never proof that the page was untouched.
+_SELECT_IDENTITY_FAILURE_CODES = frozenset({
+    "stale-target",
+    "target-not-found",
+    "pointer-target-stale",
+    "target-preparation-failed",
+})
+_SELECT_IDENTITY_STALE_AXTREE_CODE = "axtree-stale-reference"
+_SELECT_IDENTITY_NATIVE_RECOVERY_BUDGET = 1
+_SELECT_IDENTITY_FAILURE_FAMILY = "control-identity"
+
+_SELECT_IDENTITY_GENERIC_UI_LADDER = (
+    "This control had two identity-resolution failures with a successful fresh"
+    " DOM.getAXTree between them. The current structured evidence makes ordinary"
+    " UI a candidate recovery: read the current value and expanded state; only"
+    " when needed, use an observed control, search field, option, paging control"
+    " or scroll surface; then re-observe and verify the value. This is advice,"
+    " not authorization or a ban on Select Actions. If structured evidence"
+    " cannot name a visible target, visual_verify mode=visual_locate may locate"
+    " it but does not make a stale id current."
+)
+
 
 def _select_call_locators(params: JsonDict, result: JsonDict = None) -> frozenset:
     """Every name this call used for the control, plus the one ABCP returned.
@@ -2026,7 +2053,11 @@ def _select_drop_superseded_epochs(agent: Any, page_id: str, epoch: int) -> None
     meant a page that navigated and was then inspected by id alone kept its old
     rows forever.
     """
-    for attribute in ("_select_control_aliases", "_select_failure_ledger"):
+    for attribute in (
+        "_select_control_aliases",
+        "_select_failure_ledger",
+        "_select_identity_failure_ledger",
+    ):
         store = getattr(agent, attribute, None)
         if not isinstance(store, dict):
             continue
@@ -2096,6 +2127,206 @@ def _select_failure_count(entry: Any) -> int:
     if isinstance(entry, tuple) and entry:
         return int(entry[0] or 0)
     return int(entry or 0)
+
+
+def _select_identity_error_code(result: JsonDict) -> str:
+    """Return a stable control-identity failure code, or an empty string.
+
+    The harness's AX snapshot guard is a first-hand pre-dispatch refusal and
+    does not carry a public ABCP error.  It belongs to the same recovery family
+    as the platform's identity codes, but remains distinguishable in the
+    ledger.  Other entries come from the public error classification rather
+    than prose matching.
+    """
+    if str(result.get("status") or "") == "stale_element_reference":
+        return _SELECT_IDENTITY_STALE_AXTREE_CODE
+    classification = result.get("errorClassification")
+    code = (
+        str(classification.get("errorCode") or "")
+        if isinstance(classification, dict)
+        else ""
+    )
+    return code if code in _SELECT_IDENTITY_FAILURE_CODES else ""
+
+
+def _select_current_axtree_epoch(agent: Any, page_id: str) -> Optional[int]:
+    """The latest successful AX observation for exactly this page, if any."""
+    if str(getattr(agent, "axtree_page_id", "") or "") != page_id:
+        return None
+    try:
+        return int(getattr(agent, "axtree_epoch", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _select_identity_entry_parts(
+    entry: Any,
+) -> Tuple[int, Optional[int], frozenset, frozenset, bool, frozenset]:
+    """Read an identity-ledger entry without making its tuple layout public."""
+    if not isinstance(entry, tuple) or len(entry) < 5:
+        return 0, None, frozenset(), frozenset(), False, frozenset()
+    failures = _select_failure_count(entry)
+    observed_epoch = entry[1] if isinstance(entry[1], int) else None
+    locators = entry[2] if isinstance(entry[2], frozenset) else frozenset()
+    methods = entry[3] if isinstance(entry[3], frozenset) else frozenset()
+    error_codes = entry[5] if len(entry) >= 6 and isinstance(entry[5], frozenset) else frozenset()
+    return failures, observed_epoch, locators, methods, bool(entry[4]), error_codes
+
+
+def _select_identity_recovery_for_locators(
+    agent: Any, page_id: str, locators: frozenset,
+) -> Optional[JsonDict]:
+    """Return the unresolved repeated-identity fact for a proven locator match.
+
+    This is intentionally a fact query rather than a gate.  Visual recovery
+    uses it to avoid promoting pixels back to a control identity that the
+    select path repeatedly could not use; no caller is refused by this helper.
+    """
+    ledger = getattr(agent, "_select_identity_failure_ledger", None)
+    if not isinstance(ledger, dict) or not locators:
+        return None
+    epoch = _select_page_epoch(agent, page_id)
+    candidates: List[JsonDict] = []
+    for key, entry in ledger.items():
+        if not isinstance(key, tuple) or len(key) < 4 or key[:2] != (page_id, epoch):
+            continue
+        failures, _, known, methods, generic_ui, error_codes = _select_identity_entry_parts(entry)
+        if not generic_ui or not (known & locators):
+            continue
+        candidates.append({
+            "errorCodes": sorted(str(code) for code in error_codes),
+            "failureCount": failures,
+            "methods": sorted(str(method) for method in methods),
+            "genericUiRecommended": True,
+        })
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: int(item["failureCount"]))
+
+
+def _select_clear_identity_failures(
+    agent: Any, page_id: str, epoch: int, locators: frozenset,
+) -> List[JsonDict]:
+    """Retire identity failures that a successful native select read resolved."""
+    ledger = getattr(agent, "_select_identity_failure_ledger", None)
+    if not isinstance(ledger, dict) or not locators:
+        return []
+    cleared: List[JsonDict] = []
+    for key, entry in list(ledger.items()):
+        if not isinstance(key, tuple) or len(key) < 4 or key[:2] != (page_id, epoch):
+            continue
+        failures, _, known, _, _, error_codes = _select_identity_entry_parts(entry)
+        if not (known & locators):
+            continue
+        ledger.pop(key, None)
+        cleared.append({
+            "errorCodes": sorted(str(code) for code in error_codes),
+            "failureCount": failures,
+        })
+    return cleared
+
+
+def _apply_select_identity_failure_guidance(
+    agent: Any,
+    method: str,
+    params: JsonDict,
+    result: JsonDict,
+) -> bool:
+    """Record a select control-identity failure and attach recovery facts.
+
+    Returns whether it handled the receipt.  It does not interact with the
+    Input.select replay guard: a public identity failure has no public
+    dispatch-position fact, so it cannot truthfully arm or clear that guard.
+    """
+    code = _select_identity_error_code(result)
+    if not code:
+        return False
+    page_id = str(params.get("pageId") or "")
+    epoch = _select_page_epoch(agent, page_id)
+    _select_drop_superseded_epochs(agent, page_id, epoch)
+    target = str(params.get("selector") or params.get("id") or "<unknown>")
+    locators = _select_expand_locators(
+        agent, page_id, epoch, _select_call_locators(params),
+    )
+    ledger = getattr(agent, "_select_identity_failure_ledger", None)
+    if not isinstance(ledger, dict):
+        ledger = {}
+        setattr(agent, "_select_identity_failure_ledger", ledger)
+    key = (page_id, epoch, target, _SELECT_IDENTITY_FAILURE_FAMILY)
+    prior = ledger.get(key)
+    (
+        prior_failures,
+        prior_observation_epoch,
+        prior_locators,
+        prior_methods,
+        prior_generic_ui,
+        prior_codes,
+    ) = (
+        _select_identity_entry_parts(prior)
+    )
+    current_observation_epoch = _select_current_axtree_epoch(agent, page_id)
+    observed_since_prior = bool(
+        prior_failures
+        and current_observation_epoch is not None
+        and prior_observation_epoch is not None
+        and current_observation_epoch > prior_observation_epoch
+    )
+    failures = prior_failures + 1
+    # Re-observation has already proved that this control's native identity
+    # did not recover.  Later failures without another AX read cannot undo
+    # that fact; only a successful native inspection/selection clears this
+    # ledger row.  Otherwise a third retry would re-advertise the exact id the
+    # recovery path had just told the model to leave behind.
+    generic_ui = prior_generic_ui or (
+        failures > _SELECT_IDENTITY_NATIVE_RECOVERY_BUDGET
+        and observed_since_prior
+    )
+    ledger[key] = (
+        failures,
+        current_observation_epoch,
+        frozenset(set(prior_locators) | set(locators)),
+        frozenset(set(prior_methods) | {method}),
+        generic_ui,
+        frozenset(set(prior_codes) | {code}),
+    )
+    recovery: JsonDict = {
+        "errorCode": code,
+        "errorCodes": sorted(str(item) for item in (set(prior_codes) | {code})),
+        "failureCount": failures,
+        "nativeRecoveryBudget": _SELECT_IDENTITY_NATIVE_RECOVERY_BUDGET,
+        "observedSincePreviousFailure": observed_since_prior,
+        "genericUiRecommended": generic_ui,
+        "controlTarget": target,
+        "methodsSeen": sorted(str(item) for item in (set(prior_methods) | {method})),
+        "dispatchPosition": "not_publicly_known",
+    }
+    result["selectIdentityRecovery"] = recovery
+    if generic_ui:
+        instruction = _SELECT_IDENTITY_GENERIC_UI_LADDER
+    elif failures > _SELECT_IDENTITY_NATIVE_RECOVERY_BUDGET:
+        instruction = (
+            "The same control identity failed again, but there is no successful"
+            " fresh DOM.getAXTree after the immediately preceding failure. Read"
+            " a current AX tree for this page before deciding whether to use the"
+            " one native recovery pass or the ordinary UI ladder; do not treat"
+            " an unchanged cached tree as new evidence."
+        )
+    else:
+        instruction = (
+            "The select control identity could not be resolved. Refresh"
+            " DOM.getAXTree for this page and inspect the current control and"
+            " value before deciding whether one corrected native select attempt"
+            " still fits. Do not automatically replay the failed operation; the"
+            " public receipt does not state how far a custom select operation"
+            " progressed."
+        )
+    # An upstream instruction may have evidence this bookkeeping layer did not
+    # see, such as a stronger recovery fact from the dispatch path.  Attach the
+    # structured identity record in every case, but do not contradict that
+    # instruction with a lower-layer summary.
+    if not str(result.get("next_instruction") or "").strip():
+        result["next_instruction"] = instruction
+    return True
 
 
 def _select_replay_blocked(agent: Any, params: JsonDict) -> Optional[JsonDict]:
@@ -2303,7 +2534,10 @@ def _apply_select_failure_guidance(
     that it was blocked, advertising a policy as if it were a fact about this
     control right now.
     """
+    from .target_recovery import attach_target_recovery
+
     outcome = _apply_select_failure_guidance_inner(agent, method, params, result)
+    attach_target_recovery(agent, method, params, outcome)
     if isinstance(outcome, dict):
         guard = outcome.get("selectGuard")
         if isinstance(guard, dict) and method == "Input.select":
@@ -2354,6 +2588,10 @@ def _apply_select_failure_guidance_inner(
             "popupVisibilityEnforced": False,
             "genericInputFallbackAvailable": True,
         }
+    if method in {"DOM.inspectSelect", "Input.select"} and _apply_select_identity_failure_guidance(
+        agent, method, params, result,
+    ):
+        return result
     if method == "DOM.inspectSelect":
         classification = result.get("errorClassification")
         error_code = (
@@ -2410,6 +2648,11 @@ def _apply_select_failure_guidance_inner(
         # the alias learner would return early before pruning.
         _select_drop_superseded_epochs(agent, page_id, epoch)
         _select_learn_control_aliases(agent, page_id, epoch, locators)
+        identity_cleared = _select_clear_identity_failures(
+            agent, page_id, epoch, locators,
+        )
+        if identity_cleared:
+            result["selectIdentityRecoveryCleared"] = identity_cleared
         cleared = _select_clear_replay_block(agent, page_id, epoch, locators)
         if cleared:
             result["selectReplayBlockCleared"] = cleared
@@ -2436,6 +2679,14 @@ def _apply_select_failure_guidance_inner(
     page_id = str(params.get("pageId") or "")
     ledger = getattr(agent, "_select_failure_ledger", None)
     if not _bt()._invoke_result_failed(result):
+        locators = _select_call_locators(params)
+        epoch = _select_page_epoch(agent, page_id)
+        _select_drop_superseded_epochs(agent, page_id, epoch)
+        identity_cleared = _select_clear_identity_failures(
+            agent, page_id, epoch, locators,
+        )
+        if identity_cleared:
+            result["selectIdentityRecoveryCleared"] = identity_cleared
         # Clear by CONTROL, matching the locator set the row carries - the same
         # comparison the guard and the clear path already use. This was the one
         # place still keying on the raw `target` string, so a selection that
@@ -2443,7 +2694,6 @@ def _apply_select_failure_guidance_inner(
         # selector standing: the next failure counted as the second, and a
         # budget of one was spent by a control that had meanwhile worked.
         if isinstance(ledger, dict):
-            locators = _select_call_locators(params)
             # Prune first, then match on the control. An epoch comparison in
             # the loop below would change no outcome once the prune has run -
             # a stale row can neither block nor count anywhere else - so it
@@ -2451,9 +2701,6 @@ def _apply_select_failure_guidance_inner(
             # fail. The prune, by contrast, is the only thing that clears a
             # page's rows when the worker navigates and then simply selects
             # again without inspecting.
-            _select_drop_superseded_epochs(
-                agent, page_id, _select_page_epoch(agent, page_id)
-            )
             for key, entry in list(ledger.items()):
                 if key[0] != page_id:
                     continue

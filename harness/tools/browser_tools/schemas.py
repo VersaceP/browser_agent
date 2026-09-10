@@ -3,7 +3,6 @@
 from typing import Dict, Tuple
 
 from harness.utils import JsonDict
-from harness.runtime_evaluation import EVAL_JS_REASON_KINDS
 from harness.workflow_policy import LISTENABLE_EVENTS
 
 
@@ -196,44 +195,20 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                 "runtime_policy": {
                     "type": "object",
                     "description": (
-                        "Harness-only authorization metadata required when method"
-                        " is Runtime.evaluate; it must be a SIBLING of params,"
-                        " never nested inside params, and is never forwarded to ABCP."
-                        " Runtime params must explicitly set world=isolated."
-                        " Only reason_kind=non_dom_state may authorize a harness-"
-                        "controlled second strict main-world attempt, and only"
-                        " after the dedicated ABCP_MAIN_WORLD_REQUIRED: signal."
+                        "Optional legacy Runtime.evaluate metadata. It is never"
+                        " forwarded to ABCP and does not authorize, restrict, or"
+                        " classify the expression. result_mode=json and record_name"
+                        " retain the legacy JSON extraction envelope."
                     ),
                     "properties": {
-                        "intent": {"type": "string", "enum": ["diagnostic", "extract"]},
-                        "effect": {"type": "string", "enum": ["read_only"]},
-                        "reason_kind": {
-                            "type": "string",
-                            "enum": sorted(EVAL_JS_REASON_KINDS),
-                            "description": (
-                                "Why native reads are insufficient. For non_dom_state,"
-                                " the expression must throw exactly"
-                                " ReferenceError('ABCP_MAIN_WORLD_REQUIRED:<global>')"
-                                " when its required page global is absent in isolated"
-                                " world. Ordinary errors, timeouts, and empty values"
-                                " never authorize main execution."
-                            ),
-                        },
-                        "why_structured_tools_insufficient": {"type": "string"},
-                        "cross_check_plan": {"type": "string"},
                         "result_mode": {
                             "type": "string",
                             "enum": ["raw", "json"],
-                            "description": (
-                                "json requires a JSON-serializable value expression or"
-                                " an invoked IIFE such as (() => ({rows: []}))(); do not"
-                                " pass a function body with top-level return or an"
-                                " uninvoked arrow/function value."
-                            ),
+                            "description": "Optional legacy JSON extraction envelope.",
                         },
                         "record_name": {"type": "string"},
                     },
-                    "additionalProperties": False,
+                    "additionalProperties": True,
                 },
                 "content_binding": {
                     "type": "object",
@@ -573,7 +548,7 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                 },
                 "mode": {
                     "type": "string",
-                    "description": "action_outcome | validator_failure | overlay_check | captcha_check | layout_check | visual_locate (locate a target the structured surfaces cannot name, described in `expected.target`. Returns ONE of: `resolvedId` — the pixel was promoted to a durable canonical id for the AX node that covered it; that says where the node is, not what it is, so act on it with a method the node's own role supports and the live schema accepts (Input.select needs the CONTROL, not an option id); `cssPoint` — no node covers it, so a proven viewport CSS point for a SINGLE Input.click{pageId,x,y} followed by re-observation, valid for this page state only and never persisted into a skill; or `coordinateRefused` — the capture geometry could not be proven, so re-observe and act on an id. A `consequential` field means the target reads as submit/pay/delete/sign-in: locating it does not authorize performing it) | contract_verify (judge structured visual_checks in `expected.visual_checks`; returns satisfied/violated/uncertain + failed_checks). Calls with repair_targets automatically use the internal repair_absence mode and return absent/present/uncertain.",
+                    "description": "action_outcome | validator_failure | overlay_check | captcha_check | layout_check | overlay_adjudicate (runtime-owned classification of an occluded target; returns presentation, purpose, target accessibility and a safe recovery recommendation; it does not authorize a login or payment action) | visual_locate (locate a target the structured surfaces cannot name, described in `expected.target`. Returns ONE of: `resolvedId` — the pixel was promoted to a durable canonical id for the AX node that covered it; that says where the node is, not what it is, so act on it with a method the node's own role supports and the live schema accepts (Input.select needs the CONTROL, not an option id); `cssPoint` — the later AX observation has no matching bbox, so capture scale/origin produced a viewport CSS point. This proves coordinate mapping, not current interactability or hit identity; the unmatched bbox can be a structured blind spot or a state change. Check current evidence for whether the target remains usable before deciding at most ONE Page.click{pageId,x,y}, then re-observe. Never persist the point or reuse it after the page changes; or `coordinateRefused` — the capture geometry could not be proven, so re-observe and act on an id. `visualTargetEvidence` reports observation provenance and leaves screenshot-to-click state continuity unverified. A `consequential` field means the target reads as submit/pay/delete/sign-in: locating it does not authorize performing it) | contract_verify (judge structured visual_checks in `expected.visual_checks`; returns satisfied/violated/uncertain + failed_checks). Calls with repair_targets automatically use the internal repair_absence mode and return absent/present/uncertain.",
                 },
                 "question": {
                     "type": "string",

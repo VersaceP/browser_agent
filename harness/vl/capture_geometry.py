@@ -25,6 +25,11 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+from harness.scroll_receipt import (
+    axis_magnitude as _magnitude,
+    looks_like_scroll_receipt,
+    scroll_delta_magnitude,
+)
 from harness.utils import JsonDict
 
 # Whether the region provably reached the captured frame.
@@ -70,19 +75,6 @@ def _axis(value: Any, *keys: str) -> Optional[float]:
     return None
 
 
-def _magnitude(value: Any) -> Optional[float]:
-    """Largest absolute axis component of a `{x, y}` delta, or None."""
-    if not isinstance(value, dict):
-        return None
-    magnitude: Optional[float] = None
-    for key in ("x", "y"):
-        raw = value.get(key)
-        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-            continue
-        magnitude = max(magnitude or 0.0, abs(float(raw)))
-    return magnitude
-
-
 def _receipt_data(result: Any) -> Optional[JsonDict]:
     """Unwrap `{response: {data: ...}}`, or accept an already-unwrapped receipt."""
     if not isinstance(result, dict):
@@ -92,13 +84,13 @@ def _receipt_data(result: Any) -> Optional[JsonDict]:
         data = response.get("data")
         if isinstance(data, dict):
             return data
-    if "completedReason" in result or "totalDelta" in result:
+    if looks_like_scroll_receipt(result):
         return result
     return None
 
 
 def scroll_coverage(scroll_result: Any) -> JsonDict:
-    """Normalize an `Input.scroll` receipt into the facts a capture check needs.
+    """Normalize an `Input.scroll` or `Page.wheel` receipt into capture facts.
 
     `available: False` means this call produced no receipt at all — a different
     statement from a receipt saying nothing moved, and the two must not collapse
@@ -115,15 +107,10 @@ def scroll_coverage(scroll_result: Any) -> JsonDict:
     completed = str(data.get("completedReason") or "")
     layers = data.get("layers")
     layers = layers if isinstance(layers, list) else []
-    delta = _magnitude(data.get("totalDelta"))
-    if delta is None:
-        magnitudes = [
-            magnitude
-            for layer in layers
-            if isinstance(layer, dict)
-            and (magnitude := _magnitude(layer.get("delta"))) is not None
-        ]
-        delta = max(magnitudes) if magnitudes else None
+    # Both Action shapes, and the per-surface fallback, in one reader: a
+    # `Page.wheel` receipt names its delta `observedDelta` and carries no
+    # `layers[].delta` at all.
+    delta = scroll_delta_magnitude(data)
 
     position: Optional[float] = None
     extent: Optional[float] = None

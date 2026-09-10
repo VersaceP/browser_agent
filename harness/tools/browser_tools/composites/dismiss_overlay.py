@@ -14,6 +14,7 @@ from harness.observation.overlay_actions import (
 )
 from harness.observation.overlay_detector import detect_overlay_from_result
 from harness.observation.verifiers import (
+    CONFIDENCE_HIGH,
     CONFIDENCE_LOW,
     CONFIDENCE_MEDIUM,
     VerifierResult,
@@ -56,15 +57,39 @@ def _log_dismiss_overlay(
     status: str,
     overlay: Optional[JsonDict],
     attempts: List[JsonDict],
+    retry: Optional[JsonDict] = None,
 ) -> None:
-    return _bt()._log_dismiss_overlay(agent, page_id, status, overlay, attempts)
+    return _bt()._log_dismiss_overlay(
+        agent, page_id, status, overlay, attempts, retry=retry,
+    )
 
 
 async def _verify_overlay_gone_native(
     agent: Any,
     page_id: str,
     step: int,
+    *,
+    blocked_target: str = "",
+    blocked_method: str = "",
 ) -> VerifierResult:
+    """Did the overlay actually go away?
+
+    The AXTree detector answers this only for overlays it can recognise, and it
+    recognises them by auth/paywall/cookie keywords or a dialog role. A
+    promotional mask built from anonymous `genericcontainer` nodes matches
+    neither, so the detector returns None BOTH before and after every rung --
+    and reading that None as "no overlay" made the ladder declare success on
+    its first rung. Tasks b9a91fd2 and c281862c logged six `dismissed` verdicts
+    that way, and every one of the six retried actions came straight back with
+    the original `-32005 target is covered`.
+
+    So when the ladder was armed by a blocked action, the detector's silence
+    proves nothing and the blocked target itself is the measurement: replaying
+    it either succeeds (the obstruction is gone, and the action the caller
+    wanted is now done) or reports occlusion again (it is still there). The
+    replay is bounded by the same sensitivity gate as the final retry, and a
+    caller with no blocked target keeps the detector-only behaviour.
+    """
     inspect = await _invoke_browser_method(
         agent,
         "DOM.getAXTree",
@@ -80,12 +105,102 @@ async def _verify_overlay_gone_native(
             reason="DOM.getAXTree failed while verifying overlay state",
         )
     overlay = detect_overlay_from_result(inspect)
+    if isinstance(overlay, dict):
+        # A recognised overlay is still on the page: decisive, no probe needed.
+        return VerifierResult(
+            ok=False,
+            confidence=CONFIDENCE_MEDIUM,
+            method="native_axtree",
+            evidence={"overlay": overlay},
+            reason="overlay still present",
+        )
+    if not blocked_target or _target_replay_is_unsafe(agent, page_id, blocked_target, blocked_method):
+        return VerifierResult(
+            ok=True,
+            confidence=CONFIDENCE_MEDIUM,
+            method="native_axtree",
+            evidence={"overlay": None},
+            reason="no overlay in refreshed AXTree",
+        )
+    probe = await _invoke_browser_method(
+        agent,
+        blocked_method or "Input.click",
+        {
+            "pageId": page_id,
+            "id": blocked_target,
+            "purpose": "dismiss_overlay: verify by replaying the blocked action",
+        },
+        step,
+        count_progress=False,
+        allow_rematch=True,
+    )
+    if _loop_interrupt_from_result(probe):
+        return VerifierResult(
+            ok=False,
+            confidence=CONFIDENCE_LOW,
+            method="blocked_target_replay",
+            reason="replaying the blocked action raised a challenge/HITL interrupt",
+        )
+    if not _invoke_result_failed(probe):
+        return VerifierResult(
+            ok=True,
+            confidence=CONFIDENCE_HIGH,
+            method="blocked_target_replay",
+            evidence={"overlay": None, "replayed": True},
+            reason="the blocked action went through",
+        )
+    if _bt()._result_occlusion_blocked(probe):
+        return VerifierResult(
+            ok=False,
+            confidence=CONFIDENCE_HIGH,
+            method="blocked_target_replay",
+            evidence={"overlay": None, "stillOccluded": True},
+            reason="the blocked action is still occluded",
+        )
+    # Failed for some other reason: that says nothing about the obstruction, so
+    # fall back to what the detector saw rather than inventing a verdict.
     return VerifierResult(
-        ok=not isinstance(overlay, dict),
-        confidence=CONFIDENCE_MEDIUM,
+        ok=True,
+        confidence=CONFIDENCE_LOW,
         method="native_axtree",
-        evidence={"overlay": overlay} if isinstance(overlay, dict) else {"overlay": None},
-        reason="overlay still present" if isinstance(overlay, dict) else "no overlay in refreshed AXTree",
+        evidence={"overlay": None, "replayFailedUnrelated": True},
+        reason="no overlay in refreshed AXTree; replay failed for an unrelated reason",
+    )
+
+
+def _target_replay_is_unsafe(
+    agent: Any, page_id: str, target_id: str, target_method: str,
+) -> bool:
+    """The same gate the final retry applies, asked before the probe.
+
+    Verification must never be the thing that submits a form or presses a
+    login button, so a sensitive method or a consequential-looking target
+    keeps the detector-only path.
+    """
+    _ = page_id
+    signature = _axtree_seen_signature(agent, target_id, page_id) or {}
+    return bool(
+        is_sensitive_method(target_method or "Input.click")
+        or is_sensitive_target(
+            str(signature.get("role") or ""), str(signature.get("name") or "")
+        )
+    )
+
+
+def _verdict_replayed_target(verdict: Any) -> bool:
+    """Did this verdict reach `ok` by actually performing the blocked action?
+
+    `_verify_overlay_gone_native` has two ways to say the page is clear. One
+    reads a refreshed AXTree and touches nothing. The other REPLAYS the blocked
+    action, and when that goes through it has both proved the obstruction is
+    gone and executed the very action the caller was going to retry. Only the
+    second one makes a follow-up retry a duplicate, and only the second one is
+    reported here.
+    """
+    return bool(
+        getattr(verdict, "ok", False)
+        and getattr(verdict, "method", "") == "blocked_target_replay"
+        and (getattr(verdict, "evidence", None) or {}).get("replayed")
     )
 
 
@@ -156,6 +271,7 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
         return {**interrupt, "attempts": attempts[-3:]}
 
     success = False
+    already_performed = False
     last_verdict: Optional[Any] = None
     for attempt in range(1, max_attempts + 1):
         if asyncio.get_running_loop().time() >= deadline:
@@ -187,9 +303,13 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
                 "id": close.get("id"),
                 "name": str(close.get("name") or "")[:60],
             })
-            last_verdict = await _verify_overlay_gone_native(agent, page_id, step)
+            last_verdict = await _verify_overlay_gone_native(
+                agent, page_id, step,
+                blocked_target=target_id, blocked_method=target_method,
+            )
             if last_verdict.ok:
                 success = True
+                already_performed = _verdict_replayed_target(last_verdict)
                 break
             if replay_forbidden(close_result):
                 # The click failed AFTER input dispatch began: it may already
@@ -210,9 +330,13 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
         if interrupt:
             return _interrupt_return(interrupt)
         attempts.append({"attempt": attempt, "rung": "escape"})
-        last_verdict = await _verify_overlay_gone_native(agent, page_id, step)
+        last_verdict = await _verify_overlay_gone_native(
+            agent, page_id, step,
+            blocked_target=target_id, blocked_method=target_method,
+        )
         if last_verdict.ok:
             success = True
+            already_performed = _verdict_replayed_target(last_verdict)
             break
 
         # The Escape verifier refreshed both the native AXTree and the cached
@@ -226,25 +350,42 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
         # click, and a backdrop click on a login wall is still an interaction
         # with a login wall.
         if asyncio.get_running_loop().time() < deadline:
-            backdrop_ok, backdrop_meta = await _backdrop_dismiss(agent, page_id, step)
+            backdrop_ok, backdrop_meta = await _backdrop_dismiss(
+                agent, page_id, step, target_id, target_method,
+            )
             attempts.append({"attempt": "backdrop", **backdrop_meta})
             if backdrop_ok:
                 success = True
+                already_performed = bool(
+                    backdrop_meta.get("replayedBlockedTarget")
+                )
         else:
             backdrop_meta = {"rung": "backdrop", "skipped": "deadline_exceeded"}
             attempts.append({"attempt": "backdrop", **backdrop_meta})
 
     vl_arbiter_meta: Optional[JsonDict] = None
-    if not success:
-        # Keep an explicit capability receipt for callers that previously
-        # expected coordinate/VL fallback. Without a native point hit-test the
-        # arbiter cannot safely turn a visual coordinate into an input action.
+    if not success and not policy_subtype:
+        # Gated exactly like the backdrop rung: an auth_prompt / paywall overlay
+        # gets the rungs that press controls the PAGE declares (close control,
+        # Escape) and nothing else. This gate was absent while the rung was a
+        # permanent stub -- a rung that always refused cost nothing on a login
+        # wall -- and became load-bearing the moment the rung started clicking
+        # for real.
         vl_ok, vl_arbiter_meta = await _vl_overlay_arbiter(
-            agent, page_id, oracle=None, step=step
+            agent, page_id, oracle=None, step=step,
+            blocked_target=target_id, blocked_method=target_method,
         )
         attempts.append({"attempt": "vl_arbiter", **vl_arbiter_meta})
         if vl_ok:
             success = True
+            already_performed = bool(
+                vl_arbiter_meta.get("replayedBlockedTarget")
+            )
+    elif not success:
+        # Recorded rather than silent: "refused by policy" and "ran and did not
+        # work" are different facts and the receipt must keep them apart.
+        vl_arbiter_meta = {"rung": "vl_arbiter", "skipped": "policy_subtype"}
+        attempts.append({"attempt": "vl_arbiter", **vl_arbiter_meta})
 
     if not success:
         safe_rungs = sum(
@@ -304,13 +445,14 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
         }
 
     retry = await _maybe_retry_original_action(
-        agent, page_id, target_id, target_method, step
+        agent, page_id, target_id, target_method, step,
+        already_performed=already_performed,
     )
     if retry.get("interrupt"):
         # The retried original action hit a HITL/challenge — do NOT report
         # dismissed_and_retried; surface human-needed.
         return _interrupt_return(retry["interrupt"])
-    _log_dismiss_overlay(agent, page_id, retry["status"], overlay, attempts)
+    _log_dismiss_overlay(agent, page_id, retry["status"], overlay, attempts, retry=retry)
     return {
         "status": retry["status"],
         "overlay": overlay,
@@ -351,6 +493,8 @@ async def _backdrop_dismiss(
     agent: Any,
     page_id: str,
     step: int,
+    blocked_target: str = "",
+    blocked_method: str = "",
 ) -> Tuple[bool, JsonDict]:
     """Rung 3: click the modal's own backdrop, proven by an element hit test.
 
@@ -411,13 +555,53 @@ async def _backdrop_dismiss(
     if _invoke_result_failed(click):
         return False, {"rung": "backdrop", "point": {"x": bx, "y": by},
                        "skipped": "click_failed"}
-    verdict = await _verify_overlay_gone_native(agent, page_id, step)
-    return bool(verdict.ok), {
+    verdict = await _verify_overlay_gone_native(
+        agent, page_id, step,
+        blocked_target=blocked_target, blocked_method=blocked_method,
+    )
+    meta: JsonDict = {
         "rung": "backdrop",
         "point": {"x": bx, "y": by},
         "element": gate,
         "verified": bool(verdict.ok),
     }
+    if _verdict_replayed_target(verdict):
+        meta["replayedBlockedTarget"] = True
+    return bool(verdict.ok), meta
+
+
+def _ladder_screenshot_fn(agent: Any, step: int) -> Any:
+    """A `locate_target`-shaped capture that costs the worker no step.
+
+    `locate_target` calls `screenshot_fn(browser, page_id)` and accepts either
+    a path or `{path, receipt}`. The receipt form is the one that matters: it
+    is what lets the scale be PROVEN rather than assumed, and an unproven scale
+    makes the coordinate fallback refuse instead of clicking at the wrong
+    point. Viewport scope only -- a document-height capture has no upper bound
+    and is unreadable once scaled to model input.
+    """
+    async def capture(_browser: Any, page_id: str) -> Any:
+        result = await _invoke_browser_method(
+            agent,
+            "Page.screenshot",
+            {
+                "pageId": page_id,
+                "fullPage": False,
+                "options": {"format": "file"},
+                "purpose": "dismiss_overlay: capture for VL close-control locate",
+            },
+            step,
+            count_progress=False,
+        )
+        if _invoke_result_failed(result):
+            return None
+        path = _bt()._screenshot_saved_path(result)
+        if not path:
+            return None
+        data = _bt()._response_data(result) or _bt()._raw_response_data(result) or {}
+        return {"path": path, "receipt": data if isinstance(data, dict) else {}}
+
+    return capture
 
 
 async def _vl_overlay_arbiter(
@@ -426,10 +610,103 @@ async def _vl_overlay_arbiter(
     oracle: Any = None,
     step: int = 0,
     subtype: Optional[str] = None,
+    blocked_target: str = "",
+    blocked_method: str = "",
 ) -> Tuple[bool, JsonDict]:
-    """Return an explicit receipt for the unavailable visual-coordinate rung."""
-    _ = (agent, page_id, oracle, step, subtype)
-    return False, {"rung": "vl_arbiter", "skipped": "native_hit_test_unavailable"}
+    """Rung 4: see the close control, when no structural surface names it.
+
+    The rungs above need something the page declares -- a close control the AX
+    tree can name, a key the page honours, or a hit test that proves what sits
+    under a point. A promotional mask can satisfy none of them: in task
+    b9a91fd2 the Taobao modal was `genericcontainer` all the way down, its
+    close control an unnamed 80x80 box with no role and no text, so rung 1
+    found nothing to click and rung 2 pressed a key nothing listened for.
+
+    This rung is deliberately narrow, because the 09-01 refactor removed an
+    earlier automatic VL lane whose gate was prose-marker matching that hit 1
+    of 11 real error codes -- code that looked alive and never ran. The gate
+    here is `_result_occlusion_blocked`, a structured predicate over a numeric
+    transport code, and the rung arms only after every deterministic rung has
+    failed on an obstruction the harness measured rather than inferred. Its
+    budget comes from AUTO_INTERCEPT_MAX_PER_PAGE, so a page cannot spend more
+    than a few of these no matter how often it re-masks.
+
+    Locating is not authorisation: `locate_target` reports `is_consequential`
+    for submit/pay/login-like targets and this rung refuses to click those, the
+    same boundary the worker prompt states. A pixel that cannot be promoted to
+    a durable id is still usable as ONE viewport CSS click, because
+    `locate_target` proves scale and origin fail-closed and refuses when it
+    cannot; the point is used once and never persisted.
+    """
+    _ = (oracle, subtype)
+    vl_config = getattr(
+        getattr(getattr(agent, "runtime", None), "harness", None), "vl", None,
+    )
+    if vl_config is None or not getattr(vl_config, "enabled", False):
+        return False, {"rung": "vl_arbiter", "skipped": "vl_disabled"}
+    if not getattr(vl_config, "visual_locate_enabled", True):
+        return False, {"rung": "vl_arbiter", "skipped": "visual_locate_disabled"}
+
+    from harness.vl.locate import locate_target
+
+    target = (
+        "the control that closes or dismisses the modal, popup or mask"
+        " currently covering this page (its close X, dismiss or skip control)"
+    )
+    try:
+        located = await locate_target(
+            getattr(agent, "browser", None),
+            page_id,
+            target,
+            vl_config=vl_config,
+            screenshot_fn=_ladder_screenshot_fn(agent, step),
+            logger=getattr(agent, "logger", None),
+        )
+    except Exception as exc:  # VL is a fallback, never a new hard dependency
+        return False, {"rung": "vl_arbiter", "skipped": "locate_error",
+                       "error": str(exc)[:200]}
+
+    if not located.get("ok"):
+        return False, {"rung": "vl_arbiter",
+                       "skipped": str(located.get("reason") or "not_located")}
+    if located.get("is_consequential"):
+        # Seeing where it is does not license pressing it.
+        return False, {"rung": "vl_arbiter", "skipped": "consequential_target",
+                       "label": str(located.get("label") or "")[:60]}
+
+    params: JsonDict = {"pageId": page_id, "purpose": "dismiss_overlay: VL-located close control"}
+    located_id = str(located.get("id") or "").strip()
+    css_point = located.get("cssPoint")
+    click_method = "Input.click"
+    if located_id:
+        params["id"] = located_id
+        used = {"id": located_id}
+    elif isinstance(css_point, dict) and located.get("coordinate"):
+        click_method = "Page.click"
+        params["x"] = css_point.get("x")
+        params["y"] = css_point.get("y")
+        used = {"cssPoint": dict(css_point)}
+    else:
+        return False, {"rung": "vl_arbiter", "skipped": "no_actionable_locator"}
+
+    click = await _invoke_browser_method(agent, click_method, params, step, count_progress=False)
+    if _loop_interrupt_from_result(click):
+        return False, {"rung": "vl_arbiter", "interrupted": True, **used}
+    if _invoke_result_failed(click):
+        return False, {"rung": "vl_arbiter", "skipped": "click_failed", **used}
+    verdict = await _verify_overlay_gone_native(
+        agent, page_id, step,
+        blocked_target=blocked_target, blocked_method=blocked_method,
+    )
+    meta: JsonDict = {
+        "rung": "vl_arbiter",
+        "verified": bool(verdict.ok),
+        "verifiedBy": verdict.method,
+        **used,
+    }
+    if _verdict_replayed_target(verdict):
+        meta["replayedBlockedTarget"] = True
+    return bool(verdict.ok), meta
 
 
 async def _maybe_retry_original_action(
@@ -438,6 +715,8 @@ async def _maybe_retry_original_action(
     target_id: str,
     target_method: str,
     step: int,
+    *,
+    already_performed: bool = False,
 ) -> JsonDict:
     if not target_id:
         return {"status": "dismissed", "retried": False, "reason": "no original target supplied"}
@@ -455,6 +734,20 @@ async def _maybe_retry_original_action(
                 " (submit/pay/login/delete-like). Decide whether to repeat it."
             ),
         }
+    if already_performed:
+        # A rung reached its verdict by replaying THIS action and it went
+        # through, so what the caller wanted is already done. Dispatching it
+        # again would run a non-idempotent target twice: add the item twice,
+        # page twice, toggle back to where it started. The sensitivity gate
+        # above cannot have been passed by a replayed target -- the verifier
+        # applies the same gate before probing -- so reaching here with the
+        # flag set is self-checking rather than assumed.
+        return {
+            "status": "dismissed_and_retried",
+            "retried": True,
+            "retriedBy": "overlay_verifier_replay",
+            "retryTarget": {"id": target_id, "method": target_method},
+        }
     result = await _invoke_browser_method(
         agent,
         target_method,
@@ -467,6 +760,33 @@ async def _maybe_retry_original_action(
     if interrupt:
         return {"interrupt": interrupt, "retried": False}
     failed = _invoke_result_failed(result)
+    if failed and _bt()._result_occlusion_blocked(result):
+        # The retry hit the SAME occlusion the ladder was supposed to clear.
+        #
+        # Escape reporting success and the AXTree verification agreeing are
+        # both indirect readings; this is the direct measurement, and it says
+        # the target is still covered. Reporting `dismissed` here merges two
+        # different worlds -- "the overlay is gone and the retry failed for
+        # some other reason" and "the overlay is still there" -- and hands the
+        # worker the wrong one. In task b9a91fd2 both occurrences did exactly
+        # that: the ladder logged `dismissed`, the retry came back with the
+        # original `-32005 target is covered`, and each worker then spent four
+        # steps re-deriving a route around a page it had been told was clean.
+        return {
+            "status": "failed",
+            "retried": False,
+            "stillOccluded": True,
+            "retryTarget": {"id": target_id, "method": target_method},
+            "next_instruction": (
+                "The overlay ladder reported a clear page, but retrying the"
+                " original action hit the same occlusion, so the target is"
+                " still covered. Do not treat the page as clean: re-observe"
+                " with a fresh DOM.getAXTree, look for a layer the ladder did"
+                " not reach (another frame, or a mask that swallows pointer"
+                " events without owning a close control), and request HITL"
+                " only when no control can be bound at all."
+            ),
+        }
     return {
         "status": "dismissed" if failed else "dismissed_and_retried",
         "retried": not failed,

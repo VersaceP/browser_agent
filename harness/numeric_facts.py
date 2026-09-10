@@ -41,6 +41,12 @@ PLAN_METRICS = frozenset({
     "validated_rows",
 })
 CLAIM_METRICS = ROW_METRICS | PLAN_METRICS
+CLAIM_UNITS = frozenset({
+    "artifacts", "field_entries", "items", "phases", "rows", "not_applicable",
+})
+CLAIM_SCOPES = frozenset({
+    "artifact", "row", "subset", "task_total", "site_fact", "not_applicable",
+})
 
 MAX_SUBJECT_HINTS = 60
 MAX_FIELD_HINTS = 30
@@ -200,9 +206,12 @@ def _artifact_row_count_for_subject(
     wanted = subject.strip().casefold()
     if not wanted:
         return sum(item["rowCount"] for item in artifacts)
+    wanted_name = Path(subject.strip()).name.casefold()
     named = [
         item for item in artifacts
         if item["name"].strip().casefold() == wanted
+        or Path(item["path"]).name.casefold() == wanted_name
+        or item["path"].casefold() == wanted
     ]
     if len(named) == 1:
         return int(named[0]["rowCount"])
@@ -246,7 +255,33 @@ def resolve_numeric_claim(claim: Any, index: JsonDict) -> JsonDict:
     if metric not in CLAIM_METRICS:
         return {**base, "verdict": "unresolved", "reason": f"unsupported metric {metric!r}"}
 
+    unit = str((claim or {}).get("unit") or "").strip()
+    scope = str((claim or {}).get("scope") or "").strip()
+    if unit and unit not in CLAIM_UNITS:
+        return {**base, "verdict": "unresolved", "reason": f"unsupported unit {unit!r}"}
+    if scope and scope not in CLAIM_SCOPES:
+        return {**base, "verdict": "unresolved", "reason": f"unsupported scope {scope!r}"}
+    expected_unit = {
+        "validated_artifacts": "artifacts",
+        "validated_phases": "phases",
+        "validated_rows": "rows",
+        "row_count": "rows",
+        "count": "field_entries",
+    }.get(metric)
+    if unit and unit != expected_unit:
+        return {
+            **base,
+            "verdict": "unresolved",
+            "reason": f"metric {metric!r} cannot verify unit {unit!r}",
+        }
+
     if metric in PLAN_METRICS:
+        if scope and scope != "task_total":
+            return {
+                **base,
+                "verdict": "unresolved",
+                "reason": f"{metric} verifies only task_total scope, not {scope!r}",
+            }
         if base["subject"]:
             # These metrics are whole-plan totals; there is no per-phase row
             # ledger to look a scoped claim up in. Comparing "p1 produced 3
@@ -307,14 +342,28 @@ def resolve_numeric_claim(claim: Any, index: JsonDict) -> JsonDict:
                 }
         return {**base, "verdict": "unresolved", "reason": "no active row matches this subject"}
 
-    artifact, row = matches[0]
-    actual = _row_metric_value(row, artifact, metric, base["field"])
-    if actual is None:
+    measurable = [
+        (artifact, row, _row_metric_value(row, artifact, metric, base["field"]))
+        for artifact, row in matches
+    ]
+    measurable = [item for item in measurable if item[2] is not None]
+    if not measurable:
         return {
             **base,
             "verdict": "unresolved",
-            "reason": f"row has no array field {base['field']!r}",
+            "reason": f"matching rows have no array field {base['field']!r}",
         }
+    actual_values = {int(item[2]) for item in measurable}
+    if len(actual_values) != 1:
+        return {
+            **base,
+            "verdict": "unresolved",
+            "reason": (
+                "multiple matching rows carry different values for"
+                f" {base['field']!r}: {sorted(actual_values)}"
+            ),
+        }
+    artifact, row, actual = measurable[0]
     result: JsonDict = {
         **base,
         "actualValue": actual,
@@ -404,6 +453,25 @@ def numeric_claim_tool(subjects: List[str], fields: List[str]) -> JsonDict:
                                 ),
                             },
                             "value": {"type": "number"},
+                            "unit": {
+                                "type": "string",
+                                "enum": sorted(CLAIM_UNITS),
+                                "description": (
+                                    "The noun being counted. Use items for"
+                                    " products/entities; it cannot be checked"
+                                    " as artifacts or phases."
+                                ),
+                            },
+                            "scope": {
+                                "type": "string",
+                                "enum": sorted(CLAIM_SCOPES),
+                                "description": (
+                                    "task_total only for a stated whole-task"
+                                    " total. A category such as collection"
+                                    " phases is subset and cannot be checked"
+                                    " against the whole-plan phase total."
+                                ),
+                            },
                             "disposition": {
                                 "type": "string",
                                 "enum": ["checked", "ignored"],
@@ -426,7 +494,10 @@ def numeric_claim_tool(subjects: List[str], fields: List[str]) -> JsonDict:
                         # spanId is what coverage is computed from, so asking
                         # for it optionally meant an extractor could answer
                         # every span and still be scored as covering none.
-                        "required": ["claimId", "spanId", "text"],
+                        "required": [
+                            "claimId", "spanId", "text", "disposition",
+                            "unit", "scope",
+                        ],
                         "additionalProperties": False,
                     },
                 },
@@ -449,13 +520,21 @@ _EXTRACTOR_SYSTEM_PROMPT = (
     " times, version and hash fragments, step or attempt numbers, step"
     " budgets, prices, ranks and identifiers quoted from the site, quantities"
     " describing the site's content rather than the task's output — must"
-    " still be reported, with disposition=ignored and a reason. Omit"
-    " metric/value for those.\n\n"
+    " still be reported, with disposition=ignored, unit=not_applicable,"
+    " scope=not_applicable, and a reason. Omit metric/value for those.\n\n"
     "The `spans` list is the complete, mechanically-enumerated set of numbers"
     " in the answer. Return exactly one entry per spanId — copy the spanId and"
     " its text verbatim. Do not look for numbers yourself and do not invent"
     " spans: the list is the work. A span with no entry fails the whole"
     " reconciliation, so keep each ignored entry to a few words.\n\n"
+    "For every checked claim, set unit and scope literally from the answer."
+    " Seven products has unit=items and must not become validated_artifacts;"
+    " '2 collection phases' has scope=subset and must not become the task-wide"
+    " validated_phases total. Use row_count with the named artifact when the"
+    " answer says an artifact contains N rows/items. If no supported metric"
+    " measures the stated unit and scope, mark the span ignored and explain"
+    " that the ledger has no matching aggregate; never substitute a nearby"
+    " metric with a different noun.\n\n"
     "`text` must be copied verbatim from the answer, exactly as written,"
     " including its digits. Bind `subject` to a value that identifies the row"
     " the number is about — prefer one of the supplied subject hints when the"
@@ -516,18 +595,30 @@ async def extract_numeric_claims(
         "arrayFieldHints": fields,
         "supportedMetrics": sorted(CLAIM_METRICS),
     }
-    try:
+    async def _request(*, repair_errors: Optional[List[str]] = None) -> Tuple[Any, Any]:
+        request_payload = dict(payload)
+        system_prompt = _EXTRACTOR_SYSTEM_PROMPT
+        if repair_errors:
+            request_payload["repairErrors"] = repair_errors
+            system_prompt += (
+                "\nYour previous tool arguments violated the claim contract. "
+                "Return the complete corrected claims array. Do not omit valid "
+                "claims merely because another entry needs correction."
+            )
         _text, tool_calls, _stop, usage = await provider.generate_response(
-            system_prompt=_EXTRACTOR_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             messages=[{
                 "role": "user",
-                "content": json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                "content": json.dumps(request_payload, ensure_ascii=False, sort_keys=True),
             }],
             tools=[numeric_claim_tool(subjects, fields)],
         )
         if logger is not None and hasattr(logger, "record_llm_usage"):
             logger.record_llm_usage(
-                source="numeric_claim_extractor",
+                source=(
+                    "numeric_claim_extractor_repair" if repair_errors
+                    else "numeric_claim_extractor"
+                ),
                 provider=provider_name,
                 model=model_id,
                 usage=usage,
@@ -535,6 +626,49 @@ async def extract_numeric_claims(
                 conversation_id="numeric-claims",
                 context_hash="",
             )
+        return tool_calls, usage
+
+    def _claims_from_tool_calls(tool_calls: Any) -> Tuple[Optional[List[JsonDict]], List[str]]:
+        matching = [
+            item for item in (tool_calls or [])
+            if isinstance(item, dict)
+            and str(item.get("name") or "") == NUMERIC_CLAIM_TOOL
+        ]
+        if len(matching) != 1:
+            return None, [
+                f"extractor must return exactly one {NUMERIC_CLAIM_TOOL} call"
+            ]
+        raw_claims = (matching[0].get("input") or {}).get("claims")
+        if not isinstance(raw_claims, list):
+            return None, ["claims must be an array"]
+        malformed: List[str] = []
+        valid: List[JsonDict] = []
+        for offset, claim in enumerate(raw_claims):
+            if not isinstance(claim, dict):
+                malformed.append(f"claim[{offset}] must be an object")
+                continue
+            disposition = str(claim.get("disposition") or "")
+            unit = str(claim.get("unit") or "")
+            scope = str(claim.get("scope") or "")
+            errors: List[str] = []
+            if disposition not in {"checked", "ignored"}:
+                errors.append("no valid disposition")
+            if unit not in CLAIM_UNITS:
+                errors.append("no valid unit")
+            if scope not in CLAIM_SCOPES:
+                errors.append("no valid scope")
+            if disposition == "ignored" and (
+                unit != "not_applicable" or scope != "not_applicable"
+            ):
+                errors.append("ignored claims must use not_applicable unit/scope")
+            if errors:
+                malformed.extend(f"claim[{offset}] {error}" for error in errors)
+            else:
+                valid.append(claim)
+        return valid, malformed
+
+    try:
+        tool_calls, _usage = await _request()
     except Exception as exc:  # extractor availability is not a verdict
         return {"status": "unavailable", "error": f"{type(exc).__name__}: {exc}"}
 
@@ -545,21 +679,35 @@ async def extract_numeric_claims(
     # 6d6cc283 shipped a deliverable whose Q&A had regressed from 20 items to
     # 1. A dense answer makes this outcome likelier, so re-issuing a plainer
     # one is a real remedy rather than a retry of the same dice roll.
-    matching = [
-        item for item in (tool_calls or [])
-        if isinstance(item, dict) and str(item.get("name") or "") == NUMERIC_CLAIM_TOOL
-    ]
-    if len(matching) != 1:
+    claims, malformed = _claims_from_tool_calls(tool_calls)
+    if malformed:
+        try:
+            repaired_calls, _usage = await _request(repair_errors=malformed[:6])
+            repaired_claims, repair_errors = _claims_from_tool_calls(repaired_calls)
+        except Exception as exc:
+            repaired_claims, repair_errors = None, [
+                f"repair unavailable: {type(exc).__name__}: {exc}"
+            ]
+        if not repair_errors and repaired_claims is not None:
+            return {
+                "status": "ok",
+                "claims": repaired_claims,
+                "spans": spans,
+                "repairAttempted": True,
+            }
+        # Preserve only contract-valid claims from the initial response. They
+        # can still expose a real ledger contradiction; the missing coverage is
+        # recorded as inconclusive rather than erasing the useful evidence.
         return {
-            "status": "extractor_unusable",
-            "error": f"extractor must return exactly one {NUMERIC_CLAIM_TOOL} call",
+            "status": "partial",
+            "claims": claims or [],
+            "spans": spans,
+            "error": "; ".join((malformed + repair_errors)[:8]),
+            "repairAttempted": True,
         }
-    raw_claims = (matching[0].get("input") or {}).get("claims")
-    if not isinstance(raw_claims, list):
-        return {"status": "extractor_unusable", "error": "claims must be an array"}
     return {
         "status": "ok",
-        "claims": [c for c in raw_claims if isinstance(c, dict)],
+        "claims": claims or [],
         "spans": spans,
     }
 
@@ -725,6 +873,7 @@ def uncovered_numeric_spans(answer: str, claims: List[JsonDict]) -> List[JsonDic
 
 def reconcile_numeric_claims(
     claims: List[JsonDict], *, answer: str, index: JsonDict, spans: Any = None,
+    enforce_coverage: bool = True,
 ) -> JsonDict:
     """Check each extracted claim against the ledgers.
 
@@ -764,7 +913,7 @@ def reconcile_numeric_claims(
         uncovered_span_ids(spans, claims) if by_id
         else uncovered_numeric_spans(answer, claims)
     )
-    if uncovered:
+    if uncovered and enforce_coverage:
         return {
             "status": "coverage_failed",
             "uncoveredSpans": [
