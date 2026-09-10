@@ -81,9 +81,9 @@ def parse_resource_uri(uri: str) -> Tuple[str, str]:
 
 
 def _git_sha() -> str:
-    from harness.version import git_revision
+    from harness.version import git_source_revision
 
-    return git_revision()
+    return git_source_revision()
 
 
 def _sha256(payload: bytes) -> str:

@@ -1004,6 +1004,48 @@ async def compact_messages_if_needed(
         })
         return messages
 
+    # What the compaction actually bought. Without this the only observable was
+    # "a compaction happened", so a trigger that fires on healthy runs and frees
+    # nothing looked identical to one doing real work: run 48b97d84 spent 18
+    # compactions (~900K equivalent input) while the context never exceeded 40%
+    # of its window, and nothing in the log said so.
+    estimated_after = estimate_prompt_tokens(system_prompt, new_messages, tools)
+    tokens_freed = estimated - estimated_after
+    if tokens_freed <= 0 and _compaction_reason(force_reason) == "cache_pressure":
+        # Decline only the OPTIMISING trigger. cache_pressure fires to make the
+        # next prefix cheaper, so a checkpoint that frees nothing has bought
+        # nothing and swapping it in just pays for the summary twice. Every
+        # other reason is asked for rather than inferred: threshold and overflow
+        # mean the window is genuinely close (returning the old messages walks
+        # further toward it), manual is an operator's explicit request, and
+        # provider_recovery is repairing a transport failure. The checkpoint
+        # stays on disk either way, so the evidence is not lost.
+        logger.write(
+            "context.compaction_rejected",
+            {
+                "actor": actor,
+                "step": step,
+                "reason": "no_tokens_freed",
+                "forceReason": force_reason,
+                "estimatedTokensBefore": estimated,
+                "estimatedTokensAfter": estimated_after,
+                "tokensFreed": tokens_freed,
+                "thresholdTokens": threshold,
+                "checkpointId": checkpoint_id,
+                "savedPath": str(path.resolve()),
+            },
+        )
+        if event_scope is not None:
+            event_scope.complete(
+                message_count_after=len(messages),
+                estimated_tokens_after=estimated,
+                checkpoint_ref=str(path.resolve()),
+                summary_mode=summary_mode,
+                summary_error=summary_error,
+            )
+            event_context.__exit__(None, None, None)
+        return messages
+
     logger.write(
         "context.compacted",
         {
@@ -1015,6 +1057,8 @@ async def compact_messages_if_needed(
             "checkpointMaxTokens": checkpoint_budget,
             "summaryMode": summary_mode,
             "estimatedTokensBefore": estimated,
+            "estimatedTokensAfter": estimated_after,
+            "tokensFreed": tokens_freed,
             "thresholdTokens": threshold,
             "forceReason": force_reason,
             "messageCountBefore": len(messages),
@@ -1038,7 +1082,7 @@ async def compact_messages_if_needed(
     if event_scope is not None:
         event_scope.complete(
             message_count_after=len(new_messages),
-            estimated_tokens_after=estimate_prompt_tokens(system_prompt, new_messages, tools),
+            estimated_tokens_after=estimated_after,
             checkpoint_ref=str(path.resolve()),
             summary_mode=summary_mode,
             summary_error=summary_error,

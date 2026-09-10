@@ -23,6 +23,7 @@ NO_ARTIFACT_DIAGNOSTIC_TOOLS = frozenset({
     "DOM.getText",
     "DOM.getAttribute",
     "Input.scroll",
+    "Page.wheel",
     "Input.press",
     "Memory.get",
     "Memory.save",
@@ -59,9 +60,11 @@ ARTIFACT_PROGRESS_TOOLS = {
     "DOM.getText",
     "DOM.getAttribute",
     "Input.click",
+    "Page.click",
     "Input.type",
     "Input.press",
     "Input.scroll",
+    "Page.wheel",
     "Page.getState",
     *NO_ARTIFACT_DIAGNOSTIC_TOOLS,
 }
@@ -71,9 +74,11 @@ PRODUCTIVE_PRIMITIVE_TOOLS = {
     "DOM.getText",
     "DOM.getAttribute",
     "Input.click",
+    "Page.click",
     "Input.type",
     "Input.press",
     "Input.scroll",
+    "Page.wheel",
     "Page.getState",
 }
 

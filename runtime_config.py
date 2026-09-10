@@ -861,7 +861,7 @@ class HarnessConfig:
     browser_agent_step_extension_enabled: bool = False
     browser_agent_max_extension_steps: int = 10
     max_browser_agent_instances: int = 3
-    max_browser_agents: int = 3
+    max_browser_agents: int = 4
     # Deterministic fleet routing.  When enabled, the spawner assigns every
     # BrowserAgent a Dispatcher-observed fleet before browser work begins and
     # the browser-tool boundary injects that fleetId into fleetless Page.create
@@ -1169,7 +1169,7 @@ class HarnessConfig:
     # "db" writes no process files at all and makes the database authoritative;
     # it never falls back to adjacent legacy files during resume. In "dual",
     # files remain authoritative while the database is verified as a mirror.
-    # Model-facing readers present database events/traces/resources under the
+    # Model-facing reader                  买家买家了吗男女男男女女男男女女男男女女男男女女男男女女男男女女男男女女男男女女， 。  发反反复复反反复复反反复复     4我把班长杂志虚脱　从√å3∑4zçåresources under the
     # same logical paths the historical file backend used.
     storage_backend: str = "db"
     # Relative to worktree_dir, so it follows a relocated worktree.

@@ -244,12 +244,55 @@ SELECT_FAILURE_POLICY = {
     # native <select>, Ant Design and Element have adapters, so every other
     # custom widget arrives here, and reaching it is exactly what a visual
     # locate is for.
+    #
+    # The platform SPLIT this verdict. It now decides whether the target looks
+    # like a custom select at all, and answers with two different codes:
+    #   * select-unsupported-custom - it IS a select-like custom control (a
+    #     framework marker, or DOM-select-like structure) that no adapter can
+    #     drive. The control is real; only the Select contract is unavailable.
+    #   * select-target-not-select  - it is not a select control at all.
+    # Both were `select-target-not-select` before, so the older prose below
+    # still carries the "settle which of two situations this is" fork. That
+    # fork is now partly answered BY THE CODE, which is why the two entries
+    # differ in what they tell the model to establish first.
+    "select-unsupported-custom": SelectFailurePolicy(
+        family="control_unsupported",
+        raised_by=_BOTH,
+        action="operate_the_custom_control_as_ordinary_ui_one_verified_step_at_a_time",
+        retries=0,
+        # The menu is a real, rendered surface that the platform cannot name.
+        # That is the same structured blind spot select-options-incomplete
+        # keeps the hint for, and the reason this code exists at all.
+        visual_locate=True,
+        guidance=(
+            "What this code establishes: the element you targeted carries"
+            " custom-select characteristics, and no ABCP adapter can operate"
+            " it (only native <select>, Ant Design and Element have adapters)."
+            " What it does NOT establish is whether this is the control your"
+            " task needs - targeting a different custom dropdown on the same"
+            " page returns exactly this code, so judge that from the page and"
+            " your goal, not from the code. " + _NO_REPLAY
+            + " Once you have settled that this is the control you want, the"
+            " Select Actions stay unavailable for it, so operate it as"
+            " ordinary UI, one verified step per visible level: open it with"
+            " Input.click, then re-observe to enumerate the options that are"
+            " now rendered. A custom menu is often portal-rendered outside the"
+            " control's own subtree, so when a fresh DOM.getAXTree does not"
+            " show the options, read a page-wide DOM.getSemanticTree before"
+            " concluding they are absent. Choose with Input.click, or with"
+            " Input.type when the control is observably an editable field, or"
+            " Input.press. Verify the control's value afterwards - no step"
+            " here reports the selection for you. If a level is plainly on"
+            " screen and no structured surface can name it, visual_verify"
+            " mode=visual_locate may locate it; act on the id it returns."
+        ),
+    ),
     "select-target-not-select": SelectFailurePolicy(
         family="control_unsupported",
         raised_by=_BOTH,
         action=(
-            "refresh_ax_then_choose_supported_select"
-            "_or_use_generic_input_if_unsupported"
+            "refresh_ax_then_classify_control_kind"
+            "_combobox_or_generic_input"
         ),
         retries=0,
         visual_locate=True,
@@ -259,15 +302,65 @@ SELECT_FAILURE_POLICY = {
             " situations reach this code, so settle which one first: refresh"
             " DOM.getAXTree and check whether the real select control is a"
             " different node you simply did not target. If it is, target that"
-            " one. If the page genuinely has no supported select here, stop"
-            " calling the select Actions for it and drive it as ordinary UI:"
-            " enumerate fresh AXTree targets and act one verified step per"
-            " visible"
-            " level. A visible multi-column category/list browser is ordinary"
-            " UI, not a broken select. If a level is visible but no structured"
-            " surface names it, visual_verify mode=visual_locate can locate it;"
-            " act on the id it returns with whichever ordinary Input.*/DOM.*"
-            " method that level needs."
+            " one."
+            " If the page genuinely has no supported select here, classify the"
+            " control before falling all the way to ordinary UI:"
+            " (a) COMBOBOX — a combobox-family AXTree role carrying `popup`"
+            " inside its flag group (all flags share ONE bracket, so it reads"
+            " `[enabled collapsed popup]`, not a `[popup]` group of its own)."
+            " `popup` says a menu can open; it does NOT say the control is"
+            " editable, so type into it only once the current evidence shows"
+            " an editable field, and otherwise open it with Input.click."
+            " Then look for the option surface: a custom menu is often"
+            " portal-rendered outside the control's subtree, so if a fresh"
+            " page-wide DOM.getAXTree does not list the options, read"
+            " DOM.getSemanticTree before concluding they are absent. Act on a"
+            " resolved option id with Input.click. If no structured surface"
+            " can name a level that is plainly on screen, use visual_verify"
+            " mode=visual_locate — it is the only sanctioned source of a"
+            " coordinate, and a rect or a semantic-tree position is not one."
+            " For CJK / IME labels where real keystrokes cannot produce the"
+            " text, set input.value via the native descriptor setter +"
+            " dispatchEvent('input') as a bounded fallback — one attempt only,"
+            " verify the result, never use it to bypass visible validation."
+            " (b) LIST_BROWSER — a visible multi-column category or list"
+            " browser. This is ordinary UI, not a broken select: enumerate"
+            " fresh AXTree targets and act one verified step per visible"
+            " level. If a level is visible but no structured surface names"
+            " it, visual_verify mode=visual_locate can locate it; act on the"
+            " id it returns with whichever ordinary Input.*/DOM.* method that"
+            " level needs."
+            " (c) OTHER — anything else. Treat as ordinary UI with the same"
+            " one-verified-step-per-visible-level discipline."
+        ),
+    ),
+    # --- control_ambiguous: the request named more than one control ---------
+    # Distinct from every family above: nothing is wrong with the page or the
+    # control, only with the reference. The platform refused rather than
+    # picking one, so the fix is a narrower reference - never a retry of the
+    # same one, which would be refused identically.
+    "select-target-ambiguous": SelectFailurePolicy(
+        family="control_ambiguous",
+        raised_by=_BOTH,
+        action="refresh_ax_then_name_one_current_control_uniquely",
+        retries=0,
+        # A locate answers "which of these did you mean" with one id, which is
+        # exactly the missing fact. Structured disambiguation still comes
+        # first, because two controls that look alike on screen are the case a
+        # locate is worst at.
+        visual_locate=True,
+        guidance=(
+            "The locator matched more than one candidate, so the platform"
+            " refused to guess which select you meant. Nothing is wrong with"
+            " the page: the reference is what is ambiguous, and re-sending it"
+            " will be refused the same way. Refresh DOM.getAXTree and name ONE"
+            " current control - prefer a canonical id over a selector, since"
+            " an id is unique by construction. A label element associated with"
+            " a control can also resolve here, so check whether the locator is"
+            " matching both the control and its label. Only if the fresh tree"
+            " still cannot tell the candidates apart may visual_verify"
+            " mode=visual_locate pick the intended one; act on the id it"
+            " returns."
         ),
     ),
     # --- surface_unavailable: nothing to talk to right now ------------------
@@ -427,6 +520,12 @@ def select_failure_visual_locate_useful(code):
 # which is strictly more actionable than the "unknown" prose matching returns.
 
 _RUNTIME_CODE_TYPES = {
+    "target-preparation-failed": (
+        "target_preparation_failed", "inspect_current_identity_visibility_and_scroll_ancestors",
+    ),
+    "pointer-target-stale": (
+        "stale_target", "inspect_current_identity_visibility_and_scroll_ancestors",
+    ),
     # ABCP publishes two occlusion codes and the harness has to map both:
     # `occlusion_blocked` is what arms the automatic dismiss_overlay recovery in
     # tools/browser_tools/auto_intercept.py, and a code that misses this table

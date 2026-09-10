@@ -899,6 +899,10 @@ def _existing_task_path(candidate: str) -> Optional[str]:
         rooted = Path(__file__).resolve().parent / candidate
         if rooted.exists():
             return str(rooted)
+        if re.fullmatch(r"[0-9a-fA-F]{32}", candidate):
+            task = Path(__file__).resolve().parent / "worktree" / candidate.lower()
+            if task.is_dir():
+                return str(task)
     return None
 
 
@@ -1478,6 +1482,134 @@ def read_task(args: argparse.Namespace) -> str:
         return line
 
 
+def _plan_phase_targets(phase: Dict[str, Any]) -> str:
+    contract = phase.get("worker_contract")
+    contract = contract if isinstance(contract, dict) else {}
+    source = contract.get("batch_source")
+    source = source if isinstance(source, dict) else {}
+    selector = source.get("selector") or source.get("cohort_selector")
+    selector = selector if isinstance(selector, dict) else {}
+    values = selector.get("values")
+    if isinstance(values, list) and values:
+        return ", ".join(str(value) for value in values)
+    indices = selector.get("indices")
+    if isinstance(indices, list) and indices and all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in indices
+    ):
+        # Selectors are zero-based because they address an artifact array; the
+        # operator review is one-based because it describes the visible page
+        # allocation.  Rendering this explicitly prevents a [2,3] batch from
+        # looking like an unexplained one-row phase in the approval table.
+        return "输入行 " + "、".join(str(value + 1) for value in indices)
+    rows = contract.get("batch_rows")
+    if isinstance(rows, list) and rows:
+        labels = []
+        for index, row in enumerate(rows, 1):
+            if not isinstance(row, dict):
+                labels.append(str(index))
+                continue
+            label = next((
+                row.get(key) for key in
+                ("rank", "id", "name", "title", "url", "detailUrl")
+                if row.get(key) not in (None, "")
+            ), index)
+            labels.append(str(label))
+        return ", ".join(labels)
+    offset, limit = selector.get("offset"), selector.get("limit")
+    if isinstance(limit, int):
+        start = int(offset or 0) + 1
+        return f"输入行 {start}-{start + limit - 1}"
+    expected = phase.get("expected_artifact")
+    expected = expected if isinstance(expected, dict) else {}
+    count = expected.get("exact_rows")
+    return f"{count} 行" if isinstance(count, int) else str(
+        phase.get("objective") or "-"
+    )[:42]
+
+
+def _plan_phase_round(phase: Dict[str, Any], first_phase_id: str) -> str:
+    wave = phase.get("dispatch_wave")
+    if isinstance(wave, int) and not isinstance(wave, bool):
+        return f"第{wave}轮"
+    role = str(phase.get("execution_role") or "").strip()
+    phase_id = str(phase.get("id") or "")
+    dependencies = phase.get("depends_on")
+    dependencies = dependencies if isinstance(dependencies, list) else []
+    if role == "probe" or phase_id == first_phase_id:
+        return "第一轮"
+    if first_phase_id and first_phase_id in dependencies:
+        return "第二轮"
+    return "按依赖"
+
+
+def _print_task_plan_review(plan: Dict[str, Any], candidate_hash: str) -> None:
+    phases = [item for item in plan.get("phases", []) if isinstance(item, dict)]
+    first_phase_id = str(phases[0].get("id") or "") if phases else ""
+    print("\n[TaskPlan] 执行计划等待确认", flush=True)
+    print(f"目标: {plan.get('goal') or '-'}", flush=True)
+    print(f"候选版本: {candidate_hash[:12] or '-'}", flush=True)
+    source_plan = plan.get("_sourcePlan")
+    source_plan = source_plan if isinstance(source_plan, dict) else {}
+    shared_contracts = source_plan.get("output_contracts")
+    if isinstance(shared_contracts, dict) and shared_contracts:
+        print(
+            "共享输出合同: " + ", ".join(sorted(str(name) for name in shared_contracts)),
+            flush=True,
+        )
+    print(
+        f"{'轮次':<8} {'Phase':<22} {'页面/实体分配':<22} {'Fleet':<14} 执行方式",
+        flush=True,
+    )
+    for phase in phases:
+        phase_id = str(phase.get("id") or "-")
+        round_label = _plan_phase_round(phase, first_phase_id)
+        targets = _plan_phase_targets(phase)
+        contract = phase.get("worker_contract")
+        contract = contract if isinstance(contract, dict) else {}
+        fleet = str(contract.get("fleet_id") or "运行时指定")
+        expected = phase.get("expected_artifact")
+        expected = expected if isinstance(expected, dict) else {}
+        mode = (
+            "单 worker 完整采集并验证"
+            if expected.get("exact_rows") == 1
+            else "单 worker 组内串行"
+        )
+        print(
+            f"{round_label:<8} {phase_id[:20]:<22} {targets[:20]:<22} "
+            f"{fleet[:12]:<14} {mode}",
+            flush=True,
+        )
+    print(
+        "输入“确认”或“确定”开始执行；输入修改意见让 Lead 重做计划；"
+        "输入“详情”查看完整 JSON；输入“取消”停止。",
+        flush=True,
+    )
+
+
+async def _terminal_plan_approval(
+    plan: Dict[str, Any], candidate_hash: str,
+) -> Dict[str, str]:
+    _print_task_plan_review(plan, candidate_hash)
+    while True:
+        answer = (await asyncio.to_thread(input, "计划审阅> ")).strip()
+        normalized = answer.lower()
+        # ``确定`` is the normal affirmative answer in the terminal UI.  It
+        # must have exactly the same meaning as ``确认``; treating it as free
+        # form feedback makes a user-approved candidate go back through the
+        # Lead and be submitted a second time.
+        if normalized in {"确认", "确定", "同意", "执行", "y", "yes"}:
+            return {"decision": "approved"}
+        if normalized in {"取消", "停止", "n", "no", "cancel"}:
+            return {"decision": "cancelled"}
+        if normalized in {"详情", "detail", "details", "json"}:
+            print(json.dumps(plan, ensure_ascii=False, indent=2), flush=True)
+            continue
+        if answer:
+            return {"decision": "revision", "feedback": answer}
+        print("空输入不会确认计划。请输入“确认”、修改意见、“详情”或“取消”。", flush=True)
+
+
 def _handle_resume_command(
     line: str,
     args: argparse.Namespace,
@@ -1509,6 +1641,8 @@ def _resolve_resume_directory(raw_path: str) -> Path:
     candidates = [candidate]
     if not candidate.is_absolute():
         candidates.append(Path(__file__).resolve().parent / candidate)
+        if re.fullmatch(r"[0-9a-fA-F]{32}", raw):
+            candidates.append(Path(__file__).resolve().parent / "worktree" / raw.lower())
     for item in candidates:
         try:
             resolved = item.resolve(strict=True)
@@ -2417,7 +2551,10 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
         print("模式: lead", flush=True)
         print(f"任务目录: {logger.task_dir}", flush=True)
         print(f"运行日志: {logger.path}", flush=True)
-        print("开始执行，关键进度会在这里显示。", flush=True)
+        if sys.stdin.isatty():
+            print("开始生成执行计划；确认前不会启动 BrowserAgent。", flush=True)
+        else:
+            print("开始执行，关键进度会在这里显示。", flush=True)
 
         provider = LLMFactory.create_provider(
             lead_agent_model_config(runtime.model, runtime.lead)
@@ -2428,6 +2565,9 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
             logger,
             pinned_browser_context=pinned_browser_context,
             resume=resume_context,
+            plan_approval_handler=(
+                _terminal_plan_approval if sys.stdin.isatty() else None
+            ),
         )
         answer = await harness.run(task_for_agent)
         terminal_error = getattr(harness, "terminal_error", None)

@@ -210,6 +210,18 @@ async def evaluate_visual_contract(
         failed = vl.get("failed_checks") or []
         if effective_verdict == "violated":
             allowed_failures.extend(failed)
+        # `scope` is what the skill DECLARED; `judgedImage` is the size of the
+        # image the verdict was read off. Size alone does NOT identify a
+        # capture's scope -- a short page's full-page shot and its viewport
+        # shot can be the same pixels -- so this is a record, not a detector.
+        # It exists so that a future scope downgrade leaves a trace in the
+        # contract result rather than being absorbed into a "satisfied", and
+        # so a refusal can be told apart from a verdict after the fact.
+        judged = {
+            key: vl[key]
+            for key in ("imageWidth", "imageHeight", "imagePixels", "fileBytes")
+            if key in vl
+        }
         groups_out.append({
             "scope": scope,
             "verdict": effective_verdict,
@@ -218,6 +230,7 @@ async def evaluate_visual_contract(
             "evidence": vl.get("visible_evidence") or [],
             "geometry": geometry,
             "vetoAllowed": veto_allowed,
+            **({"judgedImage": judged} if judged else {}),
         })
 
     violated = any(row.get("verdict") == "violated" for row in groups_out)

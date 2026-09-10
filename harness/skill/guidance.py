@@ -252,7 +252,7 @@ def distill_guidance_from_trace(events: List[Dict[str, Any]]) -> Dict[str, Any]:
             axtree_calls += 1
         elif method == "Input.press" and str(params.get("key") or "") == "Escape":
             overlay.append(purpose or "Input.press Escape")
-        elif method in ("Input.scroll", "Page.scroll"):
+        elif method in ("Input.scroll", "Page.wheel"):
             scroll_count += 1
             scroll_sample = {k: v for k, v in params.items()
                             if k not in ("pageId", "fleetId", "purpose")}
