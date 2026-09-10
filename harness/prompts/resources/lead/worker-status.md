@@ -1,7 +1,7 @@
 ---
 id: lead.worker-status
 audience: lead
-version: "2026-09-03"
+version: "2026-09-05"
 description: Interpret worker terminal statuses, validation state, and handoffs before continuing, replanning, or finalising.
 sources:
   - harness/results/worker_result.py
@@ -30,6 +30,8 @@ error_codes:
   - objective_exhausted
   - phase_exhausted
   - instruction_infeasible
+  - browser_api_contract_error
+  - collection_contract_replan_required
 topics:
   - worker status
   - terminal status
@@ -58,5 +60,11 @@ routing allows it; distinguish loss of required unsaved page-local state from
 ordinary renderer recovery. HITL and session-continuity outcomes require the
 structured routing instruction, not a fresh Fleet escape. A
 `blocked_cross_task_type_required` result needs a new phase with the correct
-task type. A collection-contract replan must change the immutable artifact
-shape rather than respawning the unchanged contract.
+task type. `collection_contract_replan_required` must change the immutable
+artifact shape - replan expected_artifact.fields with the nested array
+expectedShape the receipt reports, because the worker cannot repair its own
+contract; respawning it unchanged repeats the same refusal.
+`browser_api_contract_error` is a platform-side contract problem: switch method
+or report it, rather than retrying the same call. `failed`, `cancelled` and
+`unknown` carry no verdict at all - read error and diagnostics, and be
+conservative before scaling anything up.

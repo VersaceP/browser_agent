@@ -2,7 +2,7 @@
 id: browser.visual-recovery
 audience: browser
 version: "2026-09-04"
-description: Use visual recovery and visual_locate only after structured recovery is exhausted.
+description: Use visual_locate after structured recovery fails; use overlay_check to resolve a cover that current DOM/AX evidence cannot explain.
 sources:
   - harness/tools/browser_tools/visual.py
   - harness/tools/browser_tools/capability.py
@@ -32,6 +32,14 @@ aliases:
 ---
 # Visual recovery
 
+Distinguish locating a target from diagnosing a cover. The structured-recovery
+prerequisite below applies to `visual_locate`. For an occluded action whose
+cover cannot be explained by current DOM/AX evidence, a focused
+`visual_verify` with `mode="overlay_check"` can resolve the uncertainty without
+trying more controls behind it. Follow `browser.overlay-recovery`; if current
+evidence already establishes an authentication gate blocking the target,
+request HITL directly rather than obtaining redundant visual confirmation.
+
 A `visualRecoveryHint` says visual location is available after deterministic
 recovery failed. It is not an instruction to use vision or proof that the
 target is actionable. Consider it only when the target is plausibly on screen
@@ -47,7 +55,7 @@ ancestor can receive Input.scroll. A located option is not automatically a
 valid Input.select control.
 
 A located target is acted on by id wherever one exists. `cssPoint` is the
-fallback when it does not: it is valid for exactly one `Input.click{pageId,x,y}`
+fallback when it does not: it is valid for exactly one `Page.click{pageId,x,y}`
 on the current page state. It
 comes only from a proven visual locate result, must not be persisted into a
 skill, and must not survive page change. If `coordinateRefused` is present,

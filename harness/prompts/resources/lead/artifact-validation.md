@@ -1,15 +1,18 @@
 ---
 id: lead.artifact-validation
 audience: lead
-version: "2026-09-03"
+version: "2026-09-05"
 description: Distinguish artifact shape repair, missing evidence, placeholder data, and durable contract changes after worker validation.
 sources:
   - harness/evidence/artifact_evidence.py
   - harness/evidence/extraction_artifacts.py
+  - harness/task_control/artifact_validation.py
+  - harness/task_control/validators.py
   - harness/tools/lead_tools.py
 emitter_sources:
   - harness/evidence/artifact_evidence.py
   - harness/results/row_ledger.py
+  - harness/task_control/artifact_validation.py
 related_tools:
   - lead_save_artifact
   - spawn_browser_agent
@@ -20,12 +23,14 @@ error_codes:
   - absence_proof_incomplete
   - absence_declaration_missing
   - blocker_as_business_data
+  - contract_invalid
 topics:
   - artifact validation
   - placeholder
   - evidence
   - repair
   - schema
+  - contract invalid
 aliases:
   - 产物校验
   - 占位数据
@@ -46,6 +51,18 @@ When rows are trustworthy but their shape is wrong, use lead_save_artifact to
 reshape from trusted extraction artifacts. Do not re-scrape merely to rename a
 field. A validation_failed phase is not complete and cannot advance a
 dependency until a replacement passes validation.
+
+A `contract_invalid` receipt is a proved conflict between the declared schema
+and a validator, so retrying the unchanged phase cannot help. Replan with a
+compatible contract and reuse trustworthy rows where possible: `range` checks
+a numeric scalar, while `array_length` checks the number of items in a declared
+array. When the request caps a collection rather than requiring a fixed count
+(for example, “at most N” or “however many exist”), only `max: N` is a real
+constraint: the page's ceiling is not a floor the worker can meet. A lower
+bound turns “the page has fewer” into a permanent failure that no retry can
+clear. Use a lower bound or exact count only when the user explicitly requires
+it; interpret an unqualified “first N” from the surrounding request rather
+than assuming it means either a cap or a fixed delivery count.
 
 For placeholder data, wrong values, missing rank/range evidence or off-target
 rows, keep the same phase and try a changed falsifiable experiment if task

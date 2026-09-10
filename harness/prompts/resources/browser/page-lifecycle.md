@@ -1,9 +1,10 @@
 ---
 id: browser.page-lifecycle
 audience: browser
-version: "2026-09-04"
+version: "2026-09-09"
 description: Reconcile navigation, page lifecycle, dialog, page inventory and stale-handle receipts before another browser action.
 sources:
+  - abcp-platform/resources/skills/webcross-browser/SKILL.md
   - harness/observation/page_lifecycle.py
   - harness/tools/browser_tools/capability.py
   - harness/tools/browser_tools/navigate.py
@@ -18,6 +19,9 @@ related_methods:
   - Page.list
   - Page.go
   - Page.navigate
+  - Page.handleDialog
+  - File.handleChooser
+  - Download.remove
   - DOM.getAXTree
 error_codes:
   - page_changed_during_read
@@ -72,10 +76,25 @@ navigation_context on its first Page.getState, and then refresh state/AX
 evidence. A click gate's short no-navigation observation is not proof of
 failure or absence of a popup.
 
-Dialogs are stateful. Page.getState carries harness-tracked pending dialog ids;
-select the intended id when more than one is pending and refresh state after
-handling one. Never retain Page.handleDialog.userInput in reasoning, artifacts
-or output.
+Dialogs are stateful. When the Input action that opened the dialog returns
+`dialog.id`, copy that id directly into `Page.handleDialog`. If it did not,
+`Page.getState` carries harness-tracked `pendingDialogs`; select the intended id
+from that current list when more than one is pending. Refresh state after
+handling one. Never retain `Page.handleDialog.userInput` in reasoning,
+artifacts, or output.
+
+## File choosers and downloads are not document loads
+
+After `Input.click`, `Input.press`, or `Page.click` activates an upload control,
+call `File.handleChooser` with a current target. Do not wait for a chooser event
+and do not repeat the activating action. If the target was stale, refresh page
+state and DOM targets, then make one chooser call with the fresh target. A
+directory chooser requires HITL.
+
+`Download.remove` is record cleanup, not cancellation and not file deletion.
+Before removing a record, inspect current download evidence: only completed,
+failed, or cancelled records are terminal. Cancel an active record and observe
+that terminal state first.
 
 ## The one AX-refresh exemption
 

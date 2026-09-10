@@ -24,6 +24,8 @@ error_codes:
   - select-option-disabled
   - select-options-incomplete
   - select-target-not-select
+  - select-unsupported-custom
+  - select-target-ambiguous
   - select-selection-mode-unknown
   - select-state-restore-failed
   - select-final-state-unproven
@@ -71,6 +73,33 @@ evidence. A successful inspect can clear the replay block, but only
 `selectRecovery.retryAllowed=true` permits the one corrected selection the
 receipt describes.
 
+## When the control identity will not bind
+
+`selectIdentityRecovery` records a different problem from `selectRecovery`.
+It covers `stale-target`, missing-target and target-preparation failures. These
+codes do not reveal how far a custom action progressed and do not arm the
+selection replay block.
+
+`select-target-ambiguous` belongs to the same question but has a different
+answer: the locator matched more than one candidate and the platform refused to
+guess. Nothing is wrong with the page or the control - the reference is what is
+ambiguous, so re-sending it is refused identically. Refresh `DOM.getAXTree` and
+name ONE current control, preferring a canonical id over a selector because an
+id is unique by construction. A label associated with a control resolves here
+too, so check whether the locator is matching both the control and its label.
+
+After the first identity failure, refresh `DOM.getAXTree` and inspect the
+control's current value and reachability. If the same observed control fails
+again, `genericUiRecommended=true` advises using ordinary UI from that fresh
+evidence: activate the control only when closed, use an observed search field,
+option, paging control or scroll surface, then read the final value. This is an
+advisory candidate action; the model decides whether it fits the user's goal.
+
+Use visual location only when fresh structured evidence cannot name a visible
+required target. A visual match does not make a stale id current. Act only on a
+separately verified selector/id or the returned proven point, and re-observe
+before reuse after any page change.
+
 For `select-popup-not-found`, `select-popup-ambiguous`, or
 `select-popup-not-ready`, re-read AX evidence, then use a page-wide semantic
 tree to relate aria-controls/aria-owns/aria-activedescendant to a portal menu,
@@ -113,6 +142,31 @@ cannot raise it. It is advisory: the recovery in this guide is still the right
 one to follow, and `contractDriftDetail` names the mismatch to report.
 
 ## When the control is not a select at all
+
+The platform splits this verdict across two codes. Read what each one actually
+establishes, and no more.
+
+`select-unsupported-custom` establishes two things: the element you targeted
+carries custom-select characteristics, and no adapter can operate it. It does
+NOT establish that this is the control your task needs - targeting a different
+custom dropdown on the same page returns the same code. Whether this is the
+right control is a question about your goal and the page, so answer it from
+those; the code cannot answer it for you.
+
+Once you have settled that it is the control you want, the Select Actions stay
+unavailable for it. Operate it as ordinary UI, one verified step per visible
+level: open it with `Input.click`, re-observe to enumerate the options that are
+now rendered, then choose with `Input.click`, `Input.type` when the control is
+observably editable, or `Input.press`. A custom menu is often portal-rendered
+OUTSIDE the control's own subtree, so when a fresh `DOM.getAXTree` does not show
+the options, read a page-wide `DOM.getSemanticTree` before concluding they are
+absent. Verify the control's value afterwards - nothing in this path reports the
+selection for you.
+
+If a level is plainly on screen and no structured surface can name it,
+`visual_verify mode=visual_locate` may locate it. That is the only sanctioned
+source of a coordinate: a rect from an AXTree line and a position from a
+Semantic Tree are spatial evidence, not click targets.
 
 `select-target-not-select` is a verdict about the element, not a failure to
 recover from - but two different situations reach it, so settle which one

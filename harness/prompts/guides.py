@@ -249,22 +249,19 @@ def guide_manifest(audience: str) -> str:
         "returns candidate ids only, and reading one remains your call.",
     ]
     for guide in guides:
-        tools = ", ".join(guide.related_tools)
-        methods = ", ".join(guide.related_methods)
-        topics = ", ".join(guide.topics)
+        # Id, version and description only. The manifest answers one question -
+        # is there a document about this, and is it worth opening - and the
+        # description is the only field that answers it. related_tools,
+        # related_methods, topics and error_codes are all SEARCH keys: they
+        # resolve a code or a phrase to an id, which is what search does, and
+        # carrying them here grows the cached system block on every turn to
+        # save a tool call the model makes only when it already has a code in
+        # hand. Codes were excluded on exactly this reasoning; the rest follow.
         rendered.append(
             f'<guide id="{escape(guide.guide_id, quote=True)}" '
             f'version="{escape(guide.version, quote=True)}">'
         )
         rendered.append(f"<description>{escape(guide.description)}</description>")
-        rendered.append(f"<related_tools>{escape(tools)}</related_tools>")
-        if methods:
-            rendered.append(f"<related_methods>{escape(methods)}</related_methods>")
-        # Topics are in the manifest; the full error-code list is not. Codes
-        # are what search resolves, and carrying every one of them here would
-        # grow the cached system block for a lookup the search tool does better.
-        if topics:
-            rendered.append(f"<topics>{escape(topics)}</topics>")
         rendered.append("</guide>")
     rendered.append("</available_harness_guides>")
     return "\n".join(rendered)
