@@ -64,6 +64,22 @@ def _is_stream_options_rejection(exc: Exception) -> bool:
     return explicitly_named and rejection_word and (status is None or status in {400, 404, 422})
 
 
+def _is_thinking_tool_choice_rejection(exc: Exception) -> bool:
+    """Recognize gateways that cannot force a tool while thinking is enabled."""
+
+    status = getattr(exc, "status_code", None)
+    response = getattr(exc, "response", None)
+    if status is None and response is not None:
+        status = getattr(response, "status_code", None)
+    text = str(exc).lower()
+    return (
+        "tool_choice" in text
+        and "thinking" in text
+        and any(word in text for word in ("support", "invalid", "allow"))
+        and (status is None or status in {400, 422})
+    )
+
+
 def _degenerate_response_problem(response: Any) -> Optional[Dict[str, Any]]:
     """Detect a structurally degenerate chat.completions response, else None.
 
@@ -437,6 +453,12 @@ class OpenAIProvider(BaseLLMProvider):
                 else:
                     params["extra_body"] = dict(thinking_extra_body)
 
+            if getattr(self, "_thinking_disabled_after_tool_choice_reject", False):
+                params.pop("reasoning_effort", None)
+                extra_body = dict(params.get("extra_body") or {})
+                extra_body["thinking"] = {"type": "disabled"}
+                params["extra_body"] = extra_body
+
             # 只有在有工具时才添加 tools 参数
             if openai_tools:
                 params["tools"] = openai_tools
@@ -620,22 +642,31 @@ class OpenAIProvider(BaseLLMProvider):
         try:
             response = await request_with_timeout(request_params)
         except Exception as exc:
-            if not effective_cache_enabled or not _is_cache_control_rejection(exc):
+            if _is_thinking_tool_choice_rejection(exc):
+                self._thinking_disabled_after_tool_choice_reject = True
+                fallback_params = build_request_params(effective_cache_enabled)
+                _emit_cache_log(
+                    "[OpenAI Thinking] tool_choice rejected in thinking mode;"
+                    " retrying once with thinking disabled"
+                )
+                response = await request_with_timeout(fallback_params)
+            elif effective_cache_enabled and _is_cache_control_rejection(exc):
+                fallback_params = build_request_params(False)
+                cache_diagnostics = _with_cache_control_diagnostics(
+                    _build_cache_diagnostics("openai", fallback_params),
+                    cache_decision,
+                    actual_enabled=False,
+                    accepted=False,
+                    fallback="disabled_after_provider_reject",
+                    reject_error=exc,
+                )
+                _emit_cache_log(
+                    "[OpenAI Cache] cache_control rejected; retrying without markers"
+                )
+                response = await request_with_timeout(fallback_params)
+                self._cache_control_disabled_after_reject = True
+            else:
                 raise
-            fallback_params = build_request_params(False)
-            cache_diagnostics = _with_cache_control_diagnostics(
-                _build_cache_diagnostics("openai", fallback_params),
-                cache_decision,
-                actual_enabled=False,
-                accepted=False,
-                fallback="disabled_after_provider_reject",
-                reject_error=exc,
-            )
-            _emit_cache_log(
-                "[OpenAI Cache] cache_control rejected; retrying without markers"
-            )
-            response = await request_with_timeout(fallback_params)
-            self._cache_control_disabled_after_reject = True
 
         # 缓存命中观测(OpenAI 自动缓存,只能从 prompt_tokens_details.cached_tokens 反查)
         # usage 可能为 None(带 payload 的响应缺 usage 时检测器放行)——全部走
