@@ -519,6 +519,140 @@ guide 明令禁止预滚（6.1），而 reveal 超时后的建议又被 workflow
 实验后已复核页面状态：URL 未变、`status: ready`、带值表单节点 0 个、无 focus 节点 —— 三次点击全部在 reveal 阶段超时，未落到元素上，零状态变更。
 
 
+### 6.8 第二个确证实例：`occluded`（运行 `f56d50f0`，2026-09-12）
+
+6.2 的 A/B 用的是 `scroll-deadline-exceeded`。这次在另一个错误码上拿到了同样的结果，
+说明这不是某一个错误码的特例，而是嵌套失败的通用行为。
+
+**平台在段内给出的全部信息**（`Workflow.progress` / `step_finished` 原文）：
+
+```json
+{"phase": "step_finished", "errorCode": "occluded", "stepPath": "steps[4]",
+ "stepId": "clickA", "stepType": "action", "action": "Input.click",
+ "status": "error", "duration": 9085, "error": "A nested Action failed."}
+```
+
+**同一个错误码在单条调用里给出的信息**（取自运行 `7c2c828d`）：
+
+```json
+{"observation": "Input.click failed: The requested target is covered or has no usable hit-test point.",
+ "suggested_prompt": "Inspect the latest page map and the structure covering the target. Handle or dismiss the covering control when it blocks the task, then re-observe before retrying.",
+ "error": {"code": "occluded", "message": "The requested target is covered or has no usable hit-test point."}}
+```
+
+段内丢掉了 `observation`、`suggested_prompt` 和 `error.message`，与 6.2 完全一致。
+
+**这次的代价，以及它为什么可以精确归因。** 同一份 workflow 被写了两遍，
+**除一个参数外逐字节相同**：
+
+| | 第 4 步之前的 `Page.wheel` | 结果 |
+|---|---|---|
+| 失败那次（step 25） | `scrollY: +900` | `steps[4]` `Input.click` → `occluded`，段耗 35.9s |
+| 成功那次（step 27） | `scrollY: -180` | 13 步全过 |
+
+中间两回合是纯诊断，调用方的原话可以直接读出它当时知道什么、不知道什么：
+
+> **step 26**：「The click was blocked as `occluded` after scrolling — something is
+> covering the target. Let me re-observe with a fresh tree and a viewport
+> screenshot to see what's in the way.」
+>
+> **step 27**：「Now I can see it: the goal rows scrolled slightly too high — they
+> sit **under the sticky top header** (header covers top ~171 device px), which is
+> why the click was refused as occluded.」
+
+也就是说：**调用方必须靠一张截图，去发现平台已经知道的事**（是什么盖住了目标）。
+而且重读一次 AXTree 也没用——见问题 8。
+
+合计 **77.4s**（失败段 35.9s + 诊断回合 12.4s + 重写回合 29.1s）与 **8,170 个输出 token**。
+若 `suggested_prompt` 能穿透段边界，这就是一回合的事。
+
+**在 6.4 的四条之外，追加一条**：
+
+| # | 建议 |
+|---|---|
+| 5 | `occluded` 时一并给出**覆盖物的身份**（AX id / role / name，或至少其矩形）。错误码只说"被盖住了"，不说被谁盖住；调用方唯一的补救手段是截图加几何推算 |
+
+顺带确认：本次 `scroll-deadline-exceeded` 再现一次（step 22，`Input.click` 内部自动
+reveal，**9,759ms**），`occluded` 那次也在放弃前烧掉 **9,085ms**。两次合计 18.8s，
+占该运行全部失败段耗时 48.3s 的 39%。
+
+---
+
+## 问题 7：`Input.type` 能判定 readonly，但 `DOM.getAXTree` 不暴露它
+
+### 现象
+
+深创投投资申请表的「成立时间」是一个只能由日期选择器填写的字段。`Input.type`
+明确拒绝它：
+
+```
+errorCode: "target-readonly"   stepPath: "steps[1]"   action: "Input.type"   duration: 167ms
+```
+
+而调用前从 `DOM.getAXTree` 读到的这个节点是：
+
+```
+7 [2:5533:5533] textfield [enabled] # @967,1150,416,64
+```
+
+只有 `[enabled]`。**没有任何标记说明它不接受键入。**
+
+### 影响
+
+调用方无从预知，只能试了才知道。这一次失败本身很便宜（167ms，平台快速失败做得很好），
+但它让整个段在第 2 步中止（`onError: "stop"`），段里后面已授权的步骤全部作废，必须重写。
+
+更实际的问题是：**这类字段在表单里很常见**（日期、级联地区、只读回显），
+每一个都要靠一次失败去发现。
+
+### 想请确认的
+
+1. AX 侧是否有 `readonly` / `editable` 状态可以随节点一起发出？我们这侧的 AXTree
+   格式契约里预留了状态位（`checked/unchecked/enabled/disabled/inert/selected/
+   expanded/collapsed/popup`），加一个 `readonly` 无需改协议形状。
+2. 如果 AX 层面拿不到，`DOM.getAttribute` 能否把 `readonly` / `aria-readonly`
+   列为可查属性？那样至少能在动作前一次批量核验。
+
+### 我们不打算做的
+
+用启发式去猜哪些字段"看起来像日期选择器"。那会把站点特征写进通用层，
+而且判断错的代价（跳过一个本来可以填的字段）比试一次失败更高。
+
+---
+
+## 问题 8：`sticky` 布局标记未观测到发出，而吸顶元素确实会导致 `occluded`
+
+### 现象
+
+问题 6.8 那次 `occluded`，真因是目标被吸顶头部盖住（约占顶部 171 设备像素）。
+
+我们这侧的 AXTree 格式契约里，`sticky` 是**已定义的布局标记**
+（与 `hidden` / `off` / `blocked` / `scroll` / `clip` 同组）。但在运行
+`f56d50f0` 的全部 7 次 `DOM.getAXTree` 里，**`sticky` 一次都没有作为标记出现**
+——该运行日志里出现的 3 处 "sticky" 全是调用方模型自己的散文。
+
+所以 step 26 那次"重读一棵新树"什么也没换来，最终是靠截图看出来的。
+
+### 影响
+
+`occluded` 是可恢复的错误——只要知道被谁盖住。吸顶头部这一类尤其好恢复：
+反向滚一小段就行（本例 180px）。但调用方现在只能：
+
+失败 → 截图 → 目测遮挡源 → 估算像素 → 反向滚 → 重写整段
+
+### 想请确认的
+
+1. `sticky` 标记当前在什么条件下发出？是尚未实装，还是本例的头部不满足其判定
+   （例如 `position: sticky` 的祖先容器而非节点自身）？
+2. 若能在 AXTree 里标出吸顶/固定定位元素及其矩形，`occluded` 的恢复就从
+   "截图推算" 变成 "读树即知"。
+
+### 与问题 6.8 的关系
+
+两条可以独立落地，任何一条都能把这次的 77.4s 压到一回合：
+问题 6.8 让失败回执自己说出遮挡源；问题 8 让失败之前就能看见它。
+
+
 ---
 
 ## 优先级建议
@@ -527,11 +661,13 @@ guide 明令禁止预滚（6.1），而 reveal 超时后的建议又被 workflow
 |---|---|---|---|
 | 1 | 问题 2：`find` 的 `require` / `onEmpty` / `findAll` | 正确性 | 单段「观察→搜索→点击」的承重件；现在会静默点错元素 |
 | 2 | 问题 1：`waitEvent` 的 `onTimeout: 'error'` | 正确性 | 调用方侧无法补救（超时后续步骤已执行） |
-| 3 | 问题 6：嵌套 Action 的 `suggested_prompt` 被 workflow 吞掉 | 正确性 | **已用现场 A/B 实验证实**：同一目标同一点击，单调用带具体建议，包进 workflow 后 RPC 与事件流都只剩裸错误码；本次因此多烧 4 回合 39.2s。与问题 4「失败回执带终态快照」同源，建议一起做 |
+| 3 | 问题 6：嵌套 Action 的 `suggested_prompt` 被 workflow 吞掉 | 正确性 | **已用现场 A/B 实验证实，并在第二个错误码上复现（6.8）**：同一目标同一点击，单调用带具体建议，包进 workflow 后 RPC 与事件流都只剩裸错误码；本次因此多烧 4 回合 39.2s。与问题 4「失败回执带终态快照」同源，建议一起做 |
 | 4 | 问题 4：失败回执带终态快照 | 数据完整性 | 至少先带 `workflowId` |
 | 5 | 问题 5.3：`Workflow.execute` schema 加 `.strict()` | 契约 | 改动最小，能杜绝一整类静默错误 |
-| 6 | 问题 3：`DOM.axTreeUpdated` 触发条件 | 文档/确认 | 先确认行为，再决定改目录还是改文档 |
-| 7 | 问题 5.1 / 5.2：JSON Schema 生成失真 | 契约 | 影响所有按契约构建的一方 |
+| 6 | 问题 7：AXTree 不暴露 `readonly` | 信息完整性 | 表单里很常见；现在每个只读字段都要靠一次失败去发现 |
+| 7 | 问题 8：`sticky` 标记未发出 | 信息完整性 | 与问题 6.8 同一次失败的另一半；任一条落地即可把 77.4s 压到一回合 |
+| 8 | 问题 3：`DOM.axTreeUpdated` 触发条件 | 文档/确认 | 先确认行为，再决定改目录还是改文档 |
+| 9 | 问题 5.1 / 5.2：JSON Schema 生成失真 | 契约 | 影响所有按契约构建的一方 |
 
 问题 1、2 我们都是**向后兼容设计**：新字段全部可选，默认值即现有行为，存量 workflow 不受影响。
 
@@ -545,6 +681,8 @@ guide 明令禁止预滚（6.1），而 reveal 超时后的建议又被 workflow
 | 上表的 AXTree（632 行）| 上述第二个运行的 `contexts/abcp-agent-slot-001-final-context.json`，段回执内嵌 |
 | 问题 6 的完整运行日志（step 43 失败 / 46-47 手工滚动 / 50 成功） | `worktree/a686e03faba0404bb77b25eff7ee3f1b/run.jsonl` |
 | 问题 6 的现场 A/B 实验原始回执 | `scratchpad/probe_result.json`、`scratchpad/probe_b_events.json`（脚本见 6.6） |
+| 问题 6.8 / 7 / 8 的完整运行日志（9 段 3 败；step 25 `occluded` → 26 截图诊断 → 27 成功） | `worktree/f56d50f0f64a4e84a46ee8d1f76812ea/run.jsonl`，逐步回执见 `traces/browser-001.jsonl` |
+| 问题 6.8 那两份「只差一个 `scrollY`」的 workflow 原文 | 上述 trace 里第 7、8 次 `Workflow.execute` 的 `params.steps` |
 | 协议实测记录 | `docs/workflow-execute-live-contract.md` |
 
 需要我们提供可直接运行的最小复现脚本，随时说。
