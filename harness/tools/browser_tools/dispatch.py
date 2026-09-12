@@ -28,6 +28,7 @@ from harness.pacing import wait_between_rows
 from harness.observation.browser_call import build_browser_call_runner
 from harness.runtime_evaluation import RuntimeEvaluationService
 from harness.results.call_outcome import replay_forbidden
+from harness.workflow_schema_source import contract_stamp
 from harness.tool_policy import collect_sensitive_replacements
 from harness.tool_policy import hidden_harness_tools_for_task_type
 from harness.tool_policy import redact_values
@@ -440,7 +441,7 @@ BROWSER_TOOLS = ToolRegistry("browser_agent")
 def _browser_schema_for(tool_name: str) -> Callable[[Optional[Any]], JsonDict]:
     def factory(capability_methods: Optional[Any] = None) -> JsonDict:
         schema = _browser_input_schemas_cached(
-            _capability_methods_key(capability_methods)
+            _capability_methods_key(capability_methods), contract_stamp(),
         ).get(tool_name)
         if schema is not None:
             return copy.deepcopy(schema)
@@ -594,7 +595,15 @@ def _tool_exception_result(
 
 
 @lru_cache(maxsize=32)
-def _browser_input_schemas_cached(capability_methods: Tuple[str, ...]) -> Dict[str, JsonDict]:
+def _browser_input_schemas_cached(
+    capability_methods: Tuple[str, ...], stamp: str = "",
+) -> Dict[str, JsonDict]:
+    # `stamp` is unused on purpose: it is part of the cache KEY. The workflow
+    # tool's schema is derived from the platform contract, which this run's
+    # schema bootstrap rewrites after import. Keyed on capability methods
+    # alone, this cache would keep handing back a tool schema built against the
+    # previous catalog revision for the life of the process.
+    del stamp
     return _browser_input_schemas(capability_methods)
 
 def build_browser_tool_dispatcher(agent: Any) -> BrowserToolDispatcher:
@@ -1208,7 +1217,6 @@ async def _browser_execute_browser_workflow(ctx: ToolContext) -> JsonDict:
         "variables": dict(ctx.tool_input.get("variables") or {}),
         "steps": list(ctx.tool_input.get("steps") or []),
         "timeout": int(ctx.tool_input.get("timeout") or 600000),
-        "stepTimeout": int(ctx.tool_input.get("stepTimeout") or 30000),
     }
     page_id = str(ctx.tool_input.get("pageId") or "").strip()
     fleet_id = str(ctx.tool_input.get("fleetId") or "").strip()
@@ -1216,8 +1224,6 @@ async def _browser_execute_browser_workflow(ctx: ToolContext) -> JsonDict:
         params["pageId"] = page_id
     if fleet_id:
         params["fleetId"] = fleet_id
-    if isinstance(ctx.tool_input.get("errorConfig"), dict):
-        params["errorConfig"] = dict(ctx.tool_input.get("errorConfig") or {})
     result, _should_stop = await _bt()._execute_browser_capability_tool(
         ctx.agent,
         "browser_call",

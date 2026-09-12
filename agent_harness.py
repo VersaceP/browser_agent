@@ -163,6 +163,7 @@ from harness.tools.lead_tools import (
     build_lead_tool_dispatcher,
 )
 from harness.workflow_runtime import workflow_execution_enabled
+from harness.workflow_schema_source import bind_schemas_dir, contract_source
 from harness.version import version_info
 from harness.utils import (
     JsonDict,
@@ -5302,6 +5303,12 @@ class LeadAgent:
         cache_mode = "unknown"
         cache_dir = global_schema_cache_dir(self.runtime.harness.worktree_dir)
         schemas_dir = global_schemas_dir(self.runtime.harness.worktree_dir)
+        # Point the workflow contract at the directory THIS run uses, before
+        # the bootstrap writes it. The model-facing workflow schema, the
+        # workflow policy and the tool-schema cache stamp all derive from that
+        # contract; left to resolve on their own they read a default location
+        # that only coincides with this one under the default worktree_dir.
+        bind_schemas_dir(schemas_dir)
         tmp_schemas_dir = cache_dir / f"schemas.tmp.{os.getpid()}.{uuid.uuid4().hex}"
         try:
             browser_config = replace(
@@ -5533,6 +5540,14 @@ class LeadAgent:
                     "cacheMode": cache_mode,
                 },
             )
+            # The workflow contract was bound to this run's cache directory
+            # before the write. If the write did not happen, contract reads
+            # fall back to the checked-in copy rather than failing every schema
+            # build — say so, because a silently older contract is the kind of
+            # thing that is only ever noticed from the outside.
+            source = contract_source()
+            if source.get("fellBack"):
+                self.logger.write("schema.contract.fallback", source)
 
     def resolve_phase_for_spawn_with_rejection(
         self,

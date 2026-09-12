@@ -1065,9 +1065,25 @@ class HarnessConfig:
     # unique match + Lead selection gate).
     skill_selection_mode: str = "manual"
     # Master control-plane gate for every Harness-owned Workflow.execute path.
-    # Keep disabled until ABCP supports pre-armed action events plus dynamic
-    # collection/state primitives required by portable hybrid skills. Workflow
-    # skill markdown remains available as guidance while this is false.
+    #
+    # CANARY, default OFF. Opt in per deployment with config.json.
+    #
+    # The rationale that used to sit here — "keep disabled until ABCP supports
+    # pre-armed action events plus dynamic collection/state primitives" — is
+    # partly false: store does support set/merge/append/delete, and f89e15d
+    # actually retired ephemeral.py (trace-distilled replay, which depended on
+    # the banned Runtime.evaluate), not the model-authored path. But the event
+    # half was closer to right than the 2026-09-11 rewrite claimed: waitEvent
+    # SKIPS its preceding Action's event window (engine.ts advances waitCursor
+    # to window.endCursor), so events emitted during an Action need readEvents,
+    # which the model-facing schema does not yet expose.
+    # Known gaps before this can default on — docs/workflow-execute-live-contract.md:
+    #   - readEvents not exposed to the model; navigation policy still forces
+    #     waitEvent and would reject the platform's own recommended shape;
+    #   - a failed workflow returns neither store contents nor completed Action
+    #     results, so a segment that collected 7 rows before failing on the 8th
+    #     cannot hand those 7 rows back;
+    #   - no real-task A/B yet.
     workflow_execution_enabled: bool = False
     # Runtime-only operator override (NOT read from config.json): set per run from
     # the terminal via `--skill <id>` or the interactive `/skill <id>` command,

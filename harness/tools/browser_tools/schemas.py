@@ -4,68 +4,233 @@ from typing import Dict, Tuple
 
 from harness.utils import JsonDict
 from harness.workflow_policy import LISTENABLE_EVENTS
+from harness.workflow_schema_source import platform_constraints, workflow_contract
 
 
 def _workflow_condition_schema() -> JsonDict:
+    # workflowConditionOrGroupSchema is a union of two strict objects. A bare
+    # string used to be offered here and has no platform counterpart, so a
+    # string condition rejects the whole workflow with -32602.
     return {
         "anyOf": [
-            {"type": "string"},
             {"$ref": "#/$defs/workflowConditionLeaf"},
             {"$ref": "#/$defs/workflowConditionGroup"},
         ],
     }
 
 
+#: Written here, not derived: the platform's op descriptions say what each op
+#: does, not what it fails to do, and `find`'s silence on both a miss and a
+#: crowd is the sharp edge. Kept deliberately site-neutral — an example naming
+#: real labels or roles would teach one page's shape as if it were the format's.
+#: The measurements behind these sentences live with the regression tests.
+_TRANSFORM_OP_NOTES = {
+    "find": (
+        "Returns the FIRST matching item and does not check uniqueness; an"
+        " empty string when nothing matches, which then fails downstream"
+        " rather than here. A bare visible label is rarely unique in an AXTree"
+        " — the same text appears on a control, on its label, and on any"
+        " heading that mentions it. Narrow with mode=regex, combining the"
+        " parts each line carries: its role, its full quoted accessible name,"
+        " and its bracketed state. Read them off the tree you just captured"
+        " rather than assuming which role a control uses."
+    ),
+    "regex": (
+        "Applied to the current value as text. Use group to lift a canonical"
+        " id out of a matched AXTree line: ids are"
+        " frameId:axNodeId:domNodeId inside square brackets, e.g."
+        " '\\[([0-9]+:[0-9]+:[0-9]+)\\]' with group 1."
+    ),
+    "querySelector": (
+        "Matched against a simplified semantic tree by tag/class/id, not"
+        " against AXTree lines and not by visible text."
+    ),
+}
+
+
+def _execute_property(name: str) -> JsonDict:
+    """The platform's schema for one top-level Workflow.execute param."""
+    return workflow_contract().execute_property_schemas.get(name) or {}
+
+
+def _transform_op_members() -> list:
+    """Build one strict member per platform transform op.
+
+    The platform's ops are a discriminated union of `.strict()` objects, so a
+    flattened object that offers every op's fields at once lets the model write
+    `{"op": "regex", "selector": ...}` — accepted here, rejected wholesale by
+    the dispatcher. Property names, types, bounds and required sets therefore
+    come from the platform contract; only the notes above are ours.
+    """
+    contract = workflow_contract()
+    members = []
+    for name, shape in sorted(contract.transform_ops.items()):
+        properties: JsonDict = {}
+        for prop in sorted(shape.properties):
+            source = shape.property_schemas.get(prop) or {}
+            if prop == "op":
+                properties["op"] = {"type": "string", "enum": [name]}
+                continue
+            properties[prop] = {
+                key: source[key]
+                for key in ("type", "enum", "minimum", "maximum", "minLength")
+                if key in source
+            }
+            description = source.get("description")
+            if description:
+                properties[prop]["description"] = str(description)
+        member: JsonDict = {
+            "type": "object",
+            "properties": properties,
+            "required": sorted(shape.required),
+            "additionalProperties": False,
+        }
+        note = _TRANSFORM_OP_NOTES.get(name)
+        if note:
+            member["description"] = note
+        members.append(member)
+    return members
+
+
 def _workflow_step_definitions() -> JsonDict:
+    contract = workflow_contract()
     condition = _workflow_condition_schema()
+    # Every member of the platform step union carries an optional stable id;
+    # it is what failure receipts and recovery segments refer back to.
+    step_id: JsonDict = {
+        "type": "string",
+        "minLength": 1,
+        "description": "Optional stable step identifier echoed in results.",
+    }
     extract_schema: JsonDict = {
         "type": "object",
-        "additionalProperties": {"type": "string"},
+        "additionalProperties": {"type": "string", "minLength": 1},
         "description": "Map workflow variable names to result/event dot paths.",
     }
     action_step: JsonDict = {
         "type": "object",
         "properties": {
             "type": {"type": "string", "enum": ["action"]},
+            "id": step_id,
             "action": {
                 "type": "string",
+                "minLength": 1,
                 "description": "ABCP action such as Page.getState.",
             },
             "params": {"type": "object", "additionalProperties": True},
-            "purpose": {"type": "string"},
+            "purpose": {"type": "string", "minLength": 1},
             "extract": extract_schema,
             "onError": {
                 "type": "string",
-                "enum": ["stop", "continue", "retry"],
+                "enum": ["stop", "continue"],
+                "description": (
+                    "Stop the workflow on failure (default) or record it and"
+                    " continue. There is no retry setting anywhere in the"
+                    " workflow language — re-observe and submit a new segment"
+                    " instead."
+                ),
             },
-            "timeout": {"type": "integer", "minimum": 1000, "maximum": 300000},
         },
         "required": ["action"],
         "additionalProperties": False,
     }
-    listen_step: JsonDict = {
+    # Mirrors the platform's workflowWaitEventStepSchema. The harness used to
+    # emit {"type": "listen", "event": ...}; the dispatcher has no such step
+    # type and rejects the whole workflow with -32602, so the model is shown
+    # only the real spelling. Stored `listen` steps are still rewritten by
+    # harness.workflow_policy._normalize_wait_events before transport.
+    wait_event_step: JsonDict = {
         "type": "object",
         "properties": {
-            "type": {"type": "string", "enum": ["listen"]},
-            "event": {
-                "type": "string",
-                "enum": sorted(LISTENABLE_EVENTS),
+            "type": {"type": "string", "enum": ["waitEvent"]},
+            "id": step_id,
+            "focus": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string", "enum": sorted(LISTENABLE_EVENTS)},
+                "description": (
+                    "Event names to wait for AFTER the preceding Action"
+                    " completes. It cannot see events emitted during that"
+                    " Action's own window — the engine advances the wait cursor"
+                    " past it. Use a readEvents step for those. A real page load"
+                    " normally fires Page.loaded after Page.navigate returns, so"
+                    " waitEvent settles navigation; pair it with readEvents when"
+                    " the event may already have fired."
+                ),
             },
-            "filter": {"type": "object", "additionalProperties": True},
-            "timeout": {"type": "integer", "minimum": 1, "maximum": 300000},
-            "onTimeout": {
-                "type": "string",
-                "enum": ["stop", "continue"],
+            "pageId": {"type": "string", "minLength": 1},
+            "fleetId": {"type": "string", "minLength": 1},
+            "taskId": {"type": "string", "minLength": 1},
+            "timeout": {
+                "type": "integer",
+                "minimum": 100,
+                "maximum": 300000,
+                "description": (
+                    "Maximum wait in ms (default 30000). A timeout is not a"
+                    " failure: the step returns timedOut and the workflow"
+                    " continues, so assert on the extracted events if the"
+                    " event is mandatory."
+                ),
             },
             "extract": extract_schema,
         },
-        "required": ["type", "event"],
+        "required": ["type", "focus"],
+        "additionalProperties": False,
+    }
+    # readEvents reads the window of the PRECEDING Action; waitEvent only sees
+    # what comes after it (the engine advances the wait cursor to that window's
+    # end). Both are needed: which one settles a page depends on whether the
+    # event fires before or after the Action returns.
+    read_events_step: JsonDict = {
+        "type": "object",
+        "properties": {
+            "type": {"type": "string", "enum": ["readEvents"]},
+            "id": step_id,
+            "focus": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string", "enum": sorted(LISTENABLE_EVENTS)},
+                "description": (
+                    "Event names to read from the preceding Action's own event"
+                    " window. Returns immediately — it never waits."
+                ),
+            },
+            "pageId": {"type": "string", "minLength": 1},
+            "fleetId": {"type": "string", "minLength": 1},
+            "taskId": {"type": "string", "minLength": 1},
+            "extract": extract_schema,
+        },
+        "required": ["type", "focus"],
+        "additionalProperties": False,
+    }
+    store_step: JsonDict = {
+        "type": "object",
+        "properties": {
+            "type": {"type": "string", "enum": ["store"]},
+            "id": step_id,
+            "op": {
+                "type": "string",
+                "enum": ["set", "merge", "append", "delete"],
+                "description": (
+                    "append accumulates a collection across loop iterations;"
+                    " the whole store is returned with the workflow result."
+                ),
+            },
+            "path": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Dot-separated path in the workflow store.",
+            },
+            "value": {"description": "Required for every op except delete."},
+        },
+        "required": ["type", "op", "path"],
         "additionalProperties": False,
     }
     if_step: JsonDict = {
         "type": "object",
         "properties": {
             "type": {"type": "string", "enum": ["if"]},
+            "id": step_id,
             "condition": condition,
             "then": {
                 "type": "array",
@@ -83,6 +248,7 @@ def _workflow_step_definitions() -> JsonDict:
         "type": "object",
         "properties": {
             "type": {"type": "string", "enum": ["loop"]},
+            "id": step_id,
             "maxIterations": {"type": "integer", "minimum": 1, "maximum": 50},
             "condition": condition,
             "body": {
@@ -97,30 +263,31 @@ def _workflow_step_definitions() -> JsonDict:
         "type": "object",
         "properties": {
             "type": {"type": "string", "enum": ["transform"]},
-            "input": {"type": "string"},
+            "id": step_id,
+            "input": {
+                "type": "string",
+                # `^\\$.*`: the platform accepts only a reference here, and
+                # "last.lines" (no $) used to pass the harness and die at the
+                # dispatcher. Copied from the contract, never restated.
+                **platform_constraints(
+                    contract.step_shapes["transform"].property_schemas["input"],
+                    "pattern",
+                ),
+                "description": (
+                    "Workflow reference supplying the input. The roots are"
+                    " $last (the PRECEDING step's result), $cache, $store and"
+                    " $vars.NAME — there is no $steps[N]. To search an"
+                    " observation, put this step directly after the read and"
+                    " use $last.lines."
+                ),
+            },
             "ops": {
                 "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "op": {
-                            "type": "string",
-                            "enum": ["find", "regex", "jsonpath", "template"],
-                        },
-                        "pattern": {"type": "string"},
-                        "mode": {
-                            "type": "string",
-                            "enum": ["contains", "regex"],
-                        },
-                        "group": {"type": "integer", "minimum": 0},
-                        "path": {"type": "string"},
-                        "template": {"type": "string"},
-                    },
-                    "required": ["op"],
-                    "additionalProperties": False,
-                },
+                "minItems": 1,
+                "description": "Ordered transform operations.",
+                "items": {"oneOf": _transform_op_members()},
             },
-            "output": {"type": "string"},
+            "output": {"type": "string", "minLength": 1},
         },
         "required": ["type", "input", "ops", "output"],
         "additionalProperties": False,
@@ -129,7 +296,7 @@ def _workflow_step_definitions() -> JsonDict:
         "workflowConditionLeaf": {
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
+                "path": {"type": "string", "minLength": 1},
                 "operator": {
                     "type": "string",
                     "enum": [
@@ -149,6 +316,7 @@ def _workflow_step_definitions() -> JsonDict:
                 "operator": {"type": "string", "enum": ["and", "or"]},
                 "conditions": {
                     "type": "array",
+                    "minItems": 1,
                     "items": _workflow_condition_schema(),
                 },
             },
@@ -158,7 +326,9 @@ def _workflow_step_definitions() -> JsonDict:
         "workflowStep": {
             "oneOf": [
                 action_step,
-                listen_step,
+                wait_event_step,
+                read_events_step,
+                store_step,
                 if_step,
                 loop_step,
                 transform_step,
@@ -294,13 +464,26 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
             "type": "object",
             "$defs": _workflow_step_definitions(),
             "properties": {
-                "pageId": {"type": "string"},
-                "fleetId": {"type": "string"},
+                # Both are `z.string().uuid()` upstream. Without the pattern a
+                # page handle copied from prose reaches the dispatcher and dies
+                # there instead of here.
+                "pageId": {
+                    "type": "string",
+                    **platform_constraints(
+                        _execute_property("pageId"), "pattern", "format",
+                    ),
+                },
+                "fleetId": {
+                    "type": "string",
+                    **platform_constraints(
+                        _execute_property("fleetId"), "pattern", "format",
+                    ),
+                },
                 "description": {
                     "type": "string",
                     "description": (
-                        "Stable bounded sequence. Example: navigate, listen for"
-                        " Page.loaded, Page.getState, then DOM.getAXTree."
+                        "Stable bounded sequence. Example: navigate, waitEvent"
+                        " on Page.loaded, Page.getState, then DOM.getAXTree."
                     ),
                 },
                 "variables": {"type": "object", "additionalProperties": True},
@@ -308,46 +491,31 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                     "type": "array",
                     "minItems": 1,
                     "description": (
-                        "Ordered action/listen/if/loop/transform steps. Minimal"
+                        "Ordered action/waitEvent/readEvents/store/if/loop/"
+                        "transform steps. Minimal"
                         " example: [{\"action\":\"Page.getState\","
                         "\"purpose\":\"Confirm current page\"}]."
                     ),
                     "items": {"$ref": "#/$defs/workflowStep"},
                 },
-                "timeout": {"type": "integer", "minimum": 1000, "maximum": 600000},
-                "stepTimeout": {"type": "integer", "minimum": 1000, "maximum": 60000},
-                "errorConfig": {
-                    "type": "object",
-                    "properties": {
-                        "onError": {
-                            "type": "string",
-                            "enum": ["stop", "continue", "retry"],
-                        },
-                        "maxRetries": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "maximum": 10,
-                        },
-                        "retryDelay": {
-                            "type": "integer",
-                            "minimum": 100,
-                            "maximum": 30000,
-                        },
-                        "backoffMultiplier": {
-                            "type": "number",
-                            "minimum": 1,
-                            "maximum": 5,
-                        },
-                        "maxBackoffDelay": {
-                            "type": "integer",
-                            "minimum": 1000,
-                            "maximum": 60000,
-                        },
-                    },
-                    "additionalProperties": False,
+                # Workflow.execute declares exactly description/steps/
+                # variables/pageId/fleetId/timeout. Its action schema is not
+                # strict, so `stepTimeout` and `errorConfig` used to be offered
+                # here, travelled, and were dropped in silence: a live probe
+                # sent stepTimeout=1000 against a step that then ran 5005 ms.
+                # Per-step bounds live on waitEvent.timeout alone.
+                "timeout": {
+                    "type": "integer",
+                    "minimum": 1000,
+                    "maximum": 600000,
+                    "description": (
+                        "Total workflow budget in ms. There is no per-step"
+                        " timeout and no retry config; a step that must not"
+                        " run long needs its own waitEvent timeout."
+                    ),
                 },
             },
-            "required": ["pageId", "fleetId", "description", "variables", "steps", "timeout", "stepTimeout"],
+            "required": ["pageId", "fleetId", "description", "variables", "steps", "timeout"],
             "additionalProperties": False,
         },
         "navigate_verified": {
