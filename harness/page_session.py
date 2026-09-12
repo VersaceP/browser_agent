@@ -43,6 +43,7 @@ not a substitute for looking.
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -179,17 +180,194 @@ def _scrub(entry: JsonDict, method: str, params: JsonDict) -> JsonDict:
     return redact_values(entry, secrets) if secrets else entry
 
 
+WORKFLOW_METHOD = "Workflow.execute"
+
+# `stepPath` as the platform reports it: "steps[4]", or "steps[0].body[2]" once
+# a loop or condition nests one.
+_STEP_PATH_SEGMENT = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\[(\d+)\]")
+
+
+def _resolve_step_path(params: JsonDict, step_path: str) -> Optional[JsonDict]:
+    """Walk one reported stepPath back to the step the model actually authored.
+
+    The execution trace says WHAT happened and with what outcome; only the
+    authored step says what it was FOR. Both halves are needed, so the path is
+    the join key between them.
+    """
+    segments = _STEP_PATH_SEGMENT.findall(str(step_path or ""))
+    if not segments:
+        return None
+    node: Any = params
+    for key, index in segments:
+        if not isinstance(node, dict):
+            return None
+        container = node.get(key)
+        if not isinstance(container, list):
+            return None
+        position = int(index)
+        if position >= len(container):
+            return None
+        node = container[position]
+    return node if isinstance(node, dict) else None
+
+
+def _dereference(value: Any, variables: Any) -> str:
+    """Resolve a `$vars.x` reference, or report nothing rather than the reference.
+
+    A workflow may fill a field from a variable, and `"$vars.companyName"` is
+    useless to the next worker - worse than useless, because it reads like a
+    value. Resolve it when the end-state variables carry it, otherwise say
+    nothing: an absent value is honest, an unresolved one is not.
+    """
+    text = str(value if value is not None else "").strip()
+    if not text.startswith("$"):
+        return text
+    name = text[len("$vars."):] if text.startswith("$vars.") else ""
+    if name and isinstance(variables, dict) and name in variables:
+        resolved = variables[name]
+        if isinstance(resolved, (str, int, float, bool)):
+            return str(resolved)
+    return ""
+
+
+def _action_entry(
+    method: str,
+    params: JsonDict,
+    *,
+    purpose: str,
+    worker_id: str,
+    phase_id: str,
+    step: Any,
+    variables: Any = None,
+) -> Optional[JsonDict]:
+    """One page-session row, or None when this call is not worth recording."""
+    is_value = method in VALUE_METHODS or method == SELECT_METHOD
+    if not (is_value or method in ACTION_METHODS or method in NAVIGATION_METHODS):
+        return None
+    if purpose.startswith(RECOVERY_PURPOSE_PREFIXES):
+        return None
+    entry: JsonDict = {
+        "method": method,
+        "purpose": purpose,
+        "workerId": str(worker_id or ""),
+    }
+    if isinstance(step, int):
+        entry["step"] = step
+    if phase_id:
+        entry["phaseId"] = str(phase_id)
+    if method == SELECT_METHOD:
+        entry["value"] = _selected_value(params)
+    elif method in VALUE_METHODS:
+        entry["value"] = _text(
+            _dereference(params.get(VALUE_METHODS[method]), variables),
+            MAX_VALUE_CHARS,
+        )
+    elif method in NAVIGATION_METHODS:
+        entry["url"] = _text(
+            _dereference(params.get("url") or params.get("direction"), variables), 300,
+        )
+    return _scrub(entry, method, params)
+
+
+def _file_entry(session: JsonDict, entry: JsonDict, *, failed: bool) -> None:
+    method = str(entry.get("method") or "")
+    if failed:
+        session["failedPaths"].append(entry)
+    elif method in NAVIGATION_METHODS:
+        session["navigations"].append(entry)
+        if entry.get("url"):
+            session["url"] = entry["url"]
+    elif method in VALUE_METHODS or method == SELECT_METHOD:
+        session["filledValues"].append(entry)
+    else:
+        session["completedActions"].append(entry)
+
+
+def _segment_steps(item: JsonDict) -> List[Tuple[JsonDict, str, bool, str]]:
+    """The state-changing actions a segment actually ran, with their outcomes.
+
+    Why this exists: a segment's actions never appear as their own trace calls.
+    Run f56d50f0 executed 17 state-changing actions inside workflows and only 4
+    as direct calls, so reading the top-level method alone captured 19% of what
+    the page had been through - and missed the one `Input.type` that filled the
+    form's date, which is why `filledValues` came out empty on a run that
+    demonstrably filled six controls.
+
+    The outcome comes from the harness's own recorded execution trace rather
+    than from the authored list: a step inside a loop or a condition may run
+    many times or not at all, so authoring proves nothing about execution.
+    """
+    params = item.get("params")
+    result = item.get("result")
+    if not isinstance(params, dict) or not isinstance(result, dict):
+        return []
+    execution = result.get("executionTrace")
+    if not isinstance(execution, dict):
+        return []
+    steps = execution.get("steps")
+    if not isinstance(steps, list):
+        return []
+    variables = execution.get("variablesAtEnd")
+    default_page = str(params.get("pageId") or "").strip()
+    out: List[Tuple[JsonDict, str, bool, str]] = []
+    for record in steps:
+        if not isinstance(record, dict) or record.get("stepType") != "action":
+            continue
+        authored = _resolve_step_path(params, str(record.get("stepPath") or ""))
+        if authored is None:
+            continue
+        method = str(record.get("action") or authored.get("action") or "")
+        action_params = authored.get("params")
+        if not isinstance(action_params, dict):
+            action_params = {}
+        page_id = str(action_params.get("pageId") or default_page).strip()
+        if not page_id:
+            continue
+        # Workflow steps carry `purpose` on the step; a direct call carries it
+        # in params. Accept both so the label survives either authoring shape.
+        purpose = _text(
+            authored.get("purpose") or action_params.get("purpose"),
+            MAX_PURPOSE_CHARS,
+        )
+        entry = _action_entry(
+            method, action_params, purpose=purpose,
+            worker_id="", phase_id="", step=item.get("step"),
+            variables=variables,
+        )
+        if entry is None:
+            continue
+        failed = str(record.get("status") or "") == "error"
+        out.append((
+            entry, page_id, failed,
+            _text(record.get("errorCode"), 80) if failed else "",
+        ))
+    return out
+
+
 def extract_page_sessions(
     trace: Any,
     *,
     worker_id: str,
     phase_id: str = "",
 ) -> Dict[str, JsonDict]:
-    """Group one worker's state-changing calls by the page they acted on."""
+    """Group one worker's state-changing actions by the page they acted on.
+
+    Covers both shapes an action can reach the page in: a direct browser call,
+    and a step inside an `execute_browser_workflow` segment. With segments as
+    the preferred route for form work, reading only the direct calls would miss
+    most of what happened.
+    """
 
     sessions: Dict[str, JsonDict] = {}
     if not isinstance(trace, list):
         return sessions
+
+    def touch(page_id: str) -> JsonDict:
+        session = sessions.setdefault(page_id, _empty_session(page_id))
+        if worker_id and worker_id not in session["workers"]:
+            session["workers"].append(str(worker_id))
+        return session
+
     for item in trace:
         if not isinstance(item, dict) or item.get("type") != "browser_call":
             continue
@@ -197,47 +375,30 @@ def extract_page_sessions(
         params = item.get("params")
         if not isinstance(params, dict):
             continue
+        if method == WORKFLOW_METHOD:
+            for entry, page_id, failed, error_code in _segment_steps(item):
+                entry["workerId"] = str(worker_id or "")
+                if phase_id:
+                    entry["phaseId"] = str(phase_id)
+                if failed:
+                    entry["errorCode"] = error_code
+                _file_entry(touch(page_id), entry, failed=failed)
+            continue
         page_id = str(params.get("pageId") or "").strip()
         if not page_id:
             continue
-        is_value = method in VALUE_METHODS or method == SELECT_METHOD
-        if not (is_value or method in ACTION_METHODS or method in NAVIGATION_METHODS):
+        entry = _action_entry(
+            method, params,
+            purpose=_text(params.get("purpose"), MAX_PURPOSE_CHARS),
+            worker_id=worker_id, phase_id=phase_id, step=item.get("step"),
+        )
+        if entry is None:
             continue
-        purpose = _text(params.get("purpose"), MAX_PURPOSE_CHARS)
-        if purpose.startswith(RECOVERY_PURPOSE_PREFIXES):
-            continue
-        session = sessions.setdefault(page_id, _empty_session(page_id))
-        if worker_id and worker_id not in session["workers"]:
-            session["workers"].append(str(worker_id))
-        entry: JsonDict = {
-            "method": method,
-            "purpose": purpose,
-            "workerId": str(worker_id or ""),
-        }
-        step = item.get("step")
-        if isinstance(step, int):
-            entry["step"] = step
-        if phase_id:
-            entry["phaseId"] = str(phase_id)
-        if method == SELECT_METHOD:
-            entry["value"] = _selected_value(params)
-        elif method in VALUE_METHODS:
-            entry["value"] = _text(params.get(VALUE_METHODS[method]), MAX_VALUE_CHARS)
-        elif method in NAVIGATION_METHODS:
-            entry["url"] = _text(params.get("url") or params.get("direction"), 300)
-        entry = _scrub(entry, method, params)
         result = item.get("result")
-        if _entry_failed(result):
+        failed = _entry_failed(result)
+        if failed:
             entry["errorCode"] = _entry_error_code(result)
-            session["failedPaths"].append(entry)
-        elif method in NAVIGATION_METHODS:
-            session["navigations"].append(entry)
-            if entry.get("url"):
-                session["url"] = entry["url"]
-        elif is_value:
-            session["filledValues"].append(entry)
-        else:
-            session["completedActions"].append(entry)
+        _file_entry(touch(page_id), entry, failed=failed)
     return sessions
 
 
