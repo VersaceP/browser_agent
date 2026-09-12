@@ -1201,10 +1201,14 @@ async def _browser_execute_selected_skill(ctx: ToolContext) -> JsonDict:
     name="execute_browser_workflow",
     description=(
         "Execute a temporary browser-only ABCP workflow after recursive harness"
-        " validation. Use it only when the complete action sequence and simple"
-        " data dependencies are known in advance. It cannot call harness-local"
-        " tools or Runtime.evaluate, and navigation must be followed by"
-        " Page.loaded, Page.getState, and DOM.getAXTree."
+        " validation. Use it when the upcoming actions are decided — including"
+        " targets whose ids are not known yet but a step inside the segment can"
+        " resolve: read DOM.getAXTree, transform-search that reading, and act"
+        " on what it found. It cannot call harness-local tools or"
+        " Runtime.evaluate, and navigation must be followed by Page.loaded,"
+        " Page.getState, and DOM.getAXTree. End the segment at the next point"
+        " that needs exploration, a screenshot judgment, or a decision you"
+        " cannot express mechanically; use single browser_call steps there."
     ),
     input_schema=_browser_schema_for("execute_browser_workflow"),
     contract_check=True,

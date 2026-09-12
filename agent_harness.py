@@ -464,7 +464,41 @@ def _deferred_tool_result(
     *,
     after_tool_call: JsonDict,
     reason: str,
+    workflow_enabled: bool = False,
 ) -> JsonDict:
+    """Tell the model what to do with a call that was not dispatched.
+
+    A browser action can invalidate the handles of everything queued behind it,
+    so only the first one in a batch runs. Telling the model to "regenerate this
+    call next turn" is correct but expensive: task de60b7f4 spent 10 of its 58
+    steps re-issuing clicks that had been deferred this way, including two
+    independent checkboxes that could never have invalidated each other.
+
+    When Workflow execution is available there is a cheaper answer than a turn
+    per deferred call: submit the sequence as one segment and let the platform
+    run it in order, stopping at the first failure. That advice is only offered
+    for browser work — a deferred harness-local tool has nothing to do with it.
+    """
+    deferred_tool = str(tool_call.get("name") or "")
+    browser_side = deferred_tool in {"browser_call", "navigate_verified"}
+    if workflow_enabled and browser_side:
+        instruction = (
+            "This call was NOT dispatched: the preceding browser action may have"
+            " changed the page, so anything queued behind it is held back."
+            " Re-issuing one call per turn is the expensive way to recover."
+            " If the remaining actions are a sequence you have already decided"
+            " on, submit them as ONE execute_browser_workflow segment instead:"
+            " the platform runs them in order against the live page and stops at"
+            " the first failure, and the receipt reports which steps ran. Re-read"
+            " the preceding result first — if the next action genuinely depends"
+            " on what that result revealed (a newly rendered option, a fresh"
+            " canonical id), keep it as a single call in the next turn."
+        )
+    else:
+        instruction = (
+            "Inspect the preceding tool result and regenerate this call in"
+            " the next model turn with fresh page state and handles."
+        )
     return {
         "type": "tool_result",
         "tool_use_id": tool_call.get("id"),
@@ -474,10 +508,7 @@ def _deferred_tool_result(
             "deferredTool": tool_call.get("name"),
             "afterTool": after_tool_call.get("name"),
             "reason": reason,
-            "next_instruction": (
-                "Inspect the preceding tool result and regenerate this call in"
-                " the next model turn with fresh page state and handles."
-            ),
+            "next_instruction": instruction,
         }, ensure_ascii=False),
     }
 
@@ -1862,17 +1893,24 @@ class BrowserAgent:
                             if should_stop
                             else "preceding_tool_may_change_browser_state"
                         )
+                        batch_workflow_enabled = workflow_execution_enabled(self)
                         for deferred in tool_calls[tool_index + 1:]:
                             tool_results.append(_deferred_tool_result(
                                 deferred,
                                 after_tool_call=tool_call,
                                 reason=reason,
+                                workflow_enabled=batch_workflow_enabled,
                             ))
                         self.logger.write("tool_batch.deferred", {
                             "step": step,
                             "afterTool": tool_call.get("name"),
                             "reason": reason,
                             "deferredCount": len(tool_calls) - tool_index - 1,
+                            "deferredTools": [
+                                str(item.get("name") or "")
+                                for item in tool_calls[tool_index + 1:]
+                            ],
+                            "segmentAdviceOffered": batch_workflow_enabled,
                         })
                     if should_stop:
                         final_answer = result.get("answer", "")
@@ -2596,7 +2634,82 @@ class BrowserAgent:
             " validated workflow-backed skill or a policy-valid authored"
             " workflow; otherwise use the disclosed SKILL.md guidance, ordinary"
             " browser_call, and Harness composites. Never reconstruct hidden"
-            " workflow.json steps from prose."
+            " workflow.json steps from prose.\n"
+            "- Prefer execute_browser_workflow over a run of single browser_call"
+            " steps whenever the next few actions are already decided. Submit"
+            " ONE SEGMENT: the actions from here up to the next point where you"
+            " genuinely need to look before deciding. The end of a segment is"
+            " where you regain control, so you never need a mid-workflow escape"
+            " hatch — if you cannot predict what comes next, end the segment"
+            " there and read the receipt.\n"
+            "  * Choosing between the two is about where the next decision"
+            " lives, not about step counts. Single browser_call: exploring an"
+            " unfamiliar page, judging a screenshot, or diagnosing/recovering"
+            " from a failed segment. Workflow segment: the upcoming actions are"
+            " decided — INCLUDING when their target ids are not known yet but a"
+            " step inside the segment can resolve them (see the next bullet on"
+            " click → read → search → act). A lone action needs no segment, and"
+            " a segment is never worth stretching just to avoid single calls.\n"
+            "  * Keep every step's onError at its default stop, so a wrong turn"
+            " halts instead of running the rest of the segment against a page"
+            " that is no longer what you assumed.\n"
+            "  * Put any irreversible action (submitting, sending, purchasing,"
+            " deleting) in its OWN segment, after a segment that has already"
+            " confirmed the preconditions. Never bundle one behind actions whose"
+            " outcome you have not seen.\n"
+            "  * After Page.navigate/reload/go, settle with a waitEvent step on"
+            " Page.loaded (or Page.loadFailed), then Page.getState, then"
+            " DOM.getAXTree. A waitEvent sees only what follows the preceding"
+            " Action — the engine advances its cursor past that Action's own"
+            " event window — but a real page load fires after navigate returns,"
+            " so waitEvent settles it. Use a readEvents step for events that may"
+            " already have fired inside the Action's window; it returns"
+            " immediately instead of waiting.\n"
+            "  * A waitEvent that times out is NOT a failure: it returns"
+            " timedOut with no events and the segment continues. So never wait"
+            " on an event the page may not emit — you would burn the whole"
+            " timeout and then act on nothing. Only the events in the step"
+            " schema's focus enum are accepted.\n"
+            "  * A control whose options only appear after you open it is"
+            " still ONE segment: click it, read DOM.getAXTree, search that"
+            " reading with a transform, then act on what you found. References"
+            " resolve against $last (the immediately preceding step's result),"
+            " $cache, $store and $vars.NAME — there is no $steps[N], so the"
+            " transform must sit directly after the read. Chain the middle three"
+            " to walk a cascade. This is front-end agnostic because the search"
+            " runs over the tree you just captured and matches what a person"
+            " reads, not a class name.\n"
+            "  * Make that pattern match exactly ONE line. A bare label is"
+            " rarely unique — the same text sits on the control, on its label,"
+            " and in any heading mentioning it. Use mode regex and require the"
+            " role, the full quoted accessible name and the bracketed state"
+            " together, reading the role off the tree you are holding rather"
+            " than assuming one. find reports neither failure mode: no match"
+            " yields an empty string that breaks some later step instead of"
+            " naming the bad pattern, and several matches silently take the"
+            " first. So END such a segment with a read that shows the effect,"
+            " and check it in the receipt. Do not guard the acting step with an"
+            " if that skips on empty — a skipped step makes the segment succeed"
+            " having done nothing; let it fail and read variablesAtFailure to"
+            " see which variable came back empty.\n"
+            "  * Stop the segment at the point a decision needs eyes. A"
+            " screenshot cannot be judged inside a workflow, so end there, look,"
+            " and submit the next segment.\n"
+            "  * Read values you want to verify into variables with extract, and"
+            " accumulate collected rows with a store step (op append). Both come"
+            " back in the receipt. Anything you must not lose, extract or store"
+            " BEFORE the step that might fail: a failed segment hands back"
+            " variables but not the store.\n"
+            "  * A failed segment returns failedStepPath, failedErrorCode,"
+            " completedSteps and variablesAtFailure — the state as of the"
+            " failure, not a guess. Decide from it: rerun the whole segment"
+            " (read-only work whose starting point still holds), rerun with the"
+            " remaining inputs, build a continuation segment, or drop back to"
+            " single calls to explore. Do not slice a segment at failedStepPath"
+            " mechanically: a step inside a loop or branch carries iteration"
+            " state and variable setup that a bare tail would lose. Anything the"
+            " failed segment already dispatched has happened — re-running it"
+            " repeats it."
             if workflow_enabled
             else
             "- ABCP Workflow execution is runtime-gated and currently disabled."
