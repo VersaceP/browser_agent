@@ -531,11 +531,12 @@ async def _execute_browser_capability_tool(
     page_create_should_stop = False
     hitl_pause_succeeded = False
     page_list_shown: Optional[List[JsonDict]] = None
-    # See the note on the same construct in _invoke_browser_method: a blocked
-    # Workflow.execute holds the client's _call_lock, so its Workflow.progress
-    # stream on the notification channel is the only record of what ran. This
-    # is the model-facing dispatch, which reaches the same platform call by a
-    # different route and therefore needs its own observer.
+    # See the note on the same construct in _invoke_browser_method: a
+    # Workflow.execute answers once at the end and its failure envelope keeps
+    # almost nothing, so the Workflow.progress notification stream is the only
+    # record of what ran. This is the model-facing dispatch, which reaches the
+    # same platform call by a different route and therefore needs its own
+    # observer.
     exec_observer = (
         ExecObserver(
             agent.browser, page_id=str(params.get("pageId") or "") or None
@@ -1346,10 +1347,10 @@ async def _invoke_browser_method(
     if hitl_claim_guard is not None:
         return hitl_claim_guard
     hitl_pause_succeeded = False
-    # A Workflow.execute holds the client's single _call_lock for its whole run,
-    # so nothing can be asked about it while it is in flight. Its
-    # Workflow.progress events, however, arrive on the notification channel,
-    # which is demultiplexed off the background reader independent of the lock.
+    # A Workflow.execute answers only once, when the run is over, and on
+    # failure that answer carries neither results nor variables. Its
+    # Workflow.progress events, however, arrive on the notification channel
+    # while the run is still going, demultiplexed off the background reader.
     # That stream is the ONLY place the workflowId, the completed steps and the
     # failure-time variable values exist when the call raises: the -32005 error
     # carries just a step path, and getStatus (which needs a workflowId to begin

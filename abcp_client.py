@@ -301,6 +301,15 @@ def _is_local_ws_url(ws_url: str) -> bool:
     return host in {"localhost", "127.0.0.1", "::1"}
 
 
+@dataclass
+class _PendingCall:
+    """One RPC awaiting its answer, keyed in ABCPClient._pending by request id."""
+
+    future: "asyncio.Future[JsonDict]"
+    method: str
+    request_id: str
+
+
 class ABCPClient:
     def __init__(
         self,
@@ -311,15 +320,20 @@ class ABCPClient:
         self.on_event = on_event
         self._ws: Any = None
         self._reader_task: Optional[asyncio.Task] = None
-        # The server still does not reliably echo client-side request ids
-        # (responses can arrive shaped as observation/data/taskId only); we
-        # therefore only allow one RPC in flight at a time and route the next
-        # response-shaped message to it. The notification hub demultiplexes
-        # everything else.
-        self._call_lock = asyncio.Lock()
-        self._pending_call: Optional["asyncio.Future[JsonDict]"] = None
-        self._pending_request_id: Optional[str] = None
-        self._pending_method: Optional[str] = None
+        # Responses are routed by the id we sent, and by nothing else. Probed
+        # against the live panel on 2026-09-12: 17 of 17 calls across System,
+        # Fleet, Page, DOM and Workflow echoed the request id, error envelopes
+        # included, and not one response arrived without one.
+        #
+        # The shape fallback this replaces ("the next response-shaped message
+        # belongs to the call in flight") needed a global lock to be safe, and
+        # was unsafe anyway the moment anything arrived out of order. The same
+        # probe sent five requests without waiting and the platform answered
+        # them in a different order than they were sent, so the fallback was
+        # one late or reordered response away from handing a caller someone
+        # else's result. A response that matches no pending id is now reported
+        # as an orphan instead of being delivered to whoever is waiting.
+        self._pending: Dict[str, "_PendingCall"] = {}
         self._closed = False
         self._reader_failure: Optional[BaseException] = None
         self.notifications = NotificationHub()
@@ -381,14 +395,16 @@ class ABCPClient:
                 pass
             self._reader_task = None
         self.notifications.close()
-        pending = self._pending_call
-        if pending is not None and not pending.done():
-            pending.set_exception(ABCPTransportError(
-                "WebSocket closed",
-                transport_code=ABCP_TRANSPORT_CLOSED,
-                connection_fatal=not self._closed,
-                request_sent=True,
-            ))
+        for entry in list(self._pending.values()):
+            if not entry.future.done():
+                entry.future.set_exception(ABCPTransportError(
+                    "WebSocket closed",
+                    rpc_method=entry.method,
+                    transport_code=ABCP_TRANSPORT_CLOSED,
+                    connection_fatal=not self._closed,
+                    request_sent=True,
+                ))
+        self._pending.clear()
         if self._ws is not None:
             try:
                 await self._ws.close()
@@ -440,39 +456,36 @@ class ABCPClient:
         # in its own feedback fields.
         secrets = _redactors()[0](params or {}, redact_params)
 
-        async with self._call_lock:
-            loop = asyncio.get_running_loop()
-            future: "asyncio.Future[JsonDict]" = loop.create_future()
-            self._pending_call = future
-            self._pending_request_id = request_id
-            self._pending_method = method
+        loop = asyncio.get_running_loop()
+        future: "asyncio.Future[JsonDict]" = loop.create_future()
+        self._pending[request_id] = _PendingCall(
+            future=future, method=method, request_id=request_id,
+        )
+        try:
+            self._emit("request", payload, secrets)
             try:
-                self._emit("request", payload, secrets)
-                try:
-                    await self._ws.send(json.dumps(payload, ensure_ascii=False))
-                except Exception as exc:
-                    raise ABCPTransportError(
-                        f"WebSocket send failed for {method}: {exc}",
-                        rpc_method=method,
-                        transport_code=ABCP_TRANSPORT_SEND_FAILED,
-                        connection_fatal=True,
-                        request_sent=None,
-                    ) from exc
-                try:
-                    raw_response = await asyncio.wait_for(
-                        future, timeout=self.config.call_timeout_seconds
-                    )
-                except asyncio.TimeoutError as exc:
-                    raise ABCPTransportError(
-                        f"Call to {method} timed out ({self.config.call_timeout_seconds}s)",
-                        rpc_method=method,
-                        transport_code=ABCP_TRANSPORT_CALL_TIMEOUT,
-                        request_sent=True,
-                    ) from exc
-            finally:
-                self._pending_call = None
-                self._pending_request_id = None
-                self._pending_method = None
+                await self._ws.send(json.dumps(payload, ensure_ascii=False))
+            except Exception as exc:
+                raise ABCPTransportError(
+                    f"WebSocket send failed for {method}: {exc}",
+                    rpc_method=method,
+                    transport_code=ABCP_TRANSPORT_SEND_FAILED,
+                    connection_fatal=True,
+                    request_sent=None,
+                ) from exc
+            try:
+                raw_response = await asyncio.wait_for(
+                    future, timeout=self.config.call_timeout_seconds
+                )
+            except asyncio.TimeoutError as exc:
+                raise ABCPTransportError(
+                    f"Call to {method} timed out ({self.config.call_timeout_seconds}s)",
+                    rpc_method=method,
+                    transport_code=ABCP_TRANSPORT_CALL_TIMEOUT,
+                    request_sent=True,
+                ) from exc
+        finally:
+            self._pending.pop(request_id, None)
 
         if "error" in raw_response and not self._is_implicit_error_envelope(raw_response):
             self._emit("response", raw_response, secrets)
@@ -554,56 +567,61 @@ class ABCPClient:
             )
 
     def _dispatch_message(self, message: JsonDict) -> None:
-        if self._is_response_for_pending(message):
-            future = self._pending_call
-            if future is not None and not future.done():
-                future.set_result(message)
+        entry = self._pending_for(message)
+        if entry is not None:
+            if not entry.future.done():
+                entry.future.set_result(message)
             else:
-                # No one is waiting; treat as orphan (still log).
+                # The caller already gave up (timeout); the answer is late.
                 self._emit("orphan_response", message)
+            return
+        if self._looks_like_response(message):
+            # Response-shaped but matching no pending id: a late answer to a
+            # call that already timed out, or a reply the platform sent without
+            # echoing an id. Either way it belongs to nobody, and guessing an
+            # owner is exactly the cross-talk this routing exists to prevent.
+            # It is emitted rather than dropped so that "the platform stopped
+            # echoing ids" shows up in the transport log instead of as calls
+            # mysteriously timing out.
+            self._emit("orphan_response", message)
             return
         self._emit("notify", message)
         self.notifications.publish_once(message)
 
-    def _is_response_for_pending(self, message: JsonDict) -> bool:
-        if self._pending_call is None:
-            return False
-        if self._pending_call.done():
-            return False
-        if not isinstance(message, dict):
-            return False
-
-        # JSON-RPC notifications always carry a "method" field and never an
-        # id; reject them up-front so the dispatcher never confuses an
-        # unsolicited notification for the in-flight response.
+    def _pending_for(self, message: JsonDict) -> Optional["_PendingCall"]:
+        """The in-flight call this message answers, matched by id alone."""
+        if not isinstance(message, dict) or not self._pending:
+            return None
+        # A JSON-RPC notification carries a method and no id. Reject it here so
+        # a notification can never be mistaken for somebody's response.
         if "method" in message and "id" not in message:
-            return False
+            return None
         if message.get("type") == "notification":
+            return None
+        for key in ("id", "requestId", "correlationId"):
+            value = message.get(key)
+            if isinstance(value, str) and value in self._pending:
+                return self._pending[value]
+        return None
+
+    @staticmethod
+    def _looks_like_response(message: JsonDict) -> bool:
+        """Whether an unmatched message is shaped like somebody's answer.
+
+        Used only to decide between the `orphan_response` and `notify`
+        channels. It never selects an owner -- that is what routing by id is
+        for -- so a wrong guess here costs a log line, not a wrong result.
+        """
+        if not isinstance(message, dict) or "method" in message:
             return False
-
-        id_candidates = (
-            message.get("id"),
-            message.get("requestId"),
-            message.get("correlationId"),
-        )
-        if self._pending_request_id and self._pending_request_id in id_candidates:
-            return True
-
-        if self.config.request_shape.lower() == "jsonrpc":
-            # Strict jsonrpc shape: still allow ABCP's response-only-by-shape
-            # quirk because the server does not always echo the client id.
-            pass
-
         if message.get("type") in {"response", "result", "error"}:
             return True
         if "result" in message or "error" in message:
             return True
-
-        # ABCP UI returns responses as observation/data/taskId objects with no
-        # client-side id. With only one call in flight at a time (enforced by
-        # _call_lock), the next response-shaped message is the answer.
-        response_keys = {"observation", "suggested_prompt", "data", "taskId"}
-        return bool(response_keys.intersection(message.keys())) and "method" not in message
+        return bool(
+            {"observation", "suggested_prompt", "data", "taskId"}
+            .intersection(message.keys())
+        )
 
     def _is_implicit_error_envelope(self, message: JsonDict) -> bool:
         """ABCP sometimes returns successful payloads that happen to have an
@@ -614,14 +632,16 @@ class ABCPClient:
         return not isinstance(err, dict)
 
     def _fail_pending(self, exc: BaseException) -> None:
-        future = self._pending_call
-        if future is not None and not future.done():
+        """Fail every in-flight call. The transport is gone for all of them."""
+        for entry in list(self._pending.values()):
+            if entry.future.done():
+                continue
             if isinstance(exc, ABCPTransportError):
-                future.set_exception(exc)
+                entry.future.set_exception(exc)
             else:
-                future.set_exception(ABCPTransportError(
+                entry.future.set_exception(ABCPTransportError(
                     str(exc) or "transport failure",
-                    rpc_method=str(self._pending_method or ""),
+                    rpc_method=entry.method,
                     transport_code=ABCP_TRANSPORT_READER_FAILED,
                     connection_fatal=True,
                     request_sent=True,

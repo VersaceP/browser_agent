@@ -1176,9 +1176,12 @@ class HarnessConfig:
     # 复审（/skill-create --recheck），永不禁用/否决。纯被动记账，默认开。
     skill_guidance_signal_enabled: bool = True
     # Open a SECOND ABCP connection (control channel) so the harness can issue
-    # control calls (Workflow.pause/resume, Hitl.*) WHILE the primary connection is
-    # blocked inside a skill's Workflow.execute — the single primary _call_lock makes
-    # in-band control impossible. When a challenge/pause is observed mid-execute, the
+    # control calls (Workflow.pause/resume, Hitl.*) WHILE a skill's Workflow.execute
+    # is still running. The original blocker — the primary client's global call lock
+    # — was removed on 2026-09-12, so in-band control is no longer impossible; what
+    # remains is that Workflow.pause/resume are session-bound to the run's owner.
+    # This has NOT been retested since the lock came out. When a challenge/pause is
+    # observed mid-execute, the
     # control channel actively pauses → resolves (human/VL) → resumes the workflow,
     # so it finishes its remaining steps instead of handing off. Default OFF:
     # cross-connection runId/page reachability is panel-unverified; any control

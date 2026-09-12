@@ -1,10 +1,14 @@
 """harness.observation.exec_observer — execution trace for a blocked Workflow.execute.
 
-While `Workflow.execute` is in flight the ABCPClient `_call_lock` is held, so no
-other RPC can be issued on that connection (see harness/skill/pause.py).
-Notifications are the exception: the NotificationHub demultiplexes them off the
-background reader, independent of the lock. This module turns that one live
-channel into the execution record.
+A `Workflow.execute` answers only once, at the end, and its failure envelope
+carries almost nothing. The per-step record exists solely in the
+`Workflow.progress` notification stream, which the NotificationHub demultiplexes
+off the background reader while the call is still in flight. This module turns
+that one live channel into the execution record.
+
+(Before 2026-09-12 this was also the only channel available at all, because the
+client held a global call lock for the duration. The lock is gone; the reason
+this module exists is not.)
 
 It is not an optimization. Live probe 2026-09-11
 (docs/workflow-execute-live-contract.md) established three facts that make it
@@ -105,7 +109,7 @@ class ExecObserver:
     """Observe-only NotificationHub subscriber for one Workflow.execute.
 
     Safe to run while the call is blocked: subscribers fire off the background
-    reader, never through `_call_lock`. Never raises — an observer that breaks
+    reader, never through a call. Never raises — an observer that breaks
     execution is worse than one that records nothing.
     """
 

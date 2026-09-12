@@ -1,8 +1,11 @@
 """harness.skill.control — active PAGE-level control during a blocked Workflow.execute.
 
-The primary ABCPClient serializes every call behind one `_call_lock`, so while a
-skill's `Workflow.execute` is blocked, the owning connection cannot issue control
-calls. To *drive* a resolution mid-execute we open a SECOND ABCP connection.
+To *drive* a resolution mid-execute we open a SECOND ABCP connection. The
+original reason was the primary client's global call lock, removed 2026-09-12 —
+the primary can now issue control calls while a `Workflow.execute` is in flight.
+Whether that makes this second connection unnecessary is a separate question the
+probe below already half-answers, and it has NOT been retested since the lock
+came out.
 
 LIVE-VERIFIED cross-connection semantics (2026-06-27, three-connection probe):
   - `Workflow.pause/resume/getStatus(runId)` are **session-bound**: from any
@@ -203,7 +206,7 @@ class ControlChannel:
 
 
 async def _await_notification_onset(primary: Any, page_id: str, timeout: float) -> Optional[Dict[str, Any]]:
-    """Wait (via the primary's notification hub, which bypasses _call_lock) for a
+    """Wait (via the primary's notification hub, off the background reader) for a
     navigation-level pause/challenge onset for `page_id`. Returns the signal or None."""
     waiter = getattr(primary, "wait_for_notification", None)
     if not callable(waiter):

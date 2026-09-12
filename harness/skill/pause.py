@@ -2,11 +2,13 @@
 
 When a skill's frozen `Workflow.execute` is interrupted by a HITL/challenge
 (Cloudflare, CAPTCHA, a `paused` progress event, an ERR_PAGE_PAUSED step), the
-fast path cannot itself drive the resume: ABCPClient serializes every call behind
-one `_call_lock` with a single `_pending_call`, so while `Workflow.execute` is
-blocked at a paused step NO control call (`Workflow.pause/resume`,
-`Hitl.resolvePause`) can proceed on that connection. Notifications, by contrast,
-are demultiplexed through the NotificationHub independent of the lock.
+fast path cannot itself drive the resume. Until 2026-09-12 the reason was the
+client's global call lock; that lock is gone and the connection now carries
+several calls at once. What remains is the platform rule the three-connection
+probe found: `Workflow.pause/resume/getStatus` are session-bound to the run's
+owner, and the owner is the call still sitting inside `Workflow.execute`.
+Notifications are unaffected either way — the NotificationHub demultiplexes them
+off the background reader.
 
 So P4's contract here is: **observe** the pause (never drive it), classify the run
 as `hitl_required`, and hand the live (paused) page off to the BrowserAgent slow
@@ -87,9 +89,9 @@ def hitl_onset_signal(msg: Dict[str, Any], page_id: str) -> Optional[Dict[str, A
 
 class HitlOnsetMonitor:
     """Observe-only NotificationHub subscriber: records the FIRST pause/challenge
-    onset signal seen for `page_id`. Safe to run concurrently with a blocked
-    `Workflow.execute` (subscribers fire off the background reader, not through
-    `_call_lock`). No-ops gracefully if `browser` has no subscription API."""
+    onset signal seen for `page_id`. Safe to run concurrently with an
+    in-flight `Workflow.execute` — subscribers fire off the background reader,
+    not off any call. No-ops gracefully if `browser` has no subscription API."""
 
     def __init__(self, browser: Any, page_id: str):
         self._browser = browser
