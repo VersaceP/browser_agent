@@ -4067,10 +4067,16 @@ async def _auto_continue_phase(ctx: ToolContext, waited: JsonDict) -> JsonDict:
     Only one completed worker with nothing still pending is eligible. Two
     finished workers is a merge decision, and a live sibling makes a re-spawn a
     concurrency question - both belong to the Lead.
+
+    A Lead that passed `timeout_seconds` asked to have control back at that
+    deadline, and a continuation would run past it. Across every recorded run
+    no wait has ever carried one (0 of 146), so honouring it costs nothing.
     """
     agent = ctx.agent
     limit = _phase_auto_continuation_limit(agent)
     if limit <= 0:
+        return waited
+    if ctx.tool_input.get("timeout_seconds") is not None:
         return waited
     completed = waited.get("completed") if isinstance(waited, dict) else None
     if not isinstance(completed, list) or len(completed) != 1:
