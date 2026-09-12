@@ -182,6 +182,13 @@ def _validated_browser_agent_step_extension_enabled(value: Any) -> bool:
     return value
 
 
+def _validated_agent_mode(value: Any) -> str:
+    mode = str(value or "lead").strip().lower()
+    if mode not in {"lead", "browser"}:
+        raise ValueError("harness.agent_mode must be 'lead' or 'browser'")
+    return mode
+
+
 def _validated_browser_agent_max_extension_steps(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(
@@ -565,6 +572,38 @@ class ClaimExtractorConfig(PlanValidatorConfig):
         )
 
 
+@dataclass
+class TaskClassifierConfig(PlanValidatorConfig):
+    """Small, non-deliberative classifier used by explicit browser mode."""
+
+    enabled: bool = True
+    max_tokens: int = 4096
+
+    def model_config(self) -> ModelConfig:
+        # Classification is a bounded routing lookup.  Inheriting the lead's
+        # thinking/reasoning switches can turn a sub-second call into another
+        # planning pass, so remove every known deliberation parameter.
+        extra_params = {
+            key: value
+            for key, value in (self.extra_params or {}).items()
+            if key not in _REASONING_PARAM_KEYS
+        }
+        extra_params["max_tokens"] = int(self.max_tokens)
+        extra_params["tool_choice"] = "required"
+        extra_params["temperature"] = 0
+        return ModelConfig(
+            provider=self.provider,
+            model_id=self.model_id,
+            api_key=self.api_key,
+            base_url=self.base_url,
+            extra_params=extra_params,
+            llm_api_timeout_seconds=min(self.llm_api_timeout_seconds, 20.0),
+            llm_timeout_max_retries=0,
+            llm_timeout_backoff_seconds=0.0,
+            llm_timeout_retry_interval_seconds=None,
+        )
+
+
 # Spellings different providers use for the same "spend tokens deliberating"
 # switch. Stripped when a read-only lookup inherits an auditor's connection.
 _REASONING_PARAM_KEYS = frozenset({
@@ -873,6 +912,7 @@ class VLConfig:
 
 @dataclass
 class HarnessConfig:
+    agent_mode: str = "lead"
     max_steps: int = 40
     lead_max_steps: int = 40
     worker_max_steps: int = 40
@@ -1241,6 +1281,9 @@ class HarnessConfig:
     @classmethod
     def from_dict(cls, data: JsonDict) -> "HarnessConfig":
         return cls(
+            agent_mode=_validated_agent_mode(
+                data.get("agent_mode", cls.agent_mode)
+            ),
             max_steps=int(data.get("max_steps", cls.max_steps)),
             lead_max_steps=int(data.get("lead_max_steps", cls.lead_max_steps)),
             worker_max_steps=int(data.get("worker_max_steps", cls.worker_max_steps)),
@@ -1733,6 +1776,9 @@ class RuntimeConfig:
     claim_extractor: ClaimExtractorConfig = field(
         default_factory=ClaimExtractorConfig
     )
+    task_classifier: TaskClassifierConfig = field(
+        default_factory=TaskClassifierConfig
+    )
     lead: RoleModelConfig = field(default_factory=RoleModelConfig)
     worker: RoleModelConfig = field(default_factory=RoleModelConfig)
 
@@ -1749,6 +1795,7 @@ _TOP_LEVEL_EXTRA_KEYS = {
     "vl",
     "plan_validator",
     "claim_extractor",
+    "task_classifier",
     "lead",
     "worker",
     "browser",
@@ -1797,6 +1844,11 @@ def audit_config_keys(raw: JsonDict) -> List[str]:
         "claim_extractor",
         raw.get("claim_extractor"),
         _field_names(ClaimExtractorConfig),
+    )
+    check(
+        "task_classifier",
+        raw.get("task_classifier"),
+        _field_names(TaskClassifierConfig),
     )
     top_provider = str(raw.get("provider") or "").strip().lower()
     for _role in ("lead", "worker"):
@@ -1861,6 +1913,9 @@ def load_runtime_config(config_path: str, *, warn: bool = True) -> RuntimeConfig
         ),
         claim_extractor=ClaimExtractorConfig.from_dict(
             raw.get("claim_extractor", {})
+        ),
+        task_classifier=TaskClassifierConfig.from_dict(
+            raw.get("task_classifier", {})
         ),
         lead=RoleModelConfig.from_dict(raw.get("lead", {})),
         worker=RoleModelConfig.from_dict(raw.get("worker", {})),

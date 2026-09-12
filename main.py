@@ -50,6 +50,13 @@ from harness.task_control import (
     prepare_resume_state,
     write_task_state,
 )
+from harness.planning.task_classifier import (
+    classify_browser_task,
+    extract_fleet_reference,
+    synthesize_direct_input,
+)
+from harness.tools.lead_tools import LEAD_TOOLS, _run_direct_worker
+from harness.tools.registry import ToolContext
 from llm import (
     LLMConnectionError,
     LLMEmptyResponseError,
@@ -2233,12 +2240,227 @@ def _confirm_interrupted_replay(
     return answer in {"y", "yes"}
 
 
+_BROWSER_MODE_STATUS_LABELS = {
+    "done": "任务完成",
+    "completed": "任务完成",
+    "validated_done": "任务完成（已验证）",
+    "partial": "部分完成",
+    "incomplete": "未完成",
+    "failed": "失败",
+}
+
+
+def _print_browser_mode_summary(result: JsonDict, task_dir: str) -> None:
+    """Human summary printed before the machine receipt of browser mode.
+
+    The browser-mode CLI result is a machine receipt (an embedding host parses
+    it); a human watching the terminal used to see only that JSON with the
+    actual answer text buried inside string escapes (run a686e03f). Conclusion
+    first, then the answer text, then the concrete next step. Everything
+    printed is taken mechanically from the receipt — no new claims.
+    """
+    if not isinstance(result, dict):
+        return
+    status = str(result.get("status") or "").strip().lower()
+    label = _BROWSER_MODE_STATUS_LABELS.get(status, f"状态 {status or 'unknown'}")
+    worker_status = ""
+    direct_exec = result.get("directExecution")
+    if isinstance(direct_exec, dict):
+        worker_status = str(direct_exec.get("workerStatus") or "").strip()
+    header = f"Browser 模式任务结果: {label}"
+    if worker_status and worker_status not in {status, "done"}:
+        header += f"（worker 终态: {worker_status}）"
+    print(f"\n══ {header} ══", flush=True)
+    answer = str(result.get("answer") or "").strip()
+    if answer:
+        try:
+            parsed = json.loads(answer)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict) and (parsed.get("blockers") or parsed.get("next_steps")):
+            # The synthesized fallback receipt: unwrap its human fields
+            # instead of printing one escaped JSON line.
+            for blocker in parsed.get("blockers") or []:
+                print(f"阻塞: {blocker}", flush=True)
+            for step_text in parsed.get("next_steps") or []:
+                print(f"下一步: {step_text}", flush=True)
+        else:
+            print(answer, flush=True)
+    if status not in {"done", "completed", "validated_done"}:
+        print(
+            f"\n继续: python main.py --resume {task_dir}"
+            " --agent-mode browser --config config.json",
+            flush=True,
+        )
+
+
+def _browser_mode_failure(
+    harness: LeadAgent,
+    *,
+    code: str,
+    error: str,
+    tool_was_executed: bool = False,
+) -> JsonDict:
+    """Single logged exit for every terminal browser-mode abort.
+
+    Run 18daa415 ended on a structured early return that wrote no event at
+    all, leaving run.jsonl with nothing to diagnose beyond an empty usage
+    summary. Every failure exit from browser mode goes through here so a
+    failed run always says why it failed in its own log.
+    """
+    _safe_logger_write(
+        harness.logger,
+        "direct_mode.failed",
+        {
+            "code": code,
+            "error": error,
+            "toolWasExecuted": tool_was_executed,
+        },
+    )
+    return {
+        "status": "failed",
+        "error": error,
+        "code": code,
+        "tool_was_executed": tool_was_executed,
+    }
+
+
+async def _run_browser_mode(
+    harness: LeadAgent,
+    *,
+    task: str,
+    original_task: str,
+    pinned_browser_context: Optional[Dict[str, str]],
+    resume_context: Optional[ResumeContext],
+) -> JsonDict:
+    """Run the explicit browser entry without a Lead model turn.
+
+    LeadAgent remains the shared execution host because the direct worker path
+    uses its coordinator, lifecycle, plan-review and persistence methods.  No
+    ``LeadAgent.run`` call is made here; the only model call is the bounded
+    classifier below, followed by the existing direct-plan handler.
+    """
+    if resume_context is not None:
+        if str(resume_context.instruction or "").strip():
+            return _browser_mode_failure(
+                harness,
+                code="browser_mode_resume_instruction_unsupported",
+                error="browser mode cannot apply a new instruction to a resumed plan",
+            )
+        plan = resume_context.current_plan
+        phases = plan.get("phases") if isinstance(plan, dict) else None
+        if (
+            not isinstance(plan, dict)
+            or plan.get("execution_mode") != "direct_worker"
+            or not isinstance(phases, list)
+            or len(phases) != 1
+        ):
+            return _browser_mode_failure(
+                harness,
+                code="browser_mode_resume_plan_unsupported",
+                error="browser mode resume requires one accepted direct_worker phase",
+            )
+        harness.original_user_task = str(resume_context.original_user_task or task)
+        harness.spawner.root_task = harness.original_user_task
+        await harness._bootstrap_schema_cache()
+        result = await _run_direct_worker(
+            ToolContext(
+                agent=harness,
+                tool_call={"name": "resume_direct_worker", "id": "browser-resume"},
+                tool_input={},
+                step=0,
+            )
+        )
+        return result if isinstance(result, dict) else _browser_mode_failure(
+            harness,
+            code="browser_mode_resume_no_receipt",
+            error="direct resume returned no receipt",
+        )
+
+    fleet_reference, fleet_error = extract_fleet_reference(original_task)
+    if fleet_error:
+        return _browser_mode_failure(
+            harness,
+            code="browser_mode_fleet_reference_ambiguous",
+            error=fleet_error,
+        )
+    if pinned_browser_context and fleet_reference:
+        pinned_fleet = str(pinned_browser_context.get("fleet_id") or "").strip()
+        pinned_lower = pinned_fleet.lower()
+        reference_lower = fleet_reference.lower()
+        same_reference = bool(
+            pinned_fleet
+            and (
+                pinned_lower == reference_lower
+                or pinned_lower.startswith(reference_lower)
+                or reference_lower.startswith(pinned_lower)
+            )
+        )
+        if pinned_fleet and not same_reference:
+            return _browser_mode_failure(
+                harness,
+                code="browser_mode_fleet_reference_conflict",
+                error="task Fleet reference conflicts with explicit --fleet-id",
+            )
+
+    classification, classify_error = await classify_browser_task(
+        original_task, harness.runtime, harness.logger,
+    )
+    if classification is None:
+        return _browser_mode_failure(
+            harness,
+            code="browser_mode_classification_failed",
+            error=classify_error or "browser task classification failed",
+        )
+
+    plan_input = synthesize_direct_input(
+        original_task, classification,
+        fleet_reference if not pinned_browser_context else None,
+    )
+    harness.logger.write("direct_mode.plan_synthesized", {
+        "taskType": classification.get("task_type"),
+        "stageHint": classification.get("stage_hint"),
+        "itemCount": len(classification.get("literal_items") or []),
+        "fleetReferenceSource": "task_text" if fleet_reference else None,
+    })
+    harness.original_user_task = str(original_task or task)
+    harness.spawner.root_task = harness.original_user_task
+    await harness._bootstrap_schema_cache()
+    action = LEAD_TOOLS.get("emit_direct_task_plan")
+    if action is None:
+        return _browser_mode_failure(
+            harness,
+            code="browser_mode_direct_tool_missing",
+            error="emit_direct_task_plan is unavailable",
+        )
+    result = await action.handler(
+        ToolContext(
+            agent=harness,
+            tool_call={"name": "emit_direct_task_plan", "id": "browser-direct"},
+            tool_input=plan_input,
+            step=0,
+        )
+    )
+    return result if isinstance(result, dict) else _browser_mode_failure(
+        harness,
+        code="browser_mode_direct_pipeline_no_receipt",
+        error="browser mode direct pipeline returned no receipt",
+    )
+
+
 async def _run_cli_impl(args: argparse.Namespace) -> int:
     global _CANCELLED_LOGGED, _LAST_LOGGER
 
     _CANCELLED_LOGGED = False
     _LAST_LOGGER = None
     runtime = load_runtime_config(args.config)
+    requested_mode = str(getattr(args, "agent_mode", "") or "").strip().lower()
+    if requested_mode:
+        if requested_mode not in {"lead", "browser"}:
+            print("--agent-mode 必须是 lead 或 browser。")
+            return 2
+        runtime.harness.agent_mode = requested_mode
+    agent_mode = str(getattr(runtime.harness, "agent_mode", "lead") or "lead")
     # Resume helpers run before a logger exists; hand them the configuration
     # that was actually parsed rather than letting them re-guess it.
     configure_resume_storage(
@@ -2494,6 +2716,7 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                 startup_args={
                     "max_steps": getattr(args, "max_steps", None),
                     "has_explicit_browser_pin": bool(pinned_browser_context),
+                    "agent_mode": agent_mode,
                 },
             )
             runtime.harness.runs_dir = str(logger.task_dir)
@@ -2548,10 +2771,12 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                 )
         else:
             print(f"任务已创建: {logger.task_id}", flush=True)
-        print("模式: lead", flush=True)
+        print(f"模式: {agent_mode}", flush=True)
         print(f"任务目录: {logger.task_dir}", flush=True)
         print(f"运行日志: {logger.path}", flush=True)
-        if sys.stdin.isatty():
+        if agent_mode == "browser":
+            print("Browser 模式：先做轻量任务分类，再进入直达 worker。", flush=True)
+        elif sys.stdin.isatty():
             print("开始生成执行计划；确认前不会启动 BrowserAgent。", flush=True)
         else:
             print("开始执行，关键进度会在这里显示。", flush=True)
@@ -2569,9 +2794,37 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                 _terminal_plan_approval if sys.stdin.isatty() else None
             ),
         )
-        answer = await harness.run(task_for_agent)
+        if agent_mode == "browser":
+            browser_result = await _run_browser_mode(
+                harness,
+                task=task_for_agent,
+                original_task=task,
+                pinned_browser_context=pinned_browser_context,
+                resume_context=resume_context,
+            )
+            # Human summary first; the machine receipt JSON follows below and
+            # remains the parseable contract for embedding hosts.
+            _print_browser_mode_summary(
+                browser_result, str(logger.task_dir or ""),
+            )
+            answer = json.dumps(browser_result, ensure_ascii=False, default=str)
+            result_status = str(browser_result.get("status") or "failed").lower()
+            run_status = (
+                "completed"
+                if result_status in {"done", "completed", "validated_done"}
+                else "failed"
+            )
+            if run_status != "completed":
+                exit_code = CLI_ERROR_EXIT_CODE
+        else:
+            answer = await harness.run(task_for_agent)
         terminal_error = getattr(harness, "terminal_error", None)
-        if isinstance(terminal_error, dict):
+        if agent_mode == "browser":
+            # The direct finalizer owns the browser-mode receipt and status;
+            # LeadAgent.final_status is intentionally untouched because no
+            # LeadAgent.run() turn was made.
+            pass
+        elif isinstance(terminal_error, dict):
             run_status = "failed"
             exit_code = LLM_TEMPORARY_FAILURE_EXIT_CODE
             _safe_logger_write(logger, "run.rate_limited", terminal_error)
@@ -2726,6 +2979,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("task", nargs="?", help="要交给浏览器 agent 完成的任务")
     parser.add_argument("--task", dest="task_option", help="要交给浏览器 agent 完成的任务")
     parser.add_argument("--config", default="config.json", help="配置文件路径")
+    parser.add_argument(
+        "--agent-mode",
+        choices=("lead", "browser"),
+        default="",
+        help="执行入口：lead 规划编排，browser 轻量分类后直达单 worker",
+    )
     parser.add_argument("--agent-id", help="覆盖 config.json 中的 browser.agent_id")
     parser.add_argument(
         "--fleet-id",
