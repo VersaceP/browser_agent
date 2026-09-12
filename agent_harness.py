@@ -1946,6 +1946,8 @@ class BrowserAgent:
                                 "</loop_nudge>"
                             ),
                         })
+                    for block in self._consume_reality_check_blocks():
+                        tool_results.append(block)
                     reminder = self._step_cap_reminder_block(
                         current_step=step,
                         max_steps=self.effective_max_steps,
@@ -1956,6 +1958,14 @@ class BrowserAgent:
                 if should_finish:
                     break
 
+            # A background reality check outlives the loop that armed it. Its
+            # verdict is advisory and there is no turn left to deliver it to,
+            # so cancel rather than let the task (and its VL call) run on after
+            # the worker is done.
+            for task in getattr(self, "reality_check_tasks", None) or []:
+                if not task.done():
+                    task.cancel()
+            self.reality_check_tasks = []
             reached_step_cap = not should_finish
             if self._step_extension_granted_steps:
                 extension_event = (
@@ -2990,6 +3000,39 @@ L6. Termination
 
     def _trim_for_log(self, value: Any) -> Any:
         return trim_large_strings(value, max_chars=8000)
+
+    def _consume_reality_check_blocks(self) -> List[JsonDict]:
+        """Deliver any reality check that finished since the last turn.
+
+        The check itself runs in the background (see
+        `harness.tools.browser_tools.visual._reality_check_inference`): its
+        verdict is advisory, so making the worker sit through a VL inference —
+        4,527.8s of critical path across 164 runs, 60% of it producing no
+        verdict at all — bought nothing. It arrives here instead, on the first
+        turn after it completes, in its own text block so the tool receipts
+        around it stay untouched.
+        """
+        pending = getattr(self, "pending_reality_check", None)
+        if not pending:
+            return []
+        self.pending_reality_check = []
+        blocks: List[JsonDict] = []
+        for payload in pending:
+            if not isinstance(payload, dict):
+                continue
+            reality = payload.get("realityCheck")
+            instruction = str(payload.get("next_instruction") or "").strip()
+            body = json.dumps(reality, ensure_ascii=False, default=str)
+            text = f"<reality_check>\n{body}\n</reality_check>"
+            if instruction:
+                text += f"\n{instruction}"
+            blocks.append({"type": "text", "text": text})
+            self._write_agent_event("vl.reality_check.delivered", {
+                "verdict": (reality or {}).get("verdict")
+                if isinstance(reality, dict) else None,
+                "hasInstruction": bool(instruction),
+            })
+        return blocks
 
     def _step_cap_reminder_block(
         self, *, current_step: int, max_steps: int,

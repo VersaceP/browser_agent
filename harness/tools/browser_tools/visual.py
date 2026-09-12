@@ -8,6 +8,7 @@ from typing import List
 from typing import Optional
 from typing import Tuple
 from typing import Set
+import asyncio
 import json
 from urllib.parse import urlparse
 from harness.results.call_outcome import domain_state_read_succeeded
@@ -1148,6 +1149,11 @@ async def _maybe_reality_check(
             return result
         if getattr(agent, "reality_check_count", 0) >= 1:
             return result
+        if getattr(agent, "reality_check_in_flight", False):
+            # One is already running in the background. Arming a second would
+            # spend a concurrent VL call on the same worker for the same
+            # streak, and only one verdict per worker is ever delivered.
+            return result
         if (
             getattr(agent, "reality_check_capture_failures", 0)
             >= REALITY_CHECK_CAPTURE_FAILURE_LIMIT
@@ -1235,6 +1241,93 @@ async def _maybe_reality_check(
             # was partial via `screenshotScope`, and an explicit full-page
             # capture is still available to anyone who asks for one.
             capture_request["fullPage"] = False
+        # The arming decision and the scroll are done; everything left is
+        # capture + inference, which touches nothing on the page. Hand it to a
+        # background task and give the worker its tool result back now. The
+        # budget counters stay inside the task so their semantics do not
+        # change: a failed capture still does not consume the per-worker
+        # budget, and the circuit breaker still counts consecutive failures.
+        # `reality_check_in_flight` is what keeps a second check from arming
+        # while the first is still running -- without it the streak would
+        # re-arm on the very next turn.
+        agent.reality_check_in_flight = True
+        task = asyncio.create_task(_reality_check_inference(
+            agent,
+            capture_request=capture_request,
+            step=step,
+            name=name,
+            armed_by=armed_by,
+            page_id=page_id,
+            region=region,
+            coverage=coverage,
+            mode=mode,
+            claim=claim,
+            row_key=row_key,
+            page_url=page_url,
+            vl_config=vl_config,
+        ))
+        # Hold a reference: a bare create_task may be garbage collected mid
+        # flight, and the agent needs the handle to cancel at shutdown.
+        tasks = getattr(agent, "reality_check_tasks", None)
+        if tasks is None:
+            tasks = []
+            agent.reality_check_tasks = tasks
+        tasks.append(task)
+        task.add_done_callback(lambda finished: _stash_reality_check(agent, finished))
+        return result
+    except Exception as exc:  # reality check must never break the call path
+        logger = getattr(agent, "logger", None)
+        if logger is not None and hasattr(logger, "write"):
+            logger.write("vl.reality_check.error", {"error": str(exc)[:300]})
+        return result
+
+
+async def _reality_check_inference(
+    agent: Any,
+    *,
+    capture_request: JsonDict,
+    step: int,
+    name: str,
+    armed_by: str,
+    page_id: str,
+    region: JsonDict,
+    coverage: Any,
+    mode: str,
+    claim: str,
+    row_key: str,
+    page_url: str,
+    vl_config: Any,
+) -> Optional[JsonDict]:
+    """The expensive half of the reality check, off the model's critical path.
+
+    Returns the fields to hand the worker (`realityCheck` + `next_instruction`)
+    or None when the check produced nothing. The caller stashes the return for
+    injection on a later turn instead of blocking the tool call that armed it.
+
+    Why this half and not the other: the arming decision and
+    `_scroll_region_into_view` move the viewport, so they have to finish before
+    the worker's next action. Capture and VL inference do not touch the page.
+    Measured across 164 runs, 137 reality checks held the critical path for
+    4,527.8s -- 19.7% of all worker tool time -- while the tools they were
+    attached to cost almost nothing on their own (`find_in_axtree` p50 5ms,
+    `local_fs_read` p50 10ms). 3,019s of that produced no verdict at all: 28
+    timeouts at a p50 of 64s and 20 empty VL replies. None of that waiting buys
+    the worker anything, because the verdict is advisory -- it is a hint about a
+    perception streak, not a gate on the action that triggered it. A terminal
+    judgment (captcha auto-solve deciding whether to pause, `visual_verify`
+    answering a question the model asked) must stay synchronous; an advisory may
+    arrive a turn late.
+    """
+    try:
+        from harness.vl.capture_geometry import (
+            evidence_grade,
+            reconcile_region_verdict,
+            region_in_capture,
+        )
+        from harness.vl.reality_check import (
+            artifact_stall_turns,
+            build_reality_check_row,
+        )
         verdict = await _bt()._visual_verify(agent, capture_request, step)
         if not isinstance(verdict, dict) or verdict.get("status") in {
             "disabled",
@@ -1288,7 +1381,7 @@ async def _maybe_reality_check(
                         failures >= REALITY_CHECK_CAPTURE_FAILURE_LIMIT
                     ),
                 })
-            return result
+            return None
         # A capture landed: the worker's perception is working, so an earlier
         # transient failure must not count toward the circuit breaker.
         agent.reality_check_capture_failures = 0
@@ -1353,7 +1446,7 @@ async def _maybe_reality_check(
                     "triggerTool": name,
                     "recordStatus": str(record.get("status") or ""),
                 })
-            out = {**result, "realityCheck": {
+            out = {"realityCheck": {
                 **_reality_check_summary(row),
                 "evidencePersisted": False,
             }}
@@ -1379,7 +1472,7 @@ async def _maybe_reality_check(
         if logger is not None and hasattr(logger, "write"):
             logger.write("vl.reality_check", {**reality, "triggerTool": name})
         agent.target_shortfall_streak = 0
-        out = {**result, "realityCheck": reality}
+        out = {"realityCheck": reality}
         out["next_instruction"] = _reality_check_instruction(
             reconciled=row_reconciled,
             grading=row_grading,
@@ -1392,7 +1485,23 @@ async def _maybe_reality_check(
         logger = getattr(agent, "logger", None)
         if logger is not None and hasattr(logger, "write"):
             logger.write("vl.reality_check.error", {"error": str(exc)[:300]})
-        return result
+        return None
+    finally:
+        agent.reality_check_in_flight = False
+
+
+def _stash_reality_check(agent: Any, task: Any) -> None:
+    """Park a finished inference for the next turn's user message."""
+    try:
+        payload = task.result()
+    except BaseException:  # cancellation included: never raise from a callback
+        payload = None
+    if not isinstance(payload, dict) or not payload:
+        return
+    pending = list(getattr(agent, "pending_reality_check", None) or [])
+    pending.append(payload)
+    agent.pending_reality_check = pending
+
 
 async def _read_page_scroll(
     agent: Any, page_id: str, step: int
