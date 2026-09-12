@@ -3356,6 +3356,13 @@ L6. Termination
                 or method == "Runtime.evaluate"
             ):
                 continue
+            # Control-plane pauses are not page mutations. The pause → human →
+            # resume window does change the page, but that cycle is reported
+            # through the challenge/HITL receipts and the resume checkpoint;
+            # listing requestPause here as a "state-changing action" told the
+            # next worker the pause itself mutated something (run a686e03f).
+            if method.startswith("Hitl."):
+                continue
             # Same predicate the batch guard uses. A hand-rolled check on
             # result.error misses the cases that actually matter here: browser
             # action errors land in response.data.error (top-level error is only

@@ -909,6 +909,24 @@ def attach_error_classification(result: JsonDict, *, method: str = "") -> JsonDi
     if message and _contains(
         message.lower(), "err_page_paused", "paused for human intervention"
     ):
+        # A SUCCESSFUL Hitl.requestPause says "successfully paused for human
+        # intervention" in its observation — that phrase is the pause receipt,
+        # not an error. Without this exemption the success was classified
+        # hitl_paused_state, every failure predicate that reads
+        # errorClassification.type (e.g. _invoke_result_failed) then reported
+        # the completed pause as a failed action, and the step-cap progress
+        # handoff told the next worker "Last action that failed:
+        # Hitl.requestPause" (run a686e03f — the pause had already resumed by
+        # then). Positive proof only: data.paused is true. Any real error
+        # envelope still classifies through the branches below.
+        if (
+            method == "Hitl.requestPause"
+            and not result.get("error")
+            and isinstance(result.get("response"), dict)
+            and isinstance(result["response"].get("data"), dict)
+            and result["response"]["data"].get("paused") is True
+        ):
+            return result
         result["errorClassification"] = classify_browser_error(message, method=method)
         return result
     # `public_action_failure` is the ONLY path here that reads
