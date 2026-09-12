@@ -35,7 +35,7 @@ def distill_trace_to_workflow(
     base_skill: Skill,
 ) -> Optional[Dict[str, Any]]:
     """Distill a successful slow-path trace into a candidate workflow dict, seeded
-    with the live skill's variable template + errorConfig. Returns None if no usable
+    with the live skill's variable template. Returns None if no usable
     steps were recovered."""
     distiller = _load_distiller()
     steps, _notes, _persist, variables = distiller.distill(list(trace or []))
@@ -53,7 +53,6 @@ def distill_trace_to_workflow(
     return {
         "description": f"Auto-distilled candidate for {base_skill.skill_id} from a successful slow-path run.",
         "variables": template,
-        "errorConfig": base_skill.error_config or {"onError": "stop", "maxRetries": 1},
         "steps": steps,
     }
 

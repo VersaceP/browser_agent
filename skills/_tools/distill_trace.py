@@ -137,8 +137,11 @@ def distill(events: list[dict]) -> tuple[list[dict], list[str], list[str], dict]
             steps.append({"action": "Page.navigate",
                           "params": {"url": "$vars.detailUrl"},
                           "purpose": purpose or "Open the target page (same tab)"})
-            steps.append({"type": "listen", "event": "Page.loaded",
-                          "timeout": 15000, "onTimeout": "continue"})
+            # Platform step type is `waitEvent` with a focus array; `listen`
+            # is rejected with -32602. A timeout already continues the
+            # workflow, so no onTimeout field exists.
+            steps.append({"type": "waitEvent", "focus": ["Page.loaded"],
+                          "timeout": 15000})
             notes.append(f"navigate url templatized -> $vars.detailUrl (trace url: {(e.get('params') or {}).get('url')})")
             continue
 
@@ -234,7 +237,6 @@ def main(argv=None) -> int:
     wf = {
         "description": f"DRAFT distilled from {trace.name} — REVIEW before freezing.",
         "variables": variables or {"detailUrl": ""},
-        "errorConfig": {"onError": "stop", "maxRetries": 1},
         "steps": steps,
     }
     (out / "workflow.json").write_text(json.dumps(wf, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -255,9 +257,9 @@ allow_auto_captcha: false
 ## 运行指令
 1. 取运行期 pageId/fleetId（复用已打开 tab）。
 2. 取运行期 variables：{', '.join(variables) or 'detailUrl'}。
-3. `browser_call(Workflow.execute, {{ runId, pageId, fleetId, variables, steps:<workflow.json>, errorConfig }})`。
+3. `browser_call(Workflow.execute, {{ pageId, fleetId, variables, steps:<workflow.json> }})`。
 4. 返回后读 result.variables，由 harness `record_extraction` 落盘字段：{', '.join(persist) or '<TODO>'}。
-5. 失败 → catch + `Workflow.getStatus(runId)`（见 skills/README.md §6）。
+5. 失败 → catch；失败详情来自 `Workflow.progress` 流（见 skills/README.md §6）。
 
 ## ⚠️ 蒸馏 draft，冻结前人工过：见 distill_report.md
 """
@@ -271,7 +273,7 @@ allow_auto_captcha: false
   fields_required: [<TODO>]
 takeover:
   on_call_error:
-    recover_via: Workflow.getStatus(runId)
+    recover_via: exec_observer
     read: [status.failedStepPath, status.error, status.variables, "status.results[-1].step"]
     semantic_anchor: status.results[-1].step.purpose
 hitl_boundary:

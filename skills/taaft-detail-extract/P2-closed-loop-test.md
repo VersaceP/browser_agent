@@ -1,5 +1,11 @@
 # P2 闭环测试计划（TAAFT 参考 skill）
 
+> ⚠️ **2026-09-11 更正**：本文件是 2026-06-26 的实测记录，其中的调用形状已被平台证伪，
+> 保留原文只作为历史。三处不再成立：`runId` 和 `errorConfig` 不是 `Workflow.execute` 的参数
+> （action schema 非 `.strict()`，二者travel 后被静默丢弃）；`Workflow.getStatus` 需要
+> `workflowId` 而非 `runId`，且只返回变量名不返回值；`listen` 不是平台的步骤类型，正确拼写是
+> `waitEvent`。当前契约见 `docs/workflow-execute-live-contract.md`。
+
 > 状态：**离线 authoring + 静态校验 + 核心架构联机实测均已完成**（2026-06-26，headless 连 `ws://localhost:9300/ws`，**无需 JWT**）；TAAFT 真站内容 live-pin 待预热标签页/面板。
 > 这是文档 §11 P2「架构成立的关键里程碑」的验收脚本。
 

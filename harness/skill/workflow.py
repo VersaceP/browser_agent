@@ -4,21 +4,36 @@ The fast path of the skill-as-container architecture: inject runtime handles +
 variables into a skill's frozen Workflow.execute steps, run it, and normalize the
 result for the caller (success → data; failure → Workflow.getStatus snapshot).
 
-Live-verified contract (2026-06-26, headless ABCP):
-  - success: browser.call("Workflow.execute", ...) RETURNS {observation, data:{runId,results,variables}} (no status).
-  - failure: it RAISES (ABCPTransportError -32005); the rich payload (failedStepPath/
-    results/variables) is NOT in the error → must re-call Workflow.getStatus(runId).
-    So a stable runId is mandatory.
+Live-verified contract (2026-09-11, docs/workflow-execute-live-contract.md).
+This SUPERSEDES the 2026-06-26 note, which was wrong on three counts:
+
+  - success: RETURNS {observation, data:{workflowId, taskId, status:"succeeded",
+    results, variables, store, storeRevision, timing}}. There IS a status, and
+    the id that matters is the platform's `workflowId`.
+  - the client-supplied `runId` is IGNORED by the platform, and
+    `Workflow.getStatus({"runId": ...})` does not resolve. It survives here only
+    as a local correlation label for logs and events.
+  - failure: RAISES (ABCPTransportError -32005) carrying only
+    `details.failedStepPath` — no workflowId, no results, no variables. And even
+    once you have a workflowId, `getStatus` returns `variableKeys` (names only)
+    and `resultCount`, never the values or the step results.
+
+So the execution record comes from the `Workflow.progress` event stream, which
+`harness.observation.exec_observer.ExecObserver` collects off the notification
+channel while the call is blocked. It is the only source of the failure-time
+variable values, the completed steps, and the workflowId itself.
 
 `browser` is anything with `async def call(method, params) -> dict` (abcp_client.ABCPClient).
 """
 from __future__ import annotations
 
 import copy
+import re
 import uuid
 from typing import Any, Dict, List, Optional
 
 from harness.fleet.runtime import FleetClickGateTimeout
+from harness.observation.exec_observer import ExecObserver
 from harness.task_types import resolve_task_type_fail_closed
 from harness.workflow_policy import validate_workflow_params
 from harness.workflow_runtime import (
@@ -39,10 +54,15 @@ def build_execute_params(
     merged_vars: Dict[str, Any] = dict(skill.variable_template)
     if variables:
         merged_vars.update(variables)
+    # `runId` and `errorConfig` are NOT Workflow.execute params. The action
+    # declares exactly description/steps/variables/pageId/fleetId/timeout and
+    # its schema is not `.strict()`, so both used to travel and be dropped
+    # without a word. `runId` in particular bought nothing: getStatus resolves
+    # a `workflowId`, which only the Workflow.progress stream carries.
+    # `run_id` stays a parameter because the RESULT dicts key on it for
+    # harness-side correlation; it just never reaches the platform.
     params: Dict[str, Any] = {
-        "runId": run_id,
         "steps": skill.steps,
-        "errorConfig": skill.error_config,
         "variables": merged_vars,
     }
     if skill.workflow.get("description"):
@@ -125,15 +145,22 @@ async def run_skill_workflow(
             "priorResults": [],
             "exc": "Frozen workflow rejected by harness policy",
         }
+    observer = ExecObserver(browser, page_id=page_id).start()
     try:
         res = await browser.call("Workflow.execute", params)
         data = (res or {}).get("data") or {}
+        trace = observer.trace
         return {
             "succeeded": True,
             "runId": run_id,
+            "workflowId": data.get("workflowId") or trace.workflow_id,
+            "status": data.get("status"),
             "variables": data.get("variables") or {},
             "results": data.get("results") or [],
+            "store": data.get("store") or {},
+            "storeRevision": data.get("storeRevision"),
             "observation": (res or {}).get("observation"),
+            "trace": trace.to_receipt(),
         }
     except FleetClickGateTimeout as exc:
         return {
@@ -148,25 +175,82 @@ async def run_skill_workflow(
             **exc.receipt,
         }
     except Exception as exc:  # execute throws on failure; rich payload not in the error
+        trace = observer.trace
+        receipt = trace.to_receipt()
+        # The error itself carries failedStepPath and nothing else; the event
+        # stream carries the rest. getStatus only adds terminal status/timing,
+        # and only when the event stream gave us a workflowId to ask about.
+        details = getattr(exc, "rpc_data", None)
+        details = details.get("details") if isinstance(details, dict) else None
+        error_step_path = (
+            details.get("failedStepPath") if isinstance(details, dict) else None
+        )
         snapshot: Dict[str, Any] = {}
-        try:
-            status = await browser.call("Workflow.getStatus", {"runId": run_id})
-            snapshot = (status or {}).get("data") or {}
-        except Exception:  # pragma: no cover - getStatus best-effort
-            snapshot = {}
-        results: List[Dict[str, Any]] = snapshot.get("results") or []
-        last = results[-1] if results else {}
-        last_step = (last.get("step") or {}) if isinstance(last, dict) else {}
+        if trace.workflow_id:
+            try:
+                status = await browser.call(
+                    "Workflow.getStatus", {"workflowId": trace.workflow_id}
+                )
+                snapshot = (status or {}).get("data") or {}
+            except Exception:  # pragma: no cover - getStatus best-effort
+                snapshot = {}
+        failure = trace.failure or {}
         return {
             "succeeded": False,
             "runId": run_id,
-            "failedStepPath": snapshot.get("failedStepPath"),
-            "failedError": snapshot.get("error") or (last.get("error") if isinstance(last, dict) else None),
-            "failedPurpose": last_step.get("purpose"),
-            "variables": snapshot.get("variables") or {},
-            "priorResults": results[:-1] if results else [],
+            "workflowId": trace.workflow_id,
+            "status": snapshot.get("status") or trace.phase,
+            "failedStepPath": (
+                error_step_path
+                or failure.get("stepPath")
+                or snapshot.get("currentStepPath")
+            ),
+            "failedError": failure.get("error") or snapshot.get("lastFailure"),
+            "failedErrorCode": failure.get("errorCode"),
+            "failedPurpose": _purpose_at_step_path(
+                params.get("steps"), error_step_path or failure.get("stepPath")
+            ),
+            # Values, not just names: getStatus would only give variableKeys.
+            "variables": trace.variables or {},
+            "priorResults": trace.completed_steps,
+            "trace": receipt,
             "exc": str(exc),
         }
+    finally:
+        # Every exit, not just the handled ones. `except Exception` does not
+        # see asyncio.CancelledError, so a cancelled run used to leave this
+        # observer subscribed to Workflow.progress forever. stop() is
+        # idempotent and leaves the trace on the observer for the returns
+        # above.
+        observer.stop()
+
+
+_STEP_PATH_SEGMENT = re.compile(r"([A-Za-z]+)\[(\d+)\]")
+
+
+def _purpose_at_step_path(steps: Any, step_path: Any) -> Optional[str]:
+    """Resolve the authored `purpose` for a platform stepPath.
+
+    The platform reports failures as `steps[5]` or `steps[2].then[1]`; the model
+    wrote a purpose per step. Mapping one to the other is what turns "steps[5]
+    failed" into "the step that was supposed to open the review tab failed".
+    Returns None rather than guessing when the path does not resolve.
+    """
+    if not isinstance(steps, list) or not isinstance(step_path, str):
+        return None
+    node: Any = {"steps": steps}
+    for name, index in _STEP_PATH_SEGMENT.findall(step_path):
+        container = node.get(name) if isinstance(node, dict) else None
+        if not isinstance(container, list):
+            return None
+        position = int(index)
+        if position >= len(container):
+            return None
+        node = container[position]
+    if not isinstance(node, dict):
+        return None
+    purpose = node.get("purpose")
+    return str(purpose) if isinstance(purpose, str) and purpose.strip() else None
 
 
 def _prepare_frozen_runtime_steps(

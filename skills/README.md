@@ -31,7 +31,7 @@ skills/
 │   └── fallback.yaml
 └── <task-slug>/           # 一个具体 skill
     ├── SKILL.md           # 任务身份 + 运行指令 + 兜底契约（人/agent 可读）
-    ├── workflow.json      # Workflow.execute 的 steps + variables 模板 + errorConfig
+    ├── workflow.json      # Workflow.execute 的 steps + variables 模板
     └── fallback.yaml      # 结构化成功判据 + 接管策略（机器可判定）
 ```
 
@@ -81,13 +81,12 @@ allow_auto_captcha: false          # 是否允许 VL 自动解 CAPTCHA（默认 
 
 ## 3. workflow.json
 
-顶层是 `Workflow.execute` 的参数子集。**只放可冻结的部分**；`runId/pageId/fleetId` 是运行期注入，不写进文件。
+顶层是 `Workflow.execute` 的参数子集。**只放可冻结的部分**；`pageId/fleetId` 是运行期注入，不写进文件。
 
 ```jsonc
 {
   "description": "<workflow 目标一句话>",          // 可选
   "variables": { "<var>": "" },                   // 初始变量模板，运行期被实际值覆盖
-  "errorConfig": { "onError": "stop", "maxRetries": 1 },  // 见 §3.4
   "steps": [ /* 见 §3.1 */ ]
 }
 ```
@@ -95,25 +94,42 @@ allow_auto_captcha: false          # 是否允许 VL 自动解 CAPTCHA（默认 
 运行期 runner 实际调用：
 ```python
 browser_call("Workflow.execute", {
-    **workflow_json,                       # description / variables / errorConfig / steps
-    "runId": runId,                        # 关联 pause/resume/progress
+    **workflow_json,                       # description / variables / steps
     "pageId": pageId, "fleetId": fleetId,  # 自动注入到省略的 step
     "variables": {**workflow_json["variables"], **runtime_overrides},
 })
 ```
 
-### 3.1 五种 step（字段经 `packages/workflow/src/types/schemas.ts` 核实）
+### 3.1 七种 step
+
+下表与模型可见 schema 同源；`harness/workflow_schema_source.py` 从平台契约派生，
+`tests/test_workflow_schema_drift.py` 在两者出现分歧时失败。
 
 | type | 必填 | 可选 | 说明 |
 |------|------|------|------|
-| `action`（默认，可省 type） | `action` | `id, params, purpose, extract, onError, maxRetries, timeout` | 调一个 ABCP action（`Domain.action`） |
+| `action`（默认，可省 type） | `action` | `id, params, purpose, extract, onError` | 调一个 ABCP action（`Domain.action`） |
+| `waitEvent` | `focus` | `id, pageId, fleetId, taskId, timeout, extract` | 等前一个 Action **之后**的事件；`focus` 见 §3.3 |
+| `readEvents` | `focus` | `id, pageId, fleetId, taskId, extract` | 读前一个 Action **自身窗口**内的事件，立即返回 |
+| `store` | `op, path` | `id, value`（`delete` 外 `value` 必填） | `op` ∈ `set/merge/append/delete` |
 | `if` | `condition, then` | `id, else` | `condition` 见 §3.2；`then/else` 是子 step 数组 |
 | `loop` | `maxIterations, condition, body` | `id` | `maxIterations` 正整数；`body` 子 step 数组 |
-| `listen` | `event` | `id, mode, filter, timeout(≥1000), onTimeout(stop\|continue), extract, listenerId` | `event` 必须在白名单（§3.3） |
 | `transform` | `input, ops, output` | `id` | 见 §3.5；`output` 写入一个 **flat 变量名** |
 
-> `action` step：`onError` ∈ `stop\|continue\|retry`；`retry` 时 `maxRetries` 0–10；`timeout`/per-step 上限 300000ms。
-> **每个 action step 必写 `purpose`**——失败接管时它是 agent 的语义锚（`steps/action.ts:30` 也把它注入 params.purpose）。
+> **`action` step 没有 `timeout`，也没有 `maxRetries`。** 平台的
+> `workflowActionFields` 不声明它们，而步骤联合是 `.strict()`——带上就是整个
+> workflow 被 -32602 拒。唯一的单步上限是 `waitEvent.timeout`；唯一的总预算是
+> 顶层 `timeout`。
+>
+> **`onError` ∈ `stop|continue`，没有 `retry`**，也没有地方能把 retry 挪过去
+> （见 §3.4）。
+>
+> **`listen` 不是步骤类型**。它是 harness 的历史拼写，dispatcher 的步骤联合里
+> 没有这个成员，会被 -32602 拒。存量 skill 里的 `listen` 由
+> `workflow_policy._normalize_wait_events()` 在传输前改写成 `waitEvent`，但新写的
+> 不要再用。
+>
+> **每个 action step 必写 `purpose`**——失败接管时它是 agent 的语义锚
+> （`steps/action.ts` 也把它注入 params.purpose）。
 
 ### 3.2 条件（`if` / `loop` 的 condition）
 ```jsonc
@@ -126,28 +142,47 @@ operator ∈ `exists, notExists, equals, notEquals, contains, notContains, match
 > ⚠️ **守 transform 输出的 id 别用 `exists`**：transform `find` 无命中时写**空串 `""`**，而 `exists` 对 `""` 判 true → 空 id 漏进 `Input.click` 报 "Invalid params"（联机实测踩坑）。守 id 用：
 > `{ "path": "$vars.<id>", "operator": "matches", "value": "[0-9a-fA-F-]+:\\d+:\\d+" }`
 
-### 3.3 listen 事件白名单（`utils/listenableEvents.ts`，**唯此 15 个可 listen**）
-```
-Page.open  Page.close  Page.loaded  Page.startedLoading  Page.loadFailed
-Page.crashed  Page.recovered  Page.navigate  Page.titleUpdated
-Page.dialogOpened  Page.dialogClosed
-File.chooserOpened  File.chooserClosed
-Hitl.resumed                      ← workflow 侧唯一 HITL 相关可 listen 事件
-DOM.axTreeUpdated
-```
-> ⚠️ `Hitl.humanInput` / `Hitl.resumeEvent` **不在** workflow listen 白名单内——它们是 harness 侧通知流的事件，不能写进 workflow listen step。workflow 内要侦测 HITL 恢复用 `Hitl.resumed`。
+### 3.3 `waitEvent` / `readEvents` 的 focus 白名单
 
-### 3.4 errorConfig（`workflowRetryConfigSchema`，全部有默认值）
-```jsonc
-{ "onError": "stop",          // stop(默认) | continue | retry
-  "maxRetries": 2,            // 0–10
-  "retryDelay": 1000,         // 100–30000ms
-  "backoffMultiplier": 2,     // 1–5
-  "maxBackoffDelay": 10000 }  // 1000–60000ms
+以 `harness/workflow_policy.LISTENABLE_EVENTS` 为准（当前 22 个）：
+
 ```
+Page.open            Page.close           Page.loaded          Page.startedLoading
+Page.loadFailed      Page.crashed         Page.recovered       Page.navigate
+Page.titleUpdated    Page.switchTo        Page.dialogOpened    Page.dialogClosed
+File.chooserOpened   File.chooserClosed   File.operationCompleted
+File.operationFailed
+Download.waiting     Download.started     Download.progressed  Download.stateChanged
+Hitl.paused          Hitl.resumed
+```
+
+> ⚠️ **`DOM.axTreeUpdated` 已从白名单移除。** 它在 `System.listEvents` 的目录里，
+> 但两次完整导航 + 主动读树 + 滚轮都没观测到它发出，三种等待形状全部空超时。
+> 而 `waitEvent` 超时不算失败（见 §3.1），所以等它会**静默烧掉整个 30 秒默认
+> timeout** 再带着空 events 继续。在目录里 ≠ 这个部署会发。
+>
+> ⚠️ `Hitl.humanInput` / `Hitl.resumeEvent` **不存在于平台事件目录**——它们是
+> harness 侧通知流的名字。workflow 内侦测 HITL 恢复用 `Hitl.resumed`。
+
+### 3.4 步骤级 onError（没有 workflow 级重试）
+
+`Workflow.execute` 只声明 `description / steps / variables / pageId / fleetId /
+timeout` 六个参数。**`errorConfig` 不存在**——这个标识符在整个
+`packages/workflow` 里零命中。它曾经写在这里、被 runner 发出去、被平台静默丢弃，
+因为 action 的 schema 不是 `.strict()`，顶层未知参数直接剥掉不报错。
+同理被丢弃的还有 `stepTimeout`：实测 `stepTimeout: 1000` 的步骤照样跑满 5005ms。
+
+唯一的错误策略在 step 级：
+
+```jsonc
+{ "action": "...", "onError": "stop" }   // stop(默认) | continue
+```
+
 - `stop`：失败步 terminate + throw → error 信封（**触发 agent 接管的信号**）。
-- `continue`：失败步记 error 但继续，整体仍可能成功（用于可选/易抖动步，写在 step 级 `onError`）。
-- `retry`：重试 maxRetries 次指数退避。
+- `continue`：失败步记 error 但继续，整体仍可能成功（用于可选/易抖动步）。
+- **没有 `retry`**。步骤联合是 `.strict()`，带 `retry` 的步骤让整个 workflow
+  以 -32602 被拒。也没有地方可以把它挪过去。失败的那一步是对着一个你还没重新
+  观察过的页面失败的，盲目重试本来就不对——读回执、重新观察、提交新的一段。
 
 ### 3.5 变量系统（核实自 `utils/pathResolver.ts` + `steps/action.ts`）
 
@@ -156,11 +191,21 @@ DOM.axTreeUpdated
 | token | 解析目标 | 嵌套 |
 |-------|---------|------|
 | `$cache.axTree.lines` / `$cache.lastResult.lines` | WorkflowCache（axTree / semanticTree / lastResult）；**AXTree 行在 `$cache.axTree.lines`**（engine internalRpc 已解包 data 层；2026-06-26 联机实测 `.lines` 命中、`.data.lines` 空。demo 的 `.data.lines` 是另一套 transport，勿照搬） | ✅ 支持点号嵌套 |
-| `$last.data.x` | 上一步结果 | ✅ |
-| `$listen.x` | listener 捕获值 | ✅ |
+| `$last` / `$last.x` | **紧邻的上一步**的结果。engine 的 internalRpc 已解包 data 层，所以 AXTree 行是 `$last.lines`，不是 `$last.data.lines` | ✅ |
+| `$store` / `$store.x` | 显式 store 快照 | ✅ |
 | `$vars.<key>` / `$<key>` | 变量表 | ❌ **flat-only**：`$vars.a.b` 找的是字面量名为 `"a.b"` 的变量，不是 a 的 b 字段 |
 
-> 解析不到时**保留字面 `$...` 串**（不会变空）——authoring 时务必确保引用的变量在该步之前已被写入。
+> **没有 `$listen`，也没有 `$steps[N]`。** 引用根只有上表四个
+> （`utils/pathResolver.ts:37-62`）。想引用更早的某一步，把它 `extract` 成变量。
+> 这也是为什么搜索一次观察的 `transform` 必须**紧跟**那个读取步骤。
+>
+> ⚠️ **解析不到会抛错，不会保留字面串。** `resolvePath` 在结果为 `undefined` 时抛
+> `workflow-reference-not-found`（`pathResolver.ts:62-64`），整个 workflow 终止。
+> 旧版文档写的"保留字面 `$...` 串（不会变空）"是错的。
+>
+> 但要和另一种情况分清：**变量存在但值是空串**不会抛错。`transform` 的 `find`
+> 无命中时写的正是 `""`，`$vars.<id>` 解析成功、空 id 一路进 `Input.click` 才报
+> 参数错误——这就是 §3.2 那条"守 id 用 `matches` 不用 `exists`"的由来。
 
 **变量写入的 4 个来源**：
 1. 顶层 `variables`（初始模板 + 运行期覆盖）。
@@ -225,7 +270,7 @@ success_contract:
 
 takeover:
   on_call_error:                                        # Workflow.execute 失败 = 抛异常（见 §6）
-    recover_via: Workflow.getStatus(runId)              # ⚠️ rich payload 不在异常里，必须二次调 getStatus
+    recover_via: exec_observer                          # ⚠️ 失败详情只在 Workflow.progress 流里，见 §6
     read: [status.failedStepPath, status.error, status.variables, status.results[-1].step]
     reobserve: [Page.getState, DOM.getAXTree]
     semantic_anchor: status.results[-1].step.purpose
@@ -234,7 +279,7 @@ takeover:
     reason: postcondition_unmet
 
 hitl_boundary:
-  detect: [Hitl.resumed]      # workflow 侧唯一可 listen 的 HITL 事件（§3.3）
+  detect: [Hitl.resumed]      # workflow 侧的 HITL 恢复事件（§3.3）
   action: listen_then_pause   # 侦测到 → 触发 pauseController 暂停，绝不在 workflow 内 resolvePause
 
 maintenance:
@@ -273,17 +318,23 @@ phase 作用域、后跨 replan 总账；任何集合不一致、重复 identity
 `Workflow.execute` 经 `browser_call` 看到的是 action feedback，**没有 `status`**。成功/失败两路**形态不同**（实测）：
 
 ```
-成功：browser_call 【返回】 { observation:"Workflow execution completed: runId=...",
-                             suggested_prompt, data:{ runId, results, variables }, taskId }
-失败：browser_call 【抛异常】 ABCPTransportError: -32005 Action Workflow.execute failed
-      异常携带的 error.data 实测【只有】 { observation:"Workflow execution failed: Step <action> failed: ...",
-                                        suggested_prompt, method, taskId }
-      ⚠️ 没有 results / variables / failedStepPath —— rich payload 不过 JSON-RPC error 边界
+成功：browser_call 【返回】 data:{ workflowId, taskId, status:"succeeded",
+                                 results, variables, store, storeRevision, timing }
+失败：browser_call 【抛异常】 ABCPTransportError: -32005
+      异常携带的 details 实测【只有】 { failedStepPath }
+      ⚠️ 没有 workflowId / results / variables / store
 ```
 
-**判成败 + 取失败详情**（绝不读 `.status`）：
-- 成功 = `browser_call` 正常返回 → 读 `data.{runId,results,variables}`。
-- 失败 = `browser_call` 抛异常 → 用 observation 前缀 `"Workflow execution failed:"` 判定 → **二次调 `Workflow.getStatus(runId)`** 取 `{status:"error", failedStepPath, error, variables（失败时刻快照）, results[]（含每步 step+purpose+status）}`。**所以 execute 必须传稳定 runId。**
+**判成败 + 取失败详情**：
+- 成功 = `browser_call` 正常返回 → 读 `data.{results, variables, store}`。成功回执
+  **有** `status` 字段（旧文档说没有，是错的）。
+- 失败 = `browser_call` 抛异常。`Workflow.getStatus` 需要 `workflowId`，而失败错误体里
+  没有它；即使拿到了，getStatus 也只返回 `variableKeys`（变量**名**，无值）和
+  `resultCount`（**数量**，无内容）。**客户端自造的 `runId` 平台根本不接受。**
+- 唯一完整的失败记录是 `Workflow.progress` 通知流：每条 `step_finished` 都带完整的
+  `variables` 值。harness 用 `harness/observation/exec_observer.py` 在执行期旁路记录
+  这条流，失败时重建 `failedStepPath` / `failedErrorCode` / `variablesAtFailure` /
+  `completedSteps`。详见 `docs/workflow-execute-live-contract.md`。
 
 ---
 
@@ -292,13 +343,13 @@ phase 作用域、后跨 replan 总账；任何集合不一致、重复 identity
 - [ ] `name` == 目录名；frontmatter 命中四维（domain/task_type/stage_hint/fields）齐全。
 - [ ] 每个 action step 有 `purpose`。
 - [ ] 没有硬编码 AXTree id / pageId；定位走运行期重解析。
-- [ ] listen `event` 都在 §3.3 白名单内（HITL 用 `Hitl.resumed`，不是 humanInput/resumeEvent）。
-- [ ] 挑战边界（`if $vars.<flag> matches → listen Hitl.resumed`）的 `<flag>` **必须由一个 `Runtime.evaluate` 的 `extract` 产出**——`skill_control.make_challenge_poller` 反查这对结构，在第二连接上重跑同一段 JS 做 in-page 轮询；用别的 action 产 flag 会让 in-page 轮询**静默失效**（只剩导航级 onset）。
+- [ ] `waitEvent`/`readEvents` 的 `focus` 都在 §3.3 白名单内（HITL 用 `Hitl.resumed`；不要等 `DOM.axTreeUpdated`）。
+- [ ] 挑战边界（`if $vars.<flag> matches → waitEvent focus=[Hitl.resumed]`）的 `<flag>` **必须由一个 `Runtime.evaluate` 的 `extract` 产出**——`skill_control.make_challenge_poller` 反查这对结构，在第二连接上重跑同一段 JS 做 in-page 轮询；用别的 action 产 flag 会让 in-page 轮询**静默失效**（只剩导航级 onset）。
 - [ ] `$vars.*` 引用的都是 flat 变量名，且在使用前已被写入。
 - [ ] **id 守卫用 `matches "[0-9a-fA-F-]+:\d+:\d+"`，不用 `exists`**（transform 无命中写空串，exists 对空串判 true → 空 id 进 Input.click 报错；联机实测踩坑）。
 - [ ] **最后一步不是 record_extraction**；落盘是 harness 后置步（§4）。
-- [ ] `Workflow.execute` 传了稳定 `runId`（失败时靠 `Workflow.getStatus(runId)` 取详情，§6）。
-- [ ] errorConfig.onError 关键步为 `stop`（让失败触发接管）。
+- [ ] 关键步的 step 级 `onError` 是 `stop`（让失败触发接管）；**没有 `retry`，也没有 `errorConfig`**。
+- [ ] workflow.json 里没有 `runId` / `stepTimeout` / `errorConfig`——平台不接受，会被静默丢弃。
 - [ ] fallback.yaml 的 success_contract 不依赖引擎内部 status。
 
 ---

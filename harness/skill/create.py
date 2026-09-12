@@ -735,7 +735,9 @@ def harden_draft_workflow(workflow: Dict[str, Any]) -> List[str]:
                 insert_at = i + 1
                 while insert_at < len(steps) and (
                     isinstance(steps[insert_at], dict)
-                    and steps[insert_at].get("type") == "listen"
+                    and str(steps[insert_at].get("type") or "") in {
+                        "listen", "waitEvent"
+                    }
                 ):
                     insert_at += 1
                 break
@@ -1630,8 +1632,8 @@ def _render_fallback_yaml(
 
 takeover:
   on_call_error:
-    recover_via: Workflow.getStatus(runId)
-    read: [status.failedStepPath, status.error, status.variables, "status.results[-1].step"]
+    recover_via: exec_observer
+    read: [failedStepPath, failedErrorCode, variablesAtFailure, "completedSteps[-1]"]
     reobserve: [Page.getState, DOM.getAXTree]
     semantic_anchor: status.results[-1].step.purpose
   on_contract_unmet:
@@ -1745,7 +1747,6 @@ def create_skill_from_task(
             workflow_description
         ),
         "variables": best["variables"] or {"detailUrl": ""},
-        "errorConfig": {"onError": "stop", "maxRetries": 1},
         "steps": best["steps"],
     }
     def contains_runtime(value: Any) -> bool:

@@ -34,6 +34,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 from harness.skill.pause import hitl_onset_signal
 from harness.skill.workflow import run_skill_workflow
 from harness.screenshot_policy import normalize_screenshot_output_params
+from harness.workflow_policy import event_step_focus, is_event_step
 from harness.vl import captcha
 from harness.vl.captcha import run_captcha_solve_loop, solve_plan_to_input_calls
 
@@ -267,8 +268,17 @@ def _iter_steps(steps: Any) -> Any:
 
 
 def _listens_for_resumed(branch: Any) -> bool:
+    """True when a branch waits for Hitl.resumed, in either spelling.
+
+    Authored skills wrote `{"type": "listen", "event": ...}`; the platform's own
+    type is `waitEvent` with a `focus` array, and workflow_policy rewrites one
+    into the other before transport. Matching only the legacy spelling here
+    would silently stop finding the challenge boundary — and with it the
+    second-connection poll — the moment a skill is written or migrated to the
+    platform vocabulary.
+    """
     for sub in _iter_steps(branch):
-        if sub.get("type") == "listen" and str(sub.get("event") or "") == "Hitl.resumed":
+        if is_event_step(sub) and "Hitl.resumed" in event_step_focus(sub):
             return True
     return False
 

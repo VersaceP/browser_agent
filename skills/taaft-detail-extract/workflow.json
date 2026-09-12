@@ -5,10 +5,6 @@
     "productName": "",
     "detailUrl": ""
   },
-  "errorConfig": {
-    "onError": "stop",
-    "maxRetries": 1
-  },
   "steps": [
     {
       "action": "Page.navigate",
@@ -16,13 +12,14 @@
         "url": "$vars.detailUrl"
       },
       "onError": "continue",
-      "purpose": "Open the TAAFT product detail page in the SAME reused tab (avoids fresh-tab Cloudflare; re-navigating a warm tab keeps clearance). onError:continue — a heavy real page makes the navigate CALL return -32001 timeout while the page actually loads; the next listen Page.loaded settles it."
+      "purpose": "Open the TAAFT product detail page in the SAME reused tab (avoids fresh-tab Cloudflare; re-navigating a warm tab keeps clearance). onError:continue — a heavy real page makes the navigate CALL return -32001 timeout while the page actually loads; the next waitEvent on Page.loaded settles it."
     },
     {
-      "type": "listen",
-      "event": "Page.loaded",
-      "timeout": 15000,
-      "onTimeout": "continue"
+      "type": "waitEvent",
+      "focus": [
+        "Page.loaded"
+      ],
+      "timeout": 15000
     },
     {
       "action": "Page.getState",

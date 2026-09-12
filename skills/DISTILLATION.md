@@ -46,7 +46,7 @@ DOM.getAXTree
 - trace 里的 `record_extraction` 事件 → **不生成 workflow 步**，只在 report 里列出"返回后 harness 要落盘的字段"（README §4）。
 
 ## 2. 套约定（产出前自查，同 README §7）
-- id 守卫 `matches`（非 exists）；每 action 有 purpose；listen 事件在白名单；AXTree 取行 `$cache.axTree.lines`；末步不是 record_extraction；`Workflow.execute` 传稳定 runId；关键步 `onError:"stop"`。
+- id 守卫 `matches`（非 exists）；每 action 有 purpose；waitEvent/readEvents 的 focus 事件在白名单；AXTree 取行 `$cache.axTree.lines`；末步不是 record_extraction；关键步 `onError:"stop"`（无 `retry`，无 `errorConfig`，无 `runId`）。
 - 产出的 workflow.json **必须过编译版 schema 校验**（`workflowStepSchema` + `validateWorkflowSteps`）。
 
 ## 3. 工具

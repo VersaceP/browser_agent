@@ -50,7 +50,7 @@ v1 用一发 `Runtime.evaluate`（heading 启发式 JS）读三段文本；任�
 - `reviewsText` / `prosConsText` / `qaText` 至少各非空一项（三段全缺 → contract-unmet 接管；单段缺失是正常情况，如 rank 37）。
 
 ## 兜底契约（人读版，结构化见 fallback.yaml takeover）
-- **failure-takeover**：非内容步骤失败（navigate/引擎级；内容三步是 `onError:continue` 不会触发）→ `Workflow.execute` **抛异常**（rich payload 不在异常里）→ 必须二次调 **`Workflow.getStatus(runId)`** 取 `status.results[-1].step`（含 purpose）+ `failedStepPath` + `variables` → agent 接管，`Page.getState`+`DOM.getAXTree` 重新感知后用 DOM 工具继续。
+- **failure-takeover**：非内容步骤失败（navigate/引擎级；内容三步是 `onError:continue` 不会触发）→ `Workflow.execute` **抛异常**（rich payload 不在异常里）→ 失败详情来自 `Workflow.progress` 流（harness 的 `exec_observer` 旁路记录）：`failedStepPath` + `failedErrorCode` + `variablesAtFailure` + `completedSteps`。`Workflow.getStatus` 帮不上忙——它要 `workflowId`，而失败错误体里没有，且只返回变量名不返回值 → agent 接管，`Page.getState`+`DOM.getAXTree` 重新感知后用 DOM 工具继续。
 - **contract-unmet**：browser_call 无 error 但三段 *Text 全空（页面改版 / 容器 id 变了）→ agent 接管：`DOM.getAXTree` 重新感知 section 容器（v1 的 heading 启发式 JS 是备选发现手段），`DOM.getText` 复抽，成功后 self-heal 回写新选择器。
 - HITL：若 navigate 后遇 Cloudflare/挑战 → `Hitl.requestPause`（harness 既有机制），等 `Hitl.resumed`，不自己 resolvePause。
 

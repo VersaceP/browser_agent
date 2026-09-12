@@ -250,10 +250,6 @@ class Skill:
         return list(self.workflow.get("steps") or [])
 
     @property
-    def error_config(self) -> Dict[str, Any]:
-        return dict(self.workflow.get("errorConfig") or {"onError": "stop"})
-
-    @property
     def variable_template(self) -> Dict[str, Any]:
         return dict(self.workflow.get("variables") or {})
 

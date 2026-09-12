@@ -13,19 +13,21 @@
     "targetUrl": "",
     "headingText": "<目标区块的可见标题文本，用于运行期重解析其 id>"
   },
-  "errorConfig": { "onError": "stop", "maxRetries": 1 },
   "steps": [
     {
       "action": "Page.navigate",
-      "params": { "url": "$vars.targetUrl" },
+      "params": {
+        "url": "$vars.targetUrl"
+      },
       "onError": "continue",
-      "purpose": "Open the target page. onError:continue — a heavy real page can make the navigate CALL return -32001 timeout while the page still loads; the next listen Page.loaded settles it."
+      "purpose": "Open the target page. onError:continue — a heavy real page can make the navigate CALL return -32001 timeout while the page still loads; the next waitEvent on Page.loaded settles it."
     },
     {
-      "type": "listen",
-      "event": "Page.loaded",
-      "timeout": 15000,
-      "onTimeout": "continue"
+      "type": "waitEvent",
+      "focus": [
+        "Page.loaded"
+      ],
+      "timeout": 15000
     },
     {
       "action": "Page.getState",
@@ -43,20 +45,36 @@
       "type": "transform",
       "input": "$cache.axTree.lines",
       "ops": [
-        { "op": "find", "pattern": "$vars.headingText", "mode": "contains" },
-        { "op": "regex", "pattern": "\\[([0-9a-fA-F-]+:\\d+:\\d+)\\]", "group": 1 }
+        {
+          "op": "find",
+          "pattern": "$vars.headingText",
+          "mode": "contains"
+        },
+        {
+          "op": "regex",
+          "pattern": "\\[([0-9a-fA-F-]+:\\d+:\\d+)\\]",
+          "group": 1
+        }
       ],
       "output": "targetId"
     },
     {
       "type": "if",
-      "condition": { "path": "$vars.targetId", "operator": "matches", "value": "[0-9a-fA-F-]+:\\d+:\\d+" },
+      "condition": {
+        "path": "$vars.targetId",
+        "operator": "matches",
+        "value": "[0-9a-fA-F-]+:\\d+:\\d+"
+      },
       "then": [
         {
           "action": "DOM.getText",
-          "params": { "id": "$vars.targetId" },
+          "params": {
+            "id": "$vars.targetId"
+          },
           "purpose": "Read the target section text into a scalar variable",
-          "extract": { "targetText": "text" }
+          "extract": {
+            "targetText": "text"
+          }
         }
       ],
       "else": [

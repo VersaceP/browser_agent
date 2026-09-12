@@ -123,4 +123,4 @@ If ABCP is unavailable, report the connection blocker clearly. Do not fall back 
 
 Use `Workflow.execute` only for stable subflows whose sequence is known before execution: navigate, wait, inspect, bounded loops, simple branching, or extraction into variables.
 
-Avoid workflow for open-ended browsing, CAPTCHA/HITL resolution, visual judgment, or decisions that require fresh reasoning after each page change. If a workflow fails, use the stable `runId` with `Workflow.getStatus` to inspect `failedStepPath`, error, variables, and step results.
+Avoid workflow for open-ended browsing, CAPTCHA/HITL resolution, visual judgment, or decisions that require fresh reasoning after each page change. If a workflow fails, the -32005 error body carries only `failedStepPath`. `Workflow.getStatus` needs a `workflowId` the error body does not include, and returns variable NAMES without values. The complete record is the `Workflow.progress` notification stream.
