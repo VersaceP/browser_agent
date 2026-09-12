@@ -199,6 +199,9 @@ def _apply_defaults(
     resolved = _resolve_ref(schema, root)
     if resolved is not schema:
         _apply_defaults(value, resolved, root, path, applied)
+    if isinstance(value, list):
+        _apply_item_defaults(value, schema, root, path, applied)
+        return
     if not isinstance(value, dict):
         return
 
@@ -234,6 +237,51 @@ def _apply_defaults(
             applied.append(_display_path(path + (str(key),)))
         if key in value:
             _apply_defaults(value[key], child_schema, root, path + (str(key),), applied)
+
+
+def _apply_item_defaults(
+    value: List[Any],
+    schema: JsonDict,
+    root: JsonDict,
+    path: Tuple[str, ...],
+    applied: List[str],
+) -> None:
+    """Descend into array elements so item shapes can supply their defaults.
+
+    The recursion used to stop at the array: only object properties were ever
+    visited, so a field an item shape declares as required-with-a-default was
+    never filled and the element failed validation the platform would have
+    accepted.  Run a686e03f step 29: every step of an
+    ``execute_browser_workflow`` segment omitted ``onError``, which the live
+    ``Workflow.execute`` step union lists in ``required`` while carrying a
+    ``default`` -- the Zod ``.default()`` artifact already documented in
+    ``workflow_schema_source._effective_required``.  All four steps were
+    rejected here as ``anyOf`` misfits, and 16KB of schema error went back to
+    the model for a call the platform would have run.  This is not specific to
+    workflows: it applies wherever a live schema defaults a required field
+    inside an array.
+    """
+    items = schema.get("items")
+    prefix = schema.get("prefixItems")
+    consumed = 0
+    if isinstance(prefix, list):
+        for index, child_schema in enumerate(prefix[: len(value)]):
+            _apply_defaults(
+                value[index], child_schema, root, path + (str(index),), applied
+            )
+        consumed = len(prefix)
+    elif isinstance(items, list):
+        # Draft-04/07 tuple form: ``items`` is the positional list itself.
+        for index, child_schema in enumerate(items[: len(value)]):
+            _apply_defaults(
+                value[index], child_schema, root, path + (str(index),), applied
+            )
+        consumed = len(items)
+        items = schema.get("additionalItems")
+    if not isinstance(items, dict):
+        return
+    for index in range(consumed, len(value)):
+        _apply_defaults(value[index], items, root, path + (str(index),), applied)
 
 
 def _apply_composed_defaults(
