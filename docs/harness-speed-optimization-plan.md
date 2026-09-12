@@ -14,7 +14,7 @@
   | L0.2 降 worker 推理预算 | ❌ 实测否决 | — |
   | L0.3 lead max_tokens | ❌ 已撤回 | — |
   | L1.1 `--agent-mode browser` | ✅ 已完成 | `11ce1e5` |
-  | L1.2 PageSession 解耦 step 预算 | ⬜ 待做 | — |
+  | L1.2 页面记录 + 阶段自动续跑 | ✅ 已完成（范围已修正，见下） | `5cc850b` `a9522ad` |
   | L1.3 动作回执带局部 AXTree diff | ⬜ 待做，与段化重叠，需重测 | — |
   | L1.4 并行 tool_calls | ⏸ 实测无靶子（82.4% 回合单调用） | — |
   | L2.1 Workflow 执行通道 | ⚠️ 部分完成；真实任务 A/B 已补 | `5d4d8f9` `6467e9f` |
@@ -178,13 +178,90 @@ lead 的推理预算（继承就会原样复现那 254 秒），literal items �
 见 `a686e03f` 复盘。分类器早期产出的 output_contract 会把任务里枚举的条目当成产物的
 列，导致收尾返工——已在 prompt 里加列/行区分修掉。
 
-### L1.2 PageSession：把会话从 step 预算上解耦 ⬜ 待做
+### L1.2 页面记录 + 阶段自动续跑 ✅ 已完成（2026-09-12）
 
-`agent_harness.py:1314` `while not should_finish and step < self.effective_max_steps:` —— 循环一退出，`messages`（全部页面事实）随栈消失，只留一个 `final-context.json` 归档，无人读回。
+原方案是"会话宿主从 worker 换成 PageSession"。做之前先量，量完把范围改了。
 
-成本：**33.3% 的 phase 要重建 worker**（`fill_yue_application_form` 用了 4 个），每次重建 = 丢掉全部页面事实 + 重新 spawn + 重新导航 + 重新读树。
+#### 为什么原方案只能吃到 15%
 
-**动作**：会话宿主从 worker 进程换成 PageSession（绑 pageId/fleetId），存可跨 worker 复用的：已验证的选择器语义、已填值、已完成的不可重放副作用、失败过的路径。**不存** AX ID / 坐标 / 页面快照值。
+两处测量（下面两张表都是从历史 run.jsonl 逐事件算的）：
+
+| 换 worker 的代价 | 单次 | 50 次合计 |
+|---|---:|---:|
+| 第 2+ 个 worker 的热身（对照：第 1 个 18.8s） | 28.4s | **1,421s** |
+| **worker 结束 → 下一个 worker 起步（走 lead 一趟）** | p50 **96.0s** | — |
+| 　其中上一个是 `step_budget_exhausted` 的（n=50） | p50 **122.0s** | **9,350s** |
+
+间隔里平均 **4.2 次 lead LLM 调用、8,586 out token**；重新发布计划 65 次。
+
+只传结构化记录 → 省热身那 1,421s；lead 往返那 9,350s 一分不动。**1,421 : 9,350 ——
+所以"传记录"必须和"砍往返"一起做，单做任何一件都不成立。**
+
+#### step cap 到底该不该留：24 个可配对样本
+
+| `step_budget_exhausted` worker 的尾部 5 回合 | 数量 |
+|---|---:|
+| 仍在产出新的状态变更动作 → cap 砍掉了有效工作 | **14（58%）** |
+| 空转 / 高重复 → cap 在止损 | 10（42%） |
+
+结论：**cap 保留**（42% 的时候它在救命），但"撞 cap"不该等于"phase 停下等 lead"。
+单 worker 的 cap 防的是单个 worker 的上下文耗尽和死循环；phase 该不该继续，换成
+进展判据。
+
+#### 落地的两块
+
+**① 页面记录**（`harness/page_session.py`，`5cc850b`）
+
+每个 worker 终态时从 trace **机械提取**，按 pageId 落到 `<task_dir>/page_sessions/`：
+
+- 存：已填值（Input.type / Input.select）、成功的状态变更动作、失败路径 + 平台 errorCode、artifact 路径、导航
+- **不存**：AX id、selector、坐标、页面快照 —— 它们随 document 世代过期，给出去比不给更差（`stale-target` 要一个往返才发现）
+- 标签用 `params.purpose`：平台对所有状态变更方法标了 `requiresPurpose`，模型本来就写了一句"这一步在干什么"，**是运行期数据，不是 harness 里的站点/字段硬编码**
+- 过滤掉 `dismiss_overlay:` / `captcha autosolve:` 两个恢复类 composite 自己写的 purpose（是机械噪声，对下一个 worker 零价值）
+- **不问模型**：worker 自述是 claim，下一个 worker 会当成页面状态读
+- 注入进下一个 worker 的第一条 user message（不做成工具 —— guide 几乎无人按需读），且只注入这个 worker 实际被授权的 pageId；文案写明"这是上一个 worker 当时的观察，不是当前页面状态的保证"
+
+**② 阶段自动续跑**（`harness/tools/lead_tools.py`，`a9522ad`）
+
+`wait_browser_agents` 返回后，若「恰好一个完成的 worker + 无 pending + phase 未终态」，
+harness 直接重派同一个 phase，不回 lead。
+
+三条机械判据全部复用 direct-worker 已有的那套，没有新发明：
+
+| 判据 | 实现 | 谁写的 |
+|---|---|---|
+| A 完成 | `status=done` 且 phase `validated_done` | 既有 |
+| B 无进展 | `repeated_no_progress_same_signature`（行数不增 + 失败签名相同） | `_direct_continuation_decision` |
+| C 预算 | 自动续跑次数单独封顶（默认 2） | 新增 config |
+
+C 为什么不复用 `phase.max_attempts`：`_count_budgeted_phase_attempts` **把 `partial` 排除在预算外**，
+所以 phase 预算单独兜不住 partial 循环。
+
+仍然回 lead 的情况（每条都记事件）：未解决的验证码 / HITL、两个完成的 worker（是合并
+决策）、还有 worker 在跑（是并发决策）、spawn 被拒（phase_exhausted / 依赖闸 / replan 检查点）。
+
+续跑时**原样重发 lead 自己那次 dispatch**（含 session_key / fleet_id / page_policy /
+worker_contract 覆盖 —— 这些 phase 本身表达不出来），外加一段只讲回执的说明：上一个
+worker 的 status、行数、已落盘 artifact 路径。**不编造"还剩哪些行"**——能枚举的那类
+契约由既有的 `_direct_continuation_context` 给精确单元表。
+
+lead 侧 rule 11 已改：看到 `phaseContinuation` 回执就知道 harness 已经续过，旁边那个
+worker 结果是最后一次。
+
+#### 配置
+
+`runtime_config.py` → `harness.phase_auto_continuation_enabled`（默认开）、
+`phase_auto_continuation_max_attempts`（默认 2，clamp 0–6）。设 0 即完全回到旧行为。
+
+#### 明确不做（留给 `docs/persistent-browser-runtime-redesign-plan.md` 阶段 B）
+
+接管 PageSession 生命周期、跨 worker 复用浏览器连接、删掉 step 预算终止路径本身。
+
+#### 验收
+
+`3932 passed, 3 skipped, 1012 subtests`（此前 3902），新增 30 个测试：
+`tests/test_page_session.py`（14）、`tests/test_phase_auto_continuation.py`（16）。
+**真实任务 A/B 未跑** —— 上面的数字全部是历史 run 的回放测量，收益需要下一次同类任务实跑验证。
 
 ### L1.3 动作回执自带局部 AXTree diff ⬜ 待做（与段化重叠，需重测）
 
