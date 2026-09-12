@@ -340,6 +340,31 @@ def _apply_missing_defaults(
             _apply_missing_defaults(
                 value[key], candidate_values, path + (str(key),), applied
             )
+        elif isinstance(value[key], list) and all(
+            isinstance(item, list) and len(item) == len(value[key])
+            for item in candidate_values
+        ):
+            # A composed branch can complete a NESTED item too. Workflow.execute
+            # declares loop.body / if.then as arrays of the same step union, and
+            # an action step there carries the required `onError` default. The
+            # branch candidate had those defaults applied and matched; without
+            # this arm they were discarded along with the candidate, the union
+            # then failed, and the error surfaced as a `const` mismatch on the
+            # step's own `type` - neither where the problem was nor anything the
+            # caller could act on. Run f56d50f0 spent 84.3s and 18,305 output
+            # tokens on one such rejection and never authored a loop or if
+            # again, so the cost of dropping this work is not just a retry.
+            for index, element in enumerate(value[key]):
+                element_candidates = [item[index] for item in candidate_values]
+                if isinstance(element, dict) and all(
+                    isinstance(item, dict) for item in element_candidates
+                ):
+                    _apply_missing_defaults(
+                        element,
+                        element_candidates,
+                        path + (str(key), str(index)),
+                        applied,
+                    )
 
 
 def _validate(
@@ -508,6 +533,22 @@ def _append_closest_branch_issues(
     keyword: str,
 ) -> None:
     """Expose the least-failing composition branch as actionable feedback."""
+    pinned = _discriminated_branch(value, branches, root)
+    if pinned is not None:
+        pinned_issues: List[SchemaIssue] = []
+        _validate(value, pinned, root, path, pinned_issues)
+        visible_pinned = [
+            issue
+            for issue in pinned_issues
+            if not _is_defaulted_required_issue(issue, pinned, root, path)
+        ]
+        if visible_pinned:
+            for issue in visible_pinned:
+                if len(issues) >= 12:
+                    return
+                if issue not in issues:
+                    issues.append(issue)
+            return
     candidates: List[Tuple[int, int, int, List[SchemaIssue]]] = []
     for index, branch in enumerate(branches):
         branch_issues: List[SchemaIssue] = []
@@ -536,6 +577,52 @@ def _append_closest_branch_issues(
             return
         if issue not in issues:
             issues.append(issue)
+
+
+def _branch_constants(branch: Any, root: JsonDict) -> Optional[JsonDict]:
+    """The `const` properties a branch pins, i.e. its discriminator."""
+    if not isinstance(branch, dict):
+        return None
+    resolved = _resolve_ref(branch, root)
+    properties = resolved.get("properties")
+    if not isinstance(properties, dict):
+        return None
+    return {
+        key: child["const"]
+        for key, child in properties.items()
+        if isinstance(child, dict) and "const" in child
+    }
+
+
+def _discriminated_branch(
+    value: Any, branches: Sequence[Any], root: JsonDict,
+) -> Optional[Any]:
+    """The one branch the value's own discriminator selects, when there is one.
+
+    Ranking branches by issue count reads a discriminated union backwards. A
+    `loop` step measured against the `action` branch fails on exactly one
+    keyword - `type` must be the constant "action" - while the branch it
+    actually declares itself to be fails on something nested and real. The
+    cheap-looking mismatch wins the ranking, and the caller is told its `type`
+    is wrong when `type` was the only part it got right.
+
+    In run f56d50f0 the model read that verdict as "composite loop/if
+    validation was rejected" and authored no loop or if for the rest of the
+    run. An error message that names the wrong field does not merely fail to
+    help; it teaches.
+    """
+    if not isinstance(value, dict):
+        return None
+    matches = [
+        branch
+        for branch in branches
+        if (constants := _branch_constants(branch, root))
+        and all(
+            key in value and _json_equal(value[key], constant)
+            for key, constant in constants.items()
+        )
+    ]
+    return matches[0] if len(matches) == 1 else None
 
 
 def _is_defaulted_required_issue(
