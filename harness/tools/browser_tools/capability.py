@@ -2,6 +2,7 @@
 harness.tools.browser_tools.capability - ABCP capability execution core (browser_call dispatch layer).
 """
 
+import json
 import re
 from typing import Any
 from typing import List
@@ -37,6 +38,8 @@ from .axtree_state import _check_stale_axtree_target
 from .axtree_state import _observe_axtree_state_after
 from .axtree_state import _precompute_axtree_snapshot
 from harness.workflow_policy import validate_workflow_params
+from harness.observation.exec_observer import ExecObserver
+from harness.workflow_projection import project_workflow_receipt
 
 def _bt():
     import harness.tools.browser_tools as bt
@@ -528,6 +531,18 @@ async def _execute_browser_capability_tool(
     page_create_should_stop = False
     hitl_pause_succeeded = False
     page_list_shown: Optional[List[JsonDict]] = None
+    # See the note on the same construct in _invoke_browser_method: a blocked
+    # Workflow.execute holds the client's _call_lock, so its Workflow.progress
+    # stream on the notification channel is the only record of what ran. This
+    # is the model-facing dispatch, which reaches the same platform call by a
+    # different route and therefore needs its own observer.
+    exec_observer = (
+        ExecObserver(
+            agent.browser, page_id=str(params.get("pageId") or "") or None
+        ).start()
+        if method == "Workflow.execute"
+        else None
+    )
     try:
         runner = getattr(agent, "browser_call_runner", None)
         if runner is None:
@@ -811,6 +826,23 @@ async def _execute_browser_capability_tool(
             **_bt()._transport_error_metadata(method, exc),
         }
         attach_method_schema(result, method, agent.method_schemas)
+    finally:
+        # The subscription has to be dropped on EVERY exit, not just the two
+        # this function turns into a result. A connection-fatal transport error
+        # re-raises above, an unexpected exception is not handled at all, and
+        # asyncio.CancelledError is a BaseException that no `except Exception`
+        # sees — each left the observer subscribed to Workflow.progress for the
+        # life of the process. stop() is idempotent and keeps the trace on the
+        # observer, so the attach below still has it.
+        if exec_observer is not None:
+            exec_observer.stop()
+
+    if exec_observer is not None:
+        _attach_exec_trace(
+            result, exec_observer.trace, agent, step,
+            workflow_params=params if method == "Workflow.execute" else None,
+        )
+        _project_workflow_result(result, agent, step)
 
     if image_output_receipt is not None:
         result["normalizedFields"] = ["params.options.path"]
@@ -1046,6 +1078,168 @@ def _attach_complete_payload(
 
 _TRUSTED_COLLECTION_RUNTIME_TOKEN = object()
 
+def _project_workflow_result(result: JsonDict, agent: Any, step: Any) -> None:
+    """Drop the intermediate observations a segment consumed inside itself.
+
+    Runs after the trace is attached, so the receipt keeps the step-by-step
+    record even when the payloads behind it are projected away.
+    """
+    harness_config = getattr(getattr(agent, "runtime", None), "harness", None)
+    if harness_config is None or not getattr(
+        harness_config, "workflow_result_projection_enabled", False
+    ):
+        return
+    try:
+        receipt = project_workflow_receipt(
+            logger=getattr(agent, "logger", None),
+            result=result,
+            step=step,
+            prefix=str(getattr(getattr(agent, "runtime", None), "agent_id", "") or ""),
+            inline_result_bytes=int(
+                getattr(harness_config, "workflow_result_inline_bytes", 4000)
+            ),
+        )
+    except Exception:  # pragma: no cover - projection must not break a call
+        return
+    logger = getattr(agent, "logger", None)
+    if receipt is None or logger is None:
+        return
+    # A declined projection gets its own event name. Sharing one and relying on
+    # a `projected: false` field means any count-by-event-name reports the
+    # abstentions as projections.
+    skipped = receipt.get("projectionSkipped")
+    try:
+        if skipped:
+            logger.write("exec.segment.projection_skipped", {
+                "step": step,
+                "reason": skipped,
+                "stepsTotal": receipt.get("stepsTotal"),
+                "candidates": receipt.get("candidates"),
+                "originalBytes": receipt.get("originalBytes"),
+            })
+            return
+        logger.write("exec.segment.projected", {
+            "step": step,
+            "stepsTotal": receipt.get("stepsTotal"),
+            "stepResultsProjected": receipt.get("stepResultsProjected"),
+            "originalBytes": receipt.get("originalBytes"),
+            "projectedBytes": receipt.get("projectedBytes"),
+            "savedPath": receipt.get("savedPath"),
+        })
+    except Exception:  # pragma: no cover - telemetry must not break a call
+        pass
+
+
+def _segment_step_counts(steps: Any) -> JsonDict:
+    """Structural step-type census of an authored workflow, recursive.
+
+    Raw counts only — whether a segment was worth its inference cost is an
+    offline question that needs the run's own model latencies; it is not a
+    runtime fact and must not be recorded as one here.
+    """
+    counts: JsonDict = {
+        "authoredStepCount": 0,
+        "actionStepCount": 0,
+        "eventStepCount": 0,
+        "transformStepCount": 0,
+        "storeStepCount": 0,
+        "controlStepCount": 0,
+    }
+    stack = list(steps if isinstance(steps, list) else [])
+    while stack:
+        item = stack.pop()
+        if not isinstance(item, dict):
+            continue
+        counts["authoredStepCount"] += 1
+        # The platform's Action union has a typeless shorthand member
+        # ({"action": "Input.click", "params": {...}} with no "type"), and the
+        # model-facing schema deliberately leaves `type` optional on action
+        # steps — validate_workflow_params derives the same fallback
+        # (workflow_policy.py, `_validate_steps`). Counting by `type` alone
+        # would report actionStepCount 0 for any segment the model writes in
+        # shorthand.
+        kind = str(item.get("type") or "").strip()
+        if not kind and item.get("action"):
+            kind = "action"
+        if kind == "action":
+            counts["actionStepCount"] += 1
+        elif kind in {"waitEvent", "readEvents"}:
+            counts["eventStepCount"] += 1
+        elif kind == "transform":
+            counts["transformStepCount"] += 1
+        elif kind == "store":
+            counts["storeStepCount"] += 1
+        elif kind in {"if", "loop"}:
+            counts["controlStepCount"] += 1
+        for nested in (item.get("body"), item.get("then"), item.get("else")):
+            if isinstance(nested, list):
+                stack.extend(nested)
+    return counts
+
+
+def _attach_exec_trace(
+    result: JsonDict,
+    trace: Any,
+    agent: Any = None,
+    step: Any = None,
+    workflow_params: Optional[JsonDict] = None,
+) -> None:
+    """Put the reconstructed execution record on a Workflow.execute result.
+
+    On success the platform's own envelope already carries results/variables, so
+    the trace adds the per-step timing and the page events around it. On failure
+    it is the entire record, which is why `failedStepPath` and the completed
+    steps are lifted to the top level where the caller already looks for them.
+    """
+    if not isinstance(result, dict):
+        return
+    receipt = trace.to_receipt()
+    result["executionTrace"] = receipt
+    # One segment replaces N model turns; this is the number that says how many.
+    logger = getattr(agent, "logger", None)
+    if logger is not None:
+        try:
+            logger.write("exec.segment.result", {
+                "step": step,
+                "workflowId": trace.workflow_id,
+                "phase": trace.phase,
+                "actionsObserved": receipt.get("stepsObserved"),
+                "actionsSucceeded": receipt.get("stepsSucceeded"),
+                "actionsOmitted": receipt.get("stepsOmitted"),
+                "failedStepPath": (trace.failure or {}).get("stepPath"),
+                "failedErrorCode": (trace.failure or {}).get("errorCode"),
+                "pageEvents": receipt.get("pageEvents"),
+                "eventCursorRange": receipt.get("eventCursorRange"),
+                # Raw segment economics, per the b6d3156e/8208ed49 review:
+                # what was authored, what ran, how long, how big the receipt.
+                # Counts are structural (by step type), never judgments.
+                **_segment_step_counts(
+                    (workflow_params or {}).get("steps")
+                    if isinstance(workflow_params, dict) else None
+                ),
+                "executedStepCount": receipt.get("stepsObserved"),
+                "durationMs": getattr(trace, "duration_ms", None),
+                "resultBytes": len(json.dumps(result, ensure_ascii=False, default=str)),
+            })
+        except Exception:  # pragma: no cover - telemetry must not break a call
+            pass
+    if not result.get("error"):
+        return
+    failure = trace.failure or {}
+    if trace.workflow_id:
+        result.setdefault("workflowId", trace.workflow_id)
+    step_path = failure.get("stepPath")
+    if step_path:
+        result.setdefault("failedStepPath", step_path)
+    if failure.get("errorCode"):
+        result.setdefault("failedErrorCode", failure["errorCode"])
+    if trace.variables:
+        result.setdefault("variablesAtFailure", trace.variables)
+    completed = trace.completed_steps
+    if completed:
+        result.setdefault("completedSteps", completed)
+
+
 async def _invoke_browser_method(
     agent: Any,
     method: str,
@@ -1152,6 +1346,22 @@ async def _invoke_browser_method(
     if hitl_claim_guard is not None:
         return hitl_claim_guard
     hitl_pause_succeeded = False
+    # A Workflow.execute holds the client's single _call_lock for its whole run,
+    # so nothing can be asked about it while it is in flight. Its
+    # Workflow.progress events, however, arrive on the notification channel,
+    # which is demultiplexed off the background reader independent of the lock.
+    # That stream is the ONLY place the workflowId, the completed steps and the
+    # failure-time variable values exist when the call raises: the -32005 error
+    # carries just a step path, and getStatus (which needs a workflowId to begin
+    # with) returns variable NAMES and a result count.
+    # See docs/workflow-execute-live-contract.md.
+    exec_observer = (
+        ExecObserver(
+            agent.browser, page_id=str(params.get("pageId") or "") or None
+        ).start()
+        if method == "Workflow.execute"
+        else None
+    )
     try:
         runner = getattr(agent, "browser_call_runner", None)
         if runner is None:
@@ -1233,6 +1443,23 @@ async def _invoke_browser_method(
             **_bt()._transport_error_metadata(method, exc),
         }
         attach_method_schema(result, method, agent.method_schemas)
+    finally:
+        # The subscription has to be dropped on EVERY exit, not just the two
+        # this function turns into a result. A connection-fatal transport error
+        # re-raises above, an unexpected exception is not handled at all, and
+        # asyncio.CancelledError is a BaseException that no `except Exception`
+        # sees — each left the observer subscribed to Workflow.progress for the
+        # life of the process. stop() is idempotent and keeps the trace on the
+        # observer, so the attach below still has it.
+        if exec_observer is not None:
+            exec_observer.stop()
+
+    if exec_observer is not None:
+        _attach_exec_trace(
+            result, exec_observer.trace, agent, step,
+            workflow_params=params if method == "Workflow.execute" else None,
+        )
+        _project_workflow_result(result, agent, step)
 
     result = await _bt()._quarantine_workflow_result_after_auth_change(
         agent,

@@ -35,6 +35,10 @@ JsonDict = Dict[str, Any]
 
 DEFAULT_OFFLOAD_THRESHOLD_BYTES = 8000
 DEFAULT_TOOL_RESULT_OFFLOAD_THRESHOLD_BYTES = 50000
+# Step results at or below this ride back inline. A click receipt is ~120 bytes
+# and says how the target resolved; an AX tree measured 27076-45858 bytes across
+# the 13 trees in run 8208ed49 and is what projection exists to remove.
+DEFAULT_WORKFLOW_INLINE_RESULT_BYTES = 4000
 DEFAULT_LOCAL_FS_READ_BYTES = 20000
 
 DEFAULT_LLM_API_TIMEOUT_SECONDS = 180.0
@@ -1032,6 +1036,16 @@ class HarnessConfig:
     tool_result_offload_threshold_bytes: int = (
         DEFAULT_TOOL_RESULT_OFFLOAD_THRESHOLD_BYTES
     )
+    # A segment that observes inside itself (click, read the tree, match a
+    # label, click the match) consumes its own intermediate observations, but
+    # the platform returns every one of them. Field offload cannot reach them:
+    # it keys on the method name and scans only response["data"][field], while
+    # a nested tree sits at data.results[N].result.lines. Measured on run
+    # 8208ed49: data.results was 79% of all Workflow.execute receipt bytes.
+    # The last step's result is always kept whole — that is the observation the
+    # segment ended on and the model's next target comes from it.
+    workflow_result_projection_enabled: bool = True
+    workflow_result_inline_bytes: int = DEFAULT_WORKFLOW_INLINE_RESULT_BYTES
     local_fs_max_read_bytes: int = DEFAULT_LOCAL_FS_READ_BYTES
     model_context_window_tokens: int = 262144
     context_compaction_threshold_ratio: float = 0.85
@@ -1460,6 +1474,18 @@ class HarnessConfig:
             ),
             max_observation_chars=int(
                 data.get("max_observation_chars", cls.max_observation_chars)
+            ),
+            workflow_result_projection_enabled=bool(
+                data.get(
+                    "workflow_result_projection_enabled",
+                    cls.workflow_result_projection_enabled,
+                )
+            ),
+            workflow_result_inline_bytes=int(
+                data.get(
+                    "workflow_result_inline_bytes",
+                    cls.workflow_result_inline_bytes,
+                )
             ),
             offload_threshold_bytes=int(
                 data.get("offload_threshold_bytes", cls.offload_threshold_bytes)
