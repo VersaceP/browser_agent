@@ -33,7 +33,24 @@ JsonDict = Dict[str, Any]
 # 共享默认值（harness/constants.py 从这里 re-export）
 # ---------------------------------------------------------------------------
 
-DEFAULT_OFFLOAD_THRESHOLD_BYTES = 8000
+# Field-level offload for DOM.* reads (AXTree lines, text, attributes...).
+#
+# Raised 8000 -> 50000 on 2026-09-11. Offloading buys context but is PAID FOR in
+# model turns, and measurement says that is a losing trade here:
+#   - 95.7% of DOM.getAXTree results (553/578) were offloaded at 8000, and
+#     answering questions about them cost ~1000 model turns — 35.3% of all
+#     browser-agent turns — through find_in_axtree / local_fs_read /
+#     local_fs_search. Those three channels injected 6.96 MB to avoid injecting
+#     1.82 MB of tree.
+#   - Context barely moves latency: at out<300, the low-context third (ctx
+#     median 33161) answered in 4.8s and the high-context third (ctx median
+#     108680) in 6.2s. 3.3x the context, 29% more latency. A turn costs 5-8s.
+# Live AXTree sizes (2026-09-11): example.com 294 B, news.ycombinator.com
+# 49566 B (~12K tokens), Wikipedia article 137119 B (~34K tokens). 50000 keeps
+# ordinary list/detail pages inline while a genuinely huge tree still goes to
+# disk rather than repeatedly flooding the window.
+# NOT yet A/B-verified end to end — see docs/harness-speed-optimization-plan.md.
+DEFAULT_OFFLOAD_THRESHOLD_BYTES = 50000
 DEFAULT_TOOL_RESULT_OFFLOAD_THRESHOLD_BYTES = 50000
 # Step results at or below this ride back inline. A click receipt is ~120 bytes
 # and says how the target resolved; an AX tree measured 27076-45858 bytes across
