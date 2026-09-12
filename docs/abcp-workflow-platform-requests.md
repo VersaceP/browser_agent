@@ -479,7 +479,35 @@ B 路同时订阅了事件流（`executionTrace` 是调用方从 `Workflow.progr
 
 **顺带一个观察，未提为缺陷**：实验中两次用 `Page.wheel(scrollY: -6000)` 做视口归位，都返回 `-32005 scroll-target-changed-after-input`。不影响本实验（两臂起点一致、目标 id 相同），记录在此供平台侧参考。
 
-### 6.6 复现
+### 6.6 二次实测：同一缺陷在一次成功运行里吃掉 39% 墙钟
+
+运行 `d5b920de`（2026-09-12，同一张深创投表单，最终 `status: done`、6 行全部验证通过、
+无 HITL、无验证码），仍然被同一个缺陷打中：
+
+```
+turn 29  48.0s  execute_browser_workflow → failed scroll-deadline-exceeded
+                （编写 6 步，只执行 1 步，onError: stop）
+turn 30  12.5s  System.describeAction ×2   （模型去读 Page.wheel / Input.scroll 的 schema）
+turn 31  15.1s  Page.wheel
+turn 32   5.2s  DOM.getAXTree
+turn 33   9.9s  Page.wheel
+turn 34   5.6s  search_harness_guides
+turn 35  12.5s  browser_call
+turn 36  11.9s  DOM.getAXTree
+turn 37  28.5s  Input.scroll
+turn 38  21.8s  browser_call
+turn 39   3.1s  DOM.getAXTree
+turn 40   5.5s  Input.click
+─────────────────────────────────
+turn 29-40 合计 179.7s
+```
+
+视口对位之后，turn 41 / 42 两个段**共 14.4s** 就完成了段 3 原本要做的全部工作。
+
+**净浪费约 170s，占该次运行总墙钟 439.8s 的 39%。** 调用方这一侧没有任何办法规避：
+guide 明令禁止预滚（6.1），而 reveal 超时后的建议又被 workflow 吞掉（6.2）。
+
+### 6.7 复现
 
 探针脚本（调用方侧，非平台代码）：
 

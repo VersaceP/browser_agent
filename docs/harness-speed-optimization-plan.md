@@ -5,8 +5,24 @@
   （63 个 browser worker、2832 个 browser-agent 模型回合、2002 次浏览器动作）。
   **按 taskId 选取**——"最新 14 次"的滑动窗口已经复现不出这个样本。
   复现脚本：`docs/replay-baselines/analyze_turn_breakdown.py`
-- 状态：L2-exec **部分完成**（协议探针 + 模型入口 + 第一版 observer）；
-  L0.1 已改待验证；L0.2 实测否决；L1 / L2 剩余 / L3 待做
+- 状态（2026-09-12 更新）：
+
+  | 项 | 状态 | 提交 |
+  |---|---|---|
+  | L0.1 offload 阈值 8000→50000 | ✅ 已改，单站点有效，跨站点未证 | `85f0ac6` |
+  | L0.1 按结果类型分级 | ⏸ 有触发条件才做，见下 | — |
+  | L0.2 降 worker 推理预算 | ❌ 实测否决 | — |
+  | L0.3 lead max_tokens | ❌ 已撤回 | — |
+  | L1.1 `--agent-mode browser` | ✅ 已完成 | `11ce1e5` |
+  | L1.2 PageSession 解耦 step 预算 | ⬜ 待做 | — |
+  | L1.3 动作回执带局部 AXTree diff | ⬜ 待做，与段化重叠，需重测 | — |
+  | L1.4 并行 tool_calls | ⬜ 待做（L2.2 已移除传输层阻塞） | — |
+  | L2.1 Workflow 执行通道 | ⚠️ 部分完成；真实任务 A/B 已补 | `5d4d8f9` `6467e9f` |
+  | L2.2 删响应形状匹配回退 | ✅ 已完成 | `980f7b1` |
+  | L2.3 平台侧绑定 Action | ⬜ 待平台配合 | — |
+  | L3 换基模 + 删 VL | ⬜ 排最后 | — |
+  | **新增** VL reality check 异步化 | ✅ 已完成 | `d41a510` |
+  | **新增** 段化率回归 | ⬜ 查因中 | — |
 
 ## 结论的证据等级
 
@@ -54,7 +70,7 @@
 
 ## L0：配置层（0 代码，当天见效）
 
-### L0.1 取消 AXTree 的 offload ⬜ 待做
+### L0.1 取消 AXTree 的 offload ✅ 已改（`85f0ac6`），跨站点未证
 
 `runtime_config.py:36` `DEFAULT_OFFLOAD_THRESHOLD_BYTES = 8000`。
 
@@ -79,9 +95,52 @@ offload 省 token 却要花模型回合换回来，账是负的：
 （871/2832）降到 **8.9%**（7/79），worker 的 `local_fs_read` 从 379 次降到 1 次。
 回合数确实下来了，但**净收益仍未证**——没有同任务的 before/after 对照。
 
-**更好的方向（未做）**：单一全局阈值太粗。按结果类型处理更合理——小树直接返回；
-大树返回结构索引加与当前问题相关的候选，原始全树留作证据引用；段内直接用
-`transform`/`querySelector` 取值，避免模型再调文件查询工具。
+### L0.1 续：阈值改动的实测，以及分级还剩什么（2026-09-12）
+
+阈值改动前后，全仓按日期切开。注意 `tool_result.model_visible.rawBytes` 是
+offload **之后**的存根大小，原始大小要读 `fieldOriginalBytes`。
+
+| | 改前（8000） | 改后（50000） |
+|---|---:|---:|
+| browser turn | 6,216 | 275 |
+| AXTree 样本 | 914 | 83 |
+| 原始字节 p50 | 28,152 | 28,376 |
+| **原始字节 p90** | **119,667** | **38,344** |
+| **>50000 的树** | **291 = 31.8%** | **0** |
+| 实际 offload | 96.2% | **1.2%** |
+| **被迫查询回合**（`local_fs_read/search`） | **1,350 = 21.7%** | **8 = 2.9%** |
+| 主动 `find_in_axtree` 回合 | 1,024 = 16.5% | 8 = 2.9% |
+
+被迫查询 21.7% → 2.9% 是真实收益。但**净收益仍未证**，理由具体：改后的 275 个
+turn、83 棵树**全部来自同一个站点**（深创投 apply 表单，树稳定在 28-47KB）。改前
+数据里 p90 是 119,667、31.8% 的树超过 50000——那些是别的站点。在那些站点上
+50000 照样 offload，被迫查询照样回来。
+
+**「按结果类型分级」原本是三条，现在只剩一条。**
+
+| 原方案 | 现状 |
+|---|---|
+| 小树直接返回 | ✅ 50000 阈值已实现 |
+| 段内用 `transform`/`querySelector` 取值，免得模型再查文件 | ✅ 段化后模型自己就在这么做（run d5b920de 的段里有 `transform`+`find` 步骤在段内解析目标 id） |
+| **大树返回结构索引 + 相关候选，原始全树留作证据引用** | ❌ 未做 |
+
+剩下那条的形状：今天对一棵 120KB 的树只有二选一——全塞上下文（约 30K token，
+且反复塞），或落盘（模型花 1-3 个回合去查）。分级给第三条路：
+
+```
+回执里带：  结构索引（有几个 form/table/list，各自 role+name+行号范围）  ~几百字节
+          + 相关候选行（用调用必填的 purpose 字段在落盘前筛出 top-N）   ~1-2KB
+落盘保留：  全树 savedPath，需要精确定位时 find_in_axtree 照常可用
+```
+
+大树场景下额外回合为 0，上下文只付几 KB。用 `purpose`（自然语言）筛树是启发式，
+但**筛错的代价是退化到现状**（模型拿到没用的候选，再去 find_in_axtree），不会更
+糟——这让它风险很低。
+
+**触发条件（不满足就不要做）**：一个真实任务里 `fieldOriginalBytes > 50000` 的
+AXTree 出现率超过 20%，或被迫查询回合回到 10% 以上。两个数都能从 `run.jsonl`
+直接算。当前 5 个 run 里靶子出现 **0 次**，而所有 A/B 基线又都建立在深创投这一个
+任务上，所以先换站点验证再谈。
 
 ### L0.2 降 worker 的推理预算 ❌ 实测否决
 
@@ -105,11 +164,19 @@ max 1.8s/231tok、high 1.8s/260、medium 1.6s/167、low 1.7s/238，全在噪声�
 
 ## L1：Harness 层（小改动）
 
-### L1.1 `agent_mode=browser` 直达 ⬜ 待做
+### L1.1 `agent_mode=browser` 直达 ✅ 已完成（`11ce1e5`）
 
 实测首个浏览器动作要等 **6.6–19.9 分钟**，全是 lead 的计划阶段（单发输出 24000 token，耗时 356–497s）。
 
 **动作**：`main.py` 提供 `agent_mode=lead|browser`，`browser` 不创建 LeadAgent、不生成 phase plan。
+
+**已落地（`11ce1e5`）**：一次有界分类调用取代那一发计划生成，之后机械合成同形 raw
+声明，编译/校验/PlanValidator 审计/操作员审批/派发/收尾全部走原函数。分类器不继承
+lead 的推理预算（继承就会原样复现那 254 秒），literal items 必须逐字出现在任务里。
+
+**实测**：计划阶段 254s → 约 14s。但 browser 模式的 worker 侧并无提速（也不该有），
+见 `a686e03f` 复盘。分类器早期产出的 output_contract 会把任务里枚举的条目当成产物的
+列，导致收尾返工——已在 prompt 里加列/行区分修掉。
 
 ### L1.2 PageSession：把会话从 step 预算上解耦 ⬜ 待做
 
@@ -119,17 +186,26 @@ max 1.8s/231tok、high 1.8s/260、medium 1.6s/167、low 1.7s/238，全在噪声�
 
 **动作**：会话宿主从 worker 进程换成 PageSession（绑 pageId/fleetId），存可跨 worker 复用的：已验证的选择器语义、已填值、已完成的不可重放副作用、失败过的路径。**不存** AX ID / 坐标 / 页面快照值。
 
-### L1.3 动作回执自带局部 AXTree diff ⬜ 待做
+### L1.3 动作回执自带局部 AXTree diff ⬜ 待做（与段化重叠，需重测）
 
 现状：`click → getAXTree → find_in_axtree` 三个回合。已有 `snapshot_diff.detected` 事件和 `_precompute_axtree_snapshot`（`axtree_state.py:136`）。
 
 **动作**：`Input.*` 返回时附带动作后受影响区域的树片段，三个回合压成一个。
+
+**2026-09-12 修订**：这一项和段化打同一个靶子（纯观察 turn），而段化更彻底——它把
+观察收进段里，连动作 turn 一起消掉。`8208ed49` 已把纯观察 turn 从 44% 压到 21%。
+所以 L1.3 的剩余价值是"段与段之间的间隙"，**必须在段化率稳定之后重测再定**，不能
+把两者的收益相加。
 
 ### L1.4 并行执行 tool_calls ⬜ 待做
 
 `agent_harness.py:1741` 是串行 `for tool_index, tool_call in enumerate(tool_calls):`。对零延迟本地工具无所谓，但阻止了跨页并行读取。
 
 **动作**：按资源分组 `gather`（同 page 的浏览器动作保持串行）。同时在 prompt 里要求模型批量发工具调用（当前 1.21 → 目标 3+）。
+
+**2026-09-12**：传输层的阻塞已经拆掉（L2.2 删了全局 `_call_lock`，实测 5 个并发请求
+全部按 id 正确配对），所以这一项不再有传输层前置。剩下的是 harness 侧的分组与
+`gather`，以及"同 page 的浏览器动作必须串行"这条约束怎么表达。
 
 ---
 
@@ -150,12 +226,25 @@ max 1.8s/231tok、high 1.8s/260、medium 1.6s/167、low 1.7s/238，全在噪声�
   （engine.ts 把 waitCursor 推到 window.endCursor），不是我初版说的"会回放"。
   真机上导航仍安全（Page.loaded 落在窗口外），但这是页面性质，不是协议保证。
 - **`DOM.axTreeUpdated` 目录里有、这个部署不发**，已从可等待集合移除。
-- **真实任务 A/B 未做。**
+- ~~真实任务 A/B 未做。~~ **已做（2026-09-12 补记）**，同任务对照：
+
+  | | `de60b7f4` 逐动作 | `8208ed49` 段化 | 变化 |
+  |---|---:|---:|---:|
+  | worker 数 | 2（第一个步数耗尽） | 1 | |
+  | turn | 79 | 33 | **−58%** |
+  | turn 墙钟 | 956.2s | 464.3s | **−51%** |
+  | 模型时间 | 759.7s | 341.4s | −55% |
+  | **纯观察 turn** | **35（44%）** | **7（21%）** | **−80%** |
+  | out token | 130,339 | 65,477 | −50% |
+
+  **收益全部来自"观察 turn 被吞掉"，不是"批量执行动作"。** 逐动作路径里每个动作
+  后面跟着一个观察 turn，段把观察吞进去了。段的形态是 2-3 步的
+  `[Input.click …] + [DOM.getAXTree]`，平均 **2.0 个动作/段**——都很小。
 
 因此 `workflow_execution_enabled` **恢复为 canary**：代码默认 False，
 部署在 config.json 显式 opt-in。
 
-### L2.2 删响应形状匹配回退 + 多 in-flight ⬜ 待做
+### L2.2 删响应形状匹配回退 + 多 in-flight ✅ 已完成（`980f7b1`）
 
 `abcp_client.py:597-599`：
 
@@ -167,6 +256,24 @@ if message.get("type") in {"response", "result", "error"}:
 未回显 request ID 的响应靠"形状像结果"来匹配当前 pending call。`abcp_client.py:443` 的 `async with self._call_lock` 全局串行，严重到要开第二条连接绕过（`runtime_config.py:1091-1100`）。
 
 **收益是正确性**（乱序/迟到响应串台），不是速度——RPC p50 只有 0.36s。**不是 exec 的前置**。
+
+**实测前置（2026-09-12，真实面板）**：
+
+- id 回显覆盖 **17/17**：System / Fleet / Page / DOM / Workflow 五族，成功与错误
+  路径都有，没有一条响应缺 id。
+- 并发配对 **5/5**，且**返回顺序与发出顺序不同**：
+  发 `[b8c7387f, 3f589502, e59815c4, dd8bade5, 1a69bf18]`，
+  回 `[3f589502, 1a69bf18, b8c7387f, e59815c4, dd8bade5]`。
+
+乱序这条说明旧回退的危险今天只是被全局锁掩盖着，而**超时后迟到的响应照样会串台**。
+
+**已落地**：`_pending` 改成按 request id 索引的字典，删 `_call_lock`，删形状回退。
+配不上 id 的类响应消息走 `orphan_response` 事件——不静默丢、也不交给任何人，万一
+平台哪天不回显 id 会在传输日志里现形，而不是表现为"调用莫名超时"。
+
+**连带**：`skill_workflow_active_control_enabled`（第二条连接）的存在理由消失了一半
+——in-band 控制不再被锁挡住，剩下的约束是 `Workflow.pause/resume` 会话绑定到 run 的
+owner。注释已更正，**默认值没动**，需要单独验证。
 
 ### L2.3 平台侧绑定 Action（原子 check-then-act）⬜ 待平台配合
 
@@ -183,6 +290,69 @@ harness composite 只能买回合数，买不到原子性：check 和 act 之间
 **必须排在所有 A/B 敏感优化之后**：删 VL 依赖 BrowserAgent 基模多模态，而当前 worker 是 `deepseek-v4-flash`。换基模会同时改变推理长度、工具调用习惯、AXTree 理解能力，**一旦先换，前面所有优化的 A/B 归因全部失效**。
 
 ---
+
+## 新增项（2026-09-12 测量后补入计划）
+
+### N1 VL reality check 异步化 ✅ 已完成（`d41a510`）
+
+把全仓 7,599 次 worker 工具调用按「结论是否被当次消费」分类：
+
+| 类别 | 次数 | 总秒 | 占比 | 能否异步 |
+|---|---:|---:|---:|---|
+| HITL 等人 | 33 | 12,094.5 | 52.7% | 无意义（本来就是等人） |
+| 干净工具时间 | 7,366 | 5,237.7 | 22.8% | 否（结果要用） |
+| **reality check（advisory）** | **137** | **4,527.8** | **19.7%** | **可以** |
+| `visual_verify` 工具自身 | 58 | 985.7 | 4.3% | 否（模型主动要答案） |
+
+**15 个工具里除 reality check 外没有一个可以异步**——其余结果都被模型用来决定下一步。
+而 reality check 挂在的宿主工具本身几乎不花时间：`find_in_axtree` p50 **5ms**、
+`local_fs_read` p50 **10ms**。它的 4,527.8s 里还有 **3,019s 是零产出**（28 次超时
+p50 64s、20 次 VL 返回空）。
+
+划分原则，可复用到别的 VL 调用：**advisory 可以晚到，terminal 不可以。**
+- 可异步：reality check
+- 不可异步：验证码自解（决定要不要 HITL，是决策门）、模型主动调的 `visual_verify`
+- 本来就免费：`visual_recovery_hint`（静态文本，不发 VL 请求）
+
+**实测（run `d5b920de`）**：承载它的 `find_in_axtree` 从 **41,608ms → 5ms**，
+verdict 在两个 turn 后投递，模型正确读作 advisory。
+
+### N2 段化率回归 ⬜ 查因中
+
+`8208ed49` 段 turn 占 45%，`a686e03f` 只有 7%。两次的常驻 system prompt 和段工具
+都在（已核）。唯一方向明确的变量：09-11 17:50 往 strategy_bank 的 form_interaction
+procedure 加了一条
+
+> "When **a run of actions is already decided**, or the next targets can be resolved
+> uniquely inside the segment **through a structured transform** …"
+
+常驻 prompt 的门槛是「1-2 个动作 + 一次读树」，这条的门槛是「一串已确定的动作」。
+strategy_bank 注入在 `messages[0]`（user_task）里，比 system prompt 更近更具体。
+**本意是促进段化，实际抬高了门槛。** 佐证：`a686e03f` 仅有的 4 个段，恰好都符合这条
+描述的罕见形状。该行已撤回（`18bd373` 之后的 strategy_bank 状态）。
+
+**但 2 个 run 定不了因**（还有 browser 模式、captcha 打断、任务差异等混杂）。
+`d5b920de` 段 turn 11%、但平均 **4.0 动作/段**（`8208ed49` 是 1.9）且用上了段内
+`transform`，墙钟反而最短（439.8s）。需要更多同任务样本。
+
+**已知的反例约束（不要再加）**：「少于 3 步不要开段」和「段用在步骤彼此相似的动作串
+上」这两条都是错的——`8208ed49` 的 15 个段平均 2.0 动作、全部 2-3 步、且填的是不同
+字段，加上这两条会把它们全部排除。
+
+### N3 平台侧 `scroll-deadline-exceeded` ⬜ 归 ABCP
+
+不是 harness 能修的，但它是当前最大的单一时间黑洞。run `d5b920de`：
+
+```
+turn 29  48.0s  execute_browser_workflow → failed scroll-deadline-exceeded（6 步只执行 1 步）
+turn 30-40      System.describeAction ×2 / Page.wheel ×2 / Input.scroll / … 共 11 个 turn
+────────────────
+turn 29-40 合计 179.7s
+恢复之后 turn 41/42 两个段 14.4s 就把剩下的活干完了
+```
+
+**净浪费约 170s = 该次总墙钟 439.8s 的 39%。** 详见
+`docs/abcp-workflow-platform-requests.md` 问题 6。
 
 ## 验收指标（每阶段复跑）
 
