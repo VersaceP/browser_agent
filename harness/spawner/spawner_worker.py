@@ -28,6 +28,8 @@ from harness.results.row_ledger import derive_row_ledger
 from runtime_config import RuntimeConfig
 from harness.lifecycle import LifecycleContext
 from harness.model_config import browser_agent_model_config
+from harness.page_session import page_session_context_for_pages
+from harness.page_session import record_page_sessions
 from harness.schema_cache import global_schemas_dir
 from harness.schema_loader import CapabilityBundle
 from harness.schema_loader import load_capability_bundle
@@ -652,6 +654,14 @@ class SpawnerWorkerMixin:
             harness.allowed_page_ids = set(page_bindings)
             harness.page_fleet_ids = dict(page_bindings)
             self.page_lease_manager.seed_worker_pages(worker_id, page_bindings)
+            # Only now are the delegated pages known, so this is the first point
+            # at which the prior-worker record can be scoped to pages this
+            # worker may actually touch. A worker starting fresh gets nothing.
+            page_session_context = page_session_context_for_pages(
+                self.logger, page_bindings.keys(),
+            )
+            if page_session_context:
+                worker_task = f"{worker_task}\n\n{page_session_context}"
             harness.fleet_page_fleet_ids = {}
             worker_pin = (
                 task_session_binding.to_dict()
@@ -1218,6 +1228,16 @@ class SpawnerWorkerMixin:
             ] = str(self.logger.task_dir / "strategy_attempts.jsonl")
             attempt_digest["handoff"] = handoff
         result["attemptDigest"] = attempt_digest
+        # Mechanically extracted from the trace, never asked of the model: a
+        # worker's own summary of its work is a claim, and the next worker
+        # would read it as page state.
+        record_page_sessions(
+            self.logger,
+            getattr(harness, "trace", []) if harness is not None else [],
+            worker_id=worker_id,
+            phase_id=str(phase_id or ""),
+            artifacts=result.get("artifacts"),
+        )
         mark_phase_result(
             self.logger,
             phase_id=phase_id,
