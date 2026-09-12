@@ -22,6 +22,7 @@ from harness.prompts import search_harness_guides
 from harness.strategy_bank import render_strategy_guidance
 from harness.task_control import (
     EXECUTION_ROLES,
+    TERMINAL_PHASE_STATUSES,
     VALID_STAGE_HINTS,
     assess_batch_source_binding,
     contract_hash_for_phase,
@@ -30,6 +31,7 @@ from harness.task_control import (
     mark_phase_exhausted_if_needed,
     materialize_batch_rows_from_source,
     phase_contract,
+    phase_prior_artifact_paths,
     reactivate_resumable_hitl_phases,
     replan_checkpoint_spawn_rejection,
     load_task_state,
@@ -3540,6 +3542,9 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
     )
     if checkpoint_rejection is not None:
         return checkpoint_rejection
+    _remember_phase_dispatch(
+        agent, phase, tool_input, task=base_task, context=base_context,
+    )
     return await agent.spawner.spawn_browser_agent(
         task=base_task,
         context=base_context,
@@ -3907,17 +3912,316 @@ def _exact_rows_from_contract(worker_contract: JsonDict) -> Optional[int]:
     return None
 
 
+def _remember_phase_dispatch(
+    agent: Any,
+    phase: JsonDict,
+    tool_input: JsonDict,
+    *,
+    task: str,
+    context: str,
+) -> None:
+    """Record the exact dispatch so the harness can repeat it verbatim.
+
+    A harness-owned continuation must re-issue what the Lead actually asked
+    for, not a reconstruction of it from the plan. A spawn can carry routing
+    the phase alone does not express - session_key, fleet_id, page_policy, a
+    worker_contract override - and silently dropping any of those changes the
+    objective while looking like a retry.
+    """
+    store = getattr(agent, "phase_dispatch_inputs", None)
+    if not isinstance(store, dict):
+        store = {}
+        setattr(agent, "phase_dispatch_inputs", store)
+    phase_id = str(phase.get("id") or "").strip()
+    if not phase_id:
+        return
+    record: JsonDict = {
+        "task": str(task or ""),
+        "context": str(context or ""),
+        "result_contract": str(tool_input.get("result_contract") or ""),
+    }
+    for key in (
+        "name", "preferred_slot_id", "reuse_scope", "fleet_id",
+        "session_key", "page_policy",
+    ):
+        value = tool_input.get(key)
+        if value is not None:
+            record[key] = value
+    raw_contract = tool_input.get("worker_contract")
+    if isinstance(raw_contract, dict):
+        record["worker_contract"] = copy.deepcopy(raw_contract)
+    store[phase_id] = record
+
+
+def _phase_continuation_note(
+    agent: Any,
+    phase_id: str,
+    result: JsonDict,
+    *,
+    attempt: int,
+    max_attempts: int,
+) -> str:
+    """State what is mechanically known about the attempt being continued.
+
+    Deliberately no claim about WHICH rows remain. The harness knows the prior
+    attempt's status, its row count and its persisted artifact paths, all from
+    receipts. It does not know row identity for a contract whose units are not
+    enumerable, and inventing a remaining range here would reintroduce exactly
+    the model-authored guess this path exists to remove -
+    ``_direct_continuation_context`` still adds the precise unit list on the
+    contracts where one is provable.
+    """
+    paths = phase_prior_artifact_paths(agent.logger, phase_id=phase_id)
+    status = str(result.get("status") or "unknown")
+    rows = _direct_row_count(result)
+    lines = [
+        "HARNESS PHASE CONTINUATION"
+        f" (automatic continuation {attempt} of {max_attempts}).",
+        "You are continuing the SAME phase a previous worker did not finish."
+        f" That worker ended with status={status} after {rows} recorded row(s).",
+    ]
+    if paths:
+        lines.append(
+            "Its persisted artifacts are:"
+            f" {json.dumps(paths[:10], ensure_ascii=False)}."
+            " Read them before acting and continue where they end; do not"
+            " re-collect what they already contain. Record only new rows - the"
+            " harness merges them with the prior persisted evidence and"
+            " validates the original complete contract."
+        )
+    else:
+        lines.append(
+            "It persisted no artifact, so nothing of its output is trusted."
+            " Start the phase's deliverable from the beginning."
+        )
+    lines.append(
+        "The objective, the contract and the deliverable are unchanged. Do not"
+        " narrow or restate them."
+    )
+    return "\n".join(lines)
+
+
+# The statuses _direct_continuation_decision is willing to continue. Duplicated
+# as a set here only to decide whether a refusal is worth a log line; the
+# decision itself stays in that one function.
+_CONTINUABLE_WORKER_STATUSES = frozenset({
+    "partial", "step_budget_exhausted", "context_limit_exceeded",
+    "incomplete", "page_crashed", "fleet_assignment_lost",
+})
+
+
+def _phase_auto_continuation_limit(agent: Any) -> int:
+    harness_config = getattr(getattr(agent, "runtime", None), "harness", None)
+    if not getattr(harness_config, "phase_auto_continuation_enabled", False):
+        return 0
+    return max(0, int(
+        getattr(harness_config, "phase_auto_continuation_max_attempts", 0) or 0
+    ))
+
+
+def _phase_auto_continuation_block(agent: Any, result: Any) -> Optional[str]:
+    """Why this completed worker may not be continued by the harness, or None.
+
+    Every gate is mechanical. Anything needing a judgement - which phase to run
+    next, whether a blocker is worth another try, whether the objective should
+    change - stays with the Lead, and the reason is logged so an operator can
+    see which fence stopped an expected continuation.
+    """
+    if not isinstance(result, dict):
+        return "worker_result_missing"
+    phase_id = str(result.get("phaseId") or "").strip()
+    if not phase_id or phase_id == "direct_worker":
+        # direct_worker already runs its own continuation loop in
+        # _run_direct_worker; continuing it again here would double-dispatch.
+        return "phase_not_eligible"
+    plan = getattr(agent, "task_plan", None)
+    if not isinstance(find_phase(plan, phase_id), dict):
+        return "phase_not_in_plan"
+    store = getattr(agent, "phase_dispatch_inputs", None)
+    if not isinstance(store, dict) or phase_id not in store:
+        return "no_recorded_dispatch"
+    state = load_task_state(agent.logger)
+    phase_states = state.get("phases") if isinstance(state, dict) else None
+    phase_state = (
+        phase_states.get(phase_id) if isinstance(phase_states, dict) else None
+    )
+    status = (
+        str(phase_state.get("status") or "")
+        if isinstance(phase_state, dict) else ""
+    )
+    if status in TERMINAL_PHASE_STATUSES:
+        return f"phase_terminal:{status}"
+    return None
+
+
+async def _auto_continue_phase(ctx: ToolContext, waited: JsonDict) -> JsonDict:
+    """Re-dispatch one unfinished phase instead of waking the Lead to do it.
+
+    Bounded three ways, all mechanical and all already used by the direct-worker
+    loop: the status must be one _direct_continuation_decision accepts, the
+    attempt must show progress against the previous one
+    (repeated_no_progress_same_signature stops a loop), and the automatic
+    attempt count is capped separately from phase.max_attempts because a
+    `partial` attempt does not consume the phase budget.
+
+    Only one completed worker with nothing still pending is eligible. Two
+    finished workers is a merge decision, and a live sibling makes a re-spawn a
+    concurrency question - both belong to the Lead.
+    """
+    agent = ctx.agent
+    limit = _phase_auto_continuation_limit(agent)
+    if limit <= 0:
+        return waited
+    completed = waited.get("completed") if isinstance(waited, dict) else None
+    if not isinstance(completed, list) or len(completed) != 1:
+        return waited
+    if waited.get("pending"):
+        return waited
+    result = completed[0]
+    block = _phase_auto_continuation_block(agent, result)
+    if block is not None:
+        if str(result.get("status") or "").lower() in _CONTINUABLE_WORKER_STATUSES:
+            # Only worth a line when the status alone would have continued:
+            # otherwise every ordinary `done` would log a refusal.
+            agent.logger.write("lead.phase_continuation.blocked", {
+                "phaseId": result.get("phaseId"),
+                "workerId": result.get("workerId"),
+                "status": result.get("status"),
+                "reason": block,
+            })
+        return waited
+    phase_id = str(result.get("phaseId") or "")
+    chain: List[JsonDict] = []
+    previous: Optional[JsonDict] = None
+    for attempt in range(1, limit + 1):
+        phase = find_phase(getattr(agent, "task_plan", None), phase_id)
+        if not isinstance(phase, dict):
+            break
+        manifest = _direct_dispatch_manifest(agent, phase, attempt)
+        receipt = _direct_continuation_receipt(phase, result, manifest)
+        decision = _direct_continuation_decision(
+            result,
+            previous_result=previous,
+            attempt_number=attempt,
+            # The Lead's own dispatch was attempt 0, so `limit` automatic
+            # continuations need a budget of limit + 1 for the shared decision
+            # helper, whose fence is `attempt_number >= max_attempts`.
+            max_attempts=limit + 1,
+            continuation_receipt=receipt,
+        )
+        agent.logger.write("lead.phase_continuation.decision", {
+            "phaseId": phase_id,
+            "attempt": attempt,
+            "maxAttempts": limit,
+            "workerId": result.get("workerId"),
+            "status": result.get("status"),
+            **decision,
+        })
+        if not decision.get("continue"):
+            break
+        recorded = getattr(agent, "phase_dispatch_inputs", {}).get(phase_id) or {}
+        spawn_input: JsonDict = {
+            key: value for key, value in recorded.items()
+            if key not in {"context", "name"}
+        }
+        spawn_input["phase_id"] = phase_id
+        spawn_input["context"] = "\n\n".join(part for part in (
+            _direct_continuation_context(
+                str(recorded.get("context") or ""), receipt,
+            ),
+            _phase_continuation_note(
+                agent, phase_id, result, attempt=attempt, max_attempts=limit,
+            ),
+        ) if part)
+        spawn_input["reuse_from_worker_id"] = str(result.get("workerId") or "")
+        worker_status = str(result.get("status") or "").lower()
+        if worker_status == "page_crashed":
+            spawn_input["reuse_scope"] = "connection"
+            spawn_input["page_policy"] = "new"
+        elif worker_status == "fleet_assignment_lost":
+            spawn_input.pop("reuse_from_worker_id", None)
+        else:
+            spawn_input["reuse_scope"] = "page"
+            spawn_input["page_policy"] = "existing"
+        spawn_input["_runtime_dispatch_origin"] = "runtime_phase_continuation"
+        spawned = await _lead_spawn_browser_agent(ToolContext(
+            agent=agent,
+            tool_call={
+                "name": "spawn_browser_agent",
+                "id": f"phase-continuation-{phase_id}-{attempt}",
+            },
+            tool_input=spawn_input,
+            step=ctx.step,
+        ))
+        if not isinstance(spawned, dict) or spawned.get("status") != "running":
+            # A refused spawn is a real answer - phase_exhausted, a dependency
+            # fence, a replan checkpoint. Hand it back to the Lead attached to
+            # the worker result rather than retrying around it.
+            chain.append({
+                "attempt": attempt,
+                "spawnRejected": spawned if isinstance(spawned, dict) else None,
+            })
+            break
+        worker_id = str(spawned.get("workerId") or "")
+        agent.logger.write("lead.phase_continuation.attempt", {
+            "phaseId": phase_id,
+            "attempt": attempt,
+            "workerId": worker_id,
+            "continuedFromWorkerId": result.get("workerId"),
+        })
+        next_wait = await agent.spawner.wait_browser_agents(
+            worker_ids=[worker_id] if worker_id else None,
+            mode="all",
+        )
+        next_completed = (
+            next_wait.get("completed") if isinstance(next_wait, dict) else None
+        )
+        next_result = (
+            next_completed[-1]
+            if isinstance(next_completed, list) and next_completed else None
+        )
+        if not isinstance(next_result, dict):
+            chain.append({"attempt": attempt, "waitIncomplete": True})
+            break
+        chain.append({
+            "attempt": attempt,
+            "workerId": next_result.get("workerId"),
+            "status": next_result.get("status"),
+            "rowCount": _direct_row_count(next_result),
+        })
+        previous, result = result, next_result
+        waited = next_wait
+        if _phase_auto_continuation_block(agent, result) is not None:
+            break
+    if not chain:
+        return waited
+    enriched = dict(waited)
+    enriched["phaseContinuation"] = {
+        "phaseId": phase_id,
+        "dispatchedBy": "harness",
+        "maxAutomaticAttempts": limit,
+        "attempts": chain,
+        "note": (
+            "The harness continued this phase without waking the Lead."
+            " The worker result below is the LAST attempt; earlier attempts are"
+            " listed here and their artifacts are already in the phase ledger."
+        ),
+    }
+    return enriched
+
+
 @LEAD_TOOLS.register(
     name="wait_browser_agents",
     description="Wait for spawned BrowserAgents to complete; wait for all of them or the first one to finish.",
     input_schema=_wait_browser_agents_schema,
 )
 async def _lead_wait_browser_agents(ctx: ToolContext) -> JsonDict:
-    return await ctx.agent.spawner.wait_browser_agents(
+    waited = await ctx.agent.spawner.wait_browser_agents(
         worker_ids=ctx.tool_input.get("worker_ids"),
         mode=ctx.tool_input.get("mode", "all"),
         timeout_seconds=ctx.tool_input.get("timeout_seconds"),
     )
+    return await _auto_continue_phase(ctx, waited)
 
 
 @LEAD_TOOLS.register(

@@ -921,6 +921,23 @@ class HarnessConfig:
     # authoritative and the default keeps historical fixed-cap behaviour.
     browser_agent_step_extension_enabled: bool = False
     browser_agent_max_extension_steps: int = 10
+    # Harness-owned phase continuation. When a phase's worker ends in a bounded,
+    # mechanically continuable state, the harness re-dispatches that same phase
+    # itself instead of returning the decision to the Lead model.
+    #
+    # Measured on 272 worker->worker handoffs: the gap between one worker ending
+    # and the next starting is p50 96.0s (p50 122.0s when the previous worker
+    # died on its step cap), and it costs on average 4.2 Lead LLM calls and
+    # 8,586 output tokens. Rebuilding the worker itself accounts for 28.4s of
+    # that; the rest is the round trip. Lead rule 11 already tells the model to
+    # continue serially in exactly these cases, so automating it removes a
+    # deliberation whose outcome the prompt had already fixed.
+    #
+    # The cap is separate from phase.max_attempts on purpose: a `partial`
+    # attempt does not consume the phase budget (_count_budgeted_phase_attempts
+    # excludes it), so the phase budget alone cannot bound a partial loop.
+    phase_auto_continuation_enabled: bool = True
+    phase_auto_continuation_max_attempts: int = 2
     max_browser_agent_instances: int = 3
     max_browser_agents: int = 4
     # Deterministic fleet routing.  When enabled, the spawner assigns every
@@ -1306,6 +1323,18 @@ class HarnessConfig:
                     )
                 )
             ),
+            phase_auto_continuation_enabled=bool(
+                data.get(
+                    "phase_auto_continuation_enabled",
+                    cls.phase_auto_continuation_enabled,
+                )
+            ),
+            phase_auto_continuation_max_attempts=max(0, min(6, int(
+                data.get(
+                    "phase_auto_continuation_max_attempts",
+                    cls.phase_auto_continuation_max_attempts,
+                )
+            ))),
             max_browser_agent_instances=int(
                 data.get(
                     "max_browser_agent_instances",
