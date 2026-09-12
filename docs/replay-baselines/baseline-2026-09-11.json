@@ -1,0 +1,48 @@
+{
+  "label": "harness-speed-baseline-2026-09-11",
+  "capturedAt": "2026-09-11T01:30:00Z",
+  "why": "Frozen sample behind docs/harness-speed-optimization-plan.md. A 'latest 14 runs' query does NOT reproduce it: new runs have since shifted the window. Always select by taskId.",
+  "selection": "worktree/<taskId>/run.jsonl for each id below",
+  "totals": {
+    "browserAgentModelTurns": 2832,
+    "browserWorkers": 63,
+    "browserCalls": 2002
+  },
+  "taskIds": [
+    "9422571a364344f48619bf1047c6a655",
+    "362866ba51b84c178a4d4d4a6c4edbe5",
+    "1e0fd3128e6448439f9ca0f932aba0b7",
+    "a0e7eaf8fbfb4d988359fdd10659a7cf",
+    "a53978bfb1104bfcbda240f2433b3bff",
+    "85d708a49332496bbf5ad06d9ff89fe5",
+    "714827ab0b124c149dc66aa95c1dbb70",
+    "0e5bb3aad7b14b999a6b01c80f89da33",
+    "1b94ee4d74d4434085224a129cdea921",
+    "8fe82a84e9c941e0999f44c6a5a9faf1",
+    "4cc0774f0a354d058b8b0ced876957d5",
+    "0abaf51320404bb087ae860d1a0185b1",
+    "a5cb56f90e654636bfc6eabdd6b48d15",
+    "db4a96a4001041d38d97266c3a452529"
+  ],
+  "perTaskBrowserTurns": {
+    "9422571a364344f48619bf1047c6a655": 175,
+    "362866ba51b84c178a4d4d4a6c4edbe5": 5,
+    "1e0fd3128e6448439f9ca0f932aba0b7": 0,
+    "a0e7eaf8fbfb4d988359fdd10659a7cf": 41,
+    "a53978bfb1104bfcbda240f2433b3bff": 619,
+    "85d708a49332496bbf5ad06d9ff89fe5": 373,
+    "714827ab0b124c149dc66aa95c1dbb70": 35,
+    "0e5bb3aad7b14b999a6b01c80f89da33": 204,
+    "1b94ee4d74d4434085224a129cdea921": 242,
+    "8fe82a84e9c941e0999f44c6a5a9faf1": 287,
+    "4cc0774f0a354d058b8b0ced876957d5": 302,
+    "0abaf51320404bb087ae860d1a0185b1": 119,
+    "a5cb56f90e654636bfc6eabdd6b48d15": 0,
+    "db4a96a4001041d38d97266c3a452529": 430
+  },
+  "confounders": [
+    "Two worker models are mixed: glm-5.2 (n=2222 usage records) and deepseek-v4-flash (n=180). Latency p50 7.5-8.0s for both, but p90 differs (32.1s vs 18.2s).",
+    "Task difficulty is not controlled. Output-token size correlates with both latency and task complexity; the causal direction is not established by this sample.",
+    "'A phase served by >1 worker' (14/42) counts spawns, not causes. Step-cap exhaustion, planned concurrency, failure re-dispatch and recovery are NOT separated here."
+  ]
+}
