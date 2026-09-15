@@ -429,6 +429,13 @@ def record_spawn_acquisition_failure(
         entry = {"count": 0}
         signatures[signature] = entry
     entry["count"] = int(entry.get("count") or 0) + 1
+    if bool(getattr(exc, "connection_fatal", False)):
+        entry["transportFailure"] = {
+            "connectionFatal": True,
+            "code": str(getattr(exc, "transport_code", "")),
+            "requestSent": getattr(exc, "request_sent", None),
+        }
+
     entry["lastError"] = str(exc)[:1000]
     entry["updated_at"] = _tc().utc_now_iso()
     is_fleet_timeout = "-32012" in str(exc) and "fleet open timeout" in str(exc).lower()

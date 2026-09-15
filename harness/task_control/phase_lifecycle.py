@@ -33,6 +33,182 @@ def _tc():
 
     return tc
 
+
+CONTINUATION_PROTOCOL = "browser-continuation-v1"
+CONTINUATION_CONTROL_STATES = frozenset({
+    "received", "reserved", "dispatched", "rejected", "uncertain",
+})
+
+
+def continuation_receipt_id(
+    logger: RunLogger,
+    *,
+    phase_id: str,
+    worker_id: str,
+    phase: Optional[JsonDict],
+    worker_contract: Optional[JsonDict],
+) -> str:
+    """Stable identity for one worker's continuation decision.
+
+    Worker ids restart at browser-001 on a resumed run, so runId is part of the
+    identity. The contract hash fences a decision from a later plan revision.
+    """
+    payload = {
+        "protocol": CONTINUATION_PROTOCOL,
+        "taskId": str(getattr(logger, "task_id", "") or ""),
+        "runId": str(getattr(logger, "run_id", "") or ""),
+        "phaseId": str(phase_id or ""),
+        "workerId": str(worker_id or ""),
+        "contractHash": _tc().contract_hash_for_phase(
+            phase, worker_contract if isinstance(worker_contract, dict) else {},
+        ),
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def phase_continuation_record(
+    logger: RunLogger, *, phase_id: str, receipt_id: str,
+) -> Optional[JsonDict]:
+    state = _tc().load_task_state(logger)
+    phase_state = _tc()._phase_state(state, phase_id)
+    controls = (
+        phase_state.get("continuation_controls")
+        if isinstance(phase_state, dict) else None
+    )
+    record = controls.get(receipt_id) if isinstance(controls, dict) else None
+    return copy.deepcopy(record) if isinstance(record, dict) else None
+
+
+def reserve_phase_continuation(
+    logger: RunLogger,
+    *,
+    phase_id: str,
+    receipt_id: str,
+    max_automatic_attempts: int,
+) -> JsonDict:
+    """Reserve one durable continuation budget unit, failing closed on replay."""
+    # The state writer uses an RLock, so this covers the preceding read and
+    # budget calculation as one same-process critical section as well as the
+    # nested atomic write. Cross-process crash windows still fail closed via
+    # reserved/uncertain and do not claim exactly-once dispatch.
+    with _tc()._TASK_STATE_WRITE_LOCK:
+        return _reserve_phase_continuation_locked(
+            logger,
+            phase_id=phase_id,
+            receipt_id=receipt_id,
+            max_automatic_attempts=max_automatic_attempts,
+        )
+
+
+def _reserve_phase_continuation_locked(
+    logger: RunLogger,
+    *,
+    phase_id: str,
+    receipt_id: str,
+    max_automatic_attempts: int,
+) -> JsonDict:
+    state = _tc().load_task_state(logger)
+    phase_state = _tc()._phase_state(state, phase_id)
+    if not isinstance(phase_state, dict):
+        return {"status": "missing", "reason": "phase_not_in_state"}
+    controls = phase_state.get("continuation_controls")
+    if not isinstance(controls, dict):
+        return {"status": "missing", "reason": "continuation_receipt_not_recorded"}
+    record = controls.get(receipt_id)
+    if not isinstance(record, dict):
+        return {"status": "missing", "reason": "continuation_receipt_not_recorded"}
+    prior_status = str(record.get("status") or "")
+    if prior_status != "received":
+        existing = copy.deepcopy(record)
+        existing["reservationAcquired"] = False
+        if prior_status == "reserved" and not existing.get("reason"):
+            existing["reason"] = "continuation_reservation_already_exists"
+        return existing
+    spent = sum(
+        1 for value in controls.values()
+        if isinstance(value, dict)
+        and str(value.get("status") or "") in {
+            "reserved", "dispatched", "uncertain",
+        }
+    )
+    if spent >= max(0, int(max_automatic_attempts or 0)):
+        record["status"] = "rejected"
+        record["reason"] = "automatic_continuation_budget_reached"
+        record["settledAt"] = _tc().utc_now_iso()
+        _tc().write_task_state(logger, state)
+        return copy.deepcopy(record)
+    record["status"] = "reserved"
+    record["automaticAttempt"] = spent + 1
+    record["reservedAt"] = _tc().utc_now_iso()
+    record["reservationId"] = hashlib.sha256(
+        f"{receipt_id}:{spent + 1}".encode("utf-8")
+    ).hexdigest()
+    _tc().write_task_state(logger, state)
+    acquired = copy.deepcopy(record)
+    acquired["reservationAcquired"] = True
+    return acquired
+
+
+def settle_phase_continuation(
+    logger: RunLogger,
+    *,
+    phase_id: str,
+    receipt_id: str,
+    status: str,
+    worker_id: str = "",
+    reason: str = "",
+) -> JsonDict:
+    """Commit a reservation outcome without treating absence as permission."""
+    normalized = str(status or "")
+    if normalized not in {"dispatched", "rejected", "uncertain"}:
+        return {"status": "invalid", "reason": "invalid_settlement_status"}
+    state = _tc().load_task_state(logger)
+    phase_state = _tc()._phase_state(state, phase_id)
+    controls = (
+        phase_state.get("continuation_controls")
+        if isinstance(phase_state, dict) else None
+    )
+    record = controls.get(receipt_id) if isinstance(controls, dict) else None
+    if not isinstance(record, dict):
+        return {"status": "missing", "reason": "continuation_receipt_not_recorded"}
+    if str(record.get("status") or "") not in {"reserved", normalized}:
+        return copy.deepcopy(record)
+    record["status"] = normalized
+    record["settledAt"] = _tc().utc_now_iso()
+    if worker_id:
+        record["dispatchedWorkerId"] = str(worker_id)
+    if reason:
+        record["reason"] = str(reason)[:500]
+    _tc().write_task_state(logger, state)
+    return copy.deepcopy(record)
+
+
+def record_phase_dispatch_input(
+    logger: RunLogger, *, phase_id: str, dispatch_input: JsonDict,
+) -> None:
+    """Keep the accepted dispatch template available after process restart."""
+    state = _tc().load_task_state(logger)
+    phase_state = _tc()._phase_state(state, phase_id)
+    if not isinstance(phase_state, dict):
+        return
+    phase_state["continuation_dispatch_input"] = trim_large_strings(
+        copy.deepcopy(dispatch_input), 16000,
+    )
+    _tc().write_task_state(logger, state)
+
+
+def phase_dispatch_input(logger: RunLogger, *, phase_id: str) -> JsonDict:
+    state = _tc().load_task_state(logger)
+    phase_state = _tc()._phase_state(state, phase_id)
+    value = (
+        phase_state.get("continuation_dispatch_input")
+        if isinstance(phase_state, dict) else None
+    )
+    return copy.deepcopy(value) if isinstance(value, dict) else {}
+
 def mark_phase_running(
     logger: RunLogger,
     *,
@@ -142,13 +318,14 @@ def mark_phase_result(
     attempt_digest: Optional[JsonDict] = None,
     phase: Optional[JsonDict] = None,
     worker_contract: Optional[JsonDict] = None,
-) -> None:
+    continuation: Optional[JsonDict] = None,
+) -> Optional[str]:
     if not phase_id:
-        return
+        return None
     state = _tc().load_task_state(logger)
     phase_state = _tc()._phase_state(state, phase_id)
     if phase_state is None:
-        return
+        return None
 
     attempts = phase_state.setdefault("attempts", [])
     attempt = None
@@ -168,6 +345,37 @@ def mark_phase_result(
             _tc()._strip_volatile_handles(attempt_digest),
             4000,
         )
+    receipt_id: Optional[str] = None
+    if (
+        isinstance(continuation, dict)
+        and continuation.get("protocol") == CONTINUATION_PROTOCOL
+    ):
+        receipt_id = continuation_receipt_id(
+            logger,
+            phase_id=str(phase_id),
+            worker_id=worker_id,
+            phase=phase,
+            worker_contract=worker_contract,
+        )
+        decision = trim_large_strings(copy.deepcopy(continuation), 4000)
+        attempt["continuation"] = decision
+        attempt["continuationReceiptId"] = receipt_id
+        controls = phase_state.setdefault("continuation_controls", {})
+        if isinstance(controls, dict):
+            controls.setdefault(receipt_id, {
+                "receiptId": receipt_id,
+                "protocol": CONTINUATION_PROTOCOL,
+                "status": "received",
+                "sourceWorkerId": str(worker_id),
+                "phaseId": str(phase_id),
+                "planVersion": state.get("plan_version"),
+                "contractHash": _tc().contract_hash_for_phase(
+                    phase,
+                    worker_contract if isinstance(worker_contract, dict) else {},
+                ),
+                "decision": decision,
+                "receivedAt": _tc().utc_now_iso(),
+            })
 
     if result_status in _tc().RECOVERABLE_ROUTING_PHASE_STATUSES:
         phase_state["status"] = result_status
@@ -190,7 +398,7 @@ def mark_phase_result(
         # objective itself is infeasible. Preserve the reason and phase retry
         # budget, but do not consume the cross-replan objective budget.
         _tc().write_task_state(logger, state)
-        return
+        return receipt_id
 
     if result_status == "cancelled":
         phase_state["status"] = result_status
@@ -210,7 +418,7 @@ def mark_phase_result(
             else None
         )
         _tc().write_task_state(logger, state)
-        return
+        return receipt_id
 
     if result_status in {
         "blocked_by_challenge",
@@ -232,7 +440,7 @@ def mark_phase_result(
             ),
         }]
         _tc().write_task_state(logger, state)
-        return
+        return receipt_id
 
     if (
         result_status == WORKER_STATUS_DONE
@@ -293,7 +501,7 @@ def mark_phase_result(
                     succeeded=False, worker_contract=worker_contract,
                 )
             _tc().write_task_state(logger, state)
-            return
+            return receipt_id
         classification = (
             validation.get("classification")
             if isinstance(validation, dict)
@@ -314,7 +522,7 @@ def mark_phase_result(
                 ),
             }]
             _tc().write_task_state(logger, state)
-            return
+            return receipt_id
         phase_state["status"] = "validation_failed" if validation else result_status
         phase_state["last_failure"] = (
             validation.get("failures") if isinstance(validation, dict) else None
@@ -332,6 +540,7 @@ def mark_phase_result(
         )
 
     _tc().write_task_state(logger, state)
+    return receipt_id
 
 def phase_prior_artifact_paths(
     logger: RunLogger,
@@ -362,6 +571,8 @@ def phase_prior_artifact_paths(
                 "validExtractionArtifacts",
                 "attemptExtractionArtifacts",
                 "priorExtractionArtifacts",
+                "fileArtifacts",
+                "priorFileArtifacts",
             ):
                 value = validation.get(key)
                 if isinstance(value, list):
@@ -369,10 +580,11 @@ def phase_prior_artifact_paths(
         digest = attempt.get("attemptDigest")
         if isinstance(digest, dict) and isinstance(digest.get("artifactPaths"), list):
             paths.extend(digest.get("artifactPaths") or [])
-    return [
-        path for path in _tc()._unique_paths(paths)
-        if "/artifacts/extractions/" in str(path)
-    ]
+    # Preserve both extraction artifacts and concrete delivery files. A later
+    # attempt may revalidate an existing same-phase delivery without
+    # downloading it again. Validation still binds files to row declarations;
+    # this list is provenance, not permission to count arbitrary old files.
+    return _tc()._unique_paths(paths)
 
 def _normalized_depends_on(raw: Any) -> Optional[List[str]]:
     """Plan-normalization twin of _phase_dependency_ids: keep None (omitted →
@@ -1384,6 +1596,17 @@ def schedule_snapshot(
             if blocker.get("blocking"):
                 blocked += 1
             continue
+        wave_blockers = dispatch_wave_blockers(plan, phase, phases)
+        if wave_blockers:
+            waiting.append({
+                "phaseId": phase_id,
+                "status": status,
+                "dispatchWave": phase.get("dispatch_wave"),
+                "waitingForPhaseIds": wave_blockers,
+                "blocking": False,
+                "gate": "dispatch_wave",
+            })
+            continue
         # Same attempt budget the spawn path enforces, computed without
         # writing. The ordinary spawn runs an exhaustion normalizer first and
         # would correct a wrong answer here, but the repeated-invalid-replan
@@ -1439,12 +1662,23 @@ def schedule_snapshot(
             + " used the declared worker-attempt budget: raise max_attempts"
             " without changing the objective, or report the blocker."
         )
-    stalled = [
-        str(item["phaseId"]) for item in waiting if not item.get("blocking")
+    wave_waiting = [
+        str(item["phaseId"]) for item in waiting
+        if item.get("gate") == "dispatch_wave"
     ]
-    if stalled and not ready and not running:
+    dependency_waiting = [
+        str(item["phaseId"]) for item in waiting
+        if not item.get("blocking") and item.get("gate") != "dispatch_wave"
+    ]
+    if wave_waiting and not ready and not running:
         actions.append(
-            ", ".join(stalled)
+            ", ".join(wave_waiting)
+            + " are waiting for earlier reviewed dispatch-wave phases to"
+            " validate; re-check task_state before spawning."
+        )
+    if dependency_waiting and not ready and not running:
+        actions.append(
+            ", ".join(dependency_waiting)
             + " are waiting on dependencies that are neither running nor"
             " validated; re-check task_state before spawning."
         )
@@ -1456,6 +1690,38 @@ def schedule_snapshot(
     snapshot["recommendedActions"] = actions
     snapshot["recommendedAction"] = " ".join(actions)
     return snapshot
+
+
+def dispatch_wave_blockers(
+    plan: Optional[JsonDict],
+    phase: JsonDict,
+    phase_states: JsonDict,
+) -> List[str]:
+    """Return earlier reviewed scheduling-wave phases not yet complete.
+
+    Dependency readiness and operator-approved dispatch order are separate
+    facts.  Both the read-only scheduler and the mutating spawn gate must use
+    this same calculation; otherwise a later wave appears ready in a wait
+    receipt while the very next spawn rejects it.
+    """
+    wave = phase.get("dispatch_wave")
+    if not isinstance(wave, int) or isinstance(wave, bool):
+        return []
+    raw_phases = plan.get("phases") if isinstance(plan, dict) else None
+    prior_wave_ids = [
+        str(item.get("id") or "")
+        for item in (raw_phases or [])
+        if isinstance(item, dict)
+        and isinstance(item.get("dispatch_wave"), int)
+        and not isinstance(item.get("dispatch_wave"), bool)
+        and int(item.get("dispatch_wave")) < wave
+        and str(item.get("id") or "")
+    ]
+    return [
+        phase_id for phase_id in prior_wave_ids
+        if not isinstance(phase_states.get(phase_id), dict)
+        or phase_states[phase_id].get("status") != "validated_done"
+    ]
 
 
 def find_phase(plan: Optional[JsonDict], phase_id: Optional[str]) -> Optional[JsonDict]:

@@ -234,7 +234,17 @@ class BrowserAgentHandle:
 @dataclass
 class BrowserAgentSlot:
     slot_id: str
+    # Harness-local, stable routing identity.  It is never sent to WebCross as
+    # an authentication claim.
     agent_id: str
+    # Server-assigned identity for the current protocol session.  WebCross 0.9
+    # derives this from the WebSocket connection and can change it on an
+    # unauthenticated reconnect.
+    protocol_agent_id: str = ""
+    # Last server cursor delivered to this slot.  It is transport metadata,
+    # separate from BrowserAgent's semantic event reducers.
+    event_cursor: Optional[int] = None
+    event_catalog_revision: str = ""
     client: Optional[ABCPClient] = None
     registration: JsonDict = field(default_factory=dict)
     status: str = "new"

@@ -14,7 +14,7 @@ from llm.base import (
     retry_usage_from_attempts,
     rate_limit_error_details,
 )
-from llm.content_moderation import input_moderation_rejection
+from llm.content_moderation import image_input_rejection, input_moderation_rejection
 from llm.factory import LLMFactory
 from llm.openai_provider import OpenAIProvider
 
@@ -31,6 +31,7 @@ __all__ = [
     "LLMStreamDecodeError",
     "OpenAIProvider",
     "input_moderation_rejection",
+    "image_input_rejection",
     "retry_usage_from_attempts",
     "rate_limit_error_details",
 ]

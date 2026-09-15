@@ -411,45 +411,9 @@ _AUTH_PROBE_FIELD_MARKERS = frozenset({
 })
 
 def _auth_phase_kind(phase: JsonDict) -> str:
-    """Classify only explicit auth-planning phases.
-
-    Returns ``probe``, ``transition``, or ``""``.  Ordinary business phases
-    intentionally classify as empty even though they may encounter an
-    unpredictable login wall at runtime.
-    """
-    expected = phase.get("expected_artifact")
-    expected = expected if isinstance(expected, dict) else {}
-    fields = field_names_from_specs(expected.get("fields") or [])
-    required = field_names_from_specs(expected.get("required_fields") or [])
-    normalized_fields = {
-        _normalized_semantic_token(field) for field in [*fields, *required]
-    }
-    parts = [
-        phase.get("id"),
-        phase.get("objective"),
-        phase.get("worker_task"),
-        phase.get("stage_hint_reason"),
-        phase.get("context"),
-        *fields,
-        *required,
-    ]
-    text = " ".join(str(item or "") for item in parts)
-    if not any(
-        contains_semantic_marker(text, marker) for marker in _AUTH_PLAN_MARKERS
-    ):
-        return ""
-    if any(
-        contains_affirmative_semantic_marker(text, marker)
-        for marker in _AUTH_TRANSITION_MARKERS
-    ):
-        return "transition"
-    if normalized_fields & _AUTH_PROBE_FIELD_MARKERS:
-        return "probe"
-    if any(
-        contains_semantic_marker(text, marker) for marker in _AUTH_PROBE_MARKERS
-    ):
-        return "probe"
+    """Legacy API: authentication planning is not classified by keywords."""
     return ""
+
 
 def _allow_empty_fields(expected: JsonDict) -> Set[str]:
     out: Set[str] = set()
@@ -649,28 +613,6 @@ def _reject_phase_execution_integrity(
             f" field_nonempty: {conflicts}"
         )
 
-    phase_view = {
-        "id": phase_id,
-        "objective": objective,
-        "worker_task": worker_task,
-        "stage_hint_reason": stage_hint_reason,
-        "expected_artifact": expected,
-    }
-    hitl_mentioned = any(
-        contains_semantic_marker(worker_task, marker)
-        for marker in _HITL_INTERRUPT_MARKERS
-    )
-    hitl_affirmative = any(
-        contains_affirmative_semantic_marker(worker_task, marker)
-        for marker in _HITL_INTERRUPT_MARKERS
-    )
-    if hitl_mentioned and not hitl_affirmative and _auth_phase_kind(phase_view) != "probe":
-        errors.append(
-            f"phase {phase_id}: a business worker must not negate the runtime"
-            " Hitl.requestPause SOP; authentication and human verification are"
-            " runtime interrupts for the worker that encounters them"
-        )
-
     # Advisory, not a rejection. The trigger is a per-field regex over bilingual
     # verb lists, so it both misses phrasings its author did not anticipate and
     # fires on ones that meant nothing of the kind. The harm it guards against —
@@ -724,16 +666,6 @@ def _validate_task_type_capability_match(
             f"phase {phase_id}: validator download_completed requires task_type"
             f" 'file_download'; got {task_type!r}"
         )
-    if (
-        "file_integrity" in validator_types
-        and not image_export
-        and task_type != "file_download"
-    ):
-        errors.append(
-            f"phase {phase_id}: validator file_integrity requires task_type"
-            " 'file_download' unless it validates a DOM.getImg image_exported"
-            f" receipt; got {task_type!r}"
-        )
     upload_validators = validator_types & {"upload_selected", "upload_confirmed"}
     if upload_validators and task_type not in {"file_upload", "form_filling"}:
         errors.append(
@@ -768,33 +700,9 @@ def _validate_task_type_capability_match(
         })
 
 def _reject_serial_auth_handoff(phases: List[JsonDict], errors: List[str]) -> None:
-    """Reject the concrete probe-worker -> HITL-worker waste pattern.
+    """Legacy entry point: prose cannot mechanically reject a plan."""
+    return None
 
-    The guard is deliberately narrow: phases must be adjacent, the first must
-    be an explicit auth diagnostic, and the second must serialize on it either
-    implicitly or through depends_on.  A lone diagnostic probe remains valid.
-    """
-    for probe, transition in zip(phases, phases[1:]):
-        if _auth_phase_kind(probe) != "probe":
-            continue
-        if _auth_phase_kind(transition) != "transition":
-            continue
-        dependencies = _tc()._phase_dependency_ids(transition)
-        serialized_on_probe = (
-            dependencies is None
-            or str(probe.get("id") or "") in dependencies
-        )
-        if not serialized_on_probe:
-            continue
-        errors.append(
-            "auth phase split is not allowed: diagnostic phase"
-            f" {probe.get('id')!r} is followed by HITL/login phase"
-            f" {transition.get('id')!r}. Authentication and human verification"
-            " are runtime interrupts: merge detection, Hitl.requestPause, and"
-            " post-resume verification into the worker performing the protected"
-            " task. Keep a probe-only phase only when gate diagnosis itself is"
-            " the final user objective."
-        )
 
 def utc_now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
@@ -873,7 +781,7 @@ def _validate_pacing(value: Any, errors: List[str], *, where: str) -> JsonDict:
         if key in value
     }
 
-_ROW_SELECTION_LIMITS = {"probe": 1, "validation": 2}
+_EXPLICIT_ROW_SELECTION_ROLES = frozenset({"probe", "validation"})
 
 # Roles that only exist as the next rung of a validated confidence ladder.
 # `probe` opens one, `remediation` reruns an explicit failed-row set, and
@@ -940,15 +848,6 @@ def _adapt_cohort_row_selection(
             " one non-negative index into the cohort artifact"
         )
         return ""
-    limit = _ROW_SELECTION_LIMITS.get(mode)
-    if limit is not None and len(indices) > limit:
-        errors.append(
-            f"phase {phase_id}: row_selection.mode={mode} may select at most"
-            f" {limit} row(s); a confidence stage that opens many pages is a"
-            " bulk run wearing its name"
-        )
-        return ""
-
     worker_contract["batch_source"] = {
         "artifact_name": artifact_name,
         "identity_field": identity_field,
@@ -1307,22 +1206,16 @@ def _validate_execution_role_dependencies(
                 " artifact-derived rows, or batch_rows for targets explicitly"
                 " supplied by the user"
             )
-        if role in _ROW_SELECTION_LIMITS and size is None:
-            # A confidence stage whose row count cannot be read off the contract
-            # is a whole-cohort run with a confidence stage's name: the selector
-            # says "everything the artifact holds". Require the count to be
-            # stated so the one/two-row limit below is enforceable at all.
+        if role in _EXPLICIT_ROW_SELECTION_ROLES and size is None:
+            # Bind the selected work explicitly; the role itself imposes no
+            # fixed one/two-row sample size.
             errors.append(
                 f"phase {phase_id}: execution_role={role} must state which rows"
                 " it takes — use worker_contract.row_selection.source_indices"
                 " (preferred) or a bounded batch_source selector; an unbounded"
                 f" selector makes {role} a multi-page run under another name"
             )
-        if role == "probe" and size is not None and size > 1:
-            errors.append(
-                f"phase {phase_id}: execution_role=probe may select at most 1 row"
-            )
-        elif role == "validation":
+        if role == "validation":
             # The guard above already returned for a missing checkpoint, so
             # every check here may assume an active one.
             if not declared_deps:
@@ -1331,10 +1224,6 @@ def _validate_execution_role_dependencies(
                     " declare depends_on with the phase recorded by its replan"
                     " checkpoint; retain that validated predecessor in the"
                     " replacement plan"
-                )
-            if size is not None and size > 2:
-                errors.append(
-                    f"phase {phase_id}: execution_role=validation may select at most 2 rows"
                 )
         elif role == "bulk":
             if not declared_deps:
@@ -1846,9 +1735,6 @@ def _compile_output_contract(
             pattern = spec.pop("pattern", None)
             if pattern is not None:
                 additional.append({"type": "field_pattern", "field": name, "pattern": pattern})
-            domains = spec.pop("allowedDomains", None)
-            if domains is not None:
-                additional.append({"type": "allowed_domain", "field": name, "domains": domains})
             spec["name"] = name
             compiled_fields.append(spec)
             if spec.get("nonempty") is True:
@@ -2412,28 +2298,11 @@ def validate_task_plan(
                 errors.append(
                     f"phase {phase_id}: worker_contract.session_key must be a string"
                 )
-            if (
-                "fleet_id" in worker_contract
-                and not isinstance(worker_contract.get("fleet_id"), str)
-            ):
+            if "fleet_id" in worker_contract:
                 errors.append(
-                    f"phase {phase_id}: worker_contract.fleet_id must be a string"
-                )
-            if (
-                str(worker_contract.get("fleet_id") or "").strip()
-                and str(worker_contract.get("session_key") or "").strip()
-            ):
-                errors.append(
-                    f"phase {phase_id}: worker_contract.fleet_id and"
-                    " session_key are mutually exclusive"
-                )
-            if (
-                str(worker_contract.get("fleet_id") or "").strip()
-                and worker_contract.get("needs_isolated_session") is True
-            ):
-                errors.append(
-                    f"phase {phase_id}: worker_contract.fleet_id and"
-                    " needs_isolated_session are mutually exclusive"
+                    f"phase {phase_id}: worker_contract.fleet_id is forbidden;"
+                    " name an existing Fleet only as @<id> in the original"
+                    " user task"
                 )
             if "auth_verification" in worker_contract:
                 try:
@@ -2984,7 +2853,6 @@ def phase_contract(
         "batch_source",
         "batch_policy", "replan_checkpoint_id", "skill_selection", "domain",
         "needs_isolated_session", "reuse_scope", "session_key", "page_policy",
-        "fleet_id",
         "content_completeness",
     ):
         value = contract.get(skill_key)
@@ -3142,6 +3010,11 @@ def initialize_task_state(
             previous_status = str(previous.get("status") or "")
             if previous_status in REPLAN_RESET_STATUSES:
                 phases_state[phase_id] = _tc()._empty_phase_state()
+                # Reset execution status, not spent resources or crash evidence.
+                # Old decisions retain their planVersion/contractHash fences.
+                for key in ("continuation_controls", "continuation_dispatch_input"):
+                    if key in previous:
+                        phases_state[phase_id][key] = copy.deepcopy(previous[key])
                 if replan_audit is not None:
                     replan_audit["reset_phase_failed"].append({
                         "phaseId": phase_id,
@@ -3226,6 +3099,11 @@ def initialize_task_state(
         "direct_dispatches": copy.deepcopy(
             (preserve_from or {}).get("direct_dispatches") or {}
         ),
+        # The source replan reason is excluded from the executable normalized
+        # plan, but it is part of the operator-approved candidate identity.
+        # Keep it beside the plan hash so approval checks can reconstruct that
+        # identity after this process exits.
+        "plan_replan_reason": replan_reason or "",
     }
     # Approval is bound to the immutable candidate hash and committed with the
     # plan generation.  It is control-plane state, not part of the plan body:

@@ -56,6 +56,8 @@ class SpawnerRegistryMixin:
             self._update_slot_registry_from_value(slot, fleet_response)
             sync_receipt["fleetListSucceeded"] = True
         except Exception as exc:
+            if isinstance(exc, ABCPTransportError) and exc.connection_fatal:
+                raise
             slot.sync_errors.append(f"Fleet.list: {str(exc)[:240]}")
 
         # Self-heal: drop registry keys that are obviously not real ids. A
@@ -109,6 +111,8 @@ class SpawnerRegistryMixin:
                 self._update_slot_registry_from_value(slot, pages_response)
                 sync_receipt["pageListSucceededFleetIds"].append(fleet_id)
             except Exception as exc:
+                if isinstance(exc, ABCPTransportError) and exc.connection_fatal:
+                    raise
                 note_fleet_timeout(fleet_id, exc)
                 slot.sync_errors.append(f"Page.list({fleet_id}): {str(exc)[:240]}")
 
@@ -207,6 +211,8 @@ class SpawnerRegistryMixin:
                     )
                     self._mark_page_fresh(slot, page_id)
             except Exception as exc:
+                if isinstance(exc, ABCPTransportError) and exc.connection_fatal:
+                    raise
                 if page_fleet_id:
                     note_fleet_timeout(page_fleet_id, exc)
                 error_text = str(exc)[:240]
@@ -940,6 +946,18 @@ class SpawnerRegistryMixin:
         return {
             "slotId": slot.slot_id,
             "agentId": slot.agent_id,
+            **(
+                {"protocolAgentId": slot.protocol_agent_id}
+                if slot.protocol_agent_id else {}
+            ),
+            **(
+                {"eventCursor": slot.event_cursor}
+                if slot.event_cursor is not None else {}
+            ),
+            **(
+                {"eventCatalogRevision": slot.event_catalog_revision}
+                if slot.event_catalog_revision else {}
+            ),
             "status": slot.status,
             "currentWorkerId": slot.current_worker_id,
             "lastWorkerId": slot.last_worker_id,

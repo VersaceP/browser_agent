@@ -6,7 +6,14 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List
 
+from harness.planning.task_classifier import (
+    classify_browser_task,
+    extract_fleet_reference,
+    synthesize_direct_input,
+)
 from harness.planning.validator import review_plan_revision
+from harness.task_control import validate_task_plan
+from harness.tools.lead_tools import _compile_direct_task_plan
 from harness.utils import RunLogger
 
 
@@ -196,5 +203,152 @@ async def run_plan_validator_semantic_canary(
         ) else "failed",
         "provider": provider_name,
         "modelId": model_id,
+        "results": results,
+    }
+
+
+async def run_browser_mode_plan_canary(
+    runtime: Any,
+    plan_validator_provider: Any,
+    *,
+    sample_count: int = 5,
+) -> JsonDict:
+    """Exercise the real browser-mode planning path without dispatching a worker.
+
+    This deliberately stops after independent plan review. It samples the live
+    classifier because route/value separation and literal completeness are
+    semantic behaviors that a mocked unit test cannot establish.
+    """
+    samples = max(1, min(int(sample_count), 20))
+    fleet_id = "2677c96a-7a2b-4119-bec8-2e56cf93a5cd"
+    target_url = "https://www.yue-accelerator.com/#/"
+    task = (
+        f"@{fleet_id} 使用该fleet访问{target_url} 这个网站有一个表单需要你 "
+        "帮我填写，需要先登陆才能够填写。只需要你填写一下信息教育经历-本科、"
+        "毕业于广东工业大学，经管学院，应用统计学专业。"
+    )
+
+    def _is_route_value(raw: Any) -> bool:
+        value = str(raw or "").strip()
+        without_sigil = value.removeprefix("@")
+        is_fleet_reference = bool(
+            len(without_sigil) >= 8
+            and (
+                fleet_id.startswith(without_sigil)
+                or without_sigil.startswith(fleet_id)
+            )
+        )
+        is_navigation_url = bool(
+            value.startswith(("http://", "https://"))
+            and (target_url.startswith(value) or value.startswith(target_url))
+        )
+        return is_fleet_reference or is_navigation_url
+
+    validator_config = runtime.plan_validator
+    results: List[JsonDict] = []
+    with tempfile.TemporaryDirectory(
+        prefix="abcp-browser-mode-plan-canary-"
+    ) as root:
+        logger = RunLogger(str(Path(root)))
+        for sample in range(1, samples + 1):
+            classification, classify_error = await classify_browser_task(
+                task,
+                runtime,
+                logger,
+            )
+            if classification is None:
+                results.append({
+                    "sample": sample,
+                    "passed": False,
+                    "stage": "classification",
+                    "error": classify_error,
+                })
+                continue
+            literal_items = classification.get("literal_items") or []
+            route_leaks = [
+                item for item in literal_items
+                if isinstance(item, dict)
+                and _is_route_value(item.get("value"))
+            ]
+            fleet_reference, fleet_error = extract_fleet_reference(task)
+            if fleet_error or fleet_reference != fleet_id:
+                results.append({
+                    "sample": sample,
+                    "passed": False,
+                    "stage": "route_extraction",
+                    "routeLeaks": route_leaks,
+                    "error": fleet_error or "canonical Fleet reference was lost",
+                })
+                continue
+            direct_input = synthesize_direct_input(task, classification)
+            if "fleet_id" in (direct_input.get("worker_contract") or {}):
+                results.append({
+                    "sample": sample,
+                    "passed": False,
+                    "stage": "route_transport",
+                    "routeLeaks": route_leaks,
+                    "error": "Fleet routing leaked into direct worker contract",
+                })
+                continue
+            compiled, compile_error = _compile_direct_task_plan(direct_input)
+            if compiled is None:
+                results.append({
+                    "sample": sample,
+                    "passed": False,
+                    "stage": "compile",
+                    "routeLeaks": route_leaks,
+                    "error": compile_error,
+                })
+                continue
+            collection_facts: List[JsonDict] = []
+            normalized, mechanical_errors = validate_task_plan(
+                compiled,
+                user_task=task,
+                collection_facts=collection_facts,
+            )
+            if normalized is None or mechanical_errors:
+                results.append({
+                    "sample": sample,
+                    "passed": False,
+                    "stage": "mechanical_validation",
+                    "routeLeaks": route_leaks,
+                    "errors": mechanical_errors,
+                })
+                continue
+            review = await review_plan_revision(
+                plan_validator_provider,
+                logger=logger,
+                user_task=task,
+                initial_plan=None,
+                previous_plan=None,
+                candidate_plan=normalized,
+                task_state=None,
+                replan_reason="",
+                provider_name=validator_config.provider,
+                model_id=validator_config.model_id,
+                collection_facts=collection_facts,
+            )
+            summary = _review_summary(review)
+            passed = not route_leaks and summary["status"] == "approved"
+            results.append({
+                "sample": sample,
+                "passed": passed,
+                "stage": "plan_review",
+                "literalItemCount": len(literal_items),
+                "literalValues": [
+                    str(item.get("value") or "")
+                    for item in literal_items
+                    if isinstance(item, dict)
+                ],
+                "routeLeaks": route_leaks,
+                **summary,
+            })
+    return {
+        "status": "passed" if all(
+            item["passed"] for item in results
+        ) else "failed",
+        "samples": samples,
+        "classifierModelId": runtime.task_classifier.model_id or None,
+        "planValidatorModelId": validator_config.model_id,
         "results": results,
     }

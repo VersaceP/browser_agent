@@ -535,13 +535,23 @@ def read_task_file_text(logger: Any, raw_path: Any) -> Optional[str]:
     resolved, error = resolve_task_file(logger, raw_path)
     if error or resolved is None:
         return None
+    from harness.storage.virtual_fs import db_authoritative_for, virtual_fs_for
+
+    if db_authoritative_for(logger):
+        try:
+            relative = str(resolved.relative_to(Path(logger.task_dir).resolve()))
+        except (OSError, ValueError):
+            return None
+        view = virtual_fs_for(logger)
+        if view is not None:
+            lines = view.iter_lines(relative)
+            if lines is not None:
+                return "".join(lines)
     if resolved.is_file():
         try:
             return resolved.read_text(encoding="utf-8")
         except OSError:
             return None
-    from harness.storage.virtual_fs import virtual_fs_for
-
     view = virtual_fs_for(logger)
     if view is None:
         return None
@@ -564,10 +574,18 @@ def task_file_exists(logger: Any, raw_path: Any) -> bool:
     resolved, error = resolve_task_file(logger, raw_path)
     if error or resolved is None:
         return False
+    from harness.storage.virtual_fs import db_authoritative_for, virtual_fs_for
+
+    if db_authoritative_for(logger):
+        try:
+            relative = str(resolved.relative_to(Path(logger.task_dir).resolve()))
+        except (OSError, ValueError):
+            return False
+        view = virtual_fs_for(logger)
+        if view is not None and view.exists(relative):
+            return True
     if resolved.is_file():
         return True
-    from harness.storage.virtual_fs import virtual_fs_for
-
     view = virtual_fs_for(logger)
     if view is None:
         return False

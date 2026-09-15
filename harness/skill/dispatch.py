@@ -489,6 +489,8 @@ def _row_passes_validators(row: Dict[str, Any], validators: Any) -> bool:
             continue
         vtype = str(validator.get("type") or "")
         field = str(validator.get("field") or "").strip()
+        if vtype in {"field_pattern", "url_pattern", "cross_field_contains"} and validator.get("enforcement") != "literal":
+            continue
         if vtype == "range" and field:
             raw = _row_field_value(row, field)
             try:
@@ -512,15 +514,7 @@ def _row_passes_validators(row: Dict[str, Any], validators: Any) -> bool:
             except re.error:
                 continue
         elif vtype == "allowed_domain":
-            field_name = field or "detailUrl"
-            domain = str(
-                validator.get("domain") or validator.get("value") or ""
-            ).strip().lower().lstrip("*.")
-            if not domain:
-                continue
-            host = _host_of(str(_row_field_value(row, field_name) or ""))
-            if not (host == domain or host.endswith("." + domain)):
-                return False
+            continue  # Legacy domain declarations are semantic observations.
         elif vtype == "set_equals" and field:
             # At phase validation this asserts equality of the whole observed
             # set. During upstream row selection its row-local counterpart is

@@ -23,7 +23,6 @@ from harness.evidence.extraction_artifacts import field_name_from_spec
 from harness.evidence.extraction_artifacts import field_names_from_specs
 from harness.evidence.artifact_evidence import VALIDATOR_TYPES
 from harness.evidence.artifact_evidence import cumulative_row_key as _cumulative_row_key
-from harness.evidence.artifact_evidence import detect_blocker_data_rows
 from harness.evidence.artifact_evidence import detect_placeholder_rows
 from harness.evidence.file_evidence import saved_paths_from_value
 from harness.tools.browser_tools.downloads import _download_records
@@ -83,6 +82,9 @@ def _invalid_value_summary(value: Any) -> JsonDict:
 def _run_validator(validator: JsonDict, rows: List[JsonDict]) -> List[JsonDict]:
     validator_type = str(validator.get("type") or "").strip()
     failures: List[JsonDict] = []
+
+    if validator_type in {"url_pattern", "field_pattern", "cross_field_contains"} and validator.get("enforcement") != "literal":
+        return []  # Business patterns are model-visible observations.
 
     if validator_type == "artifact_required":
         return []
@@ -300,18 +302,9 @@ def _run_validator(validator: JsonDict, rows: List[JsonDict]) -> List[JsonDict]:
         return failures
 
     if validator_type == "allowed_domain":
-        field = str(validator.get("field") or "url").strip()
-        domains = set(_tc()._string_list(validator.get("domains")))
-        bad = []
-        for index, row in enumerate(rows):
-            host = urlparse(str(row.get(field) or "")).netloc.lower()
-            if host.startswith("www."):
-                host = host[4:]
-            if host not in domains:
-                bad.append({"row": index, "host": host, "value": row.get(field)})
-        if bad:
-            failures.append({"type": validator_type, "field": field, "domains": sorted(domains), "bad": bad[:20]})
-        return failures
+        # Historical plans remain readable. Domain affiliation is a semantic
+        # observation, never a row rejection or a network permission.
+        return []
 
     if validator_type == "set_equals":
         field = str(validator.get("field") or "").strip()
@@ -405,6 +398,31 @@ def _run_file_validator(
         str(path) for path in artifacts
         if str(path).strip() and "/artifacts/extractions/" not in str(path)
     ])
+
+    # When extraction rows declare concrete delivery paths, validate exactly
+    # that set. This prevents unrelated diagnostics (for example screenshots)
+    # from satisfying a product/file contract merely because the count fits.
+    declared_paths: List[str] = []
+    explicit_path_fields = {
+        str(value).strip() for value in (validator.get("path_fields") or [])
+        if str(value).strip()
+    }
+
+    def is_path_field(key: str) -> bool:
+        return key in explicit_path_fields
+
+    def collect_declared(value: Any, key: str = "") -> None:
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                collect_declared(child, str(child_key))
+        elif isinstance(value, list):
+            for child in value:
+                collect_declared(child, key)
+        elif isinstance(value, str) and is_path_field(key) and value.strip():
+            declared_paths.append(value.strip())
+
+    collect_declared(rows)
+    declared_paths = _tc()._unique_paths(declared_paths)
 
     if validator_type == "download_completed":
         # A completion receipt must come from the operation itself
@@ -500,9 +518,31 @@ def _run_file_validator(
         raw_min_bytes = validator.get("min_bytes")
         min_bytes = max(0, int(1 if raw_min_bytes is None else raw_min_bytes))
         expected_sha256 = str(validator.get("sha256") or "").strip().lower()
-        valid: List[str] = []
-        bad: List[JsonDict] = []
         regex = re.compile(pattern) if pattern else None
+
+        def targets(path: str) -> bool:
+            candidate = Path(path).expanduser()
+            if regex is not None and regex.search(str(candidate)) is None:
+                return False
+            if extensions and candidate.suffix.lower().lstrip(".") not in extensions:
+                return False
+            return True
+
+        unavailable_declared: List[str] = []
+        if explicit_path_fields:
+            targeted_declared = [path for path in declared_paths if targets(path)]
+            available = set(file_paths)
+            unavailable_declared = [
+                path for path in targeted_declared if path not in available
+            ]
+            file_paths = [
+                path for path in targeted_declared if path in available
+            ]
+        valid: List[str] = []
+        bad: List[JsonDict] = [
+            {"path": path, "reason": "not_attributed_to_phase"}
+            for path in unavailable_declared[:20]
+        ]
         for raw_path in file_paths:
             path = Path(raw_path).expanduser()
             if regex is not None and regex.search(str(path)) is None:
@@ -525,8 +565,11 @@ def _run_file_validator(
                 valid.append(str(path))
             except OSError as exc:
                 bad.append({"path": str(path), "reason": "io_error", "error": str(exc)})
-        min_files = max(1, int(validator.get("min_files") or 1))
-        if len(valid) >= min_files:
+        min_files = max(0, int(validator.get("min_files", 0)))
+        # A row that explicitly claims a target file is an integrity claim.
+        # Meeting min_files with some other files must not hide a missing,
+        # undersized, or unattributed claimed path.
+        if len(valid) >= min_files and not bad:
             return []
         return [{
             "type": validator_type,
@@ -548,7 +591,7 @@ def _run_file_validator(
             (_selected_file_count(item.get("params")) for item in receipts),
             default=0,
         )
-        min_files = max(1, int(validator.get("min_files") or 1))
+        min_files = max(0, int(validator.get("min_files", 1)))
         if not receipts or selected_count < min_files:
             return [{
                 "type": validator_type,
@@ -582,7 +625,7 @@ def _run_file_validator(
         }]
 
     if validator_type == "image_exported":
-        min_files = max(1, int(validator.get("min_files") or 1))
+        min_files = max(0, int(validator.get("min_files", 1)))
         # `svg` belongs here: DOM.getImg with imageFormat="auto" preserves a
         # safe self-contained inline SVG instead of rasterizing it, so a real
         # exported asset can legitimately arrive with that extension.
@@ -762,8 +805,6 @@ def _validate_field_provenance(
                 validator,
             )
             missing = []
-            if row.get(field) is None or str(row.get(field)).strip() == "":
-                missing.append(field)
             if not evidence_field or not _row_has_nonempty_value(row, evidence_aliases):
                 missing.append(evidence_field or "evidence_field")
             if bool(spec.get("require_source_tool", validator.get("require_source_tool", False))):
@@ -1506,7 +1547,7 @@ def _normalize_validators(
                     ),
                 })
             validator_type = canonical_type
-        if validator_type not in VALIDATOR_TYPES:
+        if validator_type not in VALIDATOR_TYPES and validator_type != "allowed_domain":
             errors.append(
                 f"phase {phase_id}: validators[{index}].type must be one of {sorted(VALIDATOR_TYPES)}"
             )
@@ -1546,36 +1587,11 @@ def _normalize_validators(
                     " expected_artifact.fields so the worker records page evidence"
                 )
         if validator_type == "allowed_domain":
-            # Accept the singular spelling a plan naturally writes, then refuse
-            # a declaration that cannot pass. An empty allowlist is not "allow
-            # anything" — it is "allow nothing": every row's host is outside
-            # it, on every attempt, with nothing the worker can do. That is the
-            # unsatisfiable-contract shape this whole series exists to stop,
-            # and it happened live in task 3189c68b: two workers extracted
-            # their pages completely and were failed anyway, because the plan
-            # wrote `domain` while the check reads `domains`.
-            singular = str(normalized_validator.pop("domain", "") or "").strip()
-            domains = _tc()._string_list(normalized_validator.get("domains"))
-            if singular and singular not in domains:
-                domains = [*domains, singular]
-            normalized_validator["domains"] = domains
-            if not domains:
-                errors.append(
-                    f"phase {phase_id}: validators[{index}] allowed_domain"
-                    " declares no domain, so no row can ever pass it; list the"
-                    " allowed hosts in `domains`"
-                )
-            # The field defaults to "url", which most artifacts do not carry.
-            # A validator pointed at a field the artifact never declares fails
-            # every row for a reason the data cannot fix.
-            domain_field = str(normalized_validator.get("field") or "url").strip()
-            normalized_validator["field"] = domain_field
-            if field_names and domain_field not in field_names:
-                errors.append(
-                    f"phase {phase_id}: allowed_domain field {domain_field!r}"
-                    " is not declared in expected_artifact.fields; point it at"
-                    " the field that holds the URL"
-                )
+            normalized_validator["enforcement"] = "advisory"
+            if warnings is not None:
+                warnings.append({"type": "retired_domain_validator", "phaseId": phase_id,
+                                 "declaration": dict(validator),
+                                 "message": "Domain affiliation is reviewed semantically; this legacy rule cannot reject rows."})
         if validator_type == "field_provenance":
             normalized_validator["fields"] = _normalize_provenance_validator_fields(
                 normalized_validator
@@ -1874,7 +1890,6 @@ def _validate_cumulative_artifacts(
     for validator in validators:
         failures.extend(_run_validator(validator, rows))
     failures.extend(detect_placeholder_rows(rows, expected_artifact=expected))
-    failures.extend(detect_blocker_data_rows(rows, expected))
     return rows, source_paths, [*schema_failures, *failures], provenance
 
 def make_row_preference(
@@ -1936,7 +1951,6 @@ def _cumulative_row_quality(
     # that merely avoided the vocabulary. Deciding which duplicate survives a
     # merge is authoritative - it destroys the other row - so it belongs to
     # facts that can be checked, not to a phrase list.
-    row_failures.extend(detect_blocker_data_rows([row], expected))
 
     expected_fields = field_names_from_specs(
         expected.get("required_fields") or expected.get("fields") or []

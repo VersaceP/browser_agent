@@ -9,8 +9,8 @@ covered all three and no check could contradict it.
 
 Two things live here, and they are deliberately different in kind:
 
-  * `absence_proof` decides whether a declared "there is nothing here" carries
-    the evidence that claim requires. An empty field is not evidence of
+  * `absence_proof` reports an explicit model judgment and its evidence text.
+    It does not mechanically certify that judgment. An empty field is not evidence of
     absence; a zero count on a region that never rendered is not either. The
     obligations are declaration-driven — the caller says which region, which
     selector, which epoch — so nothing here knows anything about any site.
@@ -66,123 +66,55 @@ ROW_CAUSES = frozenset({
 # Suffix a row uses to attach an absence declaration to field <name>.
 ABSENCE_SUFFIX = "Absence"
 
-# Each obligation maps to the recovery action that would discharge it, so a
-# rejected absence tells the worker what to DO rather than only what is wrong.
-_OBLIGATION_ACTIONS = {
-    "current_epoch_region_materialized": "materialize_region",
-    "overlay_clear": "clear_overlay_then_reobserve",
-    "target_collection_exhausted": "enumerate_target_collection",
-    "selector_calibrated": "calibrate_selector_against_positive_peer",
-    "source_provenance": "record_source_tool_and_selector",
-    "positive_evidence_text": "capture_evidence_text_for_the_empty_region",
-    "navigation_epoch_bound": "bind_observation_to_current_navigation_epoch",
-    "outcome_declared_absent": "declare_outcome_confirmed_absent",
-}
-
-
 def absence_field_name(field: str) -> str:
     return f"{field}{ABSENCE_SUFFIX}"
 
 
-def _truthy(value: Any) -> bool:
-    return value is True
-
-
-def _nonempty_text(value: Any) -> bool:
-    return isinstance(value, str) and bool(value.strip())
-
-
-def _positive_int(value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and value > 0
-
-
 def absence_proof(declaration: Any, *, region_id: str = "") -> JsonDict:
-    """Judge one declared absence against its evidence obligations.
+    """Legacy entry point: inspect a model declaration, never prove absence.
 
-    Returns `state: "complete"` only when every obligation is discharged. An
-    incomplete proof is reported as `satisfiable: True` with the obligations
-    still outstanding: "we have not proved this yet" is a different statement
-    from "this can never be proved", and collapsing them turns a page we simply
-    have not finished reading into a permanent verdict about the site.
+    Coverage, exhaustion and selector calibration are semantic evidence, not a
+    universal checklist. This validates only the declaration's protocol shape.
+    Referenced artifacts are checked at the artifact-validation boundary.
     """
     data = declaration if isinstance(declaration, dict) else {}
-    outcome = str(data.get("outcome") or "").strip()
-    checks = {
-        "current_epoch_region_materialized": _truthy(data.get("regionMaterialized")),
-        "overlay_clear": _truthy(data.get("overlayClear")),
-        "target_collection_exhausted": _truthy(data.get("enumerationExhausted")),
-        "selector_calibrated": _nonempty_text(data.get("selectorCalibratedBy")),
-        "source_provenance": (
-            _nonempty_text(data.get("sourceTool"))
-            and _nonempty_text(data.get("sourceSelectorOrAxId"))
-        ),
-        "positive_evidence_text": _nonempty_text(data.get("evidenceText")),
-        # Epoch 0 is the pre-navigation state derive_row_facts starts every row
-        # at, so a proof bound to it is bound to nothing. Requiring a positive
-        # epoch is what makes "in the CURRENT page epoch" mean anything.
-        "navigation_epoch_bound": _positive_int(data.get("navigationEpoch")),
-        # Saying it out loud is part of the proof. Without this a declaration
-        # that never names an outcome collects all seven flags and is read as
-        # confirmed_absent by default — absence granted for not asking.
-        "outcome_declared_absent": outcome == OUTCOME_CONFIRMED_ABSENT,
+    valid = (data.get("outcome") == OUTCOME_CONFIRMED_ABSENT
+             and isinstance(data.get("evidenceText"), str)
+             and bool(data["evidenceText"].strip()))
+    return {
+        "state": "declared" if valid else "undeclared",
+        "authority": "worker_semantic_judgment",
+        "mechanicallyProven": False,
+        "reason": "" if valid else "outcome_and_evidence_text_required",
     }
-    missing = [name for name, satisfied in checks.items() if not satisfied]
-    if outcome and outcome != OUTCOME_CONFIRMED_ABSENT:
-        missing.append("outcome_must_be_confirmed_absent")
-    proof: JsonDict = {
-        "state": "complete" if not missing else "incomplete",
-        "satisfiable": True,
-        "missingObligations": missing,
-        "recommendedActions": [
-            f"{_OBLIGATION_ACTIONS[name]}:{region_id}" if region_id
-            else _OBLIGATION_ACTIONS[name]
-            for name in missing
-            if name in _OBLIGATION_ACTIONS
-        ],
-    }
-    if region_id:
-        proof["regionId"] = region_id
-    return proof
 
 
 def field_absence_accepted(
     row: Any, field: str, *, allowed_outcomes: Any = None,
 ) -> JsonDict:
-    """Whether row[field] may be empty because its absence is proven.
+    """Apply a contract's conditional licence to an explicit worker judgment.
 
-    `allowed_outcomes` is the contract's `allow_empty_with_outcome` list. An
-    empty field with no such allowance always fails: staying silent about which
-    fields may legitimately be empty is what made a 16-row contract demand
-    reviews from a product that has none.
+    Acceptance is structural; it does not certify the truth of the judgment.
+    A bare empty value, or an explicit blocked/unresolved outcome, cannot use
+    confirmed_absent's licence. Legacy evidence remains visible to the Lead.
     """
-    allowed = {
-        str(item).strip()
-        for item in (allowed_outcomes or [])
-        if str(item or "").strip()
-    }
+    allowed = allowed_outcomes if isinstance(allowed_outcomes, list) else []
     if OUTCOME_CONFIRMED_ABSENT not in allowed:
-        return {
-            "accepted": False,
-            "reason": "field_not_declared_emptiable",
-            "field": field,
-        }
-    declaration = (row or {}).get(absence_field_name(field)) if isinstance(row, dict) else None
-    if not isinstance(declaration, dict):
-        return {
-            "accepted": False,
-            "reason": "absence_declaration_missing",
-            "field": field,
-            "expectedKey": absence_field_name(field),
-        }
-    proof = absence_proof(declaration, region_id=str(declaration.get("regionId") or ""))
-    if proof["state"] != "complete":
-        return {
-            "accepted": False,
-            "reason": "absence_proof_incomplete",
-            "field": field,
-            "absenceProof": proof,
-        }
-    return {"accepted": True, "field": field, "absenceProof": proof}
+        return {"accepted": False, "reason": "field_not_declared_emptiable", "field": field}
+    row = row if isinstance(row, dict) else {}
+    declaration = row.get(absence_field_name(field))
+    declaration = dict(declaration) if isinstance(declaration, dict) else {}
+    # Historical rows used a sibling outcome/evidence field. Preserve that
+    # documented shape without interpreting arbitrary flags or prose as truth.
+    declaration.setdefault("outcome", row.get(f"{field}Outcome"))
+    declaration.setdefault("evidenceText", row.get(f"{field}EvidenceText"))
+    proof = absence_proof(declaration)
+    return {
+        "accepted": proof["state"] == "declared",
+        "reason": "" if proof["state"] == "declared" else "absence_declaration_missing",
+        "field": field,
+        "absenceProof": proof,
+    }
 
 
 # Every shape a contract may use to say "this field names a row". The list is
@@ -385,6 +317,7 @@ def derive_field_entry(
         entry["outcome"] = OUTCOME_CONFIRMED_ABSENT
         entry["cause"] = CAUSE_NONE
         entry["absenceProof"] = verdict["absenceProof"]
+        entry["outcomeAuthority"] = "worker_semantic_judgment"
         return entry
 
     cause = _cause_for_unresolved(facts)
@@ -399,15 +332,6 @@ def derive_field_entry(
     entry["cause"] = cause
     if verdict.get("absenceProof"):
         entry["absenceProof"] = verdict["absenceProof"]
-    elif verdict["reason"] == "absence_declaration_missing":
-        entry["absenceProof"] = {
-            "state": "incomplete",
-            "satisfiable": True,
-            "missingObligations": ["absence_declaration_missing"],
-            "recommendedActions": [
-                f"declare_{absence_field_name(field)}_with_evidence",
-            ],
-        }
     return entry
 
 

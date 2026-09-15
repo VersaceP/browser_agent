@@ -182,6 +182,24 @@ def _validated_browser_agent_step_extension_enabled(value: Any) -> bool:
     return value
 
 
+def _validated_browser_agent_multimodal_enabled(value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(
+            "harness.browser_agent_multimodal_enabled must be a boolean;"
+            f" got {value!r}"
+        )
+    return value
+
+
+def _validated_browser_agent_max_multimodal_image_bytes(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(
+            "harness.browser_agent_max_multimodal_image_bytes must be a"
+            f" positive integer; got {value!r}"
+        )
+    return value
+
+
 def _validated_agent_mode(value: Any) -> str:
     mode = str(value or "lead").strip().lower()
     if mode not in {"lead", "browser"}:
@@ -431,6 +449,11 @@ class PlanValidatorConfig:
     llm_timeout_max_retries: int = DEFAULT_LLM_TIMEOUT_MAX_RETRIES
     llm_timeout_backoff_seconds: float = DEFAULT_LLM_TIMEOUT_BACKOFF_SECONDS
     llm_timeout_retry_interval_seconds: Optional[float] = None
+    # One malformed/transport-failed verdict must not force the Lead to alter
+    # an otherwise identical candidate just to obtain another independent
+    # review. This is an attempt budget, not a semantic override: a retry can
+    # only produce approved/rejected/error and all outcomes stay audited.
+    review_error_retry_attempts: int = 1
     extra_params: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -487,6 +510,15 @@ class PlanValidatorConfig:
             llm_timeout_retry_interval_seconds=_optional_float_config(
                 data.get("llm_timeout_retry_interval_seconds"),
                 minimum=0.0,
+            ),
+            review_error_retry_attempts=_int_config(
+                data.get(
+                    "review_error_retry_attempts",
+                    cls.review_error_retry_attempts,
+                ),
+                cls.review_error_retry_attempts,
+                minimum=0,
+                maximum=3,
             ),
             extra_params=(
                 dict(data.get("extra_params"))
@@ -620,7 +652,7 @@ _REASONING_PARAM_KEYS = frozenset({
 
 @dataclass
 class ABCPClientConfig:
-    ws_url: str = "ws://localhost:9300/ws"
+    ws_url: str = "ws://127.0.0.1:61168/ws"
     jwt_token: Optional[str] = None
     jwt_token_env: Optional[str] = None
     request_shape: str = "flat"
@@ -921,6 +953,13 @@ class HarnessConfig:
     # authoritative and the default keeps historical fixed-cap behaviour.
     browser_agent_step_extension_enabled: bool = False
     browser_agent_max_extension_steps: int = 10
+    # Declares that the configured BrowserAgent model accepts image content
+    # blocks.  The model alias is intentionally not inferred: deployments may
+    # map the same alias to different capability sets.
+    browser_agent_multimodal_enabled: bool = False
+    # A screenshot is attached only for the immediately following model call;
+    # the raw file-size bound caps request growth before base64 expansion.
+    browser_agent_max_multimodal_image_bytes: int = 4 * 1024 * 1024
     # Harness-owned phase continuation. When a phase's worker ends in a bounded,
     # mechanically continuable state, the harness re-dispatches that same phase
     # itself instead of returning the decision to the Lead model.
@@ -938,7 +977,14 @@ class HarnessConfig:
     # excludes it), so the phase budget alone cannot bound a partial loop.
     phase_auto_continuation_enabled: bool = True
     phase_auto_continuation_max_attempts: int = 2
-    max_browser_agent_instances: int = 3
+    # When an event wait observes completed work, dispatch the next approved
+    # scheduling wave through the normal spawn gate. Multiple phases fan out
+    # only when the plan explicitly assigns one common dispatch_wave, and the
+    # running count is capped by max_browser_agents.
+    phase_auto_downstream_dispatch_enabled: bool = True
+    # Reusable slot-retention target. Effective pool capacity is never smaller
+    # than max_browser_agents, which is the authoritative concurrency limit.
+    max_browser_agent_instances: int = 4
     max_browser_agents: int = 4
     # Deterministic fleet routing.  When enabled, the spawner assigns every
     # BrowserAgent a Dispatcher-observed fleet before browser work begins and
@@ -1073,8 +1119,10 @@ class HarnessConfig:
     # not retain the Fleet lock or delay another command.
     fleet_click_gate_workflow_hitl_late_guard_seconds: float = 15.0
     auth_fleet_ledger_path: str = ".auth_fleet_ledger.json"
-    # A transport failure quarantines the slot, then reconnects with the same
-    # agentId before the coordinator is allowed to tombstone its session fleets.
+    # A transport failure quarantines the slot, then reconnects and verifies
+    # the server-assigned protocol identity before the coordinator can
+    # tombstone its session fleets.  The configured agent_id is local routing
+    # metadata and is never a WebCross identity claim.
     fleet_slot_reconnect_attempts: int = 2
     fleet_slot_reconnect_backoff_seconds: float = 0.25
     fleet_slot_manual_reset_after_failures: int = 3
@@ -1323,6 +1371,22 @@ class HarnessConfig:
                     )
                 )
             ),
+            browser_agent_multimodal_enabled=(
+                _validated_browser_agent_multimodal_enabled(
+                    data.get(
+                        "browser_agent_multimodal_enabled",
+                        cls.browser_agent_multimodal_enabled,
+                    )
+                )
+            ),
+            browser_agent_max_multimodal_image_bytes=(
+                _validated_browser_agent_max_multimodal_image_bytes(
+                    data.get(
+                        "browser_agent_max_multimodal_image_bytes",
+                        cls.browser_agent_max_multimodal_image_bytes,
+                    )
+                )
+            ),
             phase_auto_continuation_enabled=bool(
                 data.get(
                     "phase_auto_continuation_enabled",
@@ -1335,6 +1399,12 @@ class HarnessConfig:
                     cls.phase_auto_continuation_max_attempts,
                 )
             ))),
+            phase_auto_downstream_dispatch_enabled=bool(
+                data.get(
+                    "phase_auto_downstream_dispatch_enabled",
+                    cls.phase_auto_downstream_dispatch_enabled,
+                )
+            ),
             max_browser_agent_instances=int(
                 data.get(
                     "max_browser_agent_instances",

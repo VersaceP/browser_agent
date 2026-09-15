@@ -32,6 +32,7 @@ from harness.page_session import page_session_context_for_pages
 from harness.page_session import record_page_sessions
 from harness.schema_cache import global_schemas_dir
 from harness.schema_loader import CapabilityBundle
+from harness.schema_loader import _capability_revisions_from_response
 from harness.schema_loader import load_capability_bundle
 from harness.task_control import build_attempt_digest
 from harness.task_control import classification_for_worker_status
@@ -92,6 +93,35 @@ def _dedupe_download_receipts(receipts: Any) -> List[JsonDict]:
         seen.add(identity)
         unique.append(dict(receipt))
     return unique
+
+
+def _workflow_definition_receipts(trace: Any) -> List[JsonDict]:
+    """Return stable definition references produced by this worker.
+
+    Workflow execution results can be large or offloaded, but the immutable
+    Harness definition identity is small and is needed by the next worker.
+    """
+    seen: Set[tuple] = set()
+    receipts: List[JsonDict] = []
+    for item in trace if isinstance(trace, list) else []:
+        if not isinstance(item, dict):
+            continue
+        result = item.get("result")
+        definition = (
+            result.get("workflowDefinition")
+            if isinstance(result, dict) else None
+        )
+        if not isinstance(definition, dict):
+            continue
+        identity = (
+            str(definition.get("definitionRef") or ""),
+            str(definition.get("definitionHash") or ""),
+        )
+        if not all(identity) or identity in seen:
+            continue
+        seen.add(identity)
+        receipts.append(dict(definition))
+    return receipts
 
 
 def _transport_failure_fields(exc: ABCPTransportError) -> JsonDict:
@@ -824,21 +854,6 @@ class SpawnerWorkerMixin:
                 task_dir=self.logger.task_dir,
                 logger=self.logger,
             )
-            unresolved_visual = _unresolved_repair_visual_evidence(harness)
-            if unresolved_visual:
-                artifact_validation["status"] = "failed"
-                failures = artifact_validation.get("failures")
-                if not isinstance(failures, list):
-                    failures = []
-                    artifact_validation["failures"] = failures
-                failures.append({
-                    "type": "repair_absence_visual_evidence",
-                    "message": (
-                        "repair marked fields confirmed_absent but completed no"
-                        " visual_verify before worker termination"
-                    ),
-                    "pending": unresolved_visual,
-                })
             terminal_classification = classification_for_worker_status(
                 harness.final_status
             )
@@ -1002,12 +1017,19 @@ class SpawnerWorkerMixin:
                 "downloadOperationReceipts": _dedupe_download_receipts(
                     getattr(harness, "download_operation_receipts", {}).values()
                 ),
+                "fileManifests": list(getattr(harness, "file_manifests", []) or []),
                 "challengeReceipt": challenge_receipt,
                 # Per-row outcome and cause, derived from receipts. The Lead
                 # reads this instead of inferring one explanation for every row
                 # from the worker's prose.
                 "rowLedger": row_ledger,
+                "workflowDefinitions": _workflow_definition_receipts(
+                    getattr(harness, "trace", [])
+                ),
             }
+            continuation = getattr(harness, "continuation_decision", None)
+            if isinstance(continuation, dict):
+                result["continuation"] = dict(continuation)
             receipt_candidate = fast_path_assessment.get("candidate")
             if isinstance(receipt_candidate, dict):
                 result["fastPathReceiptCandidate"] = receipt_candidate
@@ -1058,6 +1080,7 @@ class SpawnerWorkerMixin:
             }
             if isinstance(assignment, FleetAssignment):
                 result["fleetAssignment"] = assignment.to_dict()
+            result["workflowDefinitions"] = _workflow_definition_receipts(trace)
             result = self._prepare_worker_result(
                 result,
                 worker_id=worker_id,
@@ -1145,6 +1168,7 @@ class SpawnerWorkerMixin:
                 "phaseId": phase_id,
                 "error": str(exc),
             }
+            result["workflowDefinitions"] = _workflow_definition_receipts(trace)
             if isinstance(exc, ABCPTransportError):
                 result.update(_transport_failure_fields(exc))
                 attach_error_classification(
@@ -1162,6 +1186,11 @@ class SpawnerWorkerMixin:
             self._mark_slot_idle(slot, worker_id=worker_id)
 
         self._remove_notification_relay_for_assignment(assignment)
+        # Prepared definitions survive a fatal transport exception independently
+        # of whether a Workflow response or final_answer was ever produced.
+        result["workflowDefinitions"] = _workflow_definition_receipts(
+            getattr(harness, "trace", []) if harness is not None else []
+        )
         if run_failed:
             auth_cleanup_receipt = await self._complete_failure_cleanup(
                 self.fleet_auth_barrier.abandon_worker(worker_id),
@@ -1238,7 +1267,7 @@ class SpawnerWorkerMixin:
             phase_id=str(phase_id or ""),
             artifacts=result.get("artifacts"),
         )
-        mark_phase_result(
+        continuation_receipt_id = mark_phase_result(
             self.logger,
             phase_id=phase_id,
             worker_id=worker_id,
@@ -1250,7 +1279,22 @@ class SpawnerWorkerMixin:
             attempt_digest=attempt_digest,
             phase=phase,
             worker_contract=worker_contract,
+            continuation=(
+                result.get("continuation")
+                if isinstance(result.get("continuation"), dict)
+                else None
+            ),
         )
+        if continuation_receipt_id:
+            result["continuationReceiptId"] = continuation_receipt_id
+            levels = result.get("resultLevels")
+            if isinstance(levels, dict):
+                l2 = levels.get("l2")
+                if isinstance(l2, dict):
+                    l2["continuationReceiptId"] = continuation_receipt_id
+            handoff = attempt_digest.get("handoff")
+            if isinstance(handoff, dict):
+                handoff["continuationReceiptId"] = continuation_receipt_id
         checkpoint = record_replan_checkpoint(
             self.logger,
             phase=phase,
@@ -1314,14 +1358,41 @@ class SpawnerWorkerMixin:
             self._capability_bundle_lock = asyncio.Lock()
         async with self._capability_bundle_lock:
             if self._capability_bundle is not None:
-                self.logger.write(
-                    "schema.bundle.reused",
-                    {
-                        "capability_count": len(self._capability_bundle.capability_methods),
-                        "schema_count": len(self._capability_bundle.method_schemas),
-                    },
+                revisions = _capability_revisions_from_response(caps_response)
+                cached_catalog = str(
+                    self._capability_bundle.catalog_revision or ""
+                ).strip()
+                cached_guide = str(
+                    self._capability_bundle.guide_revision or ""
+                ).strip()
+                current_catalog = str(revisions.get("catalogRevision") or "").strip()
+                current_guide = str(revisions.get("guideRevision") or "").strip()
+                changed = bool(
+                    (current_catalog and current_catalog != cached_catalog)
+                    or (current_guide and current_guide != cached_guide)
                 )
-                return _clone_capability_bundle(self._capability_bundle)
+                if changed:
+                    self.logger.write(
+                        "schema.bundle.stale_revision",
+                        {
+                            "cachedCatalogRevision": cached_catalog or None,
+                            "currentCatalogRevision": current_catalog or None,
+                            "cachedGuideRevision": cached_guide or None,
+                            "currentGuideRevision": current_guide or None,
+                        },
+                    )
+                    self._capability_bundle = None
+                else:
+                    self.logger.write(
+                        "schema.bundle.reused",
+                        {
+                            "capability_count": len(self._capability_bundle.capability_methods),
+                            "schema_count": len(self._capability_bundle.method_schemas),
+                            "catalogRevision": cached_catalog or None,
+                            "guideRevision": cached_guide or None,
+                        },
+                    )
+                    return _clone_capability_bundle(self._capability_bundle)
             bundle = await load_capability_bundle(
                 browser,
                 logger=self.logger,
@@ -1382,6 +1453,21 @@ class SpawnerWorkerMixin:
             ),
             task_dir=getattr(self.logger, "task_dir", None),
             logger=self.logger,
+            continuation=(
+                result.get("continuation")
+                if isinstance(result.get("continuation"), dict)
+                else None
+            ),
+            workflow_definitions=(
+                result.get("workflowDefinitions")
+                if isinstance(result.get("workflowDefinitions"), list)
+                else None
+            ),
+            file_manifests=(
+                result.get("fileManifests")
+                if isinstance(result.get("fileManifests"), list)
+                else None
+            ),
         )
         result["resultLevels"] = levels
         result["workerResultProtocol"] = "L1/L2/L3"

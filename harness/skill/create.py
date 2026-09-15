@@ -1015,7 +1015,7 @@ async def trial_workflow_live(
     runs: List[Dict[str, Any]] = []
     try:
         if own_client:
-            await client.call("System.register", {"agentId": agent_id})
+            await client.call("System.register", {})
         fl = await client.call("Fleet.create", {})
         fleet_id = ((fl or {}).get("data") or {}).get("fleetId") or ""
         pg = await client.call("Page.create", {"fleetId": fleet_id, "url": "about:blank"})
@@ -1277,7 +1277,7 @@ async def recheck_skill_live(
             }
     try:
         if own_client:
-            await client.call("System.register", {"agentId": agent_id})
+            await client.call("System.register", {})
         if skill.structured_output:
             from harness.skill.structured_output import structured_output_rows
             variables = _structured_trial_variables(skill, phase)

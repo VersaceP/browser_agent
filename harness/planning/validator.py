@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from harness.utils import storage_for_logger
+from harness.utils import load_task_json, read_task_file_text, storage_for_logger
 
 
 JsonDict = Dict[str, Any]
@@ -45,11 +45,19 @@ _PLAN_AUDITOR_RULES = (
     " than flattening them into one layer.",
     "Do not reject a complete plan merely because homogeneous detail targets are"
     " split into one-row phases: that is a valid reliability choice. Likewise,"
-    " one verified sample followed by sibling groups such as [2,2,1,1] for"
-    " seven comparable pages is a preferred scheduling default, not a semantic"
-    " requirement. Describe cost and concurrency tradeoffs when useful; reject"
+    " independent homogeneous siblings in one concurrent dispatch wave are the"
+    " preferred scheduling default. A verified sample followed by later sibling"
+    " groups remains valid when concrete route risk justifies its serial cost;"
+    " neither shape is a semantic requirement. Describe cost and concurrency"
+    " tradeoffs when useful; reject"
     " only when the candidate cannot meet the user's deliverable or has a"
     " concrete, evidenced execution contradiction.",
+    "A branch-local delivery phase may share a dispatch_wave with sibling"
+    " detail phases when it depends only on its own producer and writes to an"
+    " independent destination subtree. The dependency still prevents early"
+    " execution; the shared wave removes an unnecessary cohort-wide barrier."
+    " Do not reject this shape merely because delivery begins before unrelated"
+    " sibling detail phases finish.",
     "Every evidenceIds entry must be copied verbatim from evidenceCatalog[].id."
     " Diff paths, quantity relaxation ids, quantity lineage ids, and objective"
     " ids are not evidence ids. When evidenceCatalog is empty, every"
@@ -60,6 +68,18 @@ _PLAN_AUDITOR_RULES = (
     " an uncatalogued second attempt, page count, total count, selector, or"
     " stronger receipt before recognizing that fact. Still judge whether the"
     " proven fact actually authorizes the candidate's semantic change.",
+    "A validated_artifact entry establishes that the named path was accepted"
+    " by the harness. It establishes row values only when the entry also"
+    " carries contentProjection. Never infer that a product id, URL, title,"
+    " field or row is present or absent from a bare path. contentProjection is"
+    " deliberately bounded; rowsTruncated means it cannot prove absence from"
+    " undisclosed rows.",
+    "Do not call a recovery plan contradictory merely because it records that"
+    " a prior challenge or Fleet barrier cleared and also supplies a conditional"
+    " action if a new challenge appears. A past/current state and a future"
+    " contingency can both be true. Reject only when the candidate makes"
+    " incompatible claims about the same observed state or lacks evidence for"
+    " a state claim that its execution depends on.",
     "Return exactly one quantityDecision for every supplied quantity relaxation"
     " when approving. Use collection_exhaustion only with a catalogued"
     " exhaustion evidence id. Use higher_priority_user_objective only when the"
@@ -88,6 +108,25 @@ _PLAN_AUDITOR_RULES = (
     " declared identity constraint) and uniqueness. Judge whether the Lead"
     " translated the user meaning; do not invent values or silently add"
     " validators yourself.",
+    "Read the whole worker_task when checking whether user input is preserved."
+    " In a direct-worker plan, <original_user_task> is the complete authoritative"
+    " instruction and <classifier_literal_index> is only a navigation aid. A"
+    " value present in original_user_task is present in the worker instruction"
+    " even if that helper index omits it; never report such a value as absent or"
+    " truncated. This establishes that the plan preserved the instruction; it"
+    " does not by itself prove that execution will fill or verify the right"
+    " value. The canonical form receipt records stable controlKey identities and"
+    " the filledValue observed from the page. requiredControls can express"
+    " controlKey, label and section, so never demand an expectedValue property"
+    " inside requiredControls. A set_equals check on filledValue is expressible"
+    " as an additional validator, but it checks only an unordered set: it cannot"
+    " bind each value to its control, preserve duplicate-value multiplicity, or"
+    " tolerate a site that normalizes display values. Require exact returned"
+    " strings only when the task and page semantics make that check reachable;"
+    " otherwise judge the plan's instructions and reachable verification without"
+    " inventing an unsupported contract field. Still reject an actual"
+    " contradiction or a value absent from the complete authoritative"
+    " instruction.",
     "For form_filling/form_interaction work, compare the original user's"
     " independently requested controls with expected_artifact.requiredControls."
     " Reject omitted or conflated controls and browser-epoch identifiers used"
@@ -129,6 +168,17 @@ _PLAN_AUDITOR_RULES = (
     " the harness blames the site for withholding content the plan never"
     " described. Judge the marker against the target site's actual language and"
     " vocabulary; the region id beside it may stay an identifier.",
+    "Read compiledFieldPolicies as execution facts. Conditional emptiness accepts"
+    " an explicit confirmed_absent worker judgment with evidenceText; the harness"
+    " does not prove its truth by checking materialization, selector calibration,"
+    " exhaustion or epoch flags. Judge its evidence against the original request."
+    " Do not demand a fixed absence checklist or assume more retries can satisfy it."
+    " file_integrity checks each declared file and an explicit min_files (default 0);"
+    " quantity requirements belong in explicit contracts, not hidden integrity defaults."
+    " allowed_domain is advisory, including in legacy plans. Business URL/field patterns"
+    " and cross_field_contains are advisory unless enforcement=literal. Only approve"
+    " literal enforcement for an unambiguous literal requirement grounded in the user"
+    " request or protocol; do not rebuild domain affiliation rules as URL regexes.",
     "Judge each field_nonempty entry against what the target pages actually"
     " always carry. Do not apply a blanket rule such as 'every URL-list field"
     " must be non-empty': an item that genuinely has no detail images would"
@@ -136,6 +186,55 @@ _PLAN_AUDITOR_RULES = (
     " Require non-emptiness only for fields the task cannot be answered without,"
     " and leave genuinely optional fields to required_fields.",
 )
+
+
+def compiled_field_policies(plan: JsonDict) -> List[JsonDict]:
+    """Describe actual compiled checks, including conjunctive empty exceptions."""
+    facts = []
+    for phase in plan.get("phases") or []:
+        if not isinstance(phase, dict):
+            continue
+        grouped = {}
+        for index, rule in enumerate(phase.get("validators") or []):
+            if not isinstance(rule, dict):
+                continue
+            kind = rule.get("type")
+            fields = (rule.get("fields") or ([rule["field"]] if rule.get("field") else []))
+            if kind == "file_integrity":
+                fields = rule.get("path_fields") or []
+            if kind not in {"field_nonempty", "required_fields", "array_length", "file_integrity"}:
+                continue
+            if not isinstance(fields, list):
+                continue
+            for field in fields:
+                if not isinstance(field, str):
+                    continue
+                fact = grouped.setdefault(field, {"phaseId": phase.get("id"), "field": field,
+                                                   "checks": [], "nonemptyExceptions": []})
+                check = {k: v for k, v in rule.items()
+                         if k not in {"fields", "field", "path_fields", "allow_empty_with_outcome"}}
+                allowance = rule.get("allow_empty_with_outcome")
+                if kind == "file_integrity":
+                    check["scopeFields"] = list(fields)
+                    check["minimumScope"] = "combined_file_population_not_each_field"
+                    check["effectiveMinFiles"] = max(0, int(rule.get("min_files", 0)))
+                    check["supportsEmptyException"] = False
+                if isinstance(allowance, dict) and field in allowance:
+                    check["allow_empty_with_outcome"] = {field: allowance[field]}
+                fact["checks"].append({"validatorIndex": index, **check})
+                if kind == "field_nonempty":
+                    outcomes = (rule.get("allow_empty_with_outcome") or {}).get(field, [])
+                    fact["nonemptyExceptions"].append(outcomes if isinstance(outcomes, list) else [])
+        for fact in grouped.values():
+            exceptions = fact.pop("nonemptyExceptions")
+            allowed = set(exceptions[0]) if exceptions else set()
+            for outcomes in exceptions[1:]:
+                allowed.intersection_update(outcomes)
+            fact["nonemptyRulePolicy"] = (
+                "evidence_required" if allowed else "nonempty" if exceptions else "not_required")
+            fact["allowedOutcomesForAllNonemptyRules"] = sorted(allowed)
+            facts.append(fact)
+    return facts
 
 
 def _plan_auditor_system_prompt(*, repairing_verdict: bool = False) -> str:
@@ -333,7 +432,64 @@ def _evidence_id(kind: str, payload: Any) -> str:
     return f"{kind}:{digest[:16]}"
 
 
-def evidence_catalog(task_state: Optional[JsonDict]) -> List[JsonDict]:
+def _bounded_artifact_projection(value: Any) -> Optional[JsonDict]:
+    """Expose bounded validated JSON facts without copying whole artifacts."""
+    if not isinstance(value, dict):
+        return None
+    projection: JsonDict = {}
+    for key in ("name", "rowCount", "schemaVersion"):
+        item = value.get(key)
+        if (
+            isinstance(item, (str, int, float, bool))
+            or (item is None and key in value)
+        ):
+            projection[key] = item
+    rows = value.get("rows")
+    if isinstance(rows, list):
+        projected_rows: List[JsonDict] = []
+        for row in rows[:10]:
+            if not isinstance(row, dict):
+                continue
+            projected: JsonDict = {}
+            for key, item in list(row.items())[:30]:
+                if isinstance(item, str):
+                    candidate: Any = item[:500]
+                elif isinstance(item, (int, float, bool)) or item is None:
+                    candidate = item
+                elif (
+                    isinstance(item, list)
+                    and all(
+                        isinstance(child, (str, int, float, bool)) or child is None
+                        for child in item
+                    )
+                ):
+                    candidate = [
+                        child[:500] if isinstance(child, str) else child
+                        for child in item[:10]
+                    ]
+                else:
+                    continue
+                proposed = {**projected, str(key): candidate}
+                if len(json.dumps(proposed, ensure_ascii=False)) > 5000:
+                    break
+                projected = proposed
+            projected_rows.append(projected)
+        projection["rows"] = projected_rows
+        projection["rowsShown"] = len(projected_rows)
+        projection["rowsTruncated"] = len(rows) > len(projected_rows)
+        while (
+            projection["rows"]
+            and len(json.dumps(projection, ensure_ascii=False)) > 20000
+        ):
+            projection["rows"].pop()
+            projection["rowsShown"] = len(projection["rows"])
+            projection["rowsTruncated"] = True
+    return projection or None
+
+
+def evidence_catalog(
+    task_state: Optional[JsonDict], *, logger: Any = None,
+) -> List[JsonDict]:
     state = task_state if isinstance(task_state, dict) else {}
     evidence: List[JsonDict] = []
     seen = set()
@@ -349,9 +505,42 @@ def evidence_catalog(task_state: Optional[JsonDict]) -> List[JsonDict]:
             **payload,
         })
 
+    artifact_sources: Dict[str, List[str]] = {}
+    phase_states = (
+        state.get("phases") if isinstance(state.get("phases"), dict) else {}
+    )
+    for phase_id, phase_state in phase_states.items():
+        if not isinstance(phase_state, dict):
+            continue
+        for artifact in phase_state.get("validated_artifacts") or []:
+            if isinstance(artifact, str) and artifact.strip():
+                artifact_sources.setdefault(artifact.strip(), []).append(
+                    f"task_state.phases.{phase_id}.validated_artifacts"
+                )
     for artifact in state.get("artifacts") or []:
         if isinstance(artifact, str) and artifact.strip():
-            add("validated_artifact", {"path": artifact.strip()})
+            path = artifact.strip()
+            payload: JsonDict = {
+                "path": path,
+                "stateSources": artifact_sources.get(path) or [
+                    "task_state.artifacts"
+                ],
+            }
+            if logger is not None:
+                raw_text = read_task_file_text(logger, path)
+                projection = _bounded_artifact_projection(
+                    load_task_json(logger, path)
+                )
+                if raw_text is not None:
+                    payload["contentSha256"] = hashlib.sha256(
+                        raw_text.encode("utf-8")
+                    ).hexdigest()
+                if projection is not None:
+                    payload["contentProjection"] = projection
+                    payload["contentSource"] = "validated_task_artifact"
+                else:
+                    payload["contentStatus"] = "not_projectable_json"
+            add("validated_artifact", payload)
 
     def walk(value: Any, path: str) -> None:
         if isinstance(value, dict):
@@ -1318,7 +1507,7 @@ async def review_plan_revision(
         initial_plan=initial_plan,
         candidate_plan=candidate_plan,
     )
-    evidence = evidence_catalog(task_state)
+    evidence = evidence_catalog(task_state, logger=logger)
     worker_handoffs = []
     state_phases = (
         task_state.get("phases")
@@ -1367,6 +1556,7 @@ async def review_plan_revision(
         # so that judging them against the request is a decision this
         # reviewer can make rather than one it has to notice.
         "requiredCollectionFacts": collection_facts,
+        "compiledFieldPolicies": compiled_field_policies(candidate_plan),
     }
     verdict_tool = _verdict_tool(
         (item["id"] for item in objectives),

@@ -62,6 +62,9 @@ def build_worker_result_levels(
     extraction_attempt_artifacts: Optional[List[str]] = None,
     row_ledger: Optional[List[JsonDict]] = None,
     logger: Optional[Any] = None,
+    continuation: Optional[JsonDict] = None,
+    workflow_definitions: Optional[List[JsonDict]] = None,
+    file_manifests: Optional[List[JsonDict]] = None,
 ) -> JsonDict:
     """Return the stable worker handoff shape consumed by LeadAgent.
 
@@ -86,6 +89,23 @@ def build_worker_result_levels(
     error_count = len(trace_summary.get("errors", [])) if isinstance(trace_summary, dict) else 0
     artifact_count = len(artifacts) if isinstance(artifacts, list) else 0
     offload_count = len(offloaded_files) if isinstance(offloaded_files, list) else 0
+    validated_extraction_paths = (
+        artifact_validation.get("validExtractionArtifacts")
+        if isinstance(artifact_validation, dict)
+        and isinstance(artifact_validation.get("validExtractionArtifacts"), list)
+        else []
+    )
+    validated_row_count = (
+        artifact_validation.get("rowCount")
+        if isinstance(artifact_validation, dict)
+        else None
+    )
+    if not isinstance(validated_row_count, int) or isinstance(validated_row_count, bool):
+        validated_row_count = sum(
+            int(item.get("rowCount") or 0)
+            for item in extraction_artifacts
+            if isinstance(item, dict)
+        )
 
     l1: JsonDict = {
         "status": status,
@@ -115,14 +135,14 @@ def build_worker_result_levels(
         "data": {
             "extractionArtifacts": extraction_artifacts,
             "extractionAttemptArtifacts": attempt_artifacts,
-            "totalExtractedRows": sum(
-                int(item.get("rowCount") or 0)
-                for item in extraction_artifacts
-                if isinstance(item, dict)
-            ),
+            # The validator has already merged/deduplicated authoritative rows.
+            # Summing per-attempt artifact summaries double counts a row when a
+            # continuation rewrites the same extraction artifact.
+            "totalExtractedRows": validated_row_count,
         },
         "evidence": {
             "artifacts": artifacts[:MAX_INLINE_ARTIFACTS],
+            "validatedExtractionArtifacts": validated_extraction_paths[:10],
             "tracePath": trace_path,
             "offloadedFiles": offloaded_files[:100],
         },
@@ -141,6 +161,17 @@ def build_worker_result_levels(
         # A row missing because the budget ran out and a row blocked by an
         # overlay look identical in prose; here they never do.
         l2["rowLedger"] = row_ledger
+    if isinstance(continuation, dict):
+        l1["continuationAction"] = continuation.get("action")
+        l2["continuation"] = trim_large_strings(continuation, 4000)
+    if workflow_definitions:
+        l1["workflowDefinitionCount"] = len(workflow_definitions)
+        l2["data"]["workflowDefinitions"] = trim_large_strings(
+            workflow_definitions, 8000,
+        )
+    if file_manifests:
+        l1["fileManifestCount"] = len(file_manifests)
+        l2["data"]["fileManifests"] = trim_large_strings(file_manifests, 4000)
 
     l3: JsonDict = {
         "tracePath": trace_path,
@@ -151,6 +182,14 @@ def build_worker_result_levels(
         "artifactValidation": artifact_validation,
         "traceSummary": trace_summary,
     }
+    if isinstance(continuation, dict):
+        l3["continuation"] = trim_large_strings(continuation, 4000)
+    if workflow_definitions:
+        l3["workflowDefinitions"] = trim_large_strings(
+            workflow_definitions, 12000,
+        )
+    if file_manifests:
+        l3["fileManifests"] = trim_large_strings(file_manifests, 8000)
 
     return {
         "schemaVersion": "worker_result_levels.v1",
@@ -248,6 +287,15 @@ def build_worker_handoff_projection(
     # rows and fields were flagged, and a large worker result is offloaded to
     # disk with only this projection surviving in context.
     artifact_advisories = _artifact_advisories(levels)
+    artifact_validation = (
+        (levels.get("l3") or {}).get("artifactValidation", {})
+        if isinstance(levels.get("l3"), dict)
+        and isinstance((levels.get("l3") or {}).get("artifactValidation"), dict)
+        else {}
+    )
+    artifact_failures = artifact_validation.get("failures")
+    if not isinstance(artifact_failures, list):
+        artifact_failures = []
 
     claim: JsonDict = {
         "source": "worker_claim_unverified",
@@ -267,11 +315,11 @@ def build_worker_handoff_projection(
             # ``validatedStatus`` label here: partial workers with shape-valid
             # rows were repeatedly misread as completed objectives.
             "artifactSchemaStatus": (
-                (levels.get("l3") or {}).get("artifactValidation", {}).get("status")
-                if isinstance(levels.get("l3"), dict)
-                and isinstance((levels.get("l3") or {}).get("artifactValidation"), dict)
-                else None
+                artifact_validation.get("status")
             ),
+            "artifactFailures": trim_large_strings(artifact_failures[:5], 500),
+            "deliveryFileCount": len(artifact_validation.get("fileArtifacts") or []),
+            "priorDeliveryFileCount": len(artifact_validation.get("priorFileArtifacts") or []),
             "artifacts": [
                 {
                     "savedPath": item.get("savedPath"),
@@ -303,10 +351,49 @@ def build_worker_handoff_projection(
         ),
         "evidencePaths": {
             "tracePath": evidence.get("tracePath"),
+            "validatedExtractionArtifacts": (
+                evidence.get("validatedExtractionArtifacts") or
+                artifact_validation.get("validExtractionArtifacts") or []
+            )[:5],
             "artifacts": (evidence.get("artifacts") or [])[:10],
             "offloadedFiles": (evidence.get("offloadedFiles") or [])[:10],
         },
     }
+    continuation = result.get("continuation")
+    if not isinstance(continuation, dict):
+        continuation = l2.get("continuation")
+    if isinstance(continuation, dict):
+        projection["continuationDecision"] = trim_large_strings(
+            continuation, MAX_HANDOFF_SECTION_CHARS,
+        )
+        if result.get("continuationReceiptId"):
+            projection["continuationReceiptId"] = str(
+                result.get("continuationReceiptId")
+            )
+    workflow_definitions = data.get("workflowDefinitions")
+    if isinstance(workflow_definitions, list) and workflow_definitions:
+        projection["rawReceipts"]["workflowDefinitions"] = [
+            {
+                key: item.get(key)
+                for key in (
+                    "definitionRef", "definitionHash", "reused",
+                    "definitionBytes", "patchBytes", "executable",
+                    "requiresSensitiveRebinding",
+                )
+                if key in item
+            }
+            for item in workflow_definitions
+            if isinstance(item, dict)
+        ][:10]
+    file_manifests = data.get("fileManifests")
+    if isinstance(file_manifests, list) and file_manifests:
+        projection["rawReceipts"]["fileManifests"] = trim_large_strings(
+            file_manifests[:10], 500,
+        )
+        projection["evidencePaths"]["fileManifests"] = [
+            item.get("manifestPath") for item in file_manifests
+            if isinstance(item, dict) and item.get("manifestPath")
+        ][:5]
     if _fits_budget(projection):
         return projection
 
@@ -356,13 +443,27 @@ def build_worker_handoff_projection(
     fitted["evidencePaths"]["offloadedFiles"] = fitted["evidencePaths"][
         "offloadedFiles"
     ][:2]
+    validated_paths = fitted["evidencePaths"].get("validatedExtractionArtifacts")
+    if isinstance(validated_paths, list):
+        fitted["evidencePaths"]["validatedExtractionArtifacts"] = validated_paths[:2]
+    manifest_paths = fitted["evidencePaths"].get("fileManifests")
+    if isinstance(manifest_paths, list):
+        fitted["evidencePaths"]["fileManifests"] = manifest_paths[:2]
     fitted["rawReceipts"]["artifacts"] = fitted["rawReceipts"]["artifacts"][:2]
     fitted["rawReceipts"]["latestPageStats"] = {
         "offloaded": True,
         "reason": "handoff_size_budget",
     }
     fitted["originalGoal"] = trim_large_strings(fitted["originalGoal"], 200)
-    return _shed_observations_to_fit(trim_large_strings(fitted, 200))
+    reduced = trim_large_strings(fitted, 200)
+    # The blanket final trim protects every drifting prose field, but route
+    # guidance has its own tighter shape and a deliberate 500-character cap.
+    # Restore it after that trim so a compound route hint does not lose its
+    # final operational clause (often the file destination or verification).
+    route_hint = projection.get("suggestedNextExperiment")
+    if isinstance(route_hint, list):
+        reduced["suggestedNextExperiment"] = trim_large_strings(route_hint[:1], 500)
+    return _shed_observations_to_fit(reduced)
 
 
 def _shed_observations_to_fit(projection: JsonDict) -> JsonDict:
@@ -458,6 +559,14 @@ def _minimal_handoff(projection: JsonDict) -> JsonDict:
             "artifactAdvisoryCount": (
                 len(advisories) if isinstance(advisories, list) else 0
             ),
+            "artifactFailureCount": (
+                len(receipts.get("artifactFailures"))
+                if isinstance(receipts.get("artifactFailures"), list) else 0
+            ),
+            "deliveryFileCount": _bounded_int(receipts.get("deliveryFileCount")),
+            "priorDeliveryFileCount": _bounded_int(
+                receipts.get("priorDeliveryFileCount")
+            ),
             "reduced": "handoff_size_budget",
         },
         "workerClaims": {
@@ -465,9 +574,22 @@ def _minimal_handoff(projection: JsonDict) -> JsonDict:
             "reduced": "handoff_size_budget",
         },
         "unresolvedCounterevidence": [],
-        "suggestedNextExperiment": [],
+        # Keep one bounded worker-authored route hint. This is advisory rather
+        # than a mechanical decision, but it is the useful part of a sibling
+        # handoff (for example, a canonical URL or shadow-root route) and avoids
+        # forcing Lead to reread the full result merely to restate it.
+        "suggestedNextExperiment": trim_large_strings(
+            (projection.get("suggestedNextExperiment") or [])[:1]
+            if isinstance(projection.get("suggestedNextExperiment"), list)
+            else projection.get("suggestedNextExperiment"),
+            500,
+        ),
         "evidencePaths": {
             "tracePath": evidence.get("tracePath"),
+            "validatedExtractionArtifacts": (
+                evidence.get("validatedExtractionArtifacts") or []
+            )[:2],
+            "fileManifests": (evidence.get("fileManifests") or [])[:2],
             "artifacts": (evidence.get("artifacts") or [])[:2],
             "offloadedFiles": (evidence.get("offloadedFiles") or [])[:2],
         },
@@ -748,9 +870,12 @@ def _artifact_advisories(levels: JsonDict) -> List[JsonDict]:
         else {}
     )
     warnings = validation.get("warnings")
-    if not isinstance(warnings, list):
-        return []
-    out: List[JsonDict] = []
+    warnings = warnings if isinstance(warnings, list) else []
+    out: List[JsonDict] = [
+        trim_large_strings({**item, "source": "worker_judgment_or_contract_observation_not_proof"}, 800)
+        for item in (validation.get("semanticObservations") or [])[:5]
+        if isinstance(item, dict)
+    ]
     for item in warnings:
         if not isinstance(item, dict) or item.get("severity") != "advisory":
             continue

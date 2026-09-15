@@ -47,7 +47,8 @@ def _types_with_scope(scope: str) -> frozenset:
     )
 
 
-VALIDATOR_TYPES = frozenset(VALIDATOR_SCOPE)
+ADVISORY_VALIDATOR_TYPES = frozenset({"allowed_domain"})
+VALIDATOR_TYPES = frozenset(VALIDATOR_SCOPE) - ADVISORY_VALIDATOR_TYPES
 FILE_VALIDATOR_TYPES = _types_with_scope("file")
 
 
@@ -260,75 +261,11 @@ def _placeholder_pattern(text: str) -> str:
 
 
 def detect_blocker_data_rows(
-    rows: List[JsonDict],
-    expected_artifact: Optional[JsonDict],
-    *,
-    limit: Optional[int] = DIAGNOSTIC_FAILURE_LIMIT,
+    rows: List[JsonDict], expected_artifact: Optional[JsonDict],
+    *, limit: Optional[int] = DIAGNOSTIC_FAILURE_LIMIT,
 ) -> List[JsonDict]:
-    """Reject control-plane failure explanations embedded as business data."""
-    expected = expected_artifact if isinstance(expected_artifact, dict) else {}
-    business_fields = _business_fields_from_expected(expected)
-    if not business_fields:
-        return []
-    failures: List[JsonDict] = []
-    for index, row in enumerate(rows):
-        matched: List[JsonDict] = []
-        for field in business_fields:
-            value = row.get(field)
-            if isinstance(value, str):
-                text = value.strip()
-                if text and _STRUCTURED_BLOCKER_STATUS_RE.fullmatch(text):
-                    matched.append({
-                        "field": field,
-                        "value": text[:120],
-                        "reason": "structured_blocker_status_in_business_field",
-                    })
-                continue
-            if not isinstance(value, list):
-                continue
-            texts = [
-                item.strip() for item in value
-                if isinstance(item, str) and item.strip()
-            ]
-            exact_tokens = [
-                text for text in texts
-                if _STRUCTURED_BLOCKER_STATUS_RE.fullmatch(text)
-            ]
-            if exact_tokens:
-                matched.append({
-                    "field": field,
-                    "value": exact_tokens[0][:120],
-                    "reason": "structured_blocker_status_in_business_array",
-                })
-                continue
-            has_other_meaningful_content = any(
-                not isinstance(item, str)
-                and item is not None
-                and bool(item)
-                for item in value
-            )
-            all_text_is_blocker = bool(texts) and all(
-                _BLOCKER_TEMPLATE_RE.search(text) is not None
-                for text in texts
-            )
-            if (
-                all_text_is_blocker
-                and not has_other_meaningful_content
-                and not _has_field_specific_evidence(row, field)
-            ):
-                matched.append({
-                    "field": field,
-                    "value": " | ".join(texts[:2])[:120],
-                    "reason": "blocker_only_array_without_field_evidence",
-                })
-        if matched:
-            failures.append({
-                "type": "data_placeholder",
-                "row": index,
-                "reason": "blocker_as_business_data",
-                "fields": matched[:5],
-            })
-    return _capped(failures, limit)
+    """Legacy import compatibility: business wording never rejects data."""
+    return []
 
 
 def detect_placeholder_rows(

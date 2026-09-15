@@ -20,9 +20,9 @@ from harness.evidence.artifact_evidence import FILE_VALIDATOR_TYPES
 from harness.evidence.extraction_artifacts import ARRAY_FIELD_TYPES
 from harness.evidence.extraction_artifacts import NON_NUMERIC_CONTAINER_FIELD_TYPES
 from harness.evidence.extraction_artifacts import field_name_from_spec
-from harness.evidence.artifact_evidence import detect_blocker_data_rows
 from harness.evidence.artifact_evidence import detect_near_stub_rows
 from harness.evidence.artifact_evidence import detect_placeholder_rows
+from harness.evidence.validation_observations import validation_observations
 from harness.evidence.artifact_evidence import observe_placeholder_text_rows
 from harness.evidence.artifact_evidence import detect_stub_rows
 from harness.utils import JsonDict
@@ -124,7 +124,6 @@ def _required_control_unit_receipt(
         for validator in row_validators:
             failures.extend(_tc()._run_validator(validator, [row]))
         failures.extend(detect_placeholder_rows([row], expected_artifact=expected))
-        failures.extend(detect_blocker_data_rows([row], expected))
         if failures:
             invalid.append({
                 "unitId": unit_id,
@@ -213,6 +212,17 @@ def validate_worker_artifacts(
         path for path in (prior_artifacts or [])
         if "/artifacts/extractions/" in str(path)
     ]
+    prior_file_artifacts = [
+        path for path in (prior_artifacts or [])
+        if "/artifacts/extractions/" not in str(path)
+    ]
+    validation_file_artifacts = _tc()._unique_paths([
+        *[
+            path for path in artifacts
+            if "/artifacts/extractions/" not in str(path)
+        ],
+        *prior_file_artifacts,
+    ])
     all_extraction_artifacts = _tc()._unique_paths([
         *extraction_artifacts,
         *extraction_attempt_artifacts,
@@ -313,7 +323,8 @@ def validate_worker_artifacts(
         cand_failures.extend(
             detect_placeholder_rows(cand_rows, expected_artifact=expected)
         )
-        cand_failures.extend(detect_blocker_data_rows(cand_rows, expected))
+        _, reference_failures = validation_observations(cand_rows, expected, validators, task_dir=task_dir, logger=logger)
+        cand_failures.extend(reference_failures)
         return cand_failures, cand_rows
 
     if expected_name:
@@ -374,11 +385,18 @@ def validate_worker_artifacts(
     )
             cumulative = True
 
+    semantic_observations, reference_failures = validation_observations(
+        rows, expected, validators, task_dir=task_dir, logger=logger,
+    )
+    for failure in reference_failures:
+        if failure not in failures:
+            failures.append(failure)
+
     file_failures: List[JsonDict] = []
     for validator in file_validators:
         file_failures.extend(_tc()._run_file_validator(
             validator,
-            artifacts=artifacts,
+            artifacts=validation_file_artifacts,
             evidence=file_evidence or [],
             rows=rows,
         ))
@@ -514,12 +532,11 @@ def validate_worker_artifacts(
         "validExtractionArtifacts": valid_extraction_artifacts,
         "attemptExtractionArtifacts": extraction_attempt_artifacts,
         "priorExtractionArtifacts": prior_extraction_artifacts,
-        "fileArtifacts": _tc()._unique_paths([
-            path for path in artifacts
-            if "/artifacts/extractions/" not in str(path)
-        ]),
+        "fileArtifacts": validation_file_artifacts,
+        "priorFileArtifacts": prior_file_artifacts,
         "fileEvidenceCount": len(file_evidence or []),
         "failures": failures,
+        "semanticObservations": semantic_observations,
     }
     # A failed full-contract validation may still contain independently valid
     # form-control receipts. Keep this separate from ``validExtractionArtifacts``:

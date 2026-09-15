@@ -250,6 +250,7 @@ _REVIEWER_SYSTEM_PROMPT = (
     "You audit whether delivered data fields answer the question that was"
     " asked. For each entry you are given the field name, its delivered value,"
     " and the evidence text the worker recorded for it.\n"
+    "Empty values can be deliberate absence judgments. Evaluate the supplied evidence, not fixed counts of scrolls, screenshots or flags. A claim is not mechanically proven merely because its declaration is well-formed. Use unclear when its evidence is insufficient.\n"
     "Judge ONE thing: does the subject described by the evidence text match the"
     " subject the original user task asks that field to be about?\n"
     "- A metric about the seller, shop, listing, page, or category is a"

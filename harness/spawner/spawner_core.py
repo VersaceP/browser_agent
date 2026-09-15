@@ -40,6 +40,7 @@ from harness.task_control import spawn_acquisition_fingerprint
 from harness.task_control import spawn_acquisition_rejection
 from harness.task_control import load_task_state
 from harness.task_control import write_task_state
+from harness.utils import make_browser_event_logger
 from harness.utils import JsonDict
 from harness.utils import RunLogger
 from harness.utils import build_static_context_block
@@ -1139,13 +1140,23 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
         preferred_slot_id: Optional[str] = None,
         reuse_from_worker_id: Optional[str] = None,
         reuse_scope: Optional[str] = None,
-        fleet_id: Optional[str] = None,
+        task_fleet_reference: Optional[str] = None,
         session_key: Optional[str] = None,
         page_policy: Optional[str] = None,
         dispatch_origin: str = "lead_model",
         dispatch_identity: Optional[JsonDict] = None,
     ) -> JsonDict:
         effective_contract = worker_contract or {}
+        if "fleet_id" in effective_contract:
+            return {
+                "status": "fleet_routing_input_forbidden",
+                "error": "worker_contract.fleet_id is not a Fleet routing input",
+                "tool_was_executed": False,
+                "next_instruction": (
+                    "Fleet routing is parsed only from @<id> in the original"
+                    " user task and injected by the task runtime."
+                ),
+            }
         pinned = self.pinned_browser_context
         task_session_binding = (
             None
@@ -1175,8 +1186,7 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
             }
         if pinned is not None and (
             effective_contract.get("needs_isolated_session")
-            or fleet_id
-            or effective_contract.get("fleet_id")
+            or task_fleet_reference
             or session_key
             or effective_contract.get("session_key")
         ):
@@ -1217,19 +1227,10 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                 "error": "session_key must be a string or null",
                 "tool_was_executed": False,
             }
-        if fleet_id is not None and not isinstance(fleet_id, str):
+        if task_fleet_reference is not None and not isinstance(task_fleet_reference, str):
             return {
                 "status": "invalid_fleet_routing",
-                "error": "fleet_id must be a string or null",
-                "tool_was_executed": False,
-            }
-        if (
-            "fleet_id" in effective_contract
-            and not isinstance(effective_contract.get("fleet_id"), str)
-        ):
-            return {
-                "status": "invalid_fleet_routing",
-                "error": "worker_contract.fleet_id must be a string",
+                "error": "task_fleet_reference must be a string or null",
                 "tool_was_executed": False,
             }
         if (
@@ -1290,27 +1291,7 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
         effective_session_key = str(
             session_key or effective_contract.get("session_key") or ""
         ).strip()
-        direct_fleet_reference = str(fleet_id or "").strip()
-        contract_fleet_reference = str(
-            effective_contract.get("fleet_id") or ""
-        ).strip()
-        if (
-            direct_fleet_reference
-            and contract_fleet_reference
-            and direct_fleet_reference.lower()
-            != contract_fleet_reference.lower()
-        ):
-            return {
-                "status": "invalid_fleet_routing",
-                "error": (
-                    "spawn fleet_id and worker_contract.fleet_id must"
-                    " reference the same existing Fleet"
-                ),
-                "tool_was_executed": False,
-            }
-        effective_fleet_reference = (
-            direct_fleet_reference or contract_fleet_reference
-        )
+        effective_fleet_reference = str(task_fleet_reference or "").strip()
         binding_supplied_routing = False
         if task_session_binding is not None:
             if (
@@ -1390,7 +1371,7 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
             return {
                 "status": "invalid_fleet_routing",
                 "error": (
-                    "fleet_id requires"
+                    "task_fleet_reference requires"
                     " runtime.harness.fleet_reuse_enabled=true"
                 ),
                 "tool_was_executed": False,
@@ -1402,12 +1383,12 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
         ):
             return {
                 "status": "invalid_fleet_routing",
-                "error": "fleet_id and session_key are mutually exclusive",
+                "error": "task Fleet routing and session_key are mutually exclusive",
                 "tool_was_executed": False,
                 "next_instruction": (
-                    "Use fleet_id for an existing Fleet UUID/prefix. Use"
-                    " session_key only to create or reuse a named harness"
-                    " session whose Fleet does not yet have to exist."
+                    "Use @<Fleet UUID or unique prefix> in the original task"
+                    " for an existing Fleet. Use session_key only to create"
+                    " or reuse a named harness session."
                 ),
             }
         if (
@@ -1417,7 +1398,7 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
             return {
                 "status": "invalid_fleet_routing",
                 "error": (
-                    "fleet_id cannot be combined with"
+                    "task Fleet routing cannot be combined with"
                     " needs_isolated_session"
                 ),
                 "tool_was_executed": False,
@@ -1491,6 +1472,14 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
             phase_id=phase_id,
         )
         if acquisition_rejection is not None:
+            if effective_fleet_reference:
+                acquisition_rejection["next_instruction"] = (
+                    "Do not change, replace, or replan the task identity: the "
+                    "original task's @Fleet binding is authoritative. This is "
+                    "a bounded startup infrastructure failure. Report the "
+                    "WebSocket/Fleet availability blocker. After external recovery, use "
+                    "list_browser_agents(refresh_connection=true) to verify it before retrying."
+                )
             self.logger.write(
                 "spawner.slot.acquire_exhausted", acquisition_rejection
             )
@@ -1975,7 +1964,7 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                     # A Fleet restore timeout is an acquisition failure, not
                     # proof that its owner WebSocket is corrupt.
                     self._release_slot_start_failure(slot, worker_id=worker_id)
-                elif isinstance(exc, ABCPTransportError):
+                elif isinstance(exc, ABCPTransportError) and exc.connection_fatal:
                     slot.status = "broken"
                     self.fleet_coordinator.mark_slot_suspect(slot.slot_id)
                     slot.current_worker_id = None
@@ -1997,8 +1986,31 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                 "workerId": worker_id,
                 "name": agent_name,
             }
+            if isinstance(exc, ABCPTransportError):
+                result["transportFailure"] = {
+                    "code": exc.transport_code, "connectionFatal": exc.connection_fatal,
+                    "requestSent": exc.request_sent, "method": exc.rpc_method,
+                    "businessWorkerStarted": False,
+                }
+                if exc.connection_fatal:
+                    result["next_instruction"] = (
+                        "The transport connection is unusable, not an empty Fleet inventory. "
+                        "Do not repeat business dispatch or change the task contract. "
+                        "Report the blocker and resume after the same endpoint is restored; "
+                        "the bounded startup path will initialize a fresh connection. "
+                        "Do not replay prior worker actions whose effects are uncertain."
+                    )
             if failure_receipt.get("status") == "spawn_infrastructure_exhausted":
                 result["status"] = "spawn_infrastructure_exhausted"
+                if effective_fleet_reference:
+                    result["next_instruction"] = (
+                        "Do not change, replace, or replan the task identity: "
+                        "the original task's @Fleet binding is authoritative. "
+                        "Report the WebSocket/Fleet availability blocker and "
+                        "use list_browser_agents(refresh_connection=true) after that endpoint "
+                        "is restored, then retry only if its probe succeeds. The business objective attempt budget was "
+                        "not consumed."
+                    )
             self.logger.write("spawner.slot.acquire_failed", result)
             return result
         finally:
@@ -2150,6 +2162,75 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                 for slot in self._slots.values()
             ],
         }
+
+    async def refresh_browser_connection(self, fleet_reference: str = "") -> JsonDict:
+        """Explicit bounded protocol probe, never a business replay or Fleet creation."""
+        pending = getattr(self, "_connection_recovery_task", None)
+        if pending is None or pending.done():
+            async def probe():
+                client = None
+                try:
+                    client = _sp().ABCPClient(self.runtime.browser, on_event=make_browser_event_logger(
+                        self.logger, self.runtime.harness.log_browser_payloads,
+                        prefix="recovery.transport"))
+                    async def initialize():
+                        await client.connect()
+                        await client.call("System.register", {})
+                        await client.call("System.getCapabilities", {"guide": "content"})
+                        return await client.call("Fleet.list", {})
+                    inventory = await asyncio.wait_for(initialize(), timeout=10.0)
+                    from harness.fleet.coordinator import handle_records_from_value, resolve_fleet_reference
+                    ids = [str(row.get("fleetId") or "") for row in handle_records_from_value(inventory)
+                           if row.get("fleetId")]
+                    pinned = self.pinned_browser_context
+                    reference = fleet_reference or (pinned.fleet_id if pinned else "")
+                    resolved = resolve_fleet_reference(reference, ids) if reference else ""
+                    # Only transport failures are invalidated by this probe. RPC, permission,
+                    # contract, authentication and business-attempt budgets remain intact.
+                    from harness.task_control import load_task_state, write_task_state
+                    state = load_task_state(self.logger)
+                    cleared = 0
+                    for route in (state.get("spawn_acquisition_failures") or {}).values():
+                        signatures = route.get("signatures") or {}
+                        for key, item in list(signatures.items()):
+                            if (item.get("transportFailure") or {}).get("connectionFatal") is True:
+                                del signatures[key]
+                                cleared += 1
+                    if cleared:
+                        write_task_state(self.logger, state)
+                    for slot in self._slots.values():
+                        if (not slot.current_worker_id and slot.client is not None
+                                and getattr(slot.client, "connection_usable", None) is False):
+                            slot.status = "broken"
+                            self.fleet_coordinator.mark_slot_suspect(slot.slot_id)
+                            cursor = getattr(slot.client, "event_cursor", None)
+                            if isinstance(cursor, int) and not isinstance(cursor, bool) and cursor >= 0:
+                                slot.event_cursor = cursor
+                            try:
+                                await asyncio.wait_for(slot.client.close(), timeout=2.0)
+                            except Exception:
+                                pass
+                            slot.client = None
+                    receipt = {"status": "ready", "fleetId": resolved,
+                               "clearedTransportFailures": cleared, "businessActionsReplayed": 0,
+                               "sessionRestored": False,
+                               "next_instruction": "Connection and Fleet inventory answered. Decide whether to resume the original phase; normal identity, lease and contract checks still apply. No prior business operation was replayed."}
+                except Exception as exc:
+                    receipt = {"status": "blocked", "reason": type(exc).__name__,
+                               "reasonCode": getattr(exc, "code", None) or getattr(exc, "transport_code", None),
+                               "rpcCode": getattr(exc, "rpc_code", None),
+                               "businessActionsReplayed": 0,
+                               "next_instruction": "Recovery probe failed. Keep the task blocked and preserve its identity. Do not poll via spawn; retry this probe after external endpoint recovery."}
+                finally:
+                    if client is not None:
+                        try:
+                            await asyncio.wait_for(client.close(), timeout=2.0)
+                        except Exception:
+                            pass
+                self.logger.write("spawner.connection_recovery", receipt)
+                return receipt
+            pending = self._connection_recovery_task = asyncio.create_task(probe())
+        return await asyncio.shield(pending)
 
     def list_browser_agents(self) -> JsonDict:
         self._cleanup_retired_slots()

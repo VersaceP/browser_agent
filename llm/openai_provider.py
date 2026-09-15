@@ -237,6 +237,7 @@ class OpenAIProvider(BaseLLMProvider):
                 tool_calls = []
                 reasoning_parts = []
                 encrypted_parts = []
+                tool_result_images = []
                 has_user_content = False
                 
                 for block in content:
@@ -277,11 +278,34 @@ class OpenAIProvider(BaseLLMProvider):
                             # Anthropic 的 tool_result 转为 OpenAI 的 tool 消息
                             raw_content = block.get("content", "")
                             if isinstance(raw_content, list):
-                                # 提取文本块，其他类型退化为 JSON 序列化
+                                # Keep image blocks as a subsequent multimodal
+                                # user message. Serialising their base64 body
+                                # into the tool string both destroys modality
+                                # and massively inflates ordinary text context.
                                 parts = []
                                 for c in raw_content:
                                     if isinstance(c, dict) and c.get("type") == "text":
                                         parts.append(c.get("text", ""))
+                                    elif (
+                                        isinstance(c, dict)
+                                        and c.get("type") == "image"
+                                        and isinstance(c.get("source"), dict)
+                                        and c["source"].get("type") == "base64"
+                                    ):
+                                        source = c["source"]
+                                        media_type = str(
+                                            source.get("media_type") or ""
+                                        ).strip()
+                                        data = source.get("data")
+                                        if media_type and isinstance(data, str) and data:
+                                            tool_result_images.append({
+                                                "type": "image_url",
+                                                "image_url": {
+                                                    "url": (
+                                                        f"data:{media_type};base64,{data}"
+                                                    )
+                                                },
+                                            })
                                     else:
                                         parts.append(json.dumps(c, ensure_ascii=False))
                                 content_str = "\n".join(parts)
@@ -310,10 +334,22 @@ class OpenAIProvider(BaseLLMProvider):
                     if tool_calls:
                         msg_dict["tool_calls"] = tool_calls
                     openai_messages.append(msg_dict)
-                elif role == "user" and has_user_content:
-                    openai_messages.append(
-                        {"role": "user", "content": "\n".join(text_parts)}
-                    )
+                elif role == "user" and (has_user_content or tool_result_images):
+                    if tool_result_images:
+                        user_content = []
+                        if text_parts:
+                            user_content.append({
+                                "type": "text",
+                                "text": "\n".join(text_parts),
+                            })
+                        user_content.extend(tool_result_images)
+                        openai_messages.append(
+                            {"role": "user", "content": user_content}
+                        )
+                    else:
+                        openai_messages.append(
+                            {"role": "user", "content": "\n".join(text_parts)}
+                        )
             else:
                 # 其他情况直接传递
                 openai_messages.append(msg)

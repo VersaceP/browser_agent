@@ -77,6 +77,9 @@ def terminal_consistency_contradictions(
         validation = latest.get("validation")
         validation = validation if isinstance(validation, dict) else {}
         raw_status = str(latest.get("status") or "")
+        from harness.task_control.revalidate import accepted_revalidation
+        if accepted_revalidation(task_state, phase_state, latest):
+            continue
         if raw_status == "done" and validation.get("status") == "done":
             continue
         contradictions.append({

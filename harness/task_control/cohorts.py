@@ -596,10 +596,6 @@ def materialize_batch_rows_from_source(
     elif policy.get("requires_isolation_per_row") is True and len(rows) > 1:
         error = "multiple rows cross a declared per-row isolation boundary"
     role = str(phase.get("execution_role") or worker_contract.get("execution_role") or "")
-    if role == "probe" and len(rows) > 1:
-        error = "probe selected more than one row"
-    elif role == "validation" and len(rows) > 2:
-        error = "validation selected more than two rows"
     if error:
         return {
             "status": "invalid_batch_source_selection",

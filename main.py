@@ -77,6 +77,15 @@ CLI_INPUT_ERROR_EXIT_CODE = 2
 CLI_IO_FAILURE_EXIT_CODE = 74
 CLI_CANCELLED_EXIT_CODE = 130
 
+_INTERACTIVE_AGENT_MODES = {
+    "/browser": "browser",
+    "/lead": "lead",
+}
+_AGENT_MODE_LABELS = {
+    "browser": "直达单个 BrowserAgent",
+    "lead": "计划、并发与汇总",
+}
+
 
 def _safe_logger_write(
     logger: Optional[RunLogger],
@@ -260,36 +269,6 @@ def _print_text(value: Any, *, stream: Any = None) -> bool:
         return True
     except (BrokenPipeError, OSError, UnicodeError):
         return False
-
-
-def _validated_pinned_browser_context(
-    args: argparse.Namespace,
-    *,
-    fleet_reuse_enabled: bool = True,
-) -> Optional[Dict[str, str]]:
-    fleet_id = str(getattr(args, "fleet_id", "") or "").strip()
-    page_id = str(getattr(args, "page_id", "") or "").strip()
-    if page_id and not fleet_id:
-        raise ValueError("--page-id requires --fleet-id")
-    for option, raw in (("--fleet-id", fleet_id), ("--page-id", page_id)):
-        if not raw:
-            continue
-        try:
-            uuid.UUID(raw)
-        except (ValueError, AttributeError) as exc:
-            raise ValueError(f"{option} must be a UUID") from exc
-    if not fleet_id:
-        return None
-    if not fleet_reuse_enabled:
-        raise ValueError(
-            "--fleet-id/--page-id requires"
-            " harness.fleet_reuse_enabled=true"
-        )
-    return {
-        "fleet_id": fleet_id,
-        "page_id": page_id,
-        "source": "cli",
-    }
 
 
 class ConsoleProgressReporter:
@@ -1459,6 +1438,32 @@ def _handle_skill_command(line: str, args: argparse.Namespace) -> str:
     return inline_task
 
 
+def _handle_agent_mode_command(line: str, args: argparse.Namespace) -> bool:
+    """Handle a mode choice at the interactive task prompt.
+
+    The choice is intentionally scoped to this invocation by mutating the
+    parsed arguments only.  It never rewrites config.json, and it is accepted
+    only before a task is submitted from ``read_task``.
+    """
+    try:
+        tokens = shlex.split(line)
+    except ValueError as exc:
+        print(f"模式命令参数错误: {exc}")
+        return line.lstrip().startswith(("/browser", "/lead"))
+    if not tokens or tokens[0].lower() not in _INTERACTIVE_AGENT_MODES:
+        return False
+    if len(tokens) != 1:
+        print("用法: /browser 或 /lead；模式命令不能携带任务文本。")
+        return True
+    agent_mode = _INTERACTIVE_AGENT_MODES[tokens[0].lower()]
+    args.agent_mode = agent_mode
+    print(
+        f"已选择 {agent_mode}：{_AGENT_MODE_LABELS[agent_mode]}。"
+        "请继续输入任务；可用 /skill 或 /resume。"
+    )
+    return True
+
+
 def read_task(args: argparse.Namespace) -> str:
     if args.task_option:
         return args.task_option
@@ -1468,13 +1473,36 @@ def read_task(args: argparse.Namespace) -> str:
         return str(getattr(args, "resume_instruction", "") or "").strip()
     if not sys.stdin.isatty():
         return sys.stdin.read().strip()
+    configured_mode = str(
+        getattr(args, "configured_agent_mode", "lead") or "lead"
+    ).strip().lower()
+    selected_mode = str(getattr(args, "agent_mode", "") or "").strip().lower()
+    if selected_mode not in _AGENT_MODE_LABELS:
+        selected_mode = ""
+    if not selected_mode:
+        print(
+            "请选择编排模式：/browser（直达单个 BrowserAgent）或 "
+            "/lead（计划、并发与汇总）。"
+        )
+        print(f"当前配置默认：{configured_mode}；请选择后再输入任务。")
     while True:
-        line = input("请输入浏览器任务（/resume <任务目录> [新指令] 恢复任务；"
-                     "可先用 /skill <id|suite> 指定技能，/skill 列出，"
-                     "/skill-create-workflow|-guidance <任务目录> 蒸馏新技能）: ").strip()
+        prompt = (
+            f"[{selected_mode}] 请输入浏览器任务（/resume <任务目录> [新指令] 恢复任务；"
+            "可先用 /skill <id|suite> 指定技能，/skill 列出，"
+            "/skill-create-workflow|-guidance <任务目录> 蒸馏新技能）: "
+            if selected_mode
+            else "模式未选择> "
+        )
+        line = input(prompt).strip()
         # /skill-create* must route BEFORE /skill (shared prefix)
         if _is_skill_create_command(line):
             _handle_skill_create_command(line, config_path=getattr(args, "config", None))
+            continue
+        if _handle_agent_mode_command(line, args):
+            selected_mode = str(getattr(args, "agent_mode", "") or "").strip().lower()
+            continue
+        if not selected_mode:
+            print("请先输入 /browser 或 /lead 选择本次编排模式。")
             continue
         if line.startswith("/skill"):
             inline_task = _handle_skill_command(line, args)
@@ -1572,9 +1600,7 @@ def _print_task_plan_review(plan: Dict[str, Any], candidate_hash: str) -> None:
         phase_id = str(phase.get("id") or "-")
         round_label = _plan_phase_round(phase, first_phase_id)
         targets = _plan_phase_targets(phase)
-        contract = phase.get("worker_contract")
-        contract = contract if isinstance(contract, dict) else {}
-        fleet = str(contract.get("fleet_id") or "运行时指定")
+        fleet = "运行时 @Fleet（如有）"
         expected = phase.get("expected_artifact")
         expected = expected if isinstance(expected, dict) else {}
         mode = (
@@ -1596,6 +1622,7 @@ def _print_task_plan_review(plan: Dict[str, Any], candidate_hash: str) -> None:
 
 async def _terminal_plan_approval(
     plan: Dict[str, Any], candidate_hash: str,
+    *, runtime: Optional[RuntimeConfig] = None, logger: Any = None,
 ) -> Dict[str, str]:
     _print_task_plan_review(plan, candidate_hash)
     while True:
@@ -1613,7 +1640,18 @@ async def _terminal_plan_approval(
             print(json.dumps(plan, ensure_ascii=False, indent=2), flush=True)
             continue
         if answer:
-            return {"decision": "revision", "feedback": answer}
+            if runtime is None:
+                print("无法进行语义确认，请输入明确的确认、取消或详情命令。", flush=True)
+                continue
+            from harness.planning.approval_intent import classify_approval_intent
+            outcome = await classify_approval_intent(answer, plan, candidate_hash, runtime, logger)
+            if outcome["decision"] == "details":
+                print(json.dumps(plan, ensure_ascii=False, indent=2), flush=True)
+                continue
+            if outcome["decision"] == "clarify":
+                print("尚未确认计划：请明确确认、取消，或说明需要修改的内容。", flush=True)
+                continue
+            return outcome
         print("空输入不会确认计划。请输入“确认”、修改意见、“详情”或“取消”。", flush=True)
 
 
@@ -2284,12 +2322,35 @@ def _print_browser_mode_summary(result: JsonDict, task_dir: str) -> None:
                 print(f"阻塞: {blocker}", flush=True)
             for step_text in parsed.get("next_steps") or []:
                 print(f"下一步: {step_text}", flush=True)
+        elif isinstance(parsed, dict) and parsed.get("evidence"):
+            for path in parsed.get("evidence") or []:
+                print(f"产物: {path}", flush=True)
         else:
             print(answer, flush=True)
-    if status not in {"done", "completed", "validated_done"}:
+    elif str(result.get("error") or "").strip():
+        # A pre-flight abort carries no answer at all. Its `error` is the only
+        # sentence that says what happened, and printing nothing left the
+        # reason readable only inside the machine receipt's JSON escapes.
+        print(f"原因: {str(result.get('error')).strip()}", flush=True)
+        for item in result.get("errors") or []:
+            print(f"  · {item}", flush=True)
+    if status in {"done", "completed", "validated_done"}:
+        return
+    # Resume reads task_plan.json. A run that died before a plan was accepted
+    # has none, and pointing the user at resume there only produces a second,
+    # different error (verified on run c7c931b7: ResumeStateError, "task plan
+    # is missing").
+    plan_path = Path(task_dir) / "task_plan.json" if task_dir else None
+    if plan_path is not None and plan_path.exists():
         print(
-            f"\n继续: python main.py --resume {task_dir}"
-            " --agent-mode browser --config config.json",
+            "\n继续: python main.py --config config.json"
+            f"\n然后输入 /browser，再输入 /resume {task_dir}",
+            flush=True,
+        )
+    else:
+        print(
+            "\n这次在计划生成阶段就结束了，没有可恢复的计划，/resume 用不了。"
+            "\n按上面的原因改一下任务描述再跑一次即可。",
             flush=True,
         )
 
@@ -2330,7 +2391,6 @@ async def _run_browser_mode(
     *,
     task: str,
     original_task: str,
-    pinned_browser_context: Optional[Dict[str, str]],
     resume_context: Optional[ResumeContext],
 ) -> JsonDict:
     """Run the explicit browser entry without a Lead model turn.
@@ -2377,35 +2437,64 @@ async def _run_browser_mode(
             error="direct resume returned no receipt",
         )
 
-    fleet_reference, fleet_error = extract_fleet_reference(original_task)
-    if fleet_error:
-        return _browser_mode_failure(
-            harness,
-            code="browser_mode_fleet_reference_ambiguous",
-            error=fleet_error,
-        )
-    if pinned_browser_context and fleet_reference:
-        pinned_fleet = str(pinned_browser_context.get("fleet_id") or "").strip()
-        pinned_lower = pinned_fleet.lower()
-        reference_lower = fleet_reference.lower()
-        same_reference = bool(
-            pinned_fleet
-            and (
-                pinned_lower == reference_lower
-                or pinned_lower.startswith(reference_lower)
-                or reference_lower.startswith(pinned_lower)
-            )
-        )
-        if pinned_fleet and not same_reference:
+    fleet_reference = str(
+        getattr(harness, "task_fleet_reference", "") or ""
+    ).strip()
+    if not fleet_reference:
+        fleet_reference, fleet_error = extract_fleet_reference(original_task)
+        if fleet_error:
             return _browser_mode_failure(
                 harness,
-                code="browser_mode_fleet_reference_conflict",
-                error="task Fleet reference conflicts with explicit --fleet-id",
+                code="browser_mode_fleet_reference_invalid",
+                error=fleet_error,
             )
+        # Normal CLI construction sets this once before the Lead is created.
+        # Keep direct programmatic callers on the same control-plane route.
+        harness.task_fleet_reference = fleet_reference or ""
 
     classification, classify_error = await classify_browser_task(
         original_task, harness.runtime, harness.logger,
     )
+    classifier_enabled = bool(
+        getattr(getattr(harness.runtime, "task_classifier", None), "enabled", False)
+    )
+    if classification is None and classifier_enabled:
+        # Browser mode has no Lead turn to recover a transient provider failure
+        # or a structurally invalid classifier answer. Give the same bounded
+        # classifier one fresh attempt before abandoning the run. This is kept
+        # outside classify_browser_task so the later plan-repair call still has
+        # exactly its existing one-call budget.
+        first_error = classify_error or "browser task classification failed"
+        harness.logger.write("direct_mode.classification_retry_started", {
+            "attempt": 2,
+            "reason": first_error,
+        })
+        classification, retry_error = await classify_browser_task(
+            original_task,
+            harness.runtime,
+            harness.logger,
+            repair_feedback=(
+                "The previous classification failed before a plan could be "
+                f"synthesized: {first_error}"
+            ),
+        )
+        if classification is not None:
+            harness.logger.write("direct_mode.classification_retry_recovered", {
+                "attempt": 2,
+                "firstError": first_error,
+            })
+            classify_error = None
+        else:
+            second_error = retry_error or "browser task classification failed"
+            harness.logger.write("direct_mode.classification_retry_abandoned", {
+                "attempt": 2,
+                "firstError": first_error,
+                "secondError": second_error,
+            })
+            classify_error = (
+                f"classification failed twice; first: {first_error}; "
+                f"second: {second_error}"
+            )
     if classification is None:
         return _browser_mode_failure(
             harness,
@@ -2413,10 +2502,10 @@ async def _run_browser_mode(
             error=classify_error or "browser task classification failed",
         )
 
-    plan_input = synthesize_direct_input(
-        original_task, classification,
-        fleet_reference if not pinned_browser_context else None,
-    )
+    def _synthesize(result: JsonDict) -> JsonDict:
+        return synthesize_direct_input(original_task, result)
+
+    plan_input = _synthesize(classification)
     harness.logger.write("direct_mode.plan_synthesized", {
         "taskType": classification.get("task_type"),
         "stageHint": classification.get("stage_hint"),
@@ -2426,6 +2515,76 @@ async def _run_browser_mode(
     harness.original_user_task = str(original_task or task)
     harness.spawner.root_task = harness.original_user_task
     await harness._bootstrap_schema_cache()
+    if LEAD_TOOLS.get("emit_direct_task_plan") is None:
+        return _browser_mode_failure(
+            harness,
+            code="browser_mode_direct_tool_missing",
+            error="emit_direct_task_plan is unavailable",
+        )
+    result = await _submit_direct_plan(harness, plan_input, attempt=1)
+    errors = _direct_plan_rejection_reasons(result)
+    if errors:
+        # One bounded repair round. Both plan gates publish repair guidance that
+        # only a model can act on, and browser mode has no Lead turn to act on
+        # it, so a single refusal ended the whole run before it touched the
+        # browser — run c7c931b7 on a missing contract field, run 8615032d on an
+        # auditor verdict. The classifier that produced the contract is the
+        # actor that can fix it; it gets the gate's own words and one more call.
+        harness.logger.write("direct_mode.plan_repair_started", {
+            "errorCount": len(errors),
+            "errors": errors,
+        })
+        repaired, repair_error = await classify_browser_task(
+            original_task, harness.runtime, harness.logger,
+            repair_feedback="\n".join(f"- {item}" for item in errors),
+        )
+        if repaired is None:
+            harness.logger.write("direct_mode.plan_repair_abandoned", {
+                "reason": repair_error or "reclassification failed",
+            })
+            return result
+        plan_input = _synthesize(repaired)
+        harness.logger.write("direct_mode.plan_resynthesized", {
+            "taskType": repaired.get("task_type"),
+            "stageHint": repaired.get("stage_hint"),
+            "itemCount": len(repaired.get("literal_items") or []),
+            "fleetReferenceSource": "task_text" if fleet_reference else None,
+        })
+        result = await _submit_direct_plan(harness, plan_input, attempt=2)
+    return result
+
+
+def _direct_plan_rejection_reasons(result: Any) -> List[str]:
+    """Actionable reasons a submitted direct plan was refused, if it was.
+
+    Two gates can refuse it and both publish repair guidance meant for a model:
+    the mechanical validator lists schema errors, and the independent
+    PlanValidator returns a summary plus blocking semantic findings. Only the
+    first was read back at first, so run 8615032d cleared mechanical validation
+    and then died on an auditor verdict nobody fed to anyone.
+    """
+    if not isinstance(result, dict):
+        return []
+    if str(result.get("errorCode") or "") == "task_plan_schema_invalid":
+        return [
+            str(item) for item in (result.get("errors") or [])
+            if str(item).strip()
+        ]
+    review = result.get("planValidator")
+    if not isinstance(review, dict) or review.get("status") != "rejected":
+        return []
+    verdict = review.get("verdict")
+    verdict = verdict if isinstance(verdict, dict) else {}
+    reasons = [str(verdict.get("summary") or "").strip()]
+    for finding in verdict.get("semanticFindings") or []:
+        if isinstance(finding, dict) and finding.get("blocking"):
+            reasons.append(str(finding.get("reason") or "").strip())
+    return [reason for reason in reasons if reason]
+
+
+async def _submit_direct_plan(
+    harness: LeadAgent, plan_input: JsonDict, *, attempt: int,
+) -> JsonDict:
     action = LEAD_TOOLS.get("emit_direct_task_plan")
     if action is None:
         return _browser_mode_failure(
@@ -2436,7 +2595,10 @@ async def _run_browser_mode(
     result = await action.handler(
         ToolContext(
             agent=harness,
-            tool_call={"name": "emit_direct_task_plan", "id": "browser-direct"},
+            tool_call={
+                "name": "emit_direct_task_plan",
+                "id": f"browser-direct-{attempt}",
+            },
             tool_input=plan_input,
             step=0,
         )
@@ -2454,13 +2616,11 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
     _CANCELLED_LOGGED = False
     _LAST_LOGGER = None
     runtime = load_runtime_config(args.config)
-    requested_mode = str(getattr(args, "agent_mode", "") or "").strip().lower()
-    if requested_mode:
-        if requested_mode not in {"lead", "browser"}:
-            print("--agent-mode 必须是 lead 或 browser。")
-            return 2
-        runtime.harness.agent_mode = requested_mode
-    agent_mode = str(getattr(runtime.harness, "agent_mode", "lead") or "lead")
+    configured_mode = str(getattr(runtime.harness, "agent_mode", "lead") or "lead").strip().lower()
+    if configured_mode not in _AGENT_MODE_LABELS:
+        print("config.json 中 harness.agent_mode 必须是 lead 或 browser。")
+        return CLI_INPUT_ERROR_EXIT_CODE
+    args.configured_agent_mode = configured_mode
     # Resume helpers run before a logger exists; hand them the configuration
     # that was actually parsed rather than letting them re-guess it.
     configure_resume_storage(
@@ -2475,23 +2635,19 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
         runtime.harness.max_steps = args.max_steps
         runtime.harness.worker_max_steps = args.max_steps
     task = read_task(args)
+    requested_mode = str(getattr(args, "agent_mode", "") or "").strip().lower()
+    if requested_mode:
+        if requested_mode not in _AGENT_MODE_LABELS:
+            print("交互模式必须是 /lead 或 /browser。")
+            return CLI_INPUT_ERROR_EXIT_CODE
+        runtime.harness.agent_mode = requested_mode
+    agent_mode = str(getattr(runtime.harness, "agent_mode", "lead") or "lead").strip().lower()
     resume_requested = bool(str(getattr(args, "resume", "") or "").strip())
     if not task and not resume_requested:
         print("没有收到任务。")
         return 2
     if _is_skill_create_command(task):
         return _handle_skill_create_command(task, config_path=getattr(args, "config", None))
-    try:
-        pinned_browser_context = _validated_pinned_browser_context(
-            args,
-            fleet_reuse_enabled=bool(
-                getattr(runtime.harness, "fleet_reuse_enabled", True)
-            ),
-        )
-    except ValueError as exc:
-        print(f"浏览器上下文参数错误: {exc}")
-        return 2
-
     # --skill / interactive /skill both land on args.skill; force it for this run
     # without editing config. A name may be a skill_id OR a suite; expand each
     # segment to member ids (idempotent — interactive /skill already comma-joins,
@@ -2715,7 +2871,6 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                 agent_id=runtime.agent_id,
                 startup_args={
                     "max_steps": getattr(args, "max_steps", None),
-                    "has_explicit_browser_pin": bool(pinned_browser_context),
                     "agent_mode": agent_mode,
                 },
             )
@@ -2725,6 +2880,40 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
             print("无法初始化任务日志。", flush=True)
             return 2
         _LAST_LOGGER = logger
+        route_task = (
+            str(resume_context.original_user_task or "")
+            if resume_context is not None
+            else task
+        )
+        task_fleet_reference, fleet_reference_error = extract_fleet_reference(
+            route_task
+        )
+        if fleet_reference_error:
+            logger.write("task.fleet_reference.rejected", {
+                "error": fleet_reference_error,
+                "source": "original_user_task",
+            })
+            print(f"Fleet 引用错误: {fleet_reference_error}", flush=True)
+            return CLI_INPUT_ERROR_EXIT_CODE
+        if task_fleet_reference and not bool(
+            getattr(runtime.harness, "fleet_reuse_enabled", True)
+        ):
+            message = (
+                "任务使用了 @Fleet 引用，但 harness.fleet_reuse_enabled=false，"
+                "无法绑定已有 Fleet。"
+            )
+            logger.write("task.fleet_reference.rejected", {
+                "fleetReference": task_fleet_reference,
+                "error": message,
+                "source": "original_user_task",
+            })
+            print(message, flush=True)
+            return CLI_INPUT_ERROR_EXIT_CODE
+        if task_fleet_reference:
+            logger.write("task.fleet_reference.bound", {
+                "fleetReference": task_fleet_reference,
+                "source": "original_user_task",
+            })
         if resume_context is not None:
             phase_states = resume_context.report.get("phaseStates") or []
             kept = sum(
@@ -2788,10 +2977,12 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
             provider,
             runtime,
             logger,
-            pinned_browser_context=pinned_browser_context,
             resume=resume_context,
+            task_fleet_reference=task_fleet_reference or "",
             plan_approval_handler=(
-                _terminal_plan_approval if sys.stdin.isatty() else None
+                (lambda plan, candidate_hash: _terminal_plan_approval(
+                    plan, candidate_hash, runtime=runtime, logger=logger
+                )) if sys.stdin.isatty() else None
             ),
         )
         if agent_mode == "browser":
@@ -2799,7 +2990,6 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                 harness,
                 task=task_for_agent,
                 original_task=task,
-                pinned_browser_context=pinned_browser_context,
                 resume_context=resume_context,
             )
             # Human summary first; the machine receipt JSON follows below and
@@ -2979,23 +3169,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("task", nargs="?", help="要交给浏览器 agent 完成的任务")
     parser.add_argument("--task", dest="task_option", help="要交给浏览器 agent 完成的任务")
     parser.add_argument("--config", default="config.json", help="配置文件路径")
-    parser.add_argument(
-        "--agent-mode",
-        choices=("lead", "browser"),
-        default="",
-        help="执行入口：lead 规划编排，browser 轻量分类后直达单 worker",
-    )
     parser.add_argument("--agent-id", help="覆盖 config.json 中的 browser.agent_id")
-    parser.add_argument(
-        "--fleet-id",
-        default="",
-        help="复用已存在的 Fleet UUID；目标不存在时禁止创建替代 Fleet",
-    )
-    parser.add_argument(
-        "--page-id",
-        default="",
-        help="复用 --fleet-id 中的 Page UUID；指定后禁止创建替代页面",
-    )
     parser.add_argument("--max-steps", type=int, help="覆盖最大 agent 编排步数")
     parser.add_argument(
         "--resume",

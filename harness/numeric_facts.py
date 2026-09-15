@@ -69,6 +69,10 @@ def _load_artifact(path_text: str) -> Optional[JsonDict]:
         for field, value in row.items():
             if isinstance(value, list):
                 array_lengths[str(field)] = len(value)
+            elif isinstance(value, dict) and str(field).endswith("Absence"):
+                evidence = value.get("evidenceText")
+                if isinstance(evidence, str) and evidence.strip():
+                    values.setdefault(str(field)[:-7] + "EvidenceText", evidence.strip()[:2000])
             elif isinstance(value, (str, int, float)) and not isinstance(value, bool):
                 text = str(value).strip()
                 if text:

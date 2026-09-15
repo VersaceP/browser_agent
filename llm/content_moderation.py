@@ -29,6 +29,20 @@ _INPUT_MODERATION_MARKERS = (
 
 _MODERATION_STATUS_CODES = (400, 422)
 
+# These markers describe the image attachment protocol, rather than the
+# user's page content. Callers act on them only when the failed request
+# actually carried an image block; generic malformed-request errors retain
+# their existing failure behavior.
+_IMAGE_INPUT_REJECTION_MARKERS = (
+    "invalid_image",
+    "invalid image",
+    "image data is invalid",
+    "unsupported image",
+    "unsupported media type",
+    "image input is not supported",
+    "vision input is not supported",
+)
+
 
 def exception_status_code(exc: BaseException) -> Optional[int]:
     """HTTP status carried by a provider SDK exception, when it has one."""
@@ -56,6 +70,19 @@ def input_moderation_rejection(exc: BaseException) -> Optional[str]:
         return None
     return next(
         (marker for marker in _INPUT_MODERATION_MARKERS if marker in text),
+        None,
+    )
+
+
+def image_input_rejection(exc: BaseException) -> Optional[str]:
+    """Return an explicit image-attachment rejection marker, if any."""
+    if exception_status_code(exc) not in _MODERATION_STATUS_CODES:
+        return None
+    text = _exception_text(exc).casefold()
+    if not text:
+        return None
+    return next(
+        (marker for marker in _IMAGE_INPUT_REJECTION_MARKERS if marker in text),
         None,
     )
 

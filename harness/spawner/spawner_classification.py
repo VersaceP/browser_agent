@@ -200,15 +200,16 @@ def _classification_from_browser_call(
         if not isinstance(error_classification, dict):
             continue
         error_type = str(error_classification.get("type") or "").strip()
-        if error_type != "browser_unavailable_or_no_page":
+        if error_type not in {"browser_unavailable_or_no_page", "no_delegated_page_candidate",
+                              "page_recovery_probe_incomplete", "no_usable_page_in_probe_scope"}:
             continue
         return {
             "category": "blocked_infrastructure",
             "type": error_type,
             "method": result.get("method") or "Page.create",
             "hint": (
-                "Page.create failed with -32005 and no usable existing page was"
-                " found."
+                "Page.create recovery did not establish a usable permitted page. "
+                "Inspect probe scope and connection facts; do not infer global Fleet loss."
             ),
             "source": "browser_call.errorClassification",
         }
@@ -678,4 +679,6 @@ def _clone_capability_bundle(bundle: CapabilityBundle) -> CapabilityBundle:
         methods_requiring_purpose=set(bundle.methods_requiring_purpose),
         purpose_hints=dict(bundle.purpose_hints),
         agent_guide=bundle.agent_guide,
+        catalog_revision=bundle.catalog_revision,
+        guide_revision=bundle.guide_revision,
     )

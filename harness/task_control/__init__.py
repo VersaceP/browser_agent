@@ -151,6 +151,8 @@ from .fingerprints import (  # noqa: F401
     spawn_acquisition_rejection,
 )
 from .phase_lifecycle import (  # noqa: F401
+    CONTINUATION_CONTROL_STATES,
+    CONTINUATION_PROTOCOL,
     _artifact_recorded_digest,
     _artifact_sha256,
     _attempt_was_validated_done,
@@ -168,6 +170,7 @@ from .phase_lifecycle import (  # noqa: F401
     _resume_plan_phase_map,
     _tc,
     cancel_phase_running_reservation,
+    continuation_receipt_id,
     find_phase,
     mark_phase_exhausted_if_needed,
     mark_phase_result,
@@ -176,9 +179,15 @@ from .phase_lifecycle import (  # noqa: F401
     schedule_snapshot,
     phase_pacing_remaining_seconds,
     phase_prior_artifact_paths,
+    dispatch_wave_blockers,
+    phase_continuation_record,
+    phase_dispatch_input,
     phase_start_rejection,
     prepare_resume_state,
     reactivate_resumable_hitl_phases,
+    record_phase_dispatch_input,
+    reserve_phase_continuation,
+    settle_phase_continuation,
 )
 from .plan_validation import (  # noqa: F401
     AXTREE_ID_ANYWHERE_RE,
@@ -206,7 +215,7 @@ from .plan_validation import (  # noqa: F401
     _NON_IMAGE_ASSET_TOKEN_RE,
     _NON_IMAGE_FILE_SAVE_RE,
     _PathOnlyLogger,
-    _ROW_SELECTION_LIMITS,
+    _EXPLICIT_ROW_SELECTION_ROLES,
     _TASK_STATE_WRITE_LOCK,
     _TaskStateSnapshot,
     _absolute_http_urls_from_value,

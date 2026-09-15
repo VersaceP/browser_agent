@@ -33,6 +33,46 @@ def _sp():
 
     return sp
 
+
+def _registration_data(registration: Any) -> JsonDict:
+    if not isinstance(registration, dict):
+        return {}
+    data = registration.get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def _registration_protocol_agent_id(registration: Any) -> str:
+    return str(_registration_data(registration).get("agentId") or "").strip()
+
+
+def _registration_event_cursor(registration: Any) -> Optional[int]:
+    value = _registration_data(registration).get("eventCursor")
+    if isinstance(value, bool):
+        return None
+    try:
+        cursor = int(value)
+    except (TypeError, ValueError):
+        return None
+    return cursor if cursor >= 0 else None
+
+
+def _registration_event_catalog_revision(registration: Any) -> str:
+    return str(
+        _registration_data(registration).get("eventCatalogRevision") or ""
+    ).strip()
+
+
+def _client_event_cursor(client: Any) -> Optional[int]:
+    value = getattr(client, "event_cursor", None)
+    if isinstance(value, bool):
+        return None
+    try:
+        cursor = int(value)
+    except (TypeError, ValueError):
+        return None
+    return cursor if cursor >= 0 else None
+
+
 class SpawnerSlotsMixin:
 
     def _apply_worker_session_isolation(
@@ -405,13 +445,18 @@ class SpawnerSlotsMixin:
         fleet_id: str = "",
     ) -> Any:
         self._cleanup_retired_slots()
-        max_slots = (
+        max_running = optional_int(
+            self.runtime.harness.max_browser_agents, 0,
+        ) or 1
+        # max_browser_agents is the authoritative concurrency setting. The
+        # reusable slot inventory may be larger, but a smaller retention value
+        # must not silently reduce the configured running-worker capacity.
+        max_slots = max(
+            max_running,
             optional_int(
                 getattr(self.runtime.harness, "max_browser_agent_instances", None),
                 0,
-            )
-            or optional_int(self.runtime.harness.max_browser_agents, 0)
-            or 3
+            ) or 0,
         )
         running_slots = [
             slot for slot in self._slots.values()
@@ -421,12 +466,12 @@ class SpawnerSlotsMixin:
             slot for slot in self._slots.values()
             if slot.status not in {"broken", "closed"}
         ]
-        if len(running_slots) >= self.runtime.harness.max_browser_agents:
+        if len(running_slots) >= max_running:
             return {
                 "status": "rejected",
                 "error": "Reached the max_browser_agents limit",
                 "running": len(running_slots),
-                "max_browser_agents": self.runtime.harness.max_browser_agents,
+                "max_browser_agents": max_running,
                 "max_browser_agent_instances": max_slots,
                 "limit_semantics": {
                     "max_browser_agents": "maximum concurrently running BrowserAgent workers",
@@ -456,7 +501,7 @@ class SpawnerSlotsMixin:
                 "uncreatedSlotCapacity": max(0, max_slots - len(live_slots)),
                 "concurrencyHeadroom": max(
                     0,
-                    int(self.runtime.harness.max_browser_agents or 0)
+                    max_running
                     - len(running_slots),
                 ),
             },
@@ -679,7 +724,7 @@ class SpawnerSlotsMixin:
                     "status": "rejected",
                     "error": "No idle BrowserAgent slot available",
                     "running": len(running_slots),
-                    "max_browser_agents": self.runtime.harness.max_browser_agents,
+                    "max_browser_agents": max_running,
                     "max_browser_agent_instances": max_slots,
                     "limit_semantics": {
                         "max_browser_agents": "maximum concurrently running BrowserAgent workers",
@@ -816,8 +861,8 @@ class SpawnerSlotsMixin:
         if not idle_slots:
             return None
 
-        # Prefer the stable owner (or an idle observer) when the Lead supplied
-        # an existing Fleet UUID/prefix.  Final uniqueness/existence proof is
+        # Prefer the stable owner (or an idle observer) when task control
+        # supplies an existing Fleet UUID/prefix. Final uniqueness/existence proof is
         # intentionally deferred until the selected slot has refreshed its
         # authoritative Fleet.list inventory.
         fleet_reference = str(fleet_id or "").strip().lower()
@@ -950,6 +995,158 @@ class SpawnerSlotsMixin:
         )
         return slot
 
+    def _apply_slot_registration(
+        self,
+        slot: BrowserAgentSlot,
+        registration: JsonDict,
+        *,
+        reconnecting: bool,
+    ) -> bool:
+        """Record server-assigned transport identity without changing routing.
+
+        ``slot.agent_id`` is a harness-private routing key.  WebCross 0.9
+        derives protocol identity from the WebSocket connection, so sending the
+        local key as ``System.register.agentId`` neither restores a session nor
+        grants ownership.  On a reconnect, a different server identity cannot
+        safely inherit an authenticated Fleet binding.
+
+        Minimal older test doubles may omit these fields.  Their absence is a
+        compatibility fact, not an identity match, so it does not manufacture
+        a rejection.
+        """
+
+        returned_agent_id = _registration_protocol_agent_id(registration)
+        prior_agent_id = str(slot.protocol_agent_id or "").strip()
+        if (
+            reconnecting
+            and prior_agent_id
+            and returned_agent_id
+            and prior_agent_id != returned_agent_id
+        ):
+            self.logger.write(
+                "spawner.slot.protocol_identity_changed",
+                {
+                    "slotId": slot.slot_id,
+                    "routingAgentId": slot.agent_id,
+                    "previousProtocolAgentId": prior_agent_id,
+                    "returnedProtocolAgentId": returned_agent_id,
+                },
+            )
+            return False
+
+        if returned_agent_id:
+            slot.protocol_agent_id = returned_agent_id
+        revision = _registration_event_catalog_revision(registration)
+        if revision:
+            slot.event_catalog_revision = revision
+        return True
+
+    def _set_slot_event_cursor(
+        self,
+        slot: BrowserAgentSlot,
+        client: Any,
+        cursor: Optional[int],
+        *,
+        reset_client_cursor: bool,
+    ) -> None:
+        if cursor is None:
+            return
+        slot.event_cursor = cursor
+        setter = getattr(client, "set_event_cursor", None)
+        if callable(setter):
+            setter(cursor, reset=reset_client_cursor)
+
+    async def _replay_slot_events_after_reconnect(
+        self,
+        slot: BrowserAgentSlot,
+        client: Any,
+        *,
+        previous_cursor: Optional[int],
+        registration_cursor: Optional[int],
+    ) -> JsonDict:
+        """Recover a slot's durable events before it is returned to the pool."""
+
+        if previous_cursor is None:
+            self._set_slot_event_cursor(
+                slot,
+                client,
+                registration_cursor,
+                reset_client_cursor=True,
+            )
+            return {"status": "baseline", "nextCursor": slot.event_cursor}
+
+        replay = getattr(client, "replay_events", None)
+        if not callable(replay):
+            # Older client doubles and pre-0.9 transports have no recovery
+            # operation.  Keep their pre-existing reconnect behavior while
+            # making the lack of a durable replay observable.
+            self._set_slot_event_cursor(
+                slot,
+                client,
+                registration_cursor,
+                reset_client_cursor=True,
+            )
+            receipt = {
+                "status": "unavailable",
+                "afterCursor": previous_cursor,
+                "nextCursor": slot.event_cursor,
+            }
+            self.logger.write("spawner.slot.event_replay", {
+                "slotId": slot.slot_id,
+                **receipt,
+            })
+            return receipt
+
+        try:
+            receipt = await replay(after_cursor=previous_cursor)
+        except ABCPTransportError as exc:
+            # An old Dispatcher reports the absent transport operation with
+            # JSON-RPC method-not-found.  Other read failures leave recovery
+            # incomplete and must keep the authenticated slot quarantined.
+            if getattr(exc, "rpc_code", None) != -32601:
+                raise
+            self._set_slot_event_cursor(
+                slot,
+                client,
+                registration_cursor,
+                reset_client_cursor=True,
+            )
+            receipt = {
+                "status": "unsupported",
+                "afterCursor": previous_cursor,
+                "nextCursor": slot.event_cursor,
+            }
+        if not isinstance(receipt, dict):
+            raise RuntimeError("event replay returned an invalid receipt")
+        next_cursor = receipt.get("nextCursor")
+        if isinstance(next_cursor, bool):
+            raise RuntimeError("event replay returned an invalid nextCursor")
+        try:
+            normalized_cursor = int(next_cursor)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("event replay returned an invalid nextCursor") from exc
+        if normalized_cursor < previous_cursor:
+            raise RuntimeError("event replay moved the cursor backwards")
+        self._set_slot_event_cursor(
+            slot,
+            client,
+            normalized_cursor,
+            reset_client_cursor=True,
+        )
+        replay_receipt = {"status": "replayed", **receipt}
+        self.logger.write("spawner.slot.event_replay", {
+            "slotId": slot.slot_id,
+            **replay_receipt,
+        })
+        # A bounded replay is not evidence that the whole recovery gap was
+        # consumed.  Keep the slot quarantined when more pages remain; the
+        # committed cursor lets the next bounded recovery continue safely.
+        if bool(receipt.get("truncated")) or bool(receipt.get("hasMore")):
+            raise RuntimeError(
+                "event replay reached the bounded recovery limit; retry from nextCursor"
+            )
+        return replay_receipt
+
     async def _initialize_reserved_slot(self, slot: BrowserAgentSlot) -> None:
         """Connect and fully initialize a slot before Fleet work begins.
 
@@ -983,12 +1180,19 @@ class SpawnerSlotsMixin:
                 (time.monotonic() - stage_started) * 1000
             )
             stage_started = time.monotonic()
-            registration = await client.call(
-                "System.register",
-                {"agentId": slot.agent_id},
-            )
+            registration = await client.call("System.register", {})
             timings["registerMs"] = int(
                 (time.monotonic() - stage_started) * 1000
+            )
+            if not self._apply_slot_registration(
+                slot, registration, reconnecting=False,
+            ):
+                raise RuntimeError("initial registration identity was rejected")
+            self._set_slot_event_cursor(
+                slot,
+                client,
+                _registration_event_cursor(registration),
+                reset_client_cursor=True,
             )
             stage_started = time.monotonic()
             caps_response = await client.call(
@@ -1039,7 +1243,7 @@ class SpawnerSlotsMixin:
         )
 
     async def _recover_broken_slots(self) -> None:
-        """Reconnect quarantined slots with their original owner agentId.
+        """Reconnect quarantined slots with their original routing owner.
 
         Only the transport and owner inventory are retried. We deliberately do
         not replay the browser RPC that failed because a mutating call may have
@@ -1106,11 +1310,28 @@ class SpawnerSlotsMixin:
         )
         for attempt in range(1, attempts + 1):
             client = _sp().ABCPClient(self.runtime.browser, on_event=event_logger)
+            # The old client advances this value as live events are delivered;
+            # `slot.event_cursor` remains the durable fallback for adopted
+            # clients and test doubles that do not expose the transport field.
+            previous_cursor = _client_event_cursor(slot.client)
+            if previous_cursor is None:
+                previous_cursor = slot.event_cursor
             try:
                 await client.connect()
-                registration = await client.call(
-                    "System.register",
-                    {"agentId": slot.agent_id},
+                registration = await client.call("System.register", {})
+                if not self._apply_slot_registration(
+                    slot, registration, reconnecting=True,
+                ):
+                    await client.close()
+                    slot.sync_errors.append(
+                        "reconnect refused: WebCross assigned a different protocol identity"
+                    )
+                    return False
+                await self._replay_slot_events_after_reconnect(
+                    slot,
+                    client,
+                    previous_cursor=previous_cursor,
+                    registration_cursor=_registration_event_cursor(registration),
                 )
                 caps_response = await client.call(
                     "System.getCapabilities",
@@ -1157,7 +1378,7 @@ class SpawnerSlotsMixin:
                 {
                     **self._slot_summary(slot),
                     "attempt": attempt,
-                    "reusedAgentId": True,
+                    "protocolIdentityContinuity": bool(slot.protocol_agent_id),
                 },
             )
             return True
@@ -1269,9 +1490,18 @@ class SpawnerSlotsMixin:
         if slot.protocol_initialized:
             registration = slot.registration
         else:
-            registration = await slot.client.call(
-                "System.register",
-                {"agentId": slot.agent_id},
+            registration = await slot.client.call("System.register", {})
+            if not self._apply_slot_registration(
+                slot, registration, reconnecting=False,
+            ):
+                raise ABCPTransportError(
+                    "WebCross rejected the slot registration identity"
+                )
+            self._set_slot_event_cursor(
+                slot,
+                slot.client,
+                _registration_event_cursor(registration),
+                reset_client_cursor=True,
             )
         slot.registration = registration
         self._replace_slot_fleets_from_response(slot, registration)

@@ -141,17 +141,47 @@ def estimate_prompt_tokens(
     messages: List[Any],
     tools: List[JsonDict],
 ) -> int:
+    # Images are encoded by the provider's vision pipeline, not tokenized as
+    # base64 text. Reserve an approximate per-image budget; this is not an
+    # exact provider/resolution-specific token count. Only project actual
+    # content blocks, never tool inputs or text that happens to resemble one.
+    image_tokens = 0
+
+    def project_content(content: Any) -> Any:
+        nonlocal image_tokens
+        if not isinstance(content, list):
+            return content
+        projected = []
+        for block in content:
+            if not isinstance(block, dict):
+                projected.append(block)
+            elif (
+                block.get("type") == "image" and isinstance(block.get("source"), dict)
+            ) or (
+                block.get("type") in {"image_url", "input_image"} and "image_url" in block
+            ):
+                image_tokens += 4096
+                projected.append({"type": "image"})
+            elif block.get("type") == "tool_result":
+                projected.append({**block, "content": project_content(block.get("content"))})
+            else:
+                projected.append(block)
+        return projected
+
     payload = json.dumps(
         {
             "system": system_prompt,
-            "messages": to_model_messages(messages),
+            "messages": [
+                {**message, "content": project_content(message.get("content"))}
+                for message in to_model_messages(messages)
+            ],
             "tools": tools,
         },
         ensure_ascii=False,
         default=str,
     )
     # Conservative approximation for mixed CJK/JSON prompts.
-    return max(1, len(payload.encode("utf-8")) // 3)
+    return max(1, len(payload.encode("utf-8")) // 3 + image_tokens)
 
 
 def split_message_pairs(messages: List[Any]) -> List[List[Any]]:
@@ -779,11 +809,10 @@ Transcript being replaced:
             messages=[{"role": "user", "content": prompt}],
             tools=[],
         )
-        if tool_calls:
-            raise RuntimeError("compaction summary attempted tool calls")
-        if str(stop_reason or "").lower() in {"error", "max_tokens"}:
-            raise RuntimeError(f"compaction summary stopped: {stop_reason}")
         provider_config = getattr(provider, "config", None)
+        # A completed provider response consumed tokens even when its content
+        # cannot be adopted as a checkpoint. Record usage before validating
+        # stop reason, tool calls, or summary structure.
         logger.record_llm_usage(
             source="context_compaction",
             provider=str(getattr(provider_config, "provider", "unknown")),
@@ -792,6 +821,10 @@ Transcript being replaced:
             step=step,
             conversation_id=f"{actor}:compaction",
         )
+        if tool_calls:
+            raise RuntimeError("compaction summary attempted tool calls")
+        if str(stop_reason or "").lower() in {"error", "max_tokens"}:
+            raise RuntimeError(f"compaction summary stopped: {stop_reason}")
     else:
         raise RuntimeError("no summary provider configured")
     error = validate_structured_summary(text)

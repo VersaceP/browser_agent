@@ -85,7 +85,7 @@ LEAD_FLEET_ROUTING_DECISION_CODES = (
     "task_fleet_limit_reached",
 )
 
-LEAD_FLEET_ROUTING_DECISION_GUIDANCE = """- Fleet/session routing outcomes reach the Lead on a worker result or a spawn rejection, and every one of them carries its own next_instruction naming the offending reference, whether the tool ran, and whether a retry is permitted. Follow that receipt; it knows which reference failed and this prompt cannot. When a rejection needs more than its instruction, read_harness_guide("lead.fleet-session-continuity") carries the background, and search_harness_guides resolves any of these codes to it - notably session_fleet_lost and page_continuation_lost, which are terminal for the affected session or page state, fleet_auth_gated whose fleet_auth_resolver_required variant requires you to ASSIGN a resolver rather than wait, and task_fleet_limit_reached, which waiting never clears because the harness never closes a fleet.
+LEAD_FLEET_ROUTING_DECISION_GUIDANCE = """- Fleet/session routing outcomes reach the Lead on a worker result or a spawn rejection, Use their structured status, offending reference, execution facts and retry constraints, with next_instruction when present. Missing guidance does not authorize replay or identity replacement. When a rejection needs more than its instruction, read_harness_guide("lead.fleet-session-continuity") carries the background, and search_harness_guides resolves any of these codes to it - notably session_fleet_lost and page_continuation_lost, which are terminal for the affected session or page state, fleet_auth_gated whose fleet_auth_resolver_required variant requires you to ASSIGN a resolver rather than wait, and task_fleet_limit_reached, which waiting never clears because the harness never closes a fleet.
 - Never answer a routing rejection by creating a replacement fleet, releasing a named session binding, or rebinding a session_key that the receipt did not release."""
 
 GENERIC_TOOL_RESULT_KEEP_KEYS = (
@@ -118,6 +118,10 @@ GENERIC_TOOL_RESULT_KEEP_KEYS = (
     # be what decides whether the agent knows it has that option.
     "visualRecoveryHint",
     "taskId",
+    # A wait result may be offloaded because completed worker payloads are
+    # large. Keep the reviewed scheduler facts inline so Lead does not need a
+    # separate list/read round merely to learn which phase is ready next.
+    "scheduleSnapshot",
     # Compact receipt emitted by the direct-worker controller. Keep it when a
     # large worker result is offloaded so Lead can distinguish an automatic
     # continuation from a normal orchestration tool response.

@@ -253,6 +253,7 @@ def _step_union_members(schema: JsonDict, defs: JsonDict) -> List[JsonDict]:
     return members
 
 
+
 def _literal_type(member: JsonDict) -> Optional[str]:
     prop = (member.get("properties") or {}).get("type")
     if not isinstance(prop, dict):

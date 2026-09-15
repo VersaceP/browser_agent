@@ -20,7 +20,6 @@ GLOBAL_SCHEMA_CACHE_DIR = "global_schema_cache"
 CAPABILITY_HASH_FILE = "capability_hash.json"
 AGENT_GUIDE_FILE = "agent_guide.md"
 SCHEMAS_DIR = "schemas"
-SCHEMA_BOOTSTRAP_AGENT_ID = "__abcp_harness_schema_bootstrap__"
 SCHEMA_BOOTSTRAP_LOCK_DIR = ".bootstrap.lock"
 
 # Bump when a known platform schema generation changed for methods whose

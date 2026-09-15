@@ -362,9 +362,11 @@ def redact_params_for_display(
 
 HARNESS_DEFAULT_ALLOWED_TOOLS: FrozenSet[str] = frozenset({
     "final_answer",
+    "execute_saved_browser_workflow",
     "record_extraction",
     "local_fs_search",
     "local_fs_read",
+    "local_fs_batch",
     "read_harness_guide",
     "search_harness_guides",
     "find_in_axtree",
