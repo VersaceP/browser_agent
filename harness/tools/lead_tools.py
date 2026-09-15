@@ -7,7 +7,7 @@ import hashlib
 import json
 import time
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from harness.evidence.extraction_artifacts import (
     save_extraction_artifact,
@@ -27,15 +27,22 @@ from harness.task_control import (
     assess_batch_source_binding,
     contract_hash_for_phase,
     direct_batch_rows_provenance_errors,
+    dispatch_wave_blockers,
     find_phase,
     mark_phase_exhausted_if_needed,
     materialize_batch_rows_from_source,
     phase_contract,
+    phase_continuation_record,
+    phase_dispatch_input,
     phase_prior_artifact_paths,
     reactivate_resumable_hitl_phases,
+    record_phase_dispatch_input,
     replan_checkpoint_spawn_rejection,
+    reserve_phase_continuation,
+    schedule_snapshot,
     load_task_state,
     write_task_state,
+    settle_phase_continuation,
 )
 from harness.results.completion_receipt import (
     artifact_generation_view,
@@ -67,7 +74,6 @@ from harness.tools.loop_guard import check_tool_call_loop
 from harness.tools.registry import ToolContext, ToolRegistry
 from harness.utils import (
     JsonDict,
-    contains_affirmative_semantic_marker,
     contains_semantic_marker,
     optional_int,
 )
@@ -85,6 +91,8 @@ _OPTIONAL_IDENTIFIER_FIELDS = {
         "preferred_slot_id",
         "reuse_from_worker_id",
         "session_key",
+        # Retain null/empty normalization for stale model payloads. Any
+        # non-empty value is rejected by _lead_spawn_browser_agent below.
         "fleet_id",
     },
 }
@@ -319,9 +327,9 @@ def _validator_item_schema() -> JsonDict:
         "properties": {
             "type": {
                 "type": "string",
-                "enum": sorted(VALIDATOR_TYPES),
+                "enum": sorted(VALIDATOR_TYPES | {"allowed_domain"}),
                 "description": (
-                    "Validator kind. range is for numeric scalar values; "
+                    "Validator kind; use only the enum names. Legacy allowed_domain is accepted as advisory only; do not add domain affiliation rules. path_pattern is a parameter of file_integrity, not a validator kind. See lead.plan-contracts for complete examples. range is for numeric scalar values; "
                     "array_length is for the number of items in an array field. "
                     "For an up-to-N request, set max=N only unless the user "
                     "explicitly requires a minimum or exact count."
@@ -352,8 +360,9 @@ def _validator_item_schema() -> JsonDict:
             },
             "pattern": {
                 "type": "string",
-                "description": "Regex for url_pattern/field_pattern.",
+                "description": "Regex observation for url_pattern/field_pattern; enforcement=literal is only for explicit literal user/protocol requirements.",
             },
+            "enforcement": {"type": "string", "enum": ["advisory", "literal"], "description": "Patterns and cross_field_contains default to advisory. Use literal only when the user/protocol explicitly requires the exact string relation; never for inferred domain affiliation."},
             "values": {
                 "type": "array",
                 "items": {},
@@ -365,8 +374,8 @@ def _validator_item_schema() -> JsonDict:
             },
             "min_files": {
                 "type": "integer",
-                "minimum": 1,
-                "description": "Minimum selected/downloaded/exported file count for file validators.",
+                "minimum": 0,
+                "description": "Explicit file count. file_integrity defaults to 0 and checks every declared file; upload/image receipt checks default to 1.",
             },
             "min_bytes": {
                 "type": "integer",
@@ -379,7 +388,19 @@ def _validator_item_schema() -> JsonDict:
                 "description": "Allowed file extensions for file_integrity.",
             },
             "sha256": {"type": "string"},
-            "path_pattern": {"type": "string"},
+            "path_pattern": {
+                "type": "string",
+                "description": "Python regular expression matched against each attributed file path.",
+            },
+            "path_fields": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Artifact row fields containing delivery paths. Declare these"
+                    " explicitly to verify that exact population, including empty"
+                    " populations. Without them, attributed phase files are checked."
+                ),
+            },
         },
         "required": ["type"],
         "additionalProperties": True,
@@ -619,11 +640,10 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                         " obligations, not a single tactical"
                                         " script. For listing-derived detail"
                                         " work preserve the source page and"
-                                        " identity, and make freshly rebound"
-                                        " source-card clicks the normal first"
-                                        " route. Direct URL navigation is a"
-                                        " fallback when source traversal is"
-                                        " unavailable or cannot be verified."
+                                        " identity and observed verbatim href."
+                                        " Choose source-card traversal or URL"
+                                        " navigation from current evidence;"
+                                        " do not prescribe one route for all sites."
                                     ),
                                 },
                                 "stage_hint": {"type": "string"},
@@ -633,8 +653,8 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                     "enum": sorted(EXECUTION_ROLES),
                                     "description": (
                                         "Evidence-driven execution role, not a mandatory three-"
-                                        "stage template. Use probe (at most one row) only when a"
-                                        " reusable path is unknown. Use validation (at most two)"
+                                        "stage template. Use probe with an explicit sample only when a"
+                                        " reusable path is unknown. Use validation with an explicit sample"
                                         " only when the probe checkpoint authorizes confidence"
                                         " testing, and bulk only after validation authorizes it."
                                         " If no reusable candidate was produced, use continuation"
@@ -646,15 +666,17 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                 "dispatch_wave": {
                                     "type": "integer",
                                     "minimum": 1,
-                                    "description": (
-                                        "Optional operator-visible scheduling wave."
-                                        " A phase in wave N is not dispatched until"
-                                        " every declared lower-wave phase is"
-                                        " validated_done. Use this for the one-page"
-                                        " first sample followed by concurrent sibling"
-                                        " groups; do not encode this scheduling wait"
-                                        " as a false data dependency."
-                                    ),
+                                "description": (
+                                    "Optional operator-visible scheduling wave."
+                                    " A phase in wave N is not dispatched until"
+                                    " every declared lower-wave phase is"
+                                    " validated_done. Put independent homogeneous"
+                                    " siblings in the same wave so the Harness can"
+                                    " run them up to max_browser_agents. Use an"
+                                    " earlier sample wave only for a concrete common"
+                                    " route risk; do not encode a scheduling wait as"
+                                    " a false data dependency."
+                                ),
                                 },
                                 "expected_artifact": {
                                     **_expected_artifact_schema(),
@@ -672,7 +694,7 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                         "Compact output contract or override. It supports"
                                         " rows:{exact|min|max,identity} and fields keyed by"
                                         " field name with required, type, empty, provenance,"
-                                        " minItems/maxItems, pattern, or allowedDomains. For"
+                                        " minItems/maxItems, or pattern. For"
                                         " empty='with_evidence', declare a non-empty"
                                         " allow_empty_with_outcome list in that field spec,"
                                         " e.g. fields.reviews={type:'array',empty:"
@@ -752,15 +774,6 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                         "reuse_scope": {
                                             "type": "string",
                                             "enum": sorted(VALID_REUSE_SCOPES),
-                                        },
-                                        "fleet_id": {
-                                            "type": "string",
-                                            "description": (
-                                                "Existing Fleet UUID or unique"
-                                                " UUID prefix from the user or"
-                                                " authoritative evidence. Never"
-                                                " use it as session_key."
-                                            ),
                                         },
                                         "session_key": {"type": "string"},
                                         "page_policy": {
@@ -1207,6 +1220,35 @@ def _direct_dispatch_key(manifest: JsonDict) -> str:
     ])
 
 
+def _direct_ledger_progress(agent: Any, phase: JsonDict) -> Tuple[int, JsonDict]:
+    """Attempts already dispatched for this plan version, from durable state.
+
+    The reservation ledger lives in task_state, so a resumed process sees every
+    attempt the previous one made.  Nothing read it back: resume restarted at
+    attempt 1 and _reserve_direct_dispatch then refused its own saved
+    reservation with direct_dispatch_already_reserved, which made --resume
+    unusable for exactly the runs that needed it (verified on run a686e03f,
+    whose ledger holds `1:direct_worker:1` beside a non-terminal phase state).
+    """
+    state = load_task_state(agent.logger)
+    ledger = state.get("direct_dispatches")
+    if not isinstance(ledger, dict) or not ledger:
+        return 0, {}
+    base = {
+        "planVersion": int(state.get("plan_version") or 0),
+        "phaseId": str(phase.get("id") or "direct_worker"),
+    }
+    completed = 0
+    record: JsonDict = {}
+    for attempt in range(1, 100):
+        entry = ledger.get(_direct_dispatch_key({**base, "attempt": attempt}))
+        if not isinstance(entry, dict):
+            break
+        completed = attempt
+        record = entry
+    return completed, record
+
+
 def _reserve_direct_dispatch(
     agent: Any, phase: JsonDict, attempt: int,
 ) -> Tuple[Optional[JsonDict], JsonDict]:
@@ -1506,6 +1548,48 @@ async def _direct_finalize_from_worker(
     return final_result
 
 
+def _direct_result_from_phase_state(phase_state: JsonDict) -> JsonDict:
+    """Rebuild a finalizable worker result from a validated phase on disk.
+
+    A resumed process has no worker object for an attempt that finished before
+    the previous process ended.  Everything finalization needs is already
+    durable in the phase record, so this reads it back rather than inventing
+    anything: the status, the validated artifacts and the row count all come
+    from the stored validation receipt.
+    """
+    attempts = phase_state.get("attempts")
+    last = attempts[-1] if isinstance(attempts, list) and attempts else {}
+    last = last if isinstance(last, dict) else {}
+    validation = last.get("validation")
+    validation = validation if isinstance(validation, dict) else {}
+    artifacts = [
+        str(item)
+        for item in (
+            validation.get("artifacts")
+            or phase_state.get("validated_artifacts")
+            or []
+        )
+    ]
+    row_count = validation.get("rowCount")
+    return {
+        "status": "done",
+        "workerId": str(last.get("workerId") or ""),
+        "artifacts": artifacts,
+        "artifactValidation": validation,
+        "attemptDigest": last.get("attemptDigest"),
+        "answer": json.dumps(
+            {
+                "outcome": "done",
+                "data": {"rowCount": row_count} if row_count is not None else {},
+                "evidence": artifacts,
+                "blockers": [],
+                "next_steps": [],
+            },
+            ensure_ascii=False,
+        ),
+    }
+
+
 def _direct_live_worker_id(agent: Any) -> str:
     """Return the one live direct worker, if a prior invocation already owns it."""
     spawner = getattr(agent, "spawner", None)
@@ -1555,6 +1639,16 @@ async def _direct_attach_or_recover(ctx: ToolContext) -> Optional[JsonDict]:
             ),
         }
     if status == "validated_done":
+        if getattr(agent, "resume", None) is not None:
+            # Resume must be able to collect a phase that finished just before
+            # the previous process ended. Refusing here left such a run with no
+            # route to its own answer: browser mode has no Lead turn to read
+            # the stored receipt for it.
+            return {
+                "_direct_completed_phase_result": _direct_result_from_phase_state(
+                    phase_state if isinstance(phase_state, dict) else {}
+                ),
+            }
         return {
             "status": "direct_worker_finalization_required",
             "phaseId": "direct_worker",
@@ -1597,6 +1691,16 @@ async def _run_direct_worker(ctx: ToolContext) -> JsonDict:
         attached_result = attached_or_recovery["_direct_attached_result"]
         attached_worker_id = str(
             attached_or_recovery.get("_direct_attached_worker_id") or ""
+        )
+    elif isinstance(attached_or_recovery, dict) and isinstance(
+        attached_or_recovery.get("_direct_completed_phase_result"), dict
+    ):
+        completed_attempts, _ = _direct_ledger_progress(agent, phase)
+        return await _direct_finalize_from_worker(
+            ctx,
+            attached_or_recovery["_direct_completed_phase_result"],
+            attempts=max(1, completed_attempts),
+            max_attempts=max(max_attempts, max(1, completed_attempts)),
         )
     elif attached_or_recovery is not None:
         return attached_or_recovery
@@ -1669,6 +1773,32 @@ async def _run_direct_worker(ctx: ToolContext) -> JsonDict:
             spawn_input["reuse_scope"] = "page"
             spawn_input["page_policy"] = "existing"
         start_attempt = completed_attempts + 1
+    elif getattr(agent, "resume", None) is not None:
+        # A resumed process owns no live worker and must continue AFTER the
+        # attempts the previous one already spent, not re-reserve attempt 1.
+        # Routing back to the same Fleet/page is the resume browser hint's job
+        # (the previous worker id is dead in this process), so only the
+        # continuation context is restored here.
+        resumed_attempts, last_dispatch = _direct_ledger_progress(agent, phase)
+        if resumed_attempts:
+            start_attempt = resumed_attempts + 1
+            # Each resume is an explicit human decision to continue, so it
+            # grants one fresh bounded budget rather than inheriting an
+            # already-exhausted one.
+            max_attempts += resumed_attempts
+            resumed_receipt = last_dispatch.get("continuationReceipt")
+            if isinstance(resumed_receipt, dict):
+                spawn_input["context"] = _direct_continuation_context(
+                    base_context, resumed_receipt,
+                )
+            agent.logger.write("lead.direct_worker.resumed", {
+                "phaseId": "direct_worker",
+                "completedAttempts": resumed_attempts,
+                "startAttempt": start_attempt,
+                "maxAttempts": max_attempts,
+                "priorWorkerStatus": last_dispatch.get("workerStatus"),
+                "continuationContextRestored": isinstance(resumed_receipt, dict),
+            })
     for attempt_number in range(start_attempt, max_attempts + 1):
         identity_rejection = _direct_continuation_identity_rejection(
             agent, phase, attempt_number,
@@ -1853,12 +1983,16 @@ async def _lead_emit_direct_task_plan(ctx: ToolContext) -> JsonDict:
 
 
 def _repair_task_plan_schema(_: Any = None) -> JsonDict:
-    """Schema for a small edit against the latest rejected plan candidate."""
+    """Schema for a small edit against a rejected or accepted plan."""
     return {
         "type": "object",
         "description": (
-            "Repair the latest mechanically rejected emit_task_plan candidate "
-            "without regenerating its full plan JSON. Paths are RFC 6901 JSON "
+            "Repair the latest mechanically rejected candidate or the current "
+            "accepted plan without regenerating its full plan JSON. Identify a "
+            "rejected candidate with baseCandidateHash. Identify an accepted "
+            "plan with basePlanVersion and supply replan_reason; the repaired "
+            "plan still receives independent review and operator approval. "
+            "Paths are RFC 6901 JSON "
             "Pointers relative to the plan object, for example "
             "'/phases/0/expected_artifact/requiredControls'. set replaces an "
             "existing value; add creates one missing object property whose parent "
@@ -1874,6 +2008,22 @@ def _repair_task_plan_schema(_: Any = None) -> JsonDict:
                 "description": (
                     "candidateHash from the immediately preceding mechanical "
                     "rejection; prevents applying an edit to stale plan input."
+                ),
+            },
+            "basePlanVersion": {
+                "type": "integer",
+                "minimum": 1,
+                "description": (
+                    "Current accepted planVersion. Use this instead of "
+                    "baseCandidateHash for a small edit to an accepted plan."
+                ),
+            },
+            "replan_reason": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "Required with basePlanVersion. Explain why the accepted "
+                    "plan must change."
                 ),
             },
             "operations": {
@@ -1896,7 +2046,7 @@ def _repair_task_plan_schema(_: Any = None) -> JsonDict:
                 },
             },
         },
-        "required": ["baseCandidateHash", "operations"],
+        "required": ["operations"],
         "additionalProperties": False,
     }
 
@@ -2131,17 +2281,20 @@ def _spawn_browser_agent_schema(_: Any = None) -> JsonDict:
                     " guessed phase at a time."
                 ),
             },
-            "task": {"type": "string"},
+            "task": {
+                "type": "string",
+                "description": "Optional task override; omit to inherit the approved phase task. Preserve its objective and obligations.",
+            },
             "context": {
                 "type": "string",
                 "description": (
-                    "Subtask context; pass an empty string when none. Include artifact paths"
+                    "Optional new evidence or continuation context; omit when the phase is sufficient. Include artifact paths"
                     " or prior result fields that the worker may use as dynamic-param sources."
                 ),
             },
             "result_contract": {
                 "type": "string",
-                "description": "Structure / fields you expect the BrowserAgent to put in `answer`; pass an empty string when there are no extra requirements.",
+                "description": "Optional extra answer presentation guidance. Omit to use the approved phase contract; do not duplicate or change artifact requirements here.",
             },
             "preferred_slot_id": {
                 **_nullable("string"),
@@ -2159,8 +2312,9 @@ def _spawn_browser_agent_schema(_: Any = None) -> JsonDict:
                     " reusable page candidates from that slot to be exposed only"
                     " when reuse_scope=page and page_policy=existing; with"
                     " page_policy=new it reuses slot/fleet context but not the"
-                    " previous page. For a detail cohort discovered on a live"
-                    " listing, point this to the source-list worker."
+                    " previous page. This pins a slot and may serialize work;"
+                    " omit for independent siblings unless that exact slot"
+                    " is required."
                 ),
             },
             "reuse_scope": {
@@ -2180,18 +2334,9 @@ def _spawn_browser_agent_schema(_: Any = None) -> JsonDict:
                     " First use creates a fresh fleet; later uses bind only to"
                     " that exact fleet and fail terminally if it is lost. It is"
                     " not an account credential and must not contain secrets."
-                    " Never put a Fleet UUID or UUID prefix here; use fleet_id"
-                    " for an existing Fleet."
-                ),
-            },
-            "fleet_id": {
-                **_nullable("string"),
-                "description": (
-                    "Existing Fleet UUID or unique UUID prefix. The harness"
-                    " resolves it only against authoritative Fleet inventory;"
-                    " no match or multiple matches fail closed and never"
-                    " create a replacement Fleet. Mutually exclusive with"
-                    " session_key and needs_isolated_session."
+                    " Never put a Fleet UUID or UUID prefix here. A user can"
+                    " bind an existing Fleet only with @<id> in the original"
+                    " task; the runtime applies that binding itself."
                 ),
             },
             "page_policy": {
@@ -2200,8 +2345,8 @@ def _spawn_browser_agent_schema(_: Any = None) -> JsonDict:
                 "description": (
                     "Use new for a fresh page in assignedFleetId. existing is"
                     " valid only with reuse_scope=page. Use existing with the"
-                    " source-list worker when details should be entered by"
-                    " clicking freshly rebound source cards."
+                    " prior page context when current evidence requires"
+                    " source-card traversal or unfinished page state."
                 ),
             },
             "worker_contract": {
@@ -2239,18 +2384,11 @@ def _spawn_browser_agent_schema(_: Any = None) -> JsonDict:
                             " the harness never reclaims."
                         ),
                     },
-                    "fleet_id": {
-                        "type": "string",
-                        "description": (
-                            "Existing Fleet UUID or unique UUID prefix. Use"
-                            " session_key instead only for a new named session."
-                        ),
-                    },
                     "auth_verification": _auth_verification_schema(),
                     "content_completeness": _content_completeness_schema(),
                 },
                 "description": (
-                    "Contract override; pass {} when the phase contract is enough."
+                    "Optional contract override; omit when the approved phase contract is enough."
                     " The harness merges it with the"
                     " phase's expected_artifact, validators, allowed_methods,"
                     " forbidden_methods, max_surface_attempts, and stop_condition."
@@ -2292,7 +2430,10 @@ def _wait_browser_agents_schema(_: Any = None) -> JsonDict:
 
 
 def _list_browser_agents_schema(_: Any = None) -> JsonDict:
-    return {"type": "object", "properties": {}, "required": [], "additionalProperties": False}
+    return {"type": "object", "properties": {
+        "refresh_connection": {"type": "boolean", "default": False,
+            "description": "After external endpoint recovery, explicitly run one bounded registration/capability/Fleet inventory probe. Does not start workers or replay business actions."}
+    }, "required": [], "additionalProperties": False}
 
 
 def _local_fs_search_schema(_: Any = None) -> JsonDict:
@@ -2908,18 +3049,67 @@ async def _lead_submit_task_plan_draft(ctx: ToolContext) -> JsonDict:
 @LEAD_TOOLS.register(
     name="repair_task_plan",
     description=(
-        "Apply small add/set/remove JSON-Pointer edits to the latest mechanically "
-        "rejected task-plan candidate, then validate and accept the repaired "
-        "complete plan. Available after ANY mechanical rejection — use the "
-        "candidateHash that rejection returned; never guess a baseCandidateHash "
-        "or use it for semantic review findings."
+        "Apply small add/set/remove JSON-Pointer edits to either the latest "
+        "mechanically rejected candidate or the current accepted plan, then "
+        "run the normal validation, review, and approval path. For a rejection, "
+        "use its candidateHash as baseCandidateHash. For an accepted plan, use "
+        "its planVersion as basePlanVersion and provide replan_reason. Never "
+        "guess either repair base."
     ),
     input_schema=_repair_task_plan_schema,
     loop_guard=False,
 )
 async def _lead_repair_task_plan(ctx: ToolContext) -> JsonDict:
     base_hash = str(ctx.tool_input.get("baseCandidateHash") or "").strip()
-    candidate = ctx.agent.last_mechanical_plan_candidate(base_hash)
+    raw_plan_version = ctx.tool_input.get("basePlanVersion")
+    base_plan_version = (
+        int(raw_plan_version)
+        if isinstance(raw_plan_version, int) and not isinstance(raw_plan_version, bool)
+        else 0
+    )
+    if bool(base_hash) == bool(base_plan_version):
+        return {
+            "status": "failed",
+            "error": "provide exactly one repair base",
+            "errorCode": "task_plan_repair_base_invalid",
+            "next_instruction": (
+                "Use baseCandidateHash for the latest mechanically rejected "
+                "candidate, or basePlanVersion plus replan_reason for the "
+                "current accepted plan. Do not provide both."
+            ),
+        }
+    accepted_plan_repair = bool(base_plan_version)
+    if accepted_plan_repair:
+        state = load_task_state(ctx.agent.logger)
+        current_plan_version = int(state.get("plan_version") or 0)
+        reason = str(ctx.tool_input.get("replan_reason") or "").strip()
+        if not reason:
+            return {
+                "status": "failed",
+                "error": "replan_reason is required for an accepted-plan repair",
+                "errorCode": "replan_reason_required",
+                "requiredPath": "replan_reason",
+                "currentPlanVersion": current_plan_version,
+            }
+        if (
+            getattr(ctx.agent, "task_plan", None) is None
+            or base_plan_version != current_plan_version
+        ):
+            return {
+                "status": "failed",
+                "error": "accepted task-plan repair base is stale or unavailable",
+                "errorCode": "task_plan_repair_base_unavailable",
+                "basePlanVersion": base_plan_version,
+                "currentPlanVersion": current_plan_version or None,
+                "next_instruction": (
+                    "Read the current planVersion and retry against that exact "
+                    "accepted generation."
+                ),
+            }
+        candidate = copy.deepcopy(ctx.agent.task_plan)
+        candidate["replan_reason"] = reason
+    else:
+        candidate = ctx.agent.last_mechanical_plan_candidate(base_hash)
     if candidate is None:
         return {
             "status": "failed",
@@ -2942,7 +3132,8 @@ async def _lead_repair_task_plan(ctx: ToolContext) -> JsonDict:
             "error": "task_plan repair operations are invalid",
             "errorCode": "task_plan_repair_invalid_operations",
             "errors": patch_errors,
-            "candidateHash": base_hash,
+            "candidateHash": base_hash or None,
+            "basePlanVersion": base_plan_version or None,
             "next_instruction": (
                 "Choose one complete repairOptions entry from repairIssues when "
                 "present; mustChangePaths is only a direct-field summary. set only "
@@ -3151,8 +3342,12 @@ def _resume_instruction_gate_rejection(agent: Any) -> Optional[JsonDict]:
     description=(
         "Asynchronously run a BrowserAgent worker in a pooled browser slot."
         " The coordinator assigns a fleet before execution; normal workers"
-        " start a fresh page in that fleet. Use fleet_id for an existing Fleet"
-        " UUID or unique prefix. Use reuse_scope/session_key for cookie/session"
+        " start a fresh page in that fleet. A Fleet named as @<id> in the"
+        " immutable original user task is injected by the runtime; never pass"
+        " fleet_id in this tool or a worker contract. When the original task "
+        "contains @<id>, that binding also overrides session_key and "
+        "needs_isolated_session; the Lead cannot select a substitute identity. "
+        "Without an @ binding, use reuse_scope/session_key for cookie/session"
         " affinity when a new key should start a fresh fleet, and"
         " reuse_scope=page plus"
         " reuse_from_worker_id or preferred_slot_id only when prior pages must"
@@ -3176,6 +3371,26 @@ def _resume_instruction_gate_rejection(agent: Any) -> Optional[JsonDict]:
 async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
     agent = ctx.agent
     tool_input = ctx.tool_input
+    raw_contract = tool_input.get("worker_contract")
+    forbidden_fleet_inputs = []
+    if "fleet_id" in tool_input:
+        forbidden_fleet_inputs.append("spawn_browser_agent.fleet_id")
+    if isinstance(raw_contract, dict) and "fleet_id" in raw_contract:
+        forbidden_fleet_inputs.append("worker_contract.fleet_id")
+    if forbidden_fleet_inputs:
+        return {
+            "status": "fleet_routing_input_forbidden",
+            "error": (
+                ", ".join(forbidden_fleet_inputs)
+                + " is not a Fleet routing input."
+            ),
+            "tool_was_executed": False,
+            "next_instruction": (
+                "Name an existing Fleet only as @<Fleet UUID or unique prefix>"
+                " in the original user task. Do not put Fleet identifiers in"
+                " task plans, worker contracts, or tool calls."
+            ),
+        }
     resume_rejection = _resume_instruction_gate_rejection(agent)
     if resume_rejection is not None:
         return resume_rejection
@@ -3194,7 +3409,6 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
     # changes the objective via worker_contract would otherwise be rejected
     # against the raw phase's exhausted fingerprint before ever reaching the
     # spawner (which already receives the effective contract).
-    raw_contract = tool_input.get("worker_contract")
     # Runtime twin of the plan-time task_type check: execute_lead_tool does no
     # local JSON-schema validation, so the spawn schema's enum only constrains
     # a well-behaved provider — a gateway that ignores schemas (the recurring
@@ -3278,25 +3492,25 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
             "errorCode": "phase_not_found",
             "scheduleSnapshot": agent.phase_schedule_snapshot(),
         }
+    planned_contract = phase.get("worker_contract")
+    if isinstance(planned_contract, dict) and "fleet_id" in planned_contract:
+        return {
+            "status": "fleet_routing_input_forbidden",
+            "error": "phase.worker_contract.fleet_id is not a Fleet routing input.",
+            "tool_was_executed": False,
+            "next_instruction": (
+                "Revise the plan without worker_contract.fleet_id. An existing"
+                " Fleet is bound only by @<id> in the original user task."
+            ),
+        }
     dispatch_wave = phase.get("dispatch_wave")
     if isinstance(dispatch_wave, int) and not isinstance(dispatch_wave, bool):
-        lower_wave_ids = [
-            str(item.get("id") or "")
-            for item in (agent.task_plan.get("phases") or [])
-            if isinstance(item, dict)
-            and isinstance(item.get("dispatch_wave"), int)
-            and not isinstance(item.get("dispatch_wave"), bool)
-            and int(item.get("dispatch_wave")) < dispatch_wave
-            and str(item.get("id") or "")
-        ]
         state = load_task_state(agent.logger)
         phase_states = state.get("phases") if isinstance(state, dict) else {}
         phase_states = phase_states if isinstance(phase_states, dict) else {}
-        waiting_for = [
-            prior_id for prior_id in lower_wave_ids
-            if not isinstance(phase_states.get(prior_id), dict)
-            or phase_states[prior_id].get("status") != "validated_done"
-        ]
+        waiting_for = dispatch_wave_blockers(
+            agent.task_plan, phase, phase_states,
+        )
         if waiting_for:
             return {
                 "status": "dispatch_wave_not_ready",
@@ -3318,6 +3532,32 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
         phase,
         raw_contract if isinstance(raw_contract, dict) else None,
     )
+    # The immutable @Fleet reference is the user's explicit identity choice.
+    # Model-authored session routing is lower-authority planning metadata; if it
+    # survived in an accepted plan, passing it onward creates an unresolvable
+    # conflict and tempts the Lead to rewrite business phases to fix routing.
+    # Normalize that conflict at the boundary while retaining the low-level
+    # spawner's strict check for non-Lead/programmatic callers.
+    task_fleet_reference = str(
+        getattr(agent, "task_fleet_reference", "") or ""
+    ).strip()
+    ignored_task_fleet_route_fields: List[str] = []
+    if task_fleet_reference:
+        if worker_contract.pop("session_key", None) is not None:
+            ignored_task_fleet_route_fields.append("worker_contract.session_key")
+        if worker_contract.pop("needs_isolated_session", None) is not None:
+            ignored_task_fleet_route_fields.append(
+                "worker_contract.needs_isolated_session"
+            )
+        if str(tool_input.get("session_key") or "").strip():
+            ignored_task_fleet_route_fields.append("spawn_browser_agent.session_key")
+        if ignored_task_fleet_route_fields:
+            agent.logger.write("task.fleet_reference.routing_normalized", {
+                "fleetReference": task_fleet_reference,
+                "phaseId": str(phase.get("id") or ""),
+                "ignoredFields": ignored_task_fleet_route_fields,
+                "source": "original_user_task",
+            })
     # Initial ordinary downstream phases do not need the Lead to copy row
     # identities into a worker_contract. Derive only from an explicitly
     # declared input artifact, then verify that producer at runtime; never
@@ -3545,6 +3785,12 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
     _remember_phase_dispatch(
         agent, phase, tool_input, task=base_task, context=base_context,
     )
+    if task_fleet_reference:
+        agent.logger.write("task.fleet_reference.injected", {
+            "fleetReference": task_fleet_reference,
+            "phaseId": str(phase.get("id") or ""),
+            "source": "original_user_task",
+        })
     return await agent.spawner.spawn_browser_agent(
         task=base_task,
         context=base_context,
@@ -3557,8 +3803,8 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
         preferred_slot_id=tool_input.get("preferred_slot_id"),
         reuse_from_worker_id=tool_input.get("reuse_from_worker_id"),
         reuse_scope=tool_input.get("reuse_scope"),
-        fleet_id=tool_input.get("fleet_id"),
-        session_key=tool_input.get("session_key"),
+        task_fleet_reference=task_fleet_reference or None,
+        session_key=(None if task_fleet_reference else tool_input.get("session_key")),
         page_policy=tool_input.get("page_policy"),
         dispatch_origin=str(
             tool_input.get("_runtime_dispatch_origin") or "lead_model"
@@ -3571,248 +3817,14 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
     )
 
 
-_AUTH_GATE_FIELD_NAMES = {
-    "auth_required",
-    "authentication_required",
-    "login_required",
-    "signin_required",
-    "sign_in_required",
-    "requires_login",
-    "requires_auth",
-    "auth_method",
-    "authentication_method",
-    "login_method",
-    "auth_surface",
-    "login_surface",
-    "auth_evidence",
-    "login_evidence",
-    "next_phase_requires_hitl",
-}
-
-_AUTH_GATE_MARKERS = (
-    "auth",
-    "authentication",
-    "authenticate",
-    "login",
-    "log in",
-    "logged in",
-    "sign in",
-    "signin",
-    "sso",
-    "oauth",
-    "credential",
-    "password",
-    "captcha",
-    "human verification",
-    "identity verification",
-    "phone verification",
-    "security verification",
-    "verification code",
-    "sms verification",
-    "2fa",
-    "mfa",
-    "paywall",
-    "subscribe",
-    "subscription",
-    "hitl",
-    "登录",
-    "登陆",
-    "认证",
-    "手机号",
-    "验证码",
-    "人机",
-    "扫码",
-    "微信",
-    "付费墙",
-)
-
-_AUTH_GATE_PROBE_MARKERS = (
-    "probe",
-    "explore",
-    "assess",
-    "identify",
-    "detect",
-    "discover",
-    "check auth",
-    "check authentication",
-    "check login",
-    "check sign-in",
-    "check signin",
-    "check gate",
-    "check paywall",
-    "inspect",
-    "understand",
-    "requirements",
-    "page state",
-    "visible",
-    "门禁",
-    "探测",
-    "探索",
-    "识别",
-    "判断",
-    "确认",
-    "可见",
-)
-
-_AUTH_GATE_EXECUTION_MARKERS = (
-    "handle login",
-    "handle auth",
-    "handle authentication",
-    "complete login",
-    "complete auth",
-    "complete authentication",
-    "perform login",
-    "perform auth",
-    "perform authentication",
-    "requestpause",
-    "request pause",
-    "request hitl",
-    "hitl.requestpause",
-    "after login",
-    "after authentication",
-    "post-login",
-    "post login",
-    "post-auth",
-    "post auth",
-    "verify login",
-    "verify auth",
-    "verify authentication",
-    "verify authenticated",
-    "verify by page.getstate",
-    "login verification",
-    "auth verification",
-    "authentication verification",
-    "login status",
-    "login_status",
-    "form accessible",
-    "form_accessible",
-    "完成登录",
-    "完成认证",
-    "处理登录",
-    "处理认证",
-    "请求 hitl",
-    "人工登录",
-    "登录后",
-    "认证后",
-    "验证登录",
-    "验证认证",
-)
-
-_POST_AUTH_TARGET_MARKERS = (
-    "form",
-    "field",
-    "section",
-    "fill",
-    "submit",
-    "row",
-    "item",
-    "detail",
-    "download",
-    "collect",
-    "extract",
-    "list",
-    "表单",
-    "字段",
-    "版块",
-    "部分",
-    "填写",
-    "提交",
-    "采集",
-    "下载",
-    "详情",
-)
-
-
 def _auth_gate_probe_guidance(phase: JsonDict, worker_contract: JsonDict) -> str:
-    """Inject guardrails only for an explicitly diagnostic gate probe.
+    """Task prose is authoritative; keyword matches cannot change its role.
 
-    The trigger is intentionally semantic rather than site-specific: it catches
-    phases whose final deliverable is gate diagnosis, while skipping business
-    phases and phases whose job explicitly includes requesting HITL/login.
-    Unpredicted gates in ordinary work are handled by the BrowserAgent's global
-    runtime-auth interrupt SOP, not by ending this worker and spawning another.
+    A diagnostic task already tells the worker what to report. Ordinary tasks
+    often mention login diagnosis as a conditional recovery step. Never convert
+    those words into a fabricated instruction that the user wanted only a probe.
     """
-    expected = (
-        worker_contract.get("expected_artifact")
-        if isinstance(worker_contract.get("expected_artifact"), dict)
-        else phase.get("expected_artifact")
-        if isinstance(phase.get("expected_artifact"), dict)
-        else {}
-    )
-    fields = _expected_field_names(expected)
-    normalized_fields = {
-        str(item or "").strip().lower()
-        for item in fields
-        if str(item or "").strip()
-    }
-    has_gate_fields = bool(normalized_fields & _AUTH_GATE_FIELD_NAMES)
-
-    validators = worker_contract.get("validators")
-    if not isinstance(validators, list):
-        validators = phase.get("validators")
-
-    parts = [
-        phase.get("id"),
-        phase.get("objective"),
-        phase.get("worker_task"),
-        phase.get("stage_hint"),
-        phase.get("stage_hint_reason"),
-        phase.get("context"),
-        worker_contract.get("task_type"),
-        worker_contract.get("objective"),
-        worker_contract.get("stage_hint"),
-        worker_contract.get("stage_hint_reason"),
-        *fields,
-    ]
-    for structured in (expected, validators):
-        if structured:
-            try:
-                parts.append(json.dumps(structured, ensure_ascii=False, default=str))
-            except TypeError:
-                parts.append(str(structured))
-    text = " ".join(str(item or "") for item in parts)
-    if not any(
-        contains_semantic_marker(text, marker)
-        for marker in _AUTH_GATE_MARKERS
-    ):
-        return ""
-
-    is_probe = has_gate_fields or any(
-        contains_semantic_marker(text, marker)
-        for marker in _AUTH_GATE_PROBE_MARKERS
-    )
-    if not is_probe:
-        return ""
-
-    if any(
-        contains_affirmative_semantic_marker(text, marker)
-        for marker in _AUTH_GATE_EXECUTION_MARKERS
-    ):
-        return ""
-
-    target_terms = [
-        marker
-        for marker in _POST_AUTH_TARGET_MARKERS
-        if contains_semantic_marker(text, marker)
-    ][:8]
-    target_note = ""
-    if target_terms:
-        target_note = (
-            "- Treat target-content terms in this phase as post-auth scope if a"
-            f" gate is present: {target_terms!r}. Mark them behind_auth or"
-            " unknown; do not spend steps discovering them before auth.\n"
-        )
-
-    return (
-        "<auth_gate_probe_guidance>\n"
-        "- The phase contract explicitly makes gate diagnosis the final deliverable; this is the narrow probe-only exception to the runtime-auth interrupt rule.\n"
-        "- Stop as soon as login/auth/SSO/OAuth/QR/phone verification/CAPTCHA/HITL/paywall is confirmed with Page.getState and DOM.getAXTree evidence.\n"
-        "- Report only gate facts: auth_required/login_required, auth_surface, auth_method/options/providers, current URL/title, evidence text/source, and whether the next phase needs HITL.\n"
-        "- Because the user asked only for diagnosis, do not call Hitl.requestPause, dismiss auth/paywall overlays, click provider/login/submit buttons, fill credentials, direct-navigate around the gate, or inspect post-auth form/list/detail/download fields.\n"
-        f"{target_note}"
-        "- If the protected target is not visible before auth, return it as behind_auth/unknown and finish this diagnostic contract; do not assume or request a follow-up login/HITL phase.\n"
-        "</auth_gate_probe_guidance>"
-    )
+    return ""
 
 
 def _collection_contract_guidance(phase: JsonDict, worker_contract: JsonDict) -> str:
@@ -3924,7 +3936,7 @@ def _remember_phase_dispatch(
 
     A harness-owned continuation must re-issue what the Lead actually asked
     for, not a reconstruction of it from the plan. A spawn can carry routing
-    the phase alone does not express - session_key, fleet_id, page_policy, a
+    the phase alone does not express - session_key, page_policy, a
     worker_contract override - and silently dropping any of those changes the
     objective while looking like a retry.
     """
@@ -3935,14 +3947,22 @@ def _remember_phase_dispatch(
     phase_id = str(phase.get("id") or "").strip()
     if not phase_id:
         return
+    if tool_input.get("_runtime_dispatch_origin") == "runtime_phase_continuation":
+        existing = store.get(phase_id)
+        if not isinstance(existing, dict):
+            existing = phase_dispatch_input(agent.logger, phase_id=phase_id)
+            if existing:
+                store[phase_id] = existing
+        if isinstance(existing, dict) and existing:
+            return
     record: JsonDict = {
         "task": str(task or ""),
         "context": str(context or ""),
         "result_contract": str(tool_input.get("result_contract") or ""),
     }
     for key in (
-        "name", "preferred_slot_id", "reuse_scope", "fleet_id",
-        "session_key", "page_policy",
+        "name", "preferred_slot_id", "reuse_scope", "session_key",
+        "page_policy",
     ):
         value = tool_input.get(key)
         if value is not None:
@@ -3951,6 +3971,11 @@ def _remember_phase_dispatch(
     if isinstance(raw_contract, dict):
         record["worker_contract"] = copy.deepcopy(raw_contract)
     store[phase_id] = record
+    logger = getattr(agent, "logger", None)
+    if logger is not None:
+        record_phase_dispatch_input(
+            logger, phase_id=phase_id, dispatch_input=record,
+        )
 
 
 def _phase_continuation_note(
@@ -4001,15 +4026,6 @@ def _phase_continuation_note(
     return "\n".join(lines)
 
 
-# The statuses _direct_continuation_decision is willing to continue. Duplicated
-# as a set here only to decide whether a refusal is worth a log line; the
-# decision itself stays in that one function.
-_CONTINUABLE_WORKER_STATUSES = frozenset({
-    "partial", "step_budget_exhausted", "context_limit_exceeded",
-    "incomplete", "page_crashed", "fleet_assignment_lost",
-})
-
-
 def _phase_auto_continuation_limit(agent: Any) -> int:
     harness_config = getattr(getattr(agent, "runtime", None), "harness", None)
     if not getattr(harness_config, "phase_auto_continuation_enabled", False):
@@ -4029,6 +4045,15 @@ def _phase_auto_continuation_block(agent: Any, result: Any) -> Optional[str]:
     """
     if not isinstance(result, dict):
         return "worker_result_missing"
+    challenge = result.get("challengeReceipt")
+    if isinstance(challenge, dict) and challenge.get("unresolved"):
+        return "human_or_session_blocker"
+    if str(result.get("status") or "").lower() in {
+        "blocked_by_challenge", "hitl_required", "hitl_waiting", "hitl_timeout",
+        "page_settled_after_hitl", "stale_pause_deadlock", "session_fleet_lost",
+        "page_continuation_lost",
+    }:
+        return "human_or_session_blocker"
     phase_id = str(result.get("phaseId") or "").strip()
     if not phase_id or phase_id == "direct_worker":
         # direct_worker already runs its own continuation loop in
@@ -4038,7 +4063,10 @@ def _phase_auto_continuation_block(agent: Any, result: Any) -> Optional[str]:
     if not isinstance(find_phase(plan, phase_id), dict):
         return "phase_not_in_plan"
     store = getattr(agent, "phase_dispatch_inputs", None)
-    if not isinstance(store, dict) or phase_id not in store:
+    recorded = store.get(phase_id) if isinstance(store, dict) else None
+    if not isinstance(recorded, dict):
+        recorded = phase_dispatch_input(agent.logger, phase_id=phase_id)
+    if not recorded:
         return "no_recorded_dispatch"
     state = load_task_state(agent.logger)
     phase_states = state.get("phases") if isinstance(state, dict) else None
@@ -4051,26 +4079,43 @@ def _phase_auto_continuation_block(agent: Any, result: Any) -> Optional[str]:
     )
     if status in TERMINAL_PHASE_STATUSES:
         return f"phase_terminal:{status}"
+    decision = result.get("continuation")
+    if not isinstance(decision, dict):
+        return "continuation_decision_missing"
+    if decision.get("protocol") != "browser-continuation-v1":
+        return "continuation_protocol_invalid"
+    if decision.get("action") != "continue_current_phase":
+        return "continuation_requires_lead"
+    receipt_id = str(result.get("continuationReceiptId") or "").strip()
+    if not receipt_id:
+        return "continuation_receipt_id_missing"
+    control = phase_continuation_record(
+        agent.logger, phase_id=phase_id, receipt_id=receipt_id,
+    )
+    if not isinstance(control, dict):
+        return "continuation_receipt_not_persisted"
+    if control.get("decision") != decision:
+        return "continuation_decision_mismatch"
+    current_version = state.get("plan_version") if isinstance(state, dict) else None
+    if control.get("planVersion") != current_version:
+        return "continuation_plan_version_changed"
+    phase = find_phase(plan, phase_id)
+    current_contract_hash = contract_hash_for_phase(
+        phase,
+        recorded.get("worker_contract")
+        if isinstance(recorded.get("worker_contract"), dict) else {},
+    )
+    if control.get("contractHash") != current_contract_hash:
+        return "continuation_contract_changed"
     return None
 
 
 async def _auto_continue_phase(ctx: ToolContext, waited: JsonDict) -> JsonDict:
-    """Re-dispatch one unfinished phase instead of waking the Lead to do it.
+    """Reserve and dispatch model-requested phase continuations without waiting.
 
-    Bounded three ways, all mechanical and all already used by the direct-worker
-    loop: the status must be one _direct_continuation_decision accepts, the
-    attempt must show progress against the previous one
-    (repeated_no_progress_same_signature stops a loop), and the automatic
-    attempt count is capped separately from phase.max_attempts because a
-    `partial` attempt does not consume the phase budget.
-
-    Only one completed worker with nothing still pending is eligible. Two
-    finished workers is a merge decision, and a live sibling makes a re-spawn a
-    concurrency question - both belong to the Lead.
-
-    A Lead that passed `timeout_seconds` asked to have control back at that
-    deadline, and a continuation would run past it. Across every recorded run
-    no wait has ever carried one (0 of 146), so honouring it costs nothing.
+    The BrowserAgent owns the semantic decision to continue the same accepted
+    objective. The harness checks identity, contract, budget, and routing, then
+    returns the new worker to the ordinary completion-event loop.
     """
     agent = ctx.agent
     limit = _phase_auto_continuation_limit(agent)
@@ -4079,53 +4124,59 @@ async def _auto_continue_phase(ctx: ToolContext, waited: JsonDict) -> JsonDict:
     if ctx.tool_input.get("timeout_seconds") is not None:
         return waited
     completed = waited.get("completed") if isinstance(waited, dict) else None
-    if not isinstance(completed, list) or len(completed) != 1:
+    if not isinstance(completed, list) or not completed:
         return waited
-    if waited.get("pending"):
-        return waited
-    result = completed[0]
-    block = _phase_auto_continuation_block(agent, result)
-    if block is not None:
-        if str(result.get("status") or "").lower() in _CONTINUABLE_WORKER_STATUSES:
-            # Only worth a line when the status alone would have continued:
-            # otherwise every ordinary `done` would log a refusal.
+    handoffs: List[JsonDict] = []
+    for result in completed:
+        if not isinstance(result, dict):
+            continue
+        decision = result.get("continuation")
+        if not isinstance(decision, dict):
+            continue
+        block = _phase_auto_continuation_block(agent, result)
+        phase_id = str(result.get("phaseId") or "")
+        receipt_id = str(result.get("continuationReceiptId") or "")
+        if block is not None:
             agent.logger.write("lead.phase_continuation.blocked", {
-                "phaseId": result.get("phaseId"),
+                "phaseId": phase_id,
                 "workerId": result.get("workerId"),
                 "status": result.get("status"),
+                "receiptId": receipt_id or None,
                 "reason": block,
             })
-        return waited
-    phase_id = str(result.get("phaseId") or "")
-    chain: List[JsonDict] = []
-    previous: Optional[JsonDict] = None
-    for attempt in range(1, limit + 1):
+            continue
+        reserved = reserve_phase_continuation(
+            agent.logger,
+            phase_id=phase_id,
+            receipt_id=receipt_id,
+            max_automatic_attempts=limit,
+        )
+        if (
+            reserved.get("status") != "reserved"
+            or reserved.get("reservationAcquired") is not True
+        ):
+            handoffs.append({
+                "phaseId": phase_id,
+                "sourceWorkerId": result.get("workerId"),
+                "receiptId": receipt_id,
+                "status": reserved.get("status") or "not_reserved",
+                "reason": reserved.get("reason"),
+            })
+            continue
+        attempt = int(reserved.get("automaticAttempt") or 0)
         phase = find_phase(getattr(agent, "task_plan", None), phase_id)
         if not isinstance(phase, dict):
-            break
+            settle_phase_continuation(
+                agent.logger, phase_id=phase_id, receipt_id=receipt_id,
+                status="rejected", reason="phase_not_in_plan_after_reservation",
+            )
+            continue
+        store = getattr(agent, "phase_dispatch_inputs", None)
+        recorded = store.get(phase_id) if isinstance(store, dict) else None
+        if not isinstance(recorded, dict):
+            recorded = phase_dispatch_input(agent.logger, phase_id=phase_id)
         manifest = _direct_dispatch_manifest(agent, phase, attempt)
         receipt = _direct_continuation_receipt(phase, result, manifest)
-        decision = _direct_continuation_decision(
-            result,
-            previous_result=previous,
-            attempt_number=attempt,
-            # The Lead's own dispatch was attempt 0, so `limit` automatic
-            # continuations need a budget of limit + 1 for the shared decision
-            # helper, whose fence is `attempt_number >= max_attempts`.
-            max_attempts=limit + 1,
-            continuation_receipt=receipt,
-        )
-        agent.logger.write("lead.phase_continuation.decision", {
-            "phaseId": phase_id,
-            "attempt": attempt,
-            "maxAttempts": limit,
-            "workerId": result.get("workerId"),
-            "status": result.get("status"),
-            **decision,
-        })
-        if not decision.get("continue"):
-            break
-        recorded = getattr(agent, "phase_dispatch_inputs", {}).get(phase_id) or {}
         spawn_input: JsonDict = {
             key: value for key, value in recorded.items()
             if key not in {"context", "name"}
@@ -4137,6 +4188,14 @@ async def _auto_continue_phase(ctx: ToolContext, waited: JsonDict) -> JsonDict:
             ),
             _phase_continuation_note(
                 agent, phase_id, result, attempt=attempt, max_attempts=limit,
+            ),
+            (
+                "BROWSER CONTINUATION DECISION:\n"
+                f"remainingObjective={decision.get('remainingObjective') or ''}\n"
+                "evidenceRefs="
+                + json.dumps(decision.get("evidenceRefs") or [], ensure_ascii=False)
+                + (f"\nworkflowRef={decision.get('workflowRef')}"
+                   if decision.get("workflowRef") else "")
             ),
         ) if part)
         spawn_input["reuse_from_worker_id"] = str(result.get("workerId") or "")
@@ -4150,84 +4209,730 @@ async def _auto_continue_phase(ctx: ToolContext, waited: JsonDict) -> JsonDict:
             spawn_input["reuse_scope"] = "page"
             spawn_input["page_policy"] = "existing"
         spawn_input["_runtime_dispatch_origin"] = "runtime_phase_continuation"
-        spawned = await _lead_spawn_browser_agent(ToolContext(
-            agent=agent,
-            tool_call={
-                "name": "spawn_browser_agent",
-                "id": f"phase-continuation-{phase_id}-{attempt}",
-            },
-            tool_input=spawn_input,
-            step=ctx.step,
-        ))
-        if not isinstance(spawned, dict) or spawned.get("status") != "running":
-            # A refused spawn is a real answer - phase_exhausted, a dependency
-            # fence, a replan checkpoint. Hand it back to the Lead attached to
-            # the worker result rather than retrying around it.
-            chain.append({
-                "attempt": attempt,
-                "spawnRejected": spawned if isinstance(spawned, dict) else None,
+        try:
+            spawned = await _lead_spawn_browser_agent(ToolContext(
+                agent=agent,
+                tool_call={
+                    "name": "spawn_browser_agent",
+                    "id": f"phase-continuation-{receipt_id[:12]}-{attempt}",
+                },
+                tool_input=spawn_input,
+                step=ctx.step,
+            ))
+        except Exception as exc:
+            settled = settle_phase_continuation(
+                agent.logger, phase_id=phase_id, receipt_id=receipt_id,
+                status="uncertain", reason=str(exc),
+            )
+            handoffs.append({
+                "phaseId": phase_id,
+                "sourceWorkerId": result.get("workerId"),
+                "receiptId": receipt_id,
+                "status": "uncertain",
+                "control": settled,
             })
-            break
+            continue
+        if not isinstance(spawned, dict) or spawned.get("status") != "running":
+            settled = settle_phase_continuation(
+                agent.logger, phase_id=phase_id, receipt_id=receipt_id,
+                status="rejected",
+                reason=str((spawned or {}).get("status") or "invalid_spawn_result")
+                if isinstance(spawned, dict) else "invalid_spawn_result",
+            )
+            handoffs.append({
+                "phaseId": phase_id,
+                "sourceWorkerId": result.get("workerId"),
+                "receiptId": receipt_id,
+                "automaticAttempt": attempt,
+                "status": "rejected",
+                "spawnResult": spawned if isinstance(spawned, dict) else None,
+                "control": settled,
+            })
+            continue
         worker_id = str(spawned.get("workerId") or "")
+        settled = settle_phase_continuation(
+            agent.logger, phase_id=phase_id, receipt_id=receipt_id,
+            status="dispatched", worker_id=worker_id,
+        )
         agent.logger.write("lead.phase_continuation.attempt", {
             "phaseId": phase_id,
             "attempt": attempt,
             "workerId": worker_id,
             "continuedFromWorkerId": result.get("workerId"),
+            "receiptId": receipt_id,
         })
-        next_wait = await agent.spawner.wait_browser_agents(
-            worker_ids=[worker_id] if worker_id else None,
-            mode="all",
-        )
-        next_completed = (
-            next_wait.get("completed") if isinstance(next_wait, dict) else None
-        )
-        next_result = (
-            next_completed[-1]
-            if isinstance(next_completed, list) and next_completed else None
-        )
-        if not isinstance(next_result, dict):
-            chain.append({"attempt": attempt, "waitIncomplete": True})
-            break
-        chain.append({
-            "attempt": attempt,
-            "workerId": next_result.get("workerId"),
-            "status": next_result.get("status"),
-            "rowCount": _direct_row_count(next_result),
+        handoffs.append({
+            "phaseId": phase_id,
+            "sourceWorkerId": result.get("workerId"),
+            "receiptId": receipt_id,
+            "automaticAttempt": attempt,
+            "status": "dispatched",
+            "workerId": worker_id,
+            "control": settled,
         })
-        previous, result = result, next_result
-        waited = next_wait
-        if _phase_auto_continuation_block(agent, result) is not None:
-            break
-    if not chain:
+    if not handoffs:
         return waited
     enriched = dict(waited)
-    enriched["phaseContinuation"] = {
-        "phaseId": phase_id,
+    enriched["phaseContinuations"] = handoffs
+    if len(handoffs) == 1:
+        enriched["phaseContinuation"] = handoffs[0]
+    enriched["phaseContinuationSummary"] = {
         "dispatchedBy": "harness",
         "maxAutomaticAttempts": limit,
-        "attempts": chain,
+        "receipts": len(handoffs),
+        "dispatched": sum(1 for item in handoffs if item.get("status") == "dispatched"),
         "note": (
-            "The harness continued this phase without waking the Lead."
-            " The worker result below is the LAST attempt; earlier attempts are"
-            " listed here and their artifacts are already in the phase ledger."
+            "The harness processed BrowserAgent continuation decisions through"
+            " the durable phase ledger and normal spawn gate. New workers remain"
+            " visible through wait_browser_agents."
         ),
     }
     return enriched
 
 
+def _phase_auto_downstream_dispatch_enabled(agent: Any) -> bool:
+    harness_config = getattr(getattr(agent, "runtime", None), "harness", None)
+    # RuntimeConfig enables the feature by default. Test doubles and older
+    # embedding callers that do not declare the field stay conservative.
+    return bool(getattr(
+        harness_config, "phase_auto_downstream_dispatch_enabled", False,
+    ))
+
+
+def _downstream_auto_dispatch_candidate(
+    agent: Any,
+    result: Any,
+) -> Tuple[Optional[JsonDict], str, JsonDict]:
+    """Return the only mechanically startable successor, if one exists.
+
+    `next_pending_phase` mutates lifecycle state and follows plan order, which
+    is not enough for dispatch: it cannot distinguish an independent pair of
+    ready phases from a serial continuation. This helper uses the read-only
+    scheduler and acts only when there is exactly one ready phase. The regular
+    spawn path is still authoritative for all resource, binding, approval, and
+    dispatch-wave checks.
+    """
+    if not isinstance(result, dict):
+        return None, "worker_result_missing", {}
+    if str(result.get("status") or "").lower() != "done":
+        return None, "worker_not_done", {}
+    source_phase_id = str(result.get("phaseId") or "").strip()
+    if not source_phase_id or source_phase_id == "direct_worker":
+        return None, "source_phase_not_eligible", {}
+    plan = getattr(agent, "task_plan", None)
+    if not isinstance(find_phase(plan, source_phase_id), dict):
+        return None, "source_phase_not_in_plan", {}
+    state = load_task_state(agent.logger)
+    phase_states = state.get("phases") if isinstance(state, dict) else None
+    source_state = (
+        phase_states.get(source_phase_id)
+        if isinstance(phase_states, dict) else None
+    )
+    if not isinstance(source_state, dict) or (
+        str(source_state.get("status") or "") != "validated_done"
+    ):
+        return None, "source_phase_not_validated_done", {}
+    snapshot = schedule_snapshot(plan, agent.logger)
+    ready = snapshot.get("readyPhases") if isinstance(snapshot, dict) else None
+    ready_ids = [str(item) for item in ready] if isinstance(ready, list) else []
+    if len(ready_ids) != 1:
+        return None, (
+            "no_unique_ready_successor" if ready_ids else "no_ready_successor"
+        ), snapshot if isinstance(snapshot, dict) else {}
+    candidate_id = ready_ids[0]
+    if candidate_id == source_phase_id:
+        return None, "source_phase_still_ready", snapshot
+    candidate = find_phase(plan, candidate_id)
+    if not isinstance(candidate, dict):
+        return None, "ready_phase_not_in_plan", snapshot
+    if not _phase_is_declared_downstream(plan, source_phase_id, candidate):
+        # A single independently-ready phase is still a business scheduling
+        # choice. Only a dependency, an implicit ordered dependency, or a
+        # later reviewed dispatch wave makes this a mechanical consequence of
+        # the phase that just completed.
+        return None, "ready_phase_not_declared_downstream", snapshot
+    return candidate, "", snapshot
+
+
+def _phase_is_declared_downstream(
+    plan: Any,
+    source_phase_id: str,
+    candidate: JsonDict,
+) -> bool:
+    """Whether plan structure, rather than timing, orders this handoff."""
+    dependencies = candidate.get("depends_on")
+    if isinstance(dependencies, list):
+        if source_phase_id in {
+            str(value).strip() for value in dependencies
+            if str(value).strip()
+        }:
+            return True
+    phases = plan.get("phases") if isinstance(plan, dict) else None
+    ordered = (
+        [item for item in phases if isinstance(item, dict)]
+        if isinstance(phases, list) else []
+    )
+    source_index = next((
+        index for index, phase in enumerate(ordered)
+        if str(phase.get("id") or "") == source_phase_id
+    ), -1)
+    candidate_id = str(candidate.get("id") or "")
+    candidate_index = next((
+        index for index, phase in enumerate(ordered)
+        if str(phase.get("id") or "") == candidate_id
+    ), -1)
+    if (
+        dependencies is None
+        and source_index >= 0
+        and candidate_index > source_index
+    ):
+        # Omitted dependencies mean the scheduler's documented implicit order.
+        return True
+    source = find_phase(plan, source_phase_id)
+    source_wave = (
+        source.get("dispatch_wave") if isinstance(source, dict) else None
+    )
+    candidate_wave = candidate.get("dispatch_wave")
+    return (
+        isinstance(source_wave, int)
+        and not isinstance(source_wave, bool)
+        and isinstance(candidate_wave, int)
+        and not isinstance(candidate_wave, bool)
+        # A later wave is an ordered successor. The same wave is an
+        # operator-reviewed concurrency group, so when one member finishes it
+        # may also trigger capacity refill for a still-pending sibling.
+        and candidate_wave >= source_wave
+    )
+
+
+def _browser_concurrency_headroom(agent: Any) -> int:
+    """Free running-worker capacity governed only by max_browser_agents."""
+    harness_config = getattr(getattr(agent, "runtime", None), "harness", None)
+    try:
+        limit = int(getattr(harness_config, "max_browser_agents", 1) or 1)
+    except (TypeError, ValueError):
+        limit = 1
+    limit = max(1, limit)
+    spawner = getattr(agent, "spawner", None)
+    slots = getattr(spawner, "_slots", None)
+    if isinstance(slots, dict):
+        running = sum(
+            1 for slot in slots.values()
+            if getattr(slot, "status", "") in {"starting", "running"}
+            or bool(getattr(slot, "current_worker_id", None))
+        )
+        return max(0, limit - running)
+    handles = getattr(spawner, "_handles", None)
+    if isinstance(handles, dict):
+        running = 0
+        for handle in handles.values():
+            task = getattr(handle, "async_task", None)
+            if task is not None and not task.done():
+                running += 1
+        return max(0, limit - running)
+    return limit
+
+
+def _downstream_auto_dispatch_candidates(
+    agent: Any,
+    sources: List[JsonDict],
+) -> Tuple[List[JsonDict], str, JsonDict]:
+    """Return the reviewed ready wave that follows fresh completions."""
+    if not sources:
+        return [], "worker_result_missing", {}
+    plan = getattr(agent, "task_plan", None)
+    source_phase_ids: List[str] = []
+    state = load_task_state(agent.logger)
+    phase_states = state.get("phases") if isinstance(state, dict) else None
+    for source in sources:
+        if str(source.get("status") or "").lower() != "done":
+            return [], "worker_not_done", {}
+        phase_id = str(source.get("phaseId") or "").strip()
+        if not phase_id or phase_id == "direct_worker":
+            return [], "source_phase_not_eligible", {}
+        if not isinstance(find_phase(plan, phase_id), dict):
+            return [], "source_phase_not_in_plan", {}
+        phase_state = (
+            phase_states.get(phase_id) if isinstance(phase_states, dict) else None
+        )
+        if not isinstance(phase_state, dict) or (
+            str(phase_state.get("status") or "") != "validated_done"
+        ):
+            return [], "source_phase_not_validated_done", {}
+        source_phase_ids.append(phase_id)
+
+    snapshot = schedule_snapshot(plan, agent.logger)
+    ready_ids = snapshot.get("readyPhases") if isinstance(snapshot, dict) else None
+    ready_ids = [str(value) for value in ready_ids] if isinstance(ready_ids, list) else []
+    candidates: List[JsonDict] = []
+    for phase_id in ready_ids:
+        phase = find_phase(plan, phase_id)
+        phase_state = (
+            phase_states.get(phase_id) if isinstance(phase_states, dict) else None
+        )
+        attempts = (
+            phase_state.get("attempts") if isinstance(phase_state, dict) else None
+        )
+        if (
+            isinstance(phase, dict)
+            and isinstance(phase_state, dict)
+            and str(phase_state.get("status") or "pending") == "pending"
+            and not attempts
+        ):
+            candidates.append(phase)
+    if not candidates:
+        return [], "no_unattempted_ready_successor", snapshot
+    if any(
+        not any(
+            _phase_is_declared_downstream(plan, source_phase_id, candidate)
+            for source_phase_id in source_phase_ids
+        )
+        for candidate in candidates
+    ):
+        return [], "ready_phase_not_declared_downstream", snapshot
+    if len(candidates) > 1:
+        waves = {
+            candidate.get("dispatch_wave") for candidate in candidates
+            if isinstance(candidate.get("dispatch_wave"), int)
+            and not isinstance(candidate.get("dispatch_wave"), bool)
+        }
+        # Multiple ready phases are automatically started only when the
+        # approved plan explicitly puts every one in the same scheduling wave.
+        # Mere task-type equality is not enough to infer independence.
+        if len(waves) != 1 or any(
+            not isinstance(candidate.get("dispatch_wave"), int)
+            or isinstance(candidate.get("dispatch_wave"), bool)
+            for candidate in candidates
+        ):
+            return [], "multiple_ready_without_common_dispatch_wave", snapshot
+    return candidates, "", snapshot
+
+
+async def _auto_dispatch_next_phase(
+    ctx: ToolContext,
+    waited: JsonDict,
+) -> JsonDict:
+    """Dispatch an approved ready wave after fresh completion events.
+
+    This is deliberately narrower than Lead scheduling. It cannot merge a
+    batch's business results, infer concurrency from task type, override a
+    caller's deadline, or decide whether an incomplete phase deserves a new
+    attempt. Multiple phases run only when the approved plan puts them in the
+    same dispatch wave. Every start still passes through the ordinary spawn
+    gate, including its max_browser_agents limit.
+    """
+    agent = ctx.agent
+    if not _phase_auto_downstream_dispatch_enabled(agent):
+        return waited
+    # A caller that supplies a deadline has explicitly asked to regain control
+    # at that deadline.  Honour it rather than silently starting work which
+    # can outlive the requested wait.  Worker selection and FIRST_COMPLETED
+    # are not decision boundaries, though: they are the normal way an event
+    # driven wait learns that one phase has completed.
+    if ctx.tool_input.get("timeout_seconds") is not None:
+        return waited
+    completed = waited.get("completed") if isinstance(waited, dict) else None
+    if not isinstance(completed, list) or not completed:
+        return waited
+    sources = [source for source in completed if isinstance(source, dict)]
+    if len(sources) != len(completed) or any(
+        str(source.get("status") or "").lower() != "done"
+        for source in sources
+    ):
+        return waited
+    candidates, _reason, snapshot = _downstream_auto_dispatch_candidates(
+        agent, sources,
+    )
+    if not candidates:
+        return waited
+    headroom = _browser_concurrency_headroom(agent)
+    if headroom <= 0:
+        return waited
+    source_phase_ids = list(dict.fromkeys(
+        str(source.get("phaseId") or "").strip() for source in sources
+        if str(source.get("phaseId") or "").strip()
+    ))
+    source_worker_ids = list(dict.fromkeys(
+        str(source.get("workerId") or "").strip() for source in sources
+        if str(source.get("workerId") or "").strip()
+    ))
+    dispatches: List[JsonDict] = []
+    for phase in candidates[:headroom]:
+        phase_id = str(phase.get("id") or "")
+        spawned = await _lead_spawn_browser_agent(ToolContext(
+            agent=agent,
+            tool_call={
+                "name": "spawn_browser_agent",
+                "id": f"phase-downstream-{'-'.join(source_phase_ids)}-{phase_id}",
+            },
+            tool_input={
+                "phase_id": phase_id,
+                "_runtime_dispatch_origin": "runtime_phase_downstream",
+            },
+            step=ctx.step,
+        ))
+        dispatch_status = (
+            str(spawned.get("status") or "")
+            if isinstance(spawned, dict) else ""
+        )
+        receipt = {
+            "sourcePhaseIds": source_phase_ids,
+            "sourceWorkerIds": source_worker_ids,
+            **({"sourcePhaseId": source_phase_ids[0]} if len(source_phase_ids) == 1 else {}),
+            **({"sourceWorkerId": source_worker_ids[0]} if len(source_worker_ids) == 1 else {}),
+            "phaseId": phase_id,
+            "dispatchWave": phase.get("dispatch_wave"),
+            "dispatchedBy": "harness",
+            "status": dispatch_status or "invalid_spawn_result",
+            "workerId": spawned.get("workerId") if isinstance(spawned, dict) else None,
+            "spawnResult": spawned if dispatch_status != "running" else None,
+            "note": (
+                "The harness dispatched an approved ready-wave phase through"
+                " the normal spawn gate; call wait_browser_agents to observe it."
+            ),
+        }
+        dispatches.append(receipt)
+        agent.logger.write("lead.phase_downstream_dispatch", {
+            **receipt,
+            "scheduleReadyPhases": snapshot.get("readyPhases"),
+            "maxBrowserAgents": int(getattr(
+                getattr(agent.runtime, "harness", None), "max_browser_agents", 1,
+            ) or 1),
+        })
+        if dispatch_status != "running":
+            break
+    enriched = dict(waited)
+    enriched["phaseDownstreamDispatches"] = dispatches
+    if len(dispatches) == 1:
+        enriched["phaseDownstreamDispatch"] = dispatches[0]
+    enriched["phaseDownstreamDispatchSummary"] = {
+        "dispatchedBy": "harness",
+        "readyCount": len(candidates),
+        "capacityAtDispatch": headroom,
+        "attempted": len(dispatches),
+        "running": sum(1 for item in dispatches if item.get("status") == "running"),
+        "maxBrowserAgents": int(getattr(
+            getattr(agent.runtime, "harness", None), "max_browser_agents", 1,
+        ) or 1),
+    }
+    return enriched
+
+
+def _lead_wait_seen_worker_ids(agent: Any) -> Set[str]:
+    """Return the in-process Lead set of completion receipts already consumed.
+
+    ``wait_browser_agents`` historically includes completed handles in every
+    later wait.  That is useful for inspection, but unsafe for automatic
+    scheduling: a repeated wait could otherwise treat the same p1 completion
+    as a fresh event and re-dispatch p2.  Worker ids are generated once per
+    spawn and are therefore a sufficient event identity within one Lead process.
+    This set is not a persistent replay ledger.  After a process restart, task
+    state and the ordinary spawn gate remain responsible for recovery safety.
+    """
+    seen = getattr(agent, "_lead_wait_seen_worker_ids", None)
+    if not isinstance(seen, set):
+        seen = set()
+        setattr(agent, "_lead_wait_seen_worker_ids", seen)
+    return seen
+
+
+def _new_wait_completions(agent: Any, waited: Any) -> List[JsonDict]:
+    """Consume each worker completion once, preserving anonymous test receipts."""
+    completed = waited.get("completed") if isinstance(waited, dict) else None
+    values = completed if isinstance(completed, list) else []
+    seen = _lead_wait_seen_worker_ids(agent)
+    fresh: List[JsonDict] = []
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        worker_id = str(value.get("workerId") or "").strip()
+        if worker_id and worker_id in seen:
+            continue
+        if worker_id:
+            seen.add(worker_id)
+        fresh.append(value)
+    return fresh
+
+
+def _append_unique_worker_results(
+    target: List[JsonDict],
+    values: Any,
+) -> None:
+    """Append final worker receipts without showing one worker twice."""
+    incoming = values if isinstance(values, list) else []
+    known = {
+        str(item.get("workerId") or "").strip()
+        for item in target if isinstance(item, dict)
+        and str(item.get("workerId") or "").strip()
+    }
+    for value in incoming:
+        if not isinstance(value, dict):
+            continue
+        worker_id = str(value.get("workerId") or "").strip()
+        if worker_id and worker_id in known:
+            # A phase continuation replaces its earlier attempt with the
+            # final receipt.  Keep the final receipt rather than the stale one.
+            for index, prior in enumerate(target):
+                if str(prior.get("workerId") or "").strip() == worker_id:
+                    target[index] = value
+                    break
+            continue
+        target.append(value)
+        if worker_id:
+            known.add(worker_id)
+
+
+def _wait_candidate_worker_ids(
+    agent: Any,
+    requested: Any,
+) -> Tuple[Optional[List[str]], bool]:
+    """Choose live or not-yet-consumed workers for one event wait.
+
+    The second return value says whether the spawner exposed its handle
+    registry.  Older embedding callers and focused test doubles keep their
+    existing wait behaviour when it is unavailable.
+    """
+    spawner = getattr(agent, "spawner", None)
+    handles = getattr(spawner, "_handles", None)
+    if not isinstance(handles, dict):
+        return (
+            list(requested) if isinstance(requested, list) else requested,
+            False,
+        )
+    requested_ids = (
+        [str(value) for value in requested if str(value).strip()]
+        if isinstance(requested, list) and requested else list(handles)
+    )
+    seen = _lead_wait_seen_worker_ids(agent)
+    candidates: List[str] = []
+    for worker_id in requested_ids:
+        handle = handles.get(worker_id)
+        if handle is None:
+            # Preserve the public API's behaviour for an unknown explicit id.
+            if isinstance(requested, list):
+                candidates.append(worker_id)
+            continue
+        task = getattr(handle, "async_task", None)
+        done = bool(task is not None and task.done())
+        if not done or worker_id not in seen:
+            candidates.append(worker_id)
+    return candidates, True
+
+
+def _wait_result_lead_reason(
+    agent: Any,
+    waited: JsonDict,
+) -> Optional[str]:
+    """Whether a completed event leaves a non-mechanical decision.
+
+    This gate deliberately uses only worker status and the reviewed schedule.
+    It does not infer whether a failed scrape is worth retrying or which
+    business result is preferable; those choices remain with the Lead.
+    """
+    completed = waited.get("completed") if isinstance(waited, dict) else None
+    if not isinstance(completed, list) or not completed:
+        return None
+    continuation_receipts = waited.get("phaseContinuations")
+    continuation_receipts = (
+        continuation_receipts if isinstance(continuation_receipts, list) else []
+    )
+    dispatched_receipt_ids = {
+        str(item.get("receiptId") or "")
+        for item in continuation_receipts if isinstance(item, dict)
+        and str(item.get("status") or "") == "dispatched"
+    }
+    saw_completed_phase = False
+    for result in completed:
+        if not isinstance(result, dict):
+            return "invalid_worker_receipt"
+        if str(result.get("status") or "").lower() != "done":
+            receipt_id = str(result.get("continuationReceiptId") or "")
+            if receipt_id and receipt_id in dispatched_receipt_ids:
+                continue
+            return "worker_incomplete_without_dispatched_continuation"
+        saw_completed_phase = True
+        phase_id = str(result.get("phaseId") or "").strip()
+        if not phase_id or phase_id == "direct_worker":
+            return "direct_or_unbound_worker_completed"
+        state = load_task_state(agent.logger)
+        phases = state.get("phases") if isinstance(state, dict) else None
+        phase_state = phases.get(phase_id) if isinstance(phases, dict) else None
+        if not isinstance(phase_state, dict) or (
+            str(phase_state.get("status") or "") != "validated_done"
+        ):
+            return "phase_not_validated_done"
+
+    # Every fresh receipt was an incomplete attempt whose explicit model
+    # continuation has already been dispatched. Its phase remains nonterminal
+    # by design, so a scheduler snapshot cannot create a new Lead decision.
+    if not saw_completed_phase:
+        return None
+
+    snapshot = schedule_snapshot(getattr(agent, "task_plan", None), agent.logger)
+    # A ready phase that the automatic dispatcher did not start is an actual
+    # scheduling choice (for example, independent branches), not a progress
+    # update for the runtime to hide.
+    ready_phases = snapshot.get("readyPhases")
+    if ready_phases:
+        # A same-wave phase can remain ready only because max_browser_agents
+        # was full. Stay parked and refill it when a running worker completes;
+        # a free slot here means automatic dispatch declined or failed and the
+        # Lead needs the receipt.
+        if snapshot.get("runningPhases") and _browser_concurrency_headroom(agent) <= 0:
+            return None
+        return "schedule_requires_lead_decision"
+    if snapshot.get("exhaustedPhases"):
+        return "schedule_requires_lead_decision"
+    waiting = snapshot.get("waitingPhases")
+    running = snapshot.get("runningPhases")
+    if isinstance(waiting, list) and waiting and not running:
+        return "dependency_wait_without_running_worker"
+    return None
+
+
+def _wait_result_requires_lead(agent: Any, waited: JsonDict) -> bool:
+    return _wait_result_lead_reason(agent, waited) is not None
+
+
+def _wait_result_with_completions(
+    agent: Any,
+    waited: JsonDict,
+    completed: List[JsonDict],
+    automatic_handoffs: List[JsonDict],
+) -> JsonDict:
+    """Project a sequence of internal event waits as one public receipt."""
+    result = dict(waited)
+    result["completed"] = completed
+    if automatic_handoffs:
+        result["automaticHandoffs"] = automatic_handoffs
+    pending = result.get("pending")
+    if isinstance(pending, list):
+        result["status"] = "partial" if pending else "done"
+    result["scheduleSnapshot"] = schedule_snapshot(
+        getattr(agent, "task_plan", None), agent.logger,
+    )
+    return result
+
+
 @LEAD_TOOLS.register(
     name="wait_browser_agents",
-    description="Wait for spawned BrowserAgents to complete; wait for all of them or the first one to finish.",
+    description=(
+        "Wait for BrowserAgent completions. An ordinary all-worker wait without "
+        "a deadline is event-driven: deterministic continuations and unique "
+        "downstream phases run while the Lead remains parked."
+    ),
     input_schema=_wait_browser_agents_schema,
 )
 async def _lead_wait_browser_agents(ctx: ToolContext) -> JsonDict:
-    waited = await ctx.agent.spawner.wait_browser_agents(
-        worker_ids=ctx.tool_input.get("worker_ids"),
-        mode=ctx.tool_input.get("mode", "all"),
-        timeout_seconds=ctx.tool_input.get("timeout_seconds"),
+    agent = ctx.agent
+    requested_ids = ctx.tool_input.get("worker_ids")
+    requested_mode = str(ctx.tool_input.get("mode") or "all").lower()
+    timeout_seconds = ctx.tool_input.get("timeout_seconds")
+    downstream_enabled = _phase_auto_downstream_dispatch_enabled(agent)
+    continuation_enabled = _phase_auto_continuation_limit(agent) > 0
+
+    # Preserve explicitly bounded and targeted waits.  The ordinary execution
+    # path is the unbounded all-worker wait; there we can observe completions
+    # one at a time internally, perform deterministic handoffs, and keep the
+    # Lead asleep until a real decision or final result exists.
+    park_until_decision = (
+        requested_ids is None
+        and requested_mode == "all"
+        and timeout_seconds is None
+        and (downstream_enabled or continuation_enabled)
     )
-    return await _auto_continue_phase(ctx, waited)
+    if not park_until_decision:
+        waited = await agent.spawner.wait_browser_agents(
+            worker_ids=requested_ids,
+            mode=requested_mode,
+            timeout_seconds=timeout_seconds,
+        )
+        fresh = _new_wait_completions(agent, waited)
+        if not fresh:
+            return waited
+        automatic = dict(waited)
+        automatic["completed"] = fresh
+        automatic = await _auto_continue_phase(ctx, automatic)
+        automatic = await _auto_dispatch_next_phase(ctx, automatic)
+        automatic["scheduleSnapshot"] = schedule_snapshot(
+            getattr(agent, "task_plan", None), agent.logger,
+        )
+        return automatic
+
+    collected: List[JsonDict] = []
+    automatic_handoffs: List[JsonDict] = []
+    while True:
+        candidate_ids, registry_available = _wait_candidate_worker_ids(
+            agent, requested_ids,
+        )
+        if registry_available and not candidate_ids:
+            return _wait_result_with_completions(
+                agent,
+                {"status": "done", "completed": [], "pending": []},
+                collected,
+                automatic_handoffs,
+            )
+
+        waited = await agent.spawner.wait_browser_agents(
+            worker_ids=candidate_ids,
+            mode="first",
+            timeout_seconds=None,
+        )
+        fresh = _new_wait_completions(agent, waited)
+        if not fresh:
+            # The spawner can return empty after a slot was retired while the
+            # Lead was parked.  It is an observable state change, so return it
+            # rather than converting it into an unbounded local loop.
+            return _wait_result_with_completions(
+                agent,
+                waited, collected, automatic_handoffs,
+            )
+
+        automatic = dict(waited)
+        automatic["completed"] = fresh
+        automatic = await _auto_continue_phase(ctx, automatic)
+        automatic = await _auto_dispatch_next_phase(ctx, automatic)
+        final_completed = automatic.get("completed")
+        _new_wait_completions(
+            agent, {"completed": final_completed},
+        )
+        _append_unique_worker_results(collected, final_completed)
+        continuation_receipts = automatic.get("phaseContinuations")
+        if isinstance(continuation_receipts, list):
+            automatic_handoffs.extend(
+                dict(receipt) for receipt in continuation_receipts
+                if isinstance(receipt, dict)
+            )
+        dispatch_receipts = automatic.get("phaseDownstreamDispatches")
+        if isinstance(dispatch_receipts, list):
+            automatic_handoffs.extend(
+                dict(receipt) for receipt in dispatch_receipts
+                if isinstance(receipt, dict)
+            )
+        else:
+            receipt = automatic.get("phaseDownstreamDispatch")
+            if isinstance(receipt, dict):
+                automatic_handoffs.append(dict(receipt))
+
+        lead_reason = _wait_result_lead_reason(agent, automatic)
+        if lead_reason is not None:
+            agent.logger.write("lead.wait.woken", {
+                "reason": lead_reason,
+                "completedWorkerIds": [
+                    item.get("workerId") for item in (final_completed or [])
+                    if isinstance(item, dict)
+                ],
+                "automaticHandoffCount": len(automatic_handoffs),
+            })
+            return _wait_result_with_completions(
+                agent,
+                automatic, collected, automatic_handoffs,
+            )
+        if not automatic.get("pending") and not registry_available:
+            return _wait_result_with_completions(
+                agent,
+                automatic, collected, automatic_handoffs,
+            )
 
 
 @LEAD_TOOLS.register(
@@ -4240,7 +4945,14 @@ async def _lead_wait_browser_agents(ctx: ToolContext) -> JsonDict:
     input_schema=_list_browser_agents_schema,
 )
 async def _lead_list_browser_agents(ctx: ToolContext) -> JsonDict:
-    return ctx.agent.spawner.list_browser_agents()
+    recovery = None
+    if ctx.tool_input.get("refresh_connection") is True:
+        recovery = await ctx.agent.spawner.refresh_browser_connection(
+            str(getattr(ctx.agent, "task_fleet_reference", "") or ""))
+    result = ctx.agent.spawner.list_browser_agents()
+    if recovery is not None:
+        result["connectionRecovery"] = recovery
+    return result
 
 
 @LEAD_TOOLS.register(
@@ -4326,6 +5038,20 @@ async def _lead_search_harness_guides(ctx: ToolContext) -> JsonDict:
         audience="lead",
         limit=optional_int(ctx.tool_input.get("limit"), 5) or 5,
     )
+
+
+@LEAD_TOOLS.register(
+    name="revalidate_phase_artifacts",
+    description="Recheck existing phase artifacts without spawning a worker or replaying browser actions. Inspect first; accept only after reviewing the original goal and evidence. Keeps phase identity, raw attempt history and budgets.",
+    input_schema={"type": "object", "properties": {
+        "phase_id": {"type": "string"}, "plan_version": {"type": "integer"},
+        "decision": {"type": "string", "enum": ["inspect", "accept"], "default": "inspect"},
+        "reason": {"type": "string"}}, "required": ["phase_id", "plan_version"], "additionalProperties": False},
+    loop_guard=False,
+)
+async def _lead_revalidate_phase_artifacts(ctx: ToolContext) -> JsonDict:
+    from harness.task_control.revalidate import revalidate_phase_artifacts
+    return revalidate_phase_artifacts(ctx.agent, **ctx.tool_input)
 
 
 @LEAD_TOOLS.register(

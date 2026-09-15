@@ -224,15 +224,26 @@ def _page_state_is_usable(response: Any) -> bool:
         return False
     return True
 
-def _page_create_infrastructure_classification() -> JsonDict:
+def _page_create_infrastructure_classification(probe: Optional[JsonDict] = None) -> JsonDict:
+    probe = probe or {}
+    delegated = (probe.get("fleetList") or {}).get("skipped") is True
+    checked = probe.get("checkedPages") or []
+    inventory_checked = bool((probe.get("fleetList") or {}).get("ok")) and all(
+        item.get("ok") for item in probe.get("pageLists") or [])
+    kind = ("no_delegated_page_candidate" if delegated and not checked else
+            "page_recovery_probe_incomplete" if (not checked and not inventory_checked) or any(p.get("error") for p in checked)
+            else "no_usable_page_in_probe_scope")
     return {
-        "category": "blocked_infrastructure",
-        "type": "browser_unavailable_or_no_page",
-        "method": "Page.create",
+        "category": "blocked_infrastructure", "type": kind, "method": "Page.create",
         "hint": (
-            "Page.create failed with -32005 and Fleet/Page probing found no"
-            " usable existing page. Reconnect or rebuild the Browser Client"
-            " before retrying this worker."
+            "Page.create initial load failed; the page may already exist. "
+            + ("No delegated page candidate was available for this worker to probe. "
+               if kind == "no_delegated_page_candidate" else
+               "Page availability could not be established by the bounded probes. "
+               if kind == "page_recovery_probe_incomplete" else
+               "No usable page was found among the bounded, permitted candidates. ")
+            + "This does not establish global Fleet loss or a disconnected backend. "
+              "Use the recorded execution/page events and connection facts before deciding recovery."
         ),
     }
 
@@ -241,7 +252,7 @@ def _page_create_terminal_answer(
     original_error: str,
     probe: JsonDict,
 ) -> str:
-    classification = _page_create_infrastructure_classification()
+    classification = _page_create_infrastructure_classification(probe)
     payload = {
         "outcome": "blocked",
         "data": {},
@@ -249,7 +260,7 @@ def _page_create_terminal_answer(
             {
                 "method": "Page.create",
                 "error": original_error[:500],
-                "probeClassification": "browser_unavailable_or_no_page",
+                "probeClassification": classification["type"],
                 "checkedPageCount": len(probe.get("checkedPages") or []),
             }
         ],
@@ -261,8 +272,8 @@ def _page_create_terminal_answer(
             }
         ],
         "next_steps": [
-            "Reconnect or restart the Browser Client/playground backend, then retry the worker.",
-            "If Fleet.list/Page.list shows reusable pages later, prefer reusing one instead of creating a new page.",
+            classification["hint"],
+            "Preserve Fleet identity and page ownership; do not automatically repeat Page.create.",
         ],
     }
     return json.dumps(payload, ensure_ascii=False, default=str)
@@ -434,21 +445,20 @@ async def _recover_page_create_32005(
             }
             return recovered, False
 
-    probe["classification"] = "browser_unavailable_or_no_page"
-    classification = _page_create_infrastructure_classification()
+    classification = _page_create_infrastructure_classification(probe)
+    probe["classification"] = classification["type"]
     terminal = {
         "method": "Page.create",
         "params": params,
         "status": "incomplete",
         "terminal": True,
         "error": (
-            "Page.create failed with -32005 and no usable existing page was"
-            " found via Fleet.list/Page.list/Page.getState."
+            classification["hint"]
         ),
         "classification": classification,
         "errorClassification": {
-            "type": "browser_unavailable_or_no_page",
-            "suggested_action": "abort_worker_reconnect_browser_then_retry",
+            "type": classification["type"],
+            "suggested_action": "lead_review_page_and_transport_evidence",
             "method": "Page.create",
         },
         "pageCreateRecovery": probe,
@@ -457,9 +467,8 @@ async def _recover_page_create_32005(
             probe=probe,
         ),
         "next_instruction": (
-            "Stop this worker: the browser backend has no usable page after"
-            " Page.create -32005, so no further browser action can be"
-            " dispatched from it."
+            "Return the recorded page-create and probe facts to Lead. Do not infer"
+            " global unavailability or replay the creation; the page may already exist."
         ),
     }
     return terminal, True

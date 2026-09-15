@@ -587,9 +587,7 @@ async def _execute_browser_capability_tool(
                     {"redact_params": sensitive_params}
                     if sensitive_params else {}
                 )
-                response = await runner.call(
-                    method, params, **runner_kwargs
-                )
+                response = await runner.call(method, params, **runner_kwargs)
             except ABCPTransportError as exc:
                 # JSON-RPC action timeouts may happen after Electron has begun
                 # a download.  Contain this one method locally so reconciliation

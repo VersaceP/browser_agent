@@ -518,6 +518,48 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
             "required": ["pageId", "fleetId", "description", "variables", "steps", "timeout"],
             "additionalProperties": False,
         },
+        "execute_saved_browser_workflow": {
+            "type": "object",
+            "properties": {
+                "pageId": {
+                    "type": "string",
+                    **platform_constraints(_execute_property("pageId"), "pattern", "format"),
+                },
+                "fleetId": {
+                    "type": "string",
+                    **platform_constraints(_execute_property("fleetId"), "pattern", "format"),
+                },
+                "definitionRef": {"type": "string", "minLength": 1},
+                "definitionHash": {"type": "string", "minLength": 1},
+                "variables": {
+                    "type": "object",
+                    "description": "Per-execution variable overrides; pass {} when unchanged.",
+                    "additionalProperties": True,
+                },
+                "operations": {
+                    "type": "array",
+                    "maxItems": 64,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "op": {"type": "string", "enum": ["add", "set", "remove"]},
+                            "path": {"type": "string", "minLength": 1},
+                            "value": {},
+                        },
+                        "required": ["op", "path"],
+                        "additionalProperties": False,
+                    },
+                },
+                "timeout": {
+                    "type": "integer", "minimum": 1000, "maximum": 600000,
+                },
+            },
+            "required": [
+                "pageId", "fleetId", "definitionRef", "definitionHash",
+                "variables", "operations", "timeout",
+            ],
+            "additionalProperties": False,
+        },
         "navigate_verified": {
             "type": "object",
             "properties": {
@@ -801,6 +843,47 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                     "type": "string",
                     "description": "Optional; brief justification (≤ 200 chars) for non-done statuses.",
                 },
+                "continuation": {
+                    "type": ["object", "null"],
+                    "description": (
+                        "Optional BrowserAgent decision for this SAME phase. Use"
+                        " continue_current_phase only when the unfinished objective"
+                        " remains inside the accepted contract; use needs_lead_review"
+                        " when strategy, scope, authorization, or task routing needs"
+                        " Lead judgement. Omit for status=done."
+                    ),
+                    "properties": {
+                        "protocol": {
+                            "type": "string",
+                            "enum": ["browser-continuation-v1"],
+                        },
+                        "action": {
+                            "type": "string",
+                            "enum": [
+                                "continue_current_phase",
+                                "needs_lead_review",
+                            ],
+                        },
+                        "reason": {"type": "string", "minLength": 1, "maxLength": 500},
+                        "remainingObjective": {
+                            "type": "string", "maxLength": 2000,
+                        },
+                        "evidenceRefs": {
+                            "type": "array",
+                            "maxItems": 20,
+                            "items": {"type": "string", "minLength": 1, "maxLength": 1000},
+                        },
+                        "workflowRef": {
+                            "type": ["string", "null"],
+                            "maxLength": 1000,
+                        },
+                    },
+                    "required": [
+                        "protocol", "action", "reason", "remainingObjective",
+                        "evidenceRefs", "workflowRef",
+                    ],
+                    "additionalProperties": False,
+                },
             },
             "required": ["status", "answer"],
             "additionalProperties": False,
@@ -989,6 +1072,45 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                 },
             },
             "required": ["path", "line_offset", "line_limit", "max_bytes"],
+            "additionalProperties": False,
+        },
+        "local_fs_batch": {
+            "type": "object",
+            "properties": {
+                "operations": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 100,
+                    "description": (
+                        "Ordered file operations. Mutations may partially succeed; inspect every"
+                        " result. copy preserves the source. No delete, move, shell, or code execution."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "op": {
+                                "type": "string",
+                                "enum": ["mkdir", "write_text", "write_json", "copy", "stat"],
+                            },
+                            "path": {"type": "string"},
+                            "base": {
+                                "type": ["string", "null"],
+                                "enum": ["task", "desktop", None],
+                                "description": (
+                                    "Base for a relative path. Defaults to task."
+                                    " Desktop/... is also accepted as a Desktop-relative alias."
+                                ),
+                            },
+                            "source": {"type": ["string", "null"]},
+                            "content": {},
+                            "overwrite": {"type": "boolean"},
+                        },
+                        "required": ["op", "path", "overwrite"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["operations"],
             "additionalProperties": False,
         },
         "read_harness_guide": {

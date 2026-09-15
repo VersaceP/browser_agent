@@ -202,6 +202,7 @@ from .dispatch import (  # noqa: F401
     _browser_collect_items,
     _browser_dismiss_overlay,
     _browser_execute_browser_workflow,
+    _browser_execute_saved_browser_workflow,
     _browser_execute_selected_skill,
     _browser_final_answer,
     _browser_find_in_axtree,

@@ -81,6 +81,7 @@ NAVIGATION_METHODS = frozenset({
     "Page.navigate",
     "Page.go",
 })
+PAGE_STATE_METHOD = "Page.getState"
 
 # Harness recovery composites write their own `purpose`, and their actions are
 # about machinery rather than about the task: an overlay that was dismissed is
@@ -147,6 +148,100 @@ def _entry_failed(result: Any) -> bool:
     if isinstance(response, dict) and response.get("error"):
         return True
     return False
+
+
+def _observed_page_url(method: str, result: Any) -> str:
+    """A successful page read's current URL, scrubbed for session storage."""
+    if method != PAGE_STATE_METHOD or _entry_failed(result):
+        return ""
+    if not isinstance(result, dict):
+        return ""
+    response = result.get("response")
+    payload = response if isinstance(response, dict) else result
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        return ""
+    raw_url = str(data.get("url") or "").strip()
+    if not raw_url:
+        return ""
+    scrubbed = _scrub(
+        {"url": raw_url}, PAGE_STATE_METHOD, {"url": raw_url},
+    ).get("url")
+    return _text(scrubbed, 300)
+
+
+def _workflow_result_data(result: Any) -> JsonDict:
+    if not isinstance(result, dict):
+        return {}
+    response = result.get("response")
+    data = response.get("data") if isinstance(response, dict) else None
+    return data if isinstance(data, dict) else {}
+
+
+def _page_url_updates(trace: Any) -> Dict[str, str]:
+    """Latest mechanically observed/requested URL per page, in execution order."""
+    updates: Dict[str, str] = {}
+    if not isinstance(trace, list):
+        return updates
+    for item in trace:
+        if not isinstance(item, dict) or item.get("type") != "browser_call":
+            continue
+        method = str(item.get("method") or "")
+        params = item.get("params")
+        if not isinstance(params, dict):
+            continue
+        if method == WORKFLOW_METHOD:
+            default_page = str(params.get("pageId") or "").strip()
+            workflow_data = _workflow_result_data(item.get("result"))
+            variables = workflow_data.get("variables")
+            results = workflow_data.get("results")
+            if not isinstance(results, list):
+                continue
+            for record in results:
+                if not isinstance(record, dict) or record.get("status") != "success":
+                    continue
+                step = record.get("step")
+                if not isinstance(step, dict):
+                    continue
+                action = str(step.get("action") or "")
+                action_params = step.get("params")
+                if not isinstance(action_params, dict):
+                    action_params = {}
+                page_id = str(action_params.get("pageId") or default_page).strip()
+                if not page_id:
+                    continue
+                if action == PAGE_STATE_METHOD:
+                    observed = _observed_page_url(action, record.get("result"))
+                    if observed:
+                        updates[page_id] = observed
+                elif action in NAVIGATION_METHODS:
+                    raw_url = _dereference(
+                        action_params.get("url") or action_params.get("direction"),
+                        variables,
+                    )
+                    entry = _scrub(
+                        {"url": raw_url}, action,
+                        {**action_params, "url": raw_url},
+                    )
+                    url = _text(entry.get("url"), 300)
+                    if url:
+                        updates[page_id] = url
+            continue
+        page_id = str(params.get("pageId") or "").strip()
+        if not page_id:
+            continue
+        if method == PAGE_STATE_METHOD:
+            observed = _observed_page_url(method, item.get("result"))
+            if observed:
+                updates[page_id] = observed
+        elif method in NAVIGATION_METHODS and not _entry_failed(item.get("result")):
+            entry = _action_entry(
+                method, params, purpose="", worker_id="", phase_id="",
+                step=item.get("step"),
+            )
+            if isinstance(entry, dict) and entry.get("url"):
+                updates[page_id] = str(entry["url"])
+    return updates
 
 
 def _selected_value(params: JsonDict) -> str:
@@ -255,6 +350,7 @@ def _action_entry(
         entry["step"] = step
     if phase_id:
         entry["phaseId"] = str(phase_id)
+    scrub_params = params
     if method == SELECT_METHOD:
         entry["value"] = _selected_value(params)
     elif method in VALUE_METHODS:
@@ -263,10 +359,17 @@ def _action_entry(
             MAX_VALUE_CHARS,
         )
     elif method in NAVIGATION_METHODS:
-        entry["url"] = _text(
-            _dereference(params.get("url") or params.get("direction"), variables), 300,
+        raw_url = _dereference(
+            params.get("url") or params.get("direction"), variables,
         )
-    return _scrub(entry, method, params)
+        entry["url"] = raw_url
+        # Workflow variables may contain the actual credential-bearing URL while
+        # the authored params contain only `$vars.x`.  Scrub the resolved value.
+        scrub_params = {**params, "url": raw_url}
+    scrubbed = _scrub(entry, method, scrub_params)
+    if method in NAVIGATION_METHODS and "url" in scrubbed:
+        scrubbed["url"] = _text(scrubbed.get("url"), 300)
+    return scrubbed
 
 
 def _file_entry(session: JsonDict, entry: JsonDict, *, failed: bool) -> None:
@@ -375,6 +478,8 @@ def extract_page_sessions(
         params = item.get("params")
         if not isinstance(params, dict):
             continue
+        if method == PAGE_STATE_METHOD:
+            continue
         if method == WORKFLOW_METHOD:
             for entry, page_id, failed, error_code in _segment_steps(item):
                 entry["workerId"] = str(worker_id or "")
@@ -399,6 +504,9 @@ def extract_page_sessions(
         if failed:
             entry["errorCode"] = _entry_error_code(result)
         _file_entry(touch(page_id), entry, failed=failed)
+    for page_id, url in _page_url_updates(trace).items():
+        if page_id in sessions:
+            sessions[page_id]["url"] = url
     return sessions
 
 
@@ -535,15 +643,29 @@ def record_page_sessions(
         sessions = extract_page_sessions(
             trace, worker_id=worker_id, phase_id=phase_id,
         )
-        if not sessions:
+        url_updates = _page_url_updates(trace)
+        if not sessions and not url_updates:
             return written
         artifact_paths = [
             str(path) for path in (artifacts or [])
             if isinstance(path, (str, Path)) and str(path).strip()
         ][:MAX_ARTIFACTS]
-        for page_id, session in sessions.items():
-            session["artifacts"] = artifact_paths
-            merged = merge_page_session(load_page_session(logger, page_id), session)
+        page_ids = list(dict.fromkeys([*sessions, *url_updates]))
+        for page_id in page_ids:
+            existing = load_page_session(logger, page_id)
+            session = sessions.get(page_id)
+            if session is None:
+                # A read-only observation may refresh metadata that an earlier
+                # worker already established, but it does not create action
+                # history or a new page-session on its own.
+                if existing is None:
+                    continue
+                session = _empty_session(page_id)
+            else:
+                session["artifacts"] = artifact_paths
+            if url_updates.get(page_id):
+                session["url"] = url_updates[page_id]
+            merged = merge_page_session(existing, session)
             path = _session_path(logger, page_id)
             path.write_text(
                 json.dumps(merged, ensure_ascii=False, indent=2, default=str),

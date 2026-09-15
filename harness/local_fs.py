@@ -18,6 +18,16 @@ from harness.utils import (
 )
 
 
+def _search_excerpt(line, regex, max_bytes):
+    """Keep the actual regex hit visible even on a very long JSONL line."""
+    match = regex.search(line) if regex is not None else None
+    start = max(0, match.start() - min(80, max_bytes // 8)) if match else 0
+    snippet, truncated = truncate_utf8_text(line[start:].rstrip("\r\n"), max_bytes)
+    return {"snippet": snippet, "snippetTruncated": bool(start or truncated),
+            "snippetStartColumn": start + 1,
+            "matchColumn": match.start() + 1 if match else None}
+
+
 def local_fs_search(
     logger: RunLogger,
     *,
@@ -62,6 +72,15 @@ def local_fs_search(
         except re.error as exc:
             return {"status": "failed", "error": f"invalid grep pattern: {exc}"}
 
+    from harness.storage.virtual_fs import db_authoritative_for, virtual_fs_for
+
+    db_authoritative = db_authoritative_for(logger)
+    virtual_paths = set()
+    if db_authoritative:
+        view = virtual_fs_for(logger)
+        if view is not None:
+            virtual_paths = {path for path, _size, _approximate in view.list_files()}
+
     results: List[JsonDict] = []
     total_bytes = 0
     truncated = False
@@ -77,6 +96,12 @@ def local_fs_search(
         if not resolved.is_file():
             continue
         rel = str(resolved.relative_to(root))
+        # In db mode, a logical row is the current source of truth. A file
+        # from a former dual run can remain for operator inspection but must
+        # not shadow it. Unregistered binaries (not listed by VirtualTaskFs)
+        # remain physical files.
+        if db_authoritative and rel in virtual_paths:
+            continue
         size = resolved.stat().st_size
         if regex is None and not event_type:
             hit = {
@@ -103,12 +128,8 @@ def local_fs_search(
                         if not isinstance(event, dict) or event.get("type") != event_type:
                             continue
                     if regex is None or regex.search(line):
-                        excerpt = line.strip()
                         line_bytes = len(line.encode("utf-8"))
-                        excerpt, was_truncated = truncate_utf8_text(
-                            excerpt,
-                            max_bytes_per_hit,
-                        )
+                        excerpt = _search_excerpt(line, regex, max_bytes_per_hit)
                         hit = {
                             "path": str(resolved),
                             "relativePath": rel,
@@ -116,8 +137,8 @@ def local_fs_search(
                             "storage": "file",
                             "line": line_no,
                             "bytes": line_bytes,
-                            "snippet": excerpt,
-                            "snippetTruncated": was_truncated,
+                            **excerpt,
+                            "readHint": {"line_offset": max(0, line_no - 3), "line_limit": 5},
                         }
                         hit_bytes = json_size_bytes(hit)
                         if total_bytes + hit_bytes > max_total_bytes:
@@ -156,9 +177,9 @@ def local_fs_search(
             results.append(hit)
 
     if not truncated and len(results) < max_results:
-        # Whatever the database holds that never became a file. Files win: in
-        # dual mode both sides exist and the on-disk copy is authoritative, and
-        # a legacy worktree has files but no rows at all.
+        # DB-only rows are added after physical files. In db mode all logical
+        # DB paths were removed from the physical scan above; in dual/file
+        # mode the existing FileStore-primary behaviour remains unchanged.
         seen = {str(hit.get("relativePath") or "") for hit in results}
         results, total_bytes, truncated = _search_virtual_files(
             logger,
@@ -246,13 +267,13 @@ def _search_virtual_files(
                     continue
             if regex is not None and not regex.search(line):
                 continue
-            excerpt, was_truncated = truncate_utf8_text(line.strip(), max_bytes_per_hit)
+            excerpt = _search_excerpt(line, regex, max_bytes_per_hit)
             hit = dict(base)
             hit.update({
                 "line": line_no,
                 "bytes": len(line.encode("utf-8")),
-                "snippet": excerpt,
-                "snippetTruncated": was_truncated,
+                **excerpt,
+                "readHint": {"line_offset": max(0, line_no - 3), "line_limit": 5},
             })
             hit_bytes = json_size_bytes(hit)
             if total_bytes + hit_bytes > max_total_bytes:
@@ -275,6 +296,18 @@ def local_fs_read(
     resolved, error = resolve_task_file(logger, path)
     if error or resolved is None:
         return {"status": "failed", "error": error}
+    from harness.storage.virtual_fs import db_authoritative_for
+
+    if db_authoritative_for(logger):
+        virtual = _read_virtual_file(
+            logger,
+            resolved,
+            line_offset=line_offset,
+            line_limit=line_limit,
+            max_bytes=max_bytes,
+        )
+        if virtual is not None:
+            return virtual
     if not resolved.is_file():
         # No file here. Either the backend keeps this content in the database,
         # or the path really is wrong - the virtual read distinguishes the two

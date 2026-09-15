@@ -82,6 +82,11 @@ def autosolve_enabled(agent: Any) -> bool:
     clearance verifier all apply regardless, and behavioral-risk challenges are
     never driven at all.
     """
+    harness = getattr(getattr(agent, "runtime", None), "harness", None)
+    # Multimodal BrowserAgent mode has one perception model: the worker. Do
+    # not let a stale VL config revive a second-model CAPTCHA route.
+    if bool(getattr(harness, "browser_agent_multimodal_enabled", False)):
+        return False
     vl_config = _vl_config(agent)
     if vl_config is None:
         return False

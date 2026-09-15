@@ -337,6 +337,10 @@ class ABCPClient:
         self._closed = False
         self._reader_failure: Optional[BaseException] = None
         self.notifications = NotificationHub()
+        # The platform assigns cursors to durable Agent events.  This remains
+        # transport state: it never decides what an event means, only which
+        # events have already been delivered to the harness.
+        self._event_cursor: Optional[int] = None
 
     async def __aenter__(self) -> "ABCPClient":
         await self.connect()
@@ -344,6 +348,11 @@ class ABCPClient:
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.close()
+
+    @property
+    def connection_usable(self) -> bool:
+        """Local transport fact only; not proof of Fleet/page availability."""
+        return self._ws is not None and not self._closed and self._reader_failure is None
 
     async def connect(self) -> None:
         headers = {}
@@ -539,6 +548,125 @@ class ABCPClient:
         unsubscribe function. Subscribers must not block."""
         return self.notifications.subscribe(callback)
 
+    @property
+    def event_cursor(self) -> Optional[int]:
+        """Largest durable event cursor delivered on this client, if known."""
+
+        return self._event_cursor
+
+    def set_event_cursor(self, cursor: Any, *, reset: bool = False) -> Optional[int]:
+        """Record a server-provided event cursor without inventing progress.
+
+        ``reset`` is reserved for a fresh registration baseline.  Normal event
+        delivery never moves the cursor backwards, which prevents a stale
+        notification from reopening a replay gap.
+        """
+
+        if isinstance(cursor, bool):
+            return self._event_cursor
+        try:
+            normalized = int(cursor)
+        except (TypeError, ValueError):
+            return self._event_cursor
+        if normalized < 0:
+            return self._event_cursor
+        if reset or self._event_cursor is None or normalized >= self._event_cursor:
+            self._event_cursor = normalized
+        return self._event_cursor
+
+    async def replay_events(
+        self,
+        *,
+        after_cursor: Any,
+        limit: int = 100,
+        max_pages: int = 20,
+    ) -> JsonDict:
+        """Read and publish a bounded durable event sequence after a gap.
+
+        ``events.read`` is a WebSocket transport operation rather than an
+        Action, so it deliberately lives here instead of the model-visible
+        capability layer.  Events are published through the same hub as live
+        notifications; stable eventId/cursor de-duplication therefore covers a
+        race between replay and the default live subscription.
+
+        The cursor advances only after every event in a page was delivered to
+        the hub.  A finite page bound prevents an arbitrarily old stream from
+        starving connection recovery; callers can resume from ``nextCursor``.
+        """
+
+        if isinstance(after_cursor, bool):
+            raise ValueError("after_cursor must be a non-negative integer")
+        try:
+            cursor = int(after_cursor)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("after_cursor must be a non-negative integer") from exc
+        if cursor < 0:
+            raise ValueError("after_cursor must be a non-negative integer")
+
+        page_limit = min(500, max(1, int(limit)))
+        page_budget = min(100, max(1, int(max_pages)))
+        initial_cursor = cursor
+        latest_cursor: Optional[int] = None
+        pages_read = 0
+        events_read = 0
+        events_published = 0
+        has_more = False
+
+        while pages_read < page_budget:
+            prior_cursor = cursor
+            page = await self.call(
+                "events.read",
+                {"afterCursor": cursor, "limit": page_limit},
+            )
+            if not isinstance(page, dict):
+                raise RuntimeError("events.read returned a non-object response")
+            events = page.get("events")
+            if not isinstance(events, list):
+                raise RuntimeError("events.read returned no event list")
+            next_cursor = self._event_cursor_value(page.get("nextCursor"))
+            if next_cursor is None or next_cursor < cursor:
+                raise RuntimeError("events.read returned an invalid nextCursor")
+            latest = self._event_cursor_value(page.get("latestCursor"))
+            if latest is not None:
+                latest_cursor = latest
+
+            for event in events:
+                if not isinstance(event, dict):
+                    raise RuntimeError("events.read returned a non-object event")
+                event_name = str(event.get("event") or "").strip()
+                if not event_name:
+                    raise RuntimeError("events.read returned an unnamed event")
+                message: JsonDict = {
+                    "jsonrpc": "2.0",
+                    "method": "System.notification",
+                    "params": {"type": "event", "data": event},
+                }
+                if self.notifications.publish_once(message):
+                    events_published += 1
+                events_read += 1
+
+            # Every event above reached the hub successfully.  Commit only the
+            # server's safe page cursor, never a cursor inferred from payload.
+            self.set_event_cursor(next_cursor)
+            cursor = next_cursor
+            pages_read += 1
+            has_more = bool(page.get("hasMore"))
+            if not has_more:
+                break
+            if next_cursor <= prior_cursor:
+                raise RuntimeError("events.read reported more events without progress")
+
+        return {
+            "afterCursor": initial_cursor,
+            "nextCursor": cursor,
+            "latestCursor": latest_cursor,
+            "pagesRead": pages_read,
+            "eventsRead": events_read,
+            "eventsPublished": events_published,
+            "hasMore": has_more,
+            "truncated": bool(has_more and pages_read >= page_budget),
+        }
+
     async def _read_loop(self) -> None:
         try:
             while not self._closed:
@@ -586,7 +714,38 @@ class ABCPClient:
             self._emit("orphan_response", message)
             return
         self._emit("notify", message)
-        self.notifications.publish_once(message)
+        if self.notifications.publish_once(message):
+            self.set_event_cursor(self._event_cursor_from_message(message))
+
+    @staticmethod
+    def _event_cursor_value(value: Any) -> Optional[int]:
+        if isinstance(value, bool):
+            return None
+        try:
+            cursor = int(value)
+        except (TypeError, ValueError):
+            return None
+        return cursor if cursor >= 0 else None
+
+    @classmethod
+    def _event_cursor_from_message(cls, message: Any) -> Optional[int]:
+        if not isinstance(message, dict):
+            return None
+        candidates: List[Any] = [message]
+        params = message.get("params")
+        if isinstance(params, dict):
+            candidates.append(params)
+            candidates.append(params.get("data"))
+        candidates.append(message.get("data"))
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            if not str(candidate.get("event") or "").strip():
+                continue
+            cursor = cls._event_cursor_value(candidate.get("cursor"))
+            if cursor is not None:
+                return cursor
+        return None
 
     def _pending_for(self, message: JsonDict) -> Optional["_PendingCall"]:
         """The in-flight call this message answers, matched by id alone."""

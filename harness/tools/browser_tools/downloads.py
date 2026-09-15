@@ -85,7 +85,10 @@ def _normalize_download_record(raw: Any) -> Optional[JsonDict]:
     }
     if failure["errorCode"] or failure["errorMessage"]:
         record.update(failure)
-    for optional in ("expiresAt", "pageId", "sourceType"):
+    for optional in (
+        "expiresAt", "pageId", "sourceType", "sourceAction", "workflowId",
+        "workflowStepPath",
+    ):
         value = raw.get(optional)
         if value is not None:
             record[optional] = value
@@ -329,6 +332,54 @@ def _remember_download_record(agent: Any, record: JsonDict) -> JsonDict:
         agent, receipt, operation_key=keys[0] if keys else explicit_key
     )
     return receipt
+
+
+def remember_workflow_download_result(
+    agent: Any,
+    result: Any,
+    *,
+    action: str,
+    workflow_id: str,
+    step_path: str,
+) -> List[JsonDict]:
+    """Merge successful Workflow Download child receipts into the same ledger.
+
+    Workflow.execute is opaque at the RPC boundary, but its terminal result
+    identifies each completed child action. Keeping those records in a second
+    workflow-only list made retries and handoffs lose download identity.
+    """
+    remembered: List[JsonDict] = []
+    action = str(action or "").strip()
+    store = _download_receipt_store(agent)
+    attributed_paths = {
+        str(path) for path in (getattr(agent, "artifacts", []) or [])
+        if str(path).strip()
+    }
+
+    def already_owned(raw: JsonDict) -> bool:
+        normalized = _normalize_download_record(raw)
+        if normalized is None:
+            return False
+        if str(normalized.get("savePath") or "") in attributed_paths:
+            return True
+        return any(
+            key in store for key in _download_operation_keys(normalized)
+        )
+
+    for raw in _download_records(result):
+        # A list/control child observes the fleet-wide download registry. It
+        # may refresh a download this worker already started, but it must not
+        # adopt another worker's or another task's record merely because the
+        # record appeared in a successful Workflow result.
+        if action != "Download.start" and not already_owned(raw):
+            continue
+        record = dict(raw)
+        record["source"] = "Workflow.execute"
+        record["sourceAction"] = action
+        record["workflowId"] = str(workflow_id or "")
+        record["workflowStepPath"] = str(step_path or "")
+        remembered.append(_remember_download_record(agent, record))
+    return remembered
 
 def _remember_unverified_download_timeout(
     agent: Any,

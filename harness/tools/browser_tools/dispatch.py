@@ -4,6 +4,7 @@ harness.tools.browser_tools.dispatch - Tool registry, dispatcher and model-facin
 
 import asyncio
 import copy
+import json
 import re
 import uuid
 from functools import lru_cache
@@ -21,6 +22,7 @@ from harness.lifecycle import LifecycleContext
 from harness.lifecycle import lifecycle_for
 from harness.local_fs import local_fs_read
 from harness.local_fs import local_fs_search
+from harness.file_tools import local_fs_batch
 from harness.prompts import read_harness_guide
 from harness.prompts import search_harness_guides
 from harness.observation.page_lifecycle import PageLifecycleTracker
@@ -118,27 +120,6 @@ def _prepare_navigation_context(
             "sourcePageId": source_page_id,
             "tool_was_executed": False,
         }
-    tracker = getattr(agent, "content_completeness_tracker", None)
-    if (
-        tracker is None
-        or not getattr(tracker, "enabled", False)
-        or not hasattr(tracker, "can_designate_recovery_source")
-        or not tracker.can_designate_recovery_source(source_page_id)
-    ):
-        return {}, {
-            "status": "invalid_navigation_context",
-            "error": (
-                "sourcePageId is not a tracker-confirmed unresolved"
-                " route-recovery source"
-            ),
-            "sourcePageId": source_page_id,
-            "tool_was_executed": False,
-            "next_instruction": (
-                "Use Page.getState plus DOM evidence on the source page first."
-                " Supply navigation_context only after contentCompleteness"
-                " reports materialization_required or route_recovery_required."
-            ),
-        }
     return {
         "kind": kind,
         "sourcePageId": source_page_id,
@@ -195,10 +176,9 @@ def _annotate_target_independent_read(
     """Record that the AX-refresh obligation was bypassed, and still stands.
 
     The bypass buys one page-wide look at structure. It does NOT clear
-    `requires_ax_refresh`: every id in the returned tree is as unrefreshed as
-    it was a moment ago, so the next target-bound call must still refresh.
-    Saying so on the receipt is the whole reason this exemption is confined to
-    the model path.
+    `requires_ax_refresh`: a document-root read does not refresh cached AX
+    handles. Calls using those handles still need a current AXTree; selectors
+    and other targets remain subject to their own identity checks.
     """
 
     if not before or not isinstance(response, dict):
@@ -230,7 +210,7 @@ def _annotate_target_independent_read(
         "note": (
             "A document-root read needs no prior element, so it ran without the"
             " AXTree refresh. The refresh obligation is unchanged: call"
-            " DOM.getAXTree before any call that names a target."
+            " DOM.getAXTree before reusing an AX handle."
         ),
         "stableEvidence": bool(stable),
     }
@@ -363,40 +343,18 @@ async def _page_lifecycle_guard_before(
                 " recovery, dialog/chooser close, or a download state change."
             ),
         }
-    if (
-        state.requires_ax_refresh
-        and method not in {*lifecycle_recovery_methods, "DOM.getAXTree"}
-        and not is_file_control
-    ):
-        # The gate's own reason is that navigation invalidated every prior DOM
-        # target. A document-root read holds no prior target, so the reason
-        # does not reach it. The exemption is opt-in per call site rather than
-        # applied here for everyone: the caller has to be one that renders the
-        # bypass and the post-call lifecycle state back to the model, which
-        # the internal composite path does not.
-        if (
-            allow_target_independent_document_read
-            and state.status == "settled"
-            and not state.requires_state_resync
-            and target_independent_document_read(method, params)
-        ):
+    if state.requires_ax_refresh:
+        from harness.tools.browser_tools.axtree_state import _axtree_ids_from_params
+        if method != "DOM.getAXTree" and _axtree_ids_from_params(params):
+            return {"status": "page_axtree_refresh_required", "tool_was_executed": False,
+                    "pageLifecycle": tracker.receipt(page_id),
+                    "next_instruction": "Refresh the AX evidence before using handles from the previous document."}
+        if target_independent_document_read(method, params):
             agent._ax_refresh_bypass_pending = {
-                "pageId": page_id,
-                "generation": int(getattr(state, "generation", 0) or 0),
-                "status": state.status,
-                "requiresStateResync": bool(state.requires_state_resync),
-                "requiresAXTreeRefresh": bool(state.requires_ax_refresh),
+                "pageId": page_id, "generation": int(state.generation),
+                "status": state.status, "requiresStateResync": state.requires_state_resync,
+                "requiresAXTreeRefresh": state.requires_ax_refresh,
             }
-            return None
-        return {
-            "status": "page_axtree_refresh_required",
-            "tool_was_executed": False,
-            "pageLifecycle": tracker.receipt(page_id),
-            "next_instruction": (
-                "Call DOM.getAXTree before continuing; navigation/recovery"
-                " invalidated all prior DOM targets."
-            ),
-        }
     return None
 
 def _page_lifecycle_before_action(agent: Any, method: str, params: JsonDict) -> None:
@@ -1197,11 +1155,30 @@ async def _browser_execute_selected_skill(ctx: ToolContext) -> JsonDict:
     _record_selected_skill_tool_trace(agent, result)
     return result
 
+def _record_workflow_definition_before_dispatch(ctx: ToolContext, receipt: JsonDict) -> None:
+    """Keep a small recovery reference even when execution raises or is cancelled."""
+    record = {
+        "type": "workflow_definition_execution",
+        "step": ctx.step,
+        "toolCallId": ctx.tool_call.get("id"),
+        "result": {"workflowDefinition": dict(receipt), "executionOutcome": "unknown"},
+    }
+    ctx.agent.logger.write("workflow.definition.prepared", record)
+    trace = getattr(ctx.agent, "trace", None)
+    if not isinstance(trace, list):
+        trace = []
+        ctx.agent.trace = trace
+    trace.append(record)
+
+
 @BROWSER_TOOLS.register(
     name="execute_browser_workflow",
     description=(
-        "Execute a temporary browser-only ABCP workflow after recursive harness"
-        " validation. Use it when the upcoming actions are decided — including"
+        "Execute a browser-only ABCP workflow after recursive harness validation."
+        " A complete definition is saved before dispatch and its receipt returns"
+        " definitionRef/definitionHash; later calls may reuse that pair with"
+        " optional local operations instead of copying the full steps. Use it"
+        " when the upcoming actions are decided — including"
         " targets whose ids are not known yet but a step inside the segment can"
         " resolve: read DOM.getAXTree, transform-search that reading, and act"
         " on what it found. It cannot call harness-local tools or"
@@ -1212,14 +1189,37 @@ async def _browser_execute_selected_skill(ctx: ToolContext) -> JsonDict:
     ),
     input_schema=_browser_schema_for("execute_browser_workflow"),
     contract_check=True,
+    trace_type="workflow_definition_execution",
 )
 async def _browser_execute_browser_workflow(ctx: ToolContext) -> JsonDict:
     if not workflow_execution_enabled(ctx.agent):
         return workflow_execution_disabled_result(source="execute_browser_workflow")
-    params = {
-        "description": str(ctx.tool_input.get("description") or "Temporary browser workflow"),
+    from harness.workflow_definitions import save_workflow_definition
+
+    workflow_definition = {
+        "description": str(
+            ctx.tool_input.get("description") or "Temporary browser workflow"
+        ),
         "variables": dict(ctx.tool_input.get("variables") or {}),
         "steps": list(ctx.tool_input.get("steps") or []),
+    }
+    try:
+        definition_receipt = save_workflow_definition(
+            ctx.agent.logger, workflow_definition,
+        )
+    except Exception as exc:
+        return {
+            "status": "workflow_definition_store_failed",
+            "tool_was_executed": False,
+            "error": str(exc)[:500],
+        }
+    definition_receipt.update({"reused": False, "patchBytes": 0})
+    params = {
+        "description": str(
+            workflow_definition.get("description") or "Temporary browser workflow"
+        ),
+        "variables": dict(workflow_definition.get("variables") or {}),
+        "steps": list(workflow_definition.get("steps") or []),
         "timeout": int(ctx.tool_input.get("timeout") or 600000),
     }
     page_id = str(ctx.tool_input.get("pageId") or "").strip()
@@ -1228,6 +1228,7 @@ async def _browser_execute_browser_workflow(ctx: ToolContext) -> JsonDict:
         params["pageId"] = page_id
     if fleet_id:
         params["fleetId"] = fleet_id
+    _record_workflow_definition_before_dispatch(ctx, definition_receipt)
     result, _should_stop = await _bt()._execute_browser_capability_tool(
         ctx.agent,
         "browser_call",
@@ -1238,6 +1239,138 @@ async def _browser_execute_browser_workflow(ctx: ToolContext) -> JsonDict:
         },
         ctx.step,
     )
+    if isinstance(result, dict):
+        result["workflowDefinition"] = definition_receipt
+        ctx.agent.logger.write("workflow.definition.used", {
+            **definition_receipt,
+            "workflowStatus": result.get("status"),
+        })
+    return result
+
+
+@BROWSER_TOOLS.register(
+    name="execute_saved_browser_workflow",
+    description=(
+        "Execute a task-scoped immutable Workflow definition returned by"
+        " execute_browser_workflow. Supply its exact definitionRef/hash and"
+        " optional add/set/remove operations. The harness rebuilds the ordinary"
+        " Workflow.execute request and applies the same validation, Fleet/page,"
+        " authorization, and execution gates."
+    ),
+    input_schema=_browser_schema_for("execute_saved_browser_workflow"),
+    contract_check=True,
+    trace_type="workflow_definition_execution",
+)
+async def _browser_execute_saved_browser_workflow(ctx: ToolContext) -> JsonDict:
+    if not workflow_execution_enabled(ctx.agent):
+        return workflow_execution_disabled_result(
+            source="execute_saved_browser_workflow",
+        )
+    from harness.workflow_definitions import (
+        apply_workflow_definition_patch,
+        load_workflow_definition,
+        save_workflow_definition,
+    )
+
+    definition_ref = str(ctx.tool_input.get("definitionRef") or "").strip()
+    definition_hash = str(ctx.tool_input.get("definitionHash") or "").strip()
+    operations = ctx.tool_input.get("operations") or []
+    loaded, load_error = load_workflow_definition(
+        ctx.agent.logger,
+        definition_ref=definition_ref,
+        expected_hash=definition_hash,
+    )
+    if load_error is not None or not isinstance(loaded, dict):
+        return {
+            **(load_error or {"status": "workflow_definition_unavailable"}),
+            "tool_was_executed": False,
+            "next_instruction": (
+                "Use a current definitionRef/hash from this task, or send the"
+                " complete Workflow definition again."
+            ),
+        }
+    required_variables = [
+        str(value) for value in loaded.pop("_requiredVariableNames", [])
+        if str(value).strip()
+    ]
+    overrides = dict(ctx.tool_input.get("variables") or {})
+    missing_variables = [
+        name for name in required_variables if name not in overrides
+    ]
+    if missing_variables:
+        return {
+            "status": "workflow_definition_sensitive_rebinding_required",
+            "tool_was_executed": False,
+            "missingVariableNames": missing_variables,
+        }
+    workflow_definition, patch_errors = apply_workflow_definition_patch(
+        loaded, operations,
+    )
+    if patch_errors or not isinstance(workflow_definition, dict):
+        return {
+            "status": "workflow_definition_patch_invalid",
+            "tool_was_executed": False,
+            "errors": patch_errors,
+        }
+    if operations:
+        try:
+            definition_receipt = save_workflow_definition(
+                ctx.agent.logger,
+                workflow_definition,
+                required_variable_names=required_variables,
+            )
+        except Exception as exc:
+            return {
+                "status": "workflow_definition_store_failed",
+                "tool_was_executed": False,
+                "error": str(exc)[:500],
+            }
+    else:
+        definition_receipt = {
+            "definitionRef": definition_ref,
+            "definitionHash": definition_hash,
+            "definitionBytes": len(json.dumps(
+                workflow_definition, ensure_ascii=False, default=str,
+            ).encode("utf-8")),
+            "executable": True,
+            "requiresSensitiveRebinding": bool(required_variables),
+            "requiredVariableNames": required_variables,
+        }
+    definition_receipt.update({
+        "reused": True,
+        "patchBytes": len(json.dumps(
+            operations, ensure_ascii=False, default=str,
+        ).encode("utf-8")),
+    })
+    variables = dict(workflow_definition.get("variables") or {})
+    variables.update(overrides)
+    params = {
+        "description": str(
+            workflow_definition.get("description") or "Saved browser workflow"
+        ),
+        "variables": variables,
+        "steps": list(workflow_definition.get("steps") or []),
+        "timeout": int(ctx.tool_input.get("timeout") or 600000),
+        "pageId": str(ctx.tool_input.get("pageId") or "").strip(),
+        "fleetId": str(ctx.tool_input.get("fleetId") or "").strip(),
+    }
+    _record_workflow_definition_before_dispatch(ctx, definition_receipt)
+    result, _should_stop = await _bt()._execute_browser_capability_tool(
+        ctx.agent,
+        "browser_call",
+        {
+            "method": "Workflow.execute",
+            "params": params,
+            "reason": params["description"],
+        },
+        ctx.step,
+    )
+    if isinstance(result, dict):
+        result["workflowDefinition"] = definition_receipt
+        ctx.agent.logger.write("workflow.definition.used", {
+            **definition_receipt,
+            "workflowStatus": result.get("status"),
+        })
     return result
 
 def _record_selected_skill_tool_trace(agent: Any, result: JsonDict) -> None:
@@ -1292,6 +1425,28 @@ async def _browser_navigate_verified(ctx: ToolContext) -> JsonDict:
             result,
             ctx.step,
         )
+    # navigate_verified dispatches Page.navigate through its composite path,
+    # which bypasses capability.py's normal post-call observer. Feed the
+    # verified terminal facts into the same observer as Page.navigate so DOM
+    # evidence from the previous document is invalidated and receives the
+    # next navigation epoch. The synthetic response is private to this adapter
+    # and removed before the model sees the composite receipt.
+    if int(result.get("navigateDispatchCount") or 0) > 0:
+        observed = dict(result)
+        observed["response"] = {"data": {
+            "pageId": str(result.get("pageId") or ctx.tool_input.get("pageId") or ""),
+            "url": str(result.get("url") or result.get("actualUrl") or ""),
+            "title": str(result.get("title") or result.get("actualTitle") or ""),
+            "status": str(result.get("pageStatus") or ""),
+        }}
+        result = _bt()._observe_content_completeness_after(
+            ctx.agent,
+            "Page.navigate",
+            ctx.tool_input,
+            observed,
+            ctx.step,
+        )
+        result.pop("response", None)
     return result
 
 @BROWSER_TOOLS.register(
@@ -1393,6 +1548,36 @@ async def _browser_final_answer(ctx: ToolContext) -> JsonDict:
     reason = ctx.tool_input.get("reason")
     if isinstance(reason, str) and reason.strip():
         result["reason"] = reason.strip()[:200]
+    continuation = ctx.tool_input.get("continuation")
+    if isinstance(continuation, dict):
+        status = str(result.get("status") or "")
+        if status == "done":
+            result["continuationRejected"] = {
+                "reason": "done_status_cannot_request_continuation",
+            }
+            setattr(ctx.agent, "continuation_decision", None)
+        else:
+            normalized = {
+                "protocol": "browser-continuation-v1",
+                "action": str(continuation.get("action") or ""),
+                "reason": str(continuation.get("reason") or "")[:500],
+                "remainingObjective": str(
+                    continuation.get("remainingObjective") or ""
+                )[:2000],
+                "evidenceRefs": [
+                    str(value)[:1000]
+                    for value in (continuation.get("evidenceRefs") or [])[:20]
+                    if isinstance(value, str) and value.strip()
+                ],
+                "workflowRef": (
+                    str(continuation.get("workflowRef"))[:1000]
+                    if continuation.get("workflowRef") else None
+                ),
+            }
+            result["continuation"] = normalized
+            setattr(ctx.agent, "continuation_decision", normalized)
+    else:
+        setattr(ctx.agent, "continuation_decision", None)
     ctx.agent.logger.write("tool.final_answer", result)
     ctx.agent.trace.append({"type": "final_answer", "result": result})
     return result
@@ -1455,12 +1640,13 @@ async def _browser_request_step_extension(ctx: ToolContext) -> JsonDict:
 @BROWSER_TOOLS.register(
     name="record_extraction",
     description=(
-        "Persist structured data already observed in the browser (product URLs/titles, form fields,"
+        "Persist and validate structured data already observed in the browser (product URLs/titles, form fields,"
         " list rows, etc.) to an artifact that LeadAgent can reuse."
         " Fields that never went through record_extraction must not appear"
         " in the final_answer's `data`."
         " `name` identifies the dataset; `rows` must be a list[dict] backed by actual observations"
-        " and should preserve provenance for critical fields."
+        " and should preserve provenance for critical fields. Inspect the returned"
+        " validation status; savedPath alone is not proof the contract passed."
     ),
     input_schema=_browser_schema_for("record_extraction"),
     strict=False,
@@ -1551,6 +1737,24 @@ async def _browser_local_fs_read(ctx: ToolContext) -> JsonDict:
 
 
 @BROWSER_TOOLS.register(
+    name="local_fs_batch",
+    description=(
+        "Batch bounded local file operations for task delivery: create directories, write UTF-8"
+        " text/JSON, stat/hash files, or copy files while preserving their source. Destinations"
+        " are limited to task-owned output directories and Desktop delivery folders. Returns a"
+        " persisted manifest and registers successful output files for contract validation."
+        " It cannot delete/move files, execute code, or modify Harness control/source files."
+    ),
+    input_schema=_browser_schema_for("local_fs_batch"),
+    contract_check=True,
+    progress_check=True,
+    trace_type="local_fs_batch",
+)
+async def _browser_local_fs_batch(ctx: ToolContext) -> JsonDict:
+    return local_fs_batch(ctx.agent, ctx.tool_input.get("operations"))
+
+
+@BROWSER_TOOLS.register(
     name="read_harness_guide",
     description=(
         "Read a paged, versioned Harness operating guide listed in "
@@ -1592,6 +1796,7 @@ def build_browser_agent_tool_specs(
     *,
     workflow_enabled: bool = False,
     step_extension_enabled: bool = False,
+    multimodal_enabled: bool = False,
 ) -> List[JsonDict]:
     hidden = hidden_harness_tools_for_task_type(task_type)
     # A live capability does not authorize Harness execution by itself. Both
@@ -1612,6 +1817,15 @@ def build_browser_agent_tool_specs(
             or spec.get("name") not in {
                 "execute_selected_skill",
                 "execute_browser_workflow",
+                "execute_saved_browser_workflow",
             }
+        )
+        # A multimodal BrowserAgent receives a bounded Page.screenshot image
+        # attachment in the very next model request. Do not offer the old
+        # second-model visual tool alongside it: that adds a network/model
+        # round trip without adding a distinct observation surface.
+        and (
+            not multimodal_enabled
+            or spec.get("name") != "visual_verify"
         )
     ]

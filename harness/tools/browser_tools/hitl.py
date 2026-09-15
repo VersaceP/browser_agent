@@ -1468,39 +1468,123 @@ async def _verify_and_open_fleet_auth_barrier(
     worker_id = str(getattr(agent, "worker_id", "") or "").strip()
     if barrier is None or not fleet_id or not worker_id:
         return {"enabled": False}
-    state = await _bt()._post_hitl_raw_browser_call(
-        agent,
-        "Page.getState",
-        {
-            "pageId": page_id,
-            "purpose": "Verify shared fleet state before opening the authentication barrier.",
-        },
-        step,
-    )
-    tree = await _bt()._post_hitl_raw_browser_call(
-        agent,
-        "DOM.getAXTree",
-        {
-            "pageId": page_id,
-            "purpose": "Refresh page perception before opening the shared authentication barrier.",
-        },
-        step,
-        capture_axtree_text=True,
-    )
-    if _bt()._invoke_result_failed(state) or _bt()._invoke_result_failed(tree):
+    harness_config = getattr(getattr(agent, "runtime", None), "harness", None)
+    try:
+        max_rounds = max(1, int(getattr(
+            harness_config, "hitl_post_resume_confirm_max_rounds", 3,
+        ) or 1))
+    except (TypeError, ValueError):
+        max_rounds = 3
+    try:
+        poll_seconds = max(0.0, float(getattr(
+            harness_config, "hitl_poll_interval_seconds", 2.0,
+        ) or 0.0))
+    except (TypeError, ValueError):
+        poll_seconds = 2.0
+    if poll_seconds > 0:
+        try:
+            settlement_seconds = max(0.0, float(getattr(
+                harness_config, "page_settlement_timeout_seconds", 15.0,
+            ) or 0.0))
+        except (TypeError, ValueError):
+            settlement_seconds = 15.0
+        # Use the existing page-settlement window as the time boundary. The
+        # three-round challenge adjudication setting is not necessarily long
+        # enough for a real post-HITL navigation, while introducing a second
+        # independently configured lifecycle timer would let the two gates
+        # disagree again.
+        max_rounds = max(
+            max_rounds,
+            int(settlement_seconds / poll_seconds) + 1,
+        )
+
+    # A resume notification means that human control was returned; it does
+    # not mean the renderer has already reached a DOM-readable lifecycle.
+    # Keep that progress while performing a bounded, read-only readiness
+    # confirmation.  In particular, do not turn `loading -> page-not-ready`
+    # into evidence that the human failed to clear the challenge.
+    attempts: List[JsonDict] = []
+    state: JsonDict = {}
+    tree: JsonDict = {}
+    state_data: JsonDict = {}
+    loading_statuses = {"loading", "navigating", "startedloading", "pending"}
+    for round_index in range(max_rounds):
+        state = await _bt()._post_hitl_raw_browser_call(
+            agent,
+            "Page.getState",
+            {
+                "pageId": page_id,
+                "purpose": (
+                    "Verify shared fleet state before opening the"
+                    " authentication barrier."
+                ),
+            },
+            step,
+        )
+        if _bt()._invoke_result_failed(state):
+            attempts.append({
+                "round": round_index + 1,
+                "status": "state_unavailable",
+            })
+        else:
+            state_data = _bt()._response_data(state)
+            hitl = (
+                state_data.get("hitl")
+                if isinstance(state_data.get("hitl"), dict) else {}
+            )
+            if hitl.get("isPaused") is True:
+                return {
+                    "enabled": True,
+                    "opened": False,
+                    "reason": "page_still_paused",
+                    "confirmationAttempts": attempts + [{
+                        "round": round_index + 1,
+                        "status": "page_still_paused",
+                    }],
+                }
+            lifecycle = str(state_data.get("status") or "").strip().lower()
+            if lifecycle in loading_statuses:
+                attempts.append({
+                    "round": round_index + 1,
+                    "status": "page_not_ready",
+                    "lifecycle": lifecycle,
+                })
+            else:
+                tree = await _bt()._post_hitl_raw_browser_call(
+                    agent,
+                    "DOM.getAXTree",
+                    {
+                        "pageId": page_id,
+                        "purpose": (
+                            "Refresh page perception before opening the"
+                            " shared authentication barrier."
+                        ),
+                    },
+                    step,
+                    capture_axtree_text=True,
+                )
+                if not _bt()._invoke_result_failed(tree):
+                    attempts.append({
+                        "round": round_index + 1,
+                        "status": "confirmed",
+                        "lifecycle": lifecycle or None,
+                    })
+                    break
+                attempts.append({
+                    "round": round_index + 1,
+                    "status": "tree_unavailable",
+                    "lifecycle": lifecycle or None,
+                })
+        if round_index < max_rounds - 1 and poll_seconds > 0:
+            await asyncio.sleep(poll_seconds)
+    else:
         return {
             "enabled": True,
             "opened": False,
-            "reason": "clearance_perception_failed",
+            "reason": "clearance_confirmation_timeout",
+            "confirmationAttempts": attempts,
         }
-    state_data = _bt()._response_data(state)
-    hitl = state_data.get("hitl") if isinstance(state_data.get("hitl"), dict) else {}
-    if hitl.get("isPaused") is True:
-        return {
-            "enabled": True,
-            "opened": False,
-            "reason": "page_still_paused",
-        }
+
     resolved = await barrier.resolve(fleet_id, worker_id)
     if resolved.get("resolved"):
         agent.fleet_reperception_pending = True
@@ -1611,6 +1695,7 @@ async def _verify_and_open_fleet_auth_barrier(
         "ledger": ledger_receipt or None,
         "taskSessionBinding": task_binding_receipt or None,
         "reason": resolved.get("reason"),
+        "confirmationAttempts": attempts,
     }
 
 def _hitl_resumed_suggested_prompt(wait_result: Any) -> str:

@@ -6,6 +6,7 @@ import base64
 import copy
 import hashlib
 import json
+import mimetypes
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -683,6 +684,133 @@ SCREENSHOT_VISIBILITY_NOTICE: JsonDict = {
 }
 
 
+# The browser adapter has already normalized screenshots to a file.  This map
+# deliberately accepts only the image formats the model message protocol can
+# name directly; an arbitrary file path from a browser receipt must never be
+# re-labelled as an image and read into a model request.
+_MODEL_IMAGE_MEDIA_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+
+
+def _saved_screenshot_path(response: Any) -> Optional[str]:
+    """Return the normalized saved image path from a screenshot receipt."""
+
+    if not isinstance(response, dict):
+        return None
+    candidates = [response]
+    nested = response.get("response")
+    if isinstance(nested, dict):
+        candidates.append(nested)
+    for candidate in candidates:
+        data = candidate.get("data")
+        if not isinstance(data, dict):
+            continue
+        for key in ("savedPath", "path", "filePath"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        if str(data.get("encoding") or "").lower() == "file":
+            value = data.get("data")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def model_visible_screenshot_attachment(
+    response: Any,
+    *,
+    max_raw_bytes: int,
+) -> Tuple[Optional[JsonDict], JsonDict]:
+    """Build one ephemeral Anthropic image block from a screenshot receipt.
+
+    The caller owns the returned base64 block and must put it only into the
+    current model request.  The receipt intentionally contains sizes and a
+    reason, never a path or image bytes, so it is safe for run telemetry.
+    """
+
+    saved_path = _saved_screenshot_path(response)
+    if not saved_path:
+        return None, {"attached": False, "reason": "saved_path_missing"}
+    try:
+        path = Path(saved_path).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None, {"attached": False, "reason": "saved_path_unreadable"}
+    if not path.is_file():
+        return None, {"attached": False, "reason": "saved_path_not_file"}
+    media_type = _MODEL_IMAGE_MEDIA_TYPES.get(path.suffix.lower())
+    if media_type is None:
+        # Some platform builds retain the file suffix but not a useful format
+        # field.  Let the operating system make the same conservative decision
+        # before rejecting an otherwise standard image.
+        guessed, _ = mimetypes.guess_type(path.name)
+        media_type = guessed if guessed in _MODEL_IMAGE_MEDIA_TYPES.values() else None
+    if media_type is None:
+        return None, {"attached": False, "reason": "unsupported_image_type"}
+    try:
+        reported_bytes = path.stat().st_size
+    except OSError:
+        return None, {"attached": False, "reason": "saved_path_unreadable"}
+    if reported_bytes <= 0:
+        return None, {"attached": False, "reason": "empty_image"}
+    if reported_bytes > max_raw_bytes:
+        return None, {
+            "attached": False,
+            "reason": "image_too_large",
+            "rawBytes": reported_bytes,
+            "maxRawBytes": max_raw_bytes,
+        }
+    try:
+        # A screenshot file can be replaced between stat and read. Read at
+        # most one byte over the limit so that race cannot turn a bounded
+        # model attachment into an arbitrary local-file read.
+        with path.open("rb") as image_file:
+            raw = image_file.read(max_raw_bytes + 1)
+    except OSError:
+        return None, {"attached": False, "reason": "saved_path_unreadable"}
+    raw_bytes = len(raw)
+    if raw_bytes > max_raw_bytes:
+        return None, {
+            "attached": False,
+            "reason": "image_too_large",
+            "rawBytes": raw_bytes,
+            "maxRawBytes": max_raw_bytes,
+        }
+    if not _image_file_matches_media_type(raw, media_type):
+        return None, {"attached": False, "reason": "invalid_image_file"}
+    encoded = base64.b64encode(raw).decode("ascii")
+    return {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": media_type,
+            "data": encoded,
+        },
+    }, {
+        "attached": True,
+        "mediaType": media_type,
+        "rawBytes": raw_bytes,
+        "encodedBytes": len(encoded),
+    }
+
+
+def _image_file_matches_media_type(raw: bytes, media_type: str) -> bool:
+    """Check the stable signature required by a supported image type."""
+    if media_type == "image/png":
+        return raw.startswith(b"\x89PNG\r\n\x1a\n")
+    if media_type == "image/jpeg":
+        return len(raw) >= 3 and raw.startswith(b"\xff\xd8\xff")
+    if media_type == "image/gif":
+        return raw.startswith((b"GIF87a", b"GIF89a"))
+    if media_type == "image/webp":
+        return len(raw) >= 12 and raw.startswith(b"RIFF") and raw[8:12] == b"WEBP"
+    return False
+
+
 def strip_image_payload(
     *,
     logger: RunLogger,
@@ -799,6 +927,7 @@ def fold_tool_results_after_moderation(
     messages: List[Any],
     *,
     reason: str,
+    images_only: bool = False,
 ) -> Optional[JsonDict]:
     """Strip bulky harness-authored payloads from a refused conversation.
 
@@ -812,7 +941,9 @@ def fold_tool_results_after_moderation(
     turns are the model's own output and hold the ``tool_use`` blocks that
     ``tool_result`` ids pair with, so rewriting them would corrupt the
     conversation; message 0 carries the task itself, and folding the mission to
-    satisfy a content filter would leave the agent working on nothing.
+    satisfy a content filter would leave the agent working on nothing. With
+    ``images_only``, a known attachment-protocol rejection removes only image
+    blocks and preserves every text receipt verbatim.
     """
     folded: List[JsonDict] = []
     freed_chars = 0
@@ -835,7 +966,47 @@ def fold_tool_results_after_moderation(
             else:
                 continue
             payload = block.get(key)
-            if not isinstance(payload, str):
+            if block_type == "tool_result" and isinstance(payload, list):
+                retained = []
+                image_chars = 0
+                image_count = 0
+                for item in payload:
+                    source = item.get("source") if isinstance(item, dict) else None
+                    if (
+                        isinstance(item, dict)
+                        and item.get("type") == "image"
+                        and isinstance(source, dict)
+                        and source.get("type") == "base64"
+                    ):
+                        image_chars += len(str(source.get("data") or ""))
+                        image_count += 1
+                        continue
+                    retained.append(item)
+                if image_count:
+                    retained.append({
+                        "type": "text",
+                        "text": (
+                            "[Screenshot attachment withheld after the model "
+                            "provider rejected this request. Capture a fresh, "
+                            "smaller screenshot only if visual evidence remains "
+                            "necessary.]"
+                        ),
+                    })
+                    block[key] = retained
+                    freed_chars += image_chars
+                    folded.append({
+                        "messageIndex": index,
+                        "blockType": block_type,
+                        "toolUseId": block.get("tool_use_id"),
+                        "imageAttachments": image_count,
+                        "originalChars": image_chars,
+                    })
+                # Preserve the structured text receipt. Replacing the whole
+                # list with a string would violate the provider's mixed-content
+                # tool-result shape, and image bytes are the only new payload
+                # this moderation recovery is responsible for.
+                continue
+            if images_only or not isinstance(payload, str):
                 continue
             if len(payload) < MODERATION_FOLD_MIN_CHARS:
                 continue

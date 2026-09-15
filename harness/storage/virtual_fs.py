@@ -370,3 +370,19 @@ def virtual_fs_for(logger: Any) -> Optional[VirtualTaskFs]:
     candidate = getattr(storage, "secondary", storage)
     view = VirtualTaskFs(candidate, task_id)
     return view if view.available else None
+
+
+def db_authoritative_for(logger: Any) -> bool:
+    """Whether DB rows, when present, outrank task-local legacy files.
+
+    ``dual`` deliberately keeps FileStore authoritative, while ``db`` must not
+    silently read a stale file left by a previous dual run. The distinction is
+    at the storage boundary rather than inferred from the presence of a SQLite
+    connection because DualStore also has one.
+    """
+
+    from harness.storage.sqlite_store import SqliteStore
+    from harness.utils import storage_for_logger
+
+    storage, _task_id = storage_for_logger(logger)
+    return isinstance(storage, SqliteStore)

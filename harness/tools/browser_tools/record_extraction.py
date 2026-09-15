@@ -13,7 +13,6 @@ from pathlib import Path
 from harness.evidence.extraction_artifacts import field_names_from_specs
 from harness.evidence.extraction_artifacts import save_extraction_artifact
 from harness.evidence.extraction_artifacts import validate_extraction_rows
-from harness.evidence.artifact_evidence import detect_blocker_data_rows
 from harness.task_control import phase_prior_artifact_paths
 from harness.task_control import validate_worker_artifacts
 from harness.utils import JsonDict
@@ -86,33 +85,8 @@ def _record_extraction_persist(
         and isinstance(contract.get("expected_artifact"), dict)
         else {}
     )
-    blocker_failures = detect_blocker_data_rows(rows, expected)
-    if blocker_failures:
-        result = {
-            "status": "rejected",
-            "error": (
-                "blocker or challenge explanation cannot be stored in a"
-                " declared business data field"
-            ),
-            "failures": blocker_failures,
-            "next_instruction": (
-                "Keep observed business values in the declared data fields."
-                " Report authentication/challenge state through HITL and the"
-                " worker blocker/status channel; do not pad rows with failure"
-                " notes or structured blocker tokens."
-            ),
-        }
-        agent.logger.write("tool.record_extraction.rejected", {
-            "name": raw_name,
-            "rowCount": len(rows),
-            "reason": "blocker_as_business_data",
-            "failures": blocker_failures,
-        })
-        return result
-
     schema_warnings = [
         *_record_extraction_schema_warnings(agent, rows),
-        *_record_extraction_content_warnings(rows),
     ]
     result = save_extraction_artifact(
         logger=agent.logger,
@@ -130,6 +104,9 @@ def _record_extraction_persist(
         saved_path = str(result.get("savedPath") or "")
         if saved_path and saved_path not in attempts:
             attempts.append(saved_path)
+    observations = _record_extraction_content_warnings(rows)
+    if observations:
+        result["contentObservations"] = observations
     if repair_merge:
         result["repairMerge"] = repair_merge
         contract = getattr(agent, "worker_contract", None)
@@ -139,6 +116,8 @@ def _record_extraction_persist(
             and isinstance(contract.get("_repair_manifest"), dict)
             else None
         )
+        if manifest is not None:
+            manifest.pop("visualEvidencePending", None)
         if manifest is not None and result.get("savedPath"):
             # Subsequent patch saves build on the latest merged rows, so a
             # worker can repair several targets serially without resending old
@@ -194,78 +173,6 @@ def _record_extraction_persist(
                     " the canonical <field>EvidenceText keys (e.g. rankEvidenceText)"
                     " before final_answer."
                 )
-    repair_resolutions = (
-        repair_merge.get("resolutions")
-        if isinstance(repair_merge, dict)
-        and isinstance(repair_merge.get("resolutions"), list)
-        else []
-    )
-    if repair_resolutions:
-        contract = getattr(agent, "worker_contract", None)
-        manifest = (
-            contract.get("_repair_manifest")
-            if isinstance(contract, dict) else None
-        )
-        satisfied = (
-            manifest.get("visualEvidenceSatisfied")
-            if isinstance(manifest, dict) else None
-        )
-        satisfied_signatures = (
-            set(satisfied) if isinstance(satisfied, dict) else set()
-        )
-        pending_by_signature = {
-            str(item.get("signature")): dict(item)
-            for item in (
-                manifest.get("visualEvidencePending")
-                if isinstance(manifest, dict)
-                and isinstance(manifest.get("visualEvidencePending"), list)
-                else []
-            )
-            if isinstance(item, dict) and str(item.get("signature") or "")
-        }
-        visual_checks_enabled = _repair_visual_checks_enabled(agent)
-        for item in repair_resolutions:
-            identity = item.get("identity") if isinstance(item, dict) else None
-            field = item.get("field") if isinstance(item, dict) else None
-            signature = _bt()._repair_visual_target_signature(identity, field)
-            outcome = str(item.get("outcome") or "") if isinstance(item, dict) else ""
-            if outcome == "confirmed_absent" and visual_checks_enabled:
-                if signature not in satisfied_signatures:
-                    pending_by_signature[signature] = {**item, "signature": signature}
-                continue
-            pending_by_signature.pop(signature, None)
-            # Evidence for a prior absence claim must not automatically satisfy
-            # a later claim after the field was observed or supplied with a value.
-            if isinstance(satisfied, dict):
-                satisfied.pop(signature, None)
-                satisfied_signatures.discard(signature)
-        unresolved_absent = list(pending_by_signature.values())
-        if isinstance(manifest, dict):
-            if unresolved_absent:
-                manifest["visualEvidencePending"] = unresolved_absent
-            else:
-                manifest.pop("visualEvidencePending", None)
-        if unresolved_absent:
-            pending = {
-                str(item) for item in (result.get("validationPending") or [])
-                if str(item).strip()
-            }
-            pending.add("absence_visual_evidence")
-            result["validationPending"] = sorted(pending)
-            result["repairEvidencePending"] = unresolved_absent
-            visual_instruction = (
-                "Repair values marked confirmed_absent are merged, but target-"
-                "bound visual evidence is still pending. Keep/reuse the relevant"
-                " live page and call visual_verify with repair_targets matching"
-                " the listed identity/field targets before final_answer;"
-                " Page.screenshot and unrelated visual checks do not count. Cite"
-                " this merged savedPath plus the visual evidence in final_answer."
-                " Do not re-submit or re-scrape already merged fields."
-            )
-            prior_instruction = str(result.get("next_instruction") or "").strip()
-            result["next_instruction"] = (
-                f"{prior_instruction} {visual_instruction}".strip()
-            )
     return result
 
 def _merge_repair_patch_rows(

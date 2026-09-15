@@ -114,13 +114,10 @@ class PageLifecycleTracker:
             self._mark_loading(state, method)
             state.requires_state_resync = True
             state.requires_ax_refresh = True
-        elif method in {
-            # Rebuilt Download domain: start (direct or page reservation) and
-            # control (pause/resume/cancel) are the only two methods that change
-            # browser-side download state.
-            "Download.start", "Download.control",
-        }:
-            state.requires_state_resync = True
+        # Download state is tracked by downloadId and Download.* events. Starting,
+        # pausing, resuming, or cancelling a transfer does not by itself prove
+        # that the page document changed. Real navigation/dialog events below
+        # remain responsible for page-state invalidation.
 
     def observe_navigation_response(
         self,

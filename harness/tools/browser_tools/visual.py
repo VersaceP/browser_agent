@@ -366,6 +366,18 @@ def _record_repair_visual_evidence(
     return recorded
 
 async def _visual_verify(agent: Any, tool_input: JsonDict, step: int) -> JsonDict:
+    if bool(getattr(agent.runtime.harness, "browser_agent_multimodal_enabled", False)):
+        # The BrowserAgent receives bounded screenshot pixels directly in its
+        # next model request. Refuse even harness-internal callers here so an
+        # accidental VL re-enable cannot silently restore a second model hop.
+        return {
+            "status": "disabled",
+            "reason": "browser_agent_multimodal_enabled",
+            "next_instruction": (
+                "Use Page.screenshot for a bounded visual observation, then "
+                "re-observe DOM.getAXTree or DOM.getSemanticTree before acting."
+            ),
+        }
     vl_config = getattr(agent.runtime.harness, "vl", None)
     if vl_config is None or not getattr(vl_config, "enabled", False):
         return {
@@ -741,6 +753,14 @@ def _attach_visual_recovery_hint(
     advice comes first; this is what to try when it has been exhausted.
     """
     if not isinstance(result, dict) or "visualRecoveryHint" in result:
+        return result
+    if bool(getattr(
+        getattr(getattr(agent, "runtime", None), "harness", None),
+        "browser_agent_multimodal_enabled",
+        False,
+    )):
+        # The main prompt already explains the direct screenshot path. Do not
+        # emit a hint for a tool deliberately removed from this model surface.
         return result
     vl_config = getattr(
         getattr(getattr(agent, "runtime", None), "harness", None), "vl", None
