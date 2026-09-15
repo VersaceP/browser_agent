@@ -1,12 +1,30 @@
 {
   "method": "System.register",
-  "description": "Registers the current connection, restores its authorized context, and returns event and catalog cursors.",
+  "description": "Registers the current connection and returns the available Fleet, event, and catalog recovery state.",
   "requiresPurpose": false,
-  "catalogRevision": "sha256:46c89baed493789bfb9424bc488513360a2f0047f2a530a729933a4bbe4aff12",
+  "catalogRevision": "sha256:52691626582a5164f1e1aaafb5a9e390e6e1e95ccc27663283f74997776c3737",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
-    "properties": {},
+    "properties": {
+      "descriptor": {
+        "type": "object",
+        "properties": {
+          "model": {
+            "description": "Externally declared model identifier, preferably in provider/model form.",
+            "type": "string",
+            "maxLength": 128
+          },
+          "client": {
+            "description": "Externally declared client name, such as claude or codex.",
+            "type": "string",
+            "maxLength": 64
+          }
+        },
+        "additionalProperties": true,
+        "description": "Optional externally declared Agent attribution. It is informational and does not affect authentication."
+      }
+    },
     "additionalProperties": true
   },
   "resultSchema": {
@@ -17,19 +35,6 @@
         "type": "string",
         "minLength": 1,
         "description": "Agent ID assigned to this connection by the server."
-      },
-      "profileId": {
-        "anyOf": [
-          {
-            "type": "string",
-            "format": "uuid",
-            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
-          },
-          {
-            "type": "null"
-          }
-        ],
-        "description": "Paired Profile ID for this connection, or null for a managed session without a Profile."
       },
       "registered": {
         "type": "boolean",
@@ -55,7 +60,7 @@
         "type": "integer",
         "minimum": 0,
         "maximum": 9007199254740991,
-        "description": "Next event cursor to use when reading or acknowledging notifications."
+        "description": "Next event cursor to use when reading Agent events."
       },
       "fleets": {
         "type": "array",
@@ -65,7 +70,6 @@
     },
     "required": [
       "agentId",
-      "profileId",
       "registered",
       "catalogRevision",
       "guideRevision",
@@ -95,19 +99,6 @@
             "minLength": 1,
             "description": "Agent ID assigned to this connection by the server."
           },
-          "profileId": {
-            "anyOf": [
-              {
-                "type": "string",
-                "format": "uuid",
-                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Paired Profile ID for this connection, or null for a managed session without a Profile."
-          },
           "registered": {
             "type": "boolean",
             "const": true,
@@ -132,7 +123,7 @@
             "type": "integer",
             "minimum": 0,
             "maximum": 9007199254740991,
-            "description": "Next event cursor to use when reading or acknowledging notifications."
+            "description": "Next event cursor to use when reading Agent events."
           },
           "fleets": {
             "type": "array",
@@ -142,7 +133,6 @@
         },
         "required": [
           "agentId",
-          "profileId",
           "registered",
           "catalogRevision",
           "guideRevision",

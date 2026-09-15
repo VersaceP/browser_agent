@@ -1,64 +1,119 @@
 {
   "method": "Page.wheel",
-  "description": "Dispatches a native wheel gesture at a page-viewport coordinate and reports the resulting scroll state.",
+  "description": "Dispatches a native wheel gesture at a page-viewport coordinate using either an explicit delta/state read or a scroll-to-boundary request, and reports the resulting scroll state.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:46c89baed493789bfb9424bc488513360a2f0047f2a530a729933a4bbe4aff12",
+  "catalogRevision": "sha256:52691626582a5164f1e1aaafb5a9e390e6e1e95ccc27663283f74997776c3737",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "type": "object",
-    "properties": {
-      "pageId": {
-        "type": "string",
-        "format": "uuid",
-        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-        "description": "Page ID to receive the wheel input."
+    "anyOf": [
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Page ID to receive the wheel input."
+          },
+          "x": {
+            "description": "Horizontal coordinate in page viewport CSS pixels. Defaults to 0.",
+            "type": "number",
+            "minimum": 0
+          },
+          "y": {
+            "description": "Vertical coordinate in page viewport CSS pixels. Defaults to 0.",
+            "type": "number",
+            "minimum": 0
+          },
+          "scrollX": {
+            "description": "Optional horizontal scroll delta in CSS pixels. Positive values scroll right; omit both deltas for a state read.",
+            "type": "number"
+          },
+          "scrollY": {
+            "description": "Optional vertical scroll delta in CSS pixels. Positive values scroll down; omit both deltas for a state read.",
+            "type": "number"
+          },
+          "axis": {
+            "description": "Not accepted in this Page.wheel form.",
+            "not": {}
+          },
+          "edge": {
+            "description": "Not accepted in this Page.wheel form.",
+            "not": {}
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "Describe the page coordinate and choose delta/state with optional scrollX/scrollY or boundary with edge and optional axis; do not provide axis without edge."
+          }
+        },
+        "required": [
+          "pageId",
+          "purpose"
+        ],
+        "description": "Delta/state form: use optional scrollX and/or scrollY, and omit axis and edge.",
+        "additionalProperties": true
       },
-      "x": {
-        "description": "Horizontal coordinate in page viewport CSS pixels. Defaults to 0.",
-        "type": "number",
-        "minimum": 0
-      },
-      "y": {
-        "description": "Vertical coordinate in page viewport CSS pixels. Defaults to 0.",
-        "type": "number",
-        "minimum": 0
-      },
-      "scrollX": {
-        "description": "Horizontal scroll delta in CSS pixels. Positive values scroll right. Defaults to 0.",
-        "type": "number"
-      },
-      "scrollY": {
-        "description": "Vertical scroll delta in CSS pixels. Positive values scroll down. Defaults to 0.",
-        "type": "number"
-      },
-      "axis": {
-        "description": "Axis used by edge scrolling. Defaults to vertical.",
-        "type": "string",
-        "enum": [
-          "vertical",
-          "horizontal"
-        ]
-      },
-      "edge": {
-        "description": "Scrolls the hit scroll area to the start or end boundary on the selected axis.",
-        "type": "string",
-        "enum": [
-          "start",
-          "end"
-        ]
-      },
-      "purpose": {
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "string",
-        "minLength": 1,
-        "description": "Describe the page coordinate and the scroll delta or boundary that should receive the wheel gesture."
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Page ID to receive the wheel input."
+          },
+          "x": {
+            "description": "Horizontal coordinate in page viewport CSS pixels. Defaults to 0.",
+            "type": "number",
+            "minimum": 0
+          },
+          "y": {
+            "description": "Vertical coordinate in page viewport CSS pixels. Defaults to 0.",
+            "type": "number",
+            "minimum": 0
+          },
+          "scrollX": {
+            "description": "Not accepted in this Page.wheel form.",
+            "not": {}
+          },
+          "scrollY": {
+            "description": "Not accepted in this Page.wheel form.",
+            "not": {}
+          },
+          "axis": {
+            "description": "Optional boundary axis. Defaults to vertical; valid only with edge.",
+            "type": "string",
+            "enum": [
+              "vertical",
+              "horizontal"
+            ]
+          },
+          "edge": {
+            "type": "string",
+            "enum": [
+              "start",
+              "end"
+            ],
+            "description": "Required boundary: start or end on the selected axis."
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "Describe the page coordinate and choose delta/state with optional scrollX/scrollY or boundary with edge and optional axis; do not provide axis without edge."
+          }
+        },
+        "required": [
+          "pageId",
+          "edge",
+          "purpose"
+        ],
+        "description": "Boundary form: provide edge and optionally axis, and omit scrollX and scrollY.",
+        "additionalProperties": true
       }
-    },
-    "required": [
-      "pageId",
-      "purpose"
-    ],
-    "additionalProperties": true
+    ]
   },
   "resultSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -528,5 +583,5 @@
     ],
     "additionalProperties": false
   },
-  "purposeHint": "Describe the page coordinate and the scroll delta or boundary that should receive the wheel gesture."
+  "purposeHint": "Describe the page coordinate and choose delta/state with optional scrollX/scrollY or boundary with edge and optional axis; do not provide axis without edge."
 }

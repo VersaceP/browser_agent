@@ -29,17 +29,12 @@ Use only the column for the active connection. Names are intentionally transport
 | Watch live events | `webcross events watch` | subscribe to `abcp://events` | receive `System.notification`; use `events.watch` for a filtered subscription |
 | Invoke an Action | `webcross <Action.name>` | use the exact underscore tool name returned by `tools/list` | use the canonical `<Domain>.<action>` method |
 
-### CLI Profile and Output
+### CLI Identity and Output
 
-Pair a User invitation through stdin with `webcross pair`; it contains the local socket and writes the CLI Profile. The CLI registers automatically before normal commands.
-
-To select a runtime explicitly, pass its current `dispatcher-host.json` with `--runtime <path>` and use a Profile from the same Dispatcher.
-
-The CLI pairing Profile identifies and authenticates the Agent connection. It is not a browser fingerprint Profile. Profile selection follows this order: `--profile`, `ABCP_PROFILE`, then `~/.webcross/profiles/default.json`. Treat the Profile as a private credential and do not print, copy, or record its contents.
-
-CLI output defaults to `--output ndjson`. Each stdout line is an independent record whose `type` is `session.ready`, `result`, `event`, or `error`. Do not parse the complete stdout stream as one JSON document. A connected one-shot Action or event command normally emits `session.ready` followed by `result`; a watch command continues with `event` records. Use `--output human` only for interactive human-readable output.
-
-`webcross events read` reads from the committed cursor unless another cursor is selected. After successfully processing a returned batch, commit its safe cursor with `webcross events checkpoint`. Continue while `hasMore` is true. After reconnecting or restarting, resume from the committed cursor.
+- Unauthenticated use: omit `--agent-id` and `--profile` for the first call. Save `agentId` and `eventCursor` from `session.ready.data`, then reuse `--agent-id <agentId>` on later calls. Omitting `--agent-id` starts a new identity. `agentId` identifies the same Agent across calls and event reads; it is not a credential and does not grant access. It is a global option, not part of `--params`, and cannot be combined with `--profile` or `ABCP_PROFILE`.
+- Paired use: pass the User's one-time invitation on stdin to `webcross pair`, then use the paired Profile. If `--runtime <path>` is provided, it must point to the current `dispatcher-host.json`, and the Profile must belong to the same Dispatcher. A paired Profile is a CLI credential, not a browser fingerprint Profile; never print, copy, or record it. If the Dispatcher requires authentication, use a paired Profile.
+- Output: default to `--output ndjson`. Treat each stdout line as an independent record and dispatch by `type`: `session.ready`, `result`, `event`, or `error`. A one-shot command normally emits `session.ready` followed by `result`; a failed command may emit `error` after `session.ready`. `events watch` continues emitting `event` records. Use `--output human` only for interactive human use.
+- Event recovery: `events read` starts after `session.ready.eventCursor` unless `--from <cursor>` is supplied. After successfully processing a batch, save its `nextCursor`; continue while `hasMore` is `true`. `events watch` does not save cursors, and `events checkpoint` is unavailable. After a disconnect or restart, call `events read` with the saved cursor. If the saved cursor is rejected as invalid for the current runtime, do not overwrite it; use the new `session.ready.eventCursor` as the current baseline. Events before that baseline cannot be replayed from the current runtime.
 
 ### Registration Gate
 
@@ -104,27 +99,34 @@ Event names are notifications, not Actions. Do not try to call names such as `Pa
 
 `Download.remove` does not cancel active downloads automatically; confirm that the record is terminal before removing it.
 
-When an Input Action returns native dialog information, pass its `dialog.id` to `Page.handleDialog`. If no Action result identifies the dialog and multiple dialogs are pending, use the latest `Page.dialogOpened` event's `dialog.id`. After resolving a dialog, re-observe the page. Never echo or record prompt input text.
+When an Input Action returns page dialog information, pass its `dialog.id` to `Page.handleDialog`. If no Action result identifies the dialog and multiple dialogs are pending, use the latest `Page.dialogOpened` event's `dialog.id`. After resolving a dialog, re-observe the page. Never echo or record prompt input text.
 
 ## 4. DOM, Input, and Select Interaction
 
 ### Result confirmation
 
-For page-state confirmation, prefer structured evidence: use `DOM.getText` for rendered text, `DOM.getAttribute` for HTML/ARIA attributes and attribute-backed state, and `DOM.getSemanticTree` for structure, visibility, relations, or frame context. Use the current `DOM.getAXTree` for target discovery and canonical IDs; choose the Action that matches the fact instead of calling all of them.
+For confirmation, choose the smallest structured Action that directly exposes the fact:
+
+- use `DOM.getText` for rendered text or application messages;
+- use `DOM.getAttribute` for HTML or ARIA attributes and attribute-backed state;
+- use `DOM.getSemanticTree` for DOM structure, relationships, visibility, frame context, or scroll state when the target or structure is already known;
+- use `DOM.getAXTree` to discover unknown targets, obtain a full accessibility map, or inspect accessibility-only interaction evidence;
+- use `Page.screenshot` only for visual facts unavailable from structured data.
+
+Do not call `DOM.getAXTree` solely to confirm text, attributes, or known DOM structure. Use only the Actions needed for the current fact. After a page change or uncertain result, follow the single re-observation rule in the recovery section.
 
 Use `Page.screenshot` only for visual properties that structured data cannot represent. Capture the smallest useful scope: element (`id`/`selector`) first, then region (`x`, `y`, `width`, `height`), and viewport or full-page only when broader context is required. Do not use screenshots to read ordinary text, form values, or attributes. If structured-tree retrieval fails, refresh page state and targets before using a screenshot.
 
-Prefer `DOM.getAXTree` as the page map and target source. Use targets in this order:
+Prefer `DOM.getAXTree` as the page map and target-discovery source. Use targets in this order:
 
-1. A canonical `id` marked with `#` by `DOM.getAXTree`.
+1. A current canonical `id` marked with `#` by `DOM.getAXTree` or returned by targeted `DOM.getSemanticTree`.
 2. A stable, semantic `selector`.
 3. Current-viewport coordinates through `Page.click`.
 
 Use `#` targets as the preferred operation surface. A `~` target requires
 additional DOM or visual evidence. `[hidden]` is diagnostic and must not be
 operated.
-Unmarked canonical IDs provide semantic structure rather than normal Input
-targets.
+An ID without current interaction evidence provides semantic context rather than a normal Input target until a current DOM observation confirms it.
 
 Each AXTree line uses `depth [id] role "label" [flags...] #|~ @rect`. The
 optional flags group keeps a fixed order. Applicable semantic states use explicit
@@ -146,8 +148,8 @@ settle, and call `DOM.getAXTree` again before relying on the missing frame.
 `snapshot_unavailable` is a failed page-map request, not a usable truncation.
 
 `DOM.getSemanticTree` reports one `visibility` state. `visible` means the node
-has a positive Frame-local visible region but does not prove hit testing;
-`not-rendered` cannot be an Input target.
+has a positive visible region in its frame but does not prove that the page can
+receive the interaction; `not-rendered` cannot be an Input target.
 
 When the current Action schema accepts both `id` and `selector`, they may be supplied together:
 
@@ -157,9 +159,8 @@ When the current Action schema accepts both `id` and `selector`, they may be sup
 - if the schema makes them mutually exclusive, follow that schema instead of guessing.
 
 For an element target identified by an `id` or `selector`, a locator-based Input
-Action automatically attempts native target reveal before interaction, including
-`[off]` and `out-of-view` targets. Do not pre-scroll the target; use the Input
-Action directly and avoid unnecessary waits, scrolling, or repeated DOM reads.
+Action may bring the target into view before interaction, including `[off]` and
+`out-of-view` targets. Do not pre-scroll a known interaction target.
 
 Do not interact with targets that are hidden, zero-sized, fully transparent, invisible, disabled, or covered by another element. After the target has been brought into view, pause and request confirmation when its effective opacity is below `0.2`. If visibility, opacity, or coverage cannot be determined reliably, treat the state as uncertain and do not force the interaction.
 
@@ -167,12 +168,10 @@ Use explicit scrolling only to discover targets, trigger infinite scroll or lazy
 
 ### Scrolling decision
 
-- When a known element is the next interaction target, call the corresponding locator-based Input Action directly; it performs target reveal. Use the `Input.scroll` target form only when revealing the element is itself the goal.
 - For deterministic movement of a known scroll container, use `Input.scroll` with `container` and follow the current Action Schema for the exact form.
 - Use `Page.wheel` for the root viewport, coordinate-selected scrolling, an unknown scroll owner, nested or iframe propagation, or real wheel-event semantics.
-- After partial movement, a boundary result, a timeout, or any uncertain outcome, read the feedback and re-observe the page before deciding whether to continue; do not immediately retry.
-
-If an Input Action reports that a target cannot be used, inspect the current page and decide whether another element must be completed or dismissed before retrying. Re-observe before retrying.
+- Before calling `Page.wheel`, read its current Action Schema and choose the delta/state or boundary form; do not infer parameter combinations from this guide.
+- Use the `Input.scroll` target form only when bringing the element into view is itself the goal. For a known interaction target, call its locator-based Input Action directly.
 
 For select-like controls:
 
@@ -189,12 +188,10 @@ before calling `Input.select`, and inspect again when it is stale.
 For file-upload controls:
 
 - when the target is known, call `File.handleChooser` directly with the current `pageId`, `files`, and the actual file-input `id` or `selector`; do not click first or wait for chooser events;
-- if input is required to activate a wrapper, do it once, then follow the feedback to `File.handleChooser` without repeating the input; do not reuse a label or wrapper ID, and refresh DOM/AX targets only after a stale-target failure;
+- if input is required to activate a wrapper, do it once, then follow the feedback to `File.handleChooser` without repeating the input; do not reuse a label or wrapper ID, and refresh the known upload structure with `DOM.getSemanticTree` or discover a replacement with `DOM.getAXTree` only when needed;
 - directory uploads (`uploadFolder`/`openDirectory`) and save choosers require human intervention; re-observe page state after a successful injection.
 
 For `Input.drag`, element-to-element dragging requires source and destination to be in the same document. For an iframe, provide current element IDs from that iframe for both endpoints; cross-frame dragging is unsupported.
-
-After navigation, scrolling, overlays, animations, focus changes, or node replacement, refresh page state and targets instead of reusing stale IDs or coordinates.
 
 Use real Input Actions for interaction. Do not bypass focus, visibility, or coverage checks through script injection, direct DOM mutation, or equivalent methods.
 
@@ -213,7 +210,7 @@ When an Action fails, times out, or leaves the result uncertain, do not retry im
 
 - wait until the page is ready and resolve any blocking HITL or dialog state;
 - recover the committed event cursor if delivery may be incomplete;
-- refresh page state and DOM/AX targets when the page or target may be stale.
+- refresh page state and the smallest relevant DOM observation when the page or target may be stale; use `DOM.getAXTree` only when a replacement target must be discovered.
 
 Use the Action feedback and stable error code to determine whether the operation succeeded. Retry only after confirming that it did not succeed and that retrying will not duplicate a side effect. The feedback does not prove whether a side effect started or whether retrying is safe.
 

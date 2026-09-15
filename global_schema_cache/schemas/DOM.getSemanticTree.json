@@ -1,8 +1,8 @@
 {
   "method": "DOM.getSemanticTree",
-  "description": "Returns structured semantic DOM content for the main document and accessible child frames when the accessibility tree is insufficient. attributes preserve raw markup; relations expose supported explicit ID references within the current frame. Cross-origin or opaque child frames may have ownerId=null even when their frame-local tree is complete.",
+  "description": "Returns structured DOM content for the current document and observed child frames, including element attributes, relationships, visibility, bounds, and scroll state.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:46c89baed493789bfb9424bc488513360a2f0047f2a530a729933a4bbe4aff12",
+  "catalogRevision": "sha256:52691626582a5164f1e1aaafb5a9e390e6e1e95ccc27663283f74997776c3737",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -14,7 +14,7 @@
         "description": "Page ID whose DOM structure should be inspected."
       },
       "id": {
-        "description": "Canonical DOM target ID.",
+        "description": "Current target ID from DOM.getAXTree or DOM.getSemanticTree. Omit id and selector to inspect the document root.",
         "type": "string",
         "pattern": "^\\d+:\\d+:\\d+$"
       },
@@ -60,7 +60,7 @@
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "string",
         "minLength": 1,
-        "description": "Use this when DOM.getAXTree does not expose the DOM element you need. id and selector stay at the top level; omit both to inspect the document. context.maxParentDepth is ignored for a document-root request. Element bounds and scroll metrics use CSS pixels; bounds are local to each returned Frame viewport. attributes preserve raw attributes, while relations maps supported explicit ARIA/HTML ID-reference tokens to current-frame node IDs and uses null when a target is not in the projection. visibility=visible does not prove hit-testability, out-of-view can be revealed, and not-rendered cannot be used as an Input target. For cross-origin or opaque child frames, route by parentFrameId and frameId because ownerId may be null."
+        "description": "State why you need the DOM structure, relationships, frame context, or a current target, such as locating an element, inspecting a form, or verifying visibility."
       }
     },
     "required": [
@@ -107,11 +107,11 @@
                   "type": "null"
                 }
               ],
-              "description": "Frame-owner node identity. Cross-origin or opaque child frames may keep this null even when status is complete; use parentFrameId and frameId for cross-frame routing."
+              "description": "Owner node ID for this frame when available; use the frame IDs to correlate child frames."
             },
             "url": {
               "type": "string",
-              "description": "Frame URL observed by the renderer."
+              "description": "URL observed for this frame."
             },
             "status": {
               "type": "string",
@@ -150,7 +150,7 @@
                   "type": "null"
                 }
               ],
-              "description": "Reason for truncation, when applicable."
+              "description": "Reason the frame result is incomplete, when provided."
             },
             "error": {
               "description": "Structured failure for an unavailable frame.",
@@ -205,11 +205,11 @@
         "description": "Node counts, truncation, and visibility summary."
       },
       "resolutionSource": {
-        "description": "Target resolution route used when a target was requested.",
+        "description": "How the requested target was located, when a target was provided.",
         "type": "string"
       },
       "recoveredTarget": {
-        "description": "Snapshot details used when a stale target was recovered.",
+        "description": "Updated target information when the original target changed.",
         "type": "object",
         "propertyNames": {
           "type": "string"
@@ -273,11 +273,11 @@
                       "type": "null"
                     }
                   ],
-                  "description": "Frame-owner node identity. Cross-origin or opaque child frames may keep this null even when status is complete; use parentFrameId and frameId for cross-frame routing."
+                  "description": "Owner node ID for this frame when available; use the frame IDs to correlate child frames."
                 },
                 "url": {
                   "type": "string",
-                  "description": "Frame URL observed by the renderer."
+                  "description": "URL observed for this frame."
                 },
                 "status": {
                   "type": "string",
@@ -316,7 +316,7 @@
                       "type": "null"
                     }
                   ],
-                  "description": "Reason for truncation, when applicable."
+                  "description": "Reason the frame result is incomplete, when provided."
                 },
                 "error": {
                   "description": "Structured failure for an unavailable frame.",
@@ -371,11 +371,11 @@
             "description": "Node counts, truncation, and visibility summary."
           },
           "resolutionSource": {
-            "description": "Target resolution route used when a target was requested.",
+            "description": "How the requested target was located, when a target was provided.",
             "type": "string"
           },
           "recoveredTarget": {
-            "description": "Snapshot details used when a stale target was recovered.",
+            "description": "Updated target information when the original target changed.",
             "type": "object",
             "propertyNames": {
               "type": "string"
@@ -441,5 +441,5 @@
     ],
     "additionalProperties": false
   },
-  "purposeHint": "Use this when DOM.getAXTree does not expose the DOM element you need. id and selector stay at the top level; omit both to inspect the document. context.maxParentDepth is ignored for a document-root request. Element bounds and scroll metrics use CSS pixels; bounds are local to each returned Frame viewport. attributes preserve raw attributes, while relations maps supported explicit ARIA/HTML ID-reference tokens to current-frame node IDs and uses null when a target is not in the projection. visibility=visible does not prove hit-testability, out-of-view can be revealed, and not-rendered cannot be used as an Input target. For cross-origin or opaque child frames, route by parentFrameId and frameId because ownerId may be null."
+  "purposeHint": "State why you need the DOM structure, relationships, frame context, or a current target, such as locating an element, inspecting a form, or verifying visibility."
 }

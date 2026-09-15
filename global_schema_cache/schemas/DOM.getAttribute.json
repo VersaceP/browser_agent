@@ -1,8 +1,8 @@
 {
   "method": "DOM.getAttribute",
-  "description": "Reads selected HTML attributes, or all available attributes, from one or more elements.",
+  "description": "Reads one or more HTML or ARIA attributes for each specified page target and returns a separate result for every target; an absent attribute is returned as null.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:46c89baed493789bfb9424bc488513360a2f0047f2a530a729933a4bbe4aff12",
+  "catalogRevision": "sha256:52691626582a5164f1e1aaafb5a9e390e6e1e95ccc27663283f74997776c3737",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -20,7 +20,7 @@
           "type": "object",
           "properties": {
             "id": {
-              "description": "Preferred canonical element ID from DOM.getAXTree.",
+              "description": "Current target ID from a recent DOM.getAXTree or DOM.getSemanticTree result.",
               "type": "string",
               "pattern": "^\\d+:\\d+:\\d+$"
             },
@@ -31,7 +31,7 @@
             }
           },
           "additionalProperties": true,
-          "description": "DOM query target identified by id, selector, or both."
+          "description": "DOM query target identified by an ID, selector, or both."
         },
         "description": "Targets to read, preserving input order in response.data.items."
       },
@@ -58,7 +58,7 @@
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "string",
         "minLength": 1,
-        "description": "Describe why these attributes are needed, e.g., checking a link href, validating aria state, reading an input value, or debugging selector stability"
+        "description": "State why the attributes are needed, such as checking a link destination, verifying a control state, or reading a form value."
       }
     },
     "required": [
@@ -106,6 +106,120 @@
                   },
                   "additionalProperties": {},
                   "description": "Extracted text or attribute information."
+                },
+                "resolvedTarget": {
+                  "description": "Target used for the query when it differs from the requested target.",
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {}
+                },
+                "resolution": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "unchanged",
+                        "resolved",
+                        "ambiguous",
+                        "unresolved"
+                      ],
+                      "description": "Target resolution status."
+                    },
+                    "kind": {
+                      "description": "Target kind, when available.",
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "readFrom": {
+                      "description": "Data source used for the query.",
+                      "type": "string",
+                      "enum": [
+                        "original",
+                        "component-root",
+                        "control"
+                      ]
+                    },
+                    "controlTarget": {
+                      "description": "More specific target used when available.",
+                      "type": "object",
+                      "propertyNames": {
+                        "type": "string"
+                      },
+                      "additionalProperties": {}
+                    },
+                    "evidence": {
+                      "description": "Additional structural evidence for the decision.",
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    },
+                    "candidates": {
+                      "description": "Alternative targets returned when the target is ambiguous or unresolved.",
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "target": {
+                            "type": "object",
+                            "propertyNames": {
+                              "type": "string"
+                            },
+                            "additionalProperties": {},
+                            "description": "The target supplied for this batch item."
+                          },
+                          "tagName": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Candidate DOM tag name."
+                          },
+                          "kind": {
+                            "description": "Candidate target kind, when available.",
+                            "type": "string",
+                            "minLength": 1
+                          },
+                          "evidence": {
+                            "type": "array",
+                            "items": {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            "description": "Additional structural evidence for this candidate."
+                          }
+                        },
+                        "required": [
+                          "target",
+                          "tagName",
+                          "evidence"
+                        ],
+                        "additionalProperties": false,
+                        "description": "One candidate target returned for inspection."
+                      }
+                    },
+                    "attributeSources": {
+                      "description": "Source for each explicitly requested attribute.",
+                      "type": "object",
+                      "propertyNames": {
+                        "type": "string"
+                      },
+                      "additionalProperties": {
+                        "type": "string",
+                        "enum": [
+                          "component-root",
+                          "control"
+                        ]
+                      }
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ],
+                  "additionalProperties": false,
+                  "description": "Additional target resolution information."
                 }
               },
               "required": [
@@ -165,6 +279,112 @@
                     "suggested_prompt"
                   ],
                   "additionalProperties": false
+                },
+                "resolution": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "unchanged",
+                        "resolved",
+                        "ambiguous",
+                        "unresolved"
+                      ],
+                      "description": "Target resolution status."
+                    },
+                    "kind": {
+                      "description": "Target kind, when available.",
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "readFrom": {
+                      "description": "Data source used for the query.",
+                      "type": "string",
+                      "enum": [
+                        "original",
+                        "component-root",
+                        "control"
+                      ]
+                    },
+                    "controlTarget": {
+                      "description": "More specific target used when available.",
+                      "type": "object",
+                      "propertyNames": {
+                        "type": "string"
+                      },
+                      "additionalProperties": {}
+                    },
+                    "evidence": {
+                      "description": "Additional structural evidence for the decision.",
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    },
+                    "candidates": {
+                      "description": "Alternative targets returned when the target is ambiguous or unresolved.",
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "target": {
+                            "type": "object",
+                            "propertyNames": {
+                              "type": "string"
+                            },
+                            "additionalProperties": {},
+                            "description": "The target supplied for this batch item."
+                          },
+                          "tagName": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Candidate DOM tag name."
+                          },
+                          "kind": {
+                            "description": "Candidate target kind, when available.",
+                            "type": "string",
+                            "minLength": 1
+                          },
+                          "evidence": {
+                            "type": "array",
+                            "items": {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            "description": "Additional structural evidence for this candidate."
+                          }
+                        },
+                        "required": [
+                          "target",
+                          "tagName",
+                          "evidence"
+                        ],
+                        "additionalProperties": false,
+                        "description": "One candidate target returned for inspection."
+                      }
+                    },
+                    "attributeSources": {
+                      "description": "Source for each explicitly requested attribute.",
+                      "type": "object",
+                      "propertyNames": {
+                        "type": "string"
+                      },
+                      "additionalProperties": {
+                        "type": "string",
+                        "enum": [
+                          "component-root",
+                          "control"
+                        ]
+                      }
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ],
+                  "additionalProperties": false,
+                  "description": "Additional target resolution information."
                 }
               },
               "required": [
@@ -265,6 +485,120 @@
                       },
                       "additionalProperties": {},
                       "description": "Extracted text or attribute information."
+                    },
+                    "resolvedTarget": {
+                      "description": "Target used for the query when it differs from the requested target.",
+                      "type": "object",
+                      "propertyNames": {
+                        "type": "string"
+                      },
+                      "additionalProperties": {}
+                    },
+                    "resolution": {
+                      "type": "object",
+                      "properties": {
+                        "status": {
+                          "type": "string",
+                          "enum": [
+                            "unchanged",
+                            "resolved",
+                            "ambiguous",
+                            "unresolved"
+                          ],
+                          "description": "Target resolution status."
+                        },
+                        "kind": {
+                          "description": "Target kind, when available.",
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "readFrom": {
+                          "description": "Data source used for the query.",
+                          "type": "string",
+                          "enum": [
+                            "original",
+                            "component-root",
+                            "control"
+                          ]
+                        },
+                        "controlTarget": {
+                          "description": "More specific target used when available.",
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "evidence": {
+                          "description": "Additional structural evidence for the decision.",
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "minLength": 1
+                          }
+                        },
+                        "candidates": {
+                          "description": "Alternative targets returned when the target is ambiguous or unresolved.",
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "target": {
+                                "type": "object",
+                                "propertyNames": {
+                                  "type": "string"
+                                },
+                                "additionalProperties": {},
+                                "description": "The target supplied for this batch item."
+                              },
+                              "tagName": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "Candidate DOM tag name."
+                              },
+                              "kind": {
+                                "description": "Candidate target kind, when available.",
+                                "type": "string",
+                                "minLength": 1
+                              },
+                              "evidence": {
+                                "type": "array",
+                                "items": {
+                                  "type": "string",
+                                  "minLength": 1
+                                },
+                                "description": "Additional structural evidence for this candidate."
+                              }
+                            },
+                            "required": [
+                              "target",
+                              "tagName",
+                              "evidence"
+                            ],
+                            "additionalProperties": false,
+                            "description": "One candidate target returned for inspection."
+                          }
+                        },
+                        "attributeSources": {
+                          "description": "Source for each explicitly requested attribute.",
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {
+                            "type": "string",
+                            "enum": [
+                              "component-root",
+                              "control"
+                            ]
+                          }
+                        }
+                      },
+                      "required": [
+                        "status"
+                      ],
+                      "additionalProperties": false,
+                      "description": "Additional target resolution information."
                     }
                   },
                   "required": [
@@ -324,6 +658,112 @@
                         "suggested_prompt"
                       ],
                       "additionalProperties": false
+                    },
+                    "resolution": {
+                      "type": "object",
+                      "properties": {
+                        "status": {
+                          "type": "string",
+                          "enum": [
+                            "unchanged",
+                            "resolved",
+                            "ambiguous",
+                            "unresolved"
+                          ],
+                          "description": "Target resolution status."
+                        },
+                        "kind": {
+                          "description": "Target kind, when available.",
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "readFrom": {
+                          "description": "Data source used for the query.",
+                          "type": "string",
+                          "enum": [
+                            "original",
+                            "component-root",
+                            "control"
+                          ]
+                        },
+                        "controlTarget": {
+                          "description": "More specific target used when available.",
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "evidence": {
+                          "description": "Additional structural evidence for the decision.",
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "minLength": 1
+                          }
+                        },
+                        "candidates": {
+                          "description": "Alternative targets returned when the target is ambiguous or unresolved.",
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "target": {
+                                "type": "object",
+                                "propertyNames": {
+                                  "type": "string"
+                                },
+                                "additionalProperties": {},
+                                "description": "The target supplied for this batch item."
+                              },
+                              "tagName": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "Candidate DOM tag name."
+                              },
+                              "kind": {
+                                "description": "Candidate target kind, when available.",
+                                "type": "string",
+                                "minLength": 1
+                              },
+                              "evidence": {
+                                "type": "array",
+                                "items": {
+                                  "type": "string",
+                                  "minLength": 1
+                                },
+                                "description": "Additional structural evidence for this candidate."
+                              }
+                            },
+                            "required": [
+                              "target",
+                              "tagName",
+                              "evidence"
+                            ],
+                            "additionalProperties": false,
+                            "description": "One candidate target returned for inspection."
+                          }
+                        },
+                        "attributeSources": {
+                          "description": "Source for each explicitly requested attribute.",
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {
+                            "type": "string",
+                            "enum": [
+                              "component-root",
+                              "control"
+                            ]
+                          }
+                        }
+                      },
+                      "required": [
+                        "status"
+                      ],
+                      "additionalProperties": false,
+                      "description": "Additional target resolution information."
                     }
                   },
                   "required": [
@@ -427,5 +867,5 @@
     ],
     "additionalProperties": false
   },
-  "purposeHint": "Describe why these attributes are needed, e.g., checking a link href, validating aria state, reading an input value, or debugging selector stability"
+  "purposeHint": "State why the attributes are needed, such as checking a link destination, verifying a control state, or reading a form value."
 }

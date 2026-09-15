@@ -1,8 +1,8 @@
 {
   "method": "File.handleChooser",
-  "description": "Injects files directly into a resolved upload control.",
+  "description": "Assigns one or more local files to the specified page upload control without requiring a file-picker interaction.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:46c89baed493789bfb9424bc488513360a2f0047f2a530a729933a4bbe4aff12",
+  "catalogRevision": "sha256:52691626582a5164f1e1aaafb5a9e390e6e1e95ccc27663283f74997776c3737",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -23,7 +23,7 @@
         "description": "Files to set on the upload target."
       },
       "id": {
-        "description": "Preferred canonical upload target ID.",
+        "description": "Current upload target ID from a recent DOM.getAXTree or DOM.getSemanticTree result.",
         "type": "string",
         "pattern": "^\\d+:\\d+:\\d+$"
       },
@@ -36,7 +36,7 @@
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "string",
         "minLength": 1,
-        "description": "Provide the local files and the upload control id or selector to inject them directly."
+        "description": "State which upload operation the files are intended to complete and identify the current upload control."
       }
     },
     "required": [
@@ -59,21 +59,21 @@
       "handled": {
         "type": "boolean",
         "const": true,
-        "description": "Confirms that files were injected into the upload target."
+        "description": "Confirms that files were assigned to the upload target."
       },
       "selectedFileCount": {
         "type": "integer",
         "minimum": 0,
         "maximum": 9007199254740991,
-        "description": "Number of files injected."
+        "description": "Number of files assigned."
       },
       "resolvedBy": {
         "type": "string",
         "const": "agent",
-        "description": "The direct injection was requested by the agent."
+        "description": "Indicates that the Agent requested direct file assignment."
       },
       "targetResolvedBy": {
-        "description": "Resolution route used for the upload target.",
+        "description": "How the upload target was located.",
         "type": "string",
         "enum": [
           "id",
@@ -83,7 +83,7 @@
         ]
       },
       "recoveredTarget": {
-        "description": "Snapshot details used when the target was recovered after a stale reference.",
+        "description": "Updated target information when the original target changed.",
         "type": "object",
         "propertyNames": {
           "type": "string"
@@ -123,21 +123,21 @@
           "handled": {
             "type": "boolean",
             "const": true,
-            "description": "Confirms that files were injected into the upload target."
+            "description": "Confirms that files were assigned to the upload target."
           },
           "selectedFileCount": {
             "type": "integer",
             "minimum": 0,
             "maximum": 9007199254740991,
-            "description": "Number of files injected."
+            "description": "Number of files assigned."
           },
           "resolvedBy": {
             "type": "string",
             "const": "agent",
-            "description": "The direct injection was requested by the agent."
+            "description": "Indicates that the Agent requested direct file assignment."
           },
           "targetResolvedBy": {
-            "description": "Resolution route used for the upload target.",
+            "description": "How the upload target was located.",
             "type": "string",
             "enum": [
               "id",
@@ -147,7 +147,7 @@
             ]
           },
           "recoveredTarget": {
-            "description": "Snapshot details used when the target was recovered after a stale reference.",
+            "description": "Updated target information when the original target changed.",
             "type": "object",
             "propertyNames": {
               "type": "string"
@@ -214,5 +214,5 @@
     ],
     "additionalProperties": false
   },
-  "purposeHint": "Provide the local files and the upload control id or selector to inject them directly."
+  "purposeHint": "State which upload operation the files are intended to complete and identify the current upload control."
 }

@@ -1,8 +1,8 @@
 {
   "method": "Download.control",
-  "description": "Pauses, resumes, or cancels one active download and reports the observed state transition.",
+  "description": "Sends a pause, resume, or cancel command for one active download and returns an immediate local state observation.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:46c89baed493789bfb9424bc488513360a2f0047f2a530a729933a4bbe4aff12",
+  "catalogRevision": "sha256:52691626582a5164f1e1aaafb5a9e390e6e1e95ccc27663283f74997776c3737",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -60,15 +60,15 @@
         ]
       },
       "previousState": {
-        "description": "Download state observed before the command.",
+        "description": "Download state observed locally before the command was sent.",
         "type": "string"
       },
       "currentState": {
-        "description": "Download state observed after the command.",
+        "description": "Download state observed locally immediately after the command was sent; this is not guaranteed to be final.",
         "type": "string"
       },
       "changed": {
-        "description": "Whether the observed lifecycle state changed.",
+        "description": "Whether the local observed lifecycle state changed; this does not confirm native completion.",
         "type": "boolean"
       }
     },
@@ -103,15 +103,15 @@
             ]
           },
           "previousState": {
-            "description": "Download state observed before the command.",
+            "description": "Download state observed locally before the command was sent.",
             "type": "string"
           },
           "currentState": {
-            "description": "Download state observed after the command.",
+            "description": "Download state observed locally immediately after the command was sent; this is not guaranteed to be final.",
             "type": "string"
           },
           "changed": {
-            "description": "Whether the observed lifecycle state changed.",
+            "description": "Whether the local observed lifecycle state changed; this does not confirm native completion.",
             "type": "boolean"
           }
         },

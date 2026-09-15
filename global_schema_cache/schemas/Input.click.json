@@ -1,8 +1,8 @@
 {
   "method": "Input.click",
-  "description": "Dispatches one or more physical clicks to a resolved page target; one click uses Native leftClick, two use Native doubleClick, and larger counts run sequential leftClick calls with bounded randomized intervals. If it triggers a page alert, it is handled without creating an interactive dialog and the success feedback reports the alert message. If it opens a confirm, prompt, or beforeunload dialog, the action returns its dialog id and directs the caller to Page.handleDialog; if it activates a file chooser, the native chooser is cancelled automatically and the prompt directs the caller to direct File.handleChooser injection.",
+  "description": "Performs one or more clicks on a specified page target, using a current target ID or stable selector and returning guidance when the click handles a page alert, opens an interactive dialog on the page, or triggers a file-upload request.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:46c89baed493789bfb9424bc488513360a2f0047f2a530a729933a4bbe4aff12",
+  "catalogRevision": "sha256:52691626582a5164f1e1aaafb5a9e390e6e1e95ccc27663283f74997776c3737",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -19,13 +19,13 @@
         "minLength": 1
       },
       "id": {
-        "description": "Preferred canonical element ID from DOM.getAXTree.",
+        "description": "Current target ID from a recent DOM.getAXTree or DOM.getSemanticTree result.",
         "type": "string",
         "pattern": "^\\d+:\\d+:\\d+$"
       },
       "force": {
         "default": false,
-        "description": "Dispatch even when the resolved element is occluded. Normal browser hit testing still applies, so delivery to the requested target is not guaranteed.",
+        "description": "Attempt the click even when the target is currently covered. The page may still reject or ignore the interaction.",
         "type": "boolean"
       },
       "clickCount": {
@@ -59,11 +59,11 @@
         "type": "string"
       },
       "resolvedBy": {
-        "description": "Actor or resolution mode that selected the target.",
+        "description": "How the target was selected.",
         "type": "string"
       },
       "recoveredTarget": {
-        "description": "Snapshot details used when a stale target was recovered.",
+        "description": "Updated target information when the original target changed.",
         "type": "object",
         "propertyNames": {
           "type": "string"
@@ -81,7 +81,7 @@
         "maximum": 100
       },
       "point": {
-        "description": "CSS-pixel point used for the click.",
+        "description": "Page point used for the click, when available.",
         "type": "object",
         "propertyNames": {
           "type": "string"
@@ -89,17 +89,17 @@
         "additionalProperties": {}
       },
       "resolutionSource": {
-        "description": "Target resolution route used by the action.",
+        "description": "How the target was located.",
         "type": "string"
       },
       "dialog": {
-        "description": "Interactive native dialog returned by this click; handled page alerts are not returned here.",
+        "description": "Page dialog returned by this click; handled alerts are not returned here.",
         "type": "object",
         "properties": {
           "id": {
             "type": "string",
             "minLength": 1,
-            "description": "ID of an interactive native dialog returned for Page.handleDialog."
+            "description": "Dialog ID to pass to Page.handleDialog."
           },
           "type": {
             "type": "string",
@@ -109,7 +109,7 @@
               "prompt",
               "beforeunload"
             ],
-            "description": "Native dialog type."
+            "description": "Page dialog type."
           },
           "message": {
             "type": "string",
@@ -120,7 +120,7 @@
             "type": "string"
           },
           "truncated": {
-            "description": "Whether native dialog text was truncated.",
+            "description": "Whether the dialog message was shortened.",
             "type": "boolean",
             "const": true
           }
@@ -155,11 +155,11 @@
             "type": "string"
           },
           "resolvedBy": {
-            "description": "Actor or resolution mode that selected the target.",
+            "description": "How the target was selected.",
             "type": "string"
           },
           "recoveredTarget": {
-            "description": "Snapshot details used when a stale target was recovered.",
+            "description": "Updated target information when the original target changed.",
             "type": "object",
             "propertyNames": {
               "type": "string"
@@ -177,7 +177,7 @@
             "maximum": 100
           },
           "point": {
-            "description": "CSS-pixel point used for the click.",
+            "description": "Page point used for the click, when available.",
             "type": "object",
             "propertyNames": {
               "type": "string"
@@ -185,17 +185,17 @@
             "additionalProperties": {}
           },
           "resolutionSource": {
-            "description": "Target resolution route used by the action.",
+            "description": "How the target was located.",
             "type": "string"
           },
           "dialog": {
-            "description": "Interactive native dialog returned by this click; handled page alerts are not returned here.",
+            "description": "Page dialog returned by this click; handled alerts are not returned here.",
             "type": "object",
             "properties": {
               "id": {
                 "type": "string",
                 "minLength": 1,
-                "description": "ID of an interactive native dialog returned for Page.handleDialog."
+                "description": "Dialog ID to pass to Page.handleDialog."
               },
               "type": {
                 "type": "string",
@@ -205,7 +205,7 @@
                   "prompt",
                   "beforeunload"
                 ],
-                "description": "Native dialog type."
+                "description": "Page dialog type."
               },
               "message": {
                 "type": "string",
@@ -216,7 +216,7 @@
                 "type": "string"
               },
               "truncated": {
-                "description": "Whether native dialog text was truncated.",
+                "description": "Whether the dialog message was shortened.",
                 "type": "boolean",
                 "const": true
               }

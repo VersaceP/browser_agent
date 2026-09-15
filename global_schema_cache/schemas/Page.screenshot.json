@@ -2,7 +2,7 @@
   "method": "Page.screenshot",
   "description": "Captures the full page, viewport, rectangular region, or resolved element as an image; element captures also return the target Semantic Tree.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:46c89baed493789bfb9424bc488513360a2f0047f2a530a729933a4bbe4aff12",
+  "catalogRevision": "sha256:52691626582a5164f1e1aaafb5a9e390e6e1e95ccc27663283f74997776c3737",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -412,11 +412,11 @@
                               "type": "null"
                             }
                           ],
-                          "description": "Frame-owner node identity. Cross-origin or opaque child frames may keep this null even when status is complete; use parentFrameId and frameId for cross-frame routing."
+                          "description": "Owner node ID for this frame when available; use the frame IDs to correlate child frames."
                         },
                         "url": {
                           "type": "string",
-                          "description": "Frame URL observed by the renderer."
+                          "description": "URL observed for this frame."
                         },
                         "status": {
                           "type": "string",
@@ -455,7 +455,7 @@
                               "type": "null"
                             }
                           ],
-                          "description": "Reason for truncation, when applicable."
+                          "description": "Reason the frame result is incomplete, when provided."
                         },
                         "error": {
                           "description": "Structured failure for an unavailable frame.",
@@ -510,11 +510,11 @@
                     "description": "Node counts, truncation, and visibility summary."
                   },
                   "resolutionSource": {
-                    "description": "Target resolution route used when a target was requested.",
+                    "description": "How the requested target was located, when a target was provided.",
                     "type": "string"
                   },
                   "recoveredTarget": {
-                    "description": "Snapshot details used when a stale target was recovered.",
+                    "description": "Updated target information when the original target changed.",
                     "type": "object",
                     "propertyNames": {
                       "type": "string"
@@ -875,11 +875,11 @@
                                   "type": "null"
                                 }
                               ],
-                              "description": "Frame-owner node identity. Cross-origin or opaque child frames may keep this null even when status is complete; use parentFrameId and frameId for cross-frame routing."
+                              "description": "Owner node ID for this frame when available; use the frame IDs to correlate child frames."
                             },
                             "url": {
                               "type": "string",
-                              "description": "Frame URL observed by the renderer."
+                              "description": "URL observed for this frame."
                             },
                             "status": {
                               "type": "string",
@@ -918,7 +918,7 @@
                                   "type": "null"
                                 }
                               ],
-                              "description": "Reason for truncation, when applicable."
+                              "description": "Reason the frame result is incomplete, when provided."
                             },
                             "error": {
                               "description": "Structured failure for an unavailable frame.",
@@ -973,11 +973,11 @@
                         "description": "Node counts, truncation, and visibility summary."
                       },
                       "resolutionSource": {
-                        "description": "Target resolution route used when a target was requested.",
+                        "description": "How the requested target was located, when a target was provided.",
                         "type": "string"
                       },
                       "recoveredTarget": {
-                        "description": "Snapshot details used when a stale target was recovered.",
+                        "description": "Updated target information when the original target changed.",
                         "type": "object",
                         "propertyNames": {
                           "type": "string"

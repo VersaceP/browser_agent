@@ -2,7 +2,7 @@
   "method": "Input.select",
   "description": "Selects native options directly or operates supported custom select options with the keyboard.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:46c89baed493789bfb9424bc488513360a2f0047f2a530a729933a4bbe4aff12",
+  "catalogRevision": "sha256:52691626582a5164f1e1aaafb5a9e390e6e1e95ccc27663283f74997776c3737",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -32,7 +32,8 @@
               "type": "object",
               "properties": {
                 "value": {
-                  "type": "string"
+                  "type": "string",
+                  "description": "Exact option value returned by the current select inspection."
                 }
               },
               "required": [
@@ -45,7 +46,8 @@
               "properties": {
                 "id": {
                   "type": "string",
-                  "minLength": 1
+                  "minLength": 1,
+                  "description": "Exact option ID returned by the current select inspection."
                 }
               },
               "required": [
@@ -58,7 +60,8 @@
               "properties": {
                 "label": {
                   "type": "string",
-                  "minLength": 1
+                  "minLength": 1,
+                  "description": "Exact option label returned by the current select inspection."
                 }
               },
               "required": [
@@ -77,7 +80,8 @@
             "type": "object",
             "properties": {
               "value": {
-                "type": "string"
+                "type": "string",
+                "description": "Exact option value returned by the current select inspection."
               }
             },
             "required": [
@@ -90,7 +94,8 @@
             "properties": {
               "id": {
                 "type": "string",
-                "minLength": 1
+                "minLength": 1,
+                "description": "Exact option ID returned by the current select inspection."
               }
             },
             "required": [
@@ -103,7 +108,8 @@
             "properties": {
               "label": {
                 "type": "string",
-                "minLength": 1
+                "minLength": 1,
+                "description": "Exact option label returned by the current select inspection."
               }
             },
             "required": [
