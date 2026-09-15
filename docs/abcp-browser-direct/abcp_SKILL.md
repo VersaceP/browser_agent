@@ -22,7 +22,7 @@ Keep the harness boundary strict: do not run `main.py`, `agent_harness.py`, `spa
 
 ## Direct Connection
 
-Default local development uses `ws://localhost:9300/ws`. The repo's `config.json` may set `request_shape: "jsonrpc"`; preserve that value.
+Default local development uses `ws://127.0.0.1:61168/ws`. The repo's `config.json` may set `request_shape: "jsonrpc"`; preserve that value.
 
 If Dispatcher TLS/JWT is enabled, the server expects the JWT in the WebSocket URL query as `?token=<JWT>`. The helper script appends this query token from `jwt_token` or `jwt_token_env` without printing it.
 

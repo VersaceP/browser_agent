@@ -35,6 +35,7 @@
     "max_tokens": 8000
   },
   "browser": {
+    "ws_url": "ws://127.0.0.1:61168/ws",
     "request_shape": "jsonrpc",
     "jwt_token_env": "ABCP_JWT_TOKEN"
   },

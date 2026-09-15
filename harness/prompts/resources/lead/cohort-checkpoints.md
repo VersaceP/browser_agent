@@ -1,7 +1,7 @@
 ---
 id: lead.cohort-checkpoints
 audience: lead
-version: "2026-09-03"
+version: "2026-09-15"
 description: Plan cohort dependencies, confidence checkpoints, continuations, and remediation without weakening the accepted contract.
 sources:
   - harness/task_control/plan_validation.py
@@ -41,7 +41,9 @@ exact producers required. Do not create dependencies merely because a phase is
 listed later.
 
 The confidence ladder is conditional, not a template. Use a one-row probe only
-when the reusable route is genuinely unknown. A checkpoint determines the next
+when concrete evidence identifies a shared unknown route and the expected
+duplicate-work cost justifies delaying independent targets. The probe must
+contribute a requested deliverable, not be throwaway exploration. A checkpoint determines the next
 required role. A continuation that proves a reusable candidate may advance to
 validation; a bulk trace that loses proof must downgrade to continuation.
 Create bulk only when the checkpoint requires it and the rows are independent.

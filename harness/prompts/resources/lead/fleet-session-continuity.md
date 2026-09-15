@@ -1,7 +1,7 @@
 ---
 id: lead.fleet-session-continuity
 audience: lead
-version: "2026-09-05"
+version: "2026-09-15"
 description: Preserve assigned Fleet, page and session continuity while routing retries, continuations and post-HITL work.
 sources:
   - harness/fleet/coordinator.py
@@ -76,7 +76,8 @@ requirements than ordinary task routing.
 Use reuse_scope=page only when the continuation genuinely needs exposed prior
 page candidates, and then require fresh Page.getState/Page.switchTo plus AX
 evidence before action. A non-secret session_key denotes one exact reusable
-Fleet and is mutually exclusive with an explicit fleet_id. needs_isolated_session
+Fleet when the original task has no @Fleet binding. An original-task @Fleet
+binding overrides model-authored session routing. needs_isolated_session
 does not imply per-row isolation.
 
 After HITL, follow the structured next_instruction and preserve its required
@@ -87,10 +88,10 @@ distinction rather than claiming resumed work.
 
 ## Routing states that reach the Lead
 
-These arrive on a worker result or a spawn rejection. Every spawn rejection
-carries its own `next_instruction`, and that receipt is the authority for what
-to do: it names the offending reference, whether the tool ran, and whether a
-retry is permitted. This section is the background the receipt cannot carry.
+These arrive on a worker result or a spawn rejection. Use the structured
+status, identity and execution facts together with next_instruction when
+present. A missing instruction or opaque exception does not authorize a retry
+or prove a contract defect; consult lead.worker-status. This section is the background the receipt cannot carry.
 
 `session_fleet_lost` means the named fleet is gone from the owner inventory and
 is terminal until an explicit reset or re-authentication. Mark the auth session
@@ -121,11 +122,11 @@ DOM.getAXTree before any further action.
 Follow the receipt's `next_instruction`. Two of them carry more than the
 instruction can say.
 
-`fleet_reference_invalid` wants an existing Fleet UUID, or a hexadecimal prefix
-of at least eight characters, in `fleet_id` - never in `session_key`, which is
-a different routing concept entirely. Its receipt includes `candidateFleetIds`
-from the authoritative inventory; choose one of those exact ids or a unique
-prefix, and do not invent a label or replacement Fleet.
+`fleet_reference_invalid` means the immutable original task's `@<Fleet UUID or
+unique prefix>` did not resolve against the authoritative inventory. Never move
+that reference into `fleet_id`, `session_key`, a worker contract, or a tool
+call. Do not invent a label or replacement Fleet; report the candidate ids and
+let the user correct the original task reference.
 
 `task_fleet_limit_reached` is the one that looks like a waiting problem and is
 not. The task already holds `runtime_limits.max_task_fleets` fleets and this
@@ -141,3 +142,17 @@ release a binding through auth recovery, or ask the operator to raise
 `session_manual_reset_required` is likewise terminal for the Lead: repeated
 owner-socket recovery failed, and a host or operator must restore the transport
 or reset that exact fleet/generation. Never release or silently rebind it.
+
+## Concurrent workers and page reuse
+
+max_browser_agents limits running workers. max_browser_agent_instances
+configures slot inventory; the spawner raises effective slot capacity to at
+least max_browser_agents. Do not impose the smaller raw slot setting as a
+second concurrency limit. Honor actual capacity and binding receipts.
+
+Use page reuse only when existing page context is needed. A slot pin through
+reuse_from_worker_id or preferred_slot_id may serialize workers; omit it for
+independent siblings unless that exact slot is necessary. Shared mutable pages
+can serialize operations even across slots. Preserve observed source URLs and
+verbatim hrefs; let current page evidence determine the entry route. There is
+no universal requirement to click a source card or to reuse its worker slot.

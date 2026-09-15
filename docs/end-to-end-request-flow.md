@@ -159,7 +159,7 @@ fact. It is not proof of an identical world state"*——重复调用是算术�
 2. `run_cli()`（main.py:1544）依次完成：
    - `load_runtime_config(args.config)` 加载 `config.json` → `RuntimeConfig`；
    - `read_task(args)` 读任务；交互模式下 `input("请输入浏览器任务（/resume ... 恢复任务；...")`（main.py:1242）；
-   - `--fleet-id/--page-id` 钉住已有浏览器上下文（`_validated_pinned_browser_context`，main.py:52——page 必须有 fleet、必须是 UUID）；
+   - 仅从原始用户任务里的 `@<Fleet UUID 或唯一前缀>` 解析任务级 Fleet 绑定；CLI、计划和工具参数都不能指定 Fleet；
    - resume 路径：`acquire_run_lock` → 加载 task_plan/task_state/manifest → `prepare_resume_state` 决定保留哪些 validated phase、重置哪些被中断/产物失效的 phase，并记录浏览器 Fleet/Page 恢复候选；
    - 新任务路径：创建任务目录（worktree），写 task_manifest；
    - **创建 `LeadAgent` 并 `await harness.run(task_for_agent)`**（main.py:1829-1836）。

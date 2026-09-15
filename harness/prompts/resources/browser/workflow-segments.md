@@ -1,7 +1,7 @@
 ---
 id: browser.workflow-segments
 audience: browser
-version: "2026-09-11"
+version: "2026-09-15"
 description: Write one execute_browser_workflow segment instead of a run of single calls, and decide what to do when a segment fails.
 sources:
   - harness/tools/browser_tools/dispatch.py
@@ -10,6 +10,7 @@ sources:
   - harness/observation/exec_observer.py
 related_tools:
   - execute_browser_workflow
+  - execute_saved_browser_workflow
   - browser_call
 related_methods:
   - Workflow.execute
@@ -17,6 +18,11 @@ related_methods:
 ---
 
 # Segments
+
+Use this guide only when Workflow.execute and its Harness execution tool are
+exposed for this worker. A disabled workflow remains guidance, not an executable
+capability. Follow the current schema and lifecycle-policy receipt if a
+deployment differs from an example.
 
 A segment is the run of actions from where you are now to the next point where
 you genuinely have to look before deciding. Submit it as one
@@ -75,10 +81,10 @@ for you.
 
 ## Driving a control you cannot address yet
 
-A menu's options do not exist until you open it. Nothing written before that
-click can address one: not a canonical id you have never seen, and not a CSS
-selector either, because CSS cannot match on visible text. The observation is
-not optional.
+A menu's options do not exist until you open it. Do not invent a canonical id or selector for an option you have not observed.
+A previously observed selector still needs evidence that it applies to the
+current rendered control. Read the newly exposed options when that evidence
+is missing.
 
 What *is* optional is paying a model turn for it. Put the observation inside the
 segment: **act, read, search the reading, act on what you found.**
@@ -183,10 +189,14 @@ variables and the store.
 moves its cursor past that Action's own event window. `readEvents` reads exactly
 that window, and returns immediately.
 
-A real navigation fires `Page.loaded` after `Page.navigate` returns, so
-`waitEvent` settles it (measured: 527ms on a first visit, 3ms on a cached
-revisit, while `readEvents` came back empty). Reach for `readEvents` when the
-event may already have fired inside the Action — not as a mandatory prefix.
+Use the live Workflow schema and Harness lifecycle policy for the required
+settlement step after navigation. `waitEvent` observes the following window;
+`readEvents` inspects the preceding Action's window. Do not assume one historic
+load timing is guaranteed on every page. A timedOut result does not establish
+readiness: inspect the subsequent Page.getState before using targets. Page.go
+may report navigationStarted=false; that no-op does not promise a load event.
+Use readEvents for an already-finished Action window when appropriate to the
+known segment, or end the segment to decide from its receipt.
 
 **The trap**: a `waitEvent` timeout is not a failure. It returns
 `{"events": [], "timedOut": true}` and the segment continues. Waiting on an
@@ -215,7 +225,7 @@ Choose from what it says:
 
 | choice | when it applies | check first |
 | --- | --- | --- |
-| rerun the whole segment | read-only work whose starting point still holds | nothing irreversible already ran |
+| rerun the whole segment | read-only work whose starting point still holds | no state-changing operation would be repeated, and no replay prohibition applies |
 | rerun with remaining inputs | the segment is parameterized over rows/pages | which inputs are still outstanding |
 | continuation segment | you can express what is left as its own segment | the variables it needs are in `variablesAtFailure` |
 | drop back to single calls | the rest still needs exploring | keep the rows already collected |
@@ -225,10 +235,12 @@ Two rules that outrank convenience:
 1. **Do not slice at `failedStepPath` mechanically.** A step inside a loop or a
    branch carries iteration state, branch conditions and variable setup that a
    bare tail would silently lose.
-2. **Dispatched is dispatched.** Anything the failed segment already sent
-   happened. A submit that failed on the step AFTER it still submitted — verify
-   from the page before repeating it, and never re-run an irreversible action to
-   "make sure".
+2. **Dispatch is not outcome proof.** Anything already dispatched may have
+   taken effect. Check completed-step results and the affected page/resource;
+   a later failure does not undo an earlier action. Missing receipts prove
+   neither success nor non-execution. Never re-run an uncertain side effect
+   merely to "make sure", and obey replayForbidden. Workflow segmentation
+   cannot authorize an action prohibited by the worker's permission boundary.
 
 ## Sizing
 
@@ -236,3 +248,11 @@ Short segments cost one model turn to resume. A long segment on a page you have
 not verified costs a wrong path executed to completion. When unsure, cut it
 shorter — the receipt tells you what the page actually did, and the next segment
 starts from fact instead of assumption.
+
+## Reuse the saved definition
+
+After execute_browser_workflow returns workflowDefinition, reuse its exact
+returned definitionRef and definitionHash via execute_saved_browser_workflow.
+Patch only the actual change through operations; do not rewrite all steps just
+to resume reasoning. Definition identity is not execution identity: a saved
+workflow still requires checking which side effects have already occurred.

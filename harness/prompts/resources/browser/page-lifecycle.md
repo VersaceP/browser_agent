@@ -1,7 +1,7 @@
 ---
 id: browser.page-lifecycle
 audience: browser
-version: "2026-09-09"
+version: "2026-09-15"
 description: Reconcile navigation, page lifecycle, dialog, page inventory and stale-handle receipts before another browser action.
 sources:
   - abcp-platform/resources/skills/webcross-browser/SKILL.md
@@ -57,7 +57,8 @@ Use this guide when a navigation, click, page inventory, dialog or lifecycle
 receipt leaves uncertainty about whether a page is ready or an old target is
 still valid.
 
-Only a real document load blocks DOM/Input. After Page.startedLoading or a
+A real document load requires settlement before DOM/Input; dialog, readiness
+and identity gates also apply. After Page.startedLoading or a
 receipt with navigationStarted=true, wait for Page.loaded/Page.loadFailed. If
 settlement times out, call Page.getState once rather than polling. If Page.go
 reports navigationStarted=false, no history move was dispatched: keep the
@@ -120,3 +121,19 @@ receipt comes back as `page_changed_during_read` with `stableEvidence: false`.
 The call did run, so do not replay it blindly; the tree simply describes a
 document you were not asking about. Re-observe the settled page instead of
 recording it.
+
+## No dispatch, load failure and snapshot freshness
+
+navigation_not_dispatched means that navigation request was not sent.
+navigation_load_failed means a sent load failed; it does not prove that the
+previous URL/document survived unchanged. Reconcile current state before
+choosing recovery. An expectation mismatch is an arrived page with mismatched
+expectations, not a reason to repeat the navigation.
+
+Follow actual freshness receipts: Page.go with navigationStarted=false and a
+policy-verified read-only Runtime.evaluate do not themselves invalidate AX.
+Harness may accept a newer same-page AX event instead of invalidating that
+snapshot. This is not permission to assume an event happened; use the accepted
+current snapshot and refresh whenever the lifecycle/AX gate requires it.
+Download progress changes alone do not require a page refresh. Dialog,
+chooser, navigation and recovery receipts retain their own requirements.

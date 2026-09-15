@@ -13,14 +13,14 @@
   | L0.1 按结果类型分级 | ⏸ 有触发条件才做，见下 | — |
   | L0.2 降 worker 推理预算 | ❌ 实测否决 | — |
   | L0.3 lead max_tokens | ❌ 已撤回 | — |
-  | L1.1 `--agent-mode browser` | ✅ 已完成 | `11ce1e5` |
+  | L1.1 交互 `/browser` 入口 | ✅ 已完成 | `11ce1e5` |
   | L1.2 页面记录 + 阶段自动续跑 | ✅ 已完成（范围已修正，见下） | `5cc850b` `a9522ad` |
   | L1.3 动作回执带局部 AXTree diff | ⬜ 待做，与段化重叠，需重测 | — |
   | L1.4 并行 tool_calls | ⏸ 实测无靶子（82.4% 回合单调用） | — |
   | L2.1 Workflow 执行通道 | ⚠️ 部分完成；真实任务 A/B 已补 | `5d4d8f9` `6467e9f` |
   | L2.2 删响应形状匹配回退 | ✅ 已完成 | `980f7b1` |
   | L2.3 平台侧绑定 Action | ⬜ 待平台配合 | — |
-  | L3 换基模 + 删 VL | ⬜ 排最后 | — |
+  | L3 多模态 BrowserAgent + 停用 VL | 🟡 已实现，待真实任务 canary | 2026-09-12 |
   | **新增** VL reality check 异步化 | ✅ 已完成 | `d41a510` |
   | **新增** 段化率回归 | ✅ 已定性，结论反转（段少而大更快） | — |
 
@@ -168,7 +168,9 @@ max 1.8s/231tok、high 1.8s/260、medium 1.6s/167、low 1.7s/238，全在噪声�
 
 实测首个浏览器动作要等 **6.6–19.9 分钟**，全是 lead 的计划阶段（单发输出 24000 token，耗时 356–497s）。
 
-**动作**：`main.py` 提供 `agent_mode=lead|browser`，`browser` 不创建 LeadAgent、不生成 phase plan。
+**动作**：`main.py` 在交互启动时由用户输入 `/lead` 或 `/browser` 选择
+`agent_mode`；非交互调用使用 `config.json` 的默认值。`browser` 不创建
+LeadAgent、不生成 phase plan。
 
 **已落地（`11ce1e5`）**：一次有界分类调用取代那一发计划生成，之后机械合成同形 raw
 声明，编译/校验/PlanValidator 审计/操作员审批/派发/收尾全部走原函数。分类器不继承
@@ -391,11 +393,33 @@ harness composite 只能买回合数，买不到原子性：check 和 act 之间
 
 ---
 
-## L3：换基模 + 删 VL 链路 ⬜ 排最后
+## L3：多模态 BrowserAgent + 停用 VL 链路 🟡 已实现，待真实任务 canary
 
-实测 `visual_verify` 36 次、p50 13.2s、14 次运行合计 9.4 分钟 —— **不是瓶颈**。删它的收益是正确性（消除"图像结论转文字再转回主 agent"的信息损失），不是速度。
+部署确认 `worker.model_id: "deepseek-flash"` 对应 DeepSeek v4.1 flash 多模态模型，
+因此**不改模型别名或 provider**。能力不能从别名推断：新增
+`harness.browser_agent_multimodal_enabled` 显式声明模型接受图像内容块；当前部署已打开。
 
-**必须排在所有 A/B 敏感优化之后**：删 VL 依赖 BrowserAgent 基模多模态，而当前 worker 是 `deepseek-v4-flash`。换基模会同时改变推理长度、工具调用习惯、AXTree 理解能力，**一旦先换，前面所有优化的 A/B 归因全部失效**。
+实现（2026-09-12）：
+
+- `Page.screenshot` 仍由 ABCP 写成 artifact；harness 仅在文件是受支持的图片且不超过
+  `browser_agent_max_multimodal_image_bytes` 时，读取一次并作为**下一次** BrowserAgent
+  请求的 image block 附上。路径、base64 均不进入遥测。
+- 模型成功返回后，截图像素立即从对话历史移除，替换为“已过期，需要重新截图”的文字。
+  因此不会在后续每一回合反复发送同一张图片，也不会送进文本 compactor。
+- 多模态模式从模型工具表隐藏 `visual_verify`；当前配置同时将顶层 `vl.enabled` 设为
+  `false`，停止专用 GLM VL 请求。旧 VL 包和内部调用点暂留作可逆兼容面，但禁用状态下
+  不会发请求；真实任务 canary 稳定后再删除死代码。
+- 图片只用于界面、覆盖层、canvas 与 DOM/视觉不一致的有界判断。它不能生成坐标点击，
+  也不能代替 AX/SemanticTree 的身份绑定、状态验证和结构化抽取；操作前仍需拿到当前
+  canonical id 或 selector，动作后仍需重新观察。
+- OpenAI 兼容适配器会把同一附件保持为 `image_url` 内容，而不是把 base64 串化到 tool
+  文本；若 provider 拒绝含图片的请求，moderation fallback 会只撤下图片并保留工具文字
+  回执，避免无限重发。
+
+验收不能只看总耗时：在同一 commit、同一任务合同、全新页面下对比至少一对任务，记录
+`agent.multimodal_screenshot`（附图/跳过原因和尺寸）、`tool_result.model_visible.multimodalImage`
+及视觉后的结构化再观察。若附件被 provider 拒绝、视觉结论与后续结构化证据冲突，或
+任务质量下降，关闭 `browser_agent_multimodal_enabled` 即恢复旧工具面；无需换模型。
 
 ---
 

@@ -21,7 +21,7 @@ python -m pip install -r requirements.txt
 Start or point to your ABCP Browser service. The default config expects:
 
 ```text
-ws://localhost:9300/ws
+ws://127.0.0.1:61168/ws
 ```
 
 Set the model API key expected by your `config.json`:
@@ -214,12 +214,16 @@ Default browser request shape is `flat`:
 {
   "browser": {
     "agent_id": "abcp-agent",
-    "ws_url": "ws://localhost:9300/ws",
+    "ws_url": "ws://127.0.0.1:61168/ws",
     "jwt_token_env": "ABCP_JWT_TOKEN",
     "request_shape": "flat"
   }
 }
 ```
+
+`agent_id` is a harness-local routing and logging identifier. WebCross assigns
+protocol identity to the WebSocket connection; configuring this value neither
+authenticates nor restores a WebCross session.
 
 If your ABCP service expects JSON-RPC requests:
 
@@ -269,17 +273,17 @@ Common harness options:
 
 - `lead_max_steps`: maximum LeadAgent decision rounds.
 - `worker_max_steps`: maximum BrowserAgent rounds.
-- `max_browser_agent_instances`: maximum live BrowserAgent slots kept in the reusable pool. Idle slots keep their ABCP connection and page registry.
-- `max_browser_agents`: maximum concurrently running browser workers. Effective browser-slot concurrency is still bounded by `max_browser_agent_instances`.
-- `fleet_reuse_enabled`: deterministically assign each worker a fleet and force `Page.create` into it. Generic work may reuse an eligible slot fleet; a new `session_key` or isolated worker gets a fresh fleet, while `worker_contract.fleet_id` selects an existing Fleet by full UUID or unique prefix and never creates a replacement. Named/isolated fleets never become the generic slot default. Lost named sessions fail with `session_fleet_lost` instead of silently rebinding. Model-initiated `Fleet.create`/`Fleet.close` and out-of-assignment fleet ids fail closed; explicit page continuations may receive prior page candidates.
-- `similar_task_fleet_reuse_enabled`: before the first successful Fleet acquisition of an unconstrained task, compare the original user objective with the trusted harness-owned task index in current Fleet memory. A match reuses the Fleet only and always opens a fresh page. Resume and explicit pinned/fleet/session/continuation routing, plus phase-declared isolation, take precedence. Active lifecycle is keyed by top-level task plus worker so one worker cannot mark a Fleet completed while another worker still uses it. Terminal history collapses by task and keeps the latest 12 tasks. Running identity keeps at most 32 worker records plus one backward-compatible synthetic running fence for overflow; the fence cannot release before every omitted finite lease expires, and untrustworthy or non-expiring overflow remains permanently fail-closed. Admission requires a completed task record and a versioned Fleet-level policy that has never been blocked by named-session, pinned, or hard-isolation use; identity-free legacy history and foreign memory are not candidates. A stopped `prepared` Fleet may auto-wake through readiness, while a real readiness failure falls back once to ordinary routing/Fleet creation without committing the candidate.
+- `max_browser_agent_instances`: target number of live BrowserAgent slots kept in the reusable pool. Idle slots keep their ABCP connection and page registry. The effective pool is raised to at least `max_browser_agents`.
+- `max_browser_agents`: authoritative maximum number of concurrently running browser workers.
+- `fleet_reuse_enabled`: deterministically assign each worker a fleet and force `Page.create` into it. Generic work may reuse an eligible slot fleet; a new `session_key` or isolated worker gets a fresh fleet. An existing Fleet is bound only when the original user task contains `@<full UUID or unique prefix>`; the runtime resolves it from authoritative inventory and never creates a replacement. Named/isolated fleets never become the generic slot default. Lost named sessions fail with `session_fleet_lost` instead of silently rebinding. Model-initiated `Fleet.create`/`Fleet.close` and out-of-assignment fleet ids fail closed; explicit page continuations may receive prior page candidates.
+- `similar_task_fleet_reuse_enabled`: before the first successful Fleet acquisition of an unconstrained task, compare the original user objective with the trusted harness-owned task index in current Fleet memory. A match reuses the Fleet only and always opens a fresh page. Resume, task-level `@Fleet` routing, session/continuation routing, plus phase-declared isolation, take precedence. Active lifecycle is keyed by top-level task plus worker so one worker cannot mark a Fleet completed while another worker still uses it. Terminal history collapses by task and keeps the latest 12 tasks. Running identity keeps at most 32 worker records plus one backward-compatible synthetic running fence for overflow; the fence cannot release before every omitted finite lease expires, and untrustworthy or non-expiring overflow remains permanently fail-closed. Admission requires a completed task record and a versioned Fleet-level policy that has never been blocked by named-session, task-bound, or hard-isolation use; identity-free legacy history and foreign memory are not candidates. A stopped `prepared` Fleet may auto-wake through readiness, while a real readiness failure falls back once to ordinary routing/Fleet creation without committing the candidate.
 - `similar_task_reuse_threshold`: deterministic normalized text/character-ngram ranking threshold in `[0, 1]`, default `0.78`. It cannot grant reuse by itself: normalized tasks must first be equal or a high-overlap contiguous extension, explicit URL origins must not conflict, and numeric tokens must agree when both tasks contain them. Reuse transfers browser context only—prior pages and results are never accepted as current evidence.
 - `similar_task_running_stale_seconds`: lease TTL for a `running` Fleet-memory record, default `86400` (24 hours). A worker entering through similar-task reuse must save its initial lease before browser work starts. Eligible live workers then refresh the lease in the background and stop heartbeating before terminal state is written; cancellation and failure paths also attempt a bounded terminal checkpoint. Positive configured values are clamped to at least `60` seconds to avoid expiring inside one write and to bound write amplification. Set it to `0` to disable expiry and retain indefinite fail-closed blocking.
 - `same_fleet_multiworker_enabled`: opt-in canary for sharing one task/session fleet across parallel slots while keeping separate pages. It defaults to `false`; when enabled, the owner socket remains authoritative, notifications are relayed to delegates, and equal-page calls are serialized.
-- `max_task_fleets`: ceiling on how many distinct fleets (browser instances) one task may occupy; `0` disables it. The harness never closes a fleet, so one it opens holds its budget slot until the platform stops reporting it — a fleet that disappears from the owner inventory releases its slot again. Counted over fleets bound to this task's workers, never over the Agent-global `Fleet.list`. An explicitly selected fleet (`--fleet-id` pin, `worker_contract.fleet_id`, a bound `session_key`, `reuse_from_worker_id`) is always honored and never blocked, but it does consume budget. At the ceiling a fleetless worker reuses one of the task's existing fleets, preferring one no running worker holds, and deployment-default `worker_session_isolation_enabled` yields to the cap. Two cases cannot be served that way and get a `task_fleet_limit_reached` receipt instead: a spawn demanding a separate identity (a phase-declared `needs_isolated_session`, or a new `session_key`), and a ceiling where every task fleet is bound to a named session, since a logged-in cookie jar is never lent to a generic worker. Waiting does not clear either one — the harness closes no fleets and a session binding outlives its worker — so the receipt tells the Lead to continue on an existing fleet, release a session binding through auth recovery, or raise the ceiling. Before refusing, the cap re-reads the authoritative `Fleet.list` once. The dispatcher answers that from the whole fleets table with no per-connection scoping, so one successful read both finds a fleet another slot created seconds ago and retires any fleet the platform has dropped — whichever slot owned it — handing its budget back. A failed read is never treated as proof of disappearance.
+- `max_task_fleets`: ceiling on how many distinct fleets (browser instances) one task may occupy; `0` disables it. The harness never closes a fleet, so one it opens holds its budget slot until the platform stops reporting it — a fleet that disappears from the owner inventory releases its slot again. Counted over fleets bound to this task's workers, never over the Agent-global `Fleet.list`. A Fleet named by task-level `@<id>`, a bound `session_key`, or `reuse_from_worker_id` consumes the budget and is honored if current authoritative inventory confirms it. At the ceiling a fleetless worker reuses one of the task's existing fleets, preferring one no running worker holds, and deployment-default `worker_session_isolation_enabled` yields to the cap. Two cases cannot be served that way and get a `task_fleet_limit_reached` receipt instead: a spawn demanding a separate identity (a phase-declared `needs_isolated_session`, or a new `session_key`), and a ceiling where every task fleet is bound to a named session, since a logged-in cookie jar is never lent to a generic worker. Waiting does not clear either one — the harness closes no fleets and a session binding outlives its worker — so the receipt tells the Lead to continue on an existing fleet, release a session binding through auth recovery, or raise the ceiling. Before refusing, the cap re-reads the authoritative `Fleet.list` once. The dispatcher answers that from the whole fleets table with no per-connection scoping, so one successful read both finds a fleet another slot created seconds ago and retires any fleet the platform has dropped — whichever slot owned it — handing its budget back. A failed read is never treated as proof of disappearance.
 - `fleet_auth_barrier_enabled`: make login/CAPTCHA resolution fleet-wide and fail closed for non-resolver workers. `fleet_auth_barrier_wait_seconds` controls the bounded wait.
 - `auth_fleet_ledger_path`: persistent, non-secret verified session index, relative to `worktree_dir` unless absolute. Reclaimed fleets are quarantined until ledger reconciliation restores their restrictions.
-- `fleet_slot_reconnect_attempts`: bounded same-`agentId` reconnect attempts per recovery cycle. Transport loss never proves that the fleet is lost.
+- `fleet_slot_reconnect_attempts`: bounded reconnect attempts per recovery cycle. Each reconnect must retain the server-assigned protocol identity before an authenticated fleet binding is reused; transport loss never proves that the fleet is lost.
 - `fleet_slot_reconnect_backoff_seconds`: base delay between those reconnect attempts. Failed browser mutations are never replayed.
 - `fleet_slot_manual_reset_after_failures`: recovery cycles before spawn returns `session_manual_reset_required`. The binding remains fail-closed until a host/operator explicitly resets it with the reported fleet id and generation.
 - `hitl_poll_interval_seconds`: polling interval after `Hitl.requestPause`.
@@ -308,6 +312,11 @@ Override agent id or step count:
 ```bash
 python main.py --agent-id demo-agent --max-steps 20 --task "Check the current fleet list."
 ```
+
+For an interactive run, choose the orchestration entry before entering the
+task: type `/browser` for one direct BrowserAgent, or `/lead` for planning,
+parallel work, and aggregation. The prompt confirms the choice for this run;
+it does not modify `config.json`.
 
 Resume an interrupted task at phase granularity:
 

@@ -232,10 +232,18 @@ def guides_for_audience(audience: str) -> Tuple[HarnessGuide, ...]:
     )
 
 
-def guide_manifest(audience: str) -> str:
+def guide_manifest(
+    audience: str,
+    *,
+    exclude_ids: Optional[Iterable[str]] = None,
+) -> str:
     """Render a compact stable XML index; guide prose remains off-prompt."""
 
-    guides = guides_for_audience(audience)
+    excluded = {str(guide_id) for guide_id in (exclude_ids or ())}
+    guides = tuple(
+        guide for guide in guides_for_audience(audience)
+        if guide.guide_id not in excluded
+    )
     if not guides:
         return ""
     rendered: List[str] = [

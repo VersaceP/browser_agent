@@ -20,7 +20,10 @@ Harness 当前的主要性能问题不是单个浏览器 RPC 慢，而是模型�
 
 ## 已确认的设计决定
 
-1. **入口模式显式选择。** `main.py` 提供 `agent_mode=lead|browser`。`browser` 直接运行一个 BrowserAgent，不创建 LeadAgent、完整 phase plan 或计划审查模型；`lead` 运行协调、计划、多 Agent 并发、依赖和汇总路径。本阶段不定义或实现 `auto` 模式。
+1. **入口模式显式选择。** 交互启动时，用户通过 `/browser` 或 `/lead` 选择
+   `agent_mode`；非交互调用使用配置的默认值。`browser` 直接运行一个
+   BrowserAgent，不创建 LeadAgent、完整 phase plan 或计划审查模型；`lead` 运行
+   协调、计划、多 Agent 并发、依赖和汇总路径。本阶段不定义或实现 `auto` 模式。
 2. **取消固定 browser step 终止。** 模型回合继续记录为遥测数据，但不再因固定轮次耗尽而结束任务、续 step 或更换 worker。全局时间、费用、并发和单次动作超时仍是显式资源边界；到达边界时暂停并保留会话和检查点。
 3. **保留并增强多 Agent 并发。** 已批准计划中可并行的同阶段实体由调度器直接派发。每个 worker 拥有自己的持久化执行会话；共享页面、输入焦点、登录态或 fleet 生命周期等真实共享资源仍按资源加锁。
 4. **保留首个详情页探路与 sibling handoff。** 首个详情页的工作计入最终交付。其成功路线、字段位置、失败尝试和成本可供后续同类 worker 复用；不能跨页面复用 AX ID、坐标、页面值或把经验当作新页面事实。
@@ -53,7 +56,8 @@ flowchart LR
 
 ### 入口与协调
 
-`main.py` 在运行时显式选择两条互斥入口，终端、配置文件或 API 调用方都可传入该选择：
+`main.py` 在运行时显式选择两条互斥入口：交互终端使用 `/browser` 或 `/lead`，
+非交互调用使用配置默认值：
 
 - `agent_mode=browser`：直接创建一个持久化 BrowserAgent 会话。它不创建 LeadAgent，不生成完整 phase plan，也不隐式升级为协调模式。适用于调用方明确选择的单 Agent 执行。
 - `agent_mode=lead`：创建 LeadAgent 与协调器。它适用于调用方明确需要计划、多 Agent 并发、生产者/消费者依赖、跨 worker 汇总或审批控制的任务。

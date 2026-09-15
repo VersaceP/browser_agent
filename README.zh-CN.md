@@ -21,7 +21,7 @@ python -m pip install -r requirements.txt
 启动或连接你的 ABCP Browser 服务。默认配置使用：
 
 ```text
-ws://localhost:9300/ws
+ws://127.0.0.1:61168/ws
 ```
 
 设置 `config.json` 中声明的模型 API key：
@@ -190,12 +190,15 @@ DashScope compatible-mode），且不会像 `true` 那样在 Anthropic 路上额
 {
   "browser": {
     "agent_id": "abcp-agent",
-    "ws_url": "ws://localhost:9300/ws",
+    "ws_url": "ws://127.0.0.1:61168/ws",
     "jwt_token_env": "ABCP_JWT_TOKEN",
     "request_shape": "flat"
   }
 }
 ```
+
+`agent_id` 仅是 harness 的本地路由与日志标识。WebCross 的协议身份由
+WebSocket 连接分配；配置该值既不能认证，也不能恢复 WebCross 会话。
 
 如果 ABCP 服务端使用 JSON-RPC 请求格式：
 
@@ -245,17 +248,17 @@ DashScope compatible-mode），且不会像 `true` 那样在 Anthropic 路上额
 
 - `lead_max_steps`: LeadAgent 最大决策轮数。
 - `worker_max_steps`: BrowserAgent 最大执行轮数。
-- `max_browser_agent_instances`: 可复用池里最多保留的长期存活 BrowserAgent slot 数。idle slot 会保留 ABCP 连接和页面 registry。普通新 worker 只复用连接并从新页面开始；显式 continuation 才会复用旧页面候选。
-- `max_browser_agents`: 同时运行的 browser worker 上限；实际 browser slot 并发仍受 `max_browser_agent_instances` 限制。
-- `fleet_reuse_enabled`: 由协调器为 worker 确定性分配 fleet，并将无 fleetId 的 `Page.create` 收敛到该分配。具名/隔离 fleet 不会进入通用复用池。
-- `similar_task_fleet_reuse_enabled`: 未携带显式路由约束的任务只在第一次成功获取 fleet 前，用原始用户目标匹配当前 fleet memory 中由 harness 维护的可信任务索引。命中后只复用 fleet，并始终新建页面；resume、固定 fleet/page、显式 `fleet_id`、`session_key`、continuation 和阶段显式隔离始终优先。活动生命周期按顶层 task 与 worker 联合键控，避免同一 fleet 上一个 worker 完成时覆盖另一个仍在运行的 worker。终态历史按任务折叠并保留最近 12 个任务；running 身份最多保留 32 条 worker 记录，溢出部分压缩成一条向后兼容的合成 running fence。该 fence 不会早于所有被压缩的有限租约过期；不可可信时间戳或永不过期租约的溢出会永久 fail-closed。准入要求存在已完成的任务记录和可信版本的 fleet 级策略，且从未被具名会话、固定身份或硬隔离永久阻断；无身份旧记录和外部 memory 不作为候选。`prepared` fleet 可由 readiness 自动唤醒，真正的 readiness 失败则不提交候选，并只降级一次到普通路由/创建。
+- `max_browser_agent_instances`: 可复用池长期保留的 BrowserAgent slot 目标数。idle slot 会保留 ABCP 连接和页面 registry；有效池容量至少等于 `max_browser_agents`。普通新 worker 只复用连接并从新页面开始；显式 continuation 才会复用旧页面候选。
+- `max_browser_agents`: 同时运行的 browser worker 权威上限。
+- `fleet_reuse_enabled`: 由协调器为 worker 确定性分配 fleet，并将无 fleetId 的 `Page.create` 收敛到该分配。通用任务可复用合格 slot 的 fleet；新建 `session_key` 或独立 worker 会开新 fleet。已有 Fleet 只可在原始用户任务中写作 `@<完整 UUID 或唯一前缀>`；运行时以权威库存解析，目标不存在或歧义时失败，绝不创建替代 Fleet。具名/隔离 fleet 不会进入通用复用池。
+- `similar_task_fleet_reuse_enabled`: 未携带显式路由约束的任务只在第一次成功获取 fleet 前，用原始用户目标匹配当前 fleet memory 中由 harness 维护的可信任务索引。命中后只复用 fleet，并始终新建页面；resume、任务级 `@Fleet`、`session_key`、continuation 和阶段显式隔离始终优先。活动生命周期按顶层 task 与 worker 联合键控，避免同一 fleet 上一个 worker 完成时覆盖另一个仍在运行的 worker。终态历史按任务折叠并保留最近 12 个任务；running 身份最多保留 32 条 worker 记录，溢出部分压缩成一条向后兼容的合成 running fence。该 fence 不会早于所有被压缩的有限租约过期；不可可信时间戳或永不过期租约的溢出会永久 fail-closed。准入要求存在已完成的任务记录和可信版本的 fleet 级策略，且从未被具名会话、任务绑定或硬隔离永久阻断；无身份旧记录和外部 memory 不作为候选。`prepared` fleet 可由 readiness 自动唤醒，真正的 readiness 失败则不提交候选，并只降级一次到普通路由/创建。
 - `similar_task_reuse_threshold`: `[0, 1]` 范围内的确定性归一化文本/字符 n-gram 排序阈值，默认 `0.78`。它不能单独授予复用：归一化任务还必须相同或构成高重合连续扩展，显式 URL origin 不得冲突，双方都有数字 token 时必须一致。复用的只是浏览器上下文，历史 page 和任务结果都不会被当作当前证据。
 - `similar_task_running_stale_seconds`: `running` fleet-memory 记录的租约 TTL，默认 `86400`（24 小时）。通过相似任务复用进入 fleet 的 worker 必须在浏览器工作开始前先写入首条租约；符合自动复用条件的存活 worker 随后会在后台刷新租约，并在写终态之前先停止心跳。取消和异常路径仍会限时尽力写入终态。正数配置最小收敛到 `60` 秒，避免一次写入期间就过期并限制写放大；设为 `0` 表示不失效并永久 fail-closed。
 - `same_fleet_multiworker_enabled`: 多 slot 共享 task/session fleet 的灰度开关，默认 `false`；启用后各 worker 使用独立 page，owner 连接保持不变，通知由 harness 中继，同 page 调用串行化。
-- `max_task_fleets`: 单个任务最多占用的 fleet（浏览器实例）数，`0` 表示不限。harness 不会主动关闭 fleet，所以开出来的 fleet 会一直占着额度，直到平台的权威库存不再报告它——从 owner 库存消失的 fleet 会把额度释放回去。计数只统计绑定到本任务 worker 的 fleet，不看 Agent 全局的 `Fleet.list`。任务显式指定的 fleet（`--fleet-id` 固定实例、`worker_contract.fleet_id`、已绑定的 `session_key`、`reuse_from_worker_id`）永远照用不被拦截，但同样计入总数。到达上限后，没指定 fleet 的 worker 自动复用本任务已有的 fleet（优先挑没有在跑的 worker 占着的那个），`worker_session_isolation_enabled` 的默认隔离让位于上限。只有两种情况没法这么服务，返回 `task_fleet_limit_reached` 回执：一是要求独立身份（显式声明 `needs_isolated_session` 或新开 `session_key`）；二是本任务的 fleet 全部绑给了具名会话——登录态的 cookie jar 不外借。这两种**等待都解不开**（harness 不关 fleet，worker 结束后 fleet 还在；具名会话的绑定也不随 worker 结束而释放），所以回执给的是：改用已有 fleet、走可信恢复流程释放 session binding、或调高上限。拒绝之前 cap 会强制重读一次权威 `Fleet.list`。dispatcher 是从整张 fleets 表作答、不按连接分域，所以一次成功的读取既能找到别的 slot 刚建的 fleet，也能退役任何已被平台回收的 fleet（不论原属哪个 slot）并把额度还回来。读取失败则一律不当作"消失"的证据。
+- `max_task_fleets`: 单个任务最多占用的 fleet（浏览器实例）数，`0` 表示不限。harness 不会主动关闭 fleet，所以开出来的 fleet 会一直占着额度，直到平台的权威库存不再报告它——从 owner 库存消失的 fleet 会把额度释放回去。计数只统计绑定到本任务 worker 的 fleet，不看 Agent 全局的 `Fleet.list`。任务级 `@<id>`、已绑定的 `session_key`、`reuse_from_worker_id` 指向的 fleet 都计入额度；任务级引用仅在当前权威库存确认时才能使用。到达上限后，没指定 fleet 的 worker 自动复用本任务已有的 fleet（优先挑没有在跑的 worker 占着的那个），`worker_session_isolation_enabled` 的默认隔离让位于上限。只有两种情况没法这么服务，返回 `task_fleet_limit_reached` 回执：一是要求独立身份（显式声明 `needs_isolated_session` 或新开 `session_key`）；二是本任务的 fleet 全部绑给了具名会话——登录态的 cookie jar 不外借。这两种**等待都解不开**（harness 不关 fleet，worker 结束后 fleet 还在；具名会话的绑定也不随 worker 结束而释放），所以回执给的是：改用已有 fleet、走可信恢复流程释放 session binding、或调高上限。拒绝之前 cap 会强制重读一次权威 `Fleet.list`。dispatcher 是从整张 fleets 表作答、不按连接分域，所以一次成功的读取既能找到别的 slot 刚建的 fleet，也能退役任何已被平台回收的 fleet（不论原属哪个 slot）并把额度还回来。读取失败则一律不当作"消失"的证据。
 - `fleet_auth_barrier_enabled`: 登录/验证码按 fleet 全域加门，非 resolver 有界等待且超时不放行。等待时间由 `fleet_auth_barrier_wait_seconds` 控制。
 - `auth_fleet_ledger_path`: 持久化的非敏感已验证会话索引；重启回收的 fleet 在账本对账前不会进入通用复用池。
-- `fleet_slot_reconnect_attempts`: 具名会话 slot 每轮使用原 `agentId` 进行的有界重连次数；transport 故障本身不等于 fleet 已丢失。
+- `fleet_slot_reconnect_attempts`: 每轮恢复的有界重连次数。只有服务端返回的协议身份保持连续时，已认证的 fleet 绑定才可复用；transport 故障本身不等于 fleet 已丢失。
 - `fleet_slot_reconnect_backoff_seconds`: 重连间隔的基础时间；不会重放失败的浏览器写操作。
 - `fleet_slot_manual_reset_after_failures`: 连续恢复失败轮次达到该值后返回 `session_manual_reset_required`；只有 host/operator 能使用回执中的 fleet id 和 generation 显式重置。
 - `hitl_poll_interval_seconds`: `Hitl.requestPause` 后轮询恢复状态的间隔。
@@ -284,6 +287,10 @@ echo "打开 https://example.com 并总结页面。" | python main.py
 ```bash
 python main.py --agent-id demo-agent --max-steps 20 --task "检查当前 Fleet 列表。"
 ```
+
+交互启动后，先选择本次编排入口再输入任务：`/browser` 直达单个
+BrowserAgent；`/lead` 走计划、并发与汇总。终端会确认本次选择，且不会修改
+`config.json`。
 
 按 phase 粒度恢复中断任务：
 

@@ -5,6 +5,8 @@
 **平台版本**：`catalogRevision: sha256:46c89baed493789bfb9424bc488513360a2f0047f2a530a729933a4bbe4aff12`
 **涉及包**：`packages/workflow`、`packages/actions/src/domains/Workflow`
 
+**2026-09-14 补充**：问题 9 来自任务 `4e4c66973eca41a69827a18083da75b7` 的续跑，涉及 Client 下载路径前置检查。原有 1–8 项保留其历史复现口径，本次未将它们全部重新验证为当前版本仍存在的问题；问题 9 的安装版本证据单列。
+
 ---
 
 ## 背景：我们在用 Workflow 做什么
@@ -655,7 +657,63 @@ errorCode: "target-readonly"   stepPath: "steps[1]"   action: "Input.type"   dur
 
 ---
 
+## 问题 9：缺失的下载父目录被误报为越权，导致模型错误改变交付位置
+
+### 9.1 已核实的调用对照
+
+任务：`4e4c66973eca41a69827a18083da75b7`；run：`resume-20260914T122339006476Z-cd65ad48`。以下编号是该 run 的 `sequenceNo`，原始回执在任务 `run.jsonl` 中。
+
+用户要求商品文件在 Desktop 按商品及类别分目录交付。实际调用对照：
+
+| 事件 | 目标 | 结果 |
+|---|---|---|
+| 217 | Workflow 内 Download.start，Desktop 下商品分类的多层新目录 | 子步骤 `status:error`、`errorCode:download-path-not-allowed` |
+| 253/254 | 同一路径的直接 Download.start | RPC -32005，`The download destination is outside the allowed workspace.` |
+| 312 | task worktree 内新的多层 deliverables 目录 | 同样拒绝 |
+| 312 | 已存在的项目根目录，位于 task worktree 外 | 成功返回 downloadId、state=downloading |
+| 354 | 已存在的 task worktree/observations | 成功返回 downloadId、state=downloading |
+| 354 | task worktree 内新的一级目录、项目根目录下的新目录 | 同样拒绝 |
+
+成功行表示 start 已被接纳，不把 `downloading` 当成文件已经完整下载。日志对照说明拒绝并非简单的“只能写 worktree”。最终商品清单中的80个文件实际位于 observations，均存在且非空，但未按用户要求归档；这不等同于独立确认所有素材内容完整。
+
+### 9.2 执行代码与安装版本
+
+`packages/client/src/main/managers/download/DownloadPathPolicy.ts` 的顺序是：
+
+```ts
+const destination = path.resolve(rawPath);
+const parent = path.dirname(destination);
+if (!PathSecurity.isPathSafe(parent)) {
+  throw createActionError('download-path-not-allowed',
+    'The download destination is outside the allowed workspace.');
+}
+```
+
+`packages/client/src/main/infra/PathSecurity.ts` 中 `isPathSafe` 依赖 `normalizeExistingPath`；后者对 `fs.realpathSync.native` 的任何失败返回 null。缺失父目录于是被当作权限拒绝。默认允许根目录包括 Home 和 Desktop，但这不能使不存在的父目录通过 realpath。
+
+已读取当前安装文件 `/Applications/WebCross.app/Contents/Resources/resources/client/WebCross Client.app/Contents/Resources/app.asar`：Client package version `0.9.0-beta`；`dist/main/index.js` SHA-256 为 `4f945271f11890d78f828b4cbda02f279882c26fde65e18e059e5fcd8cfe55f2`。该脚本含相同检查和默认允许根。安装文件、源码和本次运行回执一致；没有用 package version 证明运行内存身份，也没有声称仅修改工作区源码就能修复已安装应用。本次未另外执行 live 下载。
+
+### 9.3 平台建议与验收
+
+建议由 Download.start 本身支持已授权路径下的父目录准备，或明确提供配套目录能力；无论哪种契约，都应区分“父目录缺失”和“目的地越权”。自动创建方案应先验证最近存在祖先及待创建路径处于允许范围，处理符号链接/路径穿越，再创建目录，并保留 Native 写入时的权限与目标复核。不要先无条件 mkdir 再做安全检查。
+
+错误回执应提供客观原因，例如 `parent_missing`、`outside_allowed_roots`、`permission_denied`、`parent_not_directory`，并在嵌套 Workflow 中保留。不要把所有原因都建议为“换一个允许目录”。目录原因细化是新增问题；Workflow 吞掉具体错误引导已由问题6覆盖，不另起一个重复问题。
+
+部署后同一允许根下验收：已有父目录、新一级目录、新多层目录、中文目录、父路径其实是文件、无写权限、符号链接越界、真正越权、并发创建以及 overwrite 行为；同时测试直接调用与 Workflow 调用。可复用 `devtools/download_path_live_canary.py` 的路径对照思路，按其文档使用隔离目标。
+
+### 9.4 责任边界与调用方影响
+
+- Client 的错误分类及目录准备属于 WebCross。Browser worker 当前无本地 mkdir/write/copy 或 shell 能力，是交付工具缺口，但不能据此把 Download.start 的路径误报归到 Harness。
+- 提供有限的本地文件工具可以用于已授权目录下生成文本、归档和清单，不应在收到不明权限拒绝后自动以 Python/Node 绕过它。不同工具必须遵守一致的目标路径授权。
+- 本次模型把错误归纳为“所有 worktree 外目录均禁止”，Lead 将错误归纳传给后续 worker。这是模型推断，不是平台已证明的权限事实。
+- 文件验收把截图当商品交付、跨尝试文件引用不完整属于 Harness，见综合优化报告 §13.4；这些不列入 WebCross 的修复职责。
+- 本次 Workflow 使用 `onError:continue`，外层 succeeded 与子步骤 error 可以同时成立，这是所声明的控制流；不能将其另报为 Workflow 终态错误。
+
+本问题建议 P1：它同时影响交付位置与模型恢复路径。修复验收以实际安装版本的路径 canary 为准。
+
 ## 优先级建议
+
+以下为旧条目的历史排序；2026-09-14 新增问题9列为 P1，旧条目是否已修复需逐项重新核验。
 
 | | 问题 | 类型 | 理由 |
 |---|---|---|---|
@@ -686,3 +744,35 @@ errorCode: "target-readonly"   stepPath: "steps[1]"   action: "Input.type"   dur
 | 协议实测记录 | `docs/workflow-execute-live-contract.md` |
 
 需要我们提供可直接运行的最小复现脚本，随时说。
+
+
+## 问题10：dispatcher 重启缺少可持久追溯的退出原因（2026-09-15）
+
+来源任务：`a71ae809dff04de88a86a17346428a37`。本节仅提 WebCross 建议，不修改平台代码或安装包。
+
+### 已确认事实
+
+北京时间 16:23:55.947 Page.open 已产生页面；16:23:57.552 已收到商品标题更新，期间发生重定向。
+16:23:57.626 Page.create 报 -32005；16:23:57.647 PID 88320 移除 dispatcher 描述文件；
+16:23:58.913 PID 96053 初始化新实例。随后 Harness worker 报 WebSocket reader failure。
+数据库 runtime_instances 将旧实例标为 dispatcher-host-restarted。
+
+- 旧进程日志：`/Users/versace/Library/Application Support/webcross/logs/dispatcher-host/fd2c2e98-63f9-401c-a4b0-8f0e4a7e0c9e/dispatcher-host.2026-09-15.2.log`，371–374行。
+- 新进程日志：`/Users/versace/Library/Application Support/webcross/logs/dispatcher-host/6a2fec6d-40e3-4ff0-8ede-b4fe7e261ed1/dispatcher-host.2026-09-15.1.log`。
+- 运行 buildId：`wc-cac0fe42c9f8-ab3c724d5be7d6b6d89eabc7`；旧、新实例相同。
+- 调查时平台工作区 HEAD：`f71794812ed365ba6ab1a17c30e59d8ffb7fb316`，与运行包 sourceRevision 不同。
+
+安装包 app.asar 的 dispatcher-host/dist/cli.js 将致命异常经 host.fatal 发给父进程后退出，
+该处理函数没有把异常堆栈持久写入日志。描述文件清理既可能来自正常关闭，也可能来自 fatalExit。
+现有证据能确认服务端重启，不能认定 Page.create 的加载失败导致进程崩溃，也不能区分人为重启和程序异常。
+
+### 平台建议与验收
+
+1. dispatcher 退出前持久记录触发来源、异常类型/堆栈、exit code/signal、runtimeInstanceId、buildId；记录过程中脱敏。
+2. 父进程记录 host.stopping / host.fatal / child exit 与恢复策略，把旧、新实例和重启原因关联起来。
+3. 保留出错 Action 的 executionId 和已产生的页面/导航事件，不把“初始加载失败”表达为“页面从未创建”。
+4. 分别验收显式停止、进程异常、父通道断开、更新重启；每种都应仅凭持久日志重建原因及先后顺序。
+5. AX 可见但 DOM.getAttribute 返回 component-unresolved/component-context-truncated 属于平台目标解析问题；
+   按既有问题核查原始目标与运行版本，不建议 Harness 增加 Runtime.evaluate 绕行。
+
+Harness 负责连接故障的结构化传播、有界启动预算和恢复后重新核验身份；它不能修复 WebCross 进程退出原因。

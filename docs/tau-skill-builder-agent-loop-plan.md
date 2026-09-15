@@ -2,13 +2,18 @@
 
 - 日期：2026-09-06
 - 状态：设计评审；本文不代表运行时代码已实现。
-- 范围：独立 `/skill-create` 程序、工具调用周期、停止协议、试运行恢复与发布。
+- 范围：与 `/browser`、`/lead` 平级的 `/skill-create` 入口、独立 Builder 会话、工具调用周期、停止协议、试运行恢复与发布。
 - 决策：采用 Tau 的 Python Agent 核心二开，替代此前独立 Builder 使用 Pi TypeScript SDK 的建议。现有主程序继续消费生成的 Hybrid Skill。
 - 2026-09-06 补充：原生 ABCP RPC 与 Workflow 共用现有 WebSocket 传输；当前 Harness 增加恢复执行适配与指标；发布由用户决定，生成完成与发布状态独立。
+- 2026-09-13 复盘修订：复用当前模型、消息、生命周期、并发 RPC、Workflow 观察和结果投影；替换旧创建链路。browser/lead 均仅接受用户显式 `/skill <name>` 选择。失败完整快照等待 ABCP 扩展，不承诺 Host 能恢复未暴露的数据。
 
 ## 1. 已核实的基础与选型
 
-Tau 是 Hugging Face 维护的 Pi 风格 Python 实现，不是 Pi 官方 TypeScript SDK 的逐接口镜像。源码分为 `tau_ai`（模型适配）、`tau_agent`（可复用循环与会话）、`tau_coding`（终端编码应用）。Builder 基于 `tau_agent` 及所需 provider 适配构建，不需要启动完整编码 TUI。
+Tau 是 Hugging Face 维护的 Pi 风格 Python 实现，不是 Pi 官方 TypeScript SDK 的逐接口镜像。源码分为 `tau_ai`（模型适配）、`tau_agent`（可复用循环与会话）、`tau_coding`（终端编码应用）。推荐保留 `tau_agent` 的薄循环，通过 adapter 使用当前项目的 LLM provider、类型化消息、LifecycleRecorder 和工具执行服务，不再整体引入 Tau 的 provider、编码 TUI 和会话存储体系。
+
+选择 Tau 而非重新造循环的原因是复用其消息与工具轮转、取消、steer/follow-up 和历史修复基础；现有工具周期已经在本项目实现，由共用 executor 负责，不能在 Tau loop 与 executor 中重复做一遍。Tau 仅补必要控制行为（如已核对基线中的 terminate、length），保留小范围补丁。新造循环会同时承担这些边界情况和长期测试，当前没有足够收益支持该方向。
+
+当前 `llm/base.py.generate_assistant_message` 已有类型化响应入口；适配时保留有序 thinking/content/tool blocks、call ID、stop reason、usage 与原生错误原因。当前 provider 的重试/超时仍由该层负责，Tau 不再叠加一套重试。生命周期只落一次，防止双重日志及双重成本累计。Tau 基线的核对日期仍为 2026-09-06；下面表格不声称描述之后的上游 main。
 
 本次核对版本：提交 `0a67734fe4c89821c652c02fe74c1e0434fd36f6`，包版本 0.4.1。实施时固定版本并跑契约测试，不直接跟随 main。
 
@@ -42,11 +47,43 @@ Tau 是 Hugging Face 维护的 Pi 风格 Python 实现，不是 Pi 官方 TypeSc
 
 ## 2. 程序边界与创建流程
 
-用户完成原任务并自行确认满足需求后，主动在独立 Builder 中调用：
+用户完成原任务并自行确认满足需求后，从统一终端主入口进入独立 Builder 会话：
 
 ```text
 /skill-create <历史任务目录> [创建要求]
 ```
+
+### 统一入口与显式 Skill 选择
+
+```text
+主入口
+  ├─ /browser       → BrowserAgent 任务会话
+  ├─ /lead          → Lead 协调任务会话
+  └─ /skill-create  → Tau SkillBuilderSession
+                         → 编写 / 试运行 / 用户决定发布
+                         → 主入口
+```
+
+同一终端程序负责命令路由，各入口创建自己的会话。Builder 不实例化完整 BrowserAgent/LeadAgent，不借用 Lead 的 phase plan；可以使用共用浏览器执行服务。`/skill-create` 完成、用户选择暂不发布或退出后，释放自己拥有的观察订阅与资源并返回主入口，不退出终端，也不自动运行刚生成的 Skill。共享浏览器页面只按所有权处理，不能为返回菜单关闭用户页面。
+
+当前 `read_task` 只负责读入一次任务并返回，新的可返回入口需要顶层 CLI 会话控制器承接，不能只在原提示中增加一个字符串。
+
+| 终端命令 | 行为 |
+| --- | --- |
+| `/browser` | 选择 BrowserAgent 编排模式 |
+| `/lead` | 选择 Lead 编排模式 |
+| `/skill-create <任务目录>` | 进入 Builder，完成后回主入口 |
+| `/skill list` | 列出所有已注册 Skill 的名称、说明、版本及兼容性事实；不调用或选中 |
+| `/skill <name>` | 用户按确切注册名为接下来的任务显式选择一个 Skill；browser/lead 都支持 |
+| `/skill off` | 清除尚未提交任务的 Skill 选择 |
+
+标准调用语法为 `/skill <name>`。没有这条用户命令时，browser/lead 均不自动选择 Skill；任务自然语言里提及名称、相似度命中、LLM 提议、历史选择、发布成功和默认配置都不构成授权。模型生成同样的字符串也不能冒充终端输入。旧 `--skill` 不再作为任务激活入口；脚本化入口需要走同一显式命令协议，避免出现第二套选择来源。
+
+建议选择作用域为下一次提交的任务：提交前显示当前模式与 Skill，可在 browser/lead 间切换而保留待提交选择；提交后固定 skill ID/版本/来源=user_command，并清空主入口的待提交选择。任务内恢复和重试保留这次授权，下一项独立任务需要再次显式选择。源任务恢复可保留其明确选择并展示，不自动给普通新任务套用。
+
+Browser 模式把选择直接交给该任务的 BrowserAgent；Lead 模式把同一个选择及允许范围传递给相关 worker，模型可根据任务语义决定在哪些步骤使用它，但不能扩展到用户未选的其他 Skill。显式调用授权使用 Hybrid Skill，不要求所有 phase 都机械执行其整段 Workflow；范围不匹配时报告事实并按 Skill prompt/普通路径继续。不能保留旧 suite 名自动展开成多个 Skill 的隐式行为。
+
+`/skill list` 在主入口和已选 browser/lead 模式下均可使用，不按模式隐藏已注册 Skill；损坏或版本不兼容显示实际状态。未发布候选属于 Builder 产物，不进入已注册列表。命令解析按完整 token 分派，不能用 `startswith('/skill')` 把 `/skill-create` 或未知命令误当作 Skill 调用。
 
 源任务不要求出现 probe/validation phase，也不要求机器再次裁定源任务成功。历史轨迹、观察文件、产物与原始需求构成参考资料。历史工具输出按数据处理，不能成为修改当前工具权限或系统指令的来源。
 
@@ -152,7 +189,7 @@ Agent 可先用 `Page.getState / DOM.getAXTree / DOM.getSemanticTree` 观察结�
 
 Adapter 复用现有传输的连接、请求关联、异常分类、敏感值脱敏、`subscribe_notifications` 和 `wait_for_notification`。Host 保留相关事件游标与 page/fleet 身份；读通知不能吞掉其他消费者需要的事件。原生操作与 Workflow 都进入同一执行记录和统计入口。
 
-当前 ABCPClient 使用 `_call_lock` 串行处理请求，需保留这一事实：不能假设同连接在长 Workflow execute 未返回时还可以发送状态查询或恢复 Action。恢复在终止/明确暂停交接后调度；进度由后台通知接收。若确需并发控制 RPC，须先验证平台连接身份与控制契约，再设计独立控制连接，不在同一受锁调用内部递归调用客户端。
+2026-09-13 代码已删除全局 `_call_lock`，ABCPClient 使用请求 ID 管理多个在途 RPC。复用同连接的查询/控制能力，不默认另开控制连接。RPC 可并发不等于共享页面 Action 可以无序执行；恢复仍需确认终止/暂停边界。当前 ExecObserver 认领先到的 workflowId，缺少请求级绑定：在通知归属未验证前，同一通知作用域不并发启动多个 Workflow，先解决事件关联再放开。
 
 仅执行这次调用的职责，生成结构化回执。建议统一字段：
 
@@ -173,7 +210,7 @@ Adapter 复用现有传输的连接、请求关联、异常分类、敏感值脱
 
 当前 ABCPClient 对未连接报告 request_sent=false、发送异常报告 null、等待超时报告 true；应原样保留。发送日志产生不代表发送成功，发送成功不代表 Action 完成。Workflow 外层请求成功也不代表某个子 Input 已派发。子 Action 是否改变页面只能引用平台明确回执，否则记 unknown。
 
-Workflow status=failed 即使通过正常 Python return 返回，也必须映射到工具 is_error=true，并保留 variables/store/results/failedStepPath。普通工具失败进入下一轮 Reason；致命连接错误、取消和预算耗尽由外围控制器处理。
+Workflow status=failed 即使通过正常 Python return 返回，也必须映射到工具 is_error=true。保留实际能获得的 variables/store/results/failedStepPath，并声明来源及缺失项；缺少 store 不填空对象伪装成空数据。当前部署失败时依赖 ExecObserver 的进度事件补变量和步骤状态，无法获取完整 store 与已完成 Action 的结果值。普通工具失败进入下一轮 Reason；致命连接错误、取消和预算耗尽由外围控制器处理。
 
 ### afterToolCall
 
@@ -257,7 +294,7 @@ while session.status == "running":
 
 示例：提取 10 件商品，第 8 件打开评论区时被广告遮挡。
 
-1. Workflow 返回失败步骤、已完成 7 件、当前变量/store、公共错误反馈。
+1. 读取失败步骤、公共错误及实际可得数据。以下局部补齐示例以“前 7 件已经由先前成功片段保存，或平台已提供完整失败快照”为前提；当前仅写入失败执行 `$store` 的 7 件不能视为可恢复。
 2. Agent 观察页面，确认浮层并关闭，刷新目标状态。
 3. Agent 判断继续方式：整个 Workflow 重跑、把输入缩到第 8–10 件后重跑，或创建一个从评论区提取开始的 continuation Workflow。
 4. 新执行使用新 workflowId，并记录 derived_from_workflow_id、输入及版本关联；保留前 7 件结果，按声明的身份键合并。
@@ -277,6 +314,8 @@ while session.status == "running":
 已提交订单、表单提交等操作不能仅因 Workflow 失败就自动重复。提供是否已派发/结果是否已观察的事实，由 LLM 决定补查和恢复；通用权限与明确禁止重放的协议边界继续执行。
 
 试运行中 Agent 介入应写入 validation 记录。例如“主 Workflow + 遮挡恢复 + 新 Workflow 成功”，不能标为无人介入纯 Workflow 成功。整段重跑相同候选成功即可记录；若修改了主候选或生成了新片段，只能把证据归于实际执行的内容 hash。
+
+完整失败快照列为 ABCP 平台开发依赖：至少提供可归属的 workflowId、变量、store/storeRevision、步骤结果或可查询的持久化结果引用。当前 Builder 可以编写、试运行并恢复页面，不能承诺任意失败位置都可无损续跑。平台能力上线后以实测合同接入；Host 不模拟缺失 store，不要求每个任务机械改造成逐行 Workflow，也不把解决该平台缺口作为重造 Agent loop 的理由。
 
 ## 7. 发布、验证与数据
 
@@ -300,11 +339,20 @@ Builder 的探索/试运行与主程序的 Skill 使用要共享一组执行服�
 | --- | --- | --- |
 | `harness/tools/browser_tools/dispatch.py` 的 `_selected_skill_workflow_attempted` 拒绝分支 | 同一 worker 第二次执行被直接拒绝，即使 Agent 已修复页面 | 用 invocation/attempt 记录替代一次性布尔拒绝；允许 Agent 发起新 attempt |
 | `harness/skill/dispatch.py` 的 `_run_with_transient_retry`、`_run_with_auth_generation_fence` | 外围禁止重跑，底层又隐藏重试；超时重试可能重放未知副作用 | 所有重试进入统一 attempt 记录；连接修复与业务重跑分离，后者交还 Agent，身份屏障仍保留 |
-| `harness/skill/workflow.py` | 正常 return 直接 succeeded=True，失败后用 runId 获取旧式快照 | 依据部署协议解析 terminal status、workflowId 和异常 partial；本地 runId 仅作关联标识 |
-| 显式 Skill 调用失败摘要 | 仅 rows/failedRow 等摘要，不足以重建中断片段 | 输出 RecoveryContext，包括原始回执引用、failedStepPath、变量/store、已完成数据 |
-| `abcp_client.py` | WebSocket 发送与通知已实现；派发未知值已有表达 | 抽取共用 adapter，保留传输事实，不为 Builder 另造传输 |
+| `harness/skill/workflow.py` | 已修正 workflowId/getStatus，使用 ExecObserver；正常 return 仍直接标 succeeded=True | 复用协议适配，检查真实状态；保留数据不可得的事实 |
+| 显式 Skill 调用失败摘要 | rows/failedRow 等摘要不足以重建中断片段 | 输出 RecoveryContext 与实际证据引用；完整失败数据等待 ABCP |
+| `abcp_client.py` | 多在途请求与通知已实现，派发未知值已有表达 | 复用；补 Workflow 通知的执行归属，不重复造传输 |
+| `harness/messages`、`harness/events`、`workflow_projection.py` | 类型化消息、生命周期与完整结果存储/模型投影已有 | Tau 用 adapter 接入，不再维护第二套模型与日志体系 |
 
 建议统一 Host 服务（新接口）：`execute_native_action`、`execute_workflow_attempt`、`read_attempt_context`、`record_recovery_decision`。Agent 仍通过工具使用它们；after hook 只记账，编排层不按单站点失败文本自动选择恢复路径。
+
+### 旧 Skill 创建链路整体替换
+
+根据本轮评审，旧创建器的解析函数、模板、历史资料提取也不作为新 Builder 的复用层。删除旧 `/skill-create-workflow`、`/skill-create-guidance`、`--recheck/--retry` 路由及其实现，新的统一 `/skill-create` 由 Tau 会话承担。
+
+计划删除旧 `harness/skill/create.py`、`distiller.py` 及其专属蒸馏脚本/模板；清理旧 guidance 蒸馏、autoheal/heal/health 自动晋升链路、调用点、配置和仅覆盖旧行为的测试。先核对依赖，把仍需使用的通用执行职责迁到共用服务，再删除旧模块，不能只留下无效 import 或失效配置。
+
+删除范围是旧创建/自动维护实现。用户已发布的 Skill、历史任务记录和产物不是旧代码，不随清理删除。注册表、显式加载、ABCP 传输、存储和通用参数校验属于运行基础设施，按新合同适配；新 Builder 通过 Storage 读取源任务，不再依赖旧的挑选“最佳 validated trace”算法。新产物接口若有变化，明确迁移已发布 Skill，不静默让它们消失。
 
 关联模型：一个 task 包含多次 Skill invocation；一次 invocation 包含多次 Workflow attempt，以及中间的原生 RPC 恢复。每次重跑增加 attempt_id；新 workflowId 由 ABCP 返回。同一 attempt 的重复终止通知幂等更新，不能重复累计。构建试运行另带 builder_run_id 与 candidate_hash。
 
@@ -338,12 +386,13 @@ Builder 的探索/试运行与主程序的 Skill 使用要共享一组执行服�
 
 ## 10. 最小实施路径与验证
 
-1. 建立独立 Python `skill_builder` 包及固定 Tau 依赖，核实 provider/tool schema/stream 与现有模型配置兼容。
-2. 小范围补齐 Tau loop：prepare、validate、钩子异常隔离、domain error 映射、terminate、length、累计预算和即时进度事件。保留与上游比较的补丁。
+1. 建立统一终端会话路由与独立 Python `skill_builder` 包；`/browser`、`/lead`、`/skill-create` 平级，Builder 返回主入口。固定 Tau 基线并接入当前 LLM adapter。
+2. 共用现有参数生命周期、消息、事件、结果投影；Tau 仅补 terminate/length 等必要循环控制，不重复建设 executor/provider。保留与上游比较的补丁。
 3. 实现 TaskBundle、CandidateStore、ABCP 与 ResultSink 适配器；绑定 live Workflow 协议并保存失败快照。
 4. 接入原生 WebSocket RPC 探索、候选编译、真实试运行、Agent 页面恢复及新 Workflow 重跑。
 5. 接入用户发布决策，将创建结果和发布状态分开；主程序与 Builder 共享执行服务。
-6. 增加 invocation/attempt 事件及统计投影，验证未知状态、重试和用户反馈的统计口径；后续按原评审范围清理自动升级链路。本文更新不授权顺带替换运行时全部 Harness。
+6. 增加 invocation/attempt 事件及统计投影，验证未知状态、重试和用户反馈的统计口径；整体删除上述旧创建/自动维护链路。
+7. browser/lead 接入统一显式 Skill 选择；`/skill list` 查询，`/skill <name>` 才能激活。完整失败快照待 ABCP 开发完成后单独验收，无损局部恢复不提前标为实现。
 
 测试重点：
 
@@ -359,5 +408,9 @@ Builder 的探索/试运行与主程序的 Skill 使用要共享一组执行服�
 - Agent 清掉浮层后同一 worker 可以发起新 attempt；隐藏重试不会造成漏记或重复计数。
 - 用户不发布仍报告生成完成，未确认不能发布；失败试运行如实展示，不按质量分数否决用户选择。
 - 一败一成产生两个 attempt、一个 invocation；重复通知只算一次，pending/unknown 与试运行样本不混入已判定正式成功样本。
+- browser/lead 都可显式调用同一个 Skill；未输入 `/skill <name>` 不得由模型、配置、历史或发布动作自动激活。
+- `/skill list` 可列出所有已注册 Skill且不改变选择；Builder 发布/暂不发布后返回主入口，下一任务不会自动套用新 Skill。
+- Lead 只能传递用户选定的 Skill，不能由 suite 自动扩展；同任务重试保留授权，新任务重新选择。
+- 清除旧创建路由/算法后启动与运行无失效 import；保留用户已发布 Skill 和历史产物。
 
 现阶段不需要新建站点/字段语义门禁。新增校验均限于通用结构、身份、权限、资源预算和回执一致性；失败要有定位与恢复方式，语义选择留在 Agent Reason 中。
