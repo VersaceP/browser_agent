@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 import websockets
 
 from runtime_config import ABCPClientConfig
+from webcross_connection import LocalControlSocket, connection_target, resolve_local_target
 
 # Deferred, not top-level: `harness/__init__.py` imports observation.browser_call,
 # which imports this module, so any `harness.*` import here at module scope is a
@@ -32,7 +33,7 @@ _REDACTORS: Optional[Tuple[Callable[..., Any], Callable[..., Any]]] = None
 def _redactors() -> Tuple[Callable[..., Any], Callable[..., Any]]:
     global _REDACTORS
     if _REDACTORS is None:
-        from harness.tool_policy import (
+        from harness.tools.tool_policy import (
             collect_sensitive_replacements,
             sanitize_transport_payload,
         )
@@ -78,6 +79,7 @@ class ABCPTransportError(RuntimeError):
         transport_code: str = ABCP_TRANSPORT_UNKNOWN,
         connection_fatal: bool = False,
         request_sent: Optional[bool] = None,
+        connection_details: Optional[JsonDict] = None,
     ) -> None:
         super().__init__(message)
         self.rpc_code = rpc_code
@@ -87,6 +89,7 @@ class ABCPTransportError(RuntimeError):
         self.connection_fatal = bool(connection_fatal)
         # ``None`` means a send failed while its delivery was indeterminate.
         self.request_sent = request_sent if isinstance(request_sent, bool) else None
+        self.connection_details = dict(connection_details or {})
 
 
 @dataclass
@@ -341,6 +344,8 @@ class ABCPClient:
         # transport state: it never decides what an event means, only which
         # events have already been delivered to the harness.
         self._event_cursor: Optional[int] = None
+        self.connection_details: JsonDict = {}
+        self._local_agent_id: Optional[str] = None
 
     async def __aenter__(self) -> "ABCPClient":
         await self.connect()
@@ -355,6 +360,45 @@ class ABCPClient:
         return self._ws is not None and not self._closed and self._reader_failure is None
 
     async def connect(self) -> None:
+        self.connection_details = connection_target(self.config)
+        if self.config.transport == "local":
+            try:
+                resolve_local_target(self.connection_details)
+                self._ws = await asyncio.wait_for(
+                    LocalControlSocket.connect(
+                        self.connection_details, self.config, self._local_agent_id,
+                    ), timeout=self.config.connect_timeout_seconds,
+                )
+                self._local_agent_id = self._ws.agent_id
+            except (OSError, ValueError, asyncio.TimeoutError, asyncio.IncompleteReadError) as exc:
+                self._raise_connect_error(exc)
+        else:
+            await self._connect_websocket()
+
+        self._closed = False
+        self._reader_failure = None
+        if self.notifications._closed:
+            self.notifications = NotificationHub()
+        self.connection_details["stage"] = "connected"
+        self._emit("connected", self.connection_details)
+        self._reader_task = asyncio.create_task(
+            self._read_loop(), name="abcp-client-reader"
+        )
+
+    def _raise_connect_error(self, exc: BaseException) -> None:
+        details = {**self.connection_details, "errorType": type(exc).__name__,
+                   "errno": getattr(exc, "errno", None)}
+        # Only local validation errors contain messages we construct ourselves.
+        reason = f" ({exc})" if type(exc) is ValueError else ""
+        raise ABCPTransportError(
+            f"Unable to connect to ABCP Browser: {details['endpoint']}"
+            f" [{details.get('stage', 'connect')}: {details['errorType']}]" + reason,
+            transport_code=ABCP_TRANSPORT_CONNECT_FAILED,
+            connection_fatal=True, request_sent=False, connection_details=details,
+        ) from exc
+
+    async def _connect_websocket(self) -> None:
+        self.connection_details["stage"] = "connect"
         headers = {}
         if self.config.jwt_token:
             headers["Authorization"] = f"Bearer {self.config.jwt_token}"
@@ -380,19 +424,8 @@ class ABCPClient:
                     extra_headers=headers or None,
                     **kwargs,
                 )
-        except OSError as exc:
-            raise ABCPTransportError(
-                f"Unable to connect to ABCP Browser WebSocket: {self.config.ws_url}",
-                transport_code=ABCP_TRANSPORT_CONNECT_FAILED,
-                connection_fatal=True,
-                request_sent=False,
-            ) from exc
-
-        self._closed = False
-        self._reader_failure = None
-        self._reader_task = asyncio.create_task(
-            self._read_loop(), name="abcp-client-reader"
-        )
+        except (OSError, asyncio.TimeoutError, websockets.exceptions.WebSocketException) as exc:
+            self._raise_connect_error(exc)
 
     async def close(self) -> None:
         self._closed = True
@@ -514,6 +547,16 @@ class ABCPClient:
             )
         response = self._unwrap_response(raw_response)
         self._emit("response", response, secrets)
+        if (method == "System.register" and isinstance(self._ws, LocalControlSocket)
+                and not self._ws.watching):
+            # Unlike WS, local-control does not install a default subscription
+            # at registration. Establish it before any browser action can run.
+            try:
+                await self.call("events.watch", {"cursor": self._ws.event_cursor})
+                self._ws.watching = True
+            except BaseException:
+                await self.close()
+                raise
         return response
 
     async def wait_for_notification(
