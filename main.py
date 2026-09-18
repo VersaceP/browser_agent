@@ -30,7 +30,7 @@ from harness.storage.base import StorageError
 from harness.storage.factory import resolve_sqlite_path
 from harness.utils import JsonDict, RunLogger
 from harness.version import HARNESS_VERSION
-from harness.resume_state import (
+from harness.runtime.resume_state import (
     ResumeStateError,
     RunLock,
     RunLockError,
@@ -315,6 +315,15 @@ class ConsoleProgressReporter:
             )
         if event_type in {"lead.model", "agent.model"}:
             return self._format_model_event(event_type, payload)
+        if event_type == "agent.truncated_response" and payload.get("kind") == "truncated":
+            streak = payload.get("streak")
+            limit = payload.get("limit")
+            ending = isinstance(streak, int) and isinstance(limit, int) and streak >= limit
+            action = "终止本 Worker 并返回未完成状态" if ending else "将按现有恢复策略再次请求模型"
+            return (
+                f"[{self._browser_actor_label(payload)}] 连续异常 {streak}/{limit}（本次：输出截断）；"
+                f"{action}"
+            )
         if event_type == "lead.tool.result":
             return self._format_lead_tool_result(payload)
         if event_type == "tool_result.offloaded":
@@ -482,6 +491,31 @@ class ConsoleProgressReporter:
             if isinstance(item, dict)
         ]
         text = self._short_text(payload.get("text"), 100)
+        stop_reason = payload.get("stop_reason")
+        telemetry = payload.get("outputTelemetry")
+        telemetry = telemetry if isinstance(telemetry, dict) else {}
+        output_tokens = telemetry.get("providerOutputTokens")
+        token_note = f"，输出 {output_tokens} tokens" if output_tokens is not None else ""
+        if stop_reason == "max_tokens":
+            if tool_summaries:
+                return (
+                    f"[{role}] 模型输出达到上限（max_tokens）{token_note}；"
+                    f"响应被截断，已返回工具调用: {'; '.join(tool_summaries)}"
+                )
+            has_thinking = (
+                bool(telemetry.get("thinkingBlockCount"))
+                or bool(telemetry.get("thinkingChars"))
+                or "thinking" in (telemetry.get("prefixBlockTypes") or [])
+                or "redacted_thinking" in (telemetry.get("prefixBlockTypes") or [])
+            )
+            content_note = (
+                "仅返回推理内容，无正文、无工具调用"
+                if has_thinking and not text else "未产生工具调用"
+            )
+            return (
+                f"[{role}] 模型输出达到上限（max_tokens）{token_note}；"
+                f"{content_note}，本步没有执行工具"
+            )
         if tool_summaries:
             if text:
                 return (
@@ -489,7 +523,10 @@ class ConsoleProgressReporter:
                     f"准备调用: {'; '.join(tool_summaries)}"
                 )
             return f"[{role}] 模型返回，准备调用: {'; '.join(tool_summaries)}"
-        return f"[{role}] 模型返回: {text or '(无文本)'}"
+        if not text:
+            reason_note = f"，stop_reason={stop_reason}" if stop_reason else ""
+            return f"[{role}] 模型未返回正文或工具调用{reason_note}"
+        return f"[{role}] 模型返回: {text}"
 
     @staticmethod
     def _browser_actor_label(payload: Dict[str, Any]) -> str:
@@ -712,6 +749,19 @@ class ConsoleProgressReporter:
                 parts.append("workers=" + ",".join(rendered))
         if payload.get("error"):
             parts.append(f"error={self._short_text(payload.get('error'), 120)}")
+        issues = payload.get("issues")
+        if isinstance(issues, list):
+            issues = [item for item in issues if isinstance(item, dict)]
+            rendered = [
+                f"{self._short_text(item.get('path') or 'input', 140)}: "
+                f"{self._short_text(item.get('message') or item.get('keyword'), 120)}"
+                for item in issues[:3]
+            ]
+            remaining = int(payload.get("issueCount") or len(issues)) - len(rendered)
+            if remaining > 0:
+                rendered.append(f"另有 {remaining} 项（见日志 issues）")
+            if rendered:
+                parts.append("issues=" + "; ".join(rendered))
         return f"[LeadAgent] 工具结果 {tool}: {', '.join(parts) if parts else 'ok'}"
 
     def _format_offloaded_tool_result(self, payload: Dict[str, Any]) -> str:
@@ -967,9 +1017,7 @@ def _build_objective_judge(config_path: Optional[str]):
     def judge(objective: str, existing: Dict[str, Any]) -> Dict[str, str]:
         async def _call() -> Dict[str, str]:
             runtime = load_runtime_config(config_path or "config.json")
-            provider = LLMFactory.create_provider(
-                lead_agent_model_config(runtime.model, runtime.lead)
-            )
+            provider = LLMFactory.create_provider(lead_agent_model_config(runtime))
             system_prompt = (
                 "你是浏览器自动化技能库的守门人。判断【新任务目标】与【已有技能】是否是"
                 "同一个业务任务（同一站点上抓取/操作同一类页面的同一类产出，字段命名差异、"
@@ -2970,9 +3018,7 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
         else:
             print("开始执行，关键进度会在这里显示。", flush=True)
 
-        provider = LLMFactory.create_provider(
-            lead_agent_model_config(runtime.model, runtime.lead)
-        )
+        provider = LLMFactory.create_provider(lead_agent_model_config(runtime))
         harness = LeadAgent(
             provider,
             runtime,

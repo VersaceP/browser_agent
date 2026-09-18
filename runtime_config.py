@@ -1,12 +1,12 @@
 """
 runtime_config.py - 全项目统一配置表（single source of truth）。
 
-config.json 的四张配置表全部定义在这一个文件里：
+config.json 的配置表全部定义在这一个文件里：
 
-    顶层             -> ModelConfig       （LLM 连接：provider/model_id/api_key/超时重试/extra_params）
-    "lead"/"worker"         -> RoleModelConfig     （角色级模型覆盖：可换厂商/模型，extra_params 浅合并）
+    "lead"/"worker"         -> ModelConfig         （各自完整的 LLM 连接：provider=供应商、api=协议、
+                                                    model_id/api_key/超时重试/extra_params；互不继承）
+    "plan_validator": {...} -> PlanValidatorConfig （独立计划审计模型，必须配置且开启）
     "vl": {...}             -> VLConfig            （视觉模型连接 + 各 VL 角色开关）
-    "plan_validator": {...} -> PlanValidatorConfig （独立计划审计模型）
     "browser": {...}        -> ABCPClientConfig    （ABCP WebSocket 连接）
     "harness": {...}        -> HarnessConfig       （编排/步数预算/offload/HITL/skill 等运行时行为）
 
@@ -233,13 +233,59 @@ def _normalize_hitl_attendance(value: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 顶层：ModelConfig（LLM 连接）
+# 模型连接：ModelConfig（lead / worker / plan_validator 各自一段，互不继承）
 # ---------------------------------------------------------------------------
+
+# 这两个供应商名是兼容写法：表示官方服务，并隐含同名协议。
+_PROTOCOL_IMPLIED_PROVIDERS = frozenset({"anthropic", "openai"})
+
+
+def require_model_connection(data: Any, *, section: str) -> None:
+    """lead / worker / plan_validator 必须各自写全连接，缺哪项点名哪项。"""
+    if not isinstance(data, dict) or not data:
+        raise ValueError(
+            f"config.json 缺少 {section} 段：lead、worker、plan_validator 必须各自"
+            "完整配置（provider、model_id、api_key 或 api_key_env；命名供应商还要写 api）"
+        )
+    problems: List[str] = []
+    provider = data.get("provider")
+    if not isinstance(provider, str) or not provider.strip():
+        problems.append(
+            "provider（供应商，如 allinone、juao、qwen-token-plan、deepseek；"
+            "anthropic / openai 表示官方服务）"
+        )
+    api = str(data.get("api") or "").strip()
+    if api:
+        from llm.profiles import API_ALIASES
+        if api.lower() not in API_ALIASES:
+            problems.append(
+                f"api 取值 {api!r} 无效（请求协议只能是 openai-chat-completions"
+                "、openai-responses 或 anthropic-messages）"
+            )
+    elif isinstance(provider, str) and provider.strip() and (
+        provider.strip().lower() not in _PROTOCOL_IMPLIED_PROVIDERS
+    ):
+        problems.append(
+            f"api（供应商 {provider.strip()} 必须写请求协议："
+            "openai-chat-completions、openai-responses 或 anthropic-messages）"
+        )
+    if not str(data.get("model_id") or "").strip():
+        problems.append("model_id")
+    if not str(data.get("api_key") or "").strip():
+        api_key_env = str(data.get("api_key_env") or "").strip()
+        if not api_key_env:
+            problems.append("api_key 或 api_key_env")
+        elif not os.environ.get(api_key_env):
+            problems.append(f"api_key（api_key_env 指向的环境变量 {api_key_env} 没有设置）")
+    if problems:
+        raise ValueError(f"config.json 的 {section} 段缺少或写错：" + "；".join(problems))
+
 
 @dataclass
 class ModelConfig:
-    """模型配置 — 定义 LLM 的连接参数"""
+    """一个角色的 LLM 连接：provider 是供应商，api 是请求协议。"""
     provider: str = "anthropic"
+    api: Optional[str] = None
     model_id: str = "claude-sonnet-4-20250514"
     api_key: Optional[str] = None
     base_url: Optional[str] = None
@@ -250,59 +296,35 @@ class ModelConfig:
     llm_timeout_retry_interval_seconds: Optional[float] = None
 
     @classmethod
-    def load_from_file(cls, filepath: str) -> "ModelConfig":
-        """从 JSON 配置文件加载配置，敏感字段通过环境变量名间接获取"""
-        if not os.path.exists(filepath):
-            return cls()
-
-        with open(filepath, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        provider_value = data.get("provider")
-        if not isinstance(provider_value, str) or not provider_value.strip():
-            raise ValueError(
-                "顶层 provider 为必填字段，必须显式设置为"
-                " 'anthropic' 或 'openai'"
-            )
-        provider = provider_value.strip().lower()
-        if provider not in {"anthropic", "openai"}:
-            raise ValueError(
-                "顶层 provider 仅支持 'anthropic' 或 'openai'，"
-                f"当前值: {provider_value!r}"
-            )
-        extra_params = (
-            data.get("extra_params")
-            if isinstance(data.get("extra_params"), dict)
-            else {}
-        )
-
-        def model_value(key: str, default: Any) -> Any:
-            return data.get(key, extra_params.get(key, default))
-
+    def from_section(cls, data: Any, *, section: str) -> "ModelConfig":
+        """解析 config.json 的一个角色段；写什么就发什么，不从别处继承。"""
+        require_model_connection(data, section=section)
+        api_key_env = str(data.get("api_key_env") or "").strip() or None
+        base_url_env = str(data.get("base_url_env") or "").strip() or None
         return cls(
-            provider=provider,
-            model_id=data.get("model_id", "claude-sonnet-4-20250514"),
-            api_key=data.get("api_key") or cls._env(data.get("api_key_env")),
-            base_url=data.get("base_url") or cls._env(data.get("base_url_env")),
-            extra_params=extra_params,
+            provider=str(data["provider"]).strip().lower(),
+            api=str(data.get("api") or "").strip() or None,
+            model_id=str(data["model_id"]).strip(),
+            api_key=data.get("api_key") or cls._env(api_key_env),
+            base_url=data.get("base_url") or cls._env(base_url_env),
+            extra_params=(
+                dict(data.get("extra_params"))
+                if isinstance(data.get("extra_params"), dict)
+                else {}
+            ),
             llm_api_timeout_seconds=_float_config(
-                model_value(
-                    "llm_api_timeout_seconds",
-                    DEFAULT_LLM_API_TIMEOUT_SECONDS,
-                ),
+                data.get("llm_api_timeout_seconds", DEFAULT_LLM_API_TIMEOUT_SECONDS),
                 DEFAULT_LLM_API_TIMEOUT_SECONDS,
                 minimum=1.0,
             ),
             llm_timeout_max_retries=_int_config(
-                model_value(
-                    "llm_timeout_max_retries",
-                    DEFAULT_LLM_TIMEOUT_MAX_RETRIES,
-                ),
+                data.get("llm_timeout_max_retries", DEFAULT_LLM_TIMEOUT_MAX_RETRIES),
                 DEFAULT_LLM_TIMEOUT_MAX_RETRIES,
                 minimum=0,
                 maximum=10,
             ),
             llm_timeout_backoff_seconds=_float_config(
-                model_value(
+                data.get(
                     "llm_timeout_backoff_seconds",
                     DEFAULT_LLM_TIMEOUT_BACKOFF_SECONDS,
                 ),
@@ -310,7 +332,7 @@ class ModelConfig:
                 minimum=0.0,
             ),
             llm_timeout_retry_interval_seconds=_optional_float_config(
-                model_value("llm_timeout_retry_interval_seconds", None),
+                data.get("llm_timeout_retry_interval_seconds"),
                 minimum=0.0,
             ),
         )
@@ -324,114 +346,6 @@ class ModelConfig:
 
 
 # ---------------------------------------------------------------------------
-# "lead" / "worker" 段：角色级模型覆盖
-# ---------------------------------------------------------------------------
-
-@dataclass
-class RoleModelConfig:
-    """Per-role override of the top-level model, for the lead and the workers.
-
-    Every field is optional and falls back to the top-level ModelConfig, so a
-    section can be as small as one key. Two different merge rules, on purpose:
-
-      - scalars (provider/model_id/api_key/base_url/timeouts) *replace* —
-        a role can run on an entirely different vendor;
-      - ``extra_params`` *shallow-merges*, so setting one knob (thinking,
-        temperature, ...) does not wipe the rest of the top-level params.
-
-    Switching ``provider`` without also giving that vendor's ``base_url`` /
-    ``api_key`` inherits the other vendor's credentials, which fails at call
-    time; audit_config_keys warns about exactly that.
-    """
-
-    provider: Optional[str] = None
-    model_id: Optional[str] = None
-    api_key: Optional[str] = None
-    api_key_env: Optional[str] = None
-    base_url: Optional[str] = None
-    base_url_env: Optional[str] = None
-    llm_api_timeout_seconds: Optional[float] = None
-    llm_timeout_max_retries: Optional[int] = None
-    llm_timeout_backoff_seconds: Optional[float] = None
-    llm_timeout_retry_interval_seconds: Optional[float] = None
-    extra_params: Dict[str, Any] = field(default_factory=dict)
-
-    @classmethod
-    def from_dict(cls, data: Any) -> "RoleModelConfig":
-        if not isinstance(data, dict):
-            return cls()
-        api_key_env = str(data.get("api_key_env") or "").strip() or None
-        base_url_env = str(data.get("base_url_env") or "").strip() or None
-        provider = data.get("provider")
-        if isinstance(provider, str) and provider.strip():
-            provider = provider.strip().lower()
-            if provider not in {"anthropic", "openai"}:
-                raise ValueError(
-                    "角色段 provider 仅支持 'anthropic' 或 'openai'，"
-                    f"当前值: {data.get('provider')!r}"
-                )
-        else:
-            provider = None
-        return cls(
-            provider=provider,
-            model_id=(str(data["model_id"]).strip() if data.get("model_id") else None),
-            api_key=(
-                data.get("api_key")
-                or (os.environ.get(api_key_env) if api_key_env else None)
-            ),
-            api_key_env=api_key_env,
-            base_url=(
-                data.get("base_url")
-                or (os.environ.get(base_url_env) if base_url_env else None)
-            ),
-            base_url_env=base_url_env,
-            llm_api_timeout_seconds=_optional_float_config(
-                data.get("llm_api_timeout_seconds"), minimum=1.0
-            ),
-            llm_timeout_max_retries=(
-                _int_config(data.get("llm_timeout_max_retries"), 0, minimum=0, maximum=10)
-                if data.get("llm_timeout_max_retries") is not None
-                else None
-            ),
-            llm_timeout_backoff_seconds=_optional_float_config(
-                data.get("llm_timeout_backoff_seconds"), minimum=0.0
-            ),
-            llm_timeout_retry_interval_seconds=_optional_float_config(
-                data.get("llm_timeout_retry_interval_seconds"), minimum=0.0
-            ),
-            extra_params=(
-                dict(data.get("extra_params"))
-                if isinstance(data.get("extra_params"), dict)
-                else {}
-            ),
-        )
-
-    def apply_to(self, model: ModelConfig) -> ModelConfig:
-        """Resolve this role's effective connection against the top-level model."""
-        merged_extra_params = dict(model.extra_params or {})
-        merged_extra_params.update(self.extra_params)
-        overrides: Dict[str, Any] = {"extra_params": merged_extra_params}
-        for name in (
-            "provider",
-            "model_id",
-            "api_key",
-            "base_url",
-            "llm_api_timeout_seconds",
-            "llm_timeout_max_retries",
-            "llm_timeout_backoff_seconds",
-            "llm_timeout_retry_interval_seconds",
-        ):
-            value = getattr(self, name)
-            if value is not None:
-                overrides[name] = value
-        return replace(model, **overrides)
-
-
-# 历史名（只覆盖 extra_params 时的旧叫法），保持旧 import 可用。
-RoleOverrideConfig = RoleModelConfig
-
-
-# ---------------------------------------------------------------------------
 # "plan_validator" 段：独立计划审计模型
 # ---------------------------------------------------------------------------
 
@@ -439,6 +353,7 @@ RoleOverrideConfig = RoleModelConfig
 class PlanValidatorConfig:
     enabled: bool = False
     provider: str = "openai"
+    api: Optional[str] = None
     model_id: str = ""
     api_key: Optional[str] = None
     api_key_env: Optional[str] = None
@@ -465,6 +380,7 @@ class PlanValidatorConfig:
         return cls(
             enabled=bool(data.get("enabled", cls.enabled)),
             provider=str(data.get("provider", cls.provider) or cls.provider),
+            api=data.get("api"),
             model_id=str(data.get("model_id", cls.model_id) or "").strip(),
             api_key=(
                 data.get("api_key")
@@ -531,9 +447,12 @@ class PlanValidatorConfig:
         extra_params = dict(self.extra_params)
         extra_params["max_tokens"] = int(self.max_tokens)
         extra_params["tool_choice"] = "required"
-        extra_params.setdefault("temperature", 0)
+        # No forced temperature: several current models reject any explicit
+        # value (GPT-5 answers 400 "Unsupported parameter: 'temperature'").
+        # Sampling is opt-in through this section's own extra_params.
         return ModelConfig(
             provider=self.provider,
+            api=self.api,
             model_id=self.model_id,
             api_key=self.api_key,
             base_url=self.base_url,
@@ -558,7 +477,7 @@ class ClaimExtractorConfig(PlanValidatorConfig):
 
     Same shape as the plan validator on purpose: both are read-only auditors
     that must not be the Lead model. Deciding whether a bound number is right
-    is code's job (harness.numeric_facts); this model only says which metric a
+    is code's job (harness.results.numeric_facts); this model only says which metric a
     sentence is talking about. When this section is absent the LeadAgent falls
     back to the plan_validator provider rather than adding a second key.
     """
@@ -591,6 +510,7 @@ class ClaimExtractorConfig(PlanValidatorConfig):
         return cls(
             enabled=True,
             provider=validator.provider,
+            api=validator.api,
             model_id=validator.model_id,
             api_key=validator.api_key,
             base_url=validator.base_url,
@@ -622,9 +542,10 @@ class TaskClassifierConfig(PlanValidatorConfig):
         }
         extra_params["max_tokens"] = int(self.max_tokens)
         extra_params["tool_choice"] = "required"
-        extra_params["temperature"] = 0
+        # See PlanValidatorConfig.model_config: temperature is never injected.
         return ModelConfig(
             provider=self.provider,
+            api=self.api,
             model_id=self.model_id,
             api_key=self.api_key,
             base_url=self.base_url,
@@ -643,6 +564,12 @@ _REASONING_PARAM_KEYS = frozenset({
     "reasoning",
     "reasoning_effort",
     "effort",
+    # Output-limit spellings travel with a role's protocol. A read-only lookup
+    # keeps the role's own connection, so leaving these in makes the inherited
+    # block contradict the protocol it is about to be encoded for.
+    "max_output_tokens",
+    "max_tokens",
+    "max_completion_tokens",
 })
 
 
@@ -660,9 +587,14 @@ class ABCPClientConfig:
     call_timeout_seconds: float = 60
     ping_interval_seconds: Optional[float] = 20
     max_message_size_bytes: Optional[int] = 16 * 1024 * 1024
+    transport: str = "websocket"
+    runtime_descriptor: str = "~/.webcross/runtime/dispatcher-host.json"
 
     @classmethod
     def from_dict(cls, data: JsonDict) -> "ABCPClientConfig":
+        transport = data.get("transport", cls.transport)
+        if transport not in {"websocket", "local"}:
+            raise ValueError("browser.transport must be websocket or local")
         token = data.get("jwt_token")
         token_env = data.get("jwt_token_env")
         if not token and token_env:
@@ -674,6 +606,8 @@ class ABCPClientConfig:
 
         return cls(
             ws_url=data.get("ws_url", cls.ws_url),
+            transport=transport,
+            runtime_descriptor=data.get("runtime_descriptor", cls.runtime_descriptor),
             jwt_token=token,
             jwt_token_env=token_env,
             request_shape=data.get("request_shape", cls.request_shape),
@@ -731,6 +665,7 @@ def _optional_positive_int(value: Any, *, name: str) -> Optional[int]:
 class VLConfig:
     enabled: bool = False
     provider: str = "openai"
+    api: Optional[str] = None
     model_id: str = ""
     base_url: Optional[str] = None
     api_key: Optional[str] = None
@@ -853,6 +788,7 @@ class VLConfig:
         return cls(
             enabled=bool(data.get("enabled", cls.enabled)),
             provider=str(data.get("provider", cls.provider) or cls.provider),
+            api=data.get("api"),
             model_id=str(data.get("model_id", cls.model_id) or cls.model_id),
             base_url=data.get("base_url"),
             api_key=data.get("api_key"),
@@ -1869,9 +1805,10 @@ class HarnessConfig:
 @dataclass
 class RuntimeConfig:
     agent_id: str
-    model: ModelConfig
     browser: ABCPClientConfig
     harness: HarnessConfig
+    lead: ModelConfig
+    worker: ModelConfig
     plan_validator: PlanValidatorConfig = field(
         default_factory=PlanValidatorConfig
     )
@@ -1881,18 +1818,14 @@ class RuntimeConfig:
     task_classifier: TaskClassifierConfig = field(
         default_factory=TaskClassifierConfig
     )
-    lead: RoleModelConfig = field(default_factory=RoleModelConfig)
-    worker: RoleModelConfig = field(default_factory=RoleModelConfig)
 
 
 # ---------------------------------------------------------------------------
 # 未知字段审计 + 装载入口
 # ---------------------------------------------------------------------------
 
-# 顶层除 ModelConfig 字段外还认识的键（env 间接键 + 三个子段 + 顶层 agent_id 兜底）。
-_TOP_LEVEL_EXTRA_KEYS = {
-    "api_key_env",
-    "base_url_env",
+# 顶层只放各段和 agent_id 兜底；模型连接一律写在 lead / worker / plan_validator 段里。
+_TOP_LEVEL_KEYS = {
     "agent_id",
     "vl",
     "plan_validator",
@@ -1903,6 +1836,23 @@ _TOP_LEVEL_EXTRA_KEYS = {
     "browser",
     "harness",
 }
+# 旧写法里放在顶层的模型字段；出现即报错，避免以为配了其实没生效。
+_REMOVED_TOP_LEVEL_MODEL_KEYS = (
+    "provider",
+    "api",
+    "model_id",
+    "api_key",
+    "api_key_env",
+    "base_url",
+    "base_url_env",
+    "extra_params",
+    "llm_api_timeout_seconds",
+    "llm_timeout_max_retries",
+    "llm_timeout_backoff_seconds",
+    "llm_timeout_retry_interval_seconds",
+)
+# lead / worker 段认识的键：ModelConfig 字段 + 两个环境变量间接键。
+_MODEL_SECTION_KEYS = {"api_key_env", "base_url_env"}
 # browser 段里 agent_id 由 load_runtime_config 直接读取（不属于 ABCPClientConfig）。
 _BROWSER_EXTRA_KEYS = {"agent_id"}
 # vl 段接受的历史别名（VLConfig.from_dict 里兼容读取）。
@@ -1928,7 +1878,7 @@ def audit_config_keys(raw: JsonDict) -> List[str]:
             names = "、".join(prefix + k for k in unknown)
             warnings.append(f"有不认识的字段（写了也不会生效，已忽略）: {names}")
 
-    check("", raw, _field_names(ModelConfig) | _TOP_LEVEL_EXTRA_KEYS)
+    check("", raw, _TOP_LEVEL_KEYS)
     check(
         "browser",
         raw.get("browser"),
@@ -1952,27 +1902,8 @@ def audit_config_keys(raw: JsonDict) -> List[str]:
         raw.get("task_classifier"),
         _field_names(TaskClassifierConfig),
     )
-    top_provider = str(raw.get("provider") or "").strip().lower()
     for _role in ("lead", "worker"):
-        section = raw.get(_role)
-        check(_role, section, _field_names(RoleModelConfig))
-        if not isinstance(section, dict):
-            continue
-        role_provider = str(section.get("provider") or "").strip().lower()
-        if role_provider and top_provider and role_provider != top_provider:
-            # Inheriting the other vendor's endpoint/key is never what anyone
-            # means; it fails at call time with an opaque auth error.
-            missing = [
-                key
-                for key in ("base_url", "api_key")
-                if not section.get(key) and not section.get(f"{key}_env")
-            ]
-            if missing:
-                warnings.append(
-                    f"{_role}.provider 是 {role_provider}，与顶层 {top_provider} 不同，"
-                    f"但没配 {'、'.join(f'{_role}.{k}' for k in missing)}，"
-                    "会沿用顶层另一家厂商的连接（调用时才报错）"
-                )
+        check(_role, raw.get(_role), _field_names(ModelConfig) | _MODEL_SECTION_KEYS)
 
     harness_raw = raw.get("harness")
     if isinstance(harness_raw, dict):
@@ -1986,17 +1917,44 @@ def audit_config_keys(raw: JsonDict) -> List[str]:
     return warnings
 
 
+def _reject_top_level_model_keys(raw: JsonDict) -> None:
+    stale = [key for key in _REMOVED_TOP_LEVEL_MODEL_KEYS if key in raw]
+    if stale:
+        raise ValueError(
+            "config.json 顶层不再配置模型：请把 " + "、".join(stale)
+            + " 写进 lead、worker 各自的段里（plan_validator 同样单独配置），"
+            "三段互不继承"
+        )
+
+
+def _load_plan_validator(data: Any) -> PlanValidatorConfig:
+    require_model_connection(data, section="plan_validator")
+    if data.get("enabled", True) is not True:
+        raise ValueError(
+            "plan_validator 必须开启：删掉 enabled 或写成 true，计划审计不能关闭"
+        )
+    return replace(PlanValidatorConfig.from_dict(data), enabled=True)
+
+
 def load_runtime_config(config_path: str, *, warn: bool = True) -> RuntimeConfig:
     path = Path(config_path)
-    raw: JsonDict = {}
-    if path.exists():
-        raw = json.loads(path.read_text(encoding="utf-8"))
+    if not path.exists():
+        raise ValueError(
+            f"找不到配置文件 {path}：lead、worker、plan_validator 必须在配置文件里"
+            "各自完整配置"
+        )
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path.name} 顶层必须是 JSON 对象")
+    _reject_top_level_model_keys(raw)
 
     if warn:
         for line in audit_config_keys(raw):
             print(f"[config] {path.name} {line}", file=sys.stderr)
 
-    model = ModelConfig.load_from_file(config_path)
+    lead = ModelConfig.from_section(raw.get("lead"), section="lead")
+    worker = ModelConfig.from_section(raw.get("worker"), section="worker")
+    plan_validator = _load_plan_validator(raw.get("plan_validator"))
     browser_raw = raw.get("browser", {})
     harness_raw = raw.get("harness", {})
 
@@ -2007,18 +1965,22 @@ def load_runtime_config(config_path: str, *, warn: bool = True) -> RuntimeConfig
 
     return RuntimeConfig(
         agent_id=browser_raw.get("agent_id") or raw.get("agent_id", "abcp-agent"),
-        model=model,
         browser=ABCPClientConfig.from_dict(browser_raw),
         harness=harness,
-        plan_validator=PlanValidatorConfig.from_dict(
-            raw.get("plan_validator", {})
-        ),
+        lead=lead,
+        worker=worker,
+        plan_validator=plan_validator,
         claim_extractor=ClaimExtractorConfig.from_dict(
             raw.get("claim_extractor", {})
         ),
         task_classifier=TaskClassifierConfig.from_dict(
             raw.get("task_classifier", {})
         ),
-        lead=RoleModelConfig.from_dict(raw.get("lead", {})),
-        worker=RoleModelConfig.from_dict(raw.get("worker", {})),
     )
+
+
+def load_vl_config(config_path: str) -> VLConfig:
+    """Read only the vl section, for offline tools that never start an agent."""
+    path = Path(config_path)
+    raw = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    return VLConfig.from_dict(raw.get("vl", {}) if isinstance(raw, dict) else {})
