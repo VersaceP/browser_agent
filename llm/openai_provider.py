@@ -25,12 +25,11 @@ from llm.cache_control import (
     _resolve_cache_control_decision,
     _with_cache_control_diagnostics,
 )
-from llm.thinking import (
-    openai_thinking_request,
-    resolve_thinking_intent,
-    thinking_block_from_reasoning,
-)
+
 from runtime_config import ModelConfig
+from llm.adapters import encode_request, decode_response
+from llm.contracts import LLMRequest, LLMResult
+from llm.profiles import resolve_target
 
 
 def _merge_stream_identity(current: str, incoming: Any) -> str:
@@ -142,7 +141,8 @@ def _validate_tool_argument_json(response: Any) -> None:
 
 class OpenAIProvider(BaseLLMProvider):
     def __init__(self, config: ModelConfig):
-        super().__init__(config)
+        from dataclasses import replace
+        super().__init__(replace(config, base_url=resolve_target(config).base_url))
 
         if AsyncOpenAI is None:
             raise ImportError(
@@ -150,7 +150,9 @@ class OpenAIProvider(BaseLLMProvider):
             )
 
         # api_key / base_url 已由 ModelConfig 统一从环境变量解析
-        api_key = self.config.api_key or os.getenv("OPENAI_API_KEY")
+        api_key = self.config.api_key or (
+            os.getenv("OPENAI_API_KEY") if self.config.provider == "openai" else None
+        )
         base_url = self.config.base_url or os.getenv("OPENAI_BASE_URL")
 
         if not api_key:
@@ -160,349 +162,29 @@ class OpenAIProvider(BaseLLMProvider):
                 "  方式 2: 直接设置系统环境变量 OPENAI_API_KEY"
             )
 
-        self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self.client = AsyncOpenAI(api_key=api_key, base_url=base_url, max_retries=0)
 
-    def _convert_anthropic_tools_to_openai(
-        self,
-        tools: List[Dict],
-        strict_tools: bool = False,
-    ) -> List[Dict]:
-        """
-        将 Anthropic 格式的 tools 转换为 OpenAI Function Calling 格式。
-        
-        Anthropic 格式:
-        {
-            "name": "get_weather",
-            "description": "Get weather info",
-            "input_schema": {
-                "type": "object",
-                "properties": {...},
-                "required": [...]
-            }
-        }
-        
-        OpenAI 格式:
-        {
-            "type": "function",
-            "function": {
-                "name": "get_weather",
-                "description": "Get weather info",
-                "parameters": {
-                    "type": "object",
-                    "properties": {...},
-                    "required": [...]
-                }
-            }
-        }
-        """
-        openai_tools = []
-        for tool in tools:
-            function = {
-                "name": tool["name"],
-                "description": tool.get("description", ""),
-                "parameters": tool.get("input_schema", {
-                    "type": "object",
-                    "properties": {}
-                })
-            }
-            if strict_tools or tool.get("strict"):
-                function["strict"] = True
-            openai_tools.append({
-                "type": "function",
-                "function": function,
-            })
-        return openai_tools
+    def _convert_anthropic_tools_to_openai(self, tools, strict_tools=False):
+        """Legacy helper retained for extensions; the codec owns conversion."""
+        from dataclasses import replace
+        from llm.legacy import request_from_legacy
+        config = replace(self.config, extra_params={"strict_tools": strict_tools})
+        return encode_request(request_from_legacy("", [], tools), config).get("tools", [])
 
-    def _convert_anthropic_messages_to_openai(self, messages: List[Dict]) -> List[Dict]:
-        """
-        将 Anthropic 格式的消息转换为 OpenAI 格式。
-        
-        主要处理 tool_result 类型的消息，Anthropic 使用 content 数组，
-        OpenAI 使用 role="tool" + tool_call_id + content 字符串。
-        """
-        openai_messages = []
-        for msg in messages:
-            role = msg.get("role")
-            content = msg.get("content")
-            
-            # 处理普通文本消息
-            if isinstance(content, str):
-                openai_messages.append({
-                    "role": role,
-                    "content": content
-                })
-            # 处理包含块结构的 content 数组
-            elif isinstance(content, list):
-                text_parts = []
-                tool_calls = []
-                reasoning_parts = []
-                encrypted_parts = []
-                tool_result_images = []
-                has_user_content = False
-                
-                for block in content:
-                    if isinstance(block, dict):
-                        b_type = block.get("type")
-                        if b_type == "text":
-                            text_parts.append(block.get("text", ""))
-                            has_user_content = True
-                        elif b_type == "tool_use":
-                            tool_calls.append({
-                                "id": block.get("id"),
-                                "type": "function",
-                                "function": {
-                                    "name": block.get("name"),
-                                    "arguments": json.dumps(block.get("input", {}))
-                                }
-                            })
-                        elif b_type == "thinking":
-                            # 思考内容统一用 thinking 块承载，这里转回 OpenAI 格式
-                            # 的同级字段。OpenAI SDK 会把消息里的未知字段原样透传
-                            # 到请求体（已实测）。
-                            #   - DeepSeek：工具调用轮次必须回传 reasoning_content，
-                            #     否则 400。
-                            #   - 方舟：不回传不报错，但 1.8 及之后的模型回传后思维链
-                            #     可参与后续推理；encrypted_content 优先级高于
-                            #     reasoning_content，两者同时回传时前者生效。
-                            reasoning = block.get("thinking", "")
-                            if reasoning:
-                                reasoning_parts.append(str(reasoning))
-                            encrypted = block.get("encrypted_content", "")
-                            if encrypted:
-                                encrypted_parts.append(str(encrypted))
-                        elif b_type == "redacted_thinking":
-                            # OpenAI/DeepSeek 格式无等价字段；丢弃以避免泄露
-                            # 被模型显式遮蔽的内容。
-                            pass
-                        elif b_type == "tool_result":
-                            # Anthropic 的 tool_result 转为 OpenAI 的 tool 消息
-                            raw_content = block.get("content", "")
-                            if isinstance(raw_content, list):
-                                # Keep image blocks as a subsequent multimodal
-                                # user message. Serialising their base64 body
-                                # into the tool string both destroys modality
-                                # and massively inflates ordinary text context.
-                                parts = []
-                                for c in raw_content:
-                                    if isinstance(c, dict) and c.get("type") == "text":
-                                        parts.append(c.get("text", ""))
-                                    elif (
-                                        isinstance(c, dict)
-                                        and c.get("type") == "image"
-                                        and isinstance(c.get("source"), dict)
-                                        and c["source"].get("type") == "base64"
-                                    ):
-                                        source = c["source"]
-                                        media_type = str(
-                                            source.get("media_type") or ""
-                                        ).strip()
-                                        data = source.get("data")
-                                        if media_type and isinstance(data, str) and data:
-                                            tool_result_images.append({
-                                                "type": "image_url",
-                                                "image_url": {
-                                                    "url": (
-                                                        f"data:{media_type};base64,{data}"
-                                                    )
-                                                },
-                                            })
-                                    else:
-                                        parts.append(json.dumps(c, ensure_ascii=False))
-                                content_str = "\n".join(parts)
-                            elif isinstance(raw_content, str):
-                                content_str = raw_content
-                            else:
-                                content_str = json.dumps(raw_content, ensure_ascii=False)
-                                
-                            openai_messages.append({
-                                "role": "tool",
-                                "tool_call_id": block.get("tool_use_id"),
-                                "content": content_str
-                            })
-                
-                # 根据原本的 role 重构消息。思维链只是回答的附属物：没有正文也
-                # 没有工具调用时不单独成一条消息，否则会造出缺 content 的
-                # assistant 消息，多数 OpenAI 兼容服务端会拒。
-                if role == "assistant" and (text_parts or tool_calls):
-                    msg_dict: Dict[str, Any] = {"role": "assistant"}
-                    if text_parts:
-                        msg_dict["content"] = "\n".join(text_parts)
-                    if reasoning_parts:
-                        msg_dict["reasoning_content"] = "\n".join(reasoning_parts)
-                    if encrypted_parts:
-                        msg_dict["encrypted_content"] = "\n".join(encrypted_parts)
-                    if tool_calls:
-                        msg_dict["tool_calls"] = tool_calls
-                    openai_messages.append(msg_dict)
-                elif role == "user" and (has_user_content or tool_result_images):
-                    if tool_result_images:
-                        user_content = []
-                        if text_parts:
-                            user_content.append({
-                                "type": "text",
-                                "text": "\n".join(text_parts),
-                            })
-                        user_content.extend(tool_result_images)
-                        openai_messages.append(
-                            {"role": "user", "content": user_content}
-                        )
-                    else:
-                        openai_messages.append(
-                            {"role": "user", "content": "\n".join(text_parts)}
-                        )
-            else:
-                # 其他情况直接传递
-                openai_messages.append(msg)
-        
-        return openai_messages
+    def _convert_anthropic_messages_to_openai(self, messages):
+        from llm.adapters import encode_messages
+        from llm.legacy import project_messages
+        from llm.profiles import OPENAI
+        return encode_messages(project_messages(messages), OPENAI)
 
-    async def generate_response(
-        self,
-        system_prompt: str,
-        messages: List[Dict],
-        tools: List[Dict],
-    ) -> Tuple[str, List[Dict], str, Dict[str, Any]]:
-        """调用 OpenAI / OpenAI-compat API 生成响应。
-
-        关于 prompt cache(以阿里云百炼/Qwen 为目标平台):
-          - 百炼支持显式 cache_control: {"type":"ephemeral"},格式与 Anthropic 同
-          - cache_control 只能放在 messages 的 content 里(包括 role=system)
-          - tools 不能独立缓存(自动并入 system 的缓存范围)— 所以下面不在 tools 上加 marker
-          - 显式缓存最小 1024 token, TTL 5 分钟(命中后重置)
-          - 命中数从 response.usage.prompt_tokens_details.cached_tokens 读
-
-        :param system_prompt: 系统提示词
-        :param messages: Anthropic 格式的消息列表
-        :param tools: Anthropic 格式的工具列表
-        :return: (文本回复, 工具调用列表, stop_reason, usage)
-        """
+    async def generate(self, request: LLMRequest) -> LLMResult:
         cache_decision = _resolve_cache_control_decision("openai", self.config)
-        strict_tools = bool(self.config.extra_params.get("strict_tools", False))
-        thinking_intent = resolve_thinking_intent(self.config.extra_params)
-        thinking_top, thinking_extra_body, thinking_warnings = (
-            openai_thinking_request(thinking_intent)
-        )
-        for _warning in (*thinking_intent.warnings, *thinking_warnings):
-            _emit_cache_log(f"[OpenAI Thinking] {_warning}")
 
         def build_request_params(cache_enabled: bool) -> Dict[str, Any]:
-            # 转换消息格式
-            openai_messages = self._convert_anthropic_messages_to_openai(messages)
-
-            # 在最后一条消息上挂缓存 marker(滚动缓存对话历史)。
-            # 该显式 cache_control 是部分 OpenAI-compatible 平台扩展能力；
-            # 标准 OpenAI/其它兼容服务默认关闭，避免因为未知字段被拒绝。
-            if cache_enabled and openai_messages:
-                last_msg = dict(openai_messages[-1])
-                if last_msg.get("role") in ("user", "tool", "assistant"):
-                    last_content = last_msg.get("content")
-                    if isinstance(last_content, str) and last_content:
-                        last_msg["content"] = [
-                            {
-                                "type": "text",
-                                "text": last_content,
-                                "cache_control": {"type": "ephemeral"},
-                            }
-                        ]
-                    elif isinstance(last_content, list) and last_content:
-                        last_blocks = list(last_content)
-                        last_block = last_blocks[-1]
-                        if isinstance(last_block, dict):
-                            last_blocks[-1] = {
-                                **last_block,
-                                "cache_control": {"type": "ephemeral"},
-                            }
-                            last_msg["content"] = last_blocks
-                    openai_messages[-1] = last_msg
-
-            # 将 system_prompt 插入到消息列表开头
-            if cache_enabled:
-                system_content: Any = [
-                    {
-                        "type": "text",
-                        "text": system_prompt,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ]
-            else:
-                system_content = system_prompt
-
-            openai_messages.insert(0, {
-                "role": "system",
-                "content": system_content,
-            })
-
-            # 转换工具格式
-            openai_tools = (
-                self._convert_anthropic_tools_to_openai(
-                    tools,
-                    strict_tools=strict_tools,
-                )
-                if tools else []
+            return encode_request(
+                request, self.config, cache_enabled=cache_enabled,
+                thinking_disabled=getattr(self, "_thinking_disabled_after_tool_choice_reject", False),
             )
-
-            # 构建请求参数
-            params = {
-                "model": self.config.model_id,
-                "messages": openai_messages,
-                "max_tokens": self.config.extra_params.get("max_tokens", 4096),
-                "temperature": self.config.extra_params.get("temperature", 1.0),
-            }
-
-            reserved_extra_keys = {
-                "cache_control_mode",
-                "enable_cache_control",
-                "strict_tools",
-                "max_tokens",
-                "temperature",
-                "tool_choice",
-                "llm_api_timeout_seconds",
-                "llm_timeout_max_retries",
-                "llm_timeout_backoff_seconds",
-                "llm_timeout_retry_interval_seconds",
-                # Providers always stream internally.  Keeping this reserved
-                # prevents a user-supplied stream=False from conflicting with
-                # the transport contract below.
-                "stream",
-                # Thinking/reasoning controls are translated by llm.thinking
-                # into the right wire shape (reasoning_effort top-level +
-                # thinking via extra_body); reserving them here avoids a raw
-                # pass-through that the OpenAI SDK would reject (`thinking`
-                # is not a chat.completions kwarg).
-                "thinking",
-                "reasoning_effort",
-                "effort",
-            }
-            for key, value in self.config.extra_params.items():
-                if key not in reserved_extra_keys:
-                    params[key] = value
-
-            # 思考模式参数：reasoning_effort 是原生 kwarg（顶级），
-            # thinking 必须走 extra_body（OpenAI SDK 不接受其为 kwarg）。
-            params.update(thinking_top)
-            if thinking_extra_body:
-                existing_extra_body = params.get("extra_body")
-                if isinstance(existing_extra_body, dict):
-                    merged = dict(existing_extra_body)
-                    merged.update(thinking_extra_body)
-                    params["extra_body"] = merged
-                else:
-                    params["extra_body"] = dict(thinking_extra_body)
-
-            if getattr(self, "_thinking_disabled_after_tool_choice_reject", False):
-                params.pop("reasoning_effort", None)
-                extra_body = dict(params.get("extra_body") or {})
-                extra_body["thinking"] = {"type": "disabled"}
-                params["extra_body"] = extra_body
-
-            # 只有在有工具时才添加 tools 参数
-            if openai_tools:
-                params["tools"] = openai_tools
-                params["tool_choice"] = self.config.extra_params.get(
-                    "tool_choice",
-                    "auto",
-                )
-            return params
 
         effective_cache_enabled = (
             cache_decision.enabled
@@ -568,9 +250,13 @@ class OpenAIProvider(BaseLLMProvider):
             finish_reason = None
             usage = None
             saw_primary_choice = False
+            response_id = None
+            response_model = None
 
             async with stream:
                 async for chunk in self._iterate_with_llm_idle_timeout(stream):
+                    response_id = getattr(chunk, "id", None) or response_id
+                    response_model = getattr(chunk, "model", None) or response_model
                     chunk_usage = getattr(chunk, "usage", None)
                     if chunk_usage is not None:
                         usage = chunk_usage
@@ -642,7 +328,7 @@ class OpenAIProvider(BaseLLMProvider):
                         finish_reason=finish_reason,
                     )
                 )
-            response = SimpleNamespace(choices=choices, usage=usage)
+            response = SimpleNamespace(choices=choices, usage=usage, id=response_id, model=response_model)
             _validate_tool_argument_json(response)
             return response
 
@@ -658,7 +344,7 @@ class OpenAIProvider(BaseLLMProvider):
 
             response, attempts = await self._request_with_timeout_retries(
                 lambda: collect_streamed_completion(request_params),
-                provider="openai",
+                provider=resolve_target(self.config).profile,
                 operation="chat.completions.stream",
                 response_validator=_degenerate_response_problem,
                 timeout_managed=True,
@@ -723,57 +409,7 @@ class OpenAIProvider(BaseLLMProvider):
             f"markers={cache_diagnostics.get('marker_count')}"
         )
 
-        # 解析响应
-        message = response.choices[0].message
-        response_text = message.content or ""
-        reasoning_content = str(getattr(message, "reasoning_content", "") or "")
-        encrypted_content = str(getattr(message, "encrypted_content", "") or "")
-        tool_calls = []
-        
-        # 解析工具调用（转换回 Anthropic 格式）
-        if message.tool_calls:
-            for tc in message.tool_calls:
-                # Whole-response validation above guarantees that malformed
-                # transport JSON can never masquerade as model-authored input.
-                parsed_input = (
-                    json.loads(tc.function.arguments)
-                    if tc.function.arguments
-                    else {}
-                )
-                tool_calls.append({
-                    "id": tc.id,
-                    "name": tc.function.name,
-                    "input": parsed_input,
-                })
-        
-        # 映射 finish_reason 到 Anthropic 的 stop_reason
-        # finish_reason 可能为 None(流式中途/异常),兜底为 "stop" 保证返回类型为 str
-        finish_reason = response.choices[0].finish_reason or "stop"
-        stop_reason_map = {
-            "stop": "end_turn",
-            "length": "max_tokens",
-            "tool_calls": "tool_use",
-            "content_filter": "end_turn",
-        }
-        stop_reason = stop_reason_map.get(finish_reason, finish_reason)
-
-        # 思维链通过 reasoning_content（+ 方舟摘要类模型的 encrypted_content）
-        # 返回。统一包装成 thinking 块存入 _assistant_prefix_blocks，与 Anthropic
-        # provider 一致，由 harness 在下一轮原样回传：DeepSeek 的工具调用轮次不
-        # 回传会报 400，方舟不报错但回传后思维链可参与后续推理。
-        assistant_prefix_blocks: List[Dict[str, Any]] = []
-        reasoning_block = thinking_block_from_reasoning(
-            reasoning_content,
-            encrypted_content,
-        )
-        if reasoning_block is not None:
-            assistant_prefix_blocks.append(reasoning_block)
-
-        return response_text, tool_calls, stop_reason, {
-            "cache_read": cache_read,
-            "cache_creation": 0,        # OpenAI 不区分,首次请求的写入算 uncached
-            "uncached_input": uncached_input,
-            "output": output_tokens,
+        diagnostics = {
             "cache_diagnostics": cache_diagnostics,
             "timeout_retries": sum(
                 1 for item in timeout_attempts
@@ -799,5 +435,6 @@ class OpenAIProvider(BaseLLMProvider):
             "timeout_seconds": self._llm_timeout_seconds(),
             "timeout_max_retries": self._llm_timeout_max_retries(),
             "timeout_retry_interval_seconds": self._llm_timeout_retry_interval_seconds(),
-            "_assistant_prefix_blocks": assistant_prefix_blocks,
         }
+
+        return decode_response(response, self.config, diagnostics)

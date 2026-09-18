@@ -6,7 +6,7 @@ import asyncio
 import importlib
 import re
 import time
-from abc import ABC, abstractmethod
+from abc import ABC
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 
 from runtime_config import ModelConfig
@@ -689,59 +689,26 @@ class BaseLLMProvider(ABC):
             if delay > 0:
                 await asyncio.sleep(delay)
 
-    @abstractmethod
-    async def generate_response(
-        self,
-        system_prompt: str,
-        messages: List[Dict[str, Any]],
-        tools: List[Dict[str, Any]],
-    ) -> Tuple[str, List[Dict], str, Dict[str, Any]]:
-        """
-        核心统一接口。
-
-        :param system_prompt: 系统提示词
-        :param messages: 对话消息列表（Anthropic 格式）
-        :param tools: 工具 Schema 列表
-        :return: (文本回复, 工具调用列表[{"id", "name", "input"}], stop_reason,
-                  usage dict: {cache_read, cache_creation, uncached_input,
-                  output, cache_diagnostics})
-        """
-        pass
-
-    async def generate_assistant_message(
-        self,
-        system_prompt: str,
-        messages: List[Dict[str, Any]],
-        tools: List[Dict[str, Any]],
-    ) -> Tuple[Any, Dict[str, Any]]:
-        """Typed form of :meth:`generate_response`.
-
-        Returns the assistant turn as ordered content blocks plus a usage dict
-        with the private ``_assistant_prefix_blocks`` key removed: thinking is
-        part of the message now, not a passenger in a metrics dict.
-
-        Concrete rather than abstract, and built on the four-tuple rather than
-        replacing it, because every retry, timeout, moderation and degenerate
-        response path in this class wraps ``generate_response``. Re-homing them
-        behind a streaming public API is a separate change - the one time this
-        codebase exposed a stream past that boundary, connection errors stopped
-        being retried at all.
-        """
-
-        from harness.events.recorder import assistant_message_from_parts
-
-        text, tool_calls, stop_reason, usage = await self.generate_response(
-            system_prompt=system_prompt, messages=messages, tools=tools,
+    async def generate(self, request):
+        """Neutral API. Fallback is only for external legacy provider subclasses."""
+        if type(self).generate_response is BaseLLMProvider.generate_response:
+            raise NotImplementedError("provider must implement generate(LLMRequest)")
+        from llm.legacy import result_from_legacy
+        from llm.adapters import encode_messages
+        from llm.profiles import ANTHROPIC
+        response = await self.generate_response(
+            "\n".join(b.text for b in request.system), encode_messages(request.messages, ANTHROPIC),
+            [{"name": t.name, "description": t.description, "input_schema": t.parameters} for t in request.tools],
         )
-        usage = usage if isinstance(usage, dict) else {}
-        message = assistant_message_from_parts(
-            text=text,
-            tool_calls=tool_calls,
-            prefix_blocks=usage.get("_assistant_prefix_blocks"),
-            stop_reason=stop_reason,
-            usage=usage,
-        )
-        return message, {
-            key: value for key, value in usage.items()
-            if key != "_assistant_prefix_blocks"
-        }
+        return result_from_legacy(response)
+
+    async def generate_response(self, system_prompt, messages, tools):
+        """Deprecated tuple facade; all built-in providers encode neutral requests."""
+        from llm.legacy import request_from_legacy
+        result = await self.generate(request_from_legacy(system_prompt, messages, tools))
+        return result.legacy_fields(include_prefix=True)
+
+    async def generate_assistant_message(self, system_prompt, messages, tools):
+        from llm.legacy import request_from_legacy
+        result = await self.generate(request_from_legacy(system_prompt, messages, tools))
+        return result.message, result.legacy_fields()[3]
