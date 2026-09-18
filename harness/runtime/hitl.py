@@ -292,6 +292,7 @@ async def _resolve_after_verified_settlement(
     page_id: str,
     deadline: float,
     poll_interval_seconds: float,
+    purpose: str = VERIFIED_RESOLVE_PURPOSE,
 ) -> Dict[str, Any]:
     """Issue Hitl.resolvePause after verified settlement, then confirm.
 
@@ -304,7 +305,7 @@ async def _resolve_after_verified_settlement(
     try:
         resolved = await browser.call(
             "Hitl.resolvePause",
-            {"pageId": page_id, "purpose": VERIFIED_RESOLVE_PURPOSE},
+            {"pageId": page_id, "purpose": purpose},
         )
         checks.append({
             "method": "Hitl.resolvePause",
@@ -610,6 +611,82 @@ async def _confirm_unpaused_after_settlement(
 
 
 async def wait_for_hitl_resume(
+    *,
+    browser: ABCPClient,
+    page_id: str,
+    timeout_seconds: float,
+    poll_interval_seconds: float,
+    diagnostics: Optional[WorkerDiagnostics],
+    logger: Optional[RunLogger],
+    challenge_verifier=None,
+    pause_snapshot=None,
+    input_handler=None,
+    pause_reason: str = "等待用户协助或确认",
+) -> Dict[str, Any]:
+    """Race page events with terminal feedback; cancel all readers on exit."""
+    from harness.runtime.hitl_input import read_hitl_input
+
+    handler = input_handler or read_hitl_input
+    event_task = asyncio.create_task(_wait_for_hitl_events(
+        browser=browser, page_id=page_id, timeout_seconds=timeout_seconds,
+        poll_interval_seconds=poll_interval_seconds, diagnostics=diagnostics,
+        logger=logger, challenge_verifier=challenge_verifier,
+        pause_snapshot=pause_snapshot,
+    ))
+    input_task = asyncio.create_task(handler(page_id, pause_reason))
+    started = time.monotonic()
+    feedback = None
+    try:
+        done, _ = await asyncio.wait(
+            {event_task, input_task}, return_when=asyncio.FIRST_COMPLETED,
+        )
+        if input_task in done:
+            try:
+                feedback = input_task.result()
+            except Exception as exc:
+                if logger is not None:
+                    logger.write("hitl.input.failed", {"pageId": page_id,
+                                 "errorType": type(exc).__name__})
+            if isinstance(feedback, str):
+                feedback = feedback.strip()
+            else:
+                feedback = None
+        if event_task in done or not feedback:
+            outcome = await event_task
+        else:
+            event_task.cancel()
+            await asyncio.gather(event_task, return_exceptions=True)
+            # Human text explicitly releases control, but does not prove the
+            # protected target usable. Keep the existing state verification.
+            outcome = await _resolve_after_verified_settlement(
+                browser=browser, page_id=page_id,
+                deadline=time.monotonic() + 10.0,
+                poll_interval_seconds=poll_interval_seconds,
+                purpose="User supplied terminal instructions for this HITL pause; release control.",
+            )
+            outcome.update(pageId=page_id, via="terminal_input",
+                           elapsedMs=int((time.monotonic() - started) * 1000))
+            if diagnostics is not None and outcome.get("status") == "resumed":
+                diagnostics.mark_hitl_resumed()
+        # Feedback may arrive while the event path confirms page settlement.
+        if not feedback and input_task.done() and not input_task.cancelled():
+            try:
+                candidate = input_task.result()
+                feedback = candidate.strip() if isinstance(candidate, str) else None
+            except Exception:
+                pass
+        if feedback:
+            outcome = {**outcome, "userFeedback": feedback,
+                       "feedbackSource": "terminal_user"}
+        return outcome
+    finally:
+        for task in (event_task, input_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(event_task, input_task, return_exceptions=True)
+
+
+async def _wait_for_hitl_events(
     *,
     browser: ABCPClient,
     page_id: str,

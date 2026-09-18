@@ -89,6 +89,36 @@ Retain normalized batch identity and observation metadata when copying a plan;
 new compact plans should declare their output contracts and let the compiler
 derive common validators.
 
+## Listing-derived details: preserve the entry requirement
+
+User: Search for products, then click the selected result cards to enter their
+details and save the requested content.
+
+Correct: retain click-through in both the phase objective and worker_task. Carry
+observed sourcePageId/sourceUrl, query/page, item identity and verbatim card href
+through existing artifacts or continuation context. The detail instruction must
+continue on the source listing, or return to it and revalidate the listing and
+item identity, then click a fresh target. Use existing page reuse controls when
+available; do not require a particular worker slot or invent handles in advance.
+Coordinate phases that mutate the same listing. Independent landing pages can
+still be processed concurrently.
+
+Wrong: "Open productUrl directly; if it is not the detail page, return to the
+listing and click the card." That reverses the requested entry route even when
+the URL is a verbatim href. Matching titles, URLs and delivery fields do not
+preserve the user's click requirement. If clicking cannot be completed, report
+the blocker rather than silently treating direct access as equivalent.
+
+When the user specifies no entry route, default to source-card click-through
+when the listing is available. Direct navigation from an observed href is an
+allowed fallback when evidence establishes that clicking is unavailable or
+unsuitable; record the reason. Standalone supplied URLs and explicit requests
+for direct navigation do not need a listing. This default preference is not an
+immutable user constraint. Express it in existing task instructions and context;
+do not invent navigation_policy fields or new reuse_scope values. page_policy
+selects page reuse, not the entry method, and historical AX ids are not durable
+click targets.
+
 ## Download: validator type versus parameter
 
 User: Download the supplied file https://example.org/manual.pdf into the

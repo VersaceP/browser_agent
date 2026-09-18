@@ -680,9 +680,16 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                         " script. For listing-derived detail"
                                         " work preserve the source page and"
                                         " identity and observed verbatim href."
-                                        " Choose source-card traversal or URL"
-                                        " navigation from current evidence;"
-                                        " do not prescribe one route for all sites."
+                                        " Preserve an explicit user request to click"
+                                        " the source card/link; direct URL access"
+                                        " is not equivalent. Otherwise prefer"
+                                        " source-card click-through when available,"
+                                        " with evidence-based direct navigation"
+                                        " fallback and a recorded reason. Carry"
+                                        " observed source-page context into detail"
+                                        " work; refresh targets before clicking."
+                                        " Standalone supplied URLs and explicit"
+                                        " direct-navigation requests are exempt."
                                     ),
                                 },
                                 "stage_hint": {"type": "string"},

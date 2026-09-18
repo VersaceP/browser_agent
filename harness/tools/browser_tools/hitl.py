@@ -1727,6 +1727,14 @@ def _hitl_resumed_suggested_prompt(wait_result: Any) -> str:
         " when needed and verify the requested content with DOM.getSemanticTree."
     )
 
+def _pause_needs_browser_assistance(params: JsonDict) -> bool:
+    text = " ".join(str(params.get(key) or "") for key in ("purpose", "reason")).lower()
+    return any(word in text for word in (
+        "captcha", "challenge", "verification", "authentication", "login",
+        "sign in", "登录", "登陆", "验证码", "滑块", "扫码", "二次验证",
+    ))
+
+
 async def _enrich_pause_with_wait(
     agent: Any,
     params: JsonDict,
@@ -1749,10 +1757,23 @@ async def _enrich_pause_with_wait(
         poll_interval_seconds=getattr(harness_cfg, "hitl_poll_interval_seconds", 2.0),
         diagnostics=diagnostics,
         logger=agent.logger,
-        challenge_verifier=_make_hitl_challenge_verifier(agent, str(page_id), step),
+        # A normal page refresh cannot answer a business clarification.
+        challenge_verifier=(
+            _make_hitl_challenge_verifier(agent, str(page_id), step)
+            if _pause_needs_browser_assistance(params) else None
+        ),
         pause_snapshot=_hitl_pause_snapshot(agent, str(page_id)),
+        pause_reason=str(params.get("reason") or params.get("purpose") or "等待确认"),
+        input_handler=getattr(agent, "hitl_input_handler", None),
     )
-    if wait_result.get("status") == "resumed":
+    feedback = wait_result.get("userFeedback")
+    if feedback:
+        pending = getattr(agent, "hitl_user_messages", None)
+        if pending is None:
+            pending = []
+            agent.hitl_user_messages = pending
+        pending.append({"pageId": str(page_id), "text": feedback})
+    if wait_result.get("status") == "resumed" and _pause_needs_browser_assistance(params):
         wait_result = await _post_hitl_recovery_loop(
             agent,
             str(page_id),

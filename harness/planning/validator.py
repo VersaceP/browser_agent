@@ -158,6 +158,27 @@ _PLAN_AUDITOR_RULES = (
     "Resolve every quantityLineageAmbiguity explicitly. An ambiguous assessment"
     " cannot be approved. If it is a quantity relaxation, submit a"
     " quantityDecision using that ambiguityId.",
+    "For listing-derived detail work, compare the entry route in the original"
+    " user task with the actual worker_task and page-continuation plan. When"
+    " the user explicitly asks to click a card/link, reject direct URL access"
+    " as the normal entry or a silent fallback, even if the href was copied"
+    " from that card. 'Open productUrl; click the card only if that fails'"
+    " does not preserve 'click the card to enter'. A preserved goal sentence"
+    " or identical output fields cannot cure contradictory worker instructions."
+    " Require a feasible source-page continuation or return-and-revalidation"
+    " instruction for split phases, carrying observed source-page context and"
+    " item identity through existing artifacts/context when available. Do not"
+    " demand fabricated pageIds, durable AX ids, a particular worker slot,"
+    " or unsupported navigation-policy fields. page_policy=new/existing alone"
+    " neither proves nor disproves click-through: inspect the whole plan.",
+    "When the user leaves the entry route unspecified for listing-derived"
+    " details, prefer a source-card click-first plan with evidence-based direct"
+    " navigation fallback and a recorded reason. An evidence-supported direct"
+    " route is acceptable; do not turn this default preference into an"
+    " immutable user requirement. Standalone supplied URLs and explicit"
+    " direct-navigation instructions do not require a listing or click. Shared"
+    " mutable listing state requires coordination, but do not demand merging"
+    " all detail workers or serializing independent detail pages.",
     "Reject unsupported navigation-policy replacement, retry disguised as a new"
     " phase id, unjustified cohort fragmentation, and renewed free exploration"
     " after a path was validated.",

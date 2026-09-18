@@ -153,6 +153,17 @@ second concurrency limit. Honor actual capacity and binding receipts.
 Use page reuse only when existing page context is needed. A slot pin through
 reuse_from_worker_id or preferred_slot_id may serialize workers; omit it for
 independent siblings unless that exact slot is necessary. Shared mutable pages
-can serialize operations even across slots. Preserve observed source URLs and
-verbatim hrefs; let current page evidence determine the entry route. There is
-no universal requirement to click a source card or to reuse its worker slot.
+can serialize operations even across slots. For listing-derived details, preserve
+explicit user requests to click the source card/link in the worker instruction;
+direct URL access is not equivalent. Otherwise prefer source-card click-through
+when available, allowing direct navigation from an observed verbatim href when
+current evidence justifies the fallback and recording the reason. Standalone
+supplied URLs and explicit direct-navigation requests do not require clicking.
+
+Carry observed sourcePageId/sourceUrl, listing query/page, item identity and
+verbatim href through existing artifacts or continuation context. Arrange source
+page reuse with the existing controls when available, or return to the observed
+listing and revalidate its state and item identity before clicking. Do not invent
+page handles or reuse stale AX ids. A particular worker slot is not universally
+required. Coordinate mutations of a shared listing, while allowing independent
+detail pages to be processed concurrently.
