@@ -18,7 +18,7 @@ from typing import Tuple
 from urllib.parse import urlsplit
 from harness.evidence.extraction_artifacts import field_names_from_specs
 from harness.evidence.artifact_evidence import VALIDATOR_SCOPE
-from harness.task_types import normalize_task_type
+from harness.planning.task_types import normalize_task_type
 from harness.utils import JsonDict
 from harness.utils import RunLogger
 from harness.utils import load_task_json

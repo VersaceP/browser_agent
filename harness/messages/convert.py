@@ -1,15 +1,7 @@
-"""harness.messages.convert - The single boundary between canonical and wire.
+"""Legacy transcript projection for compaction, recovery and old extensions.
 
-The harness's internal transcript has always been Anthropic-shaped, and the
-OpenAI provider translates it on the way out. That stays true; what changes is
-that exactly one function now decides what an assistant turn looks like on the
-wire, instead of two agent loops each assembling the blocks by hand from a
-private ``usage["_assistant_prefix_blocks"]`` key.
-
-Block ORDER is the contract. Anthropic rejects a replayed assistant message
-whose thinking does not lead, and a signature or an encrypted reasoning blob
-that is re-encoded on the way through is no longer valid - so both travel
-verbatim.
+Model requests use llm.legacy.project_messages -> LLMRequest -> llm.adapters.
+These helpers remain for utilities that inspect the old transcript layout.
 """
 
 from __future__ import annotations
@@ -25,6 +17,7 @@ from harness.messages.models import (
     ToolCallContent,
     ToolResultMessage,
     UserMessage,
+    ImageContent,
 )
 
 ProviderKind = str
@@ -40,9 +33,9 @@ def content_block_to_wire(block: Any) -> Optional[Dict[str, Any]]:
         # Absent, not null: the providers only add these keys when the model
         # actually sent them, and an unexpected null is a 400 on some
         # endpoints.
-        if block.signature:
+        if block.signature is not None:
             wire["signature"] = block.signature
-        if block.encrypted:
+        if block.encrypted is not None:
             wire["encrypted_content"] = block.encrypted
         return wire
     if isinstance(block, TextContent):
@@ -117,11 +110,28 @@ def assistant_blocks_from_wire(
 
 
 def tool_result_to_wire(message: ToolResultMessage) -> Dict[str, Any]:
-    return {
+    result = {
         "type": "tool_result",
         "tool_use_id": message.tool_call_id,
-        "content": message.content,
+        "content": input_content_to_wire(message.content),
     }
+    if message.is_error:
+        result["is_error"] = True
+    return result
+
+
+def input_content_to_wire(content: Any) -> Any:
+    if isinstance(content, str):
+        return content
+    result = []
+    for block in content:
+        if isinstance(block, TextContent):
+            result.append({"type": "text", "text": block.text})
+        elif isinstance(block, ImageContent):
+            source = ({"type": "url", "url": block.url} if block.url is not None else
+                      {"type": "base64", "media_type": block.media_type, "data": block.data})
+            result.append({"type": "image", "source": source})
+    return result
 
 
 def to_model_messages(
@@ -155,7 +165,7 @@ def to_model_messages(
             pending_results.append(tool_result_to_wire(message))
         elif isinstance(message, UserMessage):
             flush()
-            wire.append({"role": "user", "content": message.content})
+            wire.append({"role": "user", "content": input_content_to_wire(message.content)})
         elif isinstance(message, CompactionSummaryMessage):
             flush()
             wire.append({"role": "user", "content": message.content})

@@ -1,5 +1,5 @@
 """
-harness.schema_loader - Capability discovery and per-method schema loading.
+harness.capabilities.schema_loader - Capability discovery and per-method schema loading.
 
 System.getCapabilities returns one compact summary per Action (method,
 description, requiresPurpose) plus the catalog/guide revisions and, on request,

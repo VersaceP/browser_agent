@@ -1,8 +1,10 @@
 """Deterministic handoff after initial plan approval; no extra model call."""
 import json
+from harness.messages.convert import to_model_messages
 
 
 def execution_handoff(messages, plan, task_dir):
+    messages = to_model_messages(messages)
     # Preserve all actual user prose; tool results and assistant reasoning belong
     # to the recorded planning transcript. Approval feedback may arrive as a tool result.
     retained = []

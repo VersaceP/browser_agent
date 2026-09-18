@@ -13,7 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 from urllib.parse import urlsplit, urlunsplit
 
 from harness.results.call_outcome import evaluate_grant
-from harness.semantic_frames import response_node_count
+from harness.observation.semantic_frames import response_node_count
 from harness.utils import JsonDict
 
 

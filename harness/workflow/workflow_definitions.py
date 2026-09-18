@@ -7,7 +7,7 @@ import hashlib
 import json
 from typing import Any, Dict, List, Optional, Tuple
 
-from harness.tool_policy import (
+from harness.tools.tool_policy import (
     SENSITIVE_URL_QUERY_KEYS,
     collect_sensitive_replacements,
     redact_values,

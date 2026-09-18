@@ -4,8 +4,8 @@ audience: browser
 version: "2026-09-15"
 description: Interpret offloaded observations and use bounded local file tools without confusing historical evidence with live page state.
 sources:
-  - harness/offload.py
-  - harness/local_fs.py
+  - harness/context/offload.py
+  - harness/tools/local_fs.py
   - harness/tools/browser_tools/dispatch.py
 related_tools:
   - local_fs_read

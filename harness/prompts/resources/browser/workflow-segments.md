@@ -6,7 +6,7 @@ description: Write one execute_browser_workflow segment instead of a run of sing
 sources:
   - harness/tools/browser_tools/dispatch.py
   - harness/tools/browser_tools/schemas.py
-  - harness/workflow_policy.py
+  - harness/workflow/workflow_policy.py
   - harness/observation/exec_observer.py
 related_tools:
   - execute_browser_workflow
@@ -51,6 +51,19 @@ before the workflow starts.
 retry setting anywhere in the workflow language: a step that failed did so
 against a page you have not re-observed, so retrying it blind is the wrong move
 anyway. Read the failure receipt, re-observe, submit a new segment.
+
+## Observation and event choices
+
+After navigation settlement, call Page.getState. Read an AXTree only if the
+next work needs AX identities; a segment may end with state, text, attributes,
+or selector-based extraction. Autoheal adds missing state synchronization,
+not an unconditional AXTree. Old canonical ids remain invalid after navigation.
+
+Allowed focus names come from the current Workflow.execute schema, separately
+for waitEvent and readEvents. A schema-supported event is not guaranteed to
+occur during this operation. Choose it from the action's observed timing and
+receipt, and inspect empty/timeout results; Harness does not ban event names
+because it predicts they would be unhelpful.
 
 ## A filled-form segment
 

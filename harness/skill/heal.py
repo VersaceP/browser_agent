@@ -25,11 +25,11 @@ from harness.skill.workflow import (
     check_success_contract,
     run_skill_workflow,
 )
-from harness.workflow_auth_fence import (
+from harness.workflow.workflow_auth_fence import (
     workflow_auth_fence_after,
     workflow_auth_fence_before,
 )
-from harness.workflow_runtime import (
+from harness.workflow.workflow_runtime import (
     workflow_execution_disabled_result,
     workflow_execution_enabled,
 )

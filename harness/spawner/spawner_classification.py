@@ -15,8 +15,8 @@ from harness.constants import COLLECTION_CONTRACT_REPLAN_REQUIRED
 from harness.results.call_outcome import classify_call_outcome
 from harness.fleet.auth import canonical_origin
 from harness.results.row_ledger import identity_fields_from_contract
-from harness.schema_loader import CapabilityBundle
-from harness.scroll_receipt import (
+from harness.capabilities.schema_loader import CapabilityBundle
+from harness.observation.scroll_receipt import (
     STATE_READ_REASONS,
     axis_magnitude,
     scroll_delta_magnitude,
@@ -333,7 +333,7 @@ def _scroll_delta_applied(result: JsonDict) -> Optional[float]:
     None and 0 must stay distinct: None means no movement receipt was found,
     while 0 is a positive report that the page did not move.
 
-    The shapes live in harness.scroll_receipt because `Input.scroll` and
+    The shapes live in harness.observation.scroll_receipt because `Input.scroll` and
     `Page.wheel` name their delta differently - reading only `totalDelta` made
     every `Page.wheel` answer None, and None here means "cannot prove it moved",
     so no wheel could ever count as traversal or set `scrollEffectEvidence`.

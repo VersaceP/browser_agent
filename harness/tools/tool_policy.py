@@ -1,5 +1,5 @@
 """
-harness.tool_policy - Shared tool policy for BrowserAgent workers.
+harness.tools.tool_policy - Shared tool policy for BrowserAgent workers.
 
 `allowed_methods` from an LLM-authored worker contract is intentionally not
 used as a hard allow-list for ABCP atomic methods. The stable policy is owned
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, FrozenSet, Iterable, Optional, Set, Tuple
 
-from harness.task_types import (
+from harness.planning.task_types import (
     TASK_TYPE_SCENARIOS,
     TASK_TYPE_SELECTION_RULE,
     VALID_TASK_TYPES,
@@ -408,7 +408,7 @@ HARNESS_TOOL_NAMES: FrozenSet[str] = frozenset({
 # the catalog actually publishes: `Hitl.getTaskSummary` / `Hitl.resumeEvent`
 # were listed here long after the platform deleted them, which made the set read
 # as broader policy than it enforced. The Hitl domain is now requestPause /
-# resolvePause only, and wait/resume is owned by harness/hitl.py.
+# resolvePause only, and wait/resume is owned by harness/runtime/hitl.py.
 ALWAYS_FORBIDDEN_ABCP_METHODS: FrozenSet[str] = frozenset({
     "Memory.delete",
 })

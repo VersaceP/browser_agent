@@ -1,16 +1,17 @@
 """
-harness.compaction - Prompt context compaction while preserving tool pairing.
+harness.context.compaction - Prompt context compaction while preserving tool pairing.
 """
 
 import inspect
 import json
+import math
 import uuid
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from runtime_config import HarnessConfig
-from harness.lifecycle import LifecycleContext, LifecycleManager
-from harness.offload import store_offloaded
+from harness.runtime.lifecycle import LifecycleContext, LifecycleManager
+from harness.context.offload import store_offloaded
 from harness.messages.convert import to_model_messages
 from harness.messages.models import CompactionSummaryMessage
 from harness.utils import (
@@ -46,6 +47,9 @@ def _wire_message(message: Any) -> JsonDict:
     """
     if isinstance(message, CompactionSummaryMessage):
         return {"role": "user", "content": message.content}
+    if not isinstance(message, dict):
+        projected = to_model_messages([message])
+        return projected[0] if projected else {}
     return message if isinstance(message, dict) else {}
 
 
@@ -136,18 +140,57 @@ def validate_tool_pairing(messages: List[Any]) -> Optional[str]:
     return None
 
 
+# Per-image upper bound when the transport consumes an image as vision input,
+# not a pricing formula: Anthropic documents about width*height/750 after
+# resizing to at most 1.15 MP (~1.6K), and juao run a020679d grew by 1,657
+# input tokens after a 2,277,213-byte screenshot.
+VISION_IMAGE_TOKEN_BUDGET = 4096
+# Measured when a relay counted a nested image as base64 text: c6a56d5e
+# 2,184,856 chars -> +1,479,514 tokens (1.48 chars/token); e015e32e
+# 2,702,132 -> +1,878,283 (1.44). Rounded down so the estimate errs high.
+BASE64_TEXT_CHARS_PER_TOKEN = 1.4
+
+
+def _is_image_block(block: JsonDict) -> bool:
+    return (
+        block.get("type") == "image" and isinstance(block.get("source"), dict)
+    ) or (
+        block.get("type") in {"image_url", "input_image"} and "image_url" in block
+    )
+
+
+def estimate_image_tokens(block: JsonDict, *, accounting: str = "vision") -> int:
+    """Estimated input tokens for one image block under ``accounting``.
+
+    ``accounting`` comes from ``llm.adapters.tool_result_image_accounting``;
+    only ``base64_text`` depends on the encoded size.
+    """
+    if accounting != "base64_text":
+        return VISION_IMAGE_TOKEN_BUDGET
+    source = block.get("source")
+    if isinstance(source, dict):
+        payload = source.get("data") or source.get("url") or ""
+    else:
+        image_url = block.get("image_url")
+        payload = image_url.get("url") if isinstance(image_url, dict) else image_url
+    return max(1, math.ceil(len(str(payload or "")) / BASE64_TEXT_CHARS_PER_TOKEN))
+
+
 def estimate_prompt_tokens(
     system_prompt: str,
     messages: List[Any],
     tools: List[JsonDict],
+    *,
+    tool_result_image_accounting: str = "vision",
 ) -> int:
-    # Images are encoded by the provider's vision pipeline, not tokenized as
-    # base64 text. Reserve an approximate per-image budget; this is not an
-    # exact provider/resolution-specific token count. Only project actual
-    # content blocks, never tool inputs or text that happens to resemble one.
+    # An image block is costed by how the transport will count it, never by
+    # serializing it with the text. Only an image nested in a tool_result can
+    # be flattened by a relay, so only those follow the caller's accounting.
+    # Only project actual content blocks, never tool inputs or text that
+    # happens to resemble one.
     image_tokens = 0
 
-    def project_content(content: Any) -> Any:
+    def project_content(content: Any, accounting: str) -> Any:
         nonlocal image_tokens
         if not isinstance(content, list):
             return content
@@ -155,15 +198,13 @@ def estimate_prompt_tokens(
         for block in content:
             if not isinstance(block, dict):
                 projected.append(block)
-            elif (
-                block.get("type") == "image" and isinstance(block.get("source"), dict)
-            ) or (
-                block.get("type") in {"image_url", "input_image"} and "image_url" in block
-            ):
-                image_tokens += 4096
+            elif _is_image_block(block):
+                image_tokens += estimate_image_tokens(block, accounting=accounting)
                 projected.append({"type": "image"})
             elif block.get("type") == "tool_result":
-                projected.append({**block, "content": project_content(block.get("content"))})
+                projected.append({**block, "content": project_content(
+                    block.get("content"), tool_result_image_accounting,
+                )})
             else:
                 projected.append(block)
         return projected
@@ -172,7 +213,7 @@ def estimate_prompt_tokens(
         {
             "system": system_prompt,
             "messages": [
-                {**message, "content": project_content(message.get("content"))}
+                {**message, "content": project_content(message.get("content"), "vision")}
                 for message in to_model_messages(messages)
             ],
             "tools": tools,

@@ -1,5 +1,5 @@
 """
-harness.offload - Artifact capture and large result offload helpers.
+harness.context.offload - Artifact capture and large result offload helpers.
 """
 
 import base64
@@ -25,7 +25,7 @@ from harness.constants import (
     OFFLOAD_METHODS,
     SCREENSHOT_METHODS,
 )
-from harness.semantic_frames import response_node_count
+from harness.observation.semantic_frames import response_node_count
 from harness.utils import (
     JsonDict,
     RunLogger,
@@ -38,6 +38,7 @@ from harness.utils import (
     task_subdir,
 )
 from harness.results.worker_result import worker_handoff_projections
+from harness.results.recovery import recovery_overview
 
 
 def store_offloaded(
@@ -500,6 +501,7 @@ def offload_large_tool_result(
     prefix: str = "",
     threshold_bytes: int = DEFAULT_TOOL_RESULT_OFFLOAD_THRESHOLD_BYTES,
 ) -> Any:
+    recovery = recovery_overview(result)
     result = compact_model_facing_tool_result(result)
     semantic_handoffs = worker_handoff_projections(result)
     byte_size = json_size_bytes(result)
@@ -535,6 +537,8 @@ def offload_large_tool_result(
         # Preserve the semantic handoff inline while the bulky fleet inventory,
         # samples and traces move to disk.
         stub["workerHandoffs"] = semantic_handoffs
+    if recovery:
+        stub["recoveryOverview"] = recovery
     if isinstance(result, dict):
         for key in GENERIC_TOOL_RESULT_KEEP_KEYS:
             if key in result:
@@ -927,7 +931,6 @@ def fold_tool_results_after_moderation(
     messages: List[Any],
     *,
     reason: str,
-    images_only: bool = False,
 ) -> Optional[JsonDict]:
     """Strip bulky harness-authored payloads from a refused conversation.
 
@@ -941,9 +944,7 @@ def fold_tool_results_after_moderation(
     turns are the model's own output and hold the ``tool_use`` blocks that
     ``tool_result`` ids pair with, so rewriting them would corrupt the
     conversation; message 0 carries the task itself, and folding the mission to
-    satisfy a content filter would leave the agent working on nothing. With
-    ``images_only``, a known attachment-protocol rejection removes only image
-    blocks and preserves every text receipt verbatim.
+    satisfy a content filter would leave the agent working on nothing.
     """
     folded: List[JsonDict] = []
     freed_chars = 0
@@ -966,47 +967,7 @@ def fold_tool_results_after_moderation(
             else:
                 continue
             payload = block.get(key)
-            if block_type == "tool_result" and isinstance(payload, list):
-                retained = []
-                image_chars = 0
-                image_count = 0
-                for item in payload:
-                    source = item.get("source") if isinstance(item, dict) else None
-                    if (
-                        isinstance(item, dict)
-                        and item.get("type") == "image"
-                        and isinstance(source, dict)
-                        and source.get("type") == "base64"
-                    ):
-                        image_chars += len(str(source.get("data") or ""))
-                        image_count += 1
-                        continue
-                    retained.append(item)
-                if image_count:
-                    retained.append({
-                        "type": "text",
-                        "text": (
-                            "[Screenshot attachment withheld after the model "
-                            "provider rejected this request. Capture a fresh, "
-                            "smaller screenshot only if visual evidence remains "
-                            "necessary.]"
-                        ),
-                    })
-                    block[key] = retained
-                    freed_chars += image_chars
-                    folded.append({
-                        "messageIndex": index,
-                        "blockType": block_type,
-                        "toolUseId": block.get("tool_use_id"),
-                        "imageAttachments": image_count,
-                        "originalChars": image_chars,
-                    })
-                # Preserve the structured text receipt. Replacing the whole
-                # list with a string would violate the provider's mixed-content
-                # tool-result shape, and image bytes are the only new payload
-                # this moderation recovery is responsible for.
-                continue
-            if images_only or not isinstance(payload, str):
+            if not isinstance(payload, str):
                 continue
             if len(payload) < MODERATION_FOLD_MIN_CHARS:
                 continue

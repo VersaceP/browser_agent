@@ -57,7 +57,7 @@ from harness.skill.registry import (
     validate_row_contract,
 )
 from harness.skill.structured_output import validate_structured_output_workflow
-from harness.task_types import resolve_task_type_fail_closed
+from harness.planning.task_types import resolve_task_type_fail_closed
 from harness.skill.workflow import (
     check_persisted_contract,
     check_success_contract,
@@ -986,7 +986,7 @@ async def trial_workflow_live(
     """Run the draft workflow live for each instance row on ONE warm tab.
     Returns {"attempted": bool, "runs": [{"variables", "result"}], "error"?}."""
     from harness.skill.workflow import run_skill_workflow
-    from harness.workflow_runtime import (
+    from harness.workflow.workflow_runtime import (
         workflow_execution_disabled_result,
         workflow_execution_enabled,
     )
@@ -1239,7 +1239,7 @@ async def recheck_skill_live(
     The function never writes health; the CLI owns that policy after classifying
     this result as passed, failed, or inconclusive.
     """
-    from harness.workflow_runtime import (
+    from harness.workflow.workflow_runtime import (
         workflow_execution_disabled_result,
         workflow_execution_enabled,
     )

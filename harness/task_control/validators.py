@@ -9,6 +9,7 @@ import hashlib
 import fnmatch
 import re
 from difflib import SequenceMatcher
+from harness.evidence.extraction_artifacts import current_row_structure_failures
 from pathlib import Path
 from typing import Any
 from typing import Dict
@@ -24,7 +25,7 @@ from harness.evidence.extraction_artifacts import field_names_from_specs
 from harness.evidence.artifact_evidence import VALIDATOR_TYPES
 from harness.evidence.artifact_evidence import cumulative_row_key as _cumulative_row_key
 from harness.evidence.artifact_evidence import detect_placeholder_rows
-from harness.evidence.file_evidence import saved_paths_from_value
+from harness.evidence.file_evidence import saved_paths_from_value, declared_file_paths
 from harness.tools.browser_tools.downloads import _download_records
 from harness.tools.browser_tools.downloads import _normalize_download_record
 from harness.results.row_ledger import ROW_OUTCOMES
@@ -408,21 +409,7 @@ def _run_file_validator(
         if str(value).strip()
     }
 
-    def is_path_field(key: str) -> bool:
-        return key in explicit_path_fields
-
-    def collect_declared(value: Any, key: str = "") -> None:
-        if isinstance(value, dict):
-            for child_key, child in value.items():
-                collect_declared(child, str(child_key))
-        elif isinstance(value, list):
-            for child in value:
-                collect_declared(child, key)
-        elif isinstance(value, str) and is_path_field(key) and value.strip():
-            declared_paths.append(value.strip())
-
-    collect_declared(rows)
-    declared_paths = _tc()._unique_paths(declared_paths)
+    declared_paths = declared_file_paths(rows, explicit_path_fields)
 
     if validator_type == "download_completed":
         # A completion receipt must come from the operation itself
@@ -528,21 +515,12 @@ def _run_file_validator(
                 return False
             return True
 
-        unavailable_declared: List[str] = []
         if explicit_path_fields:
-            targeted_declared = [path for path in declared_paths if targets(path)]
-            available = set(file_paths)
-            unavailable_declared = [
-                path for path in targeted_declared if path not in available
-            ]
-            file_paths = [
-                path for path in targeted_declared if path in available
-            ]
+            # Declared existing files are legitimate inputs too. Provenance is
+            # reported separately; absence from a capture list is not disk corruption.
+            file_paths = [path for path in declared_paths if targets(path)]
         valid: List[str] = []
-        bad: List[JsonDict] = [
-            {"path": path, "reason": "not_attributed_to_phase"}
-            for path in unavailable_declared[:20]
-        ]
+        bad: List[JsonDict] = []
         for raw_path in file_paths:
             path = Path(raw_path).expanduser()
             if regex is not None and regex.search(str(path)) is None:
@@ -568,7 +546,7 @@ def _run_file_validator(
         min_files = max(0, int(validator.get("min_files", 0)))
         # A row that explicitly claims a target file is an integrity claim.
         # Meeting min_files with some other files must not hide a missing,
-        # undersized, or unattributed claimed path.
+        # or undersized claimed path.
         if len(valid) >= min_files and not bad:
             return []
         return [{
@@ -1841,22 +1819,10 @@ def _validate_cumulative_artifacts(
             continue
         path = str(item.get("path") or "")
         payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
-        schema_warnings = payload.get("schemaWarnings")
-        if isinstance(schema_warnings, list) and schema_warnings:
-            schema_failures.append({
-                "type": "schema",
-                "message": "cumulative artifact has schemaWarnings",
-                "path": path,
-                "schemaWarnings": schema_warnings[:5],
-            })
-            continue
         raw_rows = payload.get("rows")
-        if not isinstance(raw_rows, list):
-            schema_failures.append({
-                "type": "schema",
-                "message": "cumulative artifact has no rows array",
-                "path": path,
-            })
+        structure_errors = current_row_structure_failures(raw_rows, expected)
+        if structure_errors:
+            schema_failures.extend({**failure, "path": path} for failure in structure_errors)
             continue
         if path:
             source_paths.append(path)

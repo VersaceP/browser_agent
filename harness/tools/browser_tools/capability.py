@@ -13,13 +13,13 @@ from abcp_client import ABCPTransportError
 from harness.observation.challenge_detector import detect_structural_challenge
 from harness.diagnostics.error_classification import attach_error_classification
 from harness.fleet.runtime import FleetClickGateTimeout
-from harness.offload import offload_large_tool_result
-from harness.offload import preserve_complete_tool_payload
+from harness.context.offload import offload_large_tool_result
+from harness.context.offload import preserve_complete_tool_payload
 from harness.observation.browser_call import build_browser_call_runner
-from harness.runtime_evaluation import RuntimeEvaluationService
-from harness.task_types import resolve_task_type_fail_closed
-from harness.tool_policy import redact_params_for_display
-from harness.tool_policy import sensitive_browser_method_params
+from harness.tools.runtime_evaluation import RuntimeEvaluationService
+from harness.planning.task_types import resolve_task_type_fail_closed
+from harness.tools.tool_policy import redact_params_for_display
+from harness.tools.tool_policy import sensitive_browser_method_params
 from harness.tools.argument_pipeline import apply_required_schema_defaults
 from harness.tools.argument_pipeline import capability_argument_error
 from harness.tools.argument_pipeline import capability_input_schema
@@ -30,16 +30,16 @@ from harness.tools.parsers import parse_browser_call_params
 from harness.tools.parsers import parse_direct_capability_params
 from harness.utils import JsonDict
 from harness.utils import optional_int
-from harness.workflow_runtime import workflow_execution_disabled_result
-from harness.workflow_runtime import workflow_execution_enabled
+from harness.workflow.workflow_runtime import workflow_execution_disabled_result
+from harness.workflow.workflow_runtime import workflow_execution_enabled
 from .axtree_state import _axtree_nodes_from_lines
 from .axtree_state import _browser_side_rematch_mode
 from .axtree_state import _check_stale_axtree_target
 from .axtree_state import _observe_axtree_state_after
 from .axtree_state import _precompute_axtree_snapshot
-from harness.workflow_policy import validate_workflow_params
+from harness.workflow.workflow_policy import validate_workflow_params
 from harness.observation.exec_observer import ExecObserver
-from harness.workflow_projection import project_workflow_receipt
+from harness.workflow.workflow_projection import project_workflow_receipt
 
 def _bt():
     import harness.tools.browser_tools as bt
@@ -598,9 +598,9 @@ async def _execute_browser_capability_tool(
                 response, _recovery = {}, None
 
         if method == "Download.list":
-            known_downloads = _bt()._download_receipt_store(agent)
+            from harness.tools.browser_tools.downloads import _owned_download_record
             for download_record in _bt()._download_records(response):
-                if _bt()._download_operation_key(download_record) in known_downloads:
+                if _owned_download_record(agent, download_record) is not None:
                     _bt()._remember_download_record(agent, download_record)
         elif method == "Download.start" and (
             download_timeout_error is not None
@@ -899,7 +899,7 @@ async def _execute_browser_capability_tool(
             "attempts": list(runtime_receipt.get("attempts") or []),
             "error": _bt()._runtime_evaluation_error_text(result)[:2000],
         }
-    _bt()._fleet_auth_barrier_after_call(agent, method, result)
+    _bt()._fleet_auth_barrier_after_call(agent, method, result, params)
     result = _bt()._attach_runtime_strategy_hints(result, method=method)
     if not page_create_should_stop:
         result = await _bt()._maybe_auto_hitl_for_challenge(agent, method, params, result, step)
@@ -1194,6 +1194,9 @@ def _attach_exec_trace(
         return
     receipt = trace.to_receipt()
     result["executionTrace"] = receipt
+    if agent is not None and isinstance(workflow_params, dict):
+        from harness.tools.browser_tools.downloads import remember_workflow_download_progress
+        remember_workflow_download_progress(agent, workflow_params, receipt)
     # One segment replaces N model turns; this is the number that says how many.
     logger = getattr(agent, "logger", None)
     if logger is not None:
@@ -1495,7 +1498,7 @@ async def _invoke_browser_method(
         result["fleetAuthBarrier"] = page_create_relinquished
     attach_error_classification(result, method=method)
     result = _bt()._apply_select_failure_guidance(agent, method, params, result)
-    _bt()._fleet_auth_barrier_after_call(agent, method, result)
+    _bt()._fleet_auth_barrier_after_call(agent, method, result, params)
     result = _bt()._attach_runtime_strategy_hints(result, method=method)
     if not internal:
         result = await _bt()._maybe_auto_hitl_for_challenge(agent, method, params, result, step)

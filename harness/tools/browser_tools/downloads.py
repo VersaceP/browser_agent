@@ -16,6 +16,7 @@ import asyncio
 import hashlib
 import re
 import time
+import stat
 from typing import Any
 from typing import Dict
 from typing import List
@@ -289,6 +290,34 @@ def _register_download_resource(
 
 DOWNLOAD_TIMEOUT_RECONCILIATION_DELAY_SECONDS = 4.0
 
+def _owned_download_record(agent: Any, record: JsonDict) -> Optional[JsonDict]:
+    store = _download_receipt_store(agent)
+    for key in _download_operation_keys(record):
+        receipt = store.get(key)
+        if isinstance(receipt, dict) and isinstance(receipt.get("deliveryOwner"), dict):
+            return receipt
+    return None
+
+
+def sync_download_artifacts(agent: Any) -> None:
+    """Project this worker's proven downloads into delivery references, without IO writes."""
+    artifacts = getattr(agent, "artifacts", None)
+    if not isinstance(artifacts, list):
+        return
+    seen = set()
+    for receipt in _download_receipt_store(agent).values():
+        if id(receipt) in seen:
+            continue
+        seen.add(id(receipt))
+        if not isinstance(receipt.get("deliveryOwner"), dict) or receipt.get("state") != "completed":
+            continue
+        fact = _completed_download_file_fact(receipt)
+        if fact["status"] == "present":
+            path = fact["path"]
+            if path not in artifacts:
+                artifacts.append(path)
+
+
 def _remember_download_record(agent: Any, record: JsonDict) -> JsonDict:
     """Merge one observed download record into the ledger.
 
@@ -309,7 +338,15 @@ def _remember_download_record(agent: Any, record: JsonDict) -> JsonDict:
         download_key = json.dumps(["downloadId", download_id], ensure_ascii=False)
         receipt = store.get(download_key)
     if not isinstance(receipt, dict):
-        receipt = {}
+        receipt = _owned_download_record(agent, normalized) or {}
+    logger = getattr(agent, "logger", None)
+    receipt.pop("observedOnly", None)
+    receipt.setdefault("deliveryOwner", {
+        "taskId": str(getattr(logger, "task_id", "") or ""),
+        "runId": str(getattr(logger, "run_id", "") or ""),
+        "phaseId": str(getattr(agent, "phase_id", "") or (getattr(agent, "worker_contract", {}) or {}).get("phase_id", "")),
+        "workerId": str(getattr(agent, "worker_id", "") or ""),
+    })
     # Latest observation wins for non-empty values; keys the new record
     # lacks keep the previously observed value (aliases stay coherent).
     for key, value in normalized.items():
@@ -317,7 +354,14 @@ def _remember_download_record(agent: Any, record: JsonDict) -> JsonDict:
             continue
         if value not in (None, "", 0) or key not in receipt:
             receipt[key] = value
+    if receipt.get("state") == "completed" and "completedFileFingerprint" not in receipt:
+        fact = _completed_download_file_fact(receipt)
+        if fact["status"] == "present":
+            receipt["completedFileFingerprint"] = fact["fingerprint"]
     keys = _download_operation_keys(receipt)
+    if receipt.get("reuseInvalidated"):
+        keys = [key for key in keys if key == json.dumps(["downloadId", download_id], ensure_ascii=False)]
+        explicit_key = ""
     if explicit_key and explicit_key not in keys:
         keys.append(explicit_key)
     if keys:
@@ -331,6 +375,7 @@ def _remember_download_record(agent: Any, record: JsonDict) -> JsonDict:
     _register_download_resource(
         agent, receipt, operation_key=keys[0] if keys else explicit_key
     )
+    sync_download_artifacts(agent)
     return receipt
 
 
@@ -350,21 +395,11 @@ def remember_workflow_download_result(
     """
     remembered: List[JsonDict] = []
     action = str(action or "").strip()
-    store = _download_receipt_store(agent)
-    attributed_paths = {
-        str(path) for path in (getattr(agent, "artifacts", []) or [])
-        if str(path).strip()
-    }
-
     def already_owned(raw: JsonDict) -> bool:
         normalized = _normalize_download_record(raw)
         if normalized is None:
             return False
-        if str(normalized.get("savePath") or "") in attributed_paths:
-            return True
-        return any(
-            key in store for key in _download_operation_keys(normalized)
-        )
+        return _owned_download_record(agent, normalized) is not None
 
     for raw in _download_records(result):
         # A list/control child observes the fleet-wide download registry. It
@@ -380,6 +415,50 @@ def remember_workflow_download_result(
         record["workflowStepPath"] = str(step_path or "")
         remembered.append(_remember_download_record(agent, record))
     return remembered
+
+def remember_workflow_download_progress(agent: Any, params: JsonDict, trace: JsonDict) -> None:
+    """Keep proven child submissions even when the outer Workflow RPC times out.
+
+    Progress proves that Download.start ran, not that its file completed. A
+    later matching download event/list supplies completion. Unresolved variable
+    parameters are not guessed from the last variable snapshot.
+    """
+    def has_reference(value: Any) -> bool:
+        if isinstance(value, str):
+            return "$" in value
+        if isinstance(value, dict):
+            return any(has_reference(v) for v in value.values())
+        if isinstance(value, list):
+            return any(has_reference(v) for v in value)
+        return False
+
+    for item in trace.get("steps") or []:
+        if not isinstance(item, dict) or item.get("status") not in {"success", "succeeded", "done", "completed"} or item.get("action") != "Download.start":
+            continue
+        path = str(item.get("stepPath") or "")
+        if not re.fullmatch(r"steps\[\d+\](?:\.[A-Za-z_]+(?:\[\d+\])?)*", path):
+            continue
+        node: Any = params
+        try:
+            for name, number in re.findall(r"([A-Za-z_]+)|\[(\d+)\]", path):
+                node = node[name] if name else node[int(number)]
+        except (KeyError, IndexError, TypeError):
+            continue
+        if not isinstance(node, dict) or node.get("action") != "Download.start":
+            continue
+        child = node.get("params")
+        if not isinstance(child, dict) or has_reference(child):
+            continue
+        if not child.get("savePath") or not (child.get("url") or child.get("pageId")):
+            continue
+        store = _download_receipt_store(agent)
+        matched = next((store[key] for key in _download_operation_keys(child) if key in store), None)
+        _remember_download_record(agent, {
+            **child, "state": "submitted", **(matched if isinstance(matched, dict) else {}),
+            "sourceAction": "Download.start", "workflowId": trace.get("workflowId"),
+            "workflowStepPath": path,
+        })
+
 
 def _remember_unverified_download_timeout(
     agent: Any,
@@ -445,6 +524,57 @@ def _expires_at_ms(value: Any) -> Optional[float]:
     if stamp <= 0:
         return None
     return stamp * 1000.0 if stamp < 1e12 else stamp
+
+def _completed_download_file_fact(receipt: JsonDict) -> JsonDict:
+    """Receipt completion is history; reuse also needs a current physical file."""
+    raw_path = str(receipt.get("savePath") or "").strip()
+    if not raw_path or not Path(raw_path).expanduser().is_absolute():
+        return {"status": "unverified", "reason": "no_absolute_save_path"}
+    try:
+        current = Path(raw_path).expanduser().stat()
+    except FileNotFoundError:
+        return {"status": "missing", "path": raw_path}
+    except OSError as exc:
+        return {"status": "unverified", "reason": type(exc).__name__, "path": raw_path}
+    if not stat.S_ISREG(current.st_mode):
+        return {"status": "changed", "reason": "not_a_regular_file", "path": raw_path}
+    fingerprint = {"size": current.st_size, "mtimeNs": current.st_mtime_ns}
+    baseline = receipt.get("completedFileFingerprint")
+    expected_size = receipt.get("totalBytes") or receipt.get("receivedBytes")
+    if ((isinstance(baseline, dict) and baseline != fingerprint)
+            or (isinstance(expected_size, int) and expected_size > 0 and expected_size != current.st_size)):
+        return {"status": "changed", "path": raw_path, "observed": fingerprint,
+                "previous": baseline, "expectedBytes": expected_size}
+    return {"status": "present", "path": raw_path, "fingerprint": fingerprint}
+
+
+def _check_completed_download_reuse(agent: Any, receipt: JsonDict) -> Optional[JsonDict]:
+    fact = _completed_download_file_fact(receipt)
+    receipt["fileObservation"] = fact
+    if fact["status"] == "present":
+        receipt.setdefault("completedFileFingerprint", fact["fingerprint"])
+        return {"present": True}
+    if fact["status"] == "missing":
+        # Retain historical downloadId evidence, retire only reuse aliases.
+        # This is the caller's new explicit Download.start, not a replay after
+        # an uncertain timeout or a background side effect.
+        receipt["reuseInvalidated"] = "file_missing"
+        id_key = json.dumps(["downloadId", receipt.get("downloadId")], ensure_ascii=False)
+        store = _download_receipt_store(agent)
+        for key, item in list(store.items()):
+            if item is receipt and key != id_key:
+                store.pop(key, None)
+        logger = getattr(agent, "logger", None)
+        if logger is not None:
+            logger.write("download.reuse_invalidated", {"downloadId": receipt.get("downloadId"), **fact})
+        return None
+    return {
+        "error": "Previously completed download no longer has verified local bytes.",
+        "downloadReconciliation": {"classification": "completed_file_" + fact["status"],
+                                   "receipt": dict(receipt), "fileObservation": fact},
+        "suggested_prompt": "Inspect the existing file and choose an explicit delivery repair or a new destination. A cached success is not current file evidence.",
+    }
+
 
 def _reusable_download_response(agent: Any, params: JsonDict) -> Optional[JsonDict]:
     key = _download_operation_key(params)
@@ -526,6 +656,9 @@ def _reusable_download_response(agent: Any, params: JsonDict) -> Optional[JsonDi
         }
     if state != "completed":
         return None
+    check = _check_completed_download_reuse(agent, receipt)
+    if check is None or not check.get("present"):
+        return check
     return {
         "observation": "Reused an existing reconciled download operation.",
         "data": {
@@ -603,6 +736,8 @@ async def _refresh_active_download_response(
         if key:
             _download_receipt_store(agent).pop(key, None)
         return None
+    if state == "completed":
+        return _reusable_download_response(agent, params)
     return {
         "observation": "Refreshed and reused an existing download operation.",
         "data": {
@@ -919,6 +1054,8 @@ def _remember_download_event(agent: Any, event_name: str, payload: Any) -> Optio
                 existing = page_receipt
     record: JsonDict = dict(existing) if isinstance(existing, dict) else {}
     record["downloadId"] = download_id
+    if not isinstance(record.get("deliveryOwner"), dict):
+        record["observedOnly"] = True
     record.setdefault("state", "")
     record.setdefault("totalBytes", 0)
     record.setdefault("receivedBytes", 0)
@@ -951,8 +1088,10 @@ def _remember_download_event(agent: Any, event_name: str, payload: Any) -> Optio
         store[key] = record
     # Terminal/active-with-path states refresh file registration; waiting and
     # rejected events do not (see _register_download_resource whitelist).
-    if str(record.get("state") or "") in DOWNLOAD_FILE_REGISTRABLE_STATES:
+    if (isinstance(record.get("deliveryOwner"), dict)
+            and str(record.get("state") or "") in DOWNLOAD_FILE_REGISTRABLE_STATES):
         _register_download_resource(agent, record, operation_key=keys[0])
+        sync_download_artifacts(agent)
     if logger is not None:
         logger.write(
             "download.event_observed",

@@ -1,5 +1,5 @@
 """
-harness.progress - Lightweight per-worker progress accounting.
+harness.observation.progress - Lightweight per-worker progress accounting.
 """
 
 from __future__ import annotations

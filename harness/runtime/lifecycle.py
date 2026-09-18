@@ -1,5 +1,5 @@
 """
-harness.lifecycle - Internal typed lifecycle middleware.
+harness.runtime.lifecycle - Internal typed lifecycle middleware.
 
 The first version is intentionally in-process only. It gives the harness a
 single control surface for context, tools, compaction, and worker handoff

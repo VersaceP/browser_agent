@@ -37,14 +37,14 @@ from harness.fleet.coordinator import normalize_reuse_scope
 from harness.results.row_ledger import OUTCOME_CONFIRMED_ABSENT
 from harness.storage.base import SNAPSHOT_KEY_CURRENT_PLAN
 from harness.storage.base import SNAPSHOT_KEY_TASK_STATE
-from harness.pacing import MAX_PACING_INTERVAL_SECONDS
-from harness.pacing import PACING_FIELDS
-from harness.pacing import PACING_INTERVAL_FIELDS
-from harness.pacing import normalized_pacing
-from harness.task_types import VALID_TASK_TYPES
-from harness.task_types import normalize_task_type
-from harness.task_types import resolve_task_type_fail_closed
-from harness.task_types import task_type_choices_for_error
+from harness.planning.pacing import MAX_PACING_INTERVAL_SECONDS
+from harness.planning.pacing import PACING_FIELDS
+from harness.planning.pacing import PACING_INTERVAL_FIELDS
+from harness.planning.pacing import normalized_pacing
+from harness.planning.task_types import VALID_TASK_TYPES
+from harness.planning.task_types import normalize_task_type
+from harness.planning.task_types import resolve_task_type_fail_closed
+from harness.planning.task_types import task_type_choices_for_error
 from harness.utils import JsonDict
 from harness.utils import RunLogger
 from harness.utils import contains_affirmative_semantic_marker
@@ -3065,6 +3065,13 @@ def initialize_task_state(
         # only a phase id cannot reopen the same broken acquisition route.
         "spawn_acquisition_failures": dict(
             (preserve_from or {}).get("spawn_acquisition_failures") or {}
+        ),
+        # A fatal transport requires an explicit bounded probe before any
+        # replacement worker is dispatched.  Keep that control-plane fence
+        # across replans and process resumes; clearing it would permit a
+        # business retry against an endpoint whose state is still unknown.
+        "transport_recovery": copy.deepcopy(
+            (preserve_from or {}).get("transport_recovery") or {}
         ),
         # Task-local Stage 6B-A evidence.  Candidates remain non-executable;
         # preserving them across replans lets the Lead acknowledge the exact

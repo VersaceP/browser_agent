@@ -21,19 +21,19 @@ from harness.diagnostics.error_classification import attach_error_classification
 from harness.fleet.coordinator import FleetAssignment
 from harness.observation.browser_call import extract_page_id_from_values
 from harness.evidence.extraction_artifacts import field_names_from_specs
-from harness.fast_path import assess_fast_path_candidate
+from harness.planning.fast_path import assess_fast_path_candidate
 from harness.results.row_ledger import row_identity
 from harness.results.row_ledger import derive_row_facts
 from harness.results.row_ledger import derive_row_ledger
 from runtime_config import RuntimeConfig
-from harness.lifecycle import LifecycleContext
-from harness.model_config import browser_agent_model_config
-from harness.page_session import page_session_context_for_pages
-from harness.page_session import record_page_sessions
-from harness.schema_cache import global_schemas_dir
-from harness.schema_loader import CapabilityBundle
-from harness.schema_loader import _capability_revisions_from_response
-from harness.schema_loader import load_capability_bundle
+from harness.runtime.lifecycle import LifecycleContext
+from harness.runtime.model_config import browser_agent_model_config
+from harness.observation.page_session import page_session_context_for_pages
+from harness.observation.page_session import record_page_sessions
+from harness.capabilities.schema_cache import global_schemas_dir
+from harness.capabilities.schema_loader import CapabilityBundle
+from harness.capabilities.schema_loader import _capability_revisions_from_response
+from harness.capabilities.schema_loader import load_capability_bundle
 from harness.task_control import build_attempt_digest
 from harness.task_control import classification_for_worker_status
 from harness.task_control import mark_phase_result
@@ -41,9 +41,9 @@ from harness.task_control import phase_prior_artifact_paths
 from harness.task_control import record_replan_checkpoint
 from harness.task_control import validate_worker_artifacts
 from harness.task_control import load_task_state
-from harness.strategy_telemetry import append_strategy_attempt
-from harness.tool_policy import ALWAYS_FORBIDDEN_ABCP_METHODS
-from harness.templates import get_path
+from harness.planning.strategy_telemetry import append_strategy_attempt
+from harness.tools.tool_policy import ALWAYS_FORBIDDEN_ABCP_METHODS
+from harness.planning.templates import get_path
 from harness.utils import JsonDict
 from harness.utils import extract_offloaded_paths
 from harness.utils import make_browser_event_logger
@@ -54,7 +54,8 @@ from harness.utils import task_subdir
 from harness.utils import trim_large_strings
 from harness.results.worker_result import build_worker_handoff_projection
 from harness.results.worker_result import build_worker_result_levels
-from harness.workflow_runtime import workflow_execution_enabled
+from harness.results.recovery import worker_recovery_facts
+from harness.workflow.workflow_runtime import workflow_execution_enabled
 from llm import LLMFactory
 from .spawner_classification import _allowance_from_validators, _clone_capability_bundle, _cohort_identity_fields, _safe_str_list, _validated_rows_for_ledger, _worker_feedback_classification  # noqa: F401
 from .spawner_helpers import BrowserAgentHandle, BrowserAgentSlot, TaskSessionBinding, _TaskContextTrackingBrowserClient, _effective_worker_status, _finalize_skill_execution_metadata, _fresh_click_settlement_class, _prompt_worker_contract, _skill_execution_metadata, _unresolved_repair_visual_evidence, _verified_workflow_hitl_settlement  # noqa: F401
@@ -77,7 +78,7 @@ def _dedupe_download_receipts(receipts: Any) -> List[JsonDict]:
     seen: set = set()
     unique: List[JsonDict] = []
     for receipt in receipts:
-        if not isinstance(receipt, dict):
+        if not isinstance(receipt, dict) or receipt.get("observedOnly") is True:
             continue
         download_id = str(receipt.get("downloadId") or "").strip()
         if download_id:
@@ -491,7 +492,7 @@ class SpawnerWorkerMixin:
             ),
         )
         provider = LLMFactory.create_provider(
-            browser_agent_model_config(worker_runtime.model, worker_runtime.worker)
+            browser_agent_model_config(worker_runtime)
         )
         event_logger = make_browser_event_logger(
             self.logger,
@@ -500,6 +501,7 @@ class SpawnerWorkerMixin:
         )
 
         harness = None
+        trace_path = ""
         run_failed = False
         cancelled_during_failure = False
         failure_cleanup_receipts: List[JsonDict] = []
@@ -841,6 +843,8 @@ class SpawnerWorkerMixin:
                 if progress is not None
                 else {}
             )
+            from harness.tools.browser_tools.downloads import sync_download_artifacts
+            sync_download_artifacts(harness)
             artifact_validation = validate_worker_artifacts(
                 contract=worker_contract,
                 artifacts=harness.artifacts,
@@ -1169,6 +1173,15 @@ class SpawnerWorkerMixin:
                 "error": str(exc),
             }
             result["workflowDefinitions"] = _workflow_definition_receipts(trace)
+            # A failed worker still has evidence. Preserve it through the same
+            # trace writer as successful workers rather than forcing log scans.
+            try:
+                if trace_path or trace:
+                    result["tracePath"] = trace_path or self._write_worker_trace(worker_id, trace)
+            except Exception as trace_exc:
+                self.logger.write("worker.failure_trace_save_failed", {
+                    "workerId": worker_id, "errorType": type(trace_exc).__name__,
+                })
             if isinstance(exc, ABCPTransportError):
                 result.update(_transport_failure_fields(exc))
                 attach_error_classification(
@@ -1334,6 +1347,8 @@ class SpawnerWorkerMixin:
         agent_id: str,
         phase_id: Optional[str],
     ) -> JsonDict:
+        if result.get("status") not in {"done", "validated_done"}:
+            result["recoveryFacts"] = worker_recovery_facts(result)
         result = self._attach_worker_result_levels(result)
         return self.lifecycle.worker_before_return(
             LifecycleContext(
@@ -1721,6 +1736,7 @@ class SpawnerWorkerMixin:
                 phase_id=handle.phase_id,
             )
         except Exception as exc:
+            failure_fields = _transport_failure_fields(exc) if isinstance(exc, ABCPTransportError) else {}
             return self._prepare_worker_result(
                 {
                     "status": WORKER_STATUS_FAILED,
@@ -1731,6 +1747,7 @@ class SpawnerWorkerMixin:
                     "name": handle.name,
                     "phaseId": handle.phase_id,
                     "error": str(exc),
+                    **failure_fields,
                 },
                 worker_id=handle.worker_id,
                 agent_id=handle.agent_id,

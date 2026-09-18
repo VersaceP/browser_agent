@@ -16,7 +16,7 @@ from urllib.parse import parse_qsl
 from urllib.parse import urlencode
 from urllib.parse import urlparse
 from urllib.parse import urlsplit
-from harness.task_types import normalize_task_type
+from harness.planning.task_types import normalize_task_type
 from harness.utils import JsonDict
 from harness.utils import RunLogger
 from harness.utils import trim_large_strings

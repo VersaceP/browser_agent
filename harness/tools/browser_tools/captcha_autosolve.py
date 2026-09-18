@@ -688,7 +688,7 @@ async def _clearance_check(
 
 
 def _is_challenge_url(url: str) -> bool:
-    from harness.hitl import _is_challenge_url as impl
+    from harness.runtime.hitl import _is_challenge_url as impl
 
     return bool(impl(url))
 

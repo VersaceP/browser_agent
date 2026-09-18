@@ -11,7 +11,7 @@ path extracted its data through `Runtime.evaluate`, so banning page-world JS
 killed it, and the master switch went down with it.
 
 Model-authored workflows are a different path and were never removed: every step
-passes `harness.workflow_policy.validate_workflow_params` and each nested Action
+passes `harness.workflow.workflow_policy.validate_workflow_params` and each nested Action
 its own ABCP permission check. The reason later written next to the flag — that
 the platform lacked "pre-armed action events plus dynamic collection/state
 primitives" — was verified false on 2026-09-11 and is documented in

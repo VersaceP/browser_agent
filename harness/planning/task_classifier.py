@@ -14,8 +14,8 @@ import time
 from dataclasses import replace
 from typing import Any, Dict, List, Optional, Tuple
 
-from harness.model_config import browser_agent_model_config
-from harness.task_types import (
+from harness.runtime.model_config import browser_agent_model_config
+from harness.planning.task_types import (
     TASK_TYPE_SCENARIOS,
     TASK_TYPE_SELECTION_RULE,
     VALID_TASK_TYPES,
@@ -70,12 +70,12 @@ def _classifier_model_config(runtime: RuntimeConfig) -> ModelConfig:
     configured = runtime.task_classifier
     if configured.model_id:
         return configured.model_config()
-    resolved = browser_agent_model_config(runtime.model, runtime.worker)
+    resolved = browser_agent_model_config(runtime)
     extra = {
         key: value for key, value in (resolved.extra_params or {}).items()
         if key not in _REASONING_PARAM_KEYS
     }
-    extra.update({"max_tokens": configured.max_tokens, "tool_choice": "required", "temperature": 0})
+    extra.update({"max_tokens": configured.max_tokens, "tool_choice": "required"})
     return replace(
         resolved,
         extra_params=extra,

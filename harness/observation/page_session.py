@@ -1,5 +1,5 @@
 """
-harness.page_session - What an earlier worker already did to one page.
+harness.observation.page_session - What an earlier worker already did to one page.
 
 Why this exists
 ---------------
@@ -48,7 +48,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from harness.tool_policy import (
+from harness.tools.tool_policy import (
     collect_sensitive_replacements,
     redact_values,
     sensitive_browser_method_params,

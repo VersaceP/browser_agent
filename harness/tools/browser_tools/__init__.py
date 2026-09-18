@@ -49,9 +49,9 @@ from harness.results.call_outcome import (
     replay_forbidden,
 )
 from harness.fleet.runtime import FleetClickGateTimeout
-from harness.hitl import wait_for_hitl_resume
-from harness.lifecycle import LifecycleContext, lifecycle_for
-from harness.local_fs import local_fs_read, local_fs_search
+from harness.runtime.hitl import wait_for_hitl_resume
+from harness.runtime.lifecycle import LifecycleContext, lifecycle_for
+from harness.tools.local_fs import local_fs_read, local_fs_search
 from harness.observation.overlay_actions import (
     compute_backdrop_point,
     backdrop_point_is_safe,
@@ -82,18 +82,18 @@ from harness.observation.verifiers import (
     verify_field_value,
     verify_overlay_gone,
 )
-from harness.offload import offload_large_tool_result
-from harness.progress import NO_ARTIFACT_DIAGNOSTIC_TOOLS, extraction_artifact_count
-from harness.pacing import wait_between_rows
+from harness.context.offload import offload_large_tool_result
+from harness.observation.progress import NO_ARTIFACT_DIAGNOSTIC_TOOLS, extraction_artifact_count
+from harness.planning.pacing import wait_between_rows
 from harness.observation.browser_call import build_browser_call_runner
-from harness.screenshot_policy import normalize_screenshot_output_params
-from harness.runtime_evaluation import RuntimeEvaluationService
+from harness.tools.screenshot_policy import normalize_screenshot_output_params
+from harness.tools.runtime_evaluation import RuntimeEvaluationService
 from harness.task_control import (
     phase_prior_artifact_paths,
     validate_worker_artifacts,
 )
-from harness.task_types import resolve_task_type_fail_closed
-from harness.tool_policy import (
+from harness.planning.task_types import resolve_task_type_fail_closed
+from harness.tools.tool_policy import (
     disabled_reason_for_method,
     hidden_harness_tools_for_task_type,
     mask_params,
@@ -114,7 +114,7 @@ from harness.utils import (
     storage_for_logger,
     trim_large_strings,
 )
-from harness.workflow_runtime import (
+from harness.workflow.workflow_runtime import (
     workflow_execution_disabled_result,
     workflow_execution_enabled,
 )
@@ -137,7 +137,7 @@ from .axtree_state import (
     _record_axtree_history,
 )
 from harness.vl import visual_verify_image
-from harness.workflow_policy import validate_workflow_params
+from harness.workflow.workflow_policy import validate_workflow_params
 
 from .composites.dismiss_overlay import (
     DISMISS_OVERLAY_MAX_ATTEMPTS,

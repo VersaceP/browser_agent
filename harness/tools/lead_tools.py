@@ -15,11 +15,11 @@ from harness.evidence.extraction_artifacts import (
 )
 from harness.evidence.artifact_evidence import VALIDATOR_TYPES
 from harness.fleet.coordinator import VALID_PAGE_POLICIES, VALID_REUSE_SCOPES
-from harness.lifecycle import LifecycleContext, lifecycle_for
-from harness.local_fs import local_fs_read, local_fs_search
+from harness.runtime.lifecycle import LifecycleContext, lifecycle_for
+from harness.tools.local_fs import local_fs_read, local_fs_search
 from harness.prompts import read_harness_guide
 from harness.prompts import search_harness_guides
-from harness.strategy_bank import render_strategy_guidance
+from harness.planning.strategy_bank import render_strategy_guidance
 from harness.task_control import (
     EXECUTION_ROLES,
     TERMINAL_PHASE_STATUSES,
@@ -44,6 +44,10 @@ from harness.task_control import (
     write_task_state,
     settle_phase_continuation,
 )
+from harness.task_control.transport_recovery import (
+    note_transport_recovery_required,
+    record_transport_recovery_probe,
+)
 from harness.results.completion_receipt import (
     artifact_generation_view,
     build_completion_receipt,
@@ -52,19 +56,21 @@ from harness.results.completion_receipt import (
 from harness.evidence.field_semantics import (
     array_fields_without_semantic_evidence,
     build_field_semantic_worklist,
+    build_semantic_fact_index,
+    SEMANTIC_PROJECTION_VERSION,
     review_field_semantics,
 )
-from harness.numeric_facts import (
+from harness.results.numeric_facts import (
     build_numeric_fact_index,
     extract_numeric_claims,
     reconcile_numeric_claims,
 )
-from harness.task_types import (
+from harness.planning.task_types import (
     VALID_TASK_TYPES,
     normalize_task_type,
     task_type_choices_for_error,
 )
-from harness.tool_policy import describe_task_types
+from harness.tools.tool_policy import describe_task_types
 from harness.tools.argument_pipeline import SchemaIssue
 from harness.tools.argument_pipeline import apply_registered_tool_defaults
 from harness.tools.argument_pipeline import prepare_model_tool_call
@@ -258,6 +264,10 @@ def _content_completeness_schema() -> JsonDict:
             "id": {"type": "string"},
             "name": {"type": "string"},
             "marker": {"type": "string"},
+            "marker_source": {
+                "type": "string",
+                "description": "Origin metadata preserved from a normalized region observation.",
+            },
             "markers": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -308,6 +318,19 @@ def _content_completeness_schema() -> JsonDict:
                     "additionalProperties": True,
                 },
             },
+            "recovery": {
+                "type": "object",
+                "description": (
+                    "Legacy normalized observation metadata, retained when"
+                    " resubmitting an existing plan. New plans should omit it;"
+                    " this is not an instruction to choose a navigation route."
+                ),
+                "properties": {
+                    "mode": {"type": "string"},
+                    "max_attempts_per_item": {"type": "integer", "minimum": 1, "maximum": 5},
+                },
+                "additionalProperties": False,
+            },
         },
         "required": ["expected_regions"],
         "additionalProperties": False,
@@ -340,9 +363,15 @@ def _validator_item_schema() -> JsonDict:
                 "description": "Target field for single-field validators (range/array_length/url_pattern/field_pattern).",
             },
             "fields": {
-                "type": "array",
+                "type": ["array", "object"],
                 "items": {"type": "string"},
-                "description": "Target fields for required_fields/field_nonempty/unique.",
+                "description": (
+                    "Field-name array for required_fields/field_nonempty/unique."
+                    " field_provenance also accepts a field-name-to-evidence-spec"
+                    " object; preserve its evidence_field, evidence_aliases,"
+                    " source_tool_field, selector_field and require_* settings"
+                    " when resubmitting a normalized plan."
+                ),
             },
             "count": {
                 "type": "integer",
@@ -403,6 +432,16 @@ def _validator_item_schema() -> JsonDict:
             },
         },
         "required": ["type"],
+        # Discriminate by validator kind: accepting provenance maps must not
+        # make a map valid for required_fields, field_nonempty or unique.
+        # anyOf is supported by the shared local validator and avoids oneOf.
+        "anyOf": [
+            {"properties": {
+                "type": {"enum": sorted((VALIDATOR_TYPES | {"allowed_domain"}) - {"field_provenance"})},
+                "fields": {"type": "array", "items": {"type": "string"}},
+            }},
+            {"properties": {"type": {"const": "field_provenance"}}},
+        ],
         "additionalProperties": True,
     }
 
@@ -512,7 +551,7 @@ def _expected_artifact_schema() -> JsonDict:
 
 
 def _emit_task_plan_schema(_: Any = None) -> JsonDict:
-    from harness.pacing import MAX_PACING_INTERVAL_SECONDS
+    from harness.planning.pacing import MAX_PACING_INTERVAL_SECONDS
 
     pacing_schema = {
         "type": "object",
@@ -578,7 +617,7 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                         ),
                     },
                     "replan_checkpoint_id": {
-                        "type": "string",
+                        **_nullable("string"),
                         "description": (
                             "Legacy single-checkpoint acknowledgement. Use"
                             " replan_checkpoint_ids when more than one cohort"
@@ -649,8 +688,8 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                 "stage_hint": {"type": "string"},
                                 "stage_hint_reason": {"type": "string"},
                                 "execution_role": {
-                                    "type": "string",
-                                    "enum": sorted(EXECUTION_ROLES),
+                                    **_nullable("string"),
+                                    "enum": [*sorted(EXECUTION_ROLES), None],
                                     "description": (
                                         "Evidence-driven execution role, not a mandatory three-"
                                         "stage template. Use probe with an explicit sample only when a"
@@ -705,7 +744,7 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                     "additionalProperties": True,
                                 },
                                 "depends_on": {
-                                    "type": "array",
+                                    **_nullable("array"),
                                     "items": {"type": "string"},
                                     "description": (
                                         "Phase ids that must be validated_done"
@@ -749,7 +788,7 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                     ),
                                     "additionalProperties": True,
                                 },
-                                "pacing": pacing_schema,
+                                "pacing": {**pacing_schema, **_nullable("object")},
                                 "validators": {
                                     "type": "array",
                                     "description": (
@@ -802,6 +841,10 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                             ),
                                             "properties": {
                                                 "artifact_name": {"type": "string"},
+                                                "identity_field": {
+                                                    "type": "string",
+                                                    "description": "Preserved row identity field from the normalized cohort source.",
+                                                },
                                                 "cohort_selector": {
                                                     "type": "object",
                                                     "description": (
@@ -901,7 +944,7 @@ def _emit_task_plan_schema(_: Any = None) -> JsonDict:
                                     },
                                     "additionalProperties": True,
                                 },
-                                "max_attempts": {"type": "integer", "minimum": 1},
+                                "max_attempts": {**_nullable("integer"), "minimum": 1},
                             },
                             "required": ["id", "task_type"],
                             "additionalProperties": True,
@@ -2942,7 +2985,9 @@ async def _lead_approve_current_task_plan(ctx: ToolContext) -> JsonDict:
 @LEAD_TOOLS.register(
     name="begin_task_plan_draft",
     description=(
-        "Start an inert task-plan draft for a large plan. Add complete phase"
+        "Create only plan-level metadata, with ZERO phases; done means this"
+        " operation succeeded, not that a plan exists for approval. Continue"
+        " the returned draftId instead of repeatedly beginning new drafts. Add complete phase"
         " chunks with append_task_plan_draft, then submit once for whole-plan"
         " validation, independent review, and operator approval."
     ),
@@ -2963,7 +3008,7 @@ async def _lead_approve_current_task_plan(ctx: ToolContext) -> JsonDict:
                     "output_contracts": {"type": "object"},
                     "pacing": {"type": "object"},
                     "replan_reason": {"type": "string"},
-                    "replan_checkpoint_id": {"type": "string"},
+                    "replan_checkpoint_id": _nullable("string"),
                     "replan_checkpoint_ids": {"type": "array", "items": {"type": "string"}},
                 },
                 "required": ["goal"],
@@ -3791,7 +3836,7 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
             "phaseId": str(phase.get("id") or ""),
             "source": "original_user_task",
         })
-    return await agent.spawner.spawn_browser_agent(
+    spawned = await agent.spawner.spawn_browser_agent(
         task=base_task,
         context=base_context,
         name=tool_input.get("name") or None,
@@ -3815,6 +3860,18 @@ async def _lead_spawn_browser_agent(ctx: ToolContext) -> JsonDict:
             else None
         ),
     )
+    # A fatal failure can happen during startup before a worker handle exists.
+    # Treat that receipt exactly like a fatal worker completion: perform one
+    # bounded control-plane probe before returning control to the Lead.  The
+    # helper never retries the failed spawn or any browser operation.
+    if isinstance(spawned, dict):
+        recovery = await _recover_transport_before_lead_decision(
+            ctx, [spawned],
+        )
+        if recovery is not None:
+            spawned = dict(spawned)
+            spawned["connectionRecovery"] = recovery
+    return spawned
 
 
 def _auth_gate_probe_guidance(phase: JsonDict, worker_contract: JsonDict) -> str:
@@ -4100,11 +4157,25 @@ def _phase_auto_continuation_block(agent: Any, result: Any) -> Optional[str]:
     if control.get("planVersion") != current_version:
         return "continuation_plan_version_changed"
     phase = find_phase(plan, phase_id)
-    current_contract_hash = contract_hash_for_phase(
-        phase,
-        recorded.get("worker_contract")
-        if isinstance(recorded.get("worker_contract"), dict) else {},
-    )
+    snapshot = phase_state.get("execution_contract") if isinstance(phase_state, dict) else None
+    if isinstance(snapshot, dict):
+        if snapshot.get("workerId") != result.get("workerId"):
+            return "continuation_execution_changed"
+        if snapshot.get("phaseHash") != contract_hash_for_phase(phase, {}):
+            return "continuation_contract_changed"
+        if snapshot.get("dispatchInput") != recorded:
+            return "continuation_dispatch_changed"
+        current_contract_hash = contract_hash_for_phase(phase, snapshot.get("workerContract"))
+        if snapshot.get("contractHash") != current_contract_hash:
+            return "continuation_contract_changed"
+    else:
+        # Older receipts retain the conservative legacy check; missing data
+        # never establishes that two different contracts are equivalent.
+        current_contract_hash = contract_hash_for_phase(
+            phase,
+            recorded.get("worker_contract")
+            if isinstance(recorded.get("worker_contract"), dict) else {},
+        )
     if control.get("contractHash") != current_contract_hash:
         return "continuation_contract_changed"
     return None
@@ -4794,6 +4865,63 @@ def _wait_result_requires_lead(agent: Any, waited: JsonDict) -> bool:
     return _wait_result_lead_reason(agent, waited) is not None
 
 
+async def _recover_transport_before_lead_decision(
+    ctx: ToolContext,
+    completed: Any,
+) -> Optional[JsonDict]:
+    """Probe once for a new fatal transport batch before Lead sees the wait.
+
+    This is deliberately limited to the control-plane probe implemented by the
+    spawner.  It never retries the failed browser Action, starts a worker, or
+    creates a Fleet.  The durable fingerprint prevents repeated waits from
+    issuing the same probe again; a new fatal worker result creates a new batch.
+    """
+    results = completed if isinstance(completed, list) else []
+    required = note_transport_recovery_required(ctx.agent.logger, results)
+    if not isinstance(required, dict):
+        return None
+    if str(required.get("status") or "") == "ready":
+        return dict(required)
+    probe = getattr(ctx.agent.spawner, "refresh_browser_connection", None)
+    if not callable(probe):
+        recovery = {
+            "status": "blocked",
+            "reason": "transport recovery probe is unavailable",
+            "businessActionsReplayed": 0,
+        }
+    else:
+        try:
+            recovery = await probe(
+                str(getattr(ctx.agent, "task_fleet_reference", "") or "")
+            )
+        except Exception as exc:
+            # A probe failure is a control-plane blocker, not a reason to let
+            # the Lead retry business work or lose the durable fatal receipt.
+            recovery = {
+                "status": "blocked",
+                "reason": type(exc).__name__,
+                "businessActionsReplayed": 0,
+            }
+    recorded = record_transport_recovery_probe(
+        ctx.agent.logger, recovery,
+    )
+    receipt = dict(recovery) if isinstance(recovery, dict) else {
+        "status": "blocked",
+        "reason": "invalid recovery probe receipt",
+    }
+    receipt["requiredFingerprint"] = required.get("fingerprint")
+    try:
+        receipt["businessActionsReplayed"] = max(
+            0, int(receipt.get("businessActionsReplayed") or 0)
+        )
+    except (TypeError, ValueError):
+        receipt["businessActionsReplayed"] = 0
+    if isinstance(recorded, dict):
+        receipt["controlState"] = recorded.get("status")
+        receipt["probeAttempts"] = recorded.get("probeAttempts")
+    return receipt
+
+
 def _wait_result_with_completions(
     agent: Any,
     waited: JsonDict,
@@ -4850,6 +4978,10 @@ async def _lead_wait_browser_agents(ctx: ToolContext) -> JsonDict:
         fresh = _new_wait_completions(agent, waited)
         if not fresh:
             return waited
+        recovery = await _recover_transport_before_lead_decision(ctx, fresh)
+        if recovery is not None:
+            waited = dict(waited)
+            waited["connectionRecovery"] = recovery
         automatic = dict(waited)
         automatic["completed"] = fresh
         automatic = await _auto_continue_phase(ctx, automatic)
@@ -4890,6 +5022,9 @@ async def _lead_wait_browser_agents(ctx: ToolContext) -> JsonDict:
 
         automatic = dict(waited)
         automatic["completed"] = fresh
+        recovery = await _recover_transport_before_lead_decision(ctx, fresh)
+        if recovery is not None:
+            automatic["connectionRecovery"] = recovery
         automatic = await _auto_continue_phase(ctx, automatic)
         automatic = await _auto_dispatch_next_phase(ctx, automatic)
         final_completed = automatic.get("completed")
@@ -4949,9 +5084,18 @@ async def _lead_list_browser_agents(ctx: ToolContext) -> JsonDict:
     if ctx.tool_input.get("refresh_connection") is True:
         recovery = await ctx.agent.spawner.refresh_browser_connection(
             str(getattr(ctx.agent, "task_fleet_reference", "") or ""))
+        recorded = record_transport_recovery_probe(ctx.agent.logger, recovery)
+        if isinstance(recorded, dict):
+            recovery = dict(recovery or {})
+            recovery["controlState"] = recorded.get("status")
+            recovery["probeAttempts"] = recorded.get("probeAttempts")
     result = ctx.agent.spawner.list_browser_agents()
     if recovery is not None:
         result["connectionRecovery"] = recovery
+    from harness.results.recovery import recovery_overview
+    overview = recovery_overview(result)
+    if overview:
+        result["recoveryOverview"] = overview
     return result
 
 
@@ -5420,7 +5564,7 @@ def _record_artifact_supersession(
         if str(path or "").strip()
     ]
     active_paths, lineages = artifact_generation_view(
-        state, raw_ledger_paths,
+        state, raw_ledger_paths, logger=getattr(agent, "logger", None),
     )
     active_identities = {_resolved_path_text(path) for path in active_paths}
 
@@ -5704,7 +5848,9 @@ async def _lead_final_answer(ctx: ToolContext) -> JsonDict:
                         " collection if the requested value remains obtainable,"
                         " or return a truthful non-done status that discloses the"
                         " unresolved requested fields. Do not rename a substitute"
-                        " value as the requested field."
+                        " value as the requested field. This review targets artifact"
+                        " content at sourceRefs, not answer wording; rewriting the"
+                        " answer alone does not change that evidence."
                     ),
                 }
     ctx.agent.logger.write("lead.completion_receipt", receipt)
@@ -5737,9 +5883,10 @@ async def _review_final_field_semantics(agent: Any, state: Any) -> JsonDict:
     if provider is None:
         return {}
     try:
-        index = build_numeric_fact_index(
-            state, task_dir=getattr(logger, "task_dir", None),
-        )
+        index = build_semantic_fact_index(state, logger=logger)
+        if index.get("readErrors"):
+            return {"status": "unavailable", "reason": "artifact_content_unavailable",
+                    "readErrors": index["readErrors"], "mismatches": []}
         entries = build_field_semantic_worklist(
             index, allowed_fields=_semantic_output_fields(agent),
         )
@@ -5753,6 +5900,7 @@ async def _review_final_field_semantics(agent: Any, state: Any) -> JsonDict:
             )
         cache_key = hashlib.sha256(json.dumps(
             {
+                "projectionVersion": SEMANTIC_PROJECTION_VERSION,
                 "userTask": str(getattr(agent, "original_user_task", "") or ""),
                 "entries": entries,
                 "arrayEvidenceGaps": array_evidence_gaps,
@@ -5889,7 +6037,7 @@ def _append_field_semantic_disclosure(answer: str, review: JsonDict) -> str:
             )
         )
     lines.append("See fieldSemanticReview for the complete structured evidence.")
-    return answer.rstrip() + "\n" + "\n".join(lines)
+    return "\n".join(lines).strip() + "\n\nModel report (completion claims are superseded by the status above):\n" + answer.rstrip()
 
 
 def _sibling_phase_handoff(
@@ -5985,7 +6133,7 @@ async def _reconcile_final_answer_numbers(
         return {}
     try:
         index = build_numeric_fact_index(
-            state, task_dir=getattr(logger, "task_dir", None),
+            state, task_dir=getattr(logger, "task_dir", None), logger=logger,
         )
         extracted = await extract_numeric_claims(
             provider,
@@ -6084,7 +6232,7 @@ def _numeric_reconciliation_rejection(report: JsonDict) -> Optional[JsonDict]:
         "unavailable",
     }:
         return None
-    if status != "failed":
+    if status != "failed" or not report.get("contradicted"):
         return None
     return {
         "status": "rejected",
@@ -6097,16 +6245,11 @@ def _numeric_reconciliation_rejection(report: JsonDict) -> Optional[JsonDict]:
         "contradicted": report.get("contradicted"),
         "dataConflicts": report.get("dataConflicts"),
         "next_instruction": (
-            "A DATA problem, unlike a coverage rejection: each entry below was"
-            " recomputed and came out different. "
-            "These numbers disagree with the artifacts this task actually"
-            " delivers. `actualValue` is recomputed from the active validated"
-            " generation; a dataConflict means a superseded artifact holds MORE"
-            " than the delivered one, so the data regressed and calling it"
-            " complete would be wrong. Correct the numbers to match the"
-            " delivered artifacts — or, for a dataConflict, restore the missing"
-            " rows with lead_save_artifact mode=\"reference_merge\" — then"
-            " re-issue final_answer."
+            "These quantities differ from their bound current artifact values. "
+            "Review each sourceArtifact and counted field, then correct the "
+            "answer or its binding. Historical differences are advisory: "
+            "deduplication, filtering or correction may legitimately reduce "
+            "counts; do not restore rows solely to match an older generation."
         ),
     }
 

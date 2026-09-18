@@ -47,8 +47,8 @@ from __future__ import annotations
 import re
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-from harness.axtree_format import parse_axtree_line
-from harness.scroll_receipt import STATE_READ_REASONS, scroll_state_read_position
+from harness.observation.axtree_format import parse_axtree_line
+from harness.observation.scroll_receipt import STATE_READ_REASONS, scroll_state_read_position
 
 # Page-level containers are never a useful click target — resolving a pixel to one
 # of them means "no specific element here" → coords fallback (AXTree blind spot).
@@ -207,7 +207,7 @@ def tree_scroll(tree: Any) -> Optional[Dict[str, float]]:
     Returns None unless the resolved root really is the document node, because
     only the scrolling element reports the scroll — see the note in the body.
     """
-    from harness.semantic_frames import root_tree
+    from harness.observation.semantic_frames import root_tree
 
     root = root_tree(tree)
     if not isinstance(root, dict):
@@ -938,7 +938,7 @@ async def _default_visual_locate(vl_config: Any, image_path: str, target: str) -
 
 
 # Kept as this module's exported names. The certification itself lives in
-# harness.scroll_receipt, which knows both zero-movement shapes: `Input.scroll`
+# harness.observation.scroll_receipt, which knows both zero-movement shapes: `Input.scroll`
 # proves it with a scalar `actualDistance`, `Page.wheel` with a two-axis
 # `observedDelta`. Reading only the scalar made every wheel state read fail
 # certification and return None, which silently disabled cssPoint promotion.

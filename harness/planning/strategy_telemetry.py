@@ -1,5 +1,5 @@
 """
-harness.strategy_telemetry - Append-only strategy attempt telemetry.
+harness.planning.strategy_telemetry - Append-only strategy attempt telemetry.
 """
 
 from __future__ import annotations

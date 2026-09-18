@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Deque, List, Optional, Tuple
 
 from harness.observation.overlay_detector import detect_overlay_from_result
-from harness.semantic_frames import response_node_count
+from harness.observation.semantic_frames import response_node_count
 from harness.utils import JsonDict
 
 
@@ -26,7 +26,7 @@ AXTREE_ID_RE = re.compile(r"\b\d+:-?\d+:-?\d+\b")
 # Accepts both the legacy indent-based line format and the current
 # depth-prefixed one (`3 [3:426:426] link "TAAFT" # @10,0,106,94`).
 #
-# DELIBERATELY not harness.axtree_format.parse_axtree_line, which is the shared
+# DELIBERATELY not harness.observation.axtree_format.parse_axtree_line, which is the shared
 # parser everywhere a line's FLAGS or RECT matter. This needs only id/role/name
 # and runs over every line of every observation - measured ~8x the cost of this
 # regex per line, for fields it would then discard.

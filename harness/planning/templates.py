@@ -1,5 +1,5 @@
 """
-harness.templates - Lightweight template rendering for plan variables.
+harness.planning.templates - Lightweight template rendering for plan variables.
 """
 
 import json

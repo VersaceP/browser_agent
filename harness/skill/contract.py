@@ -11,7 +11,7 @@ import json
 from typing import Any, Dict, List, Optional
 
 from harness.evidence.extraction_artifacts import field_names_from_specs
-from harness.pacing import parse_utc_timestamp
+from harness.planning.pacing import parse_utc_timestamp
 
 
 # Minimum soft-recall score required to interrupt the Lead with a selection

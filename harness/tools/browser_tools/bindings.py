@@ -586,6 +586,8 @@ def _filter_page_list_response(
     return sanitized, receipt
 
 _REPERCEPTION_ALLOWED_METHODS = {
+    "Page.list",
+    "Page.create",
     "Page.getState",
     "DOM.getAXTree",
     "Hitl.requestPause",
@@ -681,6 +683,12 @@ async def _fleet_auth_barrier_before_call(
             agent.axtree_invalidated = True
     if not getattr(agent, "fleet_reperception_pending", False):
         return None
+    if method in {"Page.getState", "DOM.getAXTree"}:
+        page_id = str(params.get("pageId") or "")
+        if page_id != getattr(agent, "fleet_reperception_page_id", None):
+            agent.fleet_reperception_page_id = page_id
+            agent.fleet_reperception_state_seen = False
+            agent.fleet_reperception_tree_seen = False
     if method not in _REPERCEPTION_ALLOWED_METHODS:
         return {
             "status": "fleet_reperception_required",
@@ -690,8 +698,11 @@ async def _fleet_auth_barrier_before_call(
             "tool_was_executed": False,
             "retryable": True,
             "next_instruction": (
-                "The shared authentication state changed. Call Page.getState"
-                " and then DOM.getAXTree for this page before any other action."
+                "The shared authentication state changed. Use Page.list to discover"
+                " claimable pages, or explicitly create an authorized page if needed."
+                " Existing ownership/permission checks still apply. Read Page.getState"
+                " and DOM.getAXTree on the same owned page. If no page is available,"
+                " report its owners and the unresolved recovery to Lead; do not repeat blocked business calls."
             ),
         }
     return None
@@ -759,6 +770,7 @@ def _fleet_auth_barrier_after_call(
     agent: Any,
     method: str,
     result: JsonDict,
+    params: Optional[JsonDict] = None,
 ) -> None:
     if not getattr(agent, "fleet_reperception_pending", False):
         return
@@ -770,6 +782,16 @@ def _fleet_auth_barrier_after_call(
     # requires reading the page could never be opened by reading the page.
     if not classify_call_outcome(result).succeeded:
         return
+    barrier = getattr(agent, "fleet_auth_barrier", None)
+    generation = int(getattr(agent, "fleet_reperception_generation", 0) or 0)
+    if barrier is not None and barrier.generation(str(getattr(agent, "assigned_fleet_id", "") or "")) != generation:
+        # An in-flight response from an earlier auth generation is stale.
+        agent.fleet_reperception_state_seen = False
+        agent.fleet_reperception_tree_seen = False
+        return
+    if params is not None and method in {"Page.getState", "DOM.getAXTree"}:
+        if str(params.get("pageId") or "") != getattr(agent, "fleet_reperception_page_id", None):
+            return
     if method == "Page.getState":
         agent.fleet_reperception_state_seen = True
     elif method == "DOM.getAXTree":

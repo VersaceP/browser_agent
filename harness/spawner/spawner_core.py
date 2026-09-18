@@ -27,11 +27,12 @@ from harness.fleet.runtime import FleetClickGate
 from harness.fleet.runtime import PageLeaseManager
 from harness.observation.browser_call import extract_page_id_from_values
 from runtime_config import RuntimeConfig
-from harness.lifecycle import default_lifecycle_manager
-from harness.schema_loader import CapabilityBundle
+from harness.runtime.lifecycle import default_lifecycle_manager
+from harness.capabilities.schema_loader import CapabilityBundle
 from harness.task_control import cancel_phase_running_reservation
 from harness.task_control import clear_spawn_acquisition_failures
 from harness.task_control import contract_hash_for_phase
+from harness.task_control.phase_lifecycle import record_phase_execution_contract
 from harness.task_control import mark_phase_running
 from harness.task_control import phase_pacing_remaining_seconds
 from harness.task_control import phase_start_rejection
@@ -40,6 +41,9 @@ from harness.task_control import spawn_acquisition_fingerprint
 from harness.task_control import spawn_acquisition_rejection
 from harness.task_control import load_task_state
 from harness.task_control import write_task_state
+from harness.task_control.transport_recovery import (
+    transport_recovery_spawn_rejection,
+)
 from harness.utils import make_browser_event_logger
 from harness.utils import JsonDict
 from harness.utils import RunLogger
@@ -1415,6 +1419,14 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
         if start_rejection is not None:
             self.logger.write("spawner.browser.start_rejected", start_rejection)
             return start_rejection
+        transport_rejection = transport_recovery_spawn_rejection(
+            self.logger, phase_id=str(phase_id or ""),
+        )
+        if transport_rejection is not None:
+            self.logger.write(
+                "spawner.browser.start_rejected", transport_rejection,
+            )
+            return transport_rejection
         phase_wait = phase_pacing_remaining_seconds(
             task_plan,
             self.logger,
@@ -1448,6 +1460,14 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
             if start_rejection is not None:
                 self.logger.write("spawner.browser.start_rejected", start_rejection)
                 return start_rejection
+            transport_rejection = transport_recovery_spawn_rejection(
+                self.logger, phase_id=str(phase_id or ""),
+            )
+            if transport_rejection is not None:
+                self.logger.write(
+                    "spawner.browser.start_rejected", transport_rejection,
+                )
+                return transport_rejection
         # Retained as an observation/provenance key for acquisition and
         # attempt receipts; it no longer authorizes a repeated-phase lock.
         current_contract_hash = contract_hash_for_phase(
@@ -2030,6 +2050,10 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
             )
             return slot
 
+        record_phase_execution_contract(
+            self.logger, phase_id=phase_id, worker_id=worker_id,
+            phase=phase, worker_contract=effective_contract,
+        )
         async_task = asyncio.create_task(
             self._run_browser_worker(
                 slot=slot,
@@ -2169,14 +2193,19 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
         if pending is None or pending.done():
             async def probe():
                 client = None
+                probe_stage = "connect"
                 try:
                     client = _sp().ABCPClient(self.runtime.browser, on_event=make_browser_event_logger(
                         self.logger, self.runtime.harness.log_browser_payloads,
                         prefix="recovery.transport"))
                     async def initialize():
+                        nonlocal probe_stage
                         await client.connect()
+                        probe_stage = "System.register"
                         await client.call("System.register", {})
+                        probe_stage = "System.getCapabilities"
                         await client.call("System.getCapabilities", {"guide": "content"})
+                        probe_stage = "Fleet.list"
                         return await client.call("Fleet.list", {})
                     inventory = await asyncio.wait_for(initialize(), timeout=10.0)
                     from harness.fleet.coordinator import handle_records_from_value, resolve_fleet_reference
@@ -2212,11 +2241,15 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                                 pass
                             slot.client = None
                     receipt = {"status": "ready", "fleetId": resolved,
+                               "connection": getattr(client, "connection_details", {}),
                                "clearedTransportFailures": cleared, "businessActionsReplayed": 0,
                                "sessionRestored": False,
                                "next_instruction": "Connection and Fleet inventory answered. Decide whether to resume the original phase; normal identity, lease and contract checks still apply. No prior business operation was replayed."}
                 except Exception as exc:
                     receipt = {"status": "blocked", "reason": type(exc).__name__,
+                               "probeStage": probe_stage,
+                               "connection": getattr(exc, "connection_details", None)
+                                   or getattr(client, "connection_details", {}),
                                "reasonCode": getattr(exc, "code", None) or getattr(exc, "transport_code", None),
                                "rpcCode": getattr(exc, "rpc_code", None),
                                "businessActionsReplayed": 0,
@@ -2233,6 +2266,9 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
         return await asyncio.shield(pending)
 
     def list_browser_agents(self) -> JsonDict:
+        from harness.task_control import load_task_state
+        state = load_task_state(self.logger)
+        phase_states = state.get("phases") or {}
         self._cleanup_retired_slots()
         agents = []
         for handle in self._handles.values():
@@ -2252,6 +2288,17 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                 "status": status,
                 "task": handle.task,
             }
+            if handle.async_task.done() and not handle.async_task.cancelled():
+                from harness.results.recovery import worker_recovery_facts
+                if status not in {"done", "validated_done"}:
+                    facts = dict(result.get("recoveryFacts") or worker_recovery_facts(result))
+                    phase_state = phase_states.get(handle.phase_id) or {}
+                    facts["currentPhase"] = {
+                        "status": phase_state.get("status"),
+                        "recordedAttemptCount": len(phase_state.get("attempts") or []),
+                        "planVersion": state.get("plan_version"),
+                    }
+                    agent_summary["recoveryFacts"] = facts
             assignment = self.fleet_coordinator.assignment_for_worker(
                 handle.worker_id
             )

@@ -29,6 +29,7 @@ _PLAN_AUDITOR_SOURCE_PRIORITY = (
 # candidate-bearing user payload makes the trust boundary literal and gives
 # providers a stable prefix to cache across revisions.
 _PLAN_AUDITOR_RULES = (
+    "Compare the original user's qualifiers with the actual worker instructions: page-local versus global order, scope, time window, identity, and delivery destination must retain their meaning. Equal numeric sets do not establish equal targets. Do not authorize a reinterpretation merely because it is easier or because the candidate repeats it. Missing on-page rank labels need not require user clarification if current pagination and list order reliably establish the requested positions. If evidence leaves materially different interpretations or requires changing the requested scope, describe the ambiguity for Lead to clarify with the user; do not invent an interpretation.",
     "Do not invent evidence IDs.",
     "Judge whether each phase is sized for ONE worker to finish. The candidate"
     " may carry warnings[] entries reporting a phase that repeats a per-entity"

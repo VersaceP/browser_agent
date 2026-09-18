@@ -56,7 +56,7 @@ from harness.constants import (
     WORKER_STATUS_UNKNOWN,
 )
 from harness.results.call_outcome import public_action_failure
-from harness.semantic_frames import response_node_count
+from harness.observation.semantic_frames import response_node_count
 
 
 @dataclass

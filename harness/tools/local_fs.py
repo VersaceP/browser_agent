@@ -1,5 +1,5 @@
 """
-harness.local_fs - Read-only task worktree search/read tools.
+harness.tools.local_fs - Read-only task worktree search/read tools.
 """
 
 import json

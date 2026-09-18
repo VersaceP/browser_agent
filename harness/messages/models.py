@@ -115,6 +115,22 @@ class TextContent(BaseModel):
     text: str = ""
 
 
+class ImageContent(BaseModel):
+    """Image input independent of either SDK's content-part representation."""
+
+    model_config = _MODEL_CONFIG
+    type: Literal["image"] = "image"
+    media_type: str = "image/png"
+    data: Optional[str] = None
+    url: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _one_source(self) -> "ImageContent":
+        if (self.data is None) == (self.url is None):
+            raise ValueError("image requires exactly one of data or url")
+        return self
+
+
 class ThinkingContent(BaseModel):
     """Extended thinking / reasoning, in the position the model emitted it.
 
@@ -157,7 +173,7 @@ class UserMessage(BaseModel):
     model_config = _MODEL_CONFIG
 
     role: Literal["user"] = "user"
-    content: str = ""
+    content: Union[str, List[Union[TextContent, ImageContent]]] = ""
 
 
 class AssistantMessage(BaseModel):
@@ -167,6 +183,11 @@ class AssistantMessage(BaseModel):
     content: List[ContentBlock] = Field(default_factory=list)
     stop_reason: Optional[str] = None
     usage: Dict[str, Any] = Field(default_factory=dict)
+    provider: Optional[str] = None
+    api: Optional[str] = None
+    model: Optional[str] = None
+    response_id: Optional[str] = None
+    raw_stop_reason: Optional[str] = None
 
     def block_kinds(self) -> List[str]:
         """Ordered block types - the shape of the turn, without its content."""
@@ -217,7 +238,7 @@ class ToolResultMessage(BaseModel):
     tool_call_id: str
     tool_name: str = ""
     is_error: bool = False
-    content: str = ""
+    content: Union[str, List[Union[TextContent, ImageContent]]] = ""
     truncation: Optional[TruncationInfo] = None
 
 
@@ -286,6 +307,7 @@ __all__ = [
     "BrowserObservationMessage",
     "CompactionSummaryMessage",
     "ContentBlock",
+    "ImageContent",
     "PayloadRef",
     "TextContent",
     "ThinkingContent",

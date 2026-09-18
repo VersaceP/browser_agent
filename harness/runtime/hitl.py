@@ -1,5 +1,5 @@
 """
-harness.hitl - Shared HITL wait helper for BrowserAgent callers.
+harness.runtime.hitl - Shared HITL wait helper for BrowserAgent callers.
 
 After Hitl.requestPause succeeds, the agent must NOT continue calling tools —
 ABCP rejects most tools while the page is paused (see prior investigation:

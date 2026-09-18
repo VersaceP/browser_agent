@@ -4,48 +4,23 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from harness.tool_policy import disabled_reason_for_method
-from harness.screenshot_policy import normalize_screenshot_output_params
-from harness.workflow_schema_source import workflow_contract
+from harness.tools.tool_policy import disabled_reason_for_method
+from harness.tools.screenshot_policy import normalize_screenshot_output_params
+from harness.workflow.workflow_schema_source import workflow_contract, PlatformSchemaUnavailable
 
 
 JsonDict = Dict[str, Any]
-# Every name here must be an event the platform actually publishes. This set
-# used to admit `Hitl.humanInput` and `Hitl.resumeEvent` — neither exists in the
-# event catalog — while the real `Hitl.resumed` was reachable only through an
-# `allow_legacy_listen_events` back door, so the contract was exactly inverted.
-#
-# Verified 2026-09-11 against a live `System.listEvents` (eventCatalogRevision
-# event:9e1e48fc): the catalog advertises 26 agent-visible events. Being in the
-# catalog is NOT proof the deployment emits it, so this set is narrower.
-#
-# Deliberately NOT waitable:
-#   - Fleet.ready / Fleet.stopped: fleet lifecycle, never the result of a page
-#     action inside a workflow, so waiting on one can only burn the timeout.
-#   - Workflow.progress: a workflow waiting on its own progress stream.
-#   - DOM.axTreeUpdated: advertised by System.listEvents but NEVER OBSERVED.
-#     A live probe ran two full navigations plus DOM.getAXTree reads and saw
-#     only Page.startedLoading / navigate / titleUpdated / loaded / open — not
-#     one axTreeUpdated. Three workflow shapes (navigate→waitEvent,
-#     navigate→readEvents→waitEvent, wheel→readEvents→waitEvent) all timed out
-#     empty after 4-6s. Because a waitEvent timeout is NOT a failure, a step
-#     waiting on it silently burns its whole timeout (default 30s) and then
-#     continues with empty events. It was briefly admitted here on catalog
-#     evidence alone; that was wrong.
-#
-# `Action.started/succeeded/failed` are not in the agent-visible catalog at all
-# (control-plane only), so no workflow step can wait for them.
-# See docs/workflow-execute-live-contract.md.
-LISTENABLE_EVENTS = frozenset({
-    "Page.open", "Page.close", "Page.loaded", "Page.startedLoading",
-    "Page.loadFailed", "Page.crashed", "Page.recovered", "Page.navigate",
-    "Page.titleUpdated", "Page.switchTo", "Page.dialogOpened", "Page.dialogClosed",
-    "File.chooserOpened", "File.chooserClosed",
-    "File.operationCompleted", "File.operationFailed",
-    "Download.waiting", "Download.started", "Download.progressed",
-    "Download.stateChanged",
-    "Hitl.paused", "Hitl.resumed",
-})
+
+def listenable_events(step_type: str = "waitEvent") -> frozenset[str]:
+    """Use the active deployment's protocol, not a Harness strategy allowlist."""
+    kind = "waitEvent" if step_type == "listen" else step_type
+    shape = workflow_contract().step_shapes.get(kind)
+    focus = shape.property_schemas.get("focus", {}) if shape else {}
+    names = focus.get("items", {}).get("enum")
+    if not isinstance(names, list) or not names:
+        raise PlatformSchemaUnavailable(f"Workflow {kind} contract has no focus event enum; refresh the deployment schema cache")
+    return frozenset(str(name) for name in names)
+
 
 # The platform's discriminated union of step types (workflow/src/types/schemas.ts).
 # `listen` is NOT one of them: it is a harness-only legacy spelling that the
@@ -114,9 +89,9 @@ def harden_navigation_lifecycle(steps: Any) -> List[JsonDict]:
 
     Trace distillation already inserts the settlement listen. This helper is
     intentionally mechanical and idempotent so online autoheal candidates
-    satisfy the same execution policy as authored workflows. A successful
-    Page.loaded settlement needs state + AX refresh; Page.loadFailed needs only
-    Page.getState so the failure can be classified without probing a dead DOM.
+    satisfy the same execution policy as authored workflows.
+    Settlement needs Page.getState. AX observation is selected by the worker
+    when its next action needs AX identities; it is not a universal read step.
     """
     source = steps if isinstance(steps, list) else []
     hardened: List[JsonDict] = []
@@ -147,23 +122,11 @@ def harden_navigation_lifecycle(steps: Any) -> List[JsonDict]:
             continue
         if event != "Page.loaded":
             continue
-        next_next = source[index + 2] if index + 2 < len(source) else None
-        if not (
-            isinstance(next_step, dict)
-            and next_step.get("action") == "Page.getState"
-            and isinstance(next_next, dict)
-            and next_next.get("action") == "DOM.getAXTree"
-        ):
-            hardened.extend([
-                {
-                    "action": "Page.getState",
-                    "purpose": "Synchronize state after distilled navigation settlement",
-                },
-                {
-                    "action": "DOM.getAXTree",
-                    "purpose": "Refresh DOM identity after distilled navigation",
-                },
-            ])
+        if not (isinstance(next_step, dict) and next_step.get("action") == "Page.getState"):
+            hardened.append({
+                "action": "Page.getState",
+                "purpose": "Synchronize state after distilled navigation settlement",
+            })
     return hardened
 
 
@@ -324,8 +287,6 @@ def _validate_sequence(
                 )
             elif obligation == "state" and action != "Page.getState":
                 errors.append(f"{step_path} must call Page.getState after settlement/recovery")
-            elif obligation == "axtree" and action != "DOM.getAXTree":
-                errors.append(f"{step_path} must call DOM.getAXTree after Page.getState")
             elif obligation == "state_only" and action != "Page.getState":
                 errors.append(
                     f"{step_path} must call Page.getState after load failure"
@@ -359,8 +320,6 @@ def _validate_sequence(
                 if action in {"Page.navigate", "Page.reload", "Page.go"}:
                     obligation = "settlement"
                 elif obligation == "state" and action == "Page.getState":
-                    obligation = "axtree"
-                elif obligation == "axtree" and action == "DOM.getAXTree":
                     obligation = ""
                 elif obligation == "state_only" and action == "Page.getState":
                     obligation = ""
@@ -371,8 +330,9 @@ def _validate_sequence(
                     f"{step_path}: a {step_type} step must name at least one event"
                     " in focus"
                 )
+            allowed_events = listenable_events(step_type)
             for event in focus:
-                if event not in LISTENABLE_EVENTS:
+                if event not in allowed_events:
                     errors.append(f"{step_path}: event {event!r} is not listenable")
             if enforce_lifecycle:
                 waited = set(focus)
@@ -485,7 +445,7 @@ def _error(errors: List[str]) -> JsonDict:
             "Use only task-type-allowed ABCP actions. After navigation wait for"
             " Page.loaded or Page.loadFailed with a waitEvent step. After"
             " Page.loaded call"
-            " Page.getState and DOM.getAXTree; after Page.loadFailed call"
-            " Page.getState only."
+            " Page.getState, then DOM.getAXTree when later steps target AX ids;"
+            " after Page.loadFailed call Page.getState only."
         ),
     }

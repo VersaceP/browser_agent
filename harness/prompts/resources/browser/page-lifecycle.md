@@ -97,24 +97,19 @@ Before removing a record, inspect current download evidence: only completed,
 failed, or cancelled records are terminal. Cancel an active record and observe
 that terminal state first.
 
-## The one AX-refresh exemption
+## Refresh identities when the next action uses them
 
-After navigation or recovery, `page_axtree_refresh_required` blocks work
-because every element id taken before that point may now name something else.
-One call is exempt: a `DOM.getSemanticTree` with neither `id` nor `selector`.
-That is the schema's document-root request, so it holds no prior element for
-the navigation to have invalidated. It runs only on a settled page whose state
-resync is already done.
+After navigation or recovery, first settle loading and synchronize Page.getState.
+Refresh DOM.getAXTree when deriving canonical AX ids or querying find_in_axtree.
+Selector-only reads, DOM.getText, DOM.getAttribute and root DOM.getSemanticTree
+can run on a settled page without a preceding AXTree. They do not make old AX
+ids current. Target identity, ownership and actual readiness checks still apply.
 
-The exemption buys one page-wide look at structure and nothing more. The tree
-it returns is a live observation, not stale content - but its ids were never
-admitted as the harness's current AX snapshot, so the read discharges nothing
-and authorizes no target. The receipt says exactly that in
-`axRefreshBypass.doesNotClearAXRefresh`, and `DOM.getAXTree` is still required
-before any call that names a target -
-`Input.*`, a targeted `DOM.getText`/`getAttribute`, a scoped
-`DOM.getSemanticTree`, or `find_in_axtree`, which searches the AX snapshot you
-have not refreshed.
+Workflow has the same distinction: navigation settlement followed by
+Page.getState is sufficient for a text/selector read or to end the segment.
+When later steps use AX ids, derive them from a current tree; a tree call does
+not make a hard-coded old id fresh. Workflow action execution and live handle
+resolution remain WebCross's responsibility.
 
 If the page's lifecycle generation moved while that tree was being read, the
 receipt comes back as `page_changed_during_read` with `stableEvidence: false`.

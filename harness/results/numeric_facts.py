@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from harness.results.completion_receipt import _validated_artifacts
-from harness.utils import JsonDict
+from harness.utils import JsonDict, read_artifact_text
 
 NUMERIC_CLAIM_TOOL = "submit_numeric_claims"
 
@@ -53,10 +53,10 @@ MAX_FIELD_HINTS = 30
 _MIN_CONTAINS_SUBJECT_LEN = 3
 
 
-def _load_artifact(path_text: str) -> Optional[JsonDict]:
+def _load_artifact(path_text: str, logger: Any = None) -> Optional[JsonDict]:
     try:
-        payload = json.loads(Path(path_text).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, ValueError):
+        payload = json.loads(read_artifact_text(logger, path_text))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
         return None
     if not isinstance(payload, dict) or not isinstance(payload.get("rows"), list):
         return None
@@ -103,30 +103,36 @@ def build_numeric_fact_index(
     state: Any,
     *,
     task_dir: Any = None,
+    logger: Any = None,
 ) -> JsonDict:
     """Project the ledgers into the values a numeric claim can be checked against.
 
     `activeArtifacts` is the coordinator's current validated generation.
-    Everything else on disk is `historicalArtifacts`: still real evidence, but
-    superseded — a claim that matches only a historical value is reporting a
-    number the delivered data no longer contains.
+    Other generations are advisory history: count changes may be deduplication,
+    filtering or corrections. Only a bound current-value mismatch is decisive.
     """
     task_state = state if isinstance(state, dict) else {}
-    active_paths = _validated_artifacts(task_state)
+    active_paths = _validated_artifacts(task_state, logger)
     active: List[JsonDict] = []
     for path_text in active_paths:
-        artifact = _load_artifact(path_text)
+        artifact = _load_artifact(path_text, logger)
         if artifact is not None:
             active.append(artifact)
 
     historical: List[JsonDict] = []
-    directory = _extraction_dir(task_dir)
-    if directory is not None:
-        active_paths_resolved = {item["path"] for item in active}
-        for candidate in sorted(directory.glob("*.json")):
-            artifact = _load_artifact(str(candidate))
-            if artifact is not None and artifact["path"] not in active_paths_resolved:
-                historical.append(artifact)
+    directory = _extraction_dir(task_dir or getattr(logger, "task_dir", None))
+    candidates = set(directory.glob("*.json")) if directory is not None else set()
+    if logger is not None:
+        from harness.storage.virtual_fs import virtual_fs_for
+        view = virtual_fs_for(logger)
+        if view is not None:
+            candidates.update(Path(logger.task_dir) / name for name, _, _ in
+                              view.match_files("artifacts/extractions/*.json"))
+    active_paths_resolved = {item["path"] for item in active}
+    for candidate in sorted(candidates):
+        artifact = _load_artifact(str(candidate), logger)
+        if artifact is not None and artifact["path"] not in active_paths_resolved:
+            historical.append(artifact)
 
     raw_phases = task_state.get("phases")
     phases: Dict[str, Any] = raw_phases if isinstance(raw_phases, dict) else {}
@@ -228,9 +234,6 @@ def resolve_numeric_claim(claim: Any, index: JsonDict) -> JsonDict:
     Verdicts:
       verified      — the active generation says the same number
       contradicted  — the active generation says a different number
-      data_conflict — active matches nothing, but a superseded artifact holds a
-                      LARGER value for the same subject/field: the delivered
-                      data regressed and the answer is quoting the old number
       unresolved    — no ledger holds this value; the answer may be right, but
                       nothing here can confirm it
     """
@@ -272,12 +275,15 @@ def resolve_numeric_claim(claim: Any, index: JsonDict) -> JsonDict:
         "row_count": "rows",
         "count": "field_entries",
     }.get(metric)
-    if unit and unit != expected_unit:
+    if unit and unit != expected_unit and not (metric == "count" and unit == "items"):
         return {
             **base,
             "verdict": "unresolved",
             "reason": f"metric {metric!r} cannot verify unit {unit!r}",
         }
+
+    if metric != "count" and any((claim or {}).get(key) is not None for key in ("bindings", "rowIndex")):
+        return {**base, "verdict": "unresolved", "reason": "array bindings cannot identify a row or plan total"}
 
     if metric in PLAN_METRICS:
         if scope and scope != "task_total":
@@ -312,7 +318,35 @@ def resolve_numeric_claim(claim: Any, index: JsonDict) -> JsonDict:
     active = index["activeArtifacts"]
     historical = index["historicalArtifacts"]
 
+    bindings = (claim or {}).get("bindings")
+    if bindings is not None:
+        if metric != "count" or not isinstance(bindings, list) or not bindings:
+            return {**base, "verdict": "unresolved", "reason": "bindings require count and a nonempty array"}
+        if base["field"] or (claim or {}).get("artifactPath") or (claim or {}).get("rowIndex") is not None:
+            return {**base, "verdict": "unresolved", "reason": "choose bindings or a single field binding, not both"}
+        parts, seen = [], set()
+        for binding in bindings:
+            if not isinstance(binding, dict):
+                return {**base, "verdict": "unresolved", "reason": "invalid array binding"}
+            path, row_id, field = binding.get("artifactPath"), binding.get("rowIndex"), binding.get("field")
+            if not isinstance(path, str) or not isinstance(field, str) or not isinstance(row_id, int) or isinstance(row_id, bool):
+                return {**base, "verdict": "unresolved", "reason": "invalid array binding identity"}
+            key = (path, row_id, field)
+            if key in seen:
+                return {**base, "verdict": "unresolved", "reason": "duplicate array binding"}
+            seen.add(key)
+            values = [row["arrayLengths"][field] for artifact in active if artifact["path"] == path
+                      for row in artifact["rows"] if row["index"] == row_id and field in row["arrayLengths"]]
+            if len(values) != 1:
+                return {**base, "verdict": "unresolved", "reason": "array binding does not identify one current field"}
+            parts.append({**binding, "actualValue": values[0]})
+        actual = sum(part["actualValue"] for part in parts)
+        return {**base, "actualValue": actual, "source": "active_artifact_arrays", "bindings": parts,
+                "aggregation": "sum_array_lengths", "verdict": "verified" if actual == claimed else "contradicted"}
+
     if metric == "row_count":
+        if base["field"] or scope not in {"", "artifact", "task_total"}:
+            return {**base, "verdict": "unresolved", "reason": "row_count measures whole rows, not nested fields or entities"}
         actual = _artifact_row_count_for_subject(base["subject"], active)
         if actual is None:
             return {**base, "verdict": "unresolved", "reason": "no artifact matches this subject"}
@@ -323,11 +357,18 @@ def resolve_numeric_claim(claim: Any, index: JsonDict) -> JsonDict:
             "verdict": "verified" if actual == claimed else "contradicted",
         }
 
-    matches = _match_rows(base["subject"], active)
+    bound_path = str((claim or {}).get("artifactPath") or "")
+    row_index = (claim or {}).get("rowIndex")
+    if bound_path or row_index is not None:
+        if not bound_path or not isinstance(row_index, int) or isinstance(row_index, bool) or row_index < 0:
+            return {**base, "verdict": "unresolved", "reason": "exact array binding needs artifactPath and nonnegative rowIndex"}
+        matches = [(artifact, row) for artifact in active
+                   if artifact["path"] == bound_path
+                   for row in artifact["rows"] if row["index"] == row_index]
+    else:
+        matches = _match_rows(base["subject"], active)
     if not matches:
-        # A subject the active generation does not contain may still exist in a
-        # superseded artifact. Reporting its number as current is the exact
-        # regression this gate looks for, so say so rather than shrug.
+        # History supplies context, not proof of what the current output owes.
         historical_matches = _match_rows(base["subject"], historical)
         for artifact, row in historical_matches:
             value = _row_metric_value(row, artifact, metric, base["field"])
@@ -338,7 +379,7 @@ def resolve_numeric_claim(claim: Any, index: JsonDict) -> JsonDict:
                     "historicalValue": value,
                     "source": "historical_artifact",
                     "sourceArtifact": artifact["path"],
-                    "verdict": "data_conflict",
+                    "verdict": "unresolved",
                     "reason": (
                         "this number comes from a superseded artifact; the"
                         " active validated generation has no such row"
@@ -374,25 +415,15 @@ def resolve_numeric_claim(claim: Any, index: JsonDict) -> JsonDict:
         "source": "active_artifact",
         "sourceArtifact": artifact["path"],
     }
-    if actual == claimed:
-        # Matching the active value is not the end of it: a superseded artifact
-        # holding MORE means the delivered data lost rows, and an answer that
-        # calls that complete is reporting a truthful number about damaged data.
-        for old_artifact, old_row in _match_rows(base["subject"], historical):
-            old_value = _row_metric_value(old_row, old_artifact, metric, base["field"])
-            if old_value is not None and old_value > actual:
-                return {
-                    **result,
-                    "historicalValue": old_value,
-                    "historicalArtifact": old_artifact["path"],
-                    "verdict": "data_conflict",
-                    "reason": (
-                        "a superseded artifact holds more items for this"
-                        " subject than the active generation"
-                    ),
-                }
-        return {**result, "verdict": "verified"}
-    return {**result, "verdict": "contradicted"}
+    differences = []
+    for old_artifact, old_row in _match_rows(base["subject"], historical):
+        old_value = _row_metric_value(old_row, old_artifact, metric, base["field"])
+        if old_value is not None and old_value != actual:
+            differences.append({"historicalValue": old_value,
+                                "historicalArtifact": old_artifact["path"],
+                                "currentValue": actual})
+    return {**result, "verdict": "verified" if actual == claimed else "contradicted",
+            "historicalDifferences": differences}
 
 
 def numeric_claim_tool(subjects: List[str], fields: List[str]) -> JsonDict:
@@ -437,10 +468,21 @@ def numeric_claim_tool(subjects: List[str], fields: List[str]) -> JsonDict:
                                 ),
                                 "examples": subjects[:8],
                             },
+                            "bindings": {
+                                "type": "array", "minItems": 1,
+                                "description": "For count only: sum lengths of distinct arrays. This counts entries, not unique files or physical deliveries. Omit single field/artifactPath/rowIndex when using this.",
+                                "items": {"type": "object", "properties": {
+                                    "artifactPath": {"type": "string"},
+                                    "rowIndex": {"type": "integer", "minimum": 0},
+                                    "field": {"type": "string"}},
+                                    "required": ["artifactPath", "rowIndex", "field"], "additionalProperties": False},
+                            },
+                            "artifactPath": {"type": "string", "description": "Exact active artifact path for a count binding; pair with rowIndex."},
+                            "rowIndex": {"type": "integer", "minimum": 0, "description": "Zero-based row in artifactPath for count."},
                             "field": {
                                 "type": "string",
                                 "description": (
-                                    "Which field is counted, for metric=count."
+                                    "Exact array field for metric=count. Empty for row_count."
                                 ),
                                 "examples": fields[:8],
                             },
@@ -451,9 +493,9 @@ def numeric_claim_tool(subjects: List[str], fields: List[str]) -> JsonDict:
                                     "count/row_count are per-subject. "
                                     + ", ".join(sorted(PLAN_METRICS))
                                     + " are task-wide totals: use them only"
-                                    " with an empty subject. A per-phase or"
-                                    " per-artifact number is row_count with"
-                                    " that artifact as the subject."
+                                    " with an empty subject. row_count counts only top-level JSON rows;"
+                                    " count counts one named array or an explicit sum of bound arrays. File paths nested in a row"
+                                    " are array entries, not rows. Unsupported aggregates remain unresolved."
                                 ),
                             },
                             "value": {"type": "number"},
@@ -461,9 +503,9 @@ def numeric_claim_tool(subjects: List[str], fields: List[str]) -> JsonDict:
                                 "type": "string",
                                 "enum": sorted(CLAIM_UNITS),
                                 "description": (
-                                    "The noun being counted. Use items for"
-                                    " products/entities; it cannot be checked"
-                                    " as artifacts or phases."
+                                    "count uses field_entries (items is accepted for explicitly bound array entries). "
+                                    "row_count/validated_rows use rows; validated_artifacts uses artifacts; "
+                                    "validated_phases uses phases. Do not substitute row counts for file counts."
                                 ),
                             },
                             "scope": {
@@ -531,14 +573,18 @@ _EXTRACTOR_SYSTEM_PROMPT = (
     " its text verbatim. Do not look for numbers yourself and do not invent"
     " spans: the list is the work. A span with no entry fails the whole"
     " reconciliation, so keep each ignored entry to a few words.\n\n"
-    "For every checked claim, set unit and scope literally from the answer."
-    " Seven products has unit=items and must not become validated_artifacts;"
-    " '2 collection phases' has scope=subset and must not become the task-wide"
-    " validated_phases total. Use row_count with the named artifact when the"
-    " answer says an artifact contains N rows/items. If no supported metric"
-    " measures the stated unit and scope, mark the span ignored and explain"
-    " that the ledger has no matching aggregate; never substitute a nearby"
-    " metric with a different noun.\n\n"
+    "For checked claims bind the actual counted object, not a nearby noun. "
+    "count measures one array in one row (unit=field_entries); row_count "
+    "measures top-level JSON rows (unit=rows, field empty). A file containing "
+    "one row with 22 file paths does not contain 22 rows. Prefer exact "
+    "artifactPath/rowIndex/field from arrayBindingHints for array counts. "
+    "Use bindings for an explicit sum of multiple array lengths; it counts "
+    "entries, not unique entities or successful physical deliveries. "
+    "Product counts are only checkable when explicitly tied to rows or an "
+    "array in the artifact. Unsupported aggregates or ambiguous bindings "
+    "must be explained as ignored, not coerced into row_count. Plan totals "
+    "use validated_phases/phases, validated_artifacts/artifacts or "
+    "validated_rows/rows, with scope=task_total and empty subject.\n\n"
     "`text` must be copied verbatim from the answer, exactly as written,"
     " including its digits. Bind `subject` to a value that identifies the row"
     " the number is about — prefer one of the supplied subject hints when the"
@@ -598,6 +644,11 @@ async def extract_numeric_claims(
         "subjectHints": subjects,
         "arrayFieldHints": fields,
         "supportedMetrics": sorted(CLAIM_METRICS),
+        "arrayBindingHints": [
+            {"artifactPath": artifact["path"], "rowIndex": row["index"],
+             "fields": list(row["arrayLengths"])}
+            for artifact in index.get("activeArtifacts", []) for row in artifact["rows"]
+        ][:MAX_SUBJECT_HINTS],
     }
     async def _request(*, repair_errors: Optional[List[str]] = None) -> Tuple[Any, Any]:
         request_payload = dict(payload)
@@ -944,17 +995,19 @@ def reconcile_numeric_claims(
     ]
     resolved = [resolve_numeric_claim(claim, index) for claim in asserted]
     contradicted = [item for item in resolved if item["verdict"] == "contradicted"]
-    conflicts = [item for item in resolved if item["verdict"] == "data_conflict"]
+    differences = [{"claimId": item["claimId"], **difference}
+                   for item in resolved for difference in item.get("historicalDifferences", [])]
     unresolved = [item for item in resolved if item["verdict"] == "unresolved"]
     return {
         "status": (
-            "failed" if (contradicted or conflicts)
+            "failed" if contradicted
             else "inconclusive" if unresolved
             else "passed"
         ),
         "claims": resolved,
         "contradicted": contradicted,
-        "dataConflicts": conflicts,
+        "dataConflicts": [],
+        "historicalDifferences": differences,
         "unresolved": unresolved,
         "verifiedClaimCount": sum(
             1 for item in resolved if item["verdict"] == "verified"

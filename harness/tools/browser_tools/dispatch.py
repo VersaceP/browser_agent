@@ -18,23 +18,23 @@ from typing import Set
 from typing import Tuple
 from abcp_client import ABCPTransportError
 from harness.diagnostics.error_classification import attach_error_classification
-from harness.lifecycle import LifecycleContext
-from harness.lifecycle import lifecycle_for
-from harness.local_fs import local_fs_read
-from harness.local_fs import local_fs_search
-from harness.file_tools import local_fs_batch
+from harness.runtime.lifecycle import LifecycleContext
+from harness.runtime.lifecycle import lifecycle_for
+from harness.tools.local_fs import local_fs_read
+from harness.tools.local_fs import local_fs_search
+from harness.tools.file_tools import local_fs_batch
 from harness.prompts import read_harness_guide
 from harness.prompts import search_harness_guides
 from harness.observation.page_lifecycle import PageLifecycleTracker
-from harness.pacing import wait_between_rows
+from harness.planning.pacing import wait_between_rows
 from harness.observation.browser_call import build_browser_call_runner
-from harness.runtime_evaluation import RuntimeEvaluationService
+from harness.tools.runtime_evaluation import RuntimeEvaluationService
 from harness.results.call_outcome import replay_forbidden
-from harness.workflow_schema_source import contract_stamp
-from harness.tool_policy import collect_sensitive_replacements
-from harness.tool_policy import hidden_harness_tools_for_task_type
-from harness.tool_policy import redact_values
-from harness.tool_policy import sensitive_browser_method_params
+from harness.workflow.workflow_schema_source import contract_stamp
+from harness.tools.tool_policy import collect_sensitive_replacements
+from harness.tools.tool_policy import hidden_harness_tools_for_task_type
+from harness.tools.tool_policy import redact_values
+from harness.tools.tool_policy import sensitive_browser_method_params
 from harness.tools.argument_pipeline import SchemaIssue
 from harness.tools.argument_pipeline import apply_registered_tool_defaults
 from harness.tools.argument_pipeline import prepare_model_tool_call
@@ -44,8 +44,8 @@ from harness.tools.registry import ToolContext
 from harness.tools.registry import ToolRegistry
 from harness.utils import JsonDict
 from harness.utils import optional_int
-from harness.workflow_runtime import workflow_execution_disabled_result
-from harness.workflow_runtime import workflow_execution_enabled
+from harness.workflow.workflow_runtime import workflow_execution_disabled_result
+from harness.workflow.workflow_runtime import workflow_execution_enabled
 from .schemas import _browser_input_schemas
 
 def _bt():
@@ -892,7 +892,7 @@ async def _execute_browser_tool_impl(
         _bt()._observe_progress_after(agent, name, result)
         trace_entry: JsonDict = {"type": action.trace_type, "result": result}
         if name == "collect_items":
-            from harness.fast_path import trace_params_for_fast_path
+            from harness.planning.fast_path import trace_params_for_fast_path
 
             stable_params = trace_params_for_fast_path(name, tool_input)
             if stable_params:
@@ -1182,8 +1182,9 @@ def _record_workflow_definition_before_dispatch(ctx: ToolContext, receipt: JsonD
         " targets whose ids are not known yet but a step inside the segment can"
         " resolve: read DOM.getAXTree, transform-search that reading, and act"
         " on what it found. It cannot call harness-local tools or"
-        " Runtime.evaluate, and navigation must be followed by Page.loaded,"
-        " Page.getState, and DOM.getAXTree. End the segment at the next point"
+        " Runtime.evaluate, and navigation must be followed by Page.loaded and"
+        " Page.getState, then DOM.getAXTree when later steps target AX ids."
+        " End the segment at the next point"
         " that needs exploration, a screenshot judgment, or a decision you"
         " cannot express mechanically; use single browser_call steps there."
     ),
@@ -1194,7 +1195,7 @@ def _record_workflow_definition_before_dispatch(ctx: ToolContext, receipt: JsonD
 async def _browser_execute_browser_workflow(ctx: ToolContext) -> JsonDict:
     if not workflow_execution_enabled(ctx.agent):
         return workflow_execution_disabled_result(source="execute_browser_workflow")
-    from harness.workflow_definitions import save_workflow_definition
+    from harness.workflow.workflow_definitions import save_workflow_definition
 
     workflow_definition = {
         "description": str(
@@ -1266,7 +1267,7 @@ async def _browser_execute_saved_browser_workflow(ctx: ToolContext) -> JsonDict:
         return workflow_execution_disabled_result(
             source="execute_saved_browser_workflow",
         )
-    from harness.workflow_definitions import (
+    from harness.workflow.workflow_definitions import (
         apply_workflow_definition_patch,
         load_workflow_definition,
         save_workflow_definition,

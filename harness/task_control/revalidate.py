@@ -1,5 +1,4 @@
 """Recheck persisted phase deliveries without dispatch or side-effect replay."""
-import hashlib
 import io
 import json
 from pathlib import Path
@@ -84,13 +83,7 @@ def revalidate_phase_artifacts(agent, *, phase_id, plan_version, decision="inspe
     for path in current["validated_artifacts"]:
         if path not in state.setdefault("artifacts", []):
             state["artifacts"].append(path)
-        # Extraction resources may live in DB; native deliveries are bytes.
-        try:
-            resource_text = read_task_file_text(logger, path) if db_authoritative_for(logger) else None
-        except UnicodeError:
-            resource_text = None
-        digest = (hashlib.sha256(resource_text.encode()).hexdigest()
-                  if resource_text is not None else _artifact_sha256(Path(path), logger))
+        digest = _artifact_sha256(Path(path), logger)
         if digest:
             state.setdefault("artifact_digests", {})[str(Path(path).resolve())] = digest
     state["current_phase"] = tc._first_active_phase_id(agent.task_plan, state["phases"])

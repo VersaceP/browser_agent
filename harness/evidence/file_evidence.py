@@ -32,3 +32,19 @@ def saved_paths_from_value(value: Any) -> List[str]:
 
     walk(value)
     return list(dict.fromkeys(paths))
+
+
+def declared_file_paths(rows: Any, fields: set[str]) -> List[str]:
+    """Literal contract-selected paths, including nested object/array fields."""
+    paths: List[str] = []
+    def walk(value: Any, key: str = "") -> None:
+        if isinstance(value, dict):
+            for child_key, child in value.items():
+                walk(child, str(child_key))
+        elif isinstance(value, list):
+            for child in value:
+                walk(child, key)
+        elif isinstance(value, str) and key in fields and value.strip():
+            paths.append(value.strip())
+    walk(rows)
+    return list(dict.fromkeys(paths))

@@ -1,7 +1,7 @@
 ---
 id: lead.plan-contracts
 audience: lead
-version: "2026-09-15"
+version: "2026-09-16"
 description: Complete task-plan examples, file validator parameters, independent dependencies and minimal contract repairs.
 sources:
   - harness/tools/lead_tools.py
@@ -39,6 +39,25 @@ and validators. Use emit_direct_task_plan for a single coherent deliverable;
 the emit_task_plan examples below demonstrate phase contracts. Large plans use
 the same phase objects through the draft tools.
 
+## Draft progress: create metadata, append phases, submit
+
+For a plan too large for one reliable call, use this sequence:
+
+1. `begin_task_plan_draft({"draft_id":"delivery-v1","plan":{"goal":"Collect the requested records"}})`
+   returns `draftState="metadata_only", phaseCount=0, planSubmitted=false`.
+   Only an empty draft exists; `status="done"` describes this tool operation.
+2. `append_task_plan_draft({"draft_id":"delivery-v1","phases":[...]})`
+   adds actual phase objects, such as the complete collection example below.
+3. Add any remaining phases to **delivery-v1**, then
+   `submit_task_plan_draft({"draft_id":"delivery-v1"})` for validation and approval.
+
+Wrong: begin delivery-v1, then begin delivery-v2, then begin delivery-final without
+appending phases. Each begin creates a separate empty draft; naming one “final”
+does not submit it. Continue the returned draftId. Another draft is appropriate
+when you intentionally redesign the plan, not merely to advance the current one.
+After a submitted candidate is rejected, use its structured repair guidance and
+candidateHash instead of assuming a new draft is required.
+
 ## Collection: count, identity and evidence
 
 User: On the results page at https://example.org collect exactly the second
@@ -57,6 +76,18 @@ do not claim that mechanical approval proves the requested identities.
 For “up to two”, use rows.max=2 instead; for a query-driven search phase use
 web_search. URLs in prose should be separated from surrounding words and
 sentence punctuation by whitespace; never include explanatory text in a URL.
+
+When resubmitting an existing normalized plan, preserve its evidence settings.
+`field_provenance.fields` accepts either a field-name array or an object keyed
+by field name with per-field evidence settings (`evidence_field`,
+`evidence_aliases`, `source_tool_field`, `selector_field`, and `require_*`).
+Other multi-field validators (`required_fields`, `field_nonempty`, `unique`)
+use field-name arrays. Do not delete evidence requirements to repair a type
+error. Optional normalized values may be null: `depends_on: null` keeps the
+implicit serial dependencies, whereas `depends_on: []` declares independence.
+Retain normalized batch identity and observation metadata when copying a plan;
+new compact plans should declare their output contracts and let the compiler
+derive common validators.
 
 ## Download: validator type versus parameter
 
@@ -175,3 +206,16 @@ is retired; legacy declarations and ordinary business URL/field patterns are
 advisory. field_pattern/url_pattern/cross_field_contains can use
 enforcement="literal" only for an unambiguous literal user/protocol requirement,
 never as a substitute domain affiliation gate.
+
+
+## Preserve the user's selection scope
+
+Carry page, ordering, range, identity, time window and destination qualifiers into worker instructions without changing their meaning. A numeric set alone does not preserve its scope.
+
+- User: “page 2, positions 30–32.” Correct: locate positions 30–32 within page 2 using observed pagination/list order. Incorrect: reinterpret as global positions 30–32 and take page 1. Repair the instruction, not just the numeric validator.
+- User: “last month's transactions.” Do not substitute the latest available transactions when that period is missing.
+- User: “save each file on Desktop.” Internal worktree receipts do not replace physical delivery at the requested destination.
+
+Absence of a displayed rank label is not itself ambiguity: observed ordering and pagination may be sufficient. If available evidence cannot resolve materially different targets, or continuing requires changing scope, report the evidence and ask the user to clarify. Do not silently substitute an easier target. These are semantic decisions, not site-specific gates.
+
+On recovery, consult structured receipts and existing artifact references first. Search logs only for a specific missing fact; reuse earlier verified locations and do not repeatedly retrieve the same unchanging evidence. Changing final-answer wording does not fix a rejected artifact field.

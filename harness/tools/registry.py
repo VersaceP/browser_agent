@@ -30,7 +30,7 @@ class ToolAction:
     input_schema: SchemaLike
     handler: ToolHandler
     terminal: bool = False
-    strict: bool = True
+    strict: bool = False
     loop_guard: bool = True
     contract_check: bool = False
     progress_check: bool = False
@@ -47,8 +47,10 @@ class ToolAction:
             "description": self.description,
             "input_schema": schema,
         }
-        if self.strict:
-            spec["strict"] = True
+        # OpenAI Responses may normalize an omitted flag into strict mode.
+        # Registry schemas include open dictionaries and optional fields, so
+        # strict is opt-in and false must survive the neutral tool boundary.
+        spec["strict"] = self.strict
         return spec
 
 
@@ -64,7 +66,7 @@ class ToolRegistry:
         description: str,
         input_schema: SchemaLike,
         terminal: bool = False,
-        strict: bool = True,
+        strict: bool = False,
         loop_guard: bool = True,
         contract_check: bool = False,
         progress_check: bool = False,

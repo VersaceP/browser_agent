@@ -3,8 +3,8 @@
 from typing import Dict, Tuple
 
 from harness.utils import JsonDict
-from harness.workflow_policy import LISTENABLE_EVENTS
-from harness.workflow_schema_source import platform_constraints, workflow_contract
+from harness.workflow.workflow_policy import listenable_events
+from harness.workflow.workflow_schema_source import platform_constraints, workflow_contract
 
 
 def _workflow_condition_schema() -> JsonDict:
@@ -138,7 +138,7 @@ def _workflow_step_definitions() -> JsonDict:
     # emit {"type": "listen", "event": ...}; the dispatcher has no such step
     # type and rejects the whole workflow with -32602, so the model is shown
     # only the real spelling. Stored `listen` steps are still rewritten by
-    # harness.workflow_policy._normalize_wait_events before transport.
+    # harness.workflow.workflow_policy._normalize_wait_events before transport.
     wait_event_step: JsonDict = {
         "type": "object",
         "properties": {
@@ -147,7 +147,7 @@ def _workflow_step_definitions() -> JsonDict:
             "focus": {
                 "type": "array",
                 "minItems": 1,
-                "items": {"type": "string", "enum": sorted(LISTENABLE_EVENTS)},
+                "items": {"type": "string", "enum": sorted(listenable_events("waitEvent"))},
                 "description": (
                     "Event names to wait for AFTER the preceding Action"
                     " completes. It cannot see events emitted during that"
@@ -189,7 +189,7 @@ def _workflow_step_definitions() -> JsonDict:
             "focus": {
                 "type": "array",
                 "minItems": 1,
-                "items": {"type": "string", "enum": sorted(LISTENABLE_EVENTS)},
+                "items": {"type": "string", "enum": sorted(listenable_events("readEvents"))},
                 "description": (
                     "Event names to read from the preceding Action's own event"
                     " window. Returns immediately — it never waits."

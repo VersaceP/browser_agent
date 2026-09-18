@@ -34,9 +34,9 @@ from typing import Any, Dict, List, Optional
 
 from harness.fleet.runtime import FleetClickGateTimeout
 from harness.observation.exec_observer import ExecObserver
-from harness.task_types import resolve_task_type_fail_closed
-from harness.workflow_policy import validate_workflow_params
-from harness.workflow_runtime import (
+from harness.planning.task_types import resolve_task_type_fail_closed
+from harness.workflow.workflow_policy import validate_workflow_params
+from harness.workflow.workflow_runtime import (
     workflow_execution_disabled_result,
     workflow_execution_enabled,
 )

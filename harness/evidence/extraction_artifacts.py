@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Any, List, Optional
 
-from harness.offload import store_offloaded
+from harness.context.offload import store_offloaded
 from harness.utils import JsonDict
 
 
@@ -90,6 +90,40 @@ def resolve_required_field_specs(expected_artifact: Any) -> JsonDict:
         else:
             unresolved.append(name)
     return {"specs": specs, "unresolved": unresolved, "declared": declared}
+
+
+def current_row_structure_failures(raw_rows: Any, expected: Any) -> List[JsonDict]:
+    """Recompute structure from current data/contract, never cached verdicts.
+
+    Empty containers are valid values. Unknown semantic type labels are not
+    guessed; only explicit JSON types and existing container aliases apply.
+    """
+    if not isinstance(raw_rows, list):
+        return [{"type": "schema", "message": "artifact has no rows array"}]
+    resolved = resolve_required_field_specs(expected)
+    required = set(resolved["specs"]) | set(resolved["unresolved"])
+    types = {"array": list, "list": list, "object": dict, "map": dict,
+             "dict": dict, "string": str, "boolean": bool,
+             "integer": int, "number": (int, float), "null": type(None)}
+    failures = []
+    for index, row in enumerate(raw_rows):
+        if not isinstance(row, dict):
+            failures.append({"type": "schema", "row": index, "message": "row must be an object"})
+            continue
+        missing = sorted(required - row.keys())
+        if missing:
+            failures.append({"type": "required_fields", "row": index, "missing": missing})
+        for name, spec in resolved["specs"].items():
+            kind = str(spec.get("type") or "").lower()
+            if name not in row or kind not in types:
+                continue
+            value = row[name]
+            if value is None and spec.get("nullable") is True:
+                continue
+            if not isinstance(value, types[kind]) or (kind in {"integer", "number"} and isinstance(value, bool)):
+                failures.append({"type": "schema", "row": index, "field": name,
+                                 "expectedType": kind, "message": "declared field type mismatch"})
+    return failures
 
 
 def required_array_field_specs(expected_artifact: Any) -> JsonDict:

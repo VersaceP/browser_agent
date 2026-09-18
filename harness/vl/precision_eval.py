@@ -300,13 +300,13 @@ async def run_manifest(
     manifest_path: str, *, config: Any = None, config_path: str = "config.json",
 ) -> JsonDict:
     """Run the configured VL over a manifest and score it."""
-    from runtime_config import load_runtime_config
+    from runtime_config import load_vl_config
     from harness.vl.core import visual_verify_image
 
     data = load_manifest(manifest_path)
     vl_config = config
     if vl_config is None:
-        vl_config = load_runtime_config(config_path, warn=False).harness.vl
+        vl_config = load_vl_config(config_path)
     base = Path(manifest_path).resolve().parent
 
     predictions: Dict[str, JsonDict] = {}

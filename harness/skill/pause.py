@@ -13,7 +13,7 @@ off the background reader.
 So P4's contract here is: **observe** the pause (never drive it), classify the run
 as `hitl_required`, and hand the live (paused) page off to the BrowserAgent slow
 path — which already owns the proven VL-first + human-fallback HITL machinery
-(harness/hitl.py). The paused page lives in the worker's slot fleet, so the slow
+(harness/runtime/hitl.py). The paused page lives in the worker's slot fleet, so the slow
 path perceives and resolves it. A HITL interruption is NOT a skill failure: it must
 not record a health failure and must not trigger self-heal.
 
@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, Optional
 
-from harness.hitl import (
+from harness.runtime.hitl import (
     _CHALLENGE_STATE_MARKERS,
     _is_challenge_url,
     _is_paused_error_text,

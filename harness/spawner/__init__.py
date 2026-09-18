@@ -52,7 +52,7 @@ from harness.fleet.runtime import (
 )
 from harness.observation.browser_call import extract_page_id_from_values
 from harness.evidence.extraction_artifacts import field_names_from_specs
-from harness.fast_path import assess_fast_path_candidate
+from harness.planning.fast_path import assess_fast_path_candidate
 from harness.results.row_ledger import (
     identity_fields_from_contract,
     row_identity,
@@ -60,11 +60,11 @@ from harness.results.row_ledger import (
     derive_row_ledger,
 )
 from runtime_config import RuntimeConfig
-from harness.lifecycle import LifecycleContext, default_lifecycle_manager
-from harness.model_config import browser_agent_model_config
+from harness.runtime.lifecycle import LifecycleContext, default_lifecycle_manager
+from harness.runtime.model_config import browser_agent_model_config
 from harness.observation.event_observer import unwrap_notification
-from harness.schema_cache import global_schemas_dir
-from harness.schema_loader import CapabilityBundle, load_capability_bundle
+from harness.capabilities.schema_cache import global_schemas_dir
+from harness.capabilities.schema_loader import CapabilityBundle, load_capability_bundle
 from harness.task_control import (
     build_attempt_digest,
     cancel_phase_running_reservation,
@@ -84,9 +84,9 @@ from harness.task_control import (
     load_task_state,
     write_task_state,
 )
-from harness.strategy_telemetry import append_strategy_attempt
-from harness.tool_policy import ALWAYS_FORBIDDEN_ABCP_METHODS
-from harness.templates import get_path
+from harness.planning.strategy_telemetry import append_strategy_attempt
+from harness.tools.tool_policy import ALWAYS_FORBIDDEN_ABCP_METHODS
+from harness.planning.templates import get_path
 from harness.utils import (
     JsonDict,
     RunLogger,
@@ -104,7 +104,7 @@ from harness.results.worker_result import (
     build_worker_handoff_projection,
     build_worker_result_levels,
 )
-from harness.workflow_runtime import workflow_execution_enabled
+from harness.workflow.workflow_runtime import workflow_execution_enabled
 from llm import LLMFactory
 
 from .spawner_classification import (  # noqa: F401

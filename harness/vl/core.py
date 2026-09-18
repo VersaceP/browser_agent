@@ -16,12 +16,9 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional, Set, Tuple
 
 from runtime_config import VLConfig
+from llm.profiles import resolve_target
 from harness.utils import JsonDict
-from llm.thinking import (
-    anthropic_thinking_request,
-    openai_thinking_request,
-    resolve_thinking_intent,
-)
+
 # Single source of truth for "which challenge types may be driven, with which
 # action" — the harness solve loop imports the same table.
 from harness.vl.captcha import TYPE_ACTIONS as _TYPE_ACTIONS
@@ -474,7 +471,9 @@ async def _visual_verify_image(
         question=question,
     )
 
-    provider = (config.provider or "openai").strip().lower()
+    from llm.profiles import resolve_target, OPENAI, ANTHROPIC
+    target = resolve_target(config)
+    provider = "anthropic" if target.api == ANTHROPIC else "openai"
     started = time.monotonic()
     timeout_seconds = (
         float(getattr(config, "captcha_solve_timeout_seconds", 150.0) or 150.0)
@@ -992,7 +991,7 @@ def _finalize_captcha_solve(parsed: JsonDict, usage: JsonDict) -> JsonDict:
 
 # extra_params keys that llm.thinking owns: they are controls, not kwargs, and
 # splatting them into the SDK call would raise TypeError.
-_THINKING_CONTROL_KEYS = ("thinking", "reasoning_effort", "effort")
+_THINKING_CONTROL_KEYS = ("thinking", "reasoning_effort", "effort", "enable_thinking", "thinking_budget")
 
 # Endpoints that answered an explicit "thinking off" request with a parameter
 # refusal.  This is a property of the deployed model rather than of the SDK —
@@ -1013,6 +1012,7 @@ def _requested_thinking_off(params: JsonDict) -> bool:
     extra_body = params.get("extra_body")
     if isinstance(extra_body, dict):
         candidates.append(extra_body.get("thinking"))
+        candidates.append(extra_body.get("enable_thinking"))
     for value in candidates:
         if value is False:
             return True
@@ -1121,6 +1121,20 @@ def _merge_extra_body(params: JsonDict, extra_body: JsonDict) -> None:
     }
 
 
+def _visual_request(config, image_b64, mime_type, prompt, role_extra_params, inherit_base_thinking):
+    from runtime_config import ModelConfig
+    from llm.contracts import LLMRequest
+    from harness.messages.models import TextContent, ImageContent, UserMessage
+    merged = _merged_vl_extra_params(config, role_extra_params, inherit_base_thinking=inherit_base_thinking)
+    merged.setdefault("max_tokens", 800)
+    model = ModelConfig(provider=config.provider, api=config.api, model_id=config.model_id,
+                        api_key=config.api_key, base_url=config.base_url, extra_params=merged)
+    request = LLMRequest(system=[TextContent(text=VISUAL_VERIFY_SYSTEM)], messages=[
+        UserMessage(content=[TextContent(text=prompt), ImageContent(data=image_b64, media_type=mime_type)])
+    ])
+    return request, model
+
+
 async def _call_openai_compatible(
     *,
     config: VLConfig,
@@ -1136,68 +1150,41 @@ async def _call_openai_compatible(
     except ImportError as exc:
         raise RuntimeError("openai SDK is required for vl.provider=openai") from exc
 
-    api_key = config.api_key or os.getenv("OPENAI_API_KEY")
+    api_key = config.api_key or (os.getenv("OPENAI_API_KEY") if config.provider == "openai" else None)
     if not api_key:
         raise RuntimeError("VL OpenAI-compatible api_key is missing")
     # Disable the SDK's hidden retry loop: otherwise a 429/5xx can consume the
     # whole caller timeout and be misreported as a model timeout.
     client = AsyncOpenAI(
         api_key=api_key,
-        base_url=config.base_url,
+        base_url=resolve_target(config).base_url,
         max_retries=0,
         timeout=timeout_seconds,
     )
-    params: JsonDict = {
-        "model": config.model_id,
-        "messages": [
-            {"role": "system", "content": VISUAL_VERIFY_SYSTEM},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{mime_type};base64,{image_b64}",
-                        },
-                    },
-                ],
-            },
-        ],
-        "temperature": 0,
-        "max_tokens": 800,
-    }
-    merged = _merged_vl_extra_params(
-        config,
-        role_extra_params,
-        inherit_base_thinking=inherit_base_thinking,
-    )
-    intent = resolve_thinking_intent(merged)
-    thinking_top, thinking_extra_body, thinking_warnings = openai_thinking_request(
-        intent
-    )
-    params.update(_passthrough_extra_params(merged))
-    params.update(thinking_top)
-    _merge_extra_body(params, thinking_extra_body)
+    from llm.adapters import encode_request, decode_response
+    request, model = _visual_request(config, image_b64, mime_type, prompt, role_extra_params, inherit_base_thinking)
+    from llm.profiles import RESPONSES
+    is_responses = resolve_target(model).api == RESPONSES
+    if not is_responses:
+        model.extra_params.setdefault("temperature", 0)
+    params = encode_request(request, model)
+    create = client.responses.create if is_responses else client.chat.completions.create
     response, refusal_warnings = await _send_allowing_thinking_refusal(
-        lambda: client.chat.completions.create(**params),
+        lambda: create(**params),
         config=config,
         params=params,
     )
-    text = response.choices[0].message.content or ""
-    usage = getattr(response, "usage", None)
-    meta: JsonDict = {
-        "provider": "openai",
-        "model": config.model_id,
-        "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0,
-        "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0) if usage else 0,
-        "stop_reason": str(getattr(response.choices[0], "finish_reason", "") or ""),
-        "content_block_types": ["text"] if text else [],
+    result = decode_response(response, model)
+    meta = {
+        "provider": config.provider, "model": config.model_id,
+        "prompt_tokens": result.usage.input_tokens or 0,
+        "completion_tokens": result.usage.output_tokens or 0,
+        "stop_reason": result.message.raw_stop_reason or "",
+        "content_block_types": result.message.block_kinds(),
     }
-    warnings = (*intent.warnings, *thinking_warnings, *refusal_warnings)
-    if warnings:
-        meta["thinking_warnings"] = list(warnings)
-    return text, meta
+    if refusal_warnings:
+        meta["thinking_warnings"] = list(refusal_warnings)
+    return result.message.text(), meta
 
 
 async def _call_anthropic_compatible(
@@ -1215,79 +1202,36 @@ async def _call_anthropic_compatible(
     except ImportError as exc:
         raise RuntimeError("anthropic SDK is required for vl.provider=anthropic") from exc
 
-    api_key = config.api_key or os.getenv("ANTHROPIC_AUTH_TOKEN")
+    api_key = config.api_key or (os.getenv("ANTHROPIC_AUTH_TOKEN") if config.provider == "anthropic" else None)
     if not api_key:
         raise RuntimeError("VL Anthropic-compatible api_key is missing")
     client = AsyncAnthropic(
         api_key=api_key,
-        base_url=config.base_url,
+        base_url=resolve_target(config).base_url,
         max_retries=0,
         timeout=timeout_seconds,
     )
-    params: JsonDict = {
-        "model": config.model_id,
-        "system": VISUAL_VERIFY_SYSTEM,
-        "max_tokens": int((config.extra_params or {}).get("max_tokens", 800)),
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": mime_type,
-                            "data": image_b64,
-                        },
-                    },
-                ],
-            }
-        ],
-    }
-    # Symmetric with the OpenAI-compatible path: vl.extra_params applies to
-    # every VL role, and the role's own section overlays it.
-    merged = _merged_vl_extra_params(
-        config,
-        role_extra_params,
-        inherit_base_thinking=inherit_base_thinking,
-    )
-    intent = resolve_thinking_intent(merged)
-    thinking_native, thinking_warnings = anthropic_thinking_request(
-        intent,
-        merged.get("max_tokens", params["max_tokens"]),
-    )
-    params.update(_passthrough_extra_params(merged))
-    params.update(thinking_native)
+    from llm.adapters import encode_request, decode_response
+    request, model = _visual_request(config, image_b64, mime_type, prompt, role_extra_params, inherit_base_thinking)
+    params = encode_request(request, model)
     response, refusal_warnings = await _send_allowing_thinking_refusal(
         lambda: client.messages.create(**params),
         config=config,
         params=params,
     )
-    text = ""
-    block_types = []
-    for block in response.content:
-        block_type = str(getattr(block, "type", "") or "unknown")
-        block_types.append(block_type)
-        if block_type == "text":
-            text += getattr(block, "text", "") or ""
-    usage = getattr(response, "usage", None)
-    meta: JsonDict = {
-        "provider": "anthropic",
-        "model": config.model_id,
-        "input_tokens": int(getattr(usage, "input_tokens", 0) or 0) if usage else 0,
-        "output_tokens": int(getattr(usage, "output_tokens", 0) or 0) if usage else 0,
-        "stop_reason": str(getattr(response, "stop_reason", "") or ""),
+    result = decode_response(response, model)
+    block_types = result.message.block_kinds()
+    meta = {
+        "provider": config.provider, "model": config.model_id,
+        "input_tokens": result.usage.input_tokens or 0,
+        "output_tokens": result.usage.output_tokens or 0,
+        "stop_reason": result.message.raw_stop_reason or "",
         "content_block_types": block_types,
-        "thinking_block_count": sum(
-            1 for block_type in block_types
-            if block_type in {"thinking", "redacted_thinking"}
-        ),
+        "thinking_block_count": len(result.message.thinking_blocks()),
     }
-    warnings = (*intent.warnings, *thinking_warnings, *refusal_warnings)
-    if warnings:
-        meta["thinking_warnings"] = list(warnings)
-    return text, meta
+    if refusal_warnings:
+        meta["thinking_warnings"] = list(refusal_warnings)
+    return result.message.text(), meta
 
 
 def _vl_provider_error_type(exc: BaseException) -> str:

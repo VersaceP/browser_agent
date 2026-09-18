@@ -4,6 +4,7 @@ harness.task_control.artifact_validation - Worker artifact validation and classi
 
 from __future__ import annotations
 
+from harness.evidence.extraction_artifacts import current_row_structure_failures
 from pathlib import Path
 from typing import Any
 from typing import List
@@ -23,6 +24,7 @@ from harness.evidence.extraction_artifacts import field_name_from_spec
 from harness.evidence.artifact_evidence import detect_near_stub_rows
 from harness.evidence.artifact_evidence import detect_placeholder_rows
 from harness.evidence.validation_observations import validation_observations
+from harness.evidence.file_evidence import declared_file_paths
 from harness.evidence.artifact_evidence import observe_placeholder_text_rows
 from harness.evidence.artifact_evidence import detect_stub_rows
 from harness.utils import JsonDict
@@ -278,7 +280,7 @@ def validate_worker_artifacts(
         })
 
     # Same-name artifact selection (fa86c5f6 fix): within the first non-empty
-    # tier, order candidates best-first (no schemaWarnings > more rows >
+    # tier, order candidates best-first (current valid structure > more rows >
     # recorded later) and pick the FIRST one that passes every validator; if
     # none passes, keep the heuristic-best and report ITS failures. The old
     # first-recorded pick validated a schema-flagged batch dump into a bogus
@@ -287,8 +289,7 @@ def validate_worker_artifacts(
         def sort_key(pair):
             idx, item = pair
             payload = item.get("payload") or {}
-            schema_warnings = payload.get("schemaWarnings")
-            has_warnings = 1 if isinstance(schema_warnings, list) and schema_warnings else 0
+            has_warnings = bool(current_row_structure_failures(payload.get("rows"), expected))
             rows_list = payload.get("rows")
             n_rows = len(rows_list) if isinstance(rows_list, list) else 0
             return (has_warnings, -n_rows, -idx)
@@ -301,15 +302,8 @@ def validate_worker_artifacts(
         cand_rows: List[JsonDict] = []
         if item:
             payload = item.get("payload") or {}
-            schema_warnings = payload.get("schemaWarnings")
-            if isinstance(schema_warnings, list) and schema_warnings:
-                cand_failures.append({
-                    "type": "schema",
-                    "message": "selected record_extraction artifact has schemaWarnings",
-                    "path": item.get("path"),
-                    "schemaWarnings": schema_warnings[:5],
-                })
             raw_rows = payload.get("rows")
+            cand_failures.extend(current_row_structure_failures(raw_rows, expected))
             if isinstance(raw_rows, list):
                 cand_rows = [row for row in raw_rows if isinstance(row, dict)]
             else:
@@ -377,13 +371,14 @@ def validate_worker_artifacts(
             rows = cumulative_rows
             failures = []
             warnings = _empty_array_observations(rows, expected)
-            # Word-list placeholder readings inform the Lead; they do not fail the
-            # phase. The reader has the page evidence and the user's request, which
-            # is what deciding this actually takes.
-            warnings.extend(
-        observe_placeholder_text_rows(rows, expected_artifact=expected)
-    )
+            warnings.extend(observe_placeholder_text_rows(rows, expected_artifact=expected))
             cumulative = True
+
+    for candidate in [*prior_candidates, *attempt_candidates, *candidates]:
+        legacy = (candidate.get("payload") or {}).get("schemaWarnings")
+        if isinstance(legacy, list) and legacy:
+            warnings.append({"type": "historical_schema_warnings", "path": candidate.get("path"),
+                             "warnings": legacy[:5], "enforcement": "advisory"})
 
     semantic_observations, reference_failures = validation_observations(
         rows, expected, validators, task_dir=task_dir, logger=logger,
@@ -394,6 +389,17 @@ def validate_worker_artifacts(
 
     file_failures: List[JsonDict] = []
     for validator in file_validators:
+        if validator.get("type") == "file_integrity":
+            known_paths = set(validation_file_artifacts)
+            declared_fields = set(validator.get("path_fields") or [])
+            unknown_paths = [path for path in declared_file_paths(rows, declared_fields)
+                             if path not in known_paths]
+            if unknown_paths:
+                semantic_observations.append({
+                    "type": "file_provenance_unverified", "enforcement": "advisory",
+                    "paths": unknown_paths[:20], "totalCount": len(unknown_paths),
+                    "message": "Declared files lack captured production receipts; physical integrity is checked separately. They may be authorized existing inputs. Assess origin against the original objective; do not redownload merely to register ownership.",
+                })
         file_failures.extend(_tc()._run_file_validator(
             validator,
             artifacts=validation_file_artifacts,
@@ -502,8 +508,8 @@ def validate_worker_artifacts(
             scope = selected_payload.get("evidenceContext")
             sink_scope = dict(scope) if isinstance(scope, dict) else {}
             sink_row_scopes = [sink_scope] * len(rows)
-            if selected_payload.get("schemaWarnings"):
-                sink_rejection = "schema_warning_artifact"
+            if current_row_structure_failures(selected_payload.get("rows"), expected):
+                sink_rejection = "invalid_artifact_structure"
         try:
             evidence_sink({
                 "rows": sink_rows,

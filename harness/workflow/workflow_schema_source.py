@@ -21,7 +21,7 @@ by the contract file's modification time: a refreshed cache is re-read rather
 than served from a cache frozen at import.  The derivation is also lazy, so
 importing this module never pins a revision.
 
-What this is NOT: run-scoped.  ``harness.workflow_policy`` has no runtime
+What this is NOT: run-scoped.  ``harness.workflow.workflow_policy`` has no runtime
 config, so it reads the default location (``<worktree parent>/
 global_schema_cache/schemas``, which is the repo root under the default
 ``worktree_dir``).  A caller that knows the configured worktree should pass
@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
-from harness.schema_cache import global_schemas_dir
+from harness.capabilities.schema_cache import global_schemas_dir
 from harness.utils import JsonDict
 
 EXECUTE_SCHEMA_FILE = "Workflow.execute.json"
@@ -112,7 +112,7 @@ class WorkflowContract:
 
 def default_schemas_dir() -> Path:
     """Where the cache lands under the default ``worktree_dir``."""
-    return Path(__file__).resolve().parent.parent / "global_schema_cache" / "schemas"
+    return Path(__file__).resolve().parents[2] / "global_schema_cache" / "schemas"
 
 
 #: The directory this run's schema bootstrap actually wrote. Bound once, at the

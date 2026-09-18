@@ -10,7 +10,7 @@ from harness.results.call_outcome import replay_forbidden
 from harness.constants import COLLECTION_CONTRACT_REPLAN_REQUIRED
 from harness.observation.overlay_detector import detect_overlay_from_result
 from harness.observation.verifiers import probe_collection_state
-from harness.scroll_receipt import scroll_dispatch_target
+from harness.observation.scroll_receipt import scroll_dispatch_target
 from harness.utils import JsonDict, optional_int
 
 

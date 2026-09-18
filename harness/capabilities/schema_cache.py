@@ -1,5 +1,5 @@
 """
-harness.schema_cache - Global ABCP capability schema cache helpers.
+harness.capabilities.schema_cache - Global ABCP capability schema cache helpers.
 """
 
 from __future__ import annotations

@@ -635,6 +635,8 @@ def _validate_recorded_extraction(agent: Any, saved_path: str) -> JsonDict:
             phase_id=phase_id,
             exclude_worker_id=getattr(agent, "worker_id", None),
         )
+        from harness.tools.browser_tools.downloads import sync_download_artifacts
+        sync_download_artifacts(agent)
         return validate_worker_artifacts(
             contract=contract,
             artifacts=list(getattr(agent, "artifacts", []) or []),

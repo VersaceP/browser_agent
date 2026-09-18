@@ -67,7 +67,7 @@ from harness.storage.base import (
     SNAPSHOT_KEY_TASK_STATE,
 )
 from harness.results.row_ledger import ROW_OUTCOMES, field_absence_accepted
-from harness.pacing import (
+from harness.planning.pacing import (
     MAX_PACING_INTERVAL_SECONDS,
     PACING_FIELDS,
     PACING_INTERVAL_FIELDS,
@@ -76,7 +76,7 @@ from harness.pacing import (
     normalized_pacing,
     parse_utc_timestamp,
 )
-from harness.task_types import (
+from harness.planning.task_types import (
     VALID_TASK_TYPES,
     normalize_task_type,
     resolve_task_type_fail_closed,

@@ -4,6 +4,10 @@ harness.task_control.phase_lifecycle - Phase running/result transitions, resume 
 
 from __future__ import annotations
 
+from harness.utils import open_artifact_binary, read_artifact_text
+import io
+
+
 import json
 import copy
 import csv
@@ -19,9 +23,9 @@ from typing import Set
 from harness.constants import WORKER_STATUS_DONE
 from harness.constants import WORKER_STATUS_PARTIAL
 from harness.evidence.artifact_evidence import FILE_VALIDATOR_TYPES
-from harness.pacing import jittered_interval
-from harness.pacing import merge_pacing
-from harness.pacing import parse_utc_timestamp
+from harness.planning.pacing import jittered_interval
+from harness.planning.pacing import merge_pacing
+from harness.planning.pacing import parse_utc_timestamp
 from harness.utils import JsonDict
 from harness.utils import RunLogger
 from harness.utils import read_task_file_text
@@ -47,6 +51,7 @@ def continuation_receipt_id(
     worker_id: str,
     phase: Optional[JsonDict],
     worker_contract: Optional[JsonDict],
+    execution_contract_hash: Optional[str] = None,
 ) -> str:
     """Stable identity for one worker's continuation decision.
 
@@ -59,7 +64,7 @@ def continuation_receipt_id(
         "runId": str(getattr(logger, "run_id", "") or ""),
         "phaseId": str(phase_id or ""),
         "workerId": str(worker_id or ""),
-        "contractHash": _tc().contract_hash_for_phase(
+        "contractHash": execution_contract_hash or _tc().contract_hash_for_phase(
             phase, worker_contract if isinstance(worker_contract, dict) else {},
         ),
     }
@@ -194,9 +199,9 @@ def record_phase_dispatch_input(
     phase_state = _tc()._phase_state(state, phase_id)
     if not isinstance(phase_state, dict):
         return
-    phase_state["continuation_dispatch_input"] = trim_large_strings(
-        copy.deepcopy(dispatch_input), 16000,
-    )
+    # This is executable state, not a model-facing preview. Truncation changes
+    # contracts and breaks continuation identity after a process restart.
+    phase_state["continuation_dispatch_input"] = copy.deepcopy(dispatch_input)
     _tc().write_task_state(logger, state)
 
 
@@ -208,6 +213,28 @@ def phase_dispatch_input(logger: RunLogger, *, phase_id: str) -> JsonDict:
         if isinstance(phase_state, dict) else None
     )
     return copy.deepcopy(value) if isinstance(value, dict) else {}
+
+def record_phase_execution_contract(
+    logger: RunLogger, *, phase_id: Optional[str], worker_id: str,
+    phase: Optional[JsonDict], worker_contract: JsonDict,
+) -> None:
+    """Freeze the compiled contract at successful dispatch, before worker mutation."""
+    if not phase_id:
+        return
+    state = _tc().load_task_state(logger)
+    phase_state = _tc()._phase_state(state, phase_id)
+    if not isinstance(phase_state, dict):
+        return
+    phase_state["execution_contract"] = {
+        "protocol": "phase-execution-contract-v1", "workerId": worker_id,
+        "planVersion": state.get("plan_version"),
+        "workerContract": copy.deepcopy(worker_contract),
+        "phaseHash": _tc().contract_hash_for_phase(phase, {}),
+        "contractHash": _tc().contract_hash_for_phase(phase, worker_contract),
+        "dispatchInput": copy.deepcopy(phase_state.get("continuation_dispatch_input") or {}),
+    }
+    _tc().write_task_state(logger, state)
+
 
 def mark_phase_running(
     logger: RunLogger,
@@ -350,12 +377,19 @@ def mark_phase_result(
         isinstance(continuation, dict)
         and continuation.get("protocol") == CONTINUATION_PROTOCOL
     ):
+        snapshot = phase_state.get("execution_contract")
+        execution_hash = (
+            snapshot.get("contractHash")
+            if isinstance(snapshot, dict) and snapshot.get("workerId") == worker_id
+            else None
+        )
         receipt_id = continuation_receipt_id(
             logger,
             phase_id=str(phase_id),
             worker_id=worker_id,
             phase=phase,
             worker_contract=worker_contract,
+            execution_contract_hash=execution_hash,
         )
         decision = trim_large_strings(copy.deepcopy(continuation), 4000)
         attempt["continuation"] = decision
@@ -369,9 +403,8 @@ def mark_phase_result(
                 "sourceWorkerId": str(worker_id),
                 "phaseId": str(phase_id),
                 "planVersion": state.get("plan_version"),
-                "contractHash": _tc().contract_hash_for_phase(
-                    phase,
-                    worker_contract if isinstance(worker_contract, dict) else {},
+                "contractHash": execution_hash or _tc().contract_hash_for_phase(
+                    phase, worker_contract if isinstance(worker_contract, dict) else {},
                 ),
                 "decision": decision,
                 "receivedAt": _tc().utc_now_iso(),
@@ -654,67 +687,53 @@ def _resume_artifact_is_readable(logger: RunLogger, value: Any) -> bool:
     if not str(value or "").strip():
         return False
     path = _resume_artifact_path(logger, value)
-    if path.is_file():
-        try:
-            with path.open("rb") as artifact_file:
-                artifact_file.read(1)
-        except OSError:
-            return False
+    try:
+        with open_artifact_binary(logger, path) as resource:
+            resource.read(1)
         return True
-    return task_file_exists(logger, str(path))
+    except (OSError, UnicodeError):
+        return False
 
 def _artifact_sha256(path: Path, logger: Optional[RunLogger] = None) -> str:
-    """Digest an artifact's bytes from whichever backend holds them."""
-
-    if logger is not None and not path.is_file():
-        text = read_task_file_text(logger, str(path))
-        if text is None:
-            return ""
-        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    """Digest authoritative bytes; keep native file hashing streamed."""
     digest = hashlib.sha256()
     try:
-        with path.open("rb") as artifact_file:
-            for chunk in iter(lambda: artifact_file.read(1024 * 1024), b""):
+        with open_artifact_binary(logger, path) as resource:
+            for chunk in iter(lambda: resource.read(1024 * 1024), b""):
                 digest.update(chunk)
-    except OSError:
+    except (OSError, UnicodeError):
         return ""
     return digest.hexdigest()
 
 def _legacy_artifact_syntax_error(path: Path, logger: Optional[RunLogger] = None) -> str:
-    """Return a terse integrity error for legacy artifacts without a digest."""
-
+    """Check legacy syntax against the same source used for digest checks."""
     suffix = path.suffix.lower()
-    text: Optional[str] = None
-    if logger is not None and not path.is_file():
-        text = read_task_file_text(logger, str(path))
-        if text is None:
-            return "missing_or_unreadable"
+    if suffix not in {".json", ".jsonl", ".csv"}:
+        return ""
     try:
+        text = read_artifact_text(logger, path)
         if suffix == ".json":
-            json.loads(text if text is not None else path.read_text(encoding="utf-8"))
+            json.loads(text)
         elif suffix == ".jsonl":
             saw_record = False
-            with path.open("r", encoding="utf-8") as artifact_file:
-                for line_number, line in enumerate(artifact_file, start=1):
-                    if not line.strip():
-                        continue
-                    saw_record = True
-                    try:
-                        json.loads(line)
-                    except json.JSONDecodeError as exc:
-                        return f"invalid_jsonl_line:{line_number}:{exc.msg}"
+            for line_number, line in enumerate(io.StringIO(text), start=1):
+                if not line.strip():
+                    continue
+                saw_record = True
+                try:
+                    json.loads(line)
+                except json.JSONDecodeError as exc:
+                    return f"invalid_jsonl_line:{line_number}:{exc.msg}"
             if not saw_record:
                 return "empty_jsonl"
         elif suffix == ".csv":
-            with path.open("r", encoding="utf-8", newline="") as artifact_file:
-                rows = list(csv.reader(artifact_file, strict=True))
+            rows = list(csv.reader(io.StringIO(text, newline=""), strict=True))
             if not rows or not rows[0]:
                 return "empty_csv"
-            width = len(rows[0])
-            if any(len(row) != width for row in rows[1:]):
+            if any(len(row) != len(rows[0]) for row in rows[1:]):
                 return "inconsistent_csv_columns"
     except (OSError, UnicodeError, json.JSONDecodeError, csv.Error) as exc:
-        return f"invalid_{suffix.lstrip('.') or 'artifact'}:{exc}"
+        return f"invalid_{suffix.lstrip('.')}:{exc}"
     return ""
 
 def _artifact_recorded_digest(

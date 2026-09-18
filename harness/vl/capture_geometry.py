@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from harness.scroll_receipt import (
+from harness.observation.scroll_receipt import (
     axis_magnitude as _magnitude,
     looks_like_scroll_receipt,
     scroll_delta_magnitude,

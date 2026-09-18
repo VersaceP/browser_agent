@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional
 from urllib.parse import urlparse
 
-from harness.axtree_format import parse_axtree_line
+from harness.observation.axtree_format import parse_axtree_line
 from harness.utils import JsonDict
 
 

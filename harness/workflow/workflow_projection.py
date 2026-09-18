@@ -38,7 +38,7 @@ import copy
 import uuid
 from typing import Any, Dict, List, Optional
 
-from harness.offload import store_offloaded_payload
+from harness.context.offload import store_offloaded_payload
 from harness.utils import (
     JsonDict,
     RunLogger,

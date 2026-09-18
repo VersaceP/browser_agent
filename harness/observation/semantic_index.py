@@ -25,7 +25,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from harness.observation.browser_call import build_browser_call_runner
-from harness.semantic_frames import graph_digest, root_tree
+from harness.observation.semantic_frames import graph_digest, root_tree
 from harness.utils import JsonDict
 
 # A real list/card row has non-trivial geometry; utility/leaf groups (inline
@@ -204,7 +204,7 @@ async def _call_semantic_tree(agent: Any, params: JsonDict) -> Optional[JsonDict
 
     The action returns a frame graph; only the root frame's tree is digested,
     because a selector mined from an iframe cannot be handed back to a DOM read
-    (see harness.semantic_frames). Frames left unread are logged rather than
+    (see harness.observation.semantic_frames). Frames left unread are logged rather than
     dropped silently, so a later "no candidates" has an explanation."""
     runner = getattr(agent, "browser_call_runner", None)
     if runner is None:

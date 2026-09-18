@@ -9,7 +9,7 @@ import hashlib
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from harness.utils import JsonDict
+from harness.utils import JsonDict, read_artifact_text, open_artifact_binary
 
 
 def terminal_consistency_contradictions(
@@ -122,10 +122,10 @@ def _resolved(value: Any) -> str:
         return text
 
 
-def _file_sha256(path: str) -> str:
+def _file_sha256(path: str, logger: Any = None) -> str:
     digest = hashlib.sha256()
     try:
-        with Path(path).open("rb") as stream:
+        with open_artifact_binary(logger, path) as stream:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(chunk)
     except (OSError, ValueError):
@@ -134,7 +134,7 @@ def _file_sha256(path: str) -> str:
 
 
 def artifact_generation_view(
-    state: JsonDict, paths: List[str],
+    state: JsonDict, paths: List[str], logger: Any = None,
 ) -> Tuple[List[str], Dict[str, Set[str]]]:
     """Return the active delivered generation and each known artifact lineage.
 
@@ -206,17 +206,11 @@ def artifact_generation_view(
         has_integrity_record = bool(
             digests.get(deliverable_identity) or digests.get(deliverable)
         )
-        try:
-            deliverable_exists = Path(deliverable_identity).is_file()
-        except (OSError, ValueError):
-            deliverable_exists = False
-        if has_integrity_record and not deliverable_exists:
-            continue
         if has_integrity_record:
             expected_digest = str(
                 digests.get(deliverable_identity) or digests.get(deliverable) or ""
             ).strip().lower()
-            actual_digest = _file_sha256(deliverable_identity)
+            actual_digest = _file_sha256(deliverable_identity, logger)
             if actual_digest != expected_digest:
                 continue
 
@@ -240,13 +234,13 @@ def artifact_generation_view(
     return active, lineage
 
 
-def _apply_supersessions(state: JsonDict, paths: List[str]) -> List[str]:
+def _apply_supersessions(state: JsonDict, paths: List[str], logger: Any = None) -> List[str]:
     """Apply valid merge edges to the current active artifact generation."""
-    active, _lineage = artifact_generation_view(state, paths)
+    active, _lineage = artifact_generation_view(state, paths, logger)
     return active
 
 
-def _validated_artifacts(state: JsonDict) -> List[str]:
+def _validated_artifacts(state: JsonDict, logger: Any = None) -> List[str]:
     active_ledger = state.get("artifacts")
     if isinstance(active_ledger, list) and active_ledger:
         # task_state.artifacts is the coordinator's active validated generation
@@ -254,7 +248,7 @@ def _validated_artifacts(state: JsonDict) -> List[str]:
         # not double-counted across replans/remediation.
         return _apply_supersessions(state, list(dict.fromkeys(
             str(value) for value in active_ledger if value
-        )))
+        )), logger)
     paths: List[str] = []
     phases = state.get("phases") if isinstance(state.get("phases"), dict) else {}
     for phase in phases.values():
@@ -263,15 +257,15 @@ def _validated_artifacts(state: JsonDict) -> List[str]:
         values = phase.get("validated_artifacts")
         if isinstance(values, list):
             paths.extend(str(value) for value in values if value)
-    return _apply_supersessions(state, list(dict.fromkeys(paths)))
+    return _apply_supersessions(state, list(dict.fromkeys(paths)), logger)
 
 
-def _artifact_row_count(paths: List[str]) -> int:
+def _artifact_row_count(paths: List[str], logger: Any = None) -> int:
     count = 0
     for raw_path in paths:
         try:
-            payload = json.loads(Path(raw_path).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            payload = json.loads(read_artifact_text(logger, raw_path))
+        except (OSError, UnicodeError, json.JSONDecodeError):
             continue
         rows = payload.get("rows") if isinstance(payload, dict) else None
         if isinstance(rows, list):
@@ -282,13 +276,14 @@ def _artifact_row_count(paths: List[str]) -> int:
 def _build_completion_receipt_from_results(
     task_state: JsonDict,
     results: Iterable[JsonDict],
+    logger: Any = None,
 ) -> JsonDict:
     phases = task_state.get("phases") if isinstance(task_state.get("phases"), dict) else {}
     validated_phase_count = sum(
         1 for value in phases.values()
         if isinstance(value, dict) and value.get("status") == "validated_done"
     )
-    artifact_paths = _validated_artifacts(task_state)
+    artifact_paths = _validated_artifacts(task_state, logger)
 
     download_operations: Dict[str, JsonDict] = {}
     observed_challenge = False
@@ -345,7 +340,7 @@ def _build_completion_receipt_from_results(
     return {
         "artifact": {
             "validatedPhases": validated_phase_count,
-            "validatedRows": _artifact_row_count(artifact_paths),
+            "validatedRows": _artifact_row_count(artifact_paths, logger),
             "validatedArtifacts": len(artifact_paths),
         },
         "downloads": {
@@ -367,11 +362,12 @@ def _build_completion_receipt_from_results(
     }
 
 
-def build_completion_receipt(*, state: Any, spawner: Any) -> JsonDict:
+def build_completion_receipt(*, state: Any, spawner: Any, logger: Any = None) -> JsonDict:
     task_state = state if isinstance(state, dict) else {}
     return _build_completion_receipt_from_results(
         task_state,
         _finished_worker_results(spawner),
+        logger=logger if logger is not None else getattr(spawner, "logger", None),
     )
 
 
@@ -431,7 +427,7 @@ def _challenge_identity(
     )
 
 
-def _completion_evidence(*, state: JsonDict, spawner: Any, run_id: str) -> JsonDict:
+def _completion_evidence(*, state: JsonDict, spawner: Any, run_id: str, logger: Any = None) -> JsonDict:
     phases = state.get("phases") if isinstance(state.get("phases"), dict) else {}
     validated_phase_ids = sorted(
         str(phase_id)
@@ -467,7 +463,7 @@ def _completion_evidence(*, state: JsonDict, spawner: Any, run_id: str) -> JsonD
 
     return {
         "validatedPhaseIds": validated_phase_ids,
-        "artifactPaths": _validated_artifacts(state),
+        "artifactPaths": _validated_artifacts(state, logger if logger is not None else getattr(spawner, "logger", None)),
         "downloadOperations": list(downloads.values()),
         "challengeOperations": list(challenges.values()),
     }
@@ -486,6 +482,7 @@ def _merge_cumulative_evidence(
     *,
     state: JsonDict,
     current_evidence: JsonDict,
+    logger: Any = None,
 ) -> JsonDict:
     """Build a cross-run receipt from operation evidence, not prior totals."""
     downloads: Dict[str, JsonDict] = {}
@@ -558,6 +555,7 @@ def _merge_cumulative_evidence(
     return _build_completion_receipt_from_results(
         cumulative_state,
         cumulative_results,
+        logger=logger,
     )
 
 
@@ -566,18 +564,22 @@ def _build_resume_completion_receipt(
     state: Any,
     spawner: Any,
     run_id: Any,
+    logger: Any = None,
 ) -> Tuple[JsonDict, JsonDict]:
     normalized_run_id = _require_run_id(run_id)
     task_state = state if isinstance(state, dict) else {}
-    current = build_completion_receipt(state=task_state, spawner=spawner)
+    logger = logger if logger is not None else getattr(spawner, "logger", None)
+    current = build_completion_receipt(state=task_state, spawner=spawner, logger=logger)
     evidence = _completion_evidence(
         state=task_state,
         spawner=spawner,
         run_id=normalized_run_id,
+        logger=logger,
     )
     cumulative = _merge_cumulative_evidence(
         state=task_state,
         current_evidence=evidence,
+        logger=logger if logger is not None else getattr(spawner, "logger", None),
     )
     return {
         "runId": normalized_run_id,
@@ -591,6 +593,7 @@ def build_resume_completion_receipt(
     state: Any,
     spawner: Any,
     run_id: Any,
+    logger: Any = None,
 ) -> JsonDict:
     """Return current-run and deduplicated cumulative mechanical receipts.
 
@@ -602,6 +605,7 @@ def build_resume_completion_receipt(
         state=state,
         spawner=spawner,
         run_id=run_id,
+        logger=logger,
     )
     return receipt
 
@@ -621,6 +625,7 @@ def persist_completion_receipt(
         state=state,
         spawner=spawner,
         run_id=normalized_run_id,
+        logger=logger,
     )
     resumed_from = str(getattr(logger, "resumed_from", "") or "").strip()
     if resumed_from:

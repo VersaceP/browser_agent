@@ -6,9 +6,9 @@ import re
 from typing import Any
 from typing import Optional
 from harness.observation.page_lifecycle import PageLifecycleTracker
-from harness.progress import extraction_artifact_count
-from harness.task_types import resolve_task_type_fail_closed
-from harness.tool_policy import disabled_reason_for_method
+from harness.observation.progress import extraction_artifact_count
+from harness.planning.task_types import resolve_task_type_fail_closed
+from harness.tools.tool_policy import disabled_reason_for_method
 from harness.utils import JsonDict
 from harness.utils import optional_int
 

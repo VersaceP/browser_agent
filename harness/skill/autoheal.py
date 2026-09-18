@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 from harness.skill.distiller import load_distiller
 from harness.skill.heal import self_heal
 from harness.skill.registry import Skill
-from harness.workflow_policy import harden_navigation_lifecycle
+from harness.workflow.workflow_policy import harden_navigation_lifecycle
 
 # Backward-compatible name used by skill/create.py and existing tests.
 _load_distiller = load_distiller

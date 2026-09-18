@@ -4,7 +4,7 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from harness.axtree_format import (
+from harness.observation.axtree_format import (
     AXTREE_FLAG_GROUP_RE,
     AXTREE_KNOWN_FLAGS,
     AXTREE_LAYOUT_FLAGS,
@@ -15,6 +15,7 @@ from harness.axtree_format import (
     parse_axtree_line,
 )
 from harness.utils import JsonDict
+from harness.workflow.workflow_runtime import workflow_execution_enabled
 
 
 def _response_data(result: JsonDict) -> JsonDict:
@@ -38,7 +39,7 @@ AXTREE_LINE_RE = re.compile(
     r"(?P<role>[^\s\"]+)(?:\s+\"(?P<name>.*?)\")?(?P<rest>.*)$"
 )
 
-# The compact-line format itself lives in harness.axtree_format so the AX cache
+# The compact-line format itself lives in harness.observation.axtree_format so the AX cache
 # and the fleet auth verifier read it through one parser (px space of the rect
 # is a pending live probe; see abcp-panel-quirks #11). Re-exported here because
 # these names are part of this module's existing surface.
@@ -376,6 +377,23 @@ def _check_stale_axtree_target(
     else:
         return None
 
+    next_instruction = (
+        "DOM changed or the target id is not from the current AXTree epoch."
+        " Call Page.getState if lifecycle is uncertain, then DOM.getAXTree"
+        " for this page and derive a fresh id before retrying. Pairing a"
+        " stable selector with an id that this page HAS shown before lets"
+        " the call through (ABCP resolves the id first and falls back to"
+        " the selector), but a selector never licenses an id from another"
+        " page or one this page never had: resolution is id-first and a"
+        " foreign id can match an unrelated live node."
+    )
+    if workflow_execution_enabled(agent):
+        next_instruction += (
+            " When this action is one of several already decided, put the"
+            " fresh DOM.getAXTree read, a transform search of it, and those"
+            " actions in one execute_browser_workflow segment instead of"
+            " spending a turn per call."
+        )
     return {
         "status": "stale_element_reference",
         "reason": reason,
@@ -386,16 +404,7 @@ def _check_stale_axtree_target(
         "targetIds": sorted(target_ids),
         "missingIds": missing,
         "tool_was_executed": False,
-        "next_instruction": (
-            "DOM changed or the target id is not from the current AXTree epoch."
-            " Call Page.getState if lifecycle is uncertain, then DOM.getAXTree"
-            " for this page and derive a fresh id before retrying. Pairing a"
-            " stable selector with an id that this page HAS shown before lets"
-            " the call through (ABCP resolves the id first and falls back to"
-            " the selector), but a selector never licenses an id from another"
-            " page or one this page never had: resolution is id-first and a"
-            " foreign id can match an unrelated live node."
-        ),
+        "next_instruction": next_instruction,
     }
 
 

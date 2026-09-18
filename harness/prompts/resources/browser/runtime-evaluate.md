@@ -4,7 +4,7 @@ audience: browser
 version: "2026-09-08"
 description: Runtime.evaluate world selection, audit receipts, and legacy JSON extraction compatibility.
 sources:
-  - harness/runtime_evaluation.py
+  - harness/tools/runtime_evaluation.py
   - harness/tools/browser_tools/runtime_eval.py
   - harness/tools/browser_tools/capability.py
 emitter_sources:

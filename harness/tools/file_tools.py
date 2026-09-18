@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from harness.utils import JsonDict
-from harness.offload import store_offloaded
+from harness.context.offload import store_offloaded
 
 
 _TASK_OUTPUT_DIRS = frozenset({"observations", "deliverables", "scratchpad"})

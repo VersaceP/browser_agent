@@ -8,9 +8,9 @@ from typing import List
 from typing import Optional
 from typing import Tuple
 from pathlib import Path
-from harness.screenshot_policy import normalize_screenshot_output_params
-from harness.schema_loader import schema_param_spec
-from harness.schema_loader import schema_param_specs
+from harness.tools.screenshot_policy import normalize_screenshot_output_params
+from harness.capabilities.schema_loader import schema_param_spec
+from harness.capabilities.schema_loader import schema_param_specs
 from harness.utils import JsonDict
 from .axtree_state import AXTREE_ID_RE
 

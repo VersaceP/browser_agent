@@ -1,5 +1,5 @@
 """
-harness.strategy_bank - Strategy guidance for common browser tasks.
+harness.planning.strategy_bank - Strategy guidance for common browser tasks.
 """
 
 from __future__ import annotations
@@ -8,8 +8,8 @@ import json
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
-from harness.task_types import normalize_task_type
-from harness.tool_policy import task_type_capability_covers
+from harness.planning.task_types import normalize_task_type
+from harness.tools.tool_policy import task_type_capability_covers
 from harness.utils import JsonDict, trim_large_strings
 
 

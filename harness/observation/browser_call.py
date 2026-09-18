@@ -25,7 +25,7 @@ do it.
 from typing import Any, Dict, List, Optional, Set
 
 from abcp_client import ABCPClient, ABCPTransportError
-from harness.tool_policy import collect_sensitive_replacements, redact_values
+from harness.tools.tool_policy import collect_sensitive_replacements, redact_values
 from harness.utils import JsonDict, RunLogger
 
 

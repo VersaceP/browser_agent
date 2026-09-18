@@ -21,7 +21,7 @@ import uuid
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from harness.pacing import wait_between_rows
+from harness.planning.pacing import wait_between_rows
 from harness.skill.pause import HitlOnsetMonitor, classify_run_for_hitl
 from harness.skill.registry import Skill, SkillRegistry, canonical_field
 from harness.skill.workflow import (
@@ -29,7 +29,7 @@ from harness.skill.workflow import (
     check_success_contract,
     run_skill_workflow,
 )
-from harness.workflow_auth_fence import (
+from harness.workflow.workflow_auth_fence import (
     auth_fence_failure_result,
     auth_fence_outcome,
     reperceive_workflow_auth_generation,
@@ -394,7 +394,7 @@ def workflow_challenge_signal(
     title = str(result_variables.get("pageTitle") or "")
     actual_url = str(result_variables.get("pageUrl") or "")
     try:
-        from harness.hitl import _is_challenge_url
+        from harness.runtime.hitl import _is_challenge_url
         from harness.skill.pause import _title_is_challenge
         if _title_is_challenge(title):
             return {"kind": "challenge_title", "title": title, "url": actual_url}

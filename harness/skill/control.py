@@ -36,8 +36,8 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from harness.skill.pause import hitl_onset_signal
 from harness.skill.workflow import run_skill_workflow
-from harness.screenshot_policy import normalize_screenshot_output_params
-from harness.workflow_policy import event_step_focus, is_event_step
+from harness.tools.screenshot_policy import normalize_screenshot_output_params
+from harness.workflow.workflow_policy import event_step_focus, is_event_step
 from harness.vl import captcha
 from harness.vl.captcha import run_captcha_solve_loop, solve_plan_to_input_calls
 
@@ -455,7 +455,7 @@ async def resolve_via_hitl(
     auto-solve is a future `on_pause` that drives the page (Input/DOM on the 2nd
     connection) then calls `control.resolve_pause(page_id)` before falling through
     to this human path."""
-    from harness.hitl import wait_for_hitl_resume
+    from harness.runtime.hitl import wait_for_hitl_resume
 
     try:
         await control.request_pause(page_id)

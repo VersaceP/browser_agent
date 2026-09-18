@@ -1,5 +1,5 @@
 """
-harness.semantic_frames - Frame-graph shape of DOM.getSemanticTree results.
+harness.observation.semantic_frames - Frame-graph shape of DOM.getSemanticTree results.
 
 DOM.getSemanticTree returns a bounded FRAME GRAPH rather than a single tree:
 ``{rootFrameId, frames[], summary}``. Every frame carries its own local

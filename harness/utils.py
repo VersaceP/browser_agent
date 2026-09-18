@@ -521,6 +521,40 @@ class UsageAggregator:
         return summary
 
 
+def open_artifact_binary(logger: Any, raw_path: Any):
+    """Open authorized artifact bytes using the configured primary backend.
+
+    DB logical text resources precede legacy files; file/dual keep disk as
+    primary. Native downloads (including paths outside task_dir) stay physical.
+    The returned handle is a context manager and physical hashing can stream.
+    This reader does not grant tool access to a path.
+    """
+    import io
+    from harness.storage.virtual_fs import db_authoritative_for, virtual_fs_for
+
+    path = Path(raw_path).expanduser()
+    if logger is not None and not path.is_absolute():
+        path = Path(logger.task_dir) / path
+    path = path.resolve(strict=False)
+    relative = None
+    if logger is not None:
+        try:
+            relative = str(path.relative_to(Path(logger.task_dir).resolve()))
+        except ValueError:
+            pass
+    if relative is not None and (db_authoritative_for(logger) or not path.is_file()):
+        view = virtual_fs_for(logger)
+        lines = view.iter_lines(relative) if view is not None else None
+        if lines is not None:
+            return io.BytesIO("".join(lines).encode("utf-8"))
+    return path.open("rb")
+
+
+def read_artifact_text(logger: Any, raw_path: Any) -> str:
+    with open_artifact_binary(logger, raw_path) as resource:
+        return resource.read().decode("utf-8")
+
+
 def read_task_file_text(logger: Any, raw_path: Any) -> Optional[str]:
     """Read a task-scoped file's text from disk or from the backend.
 
@@ -1017,12 +1051,13 @@ def write_context_snapshot(
         else f"{safe_name}-final-context.json"
     )
     path = task_subdir(logger, "contexts") / filename
+    from harness.messages.convert import to_model_messages
     payload = {
         "actor": actor,
         "name": name,
         "metadata": metadata or {},
         "system_prompt": system_prompt,
-        "messages": messages,
+        "messages": to_model_messages(messages),
         "tools": tools,
     }
     path.write_text(

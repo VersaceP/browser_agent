@@ -24,10 +24,12 @@ subject the user asked about. No site, field name, or vocabulary is hardcoded.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any, Dict, List, Optional
 
-from harness.utils import JsonDict
+from harness.utils import JsonDict, read_artifact_text
+from harness.results.completion_receipt import _validated_artifacts
 
 # One reviewer call is bounded by this. Larger worklists are split into calls;
 # the task-level result is complete only after every batch returns coverage.
@@ -59,24 +61,74 @@ def _is_evidence_key(field: str) -> bool:
     return field.endswith("EvidenceText") or field.endswith("Evidence")
 
 
+SEMANTIC_PROJECTION_VERSION = "actual-values-v1"
+MAX_VALUE_CHARS = 2400
+
+
+def build_semantic_fact_index(state: Any, *, logger: Any = None) -> JsonDict:
+    """Read current delivered content, never the numeric count projection."""
+    artifacts = []
+    errors = []
+    for path in _validated_artifacts(state if isinstance(state, dict) else {}, logger):
+        try:
+            payload = json.loads(read_artifact_text(logger, path))
+            if not isinstance(payload, dict) or not isinstance(payload.get("rows"), list):
+                raise ValueError("artifact has no rows array")
+            rows = []
+            for index, raw in enumerate(payload["rows"]):
+                if not isinstance(raw, dict):
+                    continue
+                evidence_values = dict(raw)
+                for field, value in raw.items():
+                    if field.endswith("Absence") and isinstance(value, dict):
+                        evidence_values.setdefault(field[:-7] + "EvidenceText", value.get("evidenceText", ""))
+                rows.append({"index": index, "values": evidence_values,
+                             "rawValues": raw,
+                             "arrayLengths": {k: len(v) for k, v in raw.items() if isinstance(v, list)}})
+            receipt = {}
+            phases = state.get("phases", {}) if isinstance(state, dict) else {}
+            for phase_id, phase_state in phases.items():
+                if not isinstance(phase_state, dict) or str(path) not in phase_state.get("validated_artifacts", []):
+                    continue
+                attempts = phase_state.get("attempts") or []
+                attempt = attempts[-1] if attempts and isinstance(attempts[-1], dict) else {}
+                validation = attempt.get("validation") or {}
+                receipt = {"source": "task_state", "phaseId": phase_id,
+                           "phaseStatus": phase_state.get("status"),
+                           "workerId": attempt.get("workerId"), "workerStatus": attempt.get("status"),
+                           "lastAttemptValidationStatus": validation.get("status"),
+                           "lastAttemptObservations": (validation.get("semanticObservations") or [])[:5]}
+                break
+            artifacts.append({"path": str(path), "name": payload.get("name", ""),
+                              "rows": rows, "validationReceipt": receipt})
+        except (OSError, UnicodeError, ValueError, TypeError) as exc:
+            errors.append({"path": str(path), "reason": type(exc).__name__})
+    return {"activeArtifacts": artifacts, "readErrors": errors}
+
+
+def _value_projection(value: Any) -> JsonDict:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    kind = ("array" if isinstance(value, list) else "object" if isinstance(value, dict)
+            else "null" if value is None else "boolean" if isinstance(value, bool)
+            else "number" if isinstance(value, (int, float)) else "string")
+    projection = {"valueType": kind, "valueHash": hashlib.sha256(encoded.encode()).hexdigest(),
+                  "truncated": len(encoded) > MAX_VALUE_CHARS}
+    if isinstance(value, list):
+        projection["itemCount"] = len(value)
+    if not projection["truncated"]:
+        projection["value"] = value
+    else:
+        # A literal prefix remains clearly an excerpt, never a replacement value.
+        projection["valueExcerpt"] = encoded[:MAX_VALUE_CHARS]
+        projection["excerptFormat"] = "json_prefix"
+        projection["contentChars"] = len(encoded)
+    return projection
+
+
 def build_field_semantic_worklist(
     index: Any, *, allowed_fields: Optional[set[str]] = None,
 ) -> List[JsonDict]:
-    """Enumerate the (field, value, evidence) triples worth reviewing.
-
-    Two mechanical filters do real work before any model sees this:
-
-    * Only fields that CARRY evidence are reviewed. A field with no evidence
-      text is a provenance problem that `field_provenance` already reports;
-      sending it here would ask the reviewer to judge an absence.
-    * Only fields in the accepted output contract are reviewed when that
-      contract is available. Provenance support fields such as sourceTool and
-      sourceSelectorOrAxId prove where a value came from; they are not claims
-      that answer the user's task and must never become semantic mismatches.
-    * Entries are deduplicated by (field, evidence text). In 48b97d84 all four
-      rows of one artifact shared one `ratingScoreEvidenceText`; asking about it
-      four times cannot buy a fourth answer, and the cost is per entry.
-    """
+    """Bounded real content and provenance, with counts explicitly separate."""
     artifacts = (index or {}).get("activeArtifacts") if isinstance(index, dict) else None
     if not isinstance(artifacts, list):
         return []
@@ -85,55 +137,41 @@ def build_field_semantic_worklist(
         if not isinstance(artifact, dict):
             continue
         name = str(artifact.get("name") or "")
+        path = str(artifact.get("path") or "")
         for row in artifact.get("rows") or []:
-            if not isinstance(row, dict):
+            if not isinstance(row, dict) or not isinstance(row.get("values"), dict):
                 continue
-            values = row.get("values")
-            if not isinstance(values, dict):
-                continue
-            def add_entry(field: str, value: str, evidence: str) -> None:
-                key = (field, evidence)
-                existing = seen.get(key)
-                if existing is not None:
-                    existing["rowCount"] += 1
-                    return
-                seen[key] = {
-                    "entryId": f"f{len(seen)}",
-                    "field": field,
-                    "value": value[:200],
-                    "evidenceText": evidence[:600],
-                    "artifact": name,
-                    "rowCount": 1,
-                }
-
-            for field in values:
-                if allowed_fields is not None and field not in allowed_fields:
-                    continue
-                if _is_evidence_key(field):
+            values = row["values"]
+            raw = row.get("rawValues") if isinstance(row.get("rawValues"), dict) else values
+            lengths = row.get("arrayLengths") or {}
+            for field in dict.fromkeys([*raw, *lengths]):
+                if _is_evidence_key(field) or (allowed_fields is not None and field not in allowed_fields):
                     continue
                 evidence = _evidence_for(values, field)
-                if not evidence:
+                if not isinstance(evidence, str) or not evidence.strip():
                     continue
-                add_entry(field, str(values.get(field) or ""), evidence)
-            # Arrays are intentionally reduced to their length by the numeric
-            # fact index. The semantic reviewer does not need every review's
-            # text to decide whether a field-level evidence string describes a
-            # review array or a different subject; a bounded count is enough.
-            # This keeps a large extracted array out of the terminal prompt.
-            array_lengths = row.get("arrayLengths")
-            if not isinstance(array_lengths, dict):
-                continue
-            for field, length in array_lengths.items():
-                if allowed_fields is not None and field not in allowed_fields:
+                if field in raw:
+                    projection = _value_projection(raw[field])
+                else:
+                    # Legacy count-only indexes cannot establish delivered content.
+                    projection = {"valueType": "array", "itemCount": lengths[field],
+                                  "contentAvailable": False, "truncated": True}
+                source = {key: str(raw.get(key) or "")[:600] for key in
+                          ("sourceTool", "sourceSelectorOrAxId", "pageUrl") if raw.get(key)}
+                key = (path, name, field, json.dumps(projection, sort_keys=True, ensure_ascii=False), evidence,
+                       json.dumps(source, sort_keys=True, ensure_ascii=False))
+                ref = {"artifactPath": path, "rowIndex": row.get("index"), "field": field}
+                if key in seen:
+                    seen[key]["rowCount"] += 1
+                    if len(seen[key]["sourceRefs"]) < 8:
+                        seen[key]["sourceRefs"].append(ref)
                     continue
-                evidence = _evidence_for(values, field)
-                if not evidence:
-                    continue
-                try:
-                    count = max(0, int(length))
-                except (TypeError, ValueError):
-                    continue
-                add_entry(field, f"{count} items", evidence)
+                seen[key] = {"entryId": f"f{len(seen)}", "field": field, **projection,
+                             "evidenceText": evidence[:1200], "evidenceTruncated": len(evidence) > 1200,
+                             "evidenceHash": hashlib.sha256(evidence.encode()).hexdigest(),
+                             "sourceReceipt": source, "sourceRefs": [ref],
+                             "validationReceipt": artifact.get("validationReceipt") or {},
+                             "artifact": name, "rowCount": 1}
     return list(seen.values())
 
 
@@ -250,6 +288,9 @@ _REVIEWER_SYSTEM_PROMPT = (
     "You audit whether delivered data fields answer the question that was"
     " asked. For each entry you are given the field name, its delivered value,"
     " and the evidence text the worker recorded for it.\n"
+    "value is actual delivered content; itemCount is separate metadata, never a delivered scalar. "
+    "valueExcerpt is a truncated JSON prefix, not the complete field. sourceRefs identify the actual artifact row/field; sourceReceipt contains recorded provenance, not independent proof. validationReceipt is Harness state/validation history, not a semantic guarantee. "
+    "Do not infer missing content from truncation or counts. Use unclear and state which sourceRef/content is needed if supplied content is insufficient; do not claim full-array verification from an excerpt.\n"
     "Empty values can be deliberate absence judgments. Evaluate the supplied evidence, not fixed counts of scrolls, screenshots or flags. A claim is not mechanically proven merely because its declaration is well-formed. Use unclear when its evidence is insufficient.\n"
     "Judge ONE thing: does the subject described by the evidence text match the"
     " subject the original user task asks that field to be about?\n"
@@ -306,6 +347,7 @@ def normalize_field_review(
             "value": by_entry.get(finding["entryId"], {}).get("value", ""),
             "artifact": by_entry.get(finding["entryId"], {}).get("artifact", ""),
             "affectedRows": by_entry.get(finding["entryId"], {}).get("rowCount", 0),
+            "sourceRefs": by_entry.get(finding["entryId"], {}).get("sourceRefs", []),
         }
         for finding in findings
         if finding["assessment"] in _MISMATCH_ASSESSMENTS
@@ -322,6 +364,7 @@ def normalize_field_review(
                 "value": by_entry.get(finding["entryId"], {}).get("value", ""),
                 "artifact": by_entry.get(finding["entryId"], {}).get("artifact", ""),
                 "affectedRows": by_entry.get(finding["entryId"], {}).get("rowCount", 0),
+                "sourceRefs": by_entry.get(finding["entryId"], {}).get("sourceRefs", []),
             }
             for finding in findings if finding["assessment"] == "unclear"
         ],

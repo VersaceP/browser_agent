@@ -37,7 +37,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 import yaml
 
 from harness.skill.structured_output import validate_structured_output_workflow
-from harness.task_types import normalize_task_type
+from harness.planning.task_types import normalize_task_type
 
 SKILLS_DIR_DEFAULT = Path(__file__).resolve().parent.parent.parent / "skills"
 
