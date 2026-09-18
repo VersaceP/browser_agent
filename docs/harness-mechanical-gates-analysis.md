@@ -381,7 +381,7 @@ runner.call 之前的 20 道门,按执行顺序。任意一道返非 None 即短
 - **逻辑**:规范化 Page.screenshot 的 output 参数(格式/路径)。
 - **作用**:统一截图输出契约,便于后续 offload 和 evidence 落盘。
 
-#### P5 · Runtime.evaluate policy + escalation(browser_tools:2225;底层 harness/runtime_evaluation.py)
+#### P5 · Runtime.evaluate policy + escalation(browser_tools:2225;底层 harness/tools/runtime_evaluation.py)
 
 > `Runtime.evaluate` 能执行任意 JS,是模型能碰到的**最危险的 method**。本门因此设了**三道互相独立的关卡**,它们常被混成一件事,分开看才清楚:
 >

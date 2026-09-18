@@ -52,159 +52,16 @@ python main.py --config ./my-config.json --task "Check the current fleet list."
 
 ### Model
 
-The top-level `provider` field is required. Set it explicitly to `openai` or
-`anthropic`; the harness does not infer the wire protocol from `model_id` or
-`base_url`.
+Use the [provider and model configuration guide](docs/provider-model-configuration.md)
+for all supported services, protocol endpoints, credentials, per-role connections,
+thinking, output budgets, caching, examples and connection checks.
 
-OpenAI-compatible example:
-
-```json
-{
-  "provider": "openai",
-  "model_id": "gpt-4.1",
-  "api_key_env": "OPENAI_API_KEY",
-  "base_url_env": "OPENAI_BASE_URL",
-  "extra_params": {
-    "temperature": 0.2,
-    "max_tokens": 4096
-  }
-}
-```
-
-Anthropic example:
-
-```json
-{
-  "provider": "anthropic",
-  "model_id": "claude-sonnet-4-20250514",
-  "api_key_env": "ANTHROPIC_AUTH_TOKEN",
-  "base_url_env": "ANTHROPIC_BASE_URL",
-  "extra_params": {
-    "temperature": 0.2,
-    "max_tokens": 4096
-  }
-}
-```
-
-`cache_control_mode` controls explicit prompt-cache markers:
-
-- `auto` (default): enable markers for Anthropic-style providers and known-good OpenAI-compatible base URLs.
-- `on`: force markers and retry once without markers if the provider rejects them.
-- `off`: never send markers.
-
-```json
-{
-  "extra_params": {
-    "cache_control_mode": "auto",
-    "temperature": 0.2,
-    "max_tokens": 4096
-  }
-}
-```
-
-The legacy `enable_cache_control` boolean is still accepted when `cache_control_mode` is not set.
-
-### Thinking / reasoning mode
-
-Three `extra_params` keys control model thinking/reasoning. They work for
-**both** the OpenAI-format and the Anthropic-format providers, and can be set
-**per role** (see below):
-
-- `thinking` — the on/off switch. Accepts `bool`, the strings
-  `"enabled"`/`"disabled"`/`"on"`/`"off"`/`"true"`/`"false"`, or a `dict`
-  forwarded verbatim (`{"type": "enabled"}` for Ark/DeepSeek,
-  `{"type": "enabled", "budget_tokens": 8192}` for Claude extended thinking,
-  `{"type": "auto"}` / `{"type": "adaptive"}` where the vendor supports it).
-- `reasoning_effort` — thinking depth: `"none"`, `"minimal"`, `"low"`,
-  `"medium"`, `"high"`, `"xhigh"`, `"max"`. The full set is forwarded as-is with
-  no per-model whitelist, but **out-of-range values are handled differently per
-  vendor**: Ark documents them as no-ops, while DashScope returns 400 (measured:
-  `max` → `'reasoning_effort' must be one of: 'none', 'minimal', 'low',
-  'medium', 'high', 'xhigh'`). Anything outside the OpenAI SDK's own Literal is
-  forwarded with a warning.
-- `effort` — short alias for `reasoning_effort` (loses to it).
-
-Wire translation:
-
-| Config | OpenAI format | Anthropic format |
-|---|---|---|
-| `thinking` on/off | `extra_body={"thinking":{"type":"enabled/disabled"}}` (vendor extension, no SDK kwarg) | native `thinking=` kwarg; `true` becomes `{"type":"enabled","budget_tokens":N}` because the SDK marks the budget required |
-| `reasoning_effort` / `effort` | top-level `reasoning_effort` | native `output_config={"effort":<level>}`; `none`/`minimal` are expressed by the switch instead |
-
-Nothing is synthesised: a key you did not set produces no wire field. An
-explicit "off" plus a thinking-on effort level drops the effort with a warning
-(Ark documents that pair as an error).
-
-Notes:
-
-- The chain of thought comes back as `reasoning_content` (+ `encrypted_content`
-  on Ark's summary-mode models) in OpenAI format, or `thinking` blocks in
-  Anthropic format. Both providers capture it and feed it back on the next turn
-  via the assistant prefix blocks. DeepSeek returns `400` if `reasoning_content`
-  is not round-tripped on tool-call turns; Ark does not error but does let the
-  chain participate in later turns (and `encrypted_content` takes precedence
-  over the summary).
-- Vendor extensions this harness does not model — DeepSeek's Anthropic-format
-  `{"reasoning": {"effort": ...}}`, for one — go in `extra_params.extra_body`,
-  which both providers forward verbatim. They are not guessed from the config.
-- Measured on Ark's Anthropic-compatible `/api/coding` endpoint (glm-5.2,
-  2026-08-13): `thinking.type` is the only lever that has any effect there —
-  `output_config`, `reasoning` and `reasoning_effort` are all accepted and
-  silently ignored. Use the OpenAI-format endpoint if you need effort control
-  on Ark.
-
-### Per-role model configuration
-
-Six roles are configured independently: **lead**, **worker**, **vl**
-(visual_verify / locate / arbiter / reality_check), **vl_captcha** (CAPTCHA
-auto-solve), **plan_validator**, **claim_extractor**.
-
-The lead and workers default to the top-level model; the optional `lead` /
-`worker` sections override it with **two merge rules**:
-
-- scalars (`provider`, `model_id`, `api_key`, `base_url`, timeouts) **replace**,
-  so a role can run on an entirely different vendor;
-- `extra_params` **shallow-merges**, so setting one knob does not wipe the rest.
-
-Overriding `provider` without that vendor's `base_url` / `api_key` inherits the
-other vendor's connection and fails at call time; config loading warns about it
-up front. Every other role owns a full section (`provider` / `model_id` /
-`api_key` included).
-
-```json
-{
-  "provider": "anthropic",
-  "model_id": "glm-5.2",
-  "base_url": "https://ark.cn-beijing.volces.com/api/coding",
-  "extra_params": { "thinking": { "type": "enabled" }, "max_tokens": 24000 },
-
-  "lead":   { "extra_params": { "thinking": { "type": "enabled" } } },
-  "worker": {
-    "provider": "openai",
-    "model_id": "glm-5.2",
-    "base_url": "https://ark.cn-beijing.volces.com/api/coding/v3",
-    "api_key": "<the other key>",
-    "extra_params": { "thinking": { "type": "disabled" } }
-  },
-
-  "vl": {
-    "max_encoded_image_bytes": 20971520,
-    "extra_params": { "thinking": { "type": "enabled" } },
-    "captcha_solve_extra_params": { "max_tokens": 2500 }
-  },
-  "plan_validator":  { "extra_params": { "thinking": { "type": "enabled" } } },
-  "claim_extractor": { "extra_params": { "thinking": { "type": "disabled" } } }
-}
-```
-
-The `{"type": "enabled"}` dict form is measured working on both wire formats
-(Ark `/api/coding` and DashScope compatible-mode) and, unlike `true`, does not
-synthesise a `budget_tokens` on the Anthropic path — write `budget_tokens`
-explicitly when you want Claude extended thinking.
-`vl.max_encoded_image_bytes` is the endpoint's per-image data-URI limit.
-Ordinary visual verification does not inherit thinking from global
-`vl.extra_params`; CAPTCHA solving still inherits it and may override it via
-`captcha_solve_extra_params`.
+`lead`, `worker` and `plan_validator` are each configured in full and inherit
+nothing; the top level holds no model fields (loading fails if it does), and the
+plan validator must stay enabled. `provider` names the service and `api` the
+request protocol; named services require an explicit `api`. Auxiliary models
+have separate configuration rules. Keep configuration instructions in that guide
+so examples do not drift.
 
 ### Browser
 

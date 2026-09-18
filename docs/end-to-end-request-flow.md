@@ -510,7 +510,7 @@ build_browser_tool_dispatcher.dispatch (dispatch.py)
   `normalizedFields` 回执。
 - **作用**：统一输出契约，便于后续 offload 与 evidence 落盘。
 
-### P5 · Runtime.evaluate policy + escalation（capability.py:177；harness/runtime_evaluation.py）
+### P5 · Runtime.evaluate policy + escalation（capability.py:177；harness/tools/runtime_evaluation.py）
 
 > `Runtime.evaluate` 能执行任意 JS，是模型能碰到的**最危险的 method**。本门设**三道互相独立
 > 的关卡**：①这段 JS 该不该写成 JS -> ②现在允不允许跑 -> ③在哪个 world 跑。
@@ -579,7 +579,7 @@ RUNTIME_STRUCTURED_ALTERNATIVES = (      # runtime_evaluation.py:43
 - **触发**：`method == "Workflow.execute"`。
 - **逻辑**：`workflow_execution_enabled` 关（agent_harness.py 的运行时开关，默认关，
   skill 降级为 guidance）即返 `workflow_runtime_disabled`；开则
-  `validate_workflow_params`（harness/workflow_policy.py，allow_runtime=False，
+  `validate_workflow_params`（harness/workflow/workflow_policy.py，allow_runtime=False，
   enforce_lifecycle=True）。
 - **作用**：workflow 执行默认关。开了也要校验不能内嵌 Runtime.evaluate、必须跟生命周期。
 
@@ -957,7 +957,7 @@ post-HITL recovery）走这条减配链路，落地点 capability.py:1017：
   `_annotate_axtree_offload`（标注"卸盘的树在内存索引里也能查，且只在当前 epoch 内有效"）。
 - **作用**：防大 AXTree/截图撑爆 context。
 
-### Q7 · _enrich_pause_with_wait（capability.py:628；wait_for_hitl_resume harness/hitl.py:615）
+### Q7 · _enrich_pause_with_wait（capability.py:628；wait_for_hitl_resume harness/runtime/hitl.py:615）
 
 - **触发**：`method == "Hitl.requestPause"` 且 pause 成功。
 - **逻辑**：调 `wait_for_hitl_resume`，出口（常量 hitl.py:44-45）：
@@ -1241,10 +1241,10 @@ BrowserAgent           Spawner                LeadAgent              main.py   �
 | 工具分发 | `harness/tools/browser_tools/dispatch.py`（dispatcher:349、execute_browser_tool:394、impl:465） |
 | 前后门禁 + runner.call | `harness/tools/browser_tools/capability.py`（model 路径 :42、internal 路径 :888） |
 | fleet/page 绑定、auth barrier 接线 | `harness/tools/browser_tools/bindings.py` |
-| HITL / autosolve / post-HITL 恢复 | `harness/tools/browser_tools/hitl.py`、`captcha_autosolve.py`、`harness/hitl.py`（wait_for_hitl_resume:615） |
+| HITL / autosolve / post-HITL 恢复 | `harness/tools/browser_tools/hitl.py`、`captcha_autosolve.py`、`harness/runtime/hitl.py`（wait_for_hitl_resume:615） |
 | 页面生命周期守卫 | `harness/observation/page_lifecycle.py`（接线 dispatch.py:155） |
-| Runtime.evaluate 政策 | `harness/runtime_evaluation.py` + `browser_tools/runtime_eval.py` |
-| 进度观察（原进度门） | `harness/progress.py` + `browser_tools/progress_obs.py` |
+| Runtime.evaluate 政策 | `harness/tools/runtime_evaluation.py` + `browser_tools/runtime_eval.py` |
+| 进度观察（原进度门） | `harness/observation/progress.py` + `browser_tools/progress_obs.py` |
 | 重复调用观察 | `harness/tools/loop_guard.py`（DUPLICATE_CALL_STOP_AT:42） |
 | overlay 自动拦截 / VL 仲裁 / 现实核查 | `browser_tools/auto_intercept.py`、`visual.py`、`harness/vl/` |
 | FleetAuthBarrier / FleetClickGate | `harness/fleet/runtime.py`（:2030 / :779）、`fleet/coordinator.py` |
@@ -1252,5 +1252,5 @@ BrowserAgent           Spawner                LeadAgent              main.py   �
 | 终态分类 | `harness/diagnostics/__init__.py`（classify_terminal_status:173） |
 | 完成回执 / 终态一致性 / 数值对账 | `harness/results/completion_receipt.py`、`harness/tools/lead_tools.py:2517` |
 | ABCP 客户端 / browser-call runner | `abcp_client.py`（ABCPClient:267）、`harness/observation/browser_call.py`（:45/:60） |
-| 上下文压缩 / 卸载 | `harness/compaction.py`、`harness/offload.py` |
+| 上下文压缩 / 卸载 | `harness/context/compaction.py`、`harness/context/offload.py` |
 | 存储层 | `harness/storage/`（sqlite/file 双后端、schema.sql） |

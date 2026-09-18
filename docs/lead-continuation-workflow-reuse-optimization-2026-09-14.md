@@ -79,7 +79,7 @@ Worker 对“是否继续当前目标”的判断作为独立的模型决定保�
 源码入口：
 
 - [调度与自动续跑](../harness/tools/lead_tools.py)
-- [page-session](../harness/page_session.py)
+- [page-session](../harness/observation/page_session.py)
 - [worker 结果与 page-session 记录](../harness/spawner/spawner_worker.py)
 - [worker 结果投影](../harness/results/worker_result.py)
 

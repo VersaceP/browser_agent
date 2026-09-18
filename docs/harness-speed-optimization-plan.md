@@ -212,7 +212,7 @@ lead 的推理预算（继承就会原样复现那 254 秒），literal items �
 
 #### 落地的两块
 
-**① 页面记录**（`harness/page_session.py`，`5cc850b`）
+**① 页面记录**（`harness/observation/page_session.py`，`5cc850b`）
 
 每个 worker 终态时从 trace **机械提取**，按 pageId 落到 `<task_dir>/page_sessions/`：
 

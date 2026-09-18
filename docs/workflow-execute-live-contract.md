@@ -156,7 +156,7 @@ wheel    → readEvents → waitEvent(axTreeUpdated)  两者皆空       4009ms
 ——它们存在于 `control-contracts/src/events.ts` 的控制面全量里，但不对 agent 暴露。
 任何「等待 Action 事件」的设计不成立。
 
-`harness/workflow_policy.py` 的 `LISTENABLE_EVENTS` 原有 15 项全部存在于平台目录中
+`harness/workflow/workflow_policy.py` 的 `LISTENABLE_EVENTS` 原有 15 项全部存在于平台目录中
 （无失效项）。2026-09-11 补入的是实际会发出、且等待有意义的那些：
 
 - `Download.*`(4)、`File.operationCompleted/Failed` — 下载与文件流程

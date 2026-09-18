@@ -102,7 +102,7 @@ browser_call("Workflow.execute", {
 
 ### 3.1 七种 step
 
-下表与模型可见 schema 同源；`harness/workflow_schema_source.py` 从平台契约派生，
+下表与模型可见 schema 同源；`harness/workflow/workflow_schema_source.py` 从平台契约派生，
 `tests/test_workflow_schema_drift.py` 在两者出现分歧时失败。
 
 | type | 必填 | 可选 | 说明 |
