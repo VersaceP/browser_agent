@@ -93,9 +93,15 @@ def _destination_path(
 ) -> Tuple[Optional[Path], Optional[str]]:
     if not isinstance(raw_path, str) or not raw_path.strip():
         return None, "path must be a non-empty string"
+    if _input_path(agent, raw_path, base).is_symlink():
+        return None, "symlink destinations are not allowed"
+    from harness.tools.path_authorization import resolve_authorized_path
+    try:
+        candidate = resolve_authorized_path(agent, raw_path, mode="write", base=base)
+    except (OSError, ValueError) as exc:
+        return None, str(exc)
     task_dir = Path(agent.logger.task_dir).resolve()
     desktop = (Path.home() / "Desktop").resolve()
-    candidate = _input_path(agent, raw_path, base)
     if ".." in Path(raw_path).parts:
         return None, "parent traversal is not allowed"
     candidate, canonical_error = _canonicalize_destination(candidate)
@@ -112,14 +118,12 @@ def _destination_path(
             )
         allowed_root = task_dir / relative.parts[0]
         security_root = task_dir
-    elif _inside(candidate, desktop):
-        workspace = _workspace_root(task_dir)
-        if workspace is not None and _inside(candidate, workspace):
-            return None, "browser file tools cannot modify workspace source or control files"
-        allowed_root = desktop
-        security_root = desktop
     else:
-        return None, "destination must be in the current task output directories or Desktop"
+        # Use the approved external write root, not the destination itself, so
+        # one directory approval covers all files below it.
+        from harness.tools.path_authorization import authorized_root_for
+        allowed_root = authorized_root_for(agent, candidate, mode="write") or candidate
+        security_root = _nearest_existing(allowed_root.parent) or allowed_root.parent
 
     existing = _nearest_existing(candidate.parent)
     if existing is None:
@@ -147,9 +151,13 @@ def _stat_path(
         return None, "path must be a non-empty string"
     if ".." in Path(raw_path).parts:
         return None, "parent traversal is not allowed"
+    from harness.tools.path_authorization import resolve_authorized_path
+    try:
+        candidate = resolve_authorized_path(agent, raw_path, mode="read", base=base)
+    except (OSError, ValueError) as exc:
+        return None, str(exc)
     task_dir = Path(agent.logger.task_dir).resolve()
     desktop = (Path.home() / "Desktop").resolve()
-    candidate = _input_path(agent, raw_path, base)
     try:
         resolved = candidate.resolve(strict=True)
     except OSError as exc:
@@ -174,16 +182,18 @@ def _stat_path(
         }
         if str(resolved) in registered:
             return resolved, None
-    return None, "path must be in the current task, Desktop, or registered artifacts"
+    return resolved, None
 
 
 def _source_path(agent: Any, raw_path: Any) -> Tuple[Optional[Path], Optional[str]]:
     if not isinstance(raw_path, str) or not raw_path.strip():
         return None, "source must be a non-empty string"
+    from harness.tools.path_authorization import resolve_authorized_path
+    try:
+        candidate = resolve_authorized_path(agent, raw_path, mode="read")
+    except (OSError, ValueError) as exc:
+        return None, str(exc)
     task_dir = Path(agent.logger.task_dir).resolve()
-    candidate = Path(raw_path).expanduser()
-    if not candidate.is_absolute():
-        candidate = task_dir / candidate
     try:
         resolved = candidate.resolve(strict=True)
     except OSError as exc:
@@ -197,8 +207,6 @@ def _source_path(agent: Any, raw_path: Any) -> Tuple[Optional[Path], Optional[st
         for path in (getattr(agent, "artifacts", []) or [])
         if str(path).strip()
     }
-    if str(resolved) not in registered:
-        return None, "source is outside the task and is not a registered task artifact"
     return resolved, None
 
 
@@ -262,6 +270,13 @@ def local_fs_batch(agent: Any, operations: Any) -> JsonDict:
                 if not target.resolve(strict=True).is_dir():
                     raise ValueError("created path is not a directory")
                 results.append({"index": index, "op": op, "status": "done", "path": str(target.resolve())})
+                continue
+
+            if op == "list":
+                from harness.tools.local_fs import local_fs_list
+                listing = local_fs_list(agent, raw.get("path"), base=raw.get("base"),
+                                        recursive=bool(raw.get("recursive", False)))
+                results.append({"index": index, "op": op, **listing})
                 continue
 
             if op == "stat":

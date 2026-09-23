@@ -1535,7 +1535,7 @@ def read_task(args: argparse.Namespace) -> str:
         print(f"当前配置默认：{configured_mode}；请选择后再输入任务。")
     while True:
         prompt = (
-            f"[{selected_mode}] 请输入浏览器任务（/resume <任务目录> [新指令] 恢复任务；"
+            f"[{selected_mode}] 请输入浏览器任务（/resume <任务目录> 恢复未完成的原任务；"
             "可先用 /skill <id|suite> 指定技能，/skill 列出，"
             "/skill-create-workflow|-guidance <任务目录> 蒸馏新技能）: "
             if selected_mode
@@ -1715,13 +1715,29 @@ def _handle_resume_command(
         print(f"/resume 参数错误: {exc}")
         return None
     if len(tokens) < 2:
-        print("用法: /resume <worktree任务目录> [用户新指令]")
+        print("用法: /resume <worktree任务目录>（仅恢复原任务）")
         return None
     path, rest = _recover_task_path(tokens[1:])
+    if rest:
+        print("/resume 仅恢复原任务，不接受新指令。新目标请新建任务。")
+        return None
     args.resume = path
-    instruction = " ".join(rest).strip()
-    args.resume_instruction = instruction
-    return instruction
+    args.resume_instruction = ""
+    return ""
+
+
+def _validate_resume_mode(manifest: Optional[JsonDict], plan: JsonDict, selected: str) -> str:
+    """Check before reconciliation writes. Old tasks fall back to plan shape."""
+    startup = (manifest or {}).get("startup_args") or {}
+    recorded = startup.get("agent_mode") if isinstance(startup, dict) else None
+    original = str(recorded or "").strip().lower()
+    if original not in {"browser", "lead"}:
+        original = "browser" if plan.get("execution_mode") == "direct_worker" else "lead"
+    if selected != original:
+        raise ResumeStateError(
+            f"该任务使用 /{original} 模式；请切换到 /{original} 后恢复，不能在 /{selected} 中恢复。"
+        )
+    return original
 
 
 def _resolve_resume_directory(raw_path: str) -> Path:
@@ -2249,6 +2265,69 @@ def _resume_projection(
     }
 
 
+def _pending_human_interventions(
+    run_jsonl: Path,
+    phase_ids: List[str],
+    *,
+    tail_bytes: int = 524_288,
+) -> List[Dict[str, Any]]:
+    """Latest pending human decision per phase, from the run log tail.
+
+    Resume reopens HITL-terminal phases, and the operator deserves to see
+    WHICH decision is pending (browser challenge vs local-file authorization,
+    and the exact path) before the workers start asking again.  Only the last
+    ``tail_bytes`` are scanned: these receipts are written at worker exit, so
+    they live at the end of the log.
+    """
+    wanted = [str(item) for item in phase_ids if str(item)]
+    if not wanted or not run_jsonl.is_file():
+        return []
+    try:
+        size = run_jsonl.stat().st_size
+        with run_jsonl.open("rb") as handle:
+            if size > tail_bytes:
+                handle.seek(size - tail_bytes)
+                handle.readline()  # drop the partial first line
+            chunk = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    found: Dict[str, Dict[str, Any]] = {}
+    seen: set = set()
+    for line in reversed(chunk.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or str(event.get("type") or "") != "spawner.browser.result":
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        phase_id = str(payload.get("phaseId") or "")
+        if phase_id not in wanted or phase_id in seen:
+            continue
+        seen.add(phase_id)
+        if (
+            str(payload.get("status") or "") in {
+                "hitl_required", "hitl_waiting", "hitl_timeout",
+                "blocked_by_challenge",
+            }
+        ):
+            found[phase_id] = {
+                "phaseId": phase_id,
+                "status": str(payload.get("status") or ""),
+                "message": str(payload.get("answer") or "")[:400],
+                "source": "historical_worker_claim_unverified",
+                "requiresLiveVerification": True,
+            }
+        if len(seen) == len(set(wanted)):
+            break
+    return [found[phase_id] for phase_id in wanted if phase_id in found]
+
+
 def _resume_phase_summary(
     task_dir: Path,
     plan: Dict[str, Any],
@@ -2294,7 +2373,8 @@ def _interrupted_phase_ids(report: Dict[str, Any]) -> List[str]:
     }
     phase_ids.update(
         str(item)
-        for item in report.get("resetRunningPhases") or []
+        for key in ("resetRunningPhases", "hitlReactivatedPhases")
+        for item in report.get(key) or []
         if str(item)
     )
     return sorted(phase_ids)
@@ -2310,7 +2390,7 @@ def _confirm_interrupted_replay(
         return True
     joined = ", ".join(phase_ids)
     warning = (
-        f"上次进程中断时 phase [{joined}] 仍在运行。"
+        f"phase [{joined}] 上次运行中断，或因等待人工处理而结束。"
         "Worker 的 step/messages 不会恢复；继续将从 phase 开头重跑，"
         "而上次操作可能已产生外部副作用。"
     )
@@ -2691,6 +2771,9 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
         runtime.harness.agent_mode = requested_mode
     agent_mode = str(getattr(runtime.harness, "agent_mode", "lead") or "lead").strip().lower()
     resume_requested = bool(str(getattr(args, "resume", "") or "").strip())
+    if resume_requested and str(task or "").strip():
+        print("/resume 仅恢复原任务，不接受 --task 或附加新指令；请新建任务。", flush=True)
+        return CLI_INPUT_ERROR_EXIT_CODE
     if not task and not resume_requested:
         print("没有收到任务。")
         return 2
@@ -2735,6 +2818,8 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                 run_lock = acquire_run_lock(task_dir)
                 current_plan = load_task_plan_strict(task_dir)
                 prior_state = load_task_state_strict(task_dir)
+                manifest = load_task_manifest(task_dir)
+                _validate_resume_mode(manifest, current_plan, agent_mode)
                 current_plan, plan_alias_recovery = reconcile_torn_plan_alias(
                     task_dir,
                     current_plan=current_plan,
@@ -2830,6 +2915,16 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                     task_dir, current_plan, reconciled_state,
                 )
                 prompt_report["resumeProjection"] = resume_projection
+                prompt_report["pendingHumanInterventions"] = (
+                    _pending_human_interventions(
+                        task_dir / "run.jsonl",
+                        [
+                            str(item)
+                            for item in report.get("hitlReactivatedPhases") or []
+                            if str(item)
+                        ],
+                    )
+                )
                 prompt_report["browserRecovery"] = {
                     "candidateRecorded": bool(browser_hint),
                     "status": (
@@ -2977,6 +3072,11 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                 and str(item.get("phaseId") or "")
             ]
             reset = resume_context.report.get("resetPhases") or []
+            hitl_reactivated = [
+                str(item)
+                for item in resume_context.report.get("hitlReactivatedPhases") or []
+                if str(item)
+            ]
             print(f"任务已恢复: {logger.task_id}", flush=True)
             print(
                 f"恢复摘要: 保留 {kept} 个已验证 phase；"
@@ -2986,12 +3086,29 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                 f"{', '.join(map(str, reset)) or '(无)'}",
                 flush=True,
             )
+            if hitl_reactivated:
+                print(
+                    f"已重新开放 {len(hitl_reactivated)} 个人工中断"
+                    f"（HITL/本地文件授权）phase: "
+                    f"{', '.join(hitl_reactivated)}；执行到相关操作时会在终端"
+                    "重新请求确认。",
+                    flush=True,
+                )
+                interventions = resume_context.report.get(
+                    "pendingHumanInterventions"
+                ) or []
+                for item in interventions:
+                    if isinstance(item, dict) and item.get("message"):
+                        print(
+                            f"  · {item.get('phaseId')}: {item.get('message')}",
+                            flush=True,
+                        )
             browser_status = resume_context.report.get("browserRecovery") or {}
             if browser_status.get("candidateRecorded"):
                 print(
-                    "浏览器恢复: 已找到本任务的 Fleet/Page 候选，"
-                    "下一个 worker 启动时会用平台 inventory 探活；"
-                    "不可用时自动重开。",
+                    "浏览器恢复: 已找到历史 Fleet/Page 候选（尚未验证在线）；"
+                    "连接就绪后按会话约束探活和恢复。"
+                    "此记录不代表 WebCross Dispatcher 当前可用。",
                     flush=True,
                 )
             elif browser_status.get("status") == "disabled_by_config":
@@ -3011,7 +3128,9 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
         print(f"模式: {agent_mode}", flush=True)
         print(f"任务目录: {logger.task_dir}", flush=True)
         print(f"运行日志: {logger.path}", flush=True)
-        if agent_mode == "browser":
+        if resume_context is not None:
+            print("按原计划恢复：先检查浏览器连接；连接不可用时停止，不调用模型或派发 worker。", flush=True)
+        elif agent_mode == "browser":
             print("Browser 模式：先做轻量任务分类，再进入直达 worker。", flush=True)
         elif sys.stdin.isatty():
             print("开始生成执行计划；确认前不会启动 BrowserAgent。", flush=True)
@@ -3249,12 +3368,13 @@ def _main_impl(argv: Optional[Sequence[str]] = None) -> int:
         return _handle_skill_create_command(line)
     if raw_argv and raw_argv[0] == "/resume":
         if len(raw_argv) < 2:
-            print("用法: /resume <worktree任务目录> [用户新指令]")
+            print("用法: /resume <worktree任务目录>（仅恢复原任务）")
             return 2
         path, rest = _recover_task_path(raw_argv[1:])
         raw_argv = ["--resume", path]
         if rest:
-            raw_argv.extend(["--task", " ".join(rest)])
+            print("/resume 仅恢复原任务，不接受新指令；请新建任务。")
+            return CLI_INPUT_ERROR_EXIT_CODE
         argv = raw_argv
 
     parser = build_arg_parser()

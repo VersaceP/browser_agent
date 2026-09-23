@@ -286,6 +286,18 @@ def cancel_phase_running_reservation(
     _tc().write_task_state(logger, state)
 
 
+# Terminal execution interrupts that a pure recovery resume reopens.
+# They mean "a human decision was pending when the process ended", never
+# "this phase's evidence is wrong".  Local-file authorization gates surface
+# as hitl_required too and are covered by the same rule.
+RESUME_REACTIVATABLE_HITL_STATUSES = frozenset({
+    "blocked_by_challenge",
+    "hitl_required",
+    "hitl_timeout",
+    "page_settled_after_hitl",
+})
+
+
 def reactivate_resumable_hitl_phases(
     logger: RunLogger,
     *,
@@ -306,12 +318,7 @@ def reactivate_resumable_hitl_phases(
         for phase in plan.get("phases") or []
         if isinstance(phase, dict) and str(phase.get("id") or "")
     }
-    resumable_statuses = {
-        "blocked_by_challenge",
-        "hitl_required",
-        "hitl_timeout",
-        "page_settled_after_hitl",
-    }
+    resumable_statuses = RESUME_REACTIVATABLE_HITL_STATUSES
     state = _tc().load_task_state(logger)
     phases = state.get("phases") if isinstance(state.get("phases"), dict) else {}
     reactivated: List[str] = []
@@ -1097,6 +1104,32 @@ def prepare_resume_state(
         )
     ] if isinstance(supersessions, list) else []
 
+    # A pure recovery resume (no new user instruction) means "continue this
+    # task".  HITL terminal statuses are execution interrupts, not evidence
+    # failures, so those phases are reopened here and the accepted plan stays
+    # spawnable without a replan.  When a new instruction IS present the
+    # resume-instruction gate owns that decision instead (resume_keep_plan
+    # reopens them explicitly), because the instruction may deliberately
+    # abandon the interrupted phases.
+    hitl_reactivated: List[str] = []
+    if not str(instruction or "").strip():
+        effective_ids = {
+            str(phase.get("id") or "")
+            for phase in effective_plan.get("phases") or []
+            if isinstance(phase, dict) and str(phase.get("id") or "")
+        }
+        for phase_id in sorted(effective_ids):
+            if phase_id in invalidated:
+                continue
+            phase_state = phases_state.get(phase_id)
+            if not isinstance(phase_state, dict):
+                continue
+            prior_status = str(phase_state.get("status") or "")
+            if prior_status not in RESUME_REACTIVATABLE_HITL_STATUSES:
+                continue
+            phase_state["status"] = "pending"
+            phase_state["resume_reset_from"] = prior_status
+            hitl_reactivated.append(phase_id)
     state["current_phase"] = _tc()._first_active_phase_id(effective_plan, phases_state)
     audited_reset_phases = list(reset_phases)
     audited_reset_phases.extend(
@@ -1113,6 +1146,7 @@ def prepare_resume_state(
         "corruptArtifacts": corrupt_artifacts,
         "interruptedAttempts": interrupted_attempts,
         "resetRunningPhases": sorted(set(reset_running_phases)),
+        "hitlReactivatedPhases": hitl_reactivated,
         "changedEvidencePhases": changed_evidence_phases,
         "changedExecutionPhases": changed_execution_phases,
         "removedPhases": removed_phases,

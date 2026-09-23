@@ -31,6 +31,8 @@ def _search_excerpt(line, regex, max_bytes):
 def local_fs_search(
     logger: RunLogger,
     *,
+    agent=None,
+    path: str = ".",
     glob_pattern: str,
     pattern: Optional[str] = None,
     event_type: Optional[str] = None,
@@ -38,7 +40,12 @@ def local_fs_search(
     max_bytes_per_hit: int = 2000,
     max_total_bytes: int = 20000,
 ) -> JsonDict:
-    root = logger.task_dir.resolve()
+    from harness.tools.path_authorization import resolve_authorized_path, allowed
+    access = agent or logger
+    try:
+        root = resolve_authorized_path(access, path, mode="read")
+    except (OSError, ValueError) as exc:
+        return {"status": "failed", "error": str(exc)}
     glob_pattern = glob_pattern or "**/*"
     # Strict tool schemas force callers to always send event_type; models often
     # emit the STRING "null" for "not needed", which would otherwise silently
@@ -59,8 +66,8 @@ def local_fs_search(
     # and db mode - the switch is meant to be invisible.
     try:
         candidates = sorted(
-            path for path in root.rglob("*")
-            if glob_matches(glob_pattern, str(path.relative_to(root)))
+            item for item in _walk_authorized(access, root, recursive=True)
+            if glob_matches(glob_pattern, str(item.relative_to(root)))
         )
     except (OSError, ValueError) as exc:
         return {"status": "failed", "error": f"invalid glob: {exc}"}
@@ -74,7 +81,7 @@ def local_fs_search(
 
     from harness.storage.virtual_fs import db_authoritative_for, virtual_fs_for
 
-    db_authoritative = db_authoritative_for(logger)
+    db_authoritative = root == logger.task_dir.resolve() and db_authoritative_for(logger)
     virtual_paths = set()
     if db_authoritative:
         view = virtual_fs_for(logger)
@@ -93,7 +100,7 @@ def local_fs_search(
             resolved.relative_to(root)
         except (OSError, ValueError):
             continue
-        if not resolved.is_file():
+        if not allowed(access, resolved, "read") or not resolved.is_file():
             continue
         rel = str(resolved.relative_to(root))
         # In db mode, a logical row is the current source of truth. A file
@@ -176,7 +183,7 @@ def local_fs_search(
             total_bytes += hit_bytes
             results.append(hit)
 
-    if not truncated and len(results) < max_results:
+    if root == logger.task_dir.resolve() and not truncated and len(results) < max_results:
         # DB-only rows are added after physical files. In db mode all logical
         # DB paths were removed from the physical scan above; in dual/file
         # mode the existing FileStore-primary behaviour remains unchanged.
@@ -285,20 +292,59 @@ def _search_virtual_files(
     return results, total_bytes, truncated
 
 
+def _walk_authorized(access, root, *, recursive):
+    from harness.tools.path_authorization import allowed
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        for item in directory.iterdir():
+            # Do not follow directory symlinks during discovery. Explicit reads
+            # resolve symlinks and check their actual target independently.
+            if item.is_symlink() or not allowed(access, item.resolve(), "read"):
+                continue
+            yield item
+            if recursive and item.is_dir():
+                pending.append(item)
+
+
+def local_fs_list(agent, path, *, base=None, recursive=False):
+    """List an authorized user directory without reading file contents."""
+    from harness.tools.path_authorization import resolve_authorized_path
+    try:
+        root = resolve_authorized_path(agent, path, mode="read", base=base)
+        if not root.is_dir():
+            return {"status": "failed", "error": "path is not a directory", "path": str(root)}
+        iterator = _walk_authorized(agent, root, recursive=recursive)
+        entries = []
+        for item in sorted(iterator, key=lambda p: str(p)):
+            entries.append({"name": item.name, "path": str(item),
+                            "kind": "directory" if item.is_dir() else "file",
+                            "byteSize": item.stat().st_size if item.is_file() else None})
+        return {"status": "done", "path": str(root), "entries": entries}
+    except (OSError, ValueError) as exc:
+        return {"status": "failed", "error": str(exc)}
+
+
 def local_fs_read(
     logger: RunLogger,
     *,
     path: str,
+    agent=None,
     line_offset: int = 0,
     line_limit: int = 200,
     max_bytes: int = DEFAULT_LOCAL_FS_READ_BYTES,
 ) -> JsonDict:
-    resolved, error = resolve_task_file(logger, path)
+    try:
+        from harness.tools.path_authorization import resolve_authorized_path
+        resolved = resolve_authorized_path(agent or logger, path, mode="read")
+        error = None
+    except (OSError, ValueError) as exc:
+        resolved, error = None, str(exc)
     if error or resolved is None:
         return {"status": "failed", "error": error}
     from harness.storage.virtual_fs import db_authoritative_for
 
-    if db_authoritative_for(logger):
+    if resolved.is_relative_to(logger.task_dir.resolve()) and db_authoritative_for(logger):
         virtual = _read_virtual_file(
             logger,
             resolved,
@@ -364,7 +410,7 @@ def local_fs_read(
         return {
             "status": "done",
             "path": str(resolved),
-            "relativePath": str(resolved.relative_to(logger.task_dir.resolve())),
+            "relativePath": str(resolved.relative_to(logger.task_dir.resolve())) if resolved.is_relative_to(logger.task_dir.resolve()) else str(resolved),
             # Same shape as the database-backed read, field for field: a
             # caller must not be able to tell which branch answered, and
             # bytesRead in particular is a business field, not a diagnostic.
