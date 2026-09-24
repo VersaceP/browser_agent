@@ -14,8 +14,9 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
+import sys
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple
 
 
 HARNESS_VERSION = "1.0.0"
@@ -26,18 +27,51 @@ HARNESS_VERSION = "1.0.0"
 _GIT_CACHE: Dict[str, object] = {}
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
+_NATIVE_GIT: Tuple[str, ...] = ("/usr/bin/arch", "-arm64", "git")
+_git_launcher: Tuple[str, ...] = ("git",)
 
-def _git_output(*args: str, text: bool = True, timeout: int = 5):
-    """Run one bounded, read-only git query against this checkout."""
 
+def _run_git(launcher: Tuple[str, ...], args: Tuple[str, ...], text: bool, timeout: int):
     return subprocess.run(
-        ["git", *args],
+        [*launcher, *args],
         cwd=str(_REPO_ROOT),
         capture_output=True,
         text=text,
         timeout=timeout,
         check=False,
     )
+
+
+def _git_output(*args: str, text: bool = True, timeout: int = 5):
+    """Run one bounded, read-only git query against this checkout.
+
+    A Rosetta (x86_64) interpreter cannot load an arm64-only Command Line
+    Tools install: the /usr/bin/git shim dies inside xcrun before git runs,
+    and every provenance field silently comes back blank. The same query is
+    then re-run natively, and the launcher that worked is kept for the process.
+    """
+
+    global _git_launcher
+    completed = _run_git(_git_launcher, args, text, timeout)
+    if (
+        completed.returncode == 0
+        or _git_launcher == _NATIVE_GIT
+        or sys.platform != "darwin"
+    ):
+        return completed
+    stderr = completed.stderr
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", "replace")
+    if "xcrun" not in str(stderr or ""):
+        return completed
+    try:
+        native = _run_git(_NATIVE_GIT, args, text, timeout)
+    except OSError:
+        return completed
+    if native.returncode != 0:
+        return completed
+    _git_launcher = _NATIVE_GIT
+    return native
 
 
 def git_sha() -> str:
