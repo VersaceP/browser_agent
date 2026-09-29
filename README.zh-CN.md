@@ -254,10 +254,10 @@ LeadAgent 应通过 BrowserAgent phase 编排任务。BrowserAgent 的 `browser_
 
 ```text
 LeadAgent 接收任务
-  -> emit_task_plan: 按 task_type 和 phase 拆分
-  -> spawn_browser_agent: 用精确 expected fields 处理第一个 pending phase
+  -> spawn_browser_agent: 提交一个经过审查的 assignment
+  -> wait_browser_agents: 返回 Worker 证据和剩余工作
   -> 校验 extraction artifacts 和 resultLevels
   -> lead_save_artifact: 仅在 schema_mismatch 且证据可信时重塑并保存
-  -> 缺证/错证时 replan，或只派一个更聚焦的 continuation
+  -> 缺证/错证时修订 assignment，或用 phase_id 显式继续
   -> final_answer: 汇总成功、失败和阻塞项
 ```

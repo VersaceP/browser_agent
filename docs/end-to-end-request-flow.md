@@ -178,7 +178,7 @@ worker，再根据 worker 回执决定继续 spawn、replan 还是收尾。
 
 **实现**（`agent_harness.py:3319` `LeadAgent.run`）：
 
-1. **上下文组装**（一次）：`<user_task>` + 策略库索引（strategy_bank，advisory）+ 已知技能
+1. **上下文组装**（一次）：`<user_task>`+ 已知技能
    digest + `<resumed_state>`（resume 时）+ `<runtime_limits>` + `<pinned_browser_context>`。
    resume 场景下 prompt 明确指示三种新指令处置：`extend_task_plan`（只加新 phase）/
    完整 replan / `resume_keep_plan`。
@@ -1152,26 +1152,25 @@ spawner 在 worker 结束后（`spawner_worker.py:560` 之后）：
   修复 manifest 的视觉证据是否补齐；失败可把 phase 判 failed 触发重试/replan；
 - phase attempt 记账（`validated_done` 才算依赖完成，喂 S2 pacing 与 S1）。
 
-## 10.3 Lead 级：final_answer 三重对账
+## 10.3 Lead 级：final_answer 回执与对账
 
-`_lead_final_answer`（`harness/tools/lead_tools.py:2517`）：
+`_lead_final_answer`（`harness/tools/lead_tools.py`）：
 
 ```
 lead 调 final_answer(status, answer)
-├─[1] resume instruction gate（resume 场景指令未消化则拒）
-├─[2] build_completion_receipt (results/completion_receipt.py:318)
-│      从 task_state+spawner 汇总：哪些 phase validated、哪些还有缺口
-├─[3] terminal_consistency_contradictions (:15)
-│      提议的 done 与原始 worker 回执矛盾 → rejected_terminal_inconsistency 软拒，
-│      next_instruction 指示"继续跑完或改报非 done"
-├─[4] _reconcile_final_answer_numbers
+├─[1] build_completion_receipt
+│      从 task_state+spawner 汇总验证产物、下载和历史 phase/Worker 状态；
+│      历史 partial 是事实，由 Lead 结合最新用户目标和证据判断任务是否完成
+├─[2] _reconcile_final_answer_numbers
 │      answer 里的数字声明 vs record_extraction artifact 行数对账，
 │      不一致 → 拒绝并要求修正后重新 final_answer
+├─[3] _review_final_field_semantics（done 时）
+│      证据字段与原始请求的语义不符 → 拒绝并返回具体差异
 └─ 通过 → 返回 {status, answer, trigger: lead_decided, completionReceipt}
 ```
 
 之后 LeadAgent.run 返回 answer → main.py `print(answer)` + 任务 ID/目录 → **用户拿到
-final answer**（数值都经过账本对账，phase 缺口在 completionReceipt 里可见）。
+final answer**（数字声明经过账本对账；历史 phase 状态在 completionReceipt 中可见）。
 
 **完整输出时序**：
 
@@ -1184,7 +1183,7 @@ BrowserAgent           Spawner                LeadAgent              main.py   �
   │                     │ phase attempt 落账      │                     │        │
   │                     ├─── worker result ─────►│                     │        │
   │                     │ abandon_worker(回收)   │ wait/replan/spawn…  │        │
-  │                     │                        │ final_answer(三重对账)│        │
+  │                     │                        │ final_answer(回执与对账)│      │
   │                     │                        ├────────────────────►│ print  │
   │                     │                        │                     ├───────►│
 ```

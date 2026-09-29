@@ -276,10 +276,10 @@ LeadAgent should use BrowserAgent phases. BrowserAgent's `browser_call` uses:
 
 ```text
 LeadAgent receives task
-  -> emit_task_plan: split by task_type and phase
-  -> spawn_browser_agent: collect the first pending phase with exact expected fields
+  -> spawn_browser_agent: submit one reviewed assignment
+  -> wait_browser_agents: return worker evidence and remaining work
   -> validate extraction artifacts and resultLevels
   -> lead_save_artifact: reshape trusted rows only when validation is schema_mismatch
-  -> replan or spawn one focused continuation when evidence is missing/wrong
+  -> revise the assignment or continue its phase when evidence is missing/wrong
   -> final_answer: summarize successes, failures, and blocked items
 ```

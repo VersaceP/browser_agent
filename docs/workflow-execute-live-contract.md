@@ -1,5 +1,10 @@
 # Workflow.execute 实测契约（2026-09-11）
 
+> **2026-09-21 更新**：WebCross 0.9.3-beta 复测结果见文末 §10。§3（错误体无
+> `workflowId`）与 §9（失败拿不到 store / 已完成结果）**已解决**；§5（进度事件
+> 带完整 variables）**已不成立**；§6 的入参形状已被 `WorkflowDefinitionV1` 取代。
+> 以下 §1–§9 保留为 09-11 的历史记录。
+
 探针环境：本机 WebCross/ABCP 平台，`ws://localhost:9300/ws`，
 `catalogRevision: sha256:46c89bae…`，`eventCatalogRevision: event:9e1e48fc`。
 探针为只读验证，使用无 remark、无 agent 绑定的 fleet，自建 page 并在结束时关闭。
@@ -188,3 +193,83 @@ wheel    → readEvents → waitEvent(axTreeUpdated)  两者皆空       4009ms
 
 在这些闭环前，`workflow_execution_enabled` 保持 canary（代码默认 False，
 部署显式 opt-in）。
+
+## 10. WebCross 0.9.3-beta 复测（2026-09-21）
+
+探针环境：本机 WebCross 0.9.3-beta，local-control 传输（`~/.webcross/runtime/dispatcher-host.json`），
+`catalogRevision: sha256:41e7cf4a…`，`eventCatalogRevision: event:1ed1c609`。
+探针同样使用自建 fleet/page，结束时关闭。平台源码对照
+`abcp-platform` HEAD `b96c440`（2026-09-20），与安装包内 `app.asar` 一致。
+
+### 10.1 入参：`WorkflowDefinitionV1` + `binding`（破坏性变更，平台提交 2d941da）
+
+```
+{"workflow": {"schemaVersion": 1, "name", "description"?, "timeoutMs"?,
+              "initialVariables"?, "steps"},
+ "binding": {"pageId"?, "fleetId"?}}
+```
+
+- 顶层是 strict 对象：多传任何字段（含 `runId`）→ `-32602`。
+- 步骤不再接受省略 `type` 的 action 简写；action 步骤的 `purpose` 必填。
+- `binding.pageId` 会出现在 `variables.pageId`。
+- Harness 内部仍用扁平形状 `{description, steps, variables, timeout, pageId, fleetId}`，
+  由 `harness/workflow/workflow_wire.py` 在 `ABCPClient.call` 出口统一翻译
+  （补 `type:"action"`，缺省 purpose 以步骤 id/action 补齐）；
+  `workflow_schema_source._harness_execute_view` 把新 schema 映射回扁平视图供策略与模型 schema 使用。
+  实测：扁平入参、无 type/purpose 的 action 步骤经翻译后执行成功。
+
+### 10.2 失败回执：完整 workflow 结果（§3、§9 已解决）
+
+`Workflow.execute` 失败仍抛 `-32005 workflow-step-failed`，但 `rpc_data.details` 现在包含：
+
+```
+failedActionCode, failedStepPath, results, status, store, storeRevision,
+taskId, timing, variables, workflowId
+```
+
+`results[]` 含每个已完成步骤的 `result` 数据。Harness 改为以此为主来源
+（`run_skill_workflow` 与 `_attach_exec_trace`，新增 `storeAtFailure`），事件轨迹仅作兜底。
+
+> 注：`failureDefinitions.ts` 中 `workflow-step-failed` 的 `detailFields` 只列了
+> 4 个标量字段，但实测公开失败仍透出上述完整 details（经 `feedbackBuilder.error`
+> 的 `workflowResult`）。以实测为准。Harness 侧的 `public_failure_details` 只保留标量，
+> 因此完整 details 在捕获异常处直接读取，不经过公开投影。
+
+### 10.3 `Workflow.progress`：只剩变量名（§5 已不成立）
+
+`failed` 事件 payload：`duration, error, errorCode, phase, resultCount, stepPath,
+storeRevision, variableKeys, workflowId`——不再携带 `variables` 的值。
+ExecObserver 从事件重建的变量快照因此为空，失败数据改由 10.2 的 details 提供。
+
+### 10.4 `Workflow.getStatus`：未变
+
+`currentStepPath, lastFailure, resultCount, status, timing, variableKeys, workflowId`。
+
+Agent 可见事件目录现为 25 个：`DOM.axTreeUpdated` 已不在目录中
+（`System.describeEvent` 返回"不在当前目录"），§5c 的问题随之消失；
+`events.watch` 的过滤维度只有 events / categories / fleetId / pageId / taskId，
+不存在按节点订阅的能力（harness 侧的节点监控见 `watch_nodes`）。
+
+## 10.5 段内读取页面观察内容
+
+- `DOM.getAXTree` 在 workflow 内返回带租约的 observation artifact。
+  使用完整引用 `$cache.observation` 或 `$last` 时，Workflow host 会读取 artifact
+  文本并交给 `transform`；`$cache.observation.diff` 与
+  `$cache.observation.detail[nodeId]` 读取对应的租约 artifact。
+- `$cache.observation.artifact.path` 仍然只是路径元数据；只有完整 observation
+  引用才会读取内容。
+- 因此可以在同一个 segment 中执行“动作 → DOM.getAXTree → transform 搜索 →
+  使用当前 id 的动作”。导航后旧 id 仍然失效，但可以在新文档稳定后重新读取
+  AXTree 并提取新 id。
+- `DOM.getText` / `DOM.getAttribute` / `DOM.getSemanticTree` 仍已从平台删除；
+  已知节点的详细文本/属性读取使用 `DOM.getAXTree.query`。
+- 只有需要模型判断、截图判断、Harness 专用工具、artifact 过期或 Workflow
+  失败恢复时，才应结束 segment 交回 Agent。
+
+### 10.6 仍未闭环
+
+- 存量 skill `taaft-detail-extract`、`_template` 依赖已删除的 `DOM.getText` 在段内抽取文本，
+  无法机械迁移；预检会按实时能力目录拦截（执行前明确失败）。需决定：由 harness 在段外抽取，
+  或允许冻结 skill 使用只读 `Runtime.evaluate`。
+- `skills/_tools/distill_trace.py` 生成的段内 AX 正则抽取步骤同样失效。
+- 真实任务 A/B 仍未进行。

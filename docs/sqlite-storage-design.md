@@ -127,8 +127,10 @@ page_size    = 保持默认 4096      # 有意为之；改动需退出 WAL + VAC
 | 1 | `initial_schema` | `schema.sql` 全部初始表 |
 | 2 | `run_git_sha` | `task_runs` 增加 `git_sha TEXT`（记录实际产出行的代码版本，手写版本号会过期） |
 | 3 | `resource_stored_byte_size` | `task_resources` 增加 `stored_byte_size INTEGER`（物理存储尺寸与逻辑 `byte_size` 分离；旧行 NULL 是诚实的"从未测量"） |
+| 4 | `run_event_envelope` | `run_events` 增加事件身份与关联列 |
+| 5 | `drop_strategy_attempts` | 删除独立策略尝试表及其历史记录 |
 
-`SCHEMA_VERSION = 3`。
+`SCHEMA_VERSION = 5`。
 
 ---
 
@@ -140,7 +142,6 @@ page_size    = 保持默认 4096      # 有意为之；改动需退出 WAL + VAC
 tasks (1) ──< task_runs (1) ──< run_events
   │               │        └──< task_resources（按 (task_id, run_id) 复合外键）
   │               │        └──< worker_trace_events
-  │               │        └──< strategy_attempts
   │               └───< task_snapshots          (updated_run_id 外键)
   │               └───< task_plan_versions      (run_id 外键)
   │               └───< task_plan_reviews       (run_id 外键)
@@ -225,10 +226,6 @@ offload 阈值 `EVENT_PAYLOAD_OFFLOAD_THRESHOLD = 64KB`（实测 run.jsonl 行 p
 
 `UNIQUE(task_id, run_id, worker_id, sequence_no)`；批量追加时在事务内 `MAX(sequence_no)+1` 续号。读序 `ORDER BY worker_id, sequence_no`。
 
-### 5.9 strategy_attempts — 跨任务策略遥测
-
-半结构化投影列（`strategy_ids_json`、`status`、`status_category`、`validated_status`、`failure_classification`、`row_count`、`artifact_count`），`phase_id`/`worker_id` 可空。**跨任务分析是这个表不按任务拆分的原因**。文件侧对应 `strategy_attempts.jsonl`。
-
 ---
 
 ## 6. 核心机制设计
@@ -289,7 +286,6 @@ offload 阈值 `EVENT_PAYLOAD_OFFLOAD_THRESHOLD = 64KB`（实测 run.jsonl 行 p
 ```
 run.jsonl                -> run_events
 traces/<worker>.jsonl    -> worker_trace_events
-strategy_attempts.jsonl  -> strategy_attempts
 其余一切                  -> task_resources (logical_path)
 ```
 

@@ -132,10 +132,9 @@ Allinone 的部署地址与文档站不是同一地址；当前实现接受自�
 | `worker` | 独立连接，必须完整配置，供 BrowserAgent 使用 | `worker.extra_params.max_tokens` |
 | `plan_validator` | 独立连接，必须配置且必须开启（`enabled` 不写或写 `true`） | `plan_validator.max_tokens`；默认 8000，覆盖其 extra_params 中同名值 |
 | `claim_extractor` | 独立配置；未启用单独配置时，调用方可从 plan_validator 派生 | 段内 `max_tokens`；派生默认 16000，不继承审查器的输出预算 |
-| `task_classifier` | 设置 model_id 时用独立连接；未设置时回退到 Worker 连接 | 段内 `max_tokens`，默认 4096；移除部分推理控制，固定温度 0，超时至多 20 秒且不重试 |
 | `vl` | 独立连接 | `vl.extra_params.max_tokens`；普通视觉请求未指定时使用 800。连接只支持直接 `api_key` / `base_url`，不支持它们的 `_env` 字段 |
 
-提取和分类模型仍用 `enabled` 控制是否启用，并需填写自己的连接和模型。
+提取模型仍用 `enabled` 控制是否启用，并需填写自己的连接和模型。
 显式配置的 plan_validator、claim_extractor 模型 ID 还需与 Lead 不同，满足当前独立审查约束。
 
 三段互不继承：每段的 `extra_params` 写什么就发什么，没有任何合并。某个角色要关掉
