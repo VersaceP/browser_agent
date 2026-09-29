@@ -3,7 +3,7 @@ import asyncio
 
 from llm.openai_provider import OpenAIProvider
 from llm.adapters import encode_request, decode_response, field
-from llm.base import LLMStreamDecodeError
+from llm.base import LLMStreamDecodeError, LLMProviderResponseError
 from llm.profiles import resolve_target
 
 
@@ -33,7 +33,8 @@ class OpenAIResponsesProvider(OpenAIProvider):
                         decode_response(field(event, "response"), self.config)
                         raise LLMStreamDecodeError("Responses stream failed without error details")
                     elif kind == "error":
-                        raise ValueError(f"Responses provider error ({field(event, 'code')}): {field(event, 'message')}")
+                        raise LLMProviderResponseError(code=field(event, "code"),
+                            message=field(event, "message"), request_id=field(event, "request_id"))
             if final is None:
                 raise LLMStreamDecodeError("Responses stream ended without a terminal response")
             validate(final)

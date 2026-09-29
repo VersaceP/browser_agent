@@ -8,7 +8,7 @@ from llm.adapters import field, _tool_choice
 from llm.contracts import LLMResult, TokenUsage
 from llm.profiles import OPENAI, resolve_target
 from llm.thinking import resolve_thinking_intent
-from llm.base import LLMStreamDecodeError
+from llm.base import LLMStreamDecodeError, LLMProviderResponseError
 
 
 def input_content(content):
@@ -119,7 +119,8 @@ def decode_responses_response(response, config, diagnostics=None):
     if error:
         # A provider rejection is not corrupt tool JSON and must not consume
         # stream-decode retries or lose its diagnostic in a generic wrapper.
-        raise ValueError(f"Responses provider error ({field(error, 'code')}): {field(error, 'message')}")
+        raise LLMProviderResponseError(code=field(error, "code"),
+            message=field(error, "message"), request_id=field(response, "_request_id"))
     if status not in {"completed", "incomplete"}:
         raise LLMStreamDecodeError(f"Responses did not complete: {status}")
     blocks = []

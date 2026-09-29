@@ -89,7 +89,7 @@ def _response_header(exc: BaseException, name: str) -> str:
 
 
 def rate_limit_error_details(exc: BaseException) -> Optional[Dict[str, Any]]:
-    """Return normalized metadata for an HTTP 429 provider failure.
+    """Normalize HTTP throttling and structured Responses quota failures.
 
     SDK exception classes are intentionally not used here. ABCP deployments can
     put OpenAI- or Anthropic-compatible gateways in front of several providers,
@@ -101,8 +101,8 @@ def rate_limit_error_details(exc: BaseException) -> Optional[Dict[str, Any]]:
     try:
         status = int(status)
     except (TypeError, ValueError):
-        return None
-    if status != 429:
+        status = None
+    if status != 429 and not isinstance(exc, LLMProviderResponseError):
         return None
 
     body = _error_response_body(exc)
@@ -131,6 +131,10 @@ def rate_limit_error_details(exc: BaseException) -> Optional[Dict[str, Any]]:
         if any(marker in marker_text for marker in quota_markers)
         else "rate_limited"
     )
+    if status != 429 and kind != "quota_exhausted" and not any(
+        marker in marker_text for marker in ("rate_limit", "rate limit", "too many requests")
+    ):
+        return None
 
     retry_after_raw = _response_header(exc, "retry-after")
     retry_after_seconds: Optional[float] = None
@@ -156,14 +160,14 @@ def rate_limit_error_details(exc: BaseException) -> Optional[Dict[str, Any]]:
 
     return {
         "kind": kind,
-        "statusCode": 429,
+        "statusCode": status,
         "providerCode": provider_code,
         "providerMessage": provider_message,
         "requestId": request_id,
         # No automatic retry inside the current agent loop. A host may offer a
         # later retry when the provider supplied a reset/delay signal.
         "automaticRetry": False,
-        "retryable": kind != "quota_exhausted" or bool(reset_at),
+        "retryable": kind != "quota_exhausted" or bool(reset_at) or retry_after_seconds is not None,
         "retryAfterSeconds": retry_after_seconds,
         "resetAt": reset_at,
     }
@@ -313,6 +317,18 @@ class LLMConnectionError(Exception):
         )
 
 
+class LLMProviderResponseError(Exception):
+    """A structured provider rejection, distinct from broken transport/JSON.
+
+    SSE error codes are not HTTP statuses. Keep only the provider's diagnostic
+    fields, not the response body (which can contain conversation content).
+    """
+
+    def __init__(self, *, code, message, request_id=None):
+        self.body = {"code": code, "message": message, "request_id": request_id}
+        super().__init__(f"Responses provider error ({code}): {message}")
+
+
 class LLMRateLimitError(Exception):
     """Normalized provider throttling/quota failure.
 
@@ -335,7 +351,7 @@ class LLMRateLimitError(Exception):
         self.model = model
         self.operation = operation
         self.kind = str(details.get("kind") or "rate_limited")
-        self.status_code = int(details.get("statusCode") or 429)
+        self.status_code = details.get("statusCode")
         self.provider_code = str(details.get("providerCode") or "")
         self.provider_message = str(details.get("providerMessage") or "")
         self.request_id = str(details.get("requestId") or "")
@@ -603,6 +619,8 @@ class BaseLLMProvider(ABC):
                             operation=operation,
                             details=rate_limit,
                         ) from fallback_exc
+                    if isinstance(fallback_exc, LLMProviderResponseError):
+                        raise
                     attempts.append({
                         "attempt": fallback_attempt,
                         "reason": "nonstream_fallback_failed",
