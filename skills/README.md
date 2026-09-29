@@ -46,12 +46,11 @@ skills/
 name: <task-slug>                  # 与目录名一致，唯一
 description: |                      # 命中用：自然语言 + 触发条件
   <一句话任务目标>。
-  Triggers on: domain=<host>, task_type=<web_scrape|form_filling|file_download|file_upload|web_search|general>,
+  Triggers on: domain=<host>,
   stage_hint=<collection|detail_sections|form_interaction|...>,
   artifact fields ⊇ {<field>, ...}.
 version: 1                          # 整数；self-heal 回写 +1
 domain: <host 或 *.example.com>     # 命中维度（精确或通配）
-task_type: <web_scrape|form_filling|file_download|file_upload|web_search|general>
 stage_hint: <collection|...>
 fields: [<field>, ...]             # expected_artifact 字段子集
 allow_auto_captcha: false          # 是否允许 VL 自动解 CAPTCHA（默认 false）
@@ -91,14 +90,11 @@ allow_auto_captcha: false          # 是否允许 VL 自动解 CAPTCHA（默认 
 }
 ```
 
-运行期 runner 实际调用：
-```python
-browser_call("Workflow.execute", {
-    **workflow_json,                       # description / variables / steps
-    "pageId": pageId, "fleetId": fleetId,  # 自动注入到省略的 step
-    "variables": {**workflow_json["variables"], **runtime_overrides},
-})
-```
+这是 Harness 保存的 workflow.json 格式；runner 经 wire adapter 转换为平台的
+`workflow` + `binding`，其中 definition 使用 schemaVersion、name、timeoutMs、
+initialVariables 和 steps。不要把 Harness wrapper 直接作为平台 API 参数发送。
+平台契约参考 [Workflow reference](../abcp-platform/resources/skills/webcross-browser/references/workflow-orchestration.md)，
+Harness 示例参考 [workflow-segments](../harness/prompts/resources/browser/workflow-segments.md)。
 
 ### 3.1 七种 step
 
@@ -139,38 +135,26 @@ browser_call("Workflow.execute", {
 operator ∈ `exists, notExists, equals, notEquals, contains, notContains, matches, gt, gte, lt, lte`。
 也支持条件组：`{ "operator": "and"|"or", "conditions": [ <condition|group>, ... ] }`。
 
-> ⚠️ **守 transform 输出的 id 别用 `exists`**：transform `find` 无命中时写**空串 `""`**，而 `exists` 对 `""` 判 true → 空 id 漏进 `Input.click` 报 "Invalid params"（联机实测踩坑）。守 id 用：
-> `{ "path": "$vars.<id>", "operator": "matches", "value": "[0-9a-fA-F-]+:\\d+:\\d+" }`
+> `find` 返回所有匹配项组成的数组，无匹配返回 `[]`。先检查
+> `$vars.matches.length` 等于 1，再用 `jsonpath` 的 `0` 提取唯一项。
+> regex 对数组逐项处理；提取 scalar id 后，按当前观察的 id 格式用 matches 校验。
+> exists 对空串仍成立，不能单独作为有效 id 的守卫。
 
 ### 3.3 `waitEvent` / `readEvents` 的 focus 白名单
 
-以 `harness/workflow_policy.LISTENABLE_EVENTS` 为准（当前 22 个）：
-
-```
-Page.open            Page.close           Page.loaded          Page.startedLoading
-Page.loadFailed      Page.crashed         Page.recovered       Page.navigate
-Page.titleUpdated    Page.switchTo        Page.dialogOpened    Page.dialogClosed
-File.chooserOpened   File.chooserClosed   File.operationCompleted
-File.operationFailed
-Download.waiting     Download.started     Download.progressed  Download.stateChanged
-Hitl.paused          Hitl.resumed
-```
-
-> ⚠️ **`DOM.axTreeUpdated` 已从白名单移除。** 它在 `System.listEvents` 的目录里，
-> 但两次完整导航 + 主动读树 + 滚轮都没观测到它发出，三种等待形状全部空超时。
-> 而 `waitEvent` 超时不算失败（见 §3.1），所以等它会**静默烧掉整个 30 秒默认
-> timeout** 再带着空 events 继续。在目录里 ≠ 这个部署会发。
+以当前模型可见 schema 的 focus 枚举为准，分别检查 readEvents 与 waitEvent。
+支持某个事件不代表本次操作一定会产生它。先 readEvents 检查 Action 自身窗口，
+未发现终态事件且预期仍会到达时才 waitEvent。超时是正常数据，必须显式处理，
+不能把超时当作页面已稳定。历史某次没有观测到事件不构成永久禁用理由。
 >
 > ⚠️ `Hitl.humanInput` / `Hitl.resumeEvent` **不存在于平台事件目录**——它们是
 > harness 侧通知流的名字。workflow 内侦测 HITL 恢复用 `Hitl.resumed`。
 
 ### 3.4 步骤级 onError（没有 workflow 级重试）
 
-`Workflow.execute` 只声明 `description / steps / variables / pageId / fleetId /
-timeout` 六个参数。**`errorConfig` 不存在**——这个标识符在整个
-`packages/workflow` 里零命中。它曾经写在这里、被 runner 发出去、被平台静默丢弃，
-因为 action 的 schema 不是 `.strict()`，顶层未知参数直接剥掉不报错。
-同理被丢弃的还有 `stepTimeout`：实测 `stepTimeout: 1000` 的步骤照样跑满 5005ms。
+Harness 工具的 description、steps、variables、pageId、fleetId、timeout
+由 wire adapter 转换为平台 workflow + binding。不要添加 errorConfig、
+stepTimeout 或 maxRetries；按当前 schema 指定总预算与 waitEvent.timeout。
 
 唯一的错误策略在 step 级：
 
@@ -179,7 +163,7 @@ timeout` 六个参数。**`errorConfig` 不存在**——这个标识符在整�
 ```
 
 - `stop`：失败步 terminate + throw → error 信封（**触发 agent 接管的信号**）。
-- `continue`：失败步记 error 但继续，整体仍可能成功（用于可选/易抖动步）。
+- `continue`：失败步记 error 但继续，整体仍可能成功；仅用于后续分支明确处理失败的情况。
 - **没有 `retry`**。步骤联合是 `.strict()`，带 `retry` 的步骤让整个 workflow
   以 -32602 被拒。也没有地方可以把它挪过去。失败的那一步是对着一个你还没重新
   观察过的页面失败的，盲目重试本来就不对——读回执、重新观察、提交新的一段。
@@ -190,40 +174,40 @@ timeout` 六个参数。**`errorConfig` 不存在**——这个标识符在整�
 
 | token | 解析目标 | 嵌套 |
 |-------|---------|------|
-| `$cache.axTree.lines` / `$cache.lastResult.lines` | WorkflowCache（axTree / semanticTree / lastResult）；**AXTree 行在 `$cache.axTree.lines`**（engine internalRpc 已解包 data 层；2026-06-26 联机实测 `.lines` 命中、`.data.lines` 空。demo 的 `.data.lines` 是另一套 transport，勿照搬） | ✅ 支持点号嵌套 |
-| `$last` / `$last.x` | **紧邻的上一步**的结果。engine 的 internalRpc 已解包 data 层，所以 AXTree 行是 `$last.lines`，不是 `$last.data.lines` | ✅ |
+| `$cache.observation` | 最新 page observation；完整引用会读取 leased artifact 文本，`.diff` 与 `.detail[nodeId]` 读取对应 leased artifact 文本。 | ✅ 支持点号嵌套 |
+| `$cache.observation.artifact.path` | observation artifact 的路径元数据；不会读取 artifact 内容。 | ✅ |
+| `$last` / `$last.x` | 最近成功的 Action、readEvents 或 waitEvent 结果；结果为 observation 时完整引用读取 artifact 文本。transform 不替换 `$last`。 | ✅ |
+| `$context` | 执行上下文：pageId、fleetId、url、hostname；只读且字段可能未提供。 | ✅ |
 | `$store` / `$store.x` | 显式 store 快照 | ✅ |
-| `$vars.<key>` / `$<key>` | 变量表 | ❌ **flat-only**：`$vars.a.b` 找的是字面量名为 `"a.b"` 的变量，不是 a 的 b 字段 |
+| `$vars.<key>` / `$<key>` | JSON 变量表 | ✅ 支持嵌套字段和数字数组索引；同名字面量 key 优先 |
 
-> **没有 `$listen`，也没有 `$steps[N]`。** 引用根只有上表四个
-> （`utils/pathResolver.ts:37-62`）。想引用更早的某一步，把它 `extract` 成变量。
-> 这也是为什么搜索一次观察的 `transform` 必须**紧跟**那个读取步骤。
->
-> ⚠️ **解析不到会抛错，不会保留字面串。** `resolvePath` 在结果为 `undefined` 时抛
-> `workflow-reference-not-found`（`pathResolver.ts:62-64`），整个 workflow 终止。
-> 旧版文档写的"保留字面 `$...` 串（不会变空）"是错的。
->
-> 但要和另一种情况分清：**变量存在但值是空串**不会抛错。`transform` 的 `find`
-> 无命中时写的正是 `""`，`$vars.<id>` 解析成功、空 id 一路进 `Input.click` 才报
-> 参数错误——这就是 §3.2 那条"守 id 用 `matches` 不用 `exists`"的由来。
+> 引用必须占整个字符串；不要在普通字符串中嵌入 `$vars.x`。
+> 没有 `$listen` 或 `$steps[N]`。需要保留先前结果时 extract 到变量；
+> `$cache.observation` 可在其他步骤之后继续引用最新观察，但页面变化后必须刷新。
+> 缺失引用抛 workflow-reference-not-found；exists/notExists 可用于缺失检查。
+> find 的空数组和 regex 的空串均须显式处理。
 
 **变量写入的 4 个来源**：
 1. 顶层 `variables`（初始模板 + 运行期覆盖）。
-2. action step 的 `extract: { <varName>: "<result 内点号路径>" }`——按 step 返回值取值写入。**⚠️ 路径是对「引擎已解包的 result」取值，不带 `data.` 前缀**（联机实测：`DOM.getAXTree` 用 `lines`、`Runtime.evaluate` 返回 `{reviews,...}` 用 `reviews`、`DOM.getText` 用 `text`——都不是 `data.xxx`；internalRpc 已 `r.result?.data ?? r.result` 解包）。
+2. Action 或事件 step 的 extract：路径直接指向结果数据，例如 `url` 而非 `data.url`。DOM.getAXTree 文本使用完整 observation 引用读取，不提取旧版 lines 字段。
 3. `transform` step 的 `output`——写入该变量名。
 4. 引擎 autoExtract（如从 AXTree 自动抽 exampleId）+ `pageId`/`fleetId` 自动注入每个 action step 的 params。
 
-**所有变量值都是 scalar（string|number|boolean）**（`types/index.ts:68`）。数组/对象不能直接成为
-variable。历史上的 `structured_output/json_variable` 通道依赖冻结 workflow 内的
-`Runtime.evaluate`，现已不受支持；多行抽取应走 BrowserAgent 的 AXTree 枚举 + 原生批量
-`DOM.getText`/`DOM.getAttribute` + `record_extraction`。
+**变量值为 JSON-compatible 值**，包括 string、number、boolean、array 和 object。
+`transform` 输出与 `store` 可承载结构化值；需要持久化的抽取结果仍由 Harness
+在 Workflow 返回后调用 `record_extraction`。Workflow 内不能调用 Harness-local
+tools，也不能把 `record_extraction` 写成 Action。
 
 **`Runtime.evaluate` 不得出现在冻结 workflow 中**。运行期 BrowserAgent 也只能把它作为所有结构化原生读取均已失败后的只读末级手段，并显式使用 `world="isolated"`；只有 `non_dom_state` 的专用 blocker 可以由 harness 授权一次严格 main 重试，skill authoring 不得冻结这类表达式。
 
 ### 3.6 元素定位纪律（authoring 必守）
-- **运行期重解析**：`DOM.getAXTree → transform(find+regex 取 id) → if matches(id 形) → 操作`（守卫用 `matches` 非 `exists`，见 §7 校验清单）。**绝不**把 epoch 绑定的 AXTree id / pageId 冻进 workflow.json（导航后引擎自动清 `$cache`，旧 id 必失效）。
+- **运行期重解析**：`DOM.getAXTree → find → 检查唯一匹配 → jsonpath 0 → regex 提取 id → 校验 id → 操作`。
+  完整 `$cache.observation` 或 `$last` 引用可直接交给 `transform`；不要将
+  `$cache.observation.artifact.path` 当作内容。**绝不**把 epoch 绑定的 AXTree id / pageId
+  冻进 workflow.json（导航后旧 id 必失效）。
 - CSS 仅用于真正稳定的 hook；优先 role+name 文本定位。
-- 导航/crash 后在 workflow 内**重跑 `DOM.getAXTree`** 再用 id。
+- 导航/crash 后先重新等待页面稳定，再读取 `DOM.getAXTree` 并用 transform 提取新 id；
+  需要模型判断、截图或 Harness 工具时结束 segment，交回 Agent。
 
 ---
 
@@ -236,7 +220,7 @@ variable。历史上的 `structured_output/json_variable` 通道依赖冻结 wor
 | 数据形态 | 通道 |
 |---------|------|
 | **定 schema 的单行**（如一个详情页的 reviews/pros/cons/qa） | workflow 用 `extract`/`transform` 把每个字段写进 **scalar variables** → workflow 返回 → **harness/agent 读 `result.variables` 拼行 → 调 `record_extraction` 落盘** |
-| **多行 / 结构化** | 不走冻结 workflow 快路径；由 BrowserAgent 枚举 AXTree canonical ids，批量读取文本/属性，完成有界滚动或 load-more 后调用 `record_extraction` |
+| **多行 / 结构化** | Workflow 可读取 observation、确定性抽取并累积到 variables/store；有歧义时交回 Agent，结果由 Harness 验证后调用 `record_extraction` |
 
 > 一句话：**workflow 负责“拿到值”，harness 负责“落盘”**。workflow.json 的最后一步**不是** record_extraction，而是把字段读进 variables 的那一步。
 
@@ -270,7 +254,7 @@ success_contract:
 
 takeover:
   on_call_error:                                        # Workflow.execute 失败 = 抛异常（见 §6）
-    recover_via: exec_observer                          # ⚠️ 失败详情只在 Workflow.progress 流里，见 §6
+    recover_via: exec_observer                          # 结合终态失败回执与执行事件，见 §6
     read: [status.failedStepPath, status.error, status.variables, status.results[-1].step]
     reobserve: [Page.getState, DOM.getAXTree]
     semantic_anchor: status.results[-1].step.purpose
@@ -313,40 +297,29 @@ phase 作用域、后跨 replan 总账；任何集合不一致、重复 identity
 
 ---
 
-## 6. 结果信封（agent 可见面**无 status 字段**；2026-06-26 联机实测）
+## 6. 结果与失败恢复
 
-`Workflow.execute` 经 `browser_call` 看到的是 action feedback，**没有 `status`**。成功/失败两路**形态不同**（实测）：
+读取终态 Workflow.execute 回执的 status、results、variables、store 和 timing。
+Harness 失败回执提供 failedStepPath、failedErrorCode、completedSteps、
+variablesAtFailure 和 storeAtFailure。保留已收集结果，结合页面实际状态恢复。
+Workflow.progress 和 Workflow.getStatus 是摘要，含 variableKeys/resultCount，
+不能代替终态变量值。stepRunId 区分同一 stepPath 的不同循环执行。
 
-```
-成功：browser_call 【返回】 data:{ workflowId, taskId, status:"succeeded",
-                                 results, variables, store, storeRevision, timing }
-失败：browser_call 【抛异常】 ABCPTransportError: -32005
-      异常携带的 details 实测【只有】 { failedStepPath }
-      ⚠️ 没有 workflowId / results / variables / store
-```
-
-**判成败 + 取失败详情**：
-- 成功 = `browser_call` 正常返回 → 读 `data.{results, variables, store}`。成功回执
-  **有** `status` 字段（旧文档说没有，是错的）。
-- 失败 = `browser_call` 抛异常。`Workflow.getStatus` 需要 `workflowId`，而失败错误体里
-  没有它；即使拿到了，getStatus 也只返回 `variableKeys`（变量**名**，无值）和
-  `resultCount`（**数量**，无内容）。**客户端自造的 `runId` 平台根本不接受。**
-- 唯一完整的失败记录是 `Workflow.progress` 通知流：每条 `step_finished` 都带完整的
-  `variables` 值。harness 用 `harness/observation/exec_observer.py` 在执行期旁路记录
-  这条流，失败时重建 `failedStepPath` / `failedErrorCode` / `variablesAtFailure` /
-  `completedSteps`。详见 `docs/workflow-execute-live-contract.md`。
+已派发动作可能已生效；失败不撤销此前操作。不要机械截取 failedStepPath 后半段，
+也不要重放结果不明的副作用；遵守 replayForbidden。历史版本探针见
+[实测记录](../docs/workflow-execute-live-contract.md)。
 
 ---
 
 ## 7. 校验清单（手填后自查）
 
-- [ ] `name` == 目录名；frontmatter 命中四维（domain/task_type/stage_hint/fields）齐全。
+- [ ] `name` == 目录名；frontmatter 命中三维（domain/stage_hint/fields）齐全。
 - [ ] 每个 action step 有 `purpose`。
 - [ ] 没有硬编码 AXTree id / pageId；定位走运行期重解析。
-- [ ] `waitEvent`/`readEvents` 的 `focus` 都在 §3.3 白名单内（HITL 用 `Hitl.resumed`；不要等 `DOM.axTreeUpdated`）。
-- [ ] 挑战边界（`if $vars.<flag> matches → waitEvent focus=[Hitl.resumed]`）的 `<flag>` **必须由一个 `Runtime.evaluate` 的 `extract` 产出**——`skill_control.make_challenge_poller` 反查这对结构，在第二连接上重跑同一段 JS 做 in-page 轮询；用别的 action 产 flag 会让 in-page 轮询**静默失效**（只剩导航级 onset）。
-- [ ] `$vars.*` 引用的都是 flat 变量名，且在使用前已被写入。
-- [ ] **id 守卫用 `matches "[0-9a-fA-F-]+:\d+:\d+"`，不用 `exists`**（transform 无命中写空串，exists 对空串判 true → 空 id 进 Input.click 报错；联机实测踩坑）。
+- [ ] waitEvent/readEvents 的 focus 符合当前 schema，且显式处理失败/超时。
+- [ ] 挑战或人工接管需要 Harness 工具时结束 segment，不冻结 Runtime.evaluate。
+- [ ] `$vars.*` 的变量和嵌套路径在使用前存在；缺失检查使用 exists/notExists。
+- [ ] find 结果先检查唯一性，再选择 index 0；regex 提取后的 scalar id 按当前观察格式校验，不能只用 exists。
 - [ ] **最后一步不是 record_extraction**；落盘是 harness 后置步（§4）。
 - [ ] 关键步的 step 级 `onError` 是 `stop`（让失败触发接管）；**没有 `retry`，也没有 `errorConfig`**。
 - [ ] workflow.json 里没有 `runId` / `stepTimeout` / `errorConfig`——平台不接受，会被静默丢弃。

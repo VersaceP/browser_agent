@@ -14,7 +14,7 @@ import argparse, json, re, sys
 from pathlib import Path
 from typing import Any, Optional
 
-ID_RE = r"[0-9a-fA-F-]+:\d+:\d+"          # canonical AXTree id (matches-guard value)
+ID_RE = r"n_[0-9a-f]{16}(?:[0-9a-f]{16})?"  # page-observation node id (matches-guard value)
 # trace methods that are recovery/probe/tab-mgmt noise — never become workflow steps
 DROP_METHODS = {
     "System.describeAction", "System.describeEvent", "System.getCapabilities",
@@ -245,10 +245,9 @@ def main(argv=None) -> int:
 name: {args.slug}
 description: |
   DRAFT — distilled from {trace.name}. Fill triggers + confirm fields.
-  Triggers on: domain=<host>, task_type=<...>, stage_hint=<...>, artifact fields ⊇ {{{', '.join(persist) or '<field>'}}}.
+  Triggers on: domain=<host>, stage_hint=<...>, artifact fields ⊇ {{{', '.join(persist) or '<field>'}}}.
 version: 1
 domain: <host>
-task_type: <web_scrape|...>
 stage_hint: <...>
 fields: [{', '.join(persist)}]
 allow_auto_captcha: false
@@ -292,7 +291,7 @@ hitl_boundary:
     report += [f"- {n}" for n in notes] or ["- (none)"]
     report += ["", "## next (human)",
                "- confirm每个 transform 的 find label 与真实 AXTree 行匹配（点击会改 DOM，必要时合并/拆分 getAXTree）。",
-               "- 补 domain/task_type/stage_hint/fields；填 fallback.yaml 的 fields_required。",
+               "- 补 domain/stage_hint/fields；填 fallback.yaml 的 fields_required。",
                "- 解决任何 `__TODO_LOCATE__`。",
                "- 过编译版 schema 校验后再冻结。"]
     (out / "distill_report.md").write_text("\n".join(report) + "\n", encoding="utf-8")

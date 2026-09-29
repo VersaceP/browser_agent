@@ -2,12 +2,11 @@
 name: __FILL__-slug
 description: |
   <一句话任务目标，例如：Extract reviews/pros/cons/qa from a product detail page>.
-  Triggers on: domain=<host>, task_type=<web_scrape|form_filling|file_download|file_upload|web_search|general>,
+  Triggers on: domain=<host>,
   stage_hint=<collection|detail_sections|form_interaction|...>,
   artifact fields ⊇ {<field>, ...}.
 version: 1
 domain: <host 或 *.example.com>
-task_type: <web_scrape|form_filling|file_download|file_upload|web_search|general>
 stage_hint: <collection|detail_sections|form_interaction|...>
 fields: [<field>, <field>]
 allow_auto_captcha: false
