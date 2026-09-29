@@ -1,61 +1,123 @@
 {
   "method": "Workflow.execute",
-  "description": "Starts a validated multi-step workflow containing Action, condition, loop, event-wait, and transform steps.",
+  "description": "Starts a validated multi-step workflow containing Action, condition, loop, event, transform, and store steps.",
   "requiresPurpose": false,
-  "catalogRevision": "sha256:52691626582a5164f1e1aaafb5a9e390e6e1e95ccc27663283f74997776c3737",
+  "catalogRevision": "sha256:57787ad534cac0789a4ec5118fb0a773583a9790bab09bbabd5f03df913b3180",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "properties": {
-      "description": {
-        "description": "Optional summary of what the workflow is trying to accomplish.",
-        "type": "string"
-      },
-      "steps": {
-        "minItems": 1,
-        "type": "array",
-        "items": {
-          "$ref": "#/$defs/__schema0"
-        },
-        "description": "Non-empty ordered workflow steps to execute."
-      },
-      "variables": {
-        "description": "Initial JSON-compatible workflow variables available to all steps.",
+      "workflow": {
         "type": "object",
-        "propertyNames": {
-          "type": "string"
+        "properties": {
+          "schemaVersion": {
+            "type": "number",
+            "const": 1,
+            "description": "Workflow document schema version."
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "Human-readable Workflow name."
+          },
+          "description": {
+            "description": "Optional Workflow description.",
+            "type": "string",
+            "maxLength": 2000
+          },
+          "timeoutMs": {
+            "default": 600000,
+            "description": "Maximum total execution time in milliseconds.",
+            "type": "integer",
+            "minimum": 1000,
+            "maximum": 3600000
+          },
+          "initialVariables": {
+            "default": {},
+            "description": "Initial JSON-compatible values available through $vars.",
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {
+              "$ref": "#/$defs/__schema0"
+            }
+          },
+          "steps": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/__schema1"
+            },
+            "description": "Non-empty ordered Workflow steps."
+          }
         },
-        "additionalProperties": {
-          "$ref": "#/$defs/__schema1"
-        }
+        "required": [
+          "schemaVersion",
+          "name",
+          "steps"
+        ],
+        "additionalProperties": true,
+        "description": "Flat, versioned Workflow definition to execute."
       },
-      "pageId": {
-        "description": "Default page ID injected into steps that omit one.",
-        "type": "string",
-        "format": "uuid",
-        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
-      },
-      "fleetId": {
-        "description": "Default fleet ID injected into steps that omit one.",
-        "type": "string",
-        "format": "uuid",
-        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
-      },
-      "timeout": {
-        "default": 600000,
-        "description": "Total workflow timeout in milliseconds.",
-        "type": "integer",
-        "minimum": 1000,
-        "maximum": 3600000
+      "binding": {
+        "description": "Runtime-only resource binding; do not persist it in a reusable Workflow document.",
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "description": "Page used as the initial execution target.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "fleetId": {
+            "description": "Fleet used as the initial execution target.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          }
+        },
+        "additionalProperties": true
       }
     },
     "required": [
-      "steps",
-      "timeout"
+      "workflow"
     ],
     "additionalProperties": true,
     "$defs": {
       "__schema0": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "number"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/__schema0"
+            }
+          },
+          {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {
+              "$ref": "#/$defs/__schema0"
+            }
+          }
+        ]
+      },
+      "__schema1": {
         "anyOf": [
           {
             "type": "object",
@@ -83,9 +145,9 @@
                 "additionalProperties": {}
               },
               "purpose": {
-                "description": "Audit purpose forwarded to proxied Actions.",
                 "type": "string",
-                "minLength": 1
+                "minLength": 1,
+                "description": "Audit purpose forwarded to proxied Actions."
               },
               "extract": {
                 "description": "Variable names mapped to paths in the Action result.",
@@ -111,60 +173,7 @@
             "required": [
               "type",
               "action",
-              "onError"
-            ],
-            "additionalProperties": true
-          },
-          {
-            "type": "object",
-            "properties": {
-              "id": {
-                "description": "Optional stable step identifier.",
-                "type": "string",
-                "minLength": 1
-              },
-              "action": {
-                "type": "string",
-                "minLength": 1,
-                "description": "Canonical Domain.action identifier."
-              },
-              "params": {
-                "description": "Action params with recursively resolved Workflow references.",
-                "type": "object",
-                "propertyNames": {
-                  "type": "string"
-                },
-                "additionalProperties": {}
-              },
-              "purpose": {
-                "description": "Audit purpose forwarded to proxied Actions.",
-                "type": "string",
-                "minLength": 1
-              },
-              "extract": {
-                "description": "Variable names mapped to paths in the Action result.",
-                "type": "object",
-                "propertyNames": {
-                  "type": "string"
-                },
-                "additionalProperties": {
-                  "type": "string",
-                  "minLength": 1
-                }
-              },
-              "onError": {
-                "default": "stop",
-                "description": "Whether this Workflow stops or records the error and continues.",
-                "type": "string",
-                "enum": [
-                  "stop",
-                  "continue"
-                ]
-              }
-            },
-            "required": [
-              "action",
-              "onError"
+              "purpose"
             ],
             "additionalProperties": true
           },
@@ -209,7 +218,7 @@
                       },
                       "value": {
                         "description": "Optional literal or Workflow reference used as the right-hand value.",
-                        "$ref": "#/$defs/__schema1"
+                        "$ref": "#/$defs/__schema0"
                       }
                     },
                     "required": [
@@ -227,7 +236,7 @@
               "then": {
                 "type": "array",
                 "items": {
-                  "$ref": "#/$defs/__schema0"
+                  "$ref": "#/$defs/__schema1"
                 },
                 "description": "Steps executed when the condition matches."
               },
@@ -235,7 +244,7 @@
                 "description": "Steps executed when the condition does not match.",
                 "type": "array",
                 "items": {
-                  "$ref": "#/$defs/__schema0"
+                  "$ref": "#/$defs/__schema1"
                 }
               }
             },
@@ -293,7 +302,7 @@
                       },
                       "value": {
                         "description": "Optional literal or Workflow reference used as the right-hand value.",
-                        "$ref": "#/$defs/__schema1"
+                        "$ref": "#/$defs/__schema0"
                       }
                     },
                     "required": [
@@ -311,7 +320,7 @@
               "body": {
                 "type": "array",
                 "items": {
-                  "$ref": "#/$defs/__schema0"
+                  "$ref": "#/$defs/__schema1"
                 },
                 "description": "Steps executed while the condition matches."
               }
@@ -349,7 +358,7 @@
                   },
                   "value": {
                     "description": "JSON value or recursively resolved Workflow reference written at path.",
-                    "$ref": "#/$defs/__schema1"
+                    "$ref": "#/$defs/__schema0"
                   }
                 },
                 "required": [
@@ -383,7 +392,7 @@
                   },
                   "value": {
                     "description": "Object or Workflow reference resolved to an object and merged one level at path.",
-                    "$ref": "#/$defs/__schema1"
+                    "$ref": "#/$defs/__schema0"
                   }
                 },
                 "required": [
@@ -417,7 +426,7 @@
                   },
                   "value": {
                     "description": "JSON value or recursively resolved Workflow reference appended at path.",
-                    "$ref": "#/$defs/__schema1"
+                    "$ref": "#/$defs/__schema0"
                   }
                 },
                 "required": [
@@ -502,7 +511,6 @@
                     "Download.stateChanged",
                     "Hitl.paused",
                     "Hitl.resumed",
-                    "DOM.axTreeUpdated",
                     "Workflow.progress"
                   ]
                 }
@@ -582,7 +590,6 @@
                     "Download.stateChanged",
                     "Hitl.paused",
                     "Hitl.resumed",
-                    "DOM.axTreeUpdated",
                     "Workflow.progress"
                   ]
                 }
@@ -656,7 +663,7 @@
                         },
                         "pattern": {
                           "type": "string",
-                          "description": "Text or regular expression used to select the first matching item."
+                          "description": "Text or regular expression used to select every matching item."
                         },
                         "mode": {
                           "description": "Matching mode; defaults to contains.",
@@ -678,6 +685,38 @@
                       "properties": {
                         "op": {
                           "type": "string",
+                          "const": "join"
+                        },
+                        "separator": {
+                          "default": "\n",
+                          "description": "Separator used to combine transform items into one string.",
+                          "type": "string",
+                          "maxLength": 256
+                        }
+                      },
+                      "required": [
+                        "op"
+                      ],
+                      "additionalProperties": true
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "op": {
+                          "type": "string",
+                          "const": "decode"
+                        }
+                      },
+                      "required": [
+                        "op"
+                      ],
+                      "additionalProperties": true
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "op": {
+                          "type": "string",
                           "const": "regex"
                         },
                         "pattern": {
@@ -689,6 +728,24 @@
                           "type": "integer",
                           "minimum": 0,
                           "maximum": 9007199254740991
+                        }
+                      },
+                      "required": [
+                        "op",
+                        "pattern"
+                      ],
+                      "additionalProperties": true
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "op": {
+                          "type": "string",
+                          "const": "reg"
+                        },
+                        "pattern": {
+                          "type": "string",
+                          "description": "Regular expression matched against each observation artifact line."
                         }
                       },
                       "required": [
@@ -742,7 +799,7 @@
                         },
                         "selector": {
                           "type": "string",
-                          "description": "Selector matched against the simplified semantic tree."
+                          "description": "Supported selector subset: tags, complete classes, IDs, combinations, and whitespace descendants; other CSS syntax is rejected."
                         },
                         "index": {
                           "description": "Zero-based match index; defaults to zero.",
@@ -774,37 +831,6 @@
               "output"
             ],
             "additionalProperties": true
-          }
-        ]
-      },
-      "__schema1": {
-        "anyOf": [
-          {
-            "type": "string"
-          },
-          {
-            "type": "number"
-          },
-          {
-            "type": "boolean"
-          },
-          {
-            "type": "null"
-          },
-          {
-            "type": "array",
-            "items": {
-              "$ref": "#/$defs/__schema1"
-            }
-          },
-          {
-            "type": "object",
-            "propertyNames": {
-              "type": "string"
-            },
-            "additionalProperties": {
-              "$ref": "#/$defs/__schema1"
-            }
           }
         ]
       },
@@ -851,7 +877,7 @@
                     },
                     "value": {
                       "description": "Optional literal or Workflow reference used as the right-hand value.",
-                      "$ref": "#/$defs/__schema1"
+                      "$ref": "#/$defs/__schema0"
                     }
                   },
                   "required": [

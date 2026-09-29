@@ -1,8 +1,8 @@
 {
   "method": "Page.screenshot",
-  "description": "Captures the full page, viewport, rectangular region, or resolved element as an image; element captures also return the target Semantic Tree.",
+  "description": "Captures the full page, viewport, rectangular region, or resolved element as an image.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:52691626582a5164f1e1aaafb5a9e390e6e1e95ccc27663283f74997776c3737",
+  "catalogRevision": "sha256:57787ad534cac0789a4ec5118fb0a773583a9790bab09bbabd5f03df913b3180",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -48,9 +48,9 @@
         "minLength": 1
       },
       "id": {
-        "description": "Preferred canonical element ID for element capture.",
+        "description": "Preferred opaque element ID for element capture.",
         "type": "string",
-        "pattern": "^\\d+:\\d+:\\d+$"
+        "pattern": "^n_[0-9a-f]{16}$"
       },
       "options": {
         "description": "Output options for the screenshot result.",
@@ -147,14 +147,6 @@
             "description": "Resolution mode used for the capture target.",
             "type": "string"
           },
-          "recoveredTarget": {
-            "description": "Target identity recovered during capture.",
-            "type": "object",
-            "propertyNames": {
-              "type": "string"
-            },
-            "additionalProperties": {}
-          },
           "mode": {
             "type": "string",
             "const": "full-page",
@@ -217,14 +209,6 @@
           "resolvedBy": {
             "description": "Resolution mode used for the capture target.",
             "type": "string"
-          },
-          "recoveredTarget": {
-            "description": "Target identity recovered during capture.",
-            "type": "object",
-            "propertyNames": {
-              "type": "string"
-            },
-            "additionalProperties": {}
           },
           "mode": {
             "type": "string",
@@ -289,14 +273,6 @@
             "description": "Resolution mode used for the capture target.",
             "type": "string"
           },
-          "recoveredTarget": {
-            "description": "Target identity recovered during capture.",
-            "type": "object",
-            "propertyNames": {
-              "type": "string"
-            },
-            "additionalProperties": {}
-          },
           "mode": {
             "type": "string",
             "const": "region",
@@ -360,172 +336,95 @@
             "description": "Resolution mode used for the capture target.",
             "type": "string"
           },
-          "recoveredTarget": {
-            "description": "Target identity recovered during capture.",
-            "type": "object",
-            "propertyNames": {
-              "type": "string"
-            },
-            "additionalProperties": {}
-          },
           "mode": {
             "type": "string",
             "const": "element",
             "description": "Capture mode used."
           },
-          "semanticTree": {
+          "targetDetail": {
             "anyOf": [
               {
                 "type": "object",
                 "properties": {
-                  "rootFrameId": {
-                    "type": "string",
-                    "description": "Frame ID of the returned document root."
-                  },
-                  "frames": {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "frameId": {
-                          "type": "string",
-                          "minLength": 1,
-                          "description": "Frame identity for this tree."
-                        },
-                        "parentFrameId": {
-                          "anyOf": [
-                            {
-                              "type": "string"
-                            },
-                            {
-                              "type": "null"
-                            }
-                          ],
-                          "description": "Parent frame identity, or null for the root frame."
-                        },
-                        "ownerId": {
-                          "anyOf": [
-                            {
-                              "type": "string"
-                            },
-                            {
-                              "type": "null"
-                            }
-                          ],
-                          "description": "Owner node ID for this frame when available; use the frame IDs to correlate child frames."
-                        },
-                        "url": {
-                          "type": "string",
-                          "description": "URL observed for this frame."
-                        },
-                        "status": {
-                          "type": "string",
-                          "enum": [
-                            "complete",
-                            "truncated",
-                            "unavailable"
-                          ],
-                          "description": "Frame tree availability."
-                        },
-                        "tree": {
-                          "anyOf": [
-                            {},
-                            {
-                              "type": "null"
-                            }
-                          ],
-                          "description": "Frame-local semantic tree when available."
-                        },
-                        "nodeCount": {
-                          "type": "integer",
-                          "minimum": 0,
-                          "maximum": 9007199254740991,
-                          "description": "Number of nodes in this frame tree."
-                        },
-                        "truncated": {
-                          "type": "boolean",
-                          "description": "Whether this frame was truncated."
-                        },
-                        "truncatedReason": {
-                          "anyOf": [
-                            {
-                              "type": "string"
-                            },
-                            {
-                              "type": "null"
-                            }
-                          ],
-                          "description": "Reason the frame result is incomplete, when provided."
-                        },
-                        "error": {
-                          "description": "Structured failure for an unavailable frame.",
-                          "type": "object",
-                          "properties": {
-                            "code": {
-                              "type": "string",
-                              "minLength": 1,
-                              "description": "Stable public frame failure code."
-                            },
-                            "message": {
-                              "type": "string",
-                              "minLength": 1,
-                              "description": "Concise public frame failure message."
-                            },
-                            "suggested_prompt": {
-                              "type": "string",
-                              "minLength": 1,
-                              "description": "Next-observation guidance for this frame."
-                            }
-                          },
-                          "required": [
-                            "code",
-                            "message",
-                            "suggested_prompt"
-                          ],
-                          "additionalProperties": false
-                        }
-                      },
-                      "required": [
-                        "frameId",
-                        "parentFrameId",
-                        "ownerId",
-                        "url",
-                        "status",
-                        "tree",
-                        "nodeCount",
-                        "truncated",
-                        "truncatedReason"
-                      ],
-                      "additionalProperties": {},
-                      "description": "One frame-local semantic tree result."
-                    },
-                    "description": "Structured semantic trees for the root document and accessible child frames."
-                  },
-                  "summary": {
+                  "info": {
                     "type": "object",
                     "propertyNames": {
                       "type": "string"
                     },
                     "additionalProperties": {},
-                    "description": "Node counts, truncation, and visibility summary."
+                    "description": "Unified observation info for the screenshot target."
                   },
-                  "resolutionSource": {
-                    "description": "How the requested target was located, when a target was provided.",
-                    "type": "string"
-                  },
-                  "recoveredTarget": {
-                    "description": "Updated target information when the original target changed.",
+                  "context": {
+                    "description": "Bounded DOM context for the screenshot target.",
                     "type": "object",
-                    "propertyNames": {
-                      "type": "string"
+                    "properties": {
+                      "targetId": {
+                        "type": "string",
+                        "pattern": "^n_[0-9a-f]{16}$",
+                        "description": "Opaque ID of the resolved target node."
+                      },
+                      "root": {
+                        "type": "object",
+                        "propertyNames": {
+                          "type": "string"
+                        },
+                        "additionalProperties": {},
+                        "description": "Root of the bounded target context."
+                      },
+                      "parentDepth": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991,
+                        "description": "Number of parent levels included in the context."
+                      },
+                      "subtreeDepth": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991,
+                        "description": "Maximum target-subtree depth represented in the context."
+                      },
+                      "truncated": {
+                        "type": "boolean",
+                        "description": "Whether the bounded target context was truncated."
+                      },
+                      "truncationReasons": {
+                        "description": "Public reasons why the target context was truncated.",
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "enum": [
+                            "parent-depth",
+                            "subtree-depth",
+                            "item-node-budget",
+                            "batch-node-budget"
+                          ]
+                        }
+                      },
+                      "relatedRoots": {
+                        "description": "ARIA-related roots outside the target DOM subtree.",
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {},
+                          "description": "One bounded selector-context node with its public observation info."
+                        }
+                      }
                     },
-                    "additionalProperties": {}
+                    "required": [
+                      "targetId",
+                      "root",
+                      "parentDepth",
+                      "subtreeDepth",
+                      "truncated"
+                    ],
+                    "additionalProperties": false
                   }
                 },
                 "required": [
-                  "rootFrameId",
-                  "frames",
-                  "summary"
+                  "info"
                 ],
                 "additionalProperties": false
               },
@@ -533,7 +432,7 @@
                 "type": "null"
               }
             ],
-            "description": "Target Semantic Tree, or null when the image succeeded but the tree could not be read."
+            "description": "Optional unified target detail; null means the screenshot succeeded but the detail read did not."
           }
         },
         "required": [
@@ -544,7 +443,7 @@
           "scaleFactor",
           "target",
           "mode",
-          "semanticTree"
+          "targetDetail"
         ],
         "additionalProperties": false
       }
@@ -610,14 +509,6 @@
                 "description": "Resolution mode used for the capture target.",
                 "type": "string"
               },
-              "recoveredTarget": {
-                "description": "Target identity recovered during capture.",
-                "type": "object",
-                "propertyNames": {
-                  "type": "string"
-                },
-                "additionalProperties": {}
-              },
               "mode": {
                 "type": "string",
                 "const": "full-page",
@@ -680,14 +571,6 @@
               "resolvedBy": {
                 "description": "Resolution mode used for the capture target.",
                 "type": "string"
-              },
-              "recoveredTarget": {
-                "description": "Target identity recovered during capture.",
-                "type": "object",
-                "propertyNames": {
-                  "type": "string"
-                },
-                "additionalProperties": {}
               },
               "mode": {
                 "type": "string",
@@ -752,14 +635,6 @@
                 "description": "Resolution mode used for the capture target.",
                 "type": "string"
               },
-              "recoveredTarget": {
-                "description": "Target identity recovered during capture.",
-                "type": "object",
-                "propertyNames": {
-                  "type": "string"
-                },
-                "additionalProperties": {}
-              },
               "mode": {
                 "type": "string",
                 "const": "region",
@@ -823,172 +698,95 @@
                 "description": "Resolution mode used for the capture target.",
                 "type": "string"
               },
-              "recoveredTarget": {
-                "description": "Target identity recovered during capture.",
-                "type": "object",
-                "propertyNames": {
-                  "type": "string"
-                },
-                "additionalProperties": {}
-              },
               "mode": {
                 "type": "string",
                 "const": "element",
                 "description": "Capture mode used."
               },
-              "semanticTree": {
+              "targetDetail": {
                 "anyOf": [
                   {
                     "type": "object",
                     "properties": {
-                      "rootFrameId": {
-                        "type": "string",
-                        "description": "Frame ID of the returned document root."
-                      },
-                      "frames": {
-                        "type": "array",
-                        "items": {
-                          "type": "object",
-                          "properties": {
-                            "frameId": {
-                              "type": "string",
-                              "minLength": 1,
-                              "description": "Frame identity for this tree."
-                            },
-                            "parentFrameId": {
-                              "anyOf": [
-                                {
-                                  "type": "string"
-                                },
-                                {
-                                  "type": "null"
-                                }
-                              ],
-                              "description": "Parent frame identity, or null for the root frame."
-                            },
-                            "ownerId": {
-                              "anyOf": [
-                                {
-                                  "type": "string"
-                                },
-                                {
-                                  "type": "null"
-                                }
-                              ],
-                              "description": "Owner node ID for this frame when available; use the frame IDs to correlate child frames."
-                            },
-                            "url": {
-                              "type": "string",
-                              "description": "URL observed for this frame."
-                            },
-                            "status": {
-                              "type": "string",
-                              "enum": [
-                                "complete",
-                                "truncated",
-                                "unavailable"
-                              ],
-                              "description": "Frame tree availability."
-                            },
-                            "tree": {
-                              "anyOf": [
-                                {},
-                                {
-                                  "type": "null"
-                                }
-                              ],
-                              "description": "Frame-local semantic tree when available."
-                            },
-                            "nodeCount": {
-                              "type": "integer",
-                              "minimum": 0,
-                              "maximum": 9007199254740991,
-                              "description": "Number of nodes in this frame tree."
-                            },
-                            "truncated": {
-                              "type": "boolean",
-                              "description": "Whether this frame was truncated."
-                            },
-                            "truncatedReason": {
-                              "anyOf": [
-                                {
-                                  "type": "string"
-                                },
-                                {
-                                  "type": "null"
-                                }
-                              ],
-                              "description": "Reason the frame result is incomplete, when provided."
-                            },
-                            "error": {
-                              "description": "Structured failure for an unavailable frame.",
-                              "type": "object",
-                              "properties": {
-                                "code": {
-                                  "type": "string",
-                                  "minLength": 1,
-                                  "description": "Stable public frame failure code."
-                                },
-                                "message": {
-                                  "type": "string",
-                                  "minLength": 1,
-                                  "description": "Concise public frame failure message."
-                                },
-                                "suggested_prompt": {
-                                  "type": "string",
-                                  "minLength": 1,
-                                  "description": "Next-observation guidance for this frame."
-                                }
-                              },
-                              "required": [
-                                "code",
-                                "message",
-                                "suggested_prompt"
-                              ],
-                              "additionalProperties": false
-                            }
-                          },
-                          "required": [
-                            "frameId",
-                            "parentFrameId",
-                            "ownerId",
-                            "url",
-                            "status",
-                            "tree",
-                            "nodeCount",
-                            "truncated",
-                            "truncatedReason"
-                          ],
-                          "additionalProperties": {},
-                          "description": "One frame-local semantic tree result."
-                        },
-                        "description": "Structured semantic trees for the root document and accessible child frames."
-                      },
-                      "summary": {
+                      "info": {
                         "type": "object",
                         "propertyNames": {
                           "type": "string"
                         },
                         "additionalProperties": {},
-                        "description": "Node counts, truncation, and visibility summary."
+                        "description": "Unified observation info for the screenshot target."
                       },
-                      "resolutionSource": {
-                        "description": "How the requested target was located, when a target was provided.",
-                        "type": "string"
-                      },
-                      "recoveredTarget": {
-                        "description": "Updated target information when the original target changed.",
+                      "context": {
+                        "description": "Bounded DOM context for the screenshot target.",
                         "type": "object",
-                        "propertyNames": {
-                          "type": "string"
+                        "properties": {
+                          "targetId": {
+                            "type": "string",
+                            "pattern": "^n_[0-9a-f]{16}$",
+                            "description": "Opaque ID of the resolved target node."
+                          },
+                          "root": {
+                            "type": "object",
+                            "propertyNames": {
+                              "type": "string"
+                            },
+                            "additionalProperties": {},
+                            "description": "Root of the bounded target context."
+                          },
+                          "parentDepth": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991,
+                            "description": "Number of parent levels included in the context."
+                          },
+                          "subtreeDepth": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991,
+                            "description": "Maximum target-subtree depth represented in the context."
+                          },
+                          "truncated": {
+                            "type": "boolean",
+                            "description": "Whether the bounded target context was truncated."
+                          },
+                          "truncationReasons": {
+                            "description": "Public reasons why the target context was truncated.",
+                            "type": "array",
+                            "items": {
+                              "type": "string",
+                              "enum": [
+                                "parent-depth",
+                                "subtree-depth",
+                                "item-node-budget",
+                                "batch-node-budget"
+                              ]
+                            }
+                          },
+                          "relatedRoots": {
+                            "description": "ARIA-related roots outside the target DOM subtree.",
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "propertyNames": {
+                                "type": "string"
+                              },
+                              "additionalProperties": {},
+                              "description": "One bounded selector-context node with its public observation info."
+                            }
+                          }
                         },
-                        "additionalProperties": {}
+                        "required": [
+                          "targetId",
+                          "root",
+                          "parentDepth",
+                          "subtreeDepth",
+                          "truncated"
+                        ],
+                        "additionalProperties": false
                       }
                     },
                     "required": [
-                      "rootFrameId",
-                      "frames",
-                      "summary"
+                      "info"
                     ],
                     "additionalProperties": false
                   },
@@ -996,7 +794,7 @@
                     "type": "null"
                   }
                 ],
-                "description": "Target Semantic Tree, or null when the image succeeded but the tree could not be read."
+                "description": "Optional unified target detail; null means the screenshot succeeded but the detail read did not."
               }
             },
             "required": [
@@ -1007,7 +805,7 @@
               "scaleFactor",
               "target",
               "mode",
-              "semanticTree"
+              "targetDetail"
             ],
             "additionalProperties": false
           }

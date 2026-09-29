@@ -1,17 +1,17 @@
 {
   "method": "Page.create",
-  "description": "Creates a page in a ready Fleet and optionally starts navigation to an initial URL.",
+  "description": "Creates a page in a selected Fleet or, when fleetId is omitted, in a suitable existing Fleet or a newly created default Fleet.",
   "requiresPurpose": false,
-  "catalogRevision": "sha256:52691626582a5164f1e1aaafb5a9e390e6e1e95ccc27663283f74997776c3737",
+  "catalogRevision": "sha256:57787ad534cac0789a4ec5118fb0a773583a9790bab09bbabd5f03df913b3180",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "properties": {
       "fleetId": {
+        "description": "Optional Fleet ID. Omit it to reuse a suitable Fleet or create a default Fleet for the page.",
         "type": "string",
         "format": "uuid",
-        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-        "description": "Existing Fleet ID in which the new page should be created."
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
       },
       "url": {
         "description": "Optional initial URL to open in the new page.",
@@ -19,9 +19,6 @@
         "format": "uri"
       }
     },
-    "required": [
-      "fleetId"
-    ],
     "additionalProperties": true
   },
   "resultSchema": {
@@ -51,6 +48,15 @@
       "navigationStarted": {
         "description": "Whether initial navigation was dispatched.",
         "type": "boolean"
+      },
+      "fleetSelection": {
+        "description": "How the page Fleet was selected.",
+        "type": "string",
+        "enum": [
+          "explicit",
+          "reused",
+          "created"
+        ]
       }
     },
     "additionalProperties": {}
@@ -93,6 +99,15 @@
           "navigationStarted": {
             "description": "Whether initial navigation was dispatched.",
             "type": "boolean"
+          },
+          "fleetSelection": {
+            "description": "How the page Fleet was selected.",
+            "type": "string",
+            "enum": [
+              "explicit",
+              "reused",
+              "created"
+            ]
           }
         },
         "additionalProperties": {},

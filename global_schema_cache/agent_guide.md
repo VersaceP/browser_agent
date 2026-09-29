@@ -1,18 +1,16 @@
 ---
 name: webcross-browser
-description: Operate the WebCross local browser control platform through the webcross CLI, ABCP MCP, or WebSocket. Use this skill for browser navigation, DOM or accessibility-tree inspection, input, events, downloads, HITL, workflows, and recovery whenever an ABCP protocol connection is available.
+description: Operate the WebCross local browser control platform through the webcross CLI, ABCP MCP, or WebSocket. Use this skill for browser navigation, unified page observation, input, events, downloads, HITL, and workflows whenever an ABCP protocol connection is available.
 compatibility: Requires a running WebCross User and an available webcross CLI, MCP, or WebSocket connection.
 ---
 
 # WebCross Browser
 
-Reliable browser automation follows live feedback, confirms tool contracts dynamically, synchronizes state through events, prefers DOM and accessibility-tree data, and diagnoses failures before retrying.
-
-Operate WebCross through the connection selected by the user. Discover live ABCP contracts before invoking business operations, process events by cursor, and verify observed state before continuing.
+Operate WebCross through the user's selected connection and live Action contracts. Use current evidence to choose targets, verify task outcomes, and recover from uncertainty.
 
 ## Fleet Scope
 
-Prefer a task-matched Fleet. Record its returned `fleetId` in the current task context or Workflow variables and reuse it for this task. Create a new Fleet only for isolation, a clean session, or when no compatible Fleet exists.
+Use a task-matched Fleet when one is available. For an ordinary new page, if no suitable Fleet is available, call `Page.create` without `fleetId`; it will select or create the page's Fleet. Call `Fleet.create` only when you need an isolated session, a clean browser instance, or explicit Fleet settings.
 
 ## Connection Quick Reference
 
@@ -32,9 +30,9 @@ Use only the column for the active connection. Names are intentionally transport
 ### CLI Identity and Output
 
 - Unauthenticated use: omit `--agent-id` and `--profile` for the first call. Save `agentId` and `eventCursor` from `session.ready.data`, then reuse `--agent-id <agentId>` on later calls. Omitting `--agent-id` starts a new identity. `agentId` identifies the same Agent across calls and event reads; it is not a credential and does not grant access. It is a global option, not part of `--params`, and cannot be combined with `--profile` or `ABCP_PROFILE`.
-- Paired use: pass the User's one-time invitation on stdin to `webcross pair`, then use the paired Profile. If `--runtime <path>` is provided, it must point to the current `dispatcher-host.json`, and the Profile must belong to the same Dispatcher. A paired Profile is a CLI credential, not a browser fingerprint Profile; never print, copy, or record it. If the Dispatcher requires authentication, use a paired Profile.
+- Paired use: run `webcross pair` with the pairing information provided by the User. For subsequent CLI calls, select the resulting paired credential with `--profile <path>`. Treat it as sensitive; never print, copy, or record it.
 - Output: default to `--output ndjson`. Treat each stdout line as an independent record and dispatch by `type`: `session.ready`, `result`, `event`, or `error`. A one-shot command normally emits `session.ready` followed by `result`; a failed command may emit `error` after `session.ready`. `events watch` continues emitting `event` records. Use `--output human` only for interactive human use.
-- Event recovery: `events read` starts after `session.ready.eventCursor` unless `--from <cursor>` is supplied. After successfully processing a batch, save its `nextCursor`; continue while `hasMore` is `true`. `events watch` does not save cursors, and `events checkpoint` is unavailable. After a disconnect or restart, call `events read` with the saved cursor. If the saved cursor is rejected as invalid for the current runtime, do not overwrite it; use the new `session.ready.eventCursor` as the current baseline. Events before that baseline cannot be replayed from the current runtime.
+- Event recovery: follow the cursor procedure in Events and Page Lifecycle. `events read` starts after `session.ready.eventCursor` unless `--from <cursor>` supplies the saved cursor. `events watch` does not save cursors, and `events checkpoint` is unavailable. If the saved cursor is rejected as invalid for the current runtime, retain it separately and use the new `session.ready.eventCursor` as the current baseline. Events before that baseline cannot be replayed from the current runtime.
 
 ### Registration Gate
 
@@ -56,22 +54,13 @@ Pushed events arrive through `System.notification`. Use `events.read` to recover
 
 ## 1. Action Feedback
 
-Every Action returns `ActionFeedback`. On both success and failure, read:
-
-- `observation`: the platform's observed current state.
-- `suggested_prompt`: the platform's recommended next step or recovery advice.
-
-Base the next operation on the feedback and current page state, not on an expected result. After a failure, timeout, partial completion, or uncertain result, do not immediately repeat the Action.
+On success and failure, read the Action result, `observation`, and `suggested_prompt`. Distinguish execution acknowledgement from confirmed outcomes, and use each result only within the scope established by the Action contract.
 
 ## 2. Tools and Contracts
 
-- Discover callable operations through the current transport before invoking them. Treat the discovered names and schemas as authoritative for the session.
-- When the Action or event directory changes, refresh the corresponding directory and read the current descriptions again before invoking or relying on those operations.
-- `System.getCapabilities` returns compact Action summaries only. Use the current transport's Action-description operation for the complete input, result, output, and failure Schema of an unfamiliar Action.
-- Use the current transport's event-list operation to discover Agent-visible events. Describe an unfamiliar event before relying on its payload or recommended response.
-- Never guess operation names, parameter names, parameter types, event payloads, or resource state.
-- When the current Action contract requires `purpose`, provide a non-empty value explaining how the call advances the user's goal, and follow the returned `purposeHint`.
-- Treat the current Action schema as the source of truth for parameter shapes, required fields, defaults, and result fields. This guide does not redefine those details.
+- Discover callable Actions and Agent-visible events through the active transport. Refresh the affected catalog when it changes.
+- Use live schemas for names, arguments, defaults, results, and failures. `System.getCapabilities` provides summaries; describe an unfamiliar Action or event before using it.
+- When required, provide a non-empty `purpose` explaining how the call advances the user's goal, and follow `purposeHint`.
 
 ## 3. Events and Page Lifecycle
 
@@ -79,21 +68,18 @@ The event delivery method depends on the current transport: a connection may pus
 
 Manage event cursors as follows:
 
-1. Save the last cursor whose events were processed successfully.
-2. Advance the local cursor only after a pushed event has been handled successfully.
-3. Treat a reported latest visible cursor only as a hint that newer events may exist; it is not a consumed cursor.
-4. When replaying, read from the saved cursor and continue through every page while `hasMore` is true.
-5. Persist `nextCursor` only after the current batch has been processed successfully.
-6. After disconnects, reconnects, restarts, resource updates, or uncertain state, resume from the saved cursor.
-7. Live delivery and replay may contain the same event. Use cursors to avoid repeating side effects.
+1. Save the cursor of the last successfully processed event. A latest-visible cursor or notification is not a consumed cursor.
+2. Replay from the saved cursor, continue while `hasMore` is true, and persist `nextCursor` only after processing that batch successfully.
+3. Resume from the saved cursor after disconnects, restarts, resource updates, or uncertain delivery. If the cursor is rejected, use the active transport's recovery procedure.
+4. Live delivery and replay can overlap. Use cursors to avoid repeating side effects.
 
 Event names are notifications, not Actions. Do not try to call names such as `Page.loaded` or `Hitl.resumed`.
 
 `Page.open` means that a page is registered and visible to the Agent; it starts in `lifecycle="loading"`. Do not run DOM or Input Actions yet. Wait for `Page.loaded`, or poll `Page.getState` until `status="ready"`.
 
-`Page.loaded` means the current main document is ready for DOM/Input automation. Fetch a new `DOM.getAXTree` only when new element targets are needed; do not perform an extra state read first. `Page.startedLoading` invalidates current DOM/Input targets. `Page.loadFailed` and `Page.crashed` require inspection with `Page.getState` before recovery.
+`Page.loaded` means the page exposes a usable main-frame accessibility structure and is ready for DOM/Input actions. Call `DOM.getAXTree` when you need the current page view; page loading does not provide that view automatically. `Page.startedLoading` invalidates current DOM/Input targets. `Page.loadFailed` and `Page.crashed` require inspection with `Page.getState` before recovery.
 
-`Hitl.paused` is page-scoped. Keep the current connection and event listener open, stop ordinary automation for that page, and wait for the matching `Hitl.resumed`; if delivery is uncertain, replay from the saved cursor without disconnecting. Re-observe the page before continuing. A `pageId` remains the page identity across navigation; element IDs and geometry can become stale after navigation, recovery, or DOM replacement and must be refreshed.
+`Hitl.paused` is page-scoped. Keep the current connection open, stop ordinary automation for that page, and wait for the matching `Hitl.resumed` through the active transport's event listener or cursor-based reads. If delivery is uncertain, replay from the saved cursor without disconnecting. Follow the Human intervention rule before resuming.
 
 `Page.go` reports that history navigation was started; it does not mean the destination document has loaded. Wait for `Page.loaded` or `Page.loadFailed` before querying the page or reusing targets.
 
@@ -101,119 +87,108 @@ Event names are notifications, not Actions. Do not try to call names such as `Pa
 
 When an Input Action returns page dialog information, pass its `dialog.id` to `Page.handleDialog`. If no Action result identifies the dialog and multiple dialogs are pending, use the latest `Page.dialogOpened` event's `dialog.id`. After resolving a dialog, re-observe the page. Never echo or record prompt input text.
 
-## 4. DOM, Input, and Select Interaction
+### Human intervention
 
-### Result confirmation
+Call `Hitl.requestPause` when a CAPTCHA blocks progress or sign-in, verification, or approval requires the user. Reuse an existing authorized session when possible. For other blockers, request help after two evidence-based recovery attempts make no progress on the same step; never repeat an action with an uncertain effect to reach this limit.
 
-For confirmation, choose the smallest structured Action that directly exposes the fact:
+Give a concise `reason` describing the required human action, without credentials or verification codes. After a confirmed pause, follow the HITL waiting rule. Check the current HITL state before retrying an uncertain request; if handoff is unavailable, report the blocker. Do not call `Hitl.resolvePause` merely to bypass waiting or repeat a request the user declined.
 
-- use `DOM.getText` for rendered text or application messages;
-- use `DOM.getAttribute` for HTML or ARIA attributes and attribute-backed state;
-- use `DOM.getSemanticTree` for DOM structure, relationships, visibility, frame context, or scroll state when the target or structure is already known;
-- use `DOM.getAXTree` to discover unknown targets, obtain a full accessibility map, or inspect accessibility-only interaction evidence;
-- use `Page.screenshot` only for visual facts unavailable from structured data.
+`Hitl.resumed` means the pause ended, not that the task succeeded; system lifecycle changes can also end it. Check `Page.getState`, wait for readiness, and verify the required outcome with fresh evidence. Stop waiting if the page closes.
 
-Do not call `DOM.getAXTree` solely to confirm text, attributes, or known DOM structure. Use only the Actions needed for the current fact. After a page change or uncertain result, follow the single re-observation rule in the recovery section.
+## 4. Observation and Interaction
 
-Use `Page.screenshot` only for visual properties that structured data cannot represent. Capture the smallest useful scope: element (`id`/`selector`) first, then region (`x`, `y`, `width`, `height`), and viewport or full-page only when broader context is required. Do not use screenshots to read ordinary text, form values, or attributes. If structured-tree retrieval fails, refresh page state and targets before using a screenshot.
+### Verify outcomes
 
-Prefer `DOM.getAXTree` as the page map and target-discovery source. Use targets in this order:
+Before acting, identify the outcome required by the user's goal and where evidence of it should appear. Verify the result-bearing control, collection, or region, which may differ from the interaction target.
 
-1. A current canonical `id` marked with `#` by `DOM.getAXTree` or returned by targeted `DOM.getSemanticTree`.
-2. A stable, semantic `selector`.
-3. Current-viewport coordinates through `Page.click`.
+- Interpret fields in the context of the node's role, component, and interaction stage. Focus, highlight, selection, expansion, current value, and business completion are distinct.
+- Use sufficient direct evidence, including outcomes explicitly confirmed by the Action contract. Refresh evidence when the next decision depends on changed targets or state.
+- A missing or redacted field is unavailable evidence. `false` and an empty string are actual values; they establish failure only when their meaning on the relevant object contradicts the required outcome.
+- Do not transfer state between same-named semantic and rendered nodes. Establish identity or relationships from current structure and explicit evidence.
+- For search or filtering, verify the resulting content or applied-filter state required by the task. For saving or uploading, verify the relevant completion result. A click, closed popup, or injected file alone is insufficient.
+- Stop checking once the required outcome is established. If it is pending, wait for relevant events or use bounded observation. If evidence is missing or contradictory, inspect related state and keep the outcome unconfirmed until resolved. An unchanged field alone is not a reason to repeat the action.
 
-Use `#` targets as the preferred operation surface. A `~` target requires
-additional DOM or visual evidence. `[hidden]` is diagnostic and must not be
-operated.
-An ID without current interaction evidence provides semantic context rather than a normal Input target until a current DOM observation confirms it.
+### Choose and read observations
 
-Each AXTree line uses `depth [id] role "label" [flags...] #|~ @rect`. The
-optional flags group keeps a fixed order. Applicable semantic states use explicit
-state order: checked state, interaction state, selection state, expansion state,
-selection mode, popup, then layout. Values use explicit positive and negative
-forms where applicable: `checked`/`unchecked`, `selected`/`unselected`,
-`expanded`/`collapsed`, and `multi`/`single`. An absent semantic state means AX
-did not expose that state for the node. Interactive nodes may also expose
-`enabled` or `disabled`; native `inert` is reported separately as `inert`, and
-`popup` is emitted only when true. Layout flags remain sparse evidence:
-`hidden off blocked scroll sticky clip zN`; a missing layout flag does not prove
-false. These flags describe state and layout but never change the target
-confidence expressed by `#` or `~`.
+Choose observations by the next decision, not a fixed full-read cycle. For custom-dropdown result confirmation, follow the Select-like controls rules below first. Read the selected artifact before using its facts or IDs.
 
-If `DOM.getAXTree` succeeds with `truncatedReason: "partial-frame"`, the
-returned nodes are usable for the available frames but one or more child
-frames could not be observed. Read `Page.getState`, wait for the page to
-settle, and call `DOM.getAXTree` again before relying on the missing frame.
-`snapshot_unavailable` is a failed page-map request, not a usable truncation.
+- Full: call `DOM.getAXTree` without `query` to discover targets or restore context after navigation or lost continuity. Read `artifact.path` to establish the baseline.
+- Diff: with a usable full baseline and all intervening changes, prefer `diff.artifact.path` when `diff.status="computed"`. Apply it to that baseline; omitted nodes and limited context are not a complete inventory. A removal means leaving the observation, not deletion of business data.
+- Query: use bounded queries for known targets: `state` for current values, `text` for displayed selections, `attributes` for attributes, or `dom` for local structure. Specify targets and an appropriate DOM depth. Read the returned `artifact.path`; `mode="detail"` is a result mode, not an input parameter.
+- Detail references: read the returned `details` reference only for a needed omitted or truncated field. It belongs to that observation and does not refresh live state. Page-view text is limited to 50 Unicode characters; `valueRedacted` means the complete value is unavailable.
 
-`DOM.getSemanticTree` reports one `visibility` state. `visible` means the node
-has a positive visible region in its frame but does not prove that the page can
-receive the interaction; `not-rendered` cannot be an Input target.
+`unchanged` has no diff artifact: do not reread full by default or infer success. Choose another observation using the rules above and the custom-dropdown rules below. If diff is unavailable, read full when rebuilding context is necessary. Query results neither replace the full baseline nor fill gaps in its diff chain.
 
-When the current Action schema accepts both `id` and `selector`, they may be supplied together:
+Version changes require fresh evidence, not necessarily full reads. Do not infer ordering from version strings; targeted queries provide current data independently of full-view changes. Re-observe expired artifacts. Pending or partial observations do not prove absence.
 
-- use `id` as the primary target;
-- use `selector` as corroboration or as a fallback when the ID is stale;
-- if the two references resolve to different targets, stop and refresh page state;
-- if the schema makes them mutually exclusive, follow that schema instead of guessing.
+Use `state.value` for an editable control's current value; `attributes.value` may differ. Use `parent` and `children` for structure.
 
-For an element target identified by an `id` or `selector`, a locator-based Input
-Action may bring the target into view before interaction, including `[off]` and
-`out-of-view` targets. Do not pre-scroll a known interaction target.
+Use `Page.screenshot` for visual facts and for custom-dropdown result confirmation as described below. Start with the smallest relevant region; use a larger capture only when necessary. For other ordinary text, values, or attributes, prefer structured observation.
 
-Do not interact with targets that are hidden, zero-sized, fully transparent, invisible, disabled, or covered by another element. After the target has been brought into view, pause and request confirmation when its effective opacity is below `0.2`. If visibility, opacity, or coverage cannot be determined reliably, treat the state as uncertain and do not force the interaction.
+### Targets and interaction
 
-Use explicit scrolling only to discover targets, trigger infinite scroll or lazy loading, operate a nested scroll container, satisfy a user request to change scroll position, or support coordinate-based interaction.
+Use a current `id`, otherwise a unique current `selector`, and coordinates only when a locator cannot reliably address the target. If both `id` and `selector` are supplied, `id` takes precedence.
 
-### Scrolling decision
+Node IDs and `targetable` identify locatable nodes; they do not guarantee suitability for an operation. Use current state, interaction evidence, and geometry to choose a target. Hidden semantic nodes can provide state but are not pointer targets. `vis=↓` can indicate an offscreen or clipped node, not necessarily a target that scrolling can reveal. For a pointer failure with public code `target-has-no-interaction-area`, re-observe the page and choose the visible rendered node representing the intended control or drag endpoint; do not retry the same target ID unchanged. `target-not-visible` indicates a visibility, scrolling, reveal, or frame-exposure problem and should be handled through the current viewport and page state. Follow Recovery before retrying a failed Action.
 
-- For deterministic movement of a known scroll container, use `Input.scroll` with `container` and follow the current Action Schema for the exact form.
-- Use `Page.wheel` for the root viewport, coordinate-selected scrolling, an unknown scroll owner, nested or iframe propagation, or real wheel-event semantics.
-- Before calling `Page.wheel`, read its current Action Schema and choose the delta/state or boundary form; do not infer parameter combinations from this guide.
-- Use the `Input.scroll` target form only when bringing the element into view is itself the goal. For a known interaction target, call its locator-based Input Action directly.
+A `pageId` remains the page identity across navigation. After navigation or document replacement, discard old element IDs and geometry. After recovery or other structure changes, reuse targets only when current evidence establishes their identity and usability.
 
-For select-like controls:
+Use real Input Actions. Do not bypass focus, visibility, or coverage checks through script injection, direct DOM mutation, or forced interaction.
 
-- If the options or selection mode are unknown, call `DOM.inspectSelect` first.
-- Use `Input.select` with the returned semantics: native selects require `{ value }`; supported custom selects accept exactly one returned `{ id }`, `{ label }`, or explicit `{ value }`. Do not convert fields.
-- Follow Select feedback for `startOption` and recovery. Re-observe after custom selection or uncertainty; do not blindly retry.
+### Expandable controls
 
-Read `references/select.md` for custom-select and recovery details.
+After opening or updating associated content, use fresh evidence to identify its region, exposed expansion state, and usable targets. Follow explicit relationships and current structure; the region may be outside the control's subtree. Use a bounded `query.view="dom"` for a known region when needed, or full to discover unknown targets. Do not add a query when current evidence is sufficient. If content is not ready, use bounded re-observation rather than fixed delays.
 
-AXTree flags are generic state hints and cannot replace the control kind,
-selection mode, and options returned by `DOM.inspectSelect`; use that result
-before calling `Input.select`, and inspect again when it is stale.
+### Scrolling
 
-For file-upload controls:
+For a known interaction target, call its locator-based Action directly. Scroll explicitly to discover content, trigger lazy loading, handle nested scrolling, satisfy the user's request, or prepare coordinate interaction.
 
-- when the target is known, call `File.handleChooser` directly with the current `pageId`, `files`, and the actual file-input `id` or `selector`; do not click first or wait for chooser events;
-- if input is required to activate a wrapper, do it once, then follow the feedback to `File.handleChooser` without repeating the input; do not reuse a label or wrapper ID, and refresh the known upload structure with `DOM.getSemanticTree` or discover a replacement with `DOM.getAXTree` only when needed;
-- directory uploads (`uploadFolder`/`openDirectory`) and save choosers require human intervention; re-observe page state after a successful injection.
+- Use `Input.scroll` with `container` for deterministic movement of a known container. Use its target form when bringing an element into view is itself the goal.
+- Use `Page.wheel` for the root viewport, coordinate-selected or unknown scroll owners, nested or iframe propagation, or real wheel-event semantics. Read its current Schema for the delta/state or boundary form.
 
-For `Input.drag`, element-to-element dragging requires source and destination to be in the same document. For an iframe, provide current element IDs from that iframe for both endpoints; cross-frame dragging is unsupported.
+### Select-like controls
 
-Use real Input Actions for interaction. Do not bypass focus, visibility, or coverage checks through script injection, direct DOM mutation, or equivalent methods.
+For supported native controls, use `DOM.inspectSelect` to read the current `type`; a `combobox` role alone does not establish a native `<select>`. For native `<select>`, pass exact `{ value }` entries from inspection in `selections`, respecting selection mode and disabled options; for date, datetime-local, time, month, or week, pass `value` in HTML format and respect the current constraints; for color, use #RRGGBB. Set the value with `Input.select`; never supply both value forms. The confirmed result establishes the control value, not downstream business effects.
+
+For custom dropdowns, apply the `Expandable controls` rule and prefer pointer interaction. Click a known usable option directly; scroll the actual option list only to discover more candidates, then refresh targets. Searchable controls may narrow candidates through typing. Follow the shared scrolling and pointer-target rules. Do not use native Select Actions as a fallback.
+
+Use `Input.press` for keyboard selection only when the pointer path is unavailable and the focused control supports it. Navigate incrementally, inspect the active candidate, and press Enter only when it selects the intended option rather than submitting the form.
+
+After selecting an option in a custom dropdown, confirm the selection as follows:
+
+- If current evidence already establishes the intended selection, continue without another check.
+- Otherwise, identify where the selected result is shown. Prefer the owning control’s displayed selection or selected-item collection over the option list.
+- If the result is shown outside the popup, use `Page.screenshot` to capture the smallest visible component region containing it, then inspect the image. Do not read HTML, DOM, or AX values solely to reconfirm a selection clearly established by the image.
+- If the result is shown inside the popup, do not use a screenshot for confirmation. Use an available current diff if it meets the baseline and continuity requirements above and already provides sufficient evidence; otherwise use a bounded `DOM.getAXTree` query to read the relevant selection state.
+- If the screenshot is unavailable or inconclusive, use a bounded query of the result-bearing node. Resolve only the missing or conflicting evidence; do not repeat unchanged reads or reopen the popup solely to reconfirm an established result.
+
+Search text, focus, highlight, the active option, and popup closure alone do not prove selection. Follow Verify outcomes and Recovery if evidence remains insufficient or contradictory. Refresh dependent controls before continuing a cascading selection. Confirming the selection does not confirm form submission or downstream business effects.
+
+### Files and dragging
+
+For a known file input, call `File.handleChooser` directly with the current `pageId`, `files`, and the actual input `id` or `selector`; do not click first or wait for chooser events. If activating a wrapper is necessary, do it once and follow the feedback without repeating the input. Do not substitute the wrapper or label ID for the file input; refresh its identity when needed.
+
+Directory uploads (`uploadFolder`/`openDirectory`) and save choosers follow the Human intervention rule. File injection confirms only that stage; verify subsequent upload completion when the user's goal requires it.
+
+For `Input.drag`, source and destination must be in the same document. Within an iframe, use current IDs from that iframe for both endpoints; cross-frame dragging is unsupported.
 
 ## 5. Risk and Data Boundaries
 
-- Before delete, submit, send, download, payment, or another irreversible operation, confirm the target, scope, final parameters, and current page state.
-- Perform search, filtering, pagination, and form submission through real page interaction. Do not concatenate URL parameters to bypass page operations or carry sensitive or bulk data; a complete URL explicitly provided by the user is allowed only when it contains no credentials or sensitive data.
-- Do not use script injection, repeated navigation, or bulk URL parameters to transfer data.
-- Do not put credentials in URLs, prompts, or logs. Handle sensitive input only through the current Action contract and platform security boundary.
-- Bound loops, pagination, and batch operations, and verify results incrementally.
-- Do not use forced interaction to bypass coverage checks. Pause when the target, the reason it is covered, or the intended recipient is uncertain.
+- Before delete, submit, send, download, payment, or another consequential operation, verify the target, scope, final parameters, current state, and authorization already provided by the user.
+- Perform search, filtering, pagination, and submission through real page interaction. Do not construct URL parameters to bypass these operations or carry sensitive or bulk data. A complete URL explicitly provided by the user is allowed only when it contains no credentials or sensitive data.
+- Do not transfer data through script injection, repeated navigation, or bulk URL parameters. Keep credentials out of URLs, prompts, and logs; use the current Action contract and platform security boundary for sensitive input.
+- Bound loops, pagination, and batches, and verify results incrementally. Pause affected actions when the target, obstruction, or intended recipient is uncertain.
 
 ## 6. Recovery
 
-When an Action fails, times out, or leaves the result uncertain, do not retry immediately. First check whether the connection, page lifecycle, event delivery, or DOM/AX target changed:
+After failure, timeout, partial completion, or an uncertain result, establish what already happened before deciding what remains.
 
-- wait until the page is ready and resolve any blocking HITL or dialog state;
-- recover the committed event cursor if delivery may be incomplete;
-- refresh page state and the smallest relevant DOM observation when the page or target may be stale; use `DOM.getAXTree` only when a replacement target must be discovered.
+Use `Page.getState` when readiness, loading, renderer availability, dialogs, or HITL state is unclear. Once page interaction is permitted, inspect the smallest relevant state needed to resolve the uncertainty. After navigation or document replacement, wait for readiness and restore full context.
 
-Use the Action feedback and stable error code to determine whether the operation succeeded. Retry only after confirming that it did not succeed and that retrying will not duplicate a side effect. The feedback does not prove whether a side effect started or whether retrying is safe.
+Follow the Human intervention rule when recovery makes no progress. Do not retry blindly. Repeat an action only when evidence establishes that its intended effect did not occur, repetition is safe, and the current contract permits it. If the effect may already have occurred, inspect the outcome or report uncertainty instead of duplicating it.
 
-## Workflow Reference
+## Workflow authoring
 
-Before constructing or modifying a multi-step WebCross Workflow over the ABCP protocol, read `references/workflow-orchestration.md`.
+Read `references/workflow-orchestration.md` before creating, changing, executing, or publishing a multi-step Workflow.
+
+Use a `Workflow.execute` request for immediate execution. Use a `webcross-workshop` document for a reusable or importable workflow.

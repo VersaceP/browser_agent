@@ -1,8 +1,8 @@
 {
   "method": "Input.click",
-  "description": "Performs one or more clicks on a specified page target, using a current target ID or stable selector and returning guidance when the click handles a page alert, opens an interactive dialog on the page, or triggers a file-upload request.",
+  "description": "Performs one or more clicks on the specified target. The result reports whether the click sequence completed and exposes any dialog or file-chooser follow-up when the page interrupts it.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:52691626582a5164f1e1aaafb5a9e390e6e1e95ccc27663283f74997776c3737",
+  "catalogRevision": "sha256:57787ad534cac0789a4ec5118fb0a773583a9790bab09bbabd5f03df913b3180",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -19,13 +19,13 @@
         "minLength": 1
       },
       "id": {
-        "description": "Current target ID from a recent DOM.getAXTree or DOM.getSemanticTree result.",
+        "description": "Current node ID from the latest page observation for the click target. Refresh it after navigation or document replacement.",
         "type": "string",
-        "pattern": "^\\d+:\\d+:\\d+$"
+        "pattern": "^n_[0-9a-f]{16}$"
       },
       "force": {
         "default": false,
-        "description": "Attempt the click even when the target is currently covered. The page may still reject or ignore the interaction.",
+        "description": "Allow the existing covered-target override. This does not bypass identity or basic operation requirements.",
         "type": "boolean"
       },
       "clickCount": {
@@ -39,7 +39,7 @@
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "string",
         "minLength": 1,
-        "description": "Describe the intended effect of this click, e.g., opening a menu, selecting a result, or submitting a form"
+        "description": "Describe the intended effect of this click, such as opening a menu, selecting a result, or submitting a form."
       }
     },
     "required": [
@@ -61,14 +61,6 @@
       "resolvedBy": {
         "description": "How the target was selected.",
         "type": "string"
-      },
-      "recoveredTarget": {
-        "description": "Updated target information when the original target changed.",
-        "type": "object",
-        "propertyNames": {
-          "type": "string"
-        },
-        "additionalProperties": {}
       },
       "button": {
         "description": "Mouse button dispatched.",
@@ -157,14 +149,6 @@
           "resolvedBy": {
             "description": "How the target was selected.",
             "type": "string"
-          },
-          "recoveredTarget": {
-            "description": "Updated target information when the original target changed.",
-            "type": "object",
-            "propertyNames": {
-              "type": "string"
-            },
-            "additionalProperties": {}
           },
           "button": {
             "description": "Mouse button dispatched.",
@@ -282,5 +266,5 @@
     ],
     "additionalProperties": false
   },
-  "purposeHint": "Describe the intended effect of this click, e.g., opening a menu, selecting a result, or submitting a form"
+  "purposeHint": "Describe the intended effect of this click, such as opening a menu, selecting a result, or submitting a form."
 }

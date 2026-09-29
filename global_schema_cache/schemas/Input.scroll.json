@@ -1,8 +1,8 @@
 {
   "method": "Input.scroll",
-  "description": "Brings a specified target into view or moves a specified scrollable container by a distance or to an axis boundary, and reports the observed movement and boundary state.",
+  "description": "Reveals the specified element or scrolls the specified container, reporting movement and boundary state.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:52691626582a5164f1e1aaafb5a9e390e6e1e95ccc27663283f74997776c3737",
+  "catalogRevision": "sha256:57787ad534cac0789a4ec5118fb0a773583a9790bab09bbabd5f03df913b3180",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "anyOf": [
@@ -19,9 +19,9 @@
             "type": "object",
             "properties": {
               "id": {
-                "description": "Current target ID from a recent DOM.getAXTree or DOM.getSemanticTree result.",
+                "description": "Current node ID from the latest page observation for the target or scroll container.",
                 "type": "string",
-                "pattern": "^\\d+:\\d+:\\d+$"
+                "pattern": "^n_[0-9a-f]{16}$"
               },
               "selector": {
                 "description": "Fallback CSS selector for the scroll target.",
@@ -37,9 +37,9 @@
             "type": "object",
             "properties": {
               "id": {
-                "description": "Current target ID from a recent DOM.getAXTree or DOM.getSemanticTree result.",
+                "description": "Current node ID from the latest page observation for the target or scroll container.",
                 "type": "string",
-                "pattern": "^\\d+:\\d+:\\d+$"
+                "pattern": "^n_[0-9a-f]{16}$"
               },
               "selector": {
                 "description": "Fallback CSS selector for the scroll target.",
@@ -84,9 +84,9 @@
             "type": "object",
             "properties": {
               "id": {
-                "description": "Current target ID from a recent DOM.getAXTree or DOM.getSemanticTree result.",
+                "description": "Current node ID from the latest page observation for the target or scroll container.",
                 "type": "string",
-                "pattern": "^\\d+:\\d+:\\d+$"
+                "pattern": "^n_[0-9a-f]{16}$"
               },
               "selector": {
                 "description": "Fallback CSS selector for the scroll target.",
@@ -122,7 +122,7 @@
             "description": "Not accepted in this scroll form.",
             "not": {}
           },
-          "amount": {
+          "distance": {
             "description": "Not accepted in this scroll form.",
             "not": {}
           },
@@ -155,9 +155,9 @@
             "type": "object",
             "properties": {
               "id": {
-                "description": "Current target ID from a recent DOM.getAXTree or DOM.getSemanticTree result.",
+                "description": "Current node ID from the latest page observation for the target or scroll container.",
                 "type": "string",
-                "pattern": "^\\d+:\\d+:\\d+$"
+                "pattern": "^n_[0-9a-f]{16}$"
               },
               "selector": {
                 "description": "Fallback CSS selector for the scroll target.",
@@ -178,7 +178,7 @@
               "right"
             ]
           },
-          "amount": {
+          "distance": {
             "description": "Scroll distance in CSS pixels. Defaults to 300; zero reads state without scrolling.",
             "type": "number",
             "minimum": 0

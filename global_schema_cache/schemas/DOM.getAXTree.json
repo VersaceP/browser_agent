@@ -1,8 +1,8 @@
 {
   "method": "DOM.getAXTree",
-  "description": "Returns a compact accessibility-tree page map with actionable targets, generic AX states, and layout flags.",
+  "description": "Reads the current page view. Omit query for page structure and targets; provide query for bounded detail about known targets. Full results include a versioned artifact, change status, and detail references.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:52691626582a5164f1e1aaafb5a9e390e6e1e95ccc27663283f74997776c3737",
+  "catalogRevision": "sha256:57787ad534cac0789a4ec5118fb0a773583a9790bab09bbabd5f03df913b3180",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -11,23 +11,206 @@
         "type": "string",
         "format": "uuid",
         "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-        "description": "Page ID whose compact page map should be returned."
+        "description": "The page to observe."
       },
-      "id": {
-        "description": "Canonical element ID used to scope the AX tree to a specific subtree.",
-        "type": "string",
-        "pattern": "^\\d+:\\d+:\\d+$"
-      },
-      "selector": {
-        "description": "CSS selector used to scope the AX tree to the first matching element in the main frame.",
-        "type": "string",
-        "minLength": 1
+      "query": {
+        "description": "Optional bounded detail for known targets; omit it for the current page view.",
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "view": {
+                "type": "string",
+                "const": "dom",
+                "description": "Read DOM structure."
+              },
+              "targets": {
+                "minItems": 1,
+                "maxItems": 64,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "pattern": "^n_[0-9a-f]{16}$",
+                      "description": "An opaque node ID from the current observation. Do not parse it."
+                    },
+                    "selector": {
+                      "description": "A selector fallback, accepted only when it uniquely matches in the current document.",
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "additionalProperties": true
+                },
+                "description": "Exact query targets in input order. Component members are not substituted."
+              },
+              "maxDepth": {
+                "default": 12,
+                "description": "Maximum DOM subtree depth.",
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 64
+              },
+              "includeShadowDom": {
+                "default": true,
+                "description": "Include observable Shadow DOM subtrees.",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "view",
+              "maxDepth",
+              "includeShadowDom"
+            ],
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "properties": {
+              "view": {
+                "type": "string",
+                "const": "text",
+                "description": "Read page text."
+              },
+              "targets": {
+                "minItems": 1,
+                "maxItems": 64,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "pattern": "^n_[0-9a-f]{16}$",
+                      "description": "An opaque node ID from the current observation. Do not parse it."
+                    },
+                    "selector": {
+                      "description": "A selector fallback, accepted only when it uniquely matches in the current document.",
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "additionalProperties": true
+                },
+                "description": "Exact query targets in input order. Component members are not substituted."
+              },
+              "textMode": {
+                "default": "rendered",
+                "description": "Rendered text or DOM textContent.",
+                "type": "string",
+                "enum": [
+                  "rendered",
+                  "textContent"
+                ]
+              }
+            },
+            "required": [
+              "view",
+              "textMode"
+            ],
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "properties": {
+              "view": {
+                "type": "string",
+                "const": "attributes",
+                "description": "Read HTML or ARIA attributes."
+              },
+              "targets": {
+                "minItems": 1,
+                "maxItems": 64,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "pattern": "^n_[0-9a-f]{16}$",
+                      "description": "An opaque node ID from the current observation. Do not parse it."
+                    },
+                    "selector": {
+                      "description": "A selector fallback, accepted only when it uniquely matches in the current document.",
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "additionalProperties": true
+                },
+                "description": "Exact query targets in input order. Component members are not substituted."
+              },
+              "attributes": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "const": "*"
+                  },
+                  {
+                    "minItems": 1,
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  }
+                ],
+                "description": "Requested attributes, or * for every available attribute."
+              }
+            },
+            "required": [
+              "view",
+              "targets",
+              "attributes"
+            ],
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "properties": {
+              "view": {
+                "type": "string",
+                "const": "state",
+                "description": "Read static value attributes and live control state."
+              },
+              "targets": {
+                "minItems": 1,
+                "maxItems": 64,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "pattern": "^n_[0-9a-f]{16}$",
+                      "description": "An opaque node ID from the current observation. Do not parse it."
+                    },
+                    "selector": {
+                      "description": "A selector fallback, accepted only when it uniquely matches in the current document.",
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "additionalProperties": true
+                },
+                "description": "Exact query targets in input order. Component members are not substituted."
+              }
+            },
+            "required": [
+              "view",
+              "targets"
+            ],
+            "additionalProperties": true
+          }
+        ]
       },
       "purpose": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "string",
         "minLength": 1,
-        "description": "Describe why you need the current page map, e.g., understanding page structure, locating an actionable target, checking generic AX or layout state, or refreshing canonical element ids"
+        "description": "State whether you need page structure or targets, a change list, or bounded detail for known targets."
       }
     },
     "required": [
@@ -38,52 +221,414 @@
   },
   "resultSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "type": "object",
-    "properties": {
-      "lines": {
-        "description": "Compact accessibility-tree lines with target markers, applicable AX state values, and sparse layout flags for the current page and included frames.",
-        "type": "array",
-        "items": {
-          "type": "string"
-        }
-      },
-      "nodeCount": {
-        "description": "Number of accessibility nodes represented in lines.",
-        "type": "number"
-      },
-      "frameCount": {
-        "description": "Number of frames represented in the page map.",
-        "type": "number"
-      },
-      "truncated": {
-        "description": "Whether the page map was truncated by the configured output limit.",
-        "type": "boolean"
-      },
-      "truncatedReason": {
-        "description": "Stable public reason for a bounded page-map truncation or partial child-frame observation, when available.",
-        "anyOf": [
-          {
-            "type": "string"
-          },
-          {
-            "type": "null"
-          }
-        ]
-      },
-      "resolutionSource": {
-        "description": "Target resolution route used when a target was requested.",
-        "type": "string"
-      },
-      "recoveredTarget": {
-        "description": "Snapshot details used when a stale target was recovered.",
+    "anyOf": [
+      {
         "type": "object",
-        "propertyNames": {
-          "type": "string"
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "The page that owns this observation."
+          },
+          "checkedAt": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+            "description": "When the page state was checked."
+          },
+          "freshness": {
+            "type": "string",
+            "enum": [
+              "current",
+              "pending"
+            ],
+            "description": "Whether the page stayed stable during capture."
+          },
+          "pendingChanges": {
+            "type": "boolean",
+            "description": "Whether more page changes remain pending."
+          },
+          "completeness": {
+            "type": "string",
+            "enum": [
+              "complete",
+              "partial"
+            ],
+            "description": "Whether every accessible frame was observed."
+          },
+          "mode": {
+            "type": "string",
+            "const": "full",
+            "description": "The current page view artifact."
+          },
+          "version": {
+            "type": "string",
+            "pattern": "^v_[0-9a-f]{16}_[0-9a-z]+$",
+            "description": "The current page view identifier."
+          },
+          "artifact": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "full",
+                "description": "The current page view artifact."
+              },
+              "path": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Read the observation artifact at this path."
+              },
+              "format": {
+                "type": "string",
+                "const": "text",
+                "description": "The observation text format."
+              },
+              "bytes": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Artifact size in bytes."
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Artifact content hash."
+              },
+              "expiresAt": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+                "description": "The time until the artifact is available."
+              }
+            },
+            "required": [
+              "kind",
+              "path",
+              "format",
+              "bytes",
+              "sha256",
+              "expiresAt"
+            ],
+            "additionalProperties": false,
+            "description": "The current page view artifact reference."
+          },
+          "diff": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "const": "initial",
+                    "description": "This is the first page view."
+                  }
+                },
+                "required": [
+                  "status"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "const": "unchanged",
+                    "description": "The page view is unchanged."
+                  }
+                },
+                "required": [
+                  "status"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "const": "computed",
+                    "description": "A page change artifact is available."
+                  },
+                  "artifact": {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "diff",
+                        "description": "An optional page change artifact."
+                      },
+                      "path": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Read the observation artifact at this path."
+                      },
+                      "format": {
+                        "type": "string",
+                        "const": "text",
+                        "description": "The observation text format."
+                      },
+                      "bytes": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991,
+                        "description": "Artifact size in bytes."
+                      },
+                      "sha256": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}$",
+                        "description": "Artifact content hash."
+                      },
+                      "expiresAt": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+                        "description": "The time until the artifact is available."
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "path",
+                      "format",
+                      "bytes",
+                      "sha256",
+                      "expiresAt"
+                    ],
+                    "additionalProperties": false,
+                    "description": "An optional page change artifact."
+                  }
+                },
+                "required": [
+                  "status",
+                  "artifact"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "const": "unavailable",
+                    "description": "The current page view is valid, but no change artifact is available."
+                  },
+                  "reason": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Why the change artifact is unavailable."
+                  }
+                },
+                "required": [
+                  "status",
+                  "reason"
+                ],
+                "additionalProperties": false
+              }
+            ],
+            "description": "The page change status."
+          },
+          "details": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "nodeId": {
+                  "type": "string",
+                  "pattern": "^n_[0-9a-f]{16}$",
+                  "description": "An opaque node ID from the current observation. Do not parse it."
+                },
+                "fields": {
+                  "minItems": 1,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "description": "Fields whose complete values are available in the referenced detail artifact."
+                },
+                "artifact": {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "type": "string",
+                      "const": "detail",
+                      "description": "A bounded target detail artifact."
+                    },
+                    "path": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Read the observation artifact at this path."
+                    },
+                    "format": {
+                      "type": "string",
+                      "const": "text",
+                      "description": "The observation text format."
+                    },
+                    "bytes": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991,
+                      "description": "Artifact size in bytes."
+                    },
+                    "sha256": {
+                      "type": "string",
+                      "pattern": "^[0-9a-f]{64}$",
+                      "description": "Artifact content hash."
+                    },
+                    "expiresAt": {
+                      "type": "string",
+                      "format": "date-time",
+                      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+                      "description": "The time until the artifact is available."
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "path",
+                    "format",
+                    "bytes",
+                    "sha256",
+                    "expiresAt"
+                  ],
+                  "additionalProperties": false,
+                  "description": "A bounded target detail artifact."
+                }
+              },
+              "required": [
+                "nodeId",
+                "fields",
+                "artifact"
+              ],
+              "additionalProperties": false,
+              "description": "References to complete non-sensitive node data omitted or truncated in the page view."
+            },
+            "description": "References to complete non-sensitive node data omitted or truncated in the page view."
+          }
         },
-        "additionalProperties": {}
+        "required": [
+          "pageId",
+          "checkedAt",
+          "freshness",
+          "pendingChanges",
+          "completeness",
+          "mode",
+          "version",
+          "artifact",
+          "diff",
+          "details"
+        ],
+        "additionalProperties": false
+      },
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "The page that owns this observation."
+          },
+          "mode": {
+            "type": "string",
+            "const": "detail",
+            "description": "A bounded target detail; it does not replace the current page view."
+          },
+          "artifact": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "detail",
+                "description": "A bounded target detail artifact."
+              },
+              "path": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Read the observation artifact at this path."
+              },
+              "format": {
+                "type": "string",
+                "const": "text",
+                "description": "The observation text format."
+              },
+              "bytes": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Artifact size in bytes."
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Artifact content hash."
+              },
+              "expiresAt": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+                "description": "The time until the artifact is available."
+              }
+            },
+            "required": [
+              "kind",
+              "path",
+              "format",
+              "bytes",
+              "sha256",
+              "expiresAt"
+            ],
+            "additionalProperties": false,
+            "description": "A bounded target detail artifact."
+          },
+          "checkedAt": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+            "description": "When the page state was checked."
+          },
+          "summary": {
+            "type": "object",
+            "properties": {
+              "total": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "The number of requested targets."
+              },
+              "succeeded": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "The number of successful targets."
+              },
+              "failed": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "The number of failed targets."
+              }
+            },
+            "required": [
+              "total",
+              "succeeded",
+              "failed"
+            ],
+            "additionalProperties": false,
+            "description": "Detail query totals."
+          }
+        },
+        "required": [
+          "pageId",
+          "mode",
+          "artifact",
+          "checkedAt",
+          "summary"
+        ],
+        "additionalProperties": false
       }
-    },
-    "additionalProperties": {}
+    ]
   },
   "outputSchema": {
     "type": "object",
@@ -98,52 +643,414 @@
       },
       "data": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "properties": {
-          "lines": {
-            "description": "Compact accessibility-tree lines with target markers, applicable AX state values, and sparse layout flags for the current page and included frames.",
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "nodeCount": {
-            "description": "Number of accessibility nodes represented in lines.",
-            "type": "number"
-          },
-          "frameCount": {
-            "description": "Number of frames represented in the page map.",
-            "type": "number"
-          },
-          "truncated": {
-            "description": "Whether the page map was truncated by the configured output limit.",
-            "type": "boolean"
-          },
-          "truncatedReason": {
-            "description": "Stable public reason for a bounded page-map truncation or partial child-frame observation, when available.",
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "resolutionSource": {
-            "description": "Target resolution route used when a target was requested.",
-            "type": "string"
-          },
-          "recoveredTarget": {
-            "description": "Snapshot details used when a stale target was recovered.",
+        "anyOf": [
+          {
             "type": "object",
-            "propertyNames": {
-              "type": "string"
+            "properties": {
+              "pageId": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                "description": "The page that owns this observation."
+              },
+              "checkedAt": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+                "description": "When the page state was checked."
+              },
+              "freshness": {
+                "type": "string",
+                "enum": [
+                  "current",
+                  "pending"
+                ],
+                "description": "Whether the page stayed stable during capture."
+              },
+              "pendingChanges": {
+                "type": "boolean",
+                "description": "Whether more page changes remain pending."
+              },
+              "completeness": {
+                "type": "string",
+                "enum": [
+                  "complete",
+                  "partial"
+                ],
+                "description": "Whether every accessible frame was observed."
+              },
+              "mode": {
+                "type": "string",
+                "const": "full",
+                "description": "The current page view artifact."
+              },
+              "version": {
+                "type": "string",
+                "pattern": "^v_[0-9a-f]{16}_[0-9a-z]+$",
+                "description": "The current page view identifier."
+              },
+              "artifact": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "full",
+                    "description": "The current page view artifact."
+                  },
+                  "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Read the observation artifact at this path."
+                  },
+                  "format": {
+                    "type": "string",
+                    "const": "text",
+                    "description": "The observation text format."
+                  },
+                  "bytes": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991,
+                    "description": "Artifact size in bytes."
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$",
+                    "description": "Artifact content hash."
+                  },
+                  "expiresAt": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+                    "description": "The time until the artifact is available."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "path",
+                  "format",
+                  "bytes",
+                  "sha256",
+                  "expiresAt"
+                ],
+                "additionalProperties": false,
+                "description": "The current page view artifact reference."
+              },
+              "diff": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "status": {
+                        "type": "string",
+                        "const": "initial",
+                        "description": "This is the first page view."
+                      }
+                    },
+                    "required": [
+                      "status"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "status": {
+                        "type": "string",
+                        "const": "unchanged",
+                        "description": "The page view is unchanged."
+                      }
+                    },
+                    "required": [
+                      "status"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "status": {
+                        "type": "string",
+                        "const": "computed",
+                        "description": "A page change artifact is available."
+                      },
+                      "artifact": {
+                        "type": "object",
+                        "properties": {
+                          "kind": {
+                            "type": "string",
+                            "const": "diff",
+                            "description": "An optional page change artifact."
+                          },
+                          "path": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Read the observation artifact at this path."
+                          },
+                          "format": {
+                            "type": "string",
+                            "const": "text",
+                            "description": "The observation text format."
+                          },
+                          "bytes": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991,
+                            "description": "Artifact size in bytes."
+                          },
+                          "sha256": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{64}$",
+                            "description": "Artifact content hash."
+                          },
+                          "expiresAt": {
+                            "type": "string",
+                            "format": "date-time",
+                            "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+                            "description": "The time until the artifact is available."
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "path",
+                          "format",
+                          "bytes",
+                          "sha256",
+                          "expiresAt"
+                        ],
+                        "additionalProperties": false,
+                        "description": "An optional page change artifact."
+                      }
+                    },
+                    "required": [
+                      "status",
+                      "artifact"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "status": {
+                        "type": "string",
+                        "const": "unavailable",
+                        "description": "The current page view is valid, but no change artifact is available."
+                      },
+                      "reason": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Why the change artifact is unavailable."
+                      }
+                    },
+                    "required": [
+                      "status",
+                      "reason"
+                    ],
+                    "additionalProperties": false
+                  }
+                ],
+                "description": "The page change status."
+              },
+              "details": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "nodeId": {
+                      "type": "string",
+                      "pattern": "^n_[0-9a-f]{16}$",
+                      "description": "An opaque node ID from the current observation. Do not parse it."
+                    },
+                    "fields": {
+                      "minItems": 1,
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "description": "Fields whose complete values are available in the referenced detail artifact."
+                    },
+                    "artifact": {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "type": "string",
+                          "const": "detail",
+                          "description": "A bounded target detail artifact."
+                        },
+                        "path": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Read the observation artifact at this path."
+                        },
+                        "format": {
+                          "type": "string",
+                          "const": "text",
+                          "description": "The observation text format."
+                        },
+                        "bytes": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991,
+                          "description": "Artifact size in bytes."
+                        },
+                        "sha256": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{64}$",
+                          "description": "Artifact content hash."
+                        },
+                        "expiresAt": {
+                          "type": "string",
+                          "format": "date-time",
+                          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+                          "description": "The time until the artifact is available."
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "path",
+                        "format",
+                        "bytes",
+                        "sha256",
+                        "expiresAt"
+                      ],
+                      "additionalProperties": false,
+                      "description": "A bounded target detail artifact."
+                    }
+                  },
+                  "required": [
+                    "nodeId",
+                    "fields",
+                    "artifact"
+                  ],
+                  "additionalProperties": false,
+                  "description": "References to complete non-sensitive node data omitted or truncated in the page view."
+                },
+                "description": "References to complete non-sensitive node data omitted or truncated in the page view."
+              }
             },
-            "additionalProperties": {}
+            "required": [
+              "pageId",
+              "checkedAt",
+              "freshness",
+              "pendingChanges",
+              "completeness",
+              "mode",
+              "version",
+              "artifact",
+              "diff",
+              "details"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "pageId": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                "description": "The page that owns this observation."
+              },
+              "mode": {
+                "type": "string",
+                "const": "detail",
+                "description": "A bounded target detail; it does not replace the current page view."
+              },
+              "artifact": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "detail",
+                    "description": "A bounded target detail artifact."
+                  },
+                  "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Read the observation artifact at this path."
+                  },
+                  "format": {
+                    "type": "string",
+                    "const": "text",
+                    "description": "The observation text format."
+                  },
+                  "bytes": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991,
+                    "description": "Artifact size in bytes."
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$",
+                    "description": "Artifact content hash."
+                  },
+                  "expiresAt": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+                    "description": "The time until the artifact is available."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "path",
+                  "format",
+                  "bytes",
+                  "sha256",
+                  "expiresAt"
+                ],
+                "additionalProperties": false,
+                "description": "A bounded target detail artifact."
+              },
+              "checkedAt": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+                "description": "When the page state was checked."
+              },
+              "summary": {
+                "type": "object",
+                "properties": {
+                  "total": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991,
+                    "description": "The number of requested targets."
+                  },
+                  "succeeded": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991,
+                    "description": "The number of successful targets."
+                  },
+                  "failed": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991,
+                    "description": "The number of failed targets."
+                  }
+                },
+                "required": [
+                  "total",
+                  "succeeded",
+                  "failed"
+                ],
+                "additionalProperties": false,
+                "description": "Detail query totals."
+              }
+            },
+            "required": [
+              "pageId",
+              "mode",
+              "artifact",
+              "checkedAt",
+              "summary"
+            ],
+            "additionalProperties": false
           }
-        },
-        "additionalProperties": {},
+        ],
         "description": "Validated business result returned by the Action."
       }
     },
@@ -196,5 +1103,5 @@
     ],
     "additionalProperties": false
   },
-  "purposeHint": "Describe why you need the current page map, e.g., understanding page structure, locating an actionable target, checking generic AX or layout state, or refreshing canonical element ids"
+  "purposeHint": "State whether you need page structure or targets, a change list, or bounded detail for known targets."
 }

@@ -1,67 +1,21 @@
 {
   "method": "DOM.inspectSelect",
-  "description": "Inspects native options directly or explores supported custom select options with the keyboard without selecting them.",
+  "description": "Reads the type and current options or value constraints of a native select, date, datetime-local, time, month, week, or color control without changing it.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:52691626582a5164f1e1aaafb5a9e390e6e1e95ccc27663283f74997776c3737",
+  "catalogRevision": "sha256:57787ad534cac0789a4ec5118fb0a773583a9790bab09bbabd5f03df913b3180",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "properties": {
       "id": {
-        "description": "Canonical select control ID.",
+        "description": "Opaque select control ID from the latest DOM.getAXTree observation.",
         "type": "string",
-        "pattern": "^\\d+:\\d+:\\d+$"
+        "pattern": "^n_[0-9a-f]{16}$"
       },
       "selector": {
         "description": "Unique CSS selector for one select control.",
         "type": "string",
         "minLength": 1
-      },
-      "startOption": {
-        "description": "Optional custom-select exploration starting point returned by a previous Select action. Native selects ignore this field.",
-        "anyOf": [
-          {
-            "type": "object",
-            "properties": {
-              "value": {
-                "type": "string",
-                "description": "Exact option value returned by the current select inspection."
-              }
-            },
-            "required": [
-              "value"
-            ],
-            "additionalProperties": true
-          },
-          {
-            "type": "object",
-            "properties": {
-              "id": {
-                "type": "string",
-                "minLength": 1,
-                "description": "Exact option ID returned by the current select inspection."
-              }
-            },
-            "required": [
-              "id"
-            ],
-            "additionalProperties": true
-          },
-          {
-            "type": "object",
-            "properties": {
-              "label": {
-                "type": "string",
-                "minLength": 1,
-                "description": "Exact option label returned by the current select inspection."
-              }
-            },
-            "required": [
-              "label"
-            ],
-            "additionalProperties": true
-          }
-        ]
       },
       "pageId": {
         "type": "string",
@@ -73,7 +27,7 @@
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "string",
         "minLength": 1,
-        "description": "Use the returned id, label, or explicit value without converting between fields. Reuse a returned startOption only when the feedback requests continued exploration."
+        "description": "Inspect before Input.select to determine the value form and current constraints. Custom controls require normal input interaction."
       }
     },
     "required": [
@@ -84,72 +38,136 @@
   },
   "resultSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "type": "object",
-    "properties": {
-      "controlId": {
-        "type": "string",
-        "minLength": 1,
-        "description": "Current canonical ID of the select control."
-      },
-      "controlKind": {
-        "type": "string",
-        "enum": [
-          "native",
-          "custom"
-        ],
-        "description": "Whether the control is native HTML or custom."
-      },
-      "selectionMode": {
-        "type": "string",
-        "enum": [
-          "single",
-          "multiple"
-        ],
-        "description": "Whether one or multiple options may be selected."
-      },
-      "options": {
-        "type": "array",
-        "items": {
-          "type": "object",
-          "properties": {
-            "id": {
-              "description": "Stable option ID exposed by the current select menu.",
-              "type": "string"
-            },
-            "label": {
-              "type": "string",
-              "description": "Normalized option label."
-            },
-            "value": {
-              "description": "Native value or an explicit custom option value when available.",
-              "type": "string"
-            },
-            "selected": {
-              "type": "boolean",
-              "description": "Whether the option is currently selected."
-            },
-            "disabled": {
-              "type": "boolean",
-              "description": "Whether the option is disabled."
-            }
+    "oneOf": [
+      {
+        "type": "object",
+        "properties": {
+          "controlId": {
+            "type": "string",
+            "pattern": "^n_[0-9a-f]{16}$",
+            "description": "Current control ID."
           },
-          "required": [
-            "label",
-            "selected",
-            "disabled"
-          ],
-          "additionalProperties": false
+          "type": {
+            "type": "string",
+            "const": "select",
+            "description": "Native select control type."
+          },
+          "selectionMode": {
+            "type": "string",
+            "enum": [
+              "single",
+              "multiple"
+            ],
+            "description": "Native selection mode."
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "label": {
+                  "type": "string",
+                  "description": "Normalized native option label."
+                },
+                "value": {
+                  "type": "string",
+                  "description": "Exact native option value."
+                },
+                "selected": {
+                  "type": "boolean",
+                  "description": "Whether the option is selected."
+                },
+                "disabled": {
+                  "type": "boolean",
+                  "description": "Whether the option is disabled."
+                }
+              },
+              "required": [
+                "label",
+                "value",
+                "selected",
+                "disabled"
+              ],
+              "additionalProperties": false
+            },
+            "description": "Current native options."
+          }
         },
-        "description": "Options observed for the current select."
+        "required": [
+          "controlId",
+          "type",
+          "selectionMode",
+          "options"
+        ],
+        "additionalProperties": false
+      },
+      {
+        "type": "object",
+        "properties": {
+          "controlId": {
+            "type": "string",
+            "pattern": "^n_[0-9a-f]{16}$",
+            "description": "Current control ID."
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "date",
+              "datetime-local",
+              "time",
+              "month",
+              "week",
+              "color"
+            ],
+            "description": "Native scalar control type."
+          },
+          "value": {
+            "type": "string",
+            "description": "Current native value in HTML format."
+          },
+          "disabled": {
+            "type": "boolean",
+            "description": "Whether the control is disabled."
+          },
+          "readOnly": {
+            "type": "boolean",
+            "description": "Whether the control is read-only."
+          },
+          "required": {
+            "type": "boolean",
+            "description": "Whether a value is required."
+          },
+          "constraints": {
+            "description": "Applicable declared native constraints.",
+            "type": "object",
+            "properties": {
+              "min": {
+                "description": "Declared minimum value.",
+                "type": "string"
+              },
+              "max": {
+                "description": "Declared maximum value.",
+                "type": "string"
+              },
+              "step": {
+                "description": "Declared step, including any.",
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "controlId",
+          "type",
+          "value",
+          "disabled",
+          "readOnly",
+          "required"
+        ],
+        "additionalProperties": false
       }
-    },
-    "required": [
-      "controlId",
-      "controlKind",
-      "selectionMode",
-      "options"
-    ],
-    "additionalProperties": false
+    ]
   },
   "outputSchema": {
     "type": "object",
@@ -164,72 +182,136 @@
       },
       "data": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "object",
-        "properties": {
-          "controlId": {
-            "type": "string",
-            "minLength": 1,
-            "description": "Current canonical ID of the select control."
-          },
-          "controlKind": {
-            "type": "string",
-            "enum": [
-              "native",
-              "custom"
-            ],
-            "description": "Whether the control is native HTML or custom."
-          },
-          "selectionMode": {
-            "type": "string",
-            "enum": [
-              "single",
-              "multiple"
-            ],
-            "description": "Whether one or multiple options may be selected."
-          },
-          "options": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "properties": {
-                "id": {
-                  "description": "Stable option ID exposed by the current select menu.",
-                  "type": "string"
-                },
-                "label": {
-                  "type": "string",
-                  "description": "Normalized option label."
-                },
-                "value": {
-                  "description": "Native value or an explicit custom option value when available.",
-                  "type": "string"
-                },
-                "selected": {
-                  "type": "boolean",
-                  "description": "Whether the option is currently selected."
-                },
-                "disabled": {
-                  "type": "boolean",
-                  "description": "Whether the option is disabled."
-                }
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "controlId": {
+                "type": "string",
+                "pattern": "^n_[0-9a-f]{16}$",
+                "description": "Current control ID."
               },
-              "required": [
-                "label",
-                "selected",
-                "disabled"
-              ],
-              "additionalProperties": false
+              "type": {
+                "type": "string",
+                "const": "select",
+                "description": "Native select control type."
+              },
+              "selectionMode": {
+                "type": "string",
+                "enum": [
+                  "single",
+                  "multiple"
+                ],
+                "description": "Native selection mode."
+              },
+              "options": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "label": {
+                      "type": "string",
+                      "description": "Normalized native option label."
+                    },
+                    "value": {
+                      "type": "string",
+                      "description": "Exact native option value."
+                    },
+                    "selected": {
+                      "type": "boolean",
+                      "description": "Whether the option is selected."
+                    },
+                    "disabled": {
+                      "type": "boolean",
+                      "description": "Whether the option is disabled."
+                    }
+                  },
+                  "required": [
+                    "label",
+                    "value",
+                    "selected",
+                    "disabled"
+                  ],
+                  "additionalProperties": false
+                },
+                "description": "Current native options."
+              }
             },
-            "description": "Options observed for the current select."
+            "required": [
+              "controlId",
+              "type",
+              "selectionMode",
+              "options"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "controlId": {
+                "type": "string",
+                "pattern": "^n_[0-9a-f]{16}$",
+                "description": "Current control ID."
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "date",
+                  "datetime-local",
+                  "time",
+                  "month",
+                  "week",
+                  "color"
+                ],
+                "description": "Native scalar control type."
+              },
+              "value": {
+                "type": "string",
+                "description": "Current native value in HTML format."
+              },
+              "disabled": {
+                "type": "boolean",
+                "description": "Whether the control is disabled."
+              },
+              "readOnly": {
+                "type": "boolean",
+                "description": "Whether the control is read-only."
+              },
+              "required": {
+                "type": "boolean",
+                "description": "Whether a value is required."
+              },
+              "constraints": {
+                "description": "Applicable declared native constraints.",
+                "type": "object",
+                "properties": {
+                  "min": {
+                    "description": "Declared minimum value.",
+                    "type": "string"
+                  },
+                  "max": {
+                    "description": "Declared maximum value.",
+                    "type": "string"
+                  },
+                  "step": {
+                    "description": "Declared step, including any.",
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "controlId",
+              "type",
+              "value",
+              "disabled",
+              "readOnly",
+              "required"
+            ],
+            "additionalProperties": false
           }
-        },
-        "required": [
-          "controlId",
-          "controlKind",
-          "selectionMode",
-          "options"
         ],
-        "additionalProperties": false,
         "description": "Validated business result returned by the Action."
       }
     },
@@ -282,5 +364,5 @@
     ],
     "additionalProperties": false
   },
-  "purposeHint": "Use the returned id, label, or explicit value without converting between fields. Reuse a returned startOption only when the feedback requests continued exploration."
+  "purposeHint": "Inspect before Input.select to determine the value form and current constraints. Custom controls require normal input interaction."
 }

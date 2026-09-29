@@ -2,7 +2,7 @@
   "method": "DOM.getImg",
   "description": "Exports image content from one or more page elements as files and optionally inline data.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:52691626582a5164f1e1aaafb5a9e390e6e1e95ccc27663283f74997776c3737",
+  "catalogRevision": "sha256:57787ad534cac0789a4ec5118fb0a773583a9790bab09bbabd5f03df913b3180",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -21,9 +21,9 @@
           "type": "object",
           "properties": {
             "id": {
-              "description": "Preferred canonical element ID from the latest DOM.getAXTree or DOM.getSemanticTree observation.",
+              "description": "Preferred opaque element ID from the latest DOM.getAXTree observation.",
               "type": "string",
-              "pattern": "^\\d+:\\d+:\\d+$"
+              "pattern": "^n_[0-9a-f]{16}$"
             },
             "selector": {
               "description": "Fallback CSS selector resolved in the main document and all nested author Shadow DOM trees.",
@@ -72,9 +72,9 @@
             "minimum": 1,
             "maximum": 100
           },
-          "timeout": {
+          "timeoutMs": {
             "default": 300,
-            "description": "Maximum batch wait time for image loading, in seconds. 0 waits until every image finishes or fails.",
+            "description": "Maximum batch wait time for image loading, in milliseconds. 0 waits until every image finishes or fails.",
             "type": "integer",
             "minimum": 0,
             "maximum": 9007199254740991
@@ -85,7 +85,7 @@
           "format",
           "imageFormat",
           "quality",
-          "timeout"
+          "timeoutMs"
         ],
         "additionalProperties": true,
         "description": "Required output options. path is an output directory, not a file path."
@@ -176,7 +176,6 @@
                   "description": "Whether image export succeeded."
                 },
                 "error": {
-                  "description": "Failure details when a public classification is available.",
                   "type": "object",
                   "properties": {
                     "code": {
@@ -205,13 +204,15 @@
                     "suggested_prompt",
                     "canFallback"
                   ],
-                  "additionalProperties": {}
+                  "additionalProperties": {},
+                  "description": "Structured failure details for this image item."
                 }
               },
               "required": [
                 "index",
                 "target",
-                "ok"
+                "ok",
+                "error"
               ],
               "additionalProperties": {},
               "description": "One failed image export item."
@@ -347,7 +348,6 @@
                       "description": "Whether image export succeeded."
                     },
                     "error": {
-                      "description": "Failure details when a public classification is available.",
                       "type": "object",
                       "properties": {
                         "code": {
@@ -376,13 +376,15 @@
                         "suggested_prompt",
                         "canFallback"
                       ],
-                      "additionalProperties": {}
+                      "additionalProperties": {},
+                      "description": "Structured failure details for this image item."
                     }
                   },
                   "required": [
                     "index",
                     "target",
-                    "ok"
+                    "ok",
+                    "error"
                   ],
                   "additionalProperties": {},
                   "description": "One failed image export item."

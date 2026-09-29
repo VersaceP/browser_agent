@@ -2,7 +2,7 @@
   "method": "Page.wheel",
   "description": "Dispatches a native wheel gesture at a page-viewport coordinate using either an explicit delta/state read or a scroll-to-boundary request, and reports the resulting scroll state.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:52691626582a5164f1e1aaafb5a9e390e6e1e95ccc27663283f74997776c3737",
+  "catalogRevision": "sha256:57787ad534cac0789a4ec5118fb0a773583a9790bab09bbabd5f03df913b3180",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "anyOf": [
@@ -25,11 +25,11 @@
             "type": "number",
             "minimum": 0
           },
-          "scrollX": {
+          "deltaX": {
             "description": "Optional horizontal scroll delta in CSS pixels. Positive values scroll right; omit both deltas for a state read.",
             "type": "number"
           },
-          "scrollY": {
+          "deltaY": {
             "description": "Optional vertical scroll delta in CSS pixels. Positive values scroll down; omit both deltas for a state read.",
             "type": "number"
           },
@@ -45,14 +45,14 @@
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "string",
             "minLength": 1,
-            "description": "Describe the page coordinate and choose delta/state with optional scrollX/scrollY or boundary with edge and optional axis; do not provide axis without edge."
+            "description": "Describe the page coordinate and choose delta/state with optional deltaX/deltaY or boundary with edge and optional axis; do not provide axis without edge."
           }
         },
         "required": [
           "pageId",
           "purpose"
         ],
-        "description": "Delta/state form: use optional scrollX and/or scrollY, and omit axis and edge.",
+        "description": "Delta/state form: use optional deltaX and/or deltaY, and omit axis and edge.",
         "additionalProperties": true
       },
       {
@@ -74,11 +74,11 @@
             "type": "number",
             "minimum": 0
           },
-          "scrollX": {
+          "deltaX": {
             "description": "Not accepted in this Page.wheel form.",
             "not": {}
           },
-          "scrollY": {
+          "deltaY": {
             "description": "Not accepted in this Page.wheel form.",
             "not": {}
           },
@@ -102,7 +102,7 @@
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "string",
             "minLength": 1,
-            "description": "Describe the page coordinate and choose delta/state with optional scrollX/scrollY or boundary with edge and optional axis; do not provide axis without edge."
+            "description": "Describe the page coordinate and choose delta/state with optional deltaX/deltaY or boundary with edge and optional axis; do not provide axis without edge."
           }
         },
         "required": [
@@ -110,7 +110,7 @@
           "edge",
           "purpose"
         ],
-        "description": "Boundary form: provide edge and optionally axis, and omit scrollX and scrollY.",
+        "description": "Boundary form: provide edge and optionally axis, and omit deltaX and deltaY.",
         "additionalProperties": true
       }
     ]
@@ -253,8 +253,9 @@
               "description": "Type of scroll layer."
             },
             "id": {
-              "description": "Canonical DOM ID of the layer, when available.",
-              "type": "string"
+              "description": "Opaque observation ID of the layer, when available.",
+              "type": "string",
+              "pattern": "^n_[0-9a-f]{16}$"
             },
             "position": {
               "type": "object",
@@ -467,8 +468,9 @@
                   "description": "Type of scroll layer."
                 },
                 "id": {
-                  "description": "Canonical DOM ID of the layer, when available.",
-                  "type": "string"
+                  "description": "Opaque observation ID of the layer, when available.",
+                  "type": "string",
+                  "pattern": "^n_[0-9a-f]{16}$"
                 },
                 "position": {
                   "type": "object",
@@ -583,5 +585,5 @@
     ],
     "additionalProperties": false
   },
-  "purposeHint": "Describe the page coordinate and choose delta/state with optional scrollX/scrollY or boundary with edge and optional axis; do not provide axis without edge."
+  "purposeHint": "Describe the page coordinate and choose delta/state with optional deltaX/deltaY or boundary with edge and optional axis; do not provide axis without edge."
 }

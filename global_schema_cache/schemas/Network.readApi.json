@@ -2,7 +2,7 @@
   "method": "Network.readApi",
   "description": "Reads recent Fetch, XHR, and Beacon request hops with supported response metadata and complete text bodies when available.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:52691626582a5164f1e1aaafb5a9e390e6e1e95ccc27663283f74997776c3737",
+  "catalogRevision": "sha256:57787ad534cac0789a4ec5118fb0a773583a9790bab09bbabd5f03df913b3180",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -13,8 +13,8 @@
         "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
         "description": "Target page ID whose network snapshot should be read."
       },
-      "timestamp": {
-        "description": "Optional Unix epoch timestamp in milliseconds. Includes requests initiated at exactly this time.",
+      "sinceMs": {
+        "description": "Optional Unix epoch boundary in milliseconds. Includes requests initiated at exactly this time.",
         "type": "integer",
         "minimum": 0,
         "maximum": 9007199254740991

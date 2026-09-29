@@ -2,7 +2,7 @@
   "method": "Input.drag",
   "description": "Drags from one resolved source to a resolved target, coordinate, or bounded offset within the same document.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:52691626582a5164f1e1aaafb5a9e390e6e1e95ccc27663283f74997776c3737",
+  "catalogRevision": "sha256:57787ad534cac0789a4ec5118fb0a773583a9790bab09bbabd5f03df913b3180",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -19,9 +19,9 @@
         "minLength": 1
       },
       "id": {
-        "description": "Preferred canonical element ID for the drag source.",
+        "description": "Current source node ID from the latest page observation.",
         "type": "string",
-        "pattern": "^\\d+:\\d+:\\d+$"
+        "pattern": "^n_[0-9a-f]{16}$"
       },
       "x": {
         "description": "Fallback source X coordinate in CSS pixels.",
@@ -31,25 +31,25 @@
         "description": "Fallback source Y coordinate in CSS pixels.",
         "type": "number"
       },
-      "toSelector": {
-        "description": "CSS selector for the destination. Without toOffset, the drop point defaults to the destination center.",
+      "destinationSelector": {
+        "description": "CSS selector for the destination. Without destinationOffset, the drop point defaults to the destination center.",
         "type": "string",
         "minLength": 1
       },
-      "toId": {
-        "description": "Canonical destination ID. Without toOffset, the drop point defaults to the destination center.",
+      "destinationId": {
+        "description": "Current destination node ID from the latest page observation. Without destinationOffset, the drop point defaults to the destination center.",
         "type": "string",
-        "pattern": "^\\d+:\\d+:\\d+$"
+        "pattern": "^n_[0-9a-f]{16}$"
       },
-      "toX": {
+      "destinationX": {
         "description": "Fallback destination X coordinate.",
         "type": "number"
       },
-      "toY": {
+      "destinationY": {
         "description": "Fallback destination Y coordinate.",
         "type": "number"
       },
-      "toOffset": {
+      "destinationOffset": {
         "description": "Normalized point inside the destination (0–1). Use y=0.2/0.8 when upper/lower drop zones change the result.",
         "type": "object",
         "properties": {
@@ -72,19 +72,19 @@
         ],
         "additionalProperties": true
       },
-      "dx": {
-        "description": "Relative horizontal drag offset when not using an explicit destination. If omitted while dy is provided, defaults to 0.",
+      "deltaX": {
+        "description": "Relative horizontal drag offset when not using an explicit destination. If omitted while deltaY is provided, defaults to 0.",
         "type": "number"
       },
-      "dy": {
-        "description": "Relative vertical drag offset when not using an explicit destination. If omitted while dx is provided, defaults to 0.",
+      "deltaY": {
+        "description": "Relative vertical drag offset when not using an explicit destination. If omitted while deltaX is provided, defaults to 0.",
         "type": "number"
       },
       "purpose": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "string",
         "minLength": 1,
-        "description": "Describe the intended drag effect. Keep source and destination in the same document, and prefer canonical element IDs when targeting an element."
+        "description": "Describe the intended drag effect and keep the source and destination in the same document when using element endpoints."
       }
     },
     "required": [
@@ -213,5 +213,5 @@
     ],
     "additionalProperties": false
   },
-  "purposeHint": "Describe the intended drag effect. Keep source and destination in the same document, and prefer canonical element IDs when targeting an element."
+  "purposeHint": "Describe the intended drag effect and keep the source and destination in the same document when using element endpoints."
 }

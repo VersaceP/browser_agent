@@ -1,8 +1,8 @@
 {
   "method": "Input.type",
-  "description": "Types text into a resolved editable target, optionally clearing its current value first. Without a dialog interruption, the typed and length summary confirms that the requested text was dispatched. If typing triggers a page alert, it is handled without creating an interactive dialog; typed and length are omitted because the final field value is unconfirmed, so re-read the field through the DOM. If it opens a confirm, prompt, or beforeunload dialog, the action returns its dialog id, omits typed and length, and directs the caller to Page.handleDialog before re-reading the field value.",
+  "description": "Types text into the specified editable target, optionally clearing its current value first. If a dialog or file chooser interrupts typing, the final field value may be unconfirmed and should be read again after handling it.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:52691626582a5164f1e1aaafb5a9e390e6e1e95ccc27663283f74997776c3737",
+  "catalogRevision": "sha256:57787ad534cac0789a4ec5118fb0a773583a9790bab09bbabd5f03df913b3180",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -19,9 +19,9 @@
         "minLength": 1
       },
       "id": {
-        "description": "Preferred canonical element ID from the latest DOM.getAXTree or DOM.getSemanticTree observation.",
+        "description": "Current node ID from the latest page observation for the editable target. Refresh it after navigation or document replacement.",
         "type": "string",
-        "pattern": "^\\d+:\\d+:\\d+$"
+        "pattern": "^n_[0-9a-f]{16}$"
       },
       "text": {
         "type": "string",
@@ -32,7 +32,7 @@
         "description": "Clear existing content before typing when true.",
         "type": "boolean"
       },
-      "delay": {
+      "delayMs": {
         "default": 50,
         "description": "Delay in milliseconds between keystrokes.",
         "type": "number",
@@ -42,14 +42,14 @@
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "string",
         "minLength": 1,
-        "description": "Describe why this exact text is being entered, e.g., filling a search query, username, password, or form field"
+        "description": "Describe why this exact text is being entered, such as filling a search query, username, password, or form field."
       }
     },
     "required": [
       "pageId",
       "text",
       "clear",
-      "delay",
+      "delayMs",
       "purpose"
     ],
     "additionalProperties": true
@@ -66,20 +66,12 @@
         "description": "Actor or resolution mode that selected the target.",
         "type": "string"
       },
-      "recoveredTarget": {
-        "description": "Snapshot details used when a stale target was recovered.",
-        "type": "object",
-        "propertyNames": {
-          "type": "string"
-        },
-        "additionalProperties": {}
-      },
       "cleared": {
         "description": "Whether the target value was cleared before typing.",
         "type": "boolean"
       },
       "characterCount": {
-        "description": "Number of characters dispatched.",
+        "description": "Number of characters reported as dispatched. It may be omitted when an interruption prevents confirmation.",
         "type": "number"
       },
       "resolutionSource": {
@@ -87,7 +79,7 @@
         "type": "string"
       },
       "dialog": {
-        "description": "Interactive native dialog returned while typing; handled page alerts are not returned here.",
+        "description": "Interactive native dialog returned while typing; handled page alerts are not returned here. Re-read the field after the dialog is handled.",
         "type": "object",
         "properties": {
           "id": {
@@ -152,20 +144,12 @@
             "description": "Actor or resolution mode that selected the target.",
             "type": "string"
           },
-          "recoveredTarget": {
-            "description": "Snapshot details used when a stale target was recovered.",
-            "type": "object",
-            "propertyNames": {
-              "type": "string"
-            },
-            "additionalProperties": {}
-          },
           "cleared": {
             "description": "Whether the target value was cleared before typing.",
             "type": "boolean"
           },
           "characterCount": {
-            "description": "Number of characters dispatched.",
+            "description": "Number of characters reported as dispatched. It may be omitted when an interruption prevents confirmation.",
             "type": "number"
           },
           "resolutionSource": {
@@ -173,7 +157,7 @@
             "type": "string"
           },
           "dialog": {
-            "description": "Interactive native dialog returned while typing; handled page alerts are not returned here.",
+            "description": "Interactive native dialog returned while typing; handled page alerts are not returned here. Re-read the field after the dialog is handled.",
             "type": "object",
             "properties": {
               "id": {
@@ -266,5 +250,5 @@
     ],
     "additionalProperties": false
   },
-  "purposeHint": "Describe why this exact text is being entered, e.g., filling a search query, username, password, or form field"
+  "purposeHint": "Describe why this exact text is being entered, such as filling a search query, username, password, or form field."
 }
