@@ -67,11 +67,11 @@ _NO_REPLAY = (
 # cheapest-and-most-durable first. VL enters only at step 3 and only LOCATES;
 # the action stays an ordinary native call, chosen to fit the control.
 _POPUP_DISCOVERY_LADDER = (
-    " Recover in this order: (1) refresh DOM.getAXTree; (2) read a page-wide"
-    " DOM.getSemanticTree and relate aria-controls / aria-owns /"
-    " aria-activedescendant to a listbox/menu/option surface, which for a"
-    " custom control is often rendered in a portal OUTSIDE the control's own"
-    " subtree; (3) only when the target is visibly on screen and no structured"
+    " Recover in this order: (1) refresh DOM.getAXTree; (2) follow the"
+    " control's `rel{aria-controls|aria-owns|aria-activedescendant:[ids]}` in"
+    " that full view to the listbox/menu/option nodes, which for a custom"
+    " control are often rendered in a portal OUTSIDE the control's own"
+    " subtree (a `dom` query on those ids shows their local structure); (3) only when the target is visibly on screen and no structured"
     " surface can name it, call visual_verify mode=visual_locate - it locates,"
     " it never acts; (4) act on what step 2 or 3 returned using whichever"
     " ordinary Input.*/DOM.* method the control actually needs (a click, a"
@@ -117,7 +117,7 @@ SELECT_FAILURE_POLICY = {
     "select-popup-not-found": SelectFailurePolicy(
         family="popup_discovery",
         raised_by=_BOTH,
-        action="reobserve_page_then_locate_menu_by_semantic_tree_then_visual_locate",
+        action="reobserve_page_then_locate_menu_by_ax_relations_then_visual_locate",
         retries=0,
         visual_locate=True,
         guidance=(
@@ -143,7 +143,7 @@ SELECT_FAILURE_POLICY = {
     "select-popup-not-ready": SelectFailurePolicy(
         family="popup_discovery",
         raised_by=_BOTH,
-        action="observe_popup_with_ax_and_semantic_tree_then_one_bounded_generic_action",
+        action="observe_popup_with_ax_then_one_bounded_generic_action",
         retries=0,
         visual_locate=True,
         guidance=(
@@ -187,7 +187,7 @@ SELECT_FAILURE_POLICY = {
     "select-option-label-ambiguous": SelectFailurePolicy(
         family="option_evidence",
         raised_by=_BOTH,
-        action="read_popup_semantic_tree_then_retry_once_with_a_unique_option_id",
+        action="reinspect_popup_then_retry_once_with_a_unique_option_id",
         retries=1,
         visual_locate=False,
         guidance=(
@@ -221,11 +221,11 @@ SELECT_FAILURE_POLICY = {
     # That last one is the textbook structured blind spot: the menu is on
     # screen and the platform cannot name what is in it. Denying the hint here
     # would close the exact door this ladder exists to open. It is still last,
-    # after AXTree and SemanticTree, and it still only LOCATES.
+    # after the AXTree, and it still only LOCATES.
     "select-options-incomplete": SelectFailurePolicy(
         family="option_evidence",
         raised_by=_BOTH,
-        action="reinspect_current_select_then_locate_options_by_semantic_tree_or_visually",
+        action="reinspect_current_select_then_locate_options_by_ax_relations_or_visually",
         retries=0,
         visual_locate=True,
         guidance=(
@@ -277,9 +277,10 @@ SELECT_FAILURE_POLICY = {
             " ordinary UI, one verified step per visible level: open it with"
             " Input.click, then re-observe to enumerate the options that are"
             " now rendered. A custom menu is often portal-rendered outside the"
-            " control's own subtree, so when a fresh DOM.getAXTree does not"
-            " show the options, read a page-wide DOM.getSemanticTree before"
-            " concluding they are absent. Choose with Input.click, or with"
+            " control's own subtree, so when the control's subtree in a fresh"
+            " DOM.getAXTree does not show the options, follow its"
+            " `rel{aria-controls|aria-owns}` ids before concluding they are"
+            " absent. Choose with Input.click, or with"
             " Input.type when the control is observably an editable field, or"
             " Input.press. Verify the control's value afterwards - no step"
             " here reports the selection for you. If a level is plainly on"
@@ -312,13 +313,13 @@ SELECT_FAILURE_POLICY = {
             " editable, so type into it only once the current evidence shows"
             " an editable field, and otherwise open it with Input.click."
             " Then look for the option surface: a custom menu is often"
-            " portal-rendered outside the control's subtree, so if a fresh"
-            " page-wide DOM.getAXTree does not list the options, read"
-            " DOM.getSemanticTree before concluding they are absent. Act on a"
-            " resolved option id with Input.click. If no structured surface"
+            " portal-rendered outside the control's subtree, so if the"
+            " control's subtree in a fresh DOM.getAXTree does not list the"
+            " options, follow its `rel{aria-controls|aria-owns}` ids before"
+            " concluding they are absent. Act on a resolved option id with Input.click. If no structured surface"
             " can name a level that is plainly on screen, use visual_verify"
             " mode=visual_locate — it is the only sanctioned source of a"
-            " coordinate, and a rect or a semantic-tree position is not one."
+            " coordinate, and a rect read off the AXTree is not one."
             " For CJK / IME labels where real keystrokes cannot produce the"
             " text, set input.value via the native descriptor setter +"
             " dispatchEvent('input') as a bounded fallback — one attempt only,"
@@ -433,7 +434,7 @@ SELECT_FAILURE_POLICY = {
         guidance=(
             "The selection was recorded during the keyboard operation but the"
             " final control state could not be proven. Read the control's own"
-            " value (inspect it, or DOM.getAttribute) BEFORE issuing any"
+            " value (inspect it, or a `state` DOM.getAXTree query) BEFORE issuing any"
             " correction - a corrective selection against an unknown state can"
             " undo a selection that in fact succeeded."
         ),
@@ -574,7 +575,6 @@ _RUNTIME_CODE_FAMILIES = (
     ("select-", "select_failure", "reinspect_select_then_follow_returned_guidance"),
     ("scroll-", "scroll_failed", "inspect_viewport_then_correct_the_scroll_request"),
     ("input-", "input_surface_unavailable", "inspect_page_state_before_retrying_input"),
-    ("semantic-tree-", "semantic_tree_unavailable", "reinspect_page_state_then_retry_semantic_tree"),
 )
 
 _TIMEOUT_SUFFIX = "-timeout"

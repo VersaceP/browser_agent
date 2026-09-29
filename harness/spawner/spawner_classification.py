@@ -228,7 +228,7 @@ def _classification_from_contract_violation(
         if not isinstance(classification, dict):
             continue
         category = str(classification.get("category") or "").strip()
-        if category != "blocked_cross_task_type_required":
+        if category != "blocked_infrastructure":
             continue
         recovered = dict(classification)
         recovered["source"] = "contract_violation"
@@ -309,7 +309,7 @@ def _scroll_receipt_data(result: JsonDict) -> Optional[JsonDict]:
 def _scroll_was_state_probe(result: JsonDict) -> bool:
     """True when the receipt says no scroll input was dispatched at all.
 
-    A zero request — `Input.scroll` `amount: 0`, `Page.wheel` `scrollX/scrollY: 0`
+    A zero request — `Input.scroll` `distance: 0`, `Page.wheel` `deltaX/deltaY: 0`
     — reads the scroll state without moving anything, so such a call is neither
     a traversal nor a failed traversal; counting it either way corrupts the
     ledger that guards `target_absent`.
@@ -612,7 +612,6 @@ def _classification_from_final_answer(
             ).strip()
             classification = {"category": category}
         if category not in {
-            "blocked_cross_task_type_required",
             "blocked_infrastructure",
             COLLECTION_CONTRACT_REPLAN_REQUIRED,
             "target_absent",
@@ -661,8 +660,6 @@ def _classification_from_final_answer(
             classification.setdefault("hint", str(hint)[:500])
         if blocker.get("method"):
             classification.setdefault("method", blocker.get("method"))
-        if blocker.get("task_type"):
-            classification.setdefault("task_type", blocker.get("task_type"))
         if blocker.get("field"):
             classification.setdefault("field", blocker.get("field"))
         if isinstance(blocker.get("expectedShape"), dict):

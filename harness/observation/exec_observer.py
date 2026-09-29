@@ -31,6 +31,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from harness.utils import JsonDict
+from harness.workflow.nested_failure import public_failure
 
 # A segment that produces more step events than this is already past the point
 # where a model can reason about the trace; keep the head and the tail so both
@@ -222,6 +223,11 @@ class ExecObserver:
                     "errorCode": payload.get("errorCode"),
                     "durationMs": payload.get("duration"),
                 }
+                self.trace.failure.update(public_failure(payload))
+                for key in ("action", "stepRunId"):
+                    value = payload.get(key)
+                    if isinstance(value, (str, int)) and not isinstance(value, bool):
+                        self.trace.failure[key] = value
             return
         if phase == "started":
             self.trace.phase = "running"
@@ -235,10 +241,18 @@ class ExecObserver:
             "stepType": payload.get("stepType"),
             "status": payload.get("status"),
         }
-        for key in ("action", "duration", "error", "errorCode"):
+        for key in ("action", "stepRunId"):
             value = payload.get(key)
-            if value is not None:
-                step["durationMs" if key == "duration" else key] = value
+            if value is not None and (isinstance(value, str) or (isinstance(value, int) and not isinstance(value, bool))):
+                step[key] = value
+        for key in ("duration", "error", "errorCode"):
+            if payload.get(key) is not None:
+                step["durationMs" if key == "duration" else key] = payload[key]
+        if step.get("status") in ("error", "failed"):
+            step.update(public_failure(payload))
+            nested = public_failure(payload.get("nestedActionFailure"))
+            if nested:
+                step["nestedActionFailure"] = nested
         self._append_step(step)
 
     def _append_step(self, step: JsonDict) -> None:

@@ -650,9 +650,8 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
         candidate = self._pending_task_session_candidates.pop(worker_id, None)
         if binding is not None and binding.state == "stale":
             return None
-        task_type = str((phase or {}).get("task_type") or "").strip()
         stage_hint = str((phase or {}).get("stage_hint") or "").strip()
-        if task_type != "form_filling" or stage_hint != "form_interaction":
+        if stage_hint != "form_interaction":
             return None
         validation = result.get("artifactValidation")
         validation_done = bool(
@@ -1969,6 +1968,11 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
             return result
         except Exception as exc:
             self._preverified_fleet_readiness.pop(worker_id, None)
+            # Preserve the route before a fatal failure retires its socket.
+            failed_slot_client = getattr(slot, "client", None)
+            failed_slot_connection = dict(
+                getattr(failed_slot_client, "connection_details", {}) or {}
+            )
             self._finish_first_fleet_acquisition(
                 first_acquisition_claimed,
                 committed=False,
@@ -2010,6 +2014,9 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                 result["transportFailure"] = {
                     "code": exc.transport_code, "connectionFatal": exc.connection_fatal,
                     "requestSent": exc.request_sent, "method": exc.rpc_method,
+                    "requestId": exc.request_id or None,
+                    "rpcCode": exc.rpc_code,
+                    "connection": exc.connection_details or failed_slot_connection,
                     "businessWorkerStarted": False,
                 }
                 if exc.connection_fatal:
@@ -2252,6 +2259,8 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                                    or getattr(client, "connection_details", {}),
                                "reasonCode": getattr(exc, "code", None) or getattr(exc, "transport_code", None),
                                "rpcCode": getattr(exc, "rpc_code", None),
+                               "requestId": getattr(exc, "request_id", "") or None,
+                               "requestSent": getattr(exc, "request_sent", None),
                                "businessActionsReplayed": 0,
                                "next_instruction": "Recovery probe failed. Keep the task blocked and preserve its identity. Do not poll via spawn; retry this probe after external endpoint recovery."}
                 finally:
@@ -2319,6 +2328,12 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
             handle.async_task for handle in self._handles.values()
             if not handle.async_task.done()
         ]
+        # Recovery is shielded from its caller so concurrent waiters share one
+        # probe. It is still owned by this spawner and must release its client
+        # before the CLI closes storage or the probe can log after run teardown.
+        recovery = getattr(self, "_connection_recovery_task", None)
+        if recovery is not None and not recovery.done():
+            pending.append(recovery)
         for task in pending:
             task.cancel()
         if pending:

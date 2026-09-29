@@ -34,17 +34,12 @@ NAVIGATION_CHALLENGE_TITLE_KEYWORDS = (
 )
 
 OFFLOAD_METHODS = {
-    "DOM.getSemanticTree",
     "DOM.getAXTree",
-    "DOM.getText",
-    "DOM.getAttribute",
     "DOM.getImg",
 }
 OFFLOAD_FIELDS_AS_TEXT = {"lines"}
 OFFLOAD_FIELDS_AS_JSON = {
-    # getSemanticTree's payload moved from `tree` into `frames[].tree`, and
-    # offload only reaches top-level fields. Without `frames` the heaviest read
-    # on the surface travels into model context whole.
+    "records",
     "frames",
     "tree",
     "nodes",
@@ -100,6 +95,7 @@ GENERIC_TOOL_RESULT_KEEP_KEYS = (
     "tracePath",
     "resultLevels",
     "workerResultProtocol",
+    "argumentRepairs",
     "observation",
     "suggested_prompt",
     "error",
@@ -270,8 +266,6 @@ EXTRACTION_METHODS = frozenset({
     "Runtime.evaluate",
     "DOM.getAXTree",
     "DOM.inspectSelect",
-    "DOM.getText",
-    "DOM.getSemanticTree",
 })
 EXTRACTION_FAILURE_OBS_MARKERS = (
     "timed out",

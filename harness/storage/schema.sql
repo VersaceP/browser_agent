@@ -248,35 +248,3 @@ CREATE TABLE worker_trace_events (
 
 CREATE INDEX idx_worker_trace_lookup
     ON worker_trace_events(task_id, run_id, worker_id, sequence_no);
-
-
-CREATE TABLE strategy_attempts (
-    attempt_id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_id                TEXT NOT NULL,
-    run_id                 TEXT NOT NULL,
-    phase_id               TEXT,
-    worker_id              TEXT,
-
-    strategy_ids_json      TEXT NOT NULL DEFAULT '[]',
-    status                 TEXT,
-    status_category        TEXT,
-    validated_status       TEXT,
-    failure_classification TEXT,
-    row_count              INTEGER,
-    artifact_count         INTEGER NOT NULL DEFAULT 0,
-    created_at             TEXT NOT NULL,
-
-    FOREIGN KEY (task_id)
-        REFERENCES tasks(task_id)
-        ON DELETE CASCADE,
-
-    FOREIGN KEY (task_id, run_id)
-        REFERENCES task_runs(task_id, run_id)
-        ON DELETE CASCADE
-);
-
-CREATE INDEX idx_strategy_attempts_task
-    ON strategy_attempts(task_id, created_at);
-
-CREATE INDEX idx_strategy_attempts_phase
-    ON strategy_attempts(task_id, phase_id, created_at);

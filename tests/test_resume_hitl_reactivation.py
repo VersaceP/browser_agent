@@ -123,19 +123,6 @@ def _agent(root):
     return agent, logger
 
 
-def _transport_error_review(provider, *args, **kwargs):
-    calls = {"count": 0}
-
-    async def _review(*_args, **_kwargs):
-        calls["count"] += 1
-        return {
-            "status": "error",
-            "errorKind": "transport",
-            "errors": ["LLMConnectionError: reviewer lost the connection"],
-        }
-
-    _review.calls = calls
-    return _review
 
 
 class ResumeHitlReactivationTest(unittest.TestCase):
@@ -257,74 +244,6 @@ class PendingHumanInterventionTest(unittest.TestCase):
             )
 
 
-class ValidatorErrorLoopTest(unittest.TestCase):
-    def test_error_cache_expires_and_allows_retry_after_recovery(self):
-        with tempfile.TemporaryDirectory() as root:
-            agent, _ = _agent(root)
-            raw = _raw_plan()
-            with patch(
-                "agent_harness.review_plan_revision",
-                new=_transport_error_review(None),
-            ) as review_patch:
-                first = asyncio.run(agent.review_task_plan_candidate(raw))
-                self.assertEqual(first["status"], "error")
-                self.assertNotIn("deduplicated", first)
-                second = asyncio.run(agent.review_task_plan_candidate(raw))
-                self.assertTrue(second.get("deduplicated"))
-                self.assertFalse(second.get("providerCalled"))
-                # Age the cached error past the TTL: the reviewer gets
-                # another chance instead of replaying the failure forever.
-                for entry in agent._plan_validator_error_cache.values():
-                    entry["cachedAt"] = time.time() - 10_000
-                third = asyncio.run(agent.review_task_plan_candidate(raw))
-                self.assertNotIn("deduplicated", third)
-                self.assertGreaterEqual(review_patch.calls["count"], 2)
-
-    def test_unreviewed_replan_stops_on_first_exhausted_review(self):
-        with tempfile.TemporaryDirectory() as root:
-            agent, logger = _agent(root)
-            initial = _raw_plan()
-            with patch(
-                "agent_harness.review_plan_revision",
-                new=_transport_error_review(None),
-            ):
-                failing_review = asyncio.run(
-                    agent.review_task_plan_candidate(initial)
-                )
-                # Bootstrap an accepted plan without the reviewer: use the
-                # fail-open path by disabling the validator gate's rejection
-                # through infrastructure_unreviewed (no prior plan).
-                accepted = agent.accept_task_plan(
-                    initial, plan_validator_review=failing_review,
-                )
-            self.assertEqual(accepted["status"], "done")
-            replan = _raw_plan(
-                worker_task="Use the validated route for the remaining rows.",
-                replan_reason="Reuse the validated route for the remaining row.",
-            )
-            reviews = []
-            with patch(
-                "agent_harness.review_plan_revision",
-                new=_transport_error_review(None),
-            ):
-                # Emit path re-reviews on every submission: the second one is
-                # answered from the error cache and carries deduplicated.
-                for _ in range(3):
-                    reviews.append(asyncio.run(
-                        agent.review_task_plan_candidate(replan)
-                    ))
-            self.assertFalse(reviews[0].get("deduplicated"))
-            self.assertTrue(reviews[1].get("deduplicated"))
-            results = [
-                agent.accept_task_plan(replan, plan_validator_review=review)
-                for review in reviews
-            ]
-            for result in results:
-                self.assertEqual(result['status'], 'blocked')
-                self.assertTrue(result['_terminate_lead'])
-                self.assertTrue(result['acceptedPlanUnchanged'])
-                self.assertEqual(result['errorCode'], 'plan_validator_unavailable')
-                self.assertIn('Stop this run', result['next_instruction'])
 
 
 if __name__ == "__main__":

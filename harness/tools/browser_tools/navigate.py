@@ -904,7 +904,10 @@ def _observe_content_completeness_after(
     step: int,
     *,
     content_binding: Any = None,
+    observed_result: Any = None,
 ) -> JsonDict:
+    """`observed_result` is what the tracker judges when it differs from the
+    model-facing `result`: the full AXTree view before the model projection."""
     contract = getattr(agent, "worker_contract", None)
     tracker = _ensure_content_completeness_tracker(agent)
     if tracker is None or not tracker.enabled:
@@ -919,17 +922,18 @@ def _observe_content_completeness_after(
         params,
         result,
     )
+    evidence = observed_result if isinstance(observed_result, dict) else result
     summary = tracker.observe(
         method=method,
         params=params,
-        result=result,
+        result=evidence,
         step=step,
         upstream_blocker=upstream_blocker,
     )
     binding_receipt = tracker.observe_content_binding(
         method=method,
         params=params,
-        result=result,
+        result=evidence,
         binding=content_binding,
     ) if isinstance(content_binding, dict) else None
     if isinstance(binding_receipt, dict) and binding_receipt.get("status") in {
@@ -1928,6 +1932,9 @@ def _transport_error_metadata(
         metadata["rpcCode"] = rpc_code
     if rpc_method:
         metadata["rpcMethod"] = rpc_method
+    request_id = str(getattr(exc, "request_id", "") or "")
+    if request_id:
+        metadata["requestId"] = request_id
     rpc_data = getattr(exc, "rpc_data", None)
     public_failure = _public_failure_projection(rpc_data)
     if public_failure:
@@ -1960,11 +1967,11 @@ _SELECT_FAILURE_NEXT_INSTRUCTION: Dict[str, str] = {
         " a selector from this error text. The failed Action may still have"
         " re-rendered or opened the control, so discard prior element ids"
         " and re-observe first. A custom popup may be rendered through a"
-        " portal outside the control subtree: use fresh"
-        " DOM.getSemanticTree/AX evidence to relate aria-controls,"
-        " aria-owns, or aria-activedescendant to a page-wide"
-        " listbox/option surface. Only a selector independently returned by"
-        " that fresh semantic evidence may be used. Then perform at most one"
+        " portal outside the control subtree: in a fresh DOM.getAXTree,"
+        " follow the control's rel{aria-controls|aria-owns|"
+        "aria-activedescendant} ids to a page-wide listbox/option surface."
+        " Only an id or selector independently returned by that fresh"
+        " evidence may be used. Then perform at most one"
         " generic Input.click/Input.press/Input.type action. Its success"
         " receipt does NOT prove a popup opened: require a fresh visible"
         " related popup before calling Input.select."

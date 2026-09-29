@@ -36,12 +36,14 @@ fresh browser perception. A local_fs result proves only the file slice or
 matches returned; a miss in a truncated search does not prove that a target is
 absent.
 
-For a current offloaded AX tree, use find_in_axtree first when its liveQuery
-path is available. It queries the in-memory snapshot and preserves the current
-epoch. A stale-epoch reply requires fresh browser observation before acting on a
-target. Use local_fs_search/local_fs_read for historical line-level evidence
-or a bounded question the focused query cannot express; those reads cannot
-make stale ids current.
+For a current page view, use find_in_axtree first: it queries the in-memory
+snapshot of the latest full view, including the one saved behind a change
+list (`lines.delivery: "changes"`). A stale-snapshot reply requires a fresh
+browser read before acting on a target. Use local_fs_search/local_fs_read for
+historical line-level evidence or a bounded question the focused query cannot
+express; those reads cannot make stale ids current. The platform's own
+observation artifacts live on the browser host and are read by the harness;
+never pass a host `artifact.path` to local_fs tools.
 
 local_fs_read is paged by line_offset, line_limit and max_bytes. Respect
 truncated and nextLineOffset; totalLines tells you whether more content
@@ -51,8 +53,44 @@ offload is not new page evidence; return to Page/DOM/Input perception or state
 the evidence-bound blocker.
 
 Use local_fs_batch for delivery filesystem work that does not require browser
-execution: create directories, write UTF-8 text or JSON, inspect size/hash, and
-copy task files into their requested delivery layout. Batch independent
+execution: list directories with op=list (recursive defaults to false), create
+directories, write UTF-8 text or JSON, inspect size/hash, and copy authorized
+files into their requested delivery layout. Directory listing has no file-count
+cap. Large receipts may still be offloaded; inspect the persisted receipt.
+
+External material and delivery paths require terminal confirmation before the
+call executes. A phase's worker_contract.local_access_intent declares exact
+scopes and modes, not permission: the harness preflights separate terminal
+READ/WRITE decisions on the first relevant file call. Do not request each output
+file individually when the declared delivery directory already covers verification.
+Without an intent, plan the scope before submitting child operations. If the task
+needs multiple sibling directories or all files under a material/delivery root,
+request that common parent explicitly first: list/search the parent for READ,
+or mkdir the delivery parent for WRITE. Once approved, batch child operations
+under it; the same task reuses that permission throughout its descendants.
+For example, when both /inputs/group-a and /inputs/group-b are needed, request
+READ on /inputs first. When only /inputs/group-a is needed, request that child
+alone. These are example paths, not default input locations.
+A child approval does not cover its parent or siblings. Requesting a broader
+parent later requires a new terminal approval, not a reinterpretation of the
+child grant. Choose the root needed for the task, not an unrelated ancestor
+such as the home directory. Use list/search to discover real child names;
+search accepts path as its root.
+Interactive confirmation pauses new tool dispatches and model turns across the
+current task without a deadline. The original worker resumes the original call
+after approval. Requests already dispatched may finish; terminal IO and browser
+event handling remain live. Invalid input is not a refusal: enter yes or no.
+Do not use browser Hitl.* or another tool to bypass a refused path.
+Read and write approvals are separate, task-scoped and reused by continuations.
+Only the displayed scope and its descendants are approved. Do not silently
+expand an existing grant to a parent or request a parent to bypass a denial.
+Symlinks resolving outside the approved root need their own authorization;
+permissions do not carry over to another task. Do not retry alternate tools
+after denial. Application/source and credential paths
+are protected even under an approved parent. If no terminal is available,
+report external_path_confirmation_required; do not use file:// as a bypass.
+Download.start still obeys the browser's independent sandbox: when necessary,
+stage in scratchpad and copy to the approved delivery directory. Batch independent
 operations when practical and inspect every per-operation result; a partial
 receipt means earlier operations may already have changed files. copy keeps
 the source. The tool has no delete, move, shell, Python, or JavaScript surface.

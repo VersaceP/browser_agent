@@ -74,7 +74,9 @@ def _fresh_click_settlement_class(
     current_ids = set(getattr(agent, "axtree_ids", set()) or set())
     if target_id not in current_ids:
         return "conservative"
-    nodes = list(getattr(agent, "axtree_nodes", []) or [])
+    from harness.tools.browser_tools.axtree_state import _current_axtree_nodes
+
+    nodes = _current_axtree_nodes(agent)
     for node in nodes:
         if not isinstance(node, dict):
             continue
@@ -251,7 +253,6 @@ class BrowserAgentSlot:
     current_worker_id: Optional[str] = None
     last_worker_id: Optional[str] = None
     last_phase_id: Optional[str] = None
-    last_task_type: str = ""
     last_contract_hash: str = ""
     last_result_summary: JsonDict = field(default_factory=dict)
     last_sync_at: float = 0.0

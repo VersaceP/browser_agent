@@ -266,9 +266,9 @@ def stall_armed(agent: Any, threshold: int) -> bool:
     """Whether flailing alone should arm the visual check.
 
     The target-shortfall streak only counts tools that report a row yield, so
-    a worker looping on DOM.getAXTree / DOM.getSemanticTree / local_fs_read
+    a worker looping on perception reads (DOM.getAXTree / local_fs_read)
     never arms it — observed live in task e3173b5b, where a worker spent 30+
-    steps on those three and the streak stayed at 0 the whole time. Perception
+    steps on such reads and the streak stayed at 0 the whole time. Perception
     that produces nothing at all is the same predicament the shortfall streak
     describes; it just leaves no yield to count.
     """

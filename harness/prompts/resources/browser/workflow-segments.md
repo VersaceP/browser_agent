@@ -1,13 +1,12 @@
 ---
 id: browser.workflow-segments
 audience: browser
-version: "2026-09-15"
-description: Write one execute_browser_workflow segment instead of a run of single calls, and decide what to do when a segment fails.
+version: "2026-09-27"
+description: Author bounded Workflow segments with observation references, deterministic transforms, event synchronization and failure recovery.
 sources:
-  - harness/tools/browser_tools/dispatch.py
+  - abcp-platform/resources/skills/webcross-browser/references/workflow-orchestration.md
   - harness/tools/browser_tools/schemas.py
   - harness/workflow/workflow_policy.py
-  - harness/observation/exec_observer.py
 related_tools:
   - execute_browser_workflow
   - execute_saved_browser_workflow
@@ -19,253 +18,185 @@ related_methods:
 
 # Segments
 
-Use this guide only when Workflow.execute and its Harness execution tool are
-exposed for this worker. A disabled workflow remains guidance, not an executable
-capability. Follow the current schema and lifecycle-policy receipt if a
-deployment differs from an example.
+Use Workflow only when its execution tool is exposed and enabled for this worker.
+Choose a bounded sequence whose actions, conditions and stopping rules are known.
+A segment may observe the page and mechanically select a target. End it when the
+next decision needs model judgment, a screenshot, a Harness-only tool, artifact
+expiry recovery or failure diagnosis. Runtime.evaluate and record_extraction are
+not available inside a Harness Workflow segment.
 
-A segment is the run of actions from where you are now to the next point where
-you genuinely have to look before deciding. Submit it as one
-`execute_browser_workflow` call instead of one `browser_call` per action.
+## References and transforms
 
-The end of a segment is where you get control back, so there is no mid-workflow
-"ask the model" step and none is needed: if you cannot predict what comes next,
-that is where the segment ends.
+After DOM.getAXTree, the complete `$cache.observation` or `$last` reference reads
+leased artifact text. `$cache.observation.diff` reads a computed diff; a diff that
+was not computed remains status metadata. `$cache.observation.detail[nodeId]`
+reads an available leased detail artifact for that literal node id. The path
+`$cache.observation.artifact.path` is metadata, not content. A lease does not make
+old node ids current: after navigation, settle and read a fresh observation.
+
+Keep the two DOM.getAXTree return shapes separate. A standalone browser_call is
+hydrated by the Harness: a bounded query can appear as `response.data.records`
+after the Harness reads and parses its artifact. Inside Workflow.execute, the
+Action returns the platform's raw data: a bounded query has `mode: "detail"`,
+`artifact`, `checkedAt` and `summary`, but no `records` array. Do not write
+`extract: {"name": "records"}` or `$last.records` after a workflow DOM.getAXTree
+step. Action `extract` reads fields of that raw data (for example
+`summary.succeeded` or `artifact.path`). To inspect detail values in the same
+segment, pass the complete `$cache.observation` or `$last` to transform: the
+Workflow host reads the leased text artifact. Match only lines whose target,
+index and `ok` status establish the intended result; check failed or missing
+targets before acting. If model judgment is needed, return the Action result
+and interpret it after the segment.
+
+References occupy the complete string value; embedded references are not string
+interpolation. Use template for string construction. The roots are `$context`,
+`$vars.NAME`, `$last`, `$cache`, and `$store`; there is no `$steps[N]`.
+`$context` holds read-only execution data. `$vars` supports nested object fields
+and numeric array indices, with literal variable keys taking precedence.
+`$last` is the latest successful Action, readEvents or waitEvent result;
+transform writes its output variable without replacing `$last` or `$store`.
+`extract` paths address Action data directly: `url`, not `data.url`.
+Missing references fail unless checked with exists/notExists.
+
+## Read a known target inside a workflow
+
+This bounded query illustrates the raw result boundary. Replace the placeholder
+with an id from the current page observation. `summary.succeeded` is a raw
+Action result field; the detail line comes from the leased artifact text.
+The resulting line is evidence to inspect, not proof that a requested value
+has the expected meaning.
+
+```json
+[
+  {"type":"action","action":"DOM.getAXTree","purpose":"Read the current state of a known control","params":{"query":{"view":"state","targets":[{"id":"«current-node-id»"}]}},"extract":{"succeeded":"summary.succeeded"}},
+  {"type":"transform","input":"$cache.observation","ops":[{"op":"find","pattern":"detail index=0 ok=true","mode":"contains"}],"output":"successfulDetailLines"}
+]
+```
+
+`find` returns every matching line/item as an array, or [] on a miss. Check
+`$vars.matches.length` equals 1 before selecting jsonpath index `0` to extract an
+id. regex and template preserve array shape. A regex miss returns an empty
+string, so exists alone is not a valid id guard. jsonpath uses dot paths and
+numeric indices, not full JSONPath. reg parses the first matching observation
+record and does not prove uniqueness. querySelector operates on a supplied
+simplified tree, not the live DOM or raw artifact text. Use only operations
+exposed by the current schema; some versions also expose join and decode.
 
 ## Step types
 
-Only these exist. They are the platform's own names — anything else is rejected
-before the workflow starts.
+Write explicit type for every step and purpose for every Action. The Harness
+also accepts action shorthand where its schema permits it.
 
-| type | what it does |
+| type | purpose |
 | --- | --- |
-| `action` (default; `type` may be omitted) | one ABCP action, with `params`, `purpose`, `extract`, `onError` |
-| `waitEvent` | wait for `focus: [...]` AFTER the preceding Action, with a `timeout` |
-| `readEvents` | read `focus: [...]` from the preceding Action's OWN window; returns immediately |
-| `store` | `op` `set` / `merge` / `append` / `delete` at `path` |
-| `if` | `condition` + `then` / `else` |
-| `loop` | `maxIterations` + `condition` + `body` |
-| `transform` | `find` / `regex` / `jsonpath` / `template` / `querySelector` over `input` → `output` |
+| action | Run an Action with params, purpose, extract and onError |
+| readEvents | Read replayable events from the latest Action window |
+| waitEvent | Wait for events after that window, with bounded timeout |
+| transform | Apply deterministic operations and write an output variable |
+| store | set, merge, append or delete a path relative to the execution's store |
+| if | Evaluate condition and run then or else |
+| loop | Repeat body subject to condition, maxIterations and total deadline |
 
-`onError` is `stop` (default) or `continue` — **never `retry`**. There is no
-retry setting anywhere in the workflow language: a step that failed did so
-against a page you have not re-observed, so retrying it blind is the wrong move
-anyway. Read the failure receipt, re-observe, submit a new segment.
+Keep onError at stop. There is no retry step setting. Continue only when an
+explicit recovery branch handles the failure under the applicable policy.
+Variables and store hold JSON-compatible values. Store is execution-scoped;
+return accepted rows to the Agent for record_extraction. Every loop must make
+observable progress and recheck its continuation condition.
 
-## Observation and event choices
+Step shapes use exact field names, not a family of synonyms: a loop step is
+`{"type":"loop","maxIterations":N,"condition":{...},"body":[...]}` — never
+`steps` or `stopWhen`. A conditional step is
+`{"type":"if","condition":{...},"then":[...],"else":[...]}` — the type is
+`"if"`, never `"condition"`. A transform step is
+`{"type":"transform","input":"$reference","ops":[...],"output":"name"}`
+— never `expression`, `inputs` or `outputs`. `extract` is a field on an action
+step, not a step type.
 
-After navigation settlement, call Page.getState. Read an AXTree only if the
-next work needs AX identities; a segment may end with state, text, attributes,
-or selector-based extraction. Autoheal adds missing state synchronization,
-not an unconditional AXTree. Old canonical ids remain invalid after navigation.
+## Runtime binding
 
-Allowed focus names come from the current Workflow.execute schema, separately
-for waitEvent and readEvents. A schema-supported event is not guaranteed to
-occur during this operation. Choose it from the action's observed timing and
-receipt, and inspect empty/timeout results; Harness does not ban event names
-because it predicts they would be unhelpful.
+Do not write `pageId` or `fleetId` in action params. The runtime binding
+supplies the target; a placeholder string ("$pageId", "{{pageId}}") is sent
+as a literal value and fails, and a guessed UUID passes validation but fails
+at runtime. Omit the field entirely. Object arguments keep their object shape:
+Input.scroll's `target` and `container` are `{"id":"n_..."}` objects, never
+a bare node-id string.
 
-## A filled-form segment
+## Observe, select one target, act
 
-Everything here is decided in advance, so it is one segment. It ends right after
-the results land, because what to do with them depends on what they are.
-
-```json
-[
-  {"action": "Input.type", "params": {"pageId": "$vars.pageId", "id": "$vars.keywordId", "text": "$vars.keyword"},
-   "purpose": "Enter the search keyword", "onError": "stop"},
-  {"action": "Input.click", "params": {"pageId": "$vars.pageId", "id": "$vars.regionId"},
-   "purpose": "Open the region control", "onError": "stop"},
-  {"action": "DOM.getAttribute", "params": {"pageId": "$vars.pageId", "id": "$vars.keywordId", "name": "value"},
-   "purpose": "Read the keyword field back", "onError": "stop", "extract": {"keywordEcho": "value"}},
-  {"action": "Input.click", "params": {"pageId": "$vars.pageId", "id": "$vars.submitId"},
-   "purpose": "Submit the search", "onError": "stop"},
-  {"type": "waitEvent", "focus": ["Page.loaded", "Page.loadFailed"], "timeout": 20000},
-  {"action": "Page.getState", "params": {"pageId": "$vars.pageId"},
-   "purpose": "Confirm where the submit landed", "onError": "stop", "extract": {"landedUrl": "url"}},
-  {"action": "DOM.getAXTree", "params": {"pageId": "$vars.pageId"},
-   "purpose": "Refresh element identity for the results page", "onError": "stop"}
-]
-```
-
-`keywordEcho` comes back in the receipt: compare it to what you asked for. The
-workflow cannot judge whether a value is the right one — it only reads it back
-for you.
-
-## Driving a control you cannot address yet
-
-A menu's options do not exist until you open it. Do not invent a canonical id or selector for an option you have not observed.
-A previously observed selector still needs evidence that it applies to the
-current rendered control. Read the newly exposed options when that evidence
-is missing.
-
-What *is* optional is paying a model turn for it. Put the observation inside the
-segment: **act, read, search the reading, act on what you found.**
-
-References resolve against `$last` — the immediately preceding step's result —
-plus `$cache`, `$store` and `$vars.NAME`. There is no `$steps[N]`, so a
-`transform` that searches a reading has to sit directly after it.
+This example assumes a settled page and a previously chosen target label. The
+pattern must match the observed role/name and artifact format for the task.
+Zero or multiple matches return evidence without clicking. Even a succeeded
+Workflow can take this no-action branch; inspect its store before claiming success.
 
 ```json
 [
-  {"action": "Input.click", "params": {"pageId": "$vars.pageId", "id": "«the control you already located»"},
-   "purpose": "Open the control", "onError": "stop"},
-  {"action": "DOM.getAXTree", "params": {"pageId": "$vars.pageId"},
-   "purpose": "Read what the click revealed", "onError": "stop"},
-  {"type": "transform", "input": "$last.lines", "output": "targetId",
-   "ops": [
-     {"op": "find", "mode": "regex", "pattern": "«a pattern that matches exactly one line»"},
-     {"op": "regex", "pattern": "\\[([0-9]+:[0-9]+:[0-9]+)\\]", "group": 1}
-   ]},
-  {"action": "Input.click", "params": {"pageId": "$vars.pageId", "id": "$vars.targetId"},
-   "purpose": "Act on the match", "onError": "stop"},
-  {"action": "DOM.getAXTree", "params": {"pageId": "$vars.pageId"},
-   "purpose": "Verify the control now reads as chosen", "onError": "stop"}
+  {"type":"action","action":"DOM.getAXTree","purpose":"Read current controls"},
+  {"type":"transform","input":"$cache.observation","ops":[{"op":"find","pattern":"button \"Continue\"","mode":"contains"}],"output":"matches"},
+  {"type":"if","condition":{"path":"$vars.matches.length","operator":"equals","value":1},
+   "then":[
+     {"type":"transform","input":"$vars.matches","ops":[{"op":"jsonpath","path":"0"},{"op":"regex","pattern":"\\[(n_[A-Za-z0-9_-]+)\\]","group":1}],"output":"targetId"},
+     {"type":"if","condition":{"path":"$vars.targetId","operator":"matches","value":"^n_[A-Za-z0-9_-]+$"},
+      "then":[{"type":"action","action":"Input.click","params":{"id":"$vars.targetId"},"purpose":"Activate the uniquely matched control"}],
+      "else":[{"type":"store","op":"set","path":"selection.status","value":"invalid-id"}]}
+   ],
+   "else":[{"type":"store","op":"set","path":"selection.matches","value":"$vars.matches"}]}
 ]
 ```
 
-This is framework-agnostic on purpose: the search runs over the tree you just
-captured and matches on what a person would read. It never touches a class name
-or a DOM path, so it behaves the same on any front end that renders its labels.
+## Event synchronization
 
-Repeat the middle three steps to walk a chain — a cascading picker, a date
-picker drilling year → month → day — all in one call.
+A terminal event can arrive during or after an Action. First readEvents for its
+Action window. Only waitEvent when no terminal event was found. Handle success,
+failure and timeout explicitly. A timeout is normal data with events: [] and
+timedOut: true; it does not prove readiness. Use the current schema's focus names;
+schema support does not guarantee an event will occur for this operation.
+Page.go can report navigationStarted=false with no load event. Follow the live
+Harness lifecycle policy, synchronize Page.getState and refresh AXTree before
+using new document ids. If the policy rejects an authored synchronization shape,
+inspect its receipt and return to Agent settlement rather than bypassing the gate.
 
-### Making the pattern match exactly one line
-
-A bare label is rarely unique in a page map. The same text appears on the
-control, on the control's own label, and in any heading that mentions it. Each
-AXTree line carries more than the name: a role, the full quoted accessible
-name, and a bracketed state. Use `mode: "regex"` and require all three.
-
-Read the role off the tree you are holding. Do not assume which role a control
-uses — a checkbox is not always a `checkbox`, and a chooser is not always a
-`combobox`. Look at how *this* page rendered it, then pin that.
-
-Anchoring the name with its quotes is what separates a control from a heading
-that merely mentions it.
-
-### Two ways this fails quietly
-
-`find` reports neither problem:
-
-- **No match** → it yields an empty string, which flows on until some later step
-  chokes on it. The failure then names that later step, not the bad pattern. The
-  receipt's `variablesAtFailure` is where you see which variable came back empty
-  — that is the one whose pattern was wrong.
-- **Several matches** → it takes the first one, silently. The segment reports
-  success having acted on the wrong element.
-
-So: **end every such segment with a read that shows the effect**, and check it
-in the receipt. A click on the wrong element and a click on the right one are
-indistinguishable until you look at the result.
-
-Do not wrap the acting step in an `if` that skips when the search came back
-empty. A skipped step makes the segment succeed having done nothing, which is
-worse than a failure — let the empty value fail the step, and read the receipt.
-Where you do need a guard, test the shape rather than presence:
-`{"path": "$vars.targetId", "operator": "matches", "value": "^[0-9]+:[0-9]+:[0-9]+$"}`.
-`exists` is no use here: an empty string exists.
-
-Anything you must not lose, `extract` into a variable or `store` it **before**
-the step that might fail. A failed segment hands back variables; it does not
-hand back the store.
-
-### Where this stops
-
-It works whenever the decision can be made from a page map. When the decision
-needs eyes — a canvas, an image, a layout question, anything you would want a
-screenshot for — the segment ends at the screenshot. Look, then submit the next
-segment. There is no way to bring a visual judgement inside a workflow.
-
-## Collecting rows
-
-`store` with `op: "append"` accumulates across loop iterations, and the whole
-store returns with the result.
+The following steps illustrate event-window handling after an Action. They are
+not a standalone navigation or readiness assertion:
 
 ```json
-{"type": "loop", "maxIterations": 20,
- "condition": {"path": "$vars.nextUrl", "operator": "exists"},
- "body": [
-   {"action": "DOM.getText", "params": {"pageId": "$vars.pageId", "selector": "$vars.rowSelector"},
-    "purpose": "Read the current row", "onError": "stop", "extract": {"rowText": "text"}},
-   {"type": "store", "op": "append", "path": "rows", "value": "$vars.rowText"}
- ]}
+[
+  {"type":"readEvents","focus":["Page.loaded","Page.loadFailed"],"extract":{"navigationEvents":"events"}},
+  {"type":"if","condition":{"path":"$vars.navigationEvents.0.event","operator":"notExists"},
+   "then":[{"type":"waitEvent","focus":["Page.loaded","Page.loadFailed"],"timeout":15000,"extract":{"navigationEvents":"events","navigationTimedOut":"timedOut"}}]},
+  {"type":"store","op":"set","path":"navigation.events","value":"$vars.navigationEvents"}
+]
 ```
 
-Persist what you accept with `record_extraction`; the workflow only fills
-variables and the store.
+## Failure and continuation
 
-## Events: two halves, and a trap
+Inspect failedStepPath, failedErrorCode, completedSteps, variablesAtFailure,
+storeAtFailure and executionTrace.pageEvents in the Harness failure receipt.
+Keep collected rows and resume only the remaining work. Do not mechanically
+slice at failedStepPath: branches and loops carry state. stepPath identifies a
+static DSL location; stepRunId distinguishes executions such as loop iterations.
 
-`waitEvent` starts looking **after** the preceding Action finishes — the engine
-moves its cursor past that Action's own event window. `readEvents` reads exactly
-that window, and returns immediately.
+Dispatch is not outcome proof. An Action may have taken effect even if a later
+step failed or a receipt is missing. Verify the affected resource before retrying
+and obey replayForbidden and task permissions. A failed segment does not undo
+prior actions. Choose a new bounded segment or single calls for diagnosis.
 
-Use the live Workflow schema and Harness lifecycle policy for the required
-settlement step after navigation. `waitEvent` observes the following window;
-`readEvents` inspects the preceding Action's window. Do not assume one historic
-load timing is guaranteed on every page. A timedOut result does not establish
-readiness: inspect the subsequent Page.getState before using targets. Page.go
-may report navigationStarted=false; that no-op does not promise a load event.
-Use readEvents for an already-finished Action window when appropriate to the
-known segment, or end the segment to decide from its receipt.
+Consume final execution results for full values. Workflow.progress and
+Workflow.getStatus expose summaries such as variableKeys and resultCount, not
+full variable values. Store is not shared between executions; carry required
+state explicitly into a continuation.
 
-**The trap**: a `waitEvent` timeout is not a failure. It returns
-`{"events": [], "timedOut": true}` and the segment continues. Waiting on an
-event the page never emits costs the entire timeout and yields nothing to act
-on. Only the names in the step schema's `focus` enum are accepted — that enum
-is the list of events this deployment was actually observed emitting.
+## Reuse
 
-## When a segment fails
-
-The receipt carries the state as of the failure, rebuilt from the platform's own
-progress stream:
-
-- `failedStepPath` — which step, e.g. `steps[4]` or `steps[2].then[1]`
-- `failedErrorCode` — e.g. `target-not-found`
-- `completedSteps` — every step that did succeed, with timings
-- `variablesAtFailure` — the variable VALUES at that moment
-- `executionTrace.pageEvents` — what the page did during the run
-
-What the receipt does **not** carry yet: the workflow `store`'s contents and the
-per-step `result` data. If a segment appended 7 rows and failed on the 8th, the
-receipt proves the store changed but cannot hand those 7 rows back. Until that
-gap closes, extract anything you must keep into workflow VARIABLES (which do
-come back) rather than relying on the store alone across a possible failure.
-
-Choose from what it says:
-
-| choice | when it applies | check first |
-| --- | --- | --- |
-| rerun the whole segment | read-only work whose starting point still holds | no state-changing operation would be repeated, and no replay prohibition applies |
-| rerun with remaining inputs | the segment is parameterized over rows/pages | which inputs are still outstanding |
-| continuation segment | you can express what is left as its own segment | the variables it needs are in `variablesAtFailure` |
-| drop back to single calls | the rest still needs exploring | keep the rows already collected |
-
-Two rules that outrank convenience:
-
-1. **Do not slice at `failedStepPath` mechanically.** A step inside a loop or a
-   branch carries iteration state, branch conditions and variable setup that a
-   bare tail would silently lose.
-2. **Dispatch is not outcome proof.** Anything already dispatched may have
-   taken effect. Check completed-step results and the affected page/resource;
-   a later failure does not undo an earlier action. Missing receipts prove
-   neither success nor non-execution. Never re-run an uncertain side effect
-   merely to "make sure", and obey replayForbidden. Workflow segmentation
-   cannot authorize an action prohibited by the worker's permission boundary.
-
-## Sizing
-
-Short segments cost one model turn to resume. A long segment on a page you have
-not verified costs a wrong path executed to completion. When unsure, cut it
-shorter — the receipt tells you what the page actually did, and the next segment
-starts from fact instead of assumption.
-
-## Reuse the saved definition
-
-After execute_browser_workflow returns workflowDefinition, reuse its exact
-returned definitionRef and definitionHash via execute_saved_browser_workflow.
-Patch only the actual change through operations; do not rewrite all steps just
-to resume reasoning. Definition identity is not execution identity: a saved
-workflow still requires checking which side effects have already occurred.
+Reuse returned workflowDefinition.definitionRef and definitionHash through
+execute_saved_browser_workflow, patching only the intended changes. Read the
+receipt's lastAttempt status, issues and errors before reuse: a definition is
+saved before execution and may never have passed validation or reached the
+platform. Correct invalid parameter paths; do not replay an unchanged invalid
+definition. A page_state_resync_required receipt requires Page.getState, not a
+new template. Carry lastAttempt with ref/hash when handing a definition to
+another worker. Definition identity does not authorize replay of already
+dispatched side effects.
+The Harness execution tool accepts its own wrapper; direct platform
+Workflow.execute uses workflow plus binding. Workshop export is a separate
+format with hostname availability; exclude execution ids, credentials, cookies
+and machine-specific paths from reusable Workshop documents.

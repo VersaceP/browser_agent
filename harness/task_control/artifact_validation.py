@@ -334,6 +334,36 @@ def validate_worker_artifacts(
             if not alt_failures:
                 selected, selected_failures, rows = item, alt_failures, alt_rows
                 break
+    submitted_path = str(extraction_attempt_artifacts[-1]) if extraction_attempt_artifacts else ""
+    selected_path = str(selected.get("path") or "") if selected else ""
+    candidate_selection: JsonDict = {
+        "selectedPath": selected_path or None,
+        "selectionPolicy": "first_row_valid_else_best_structure_rows_recency",
+        "selectionReason": (
+            "first_row_valid" if not selected_failures and selected else
+            "best_available_with_failures" if selected else "no_candidate"
+        ),
+    }
+    if submitted_path:
+        candidate_selection["submittedPath"] = submitted_path
+        candidate_selection["selectedIsSubmitted"] = selected_path == submitted_path
+        if selected_path != submitted_path:
+            submitted = next(
+                (item for item in [*loaded, *loaded_attempts, *loaded_prior]
+                 if str(item.get("path") or "") == submitted_path),
+                None,
+            )
+            if submitted is not None:
+                submitted_failures, _ = _evaluate_candidate(submitted)
+                candidate_selection["submittedRowValidation"] = {
+                    "status": "done" if not submitted_failures else "failed",
+                    "failures": submitted_failures,
+                }
+            else:
+                candidate_selection["submittedRowValidation"] = {
+                    "status": "unavailable",
+                    "reason": "submitted_candidate_not_loaded_or_name_mismatch",
+                }
     failures.extend(selected_failures)
     warnings = _empty_array_observations(rows, expected)
     # Word-list placeholder readings inform the Lead; they do not fail the
@@ -544,6 +574,11 @@ def validate_worker_artifacts(
         "failures": failures,
         "semanticObservations": semantic_observations,
     }
+    if submitted_path:
+        if cumulative:
+            candidate_selection["selectionReason"] = "cumulative_rows_validated"
+            candidate_selection["cumulativeSourcePaths"] = cumulative_sources
+        result["candidateSelection"] = candidate_selection
     # A failed full-contract validation may still contain independently valid
     # form-control receipts. Keep this separate from ``validExtractionArtifacts``:
     # it is a bounded-continuation aid, never an upstream validated artifact.

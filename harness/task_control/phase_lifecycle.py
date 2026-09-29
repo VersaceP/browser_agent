@@ -39,9 +39,6 @@ def _tc():
 
 
 CONTINUATION_PROTOCOL = "browser-continuation-v1"
-CONTINUATION_CONTROL_STATES = frozenset({
-    "received", "reserved", "dispatched", "rejected", "uncertain",
-})
 
 
 def continuation_receipt_id(
@@ -53,10 +50,11 @@ def continuation_receipt_id(
     worker_contract: Optional[JsonDict],
     execution_contract_hash: Optional[str] = None,
 ) -> str:
-    """Stable identity for one worker's continuation decision.
+    """Return the stable identity for one worker continuation receipt.
 
-    Worker ids restart at browser-001 on a resumed run, so runId is part of the
-    identity. The contract hash fences a decision from a later plan revision.
+    This is an evidence identity, not an automatic continuation control.  A
+    worker id can restart on a resumed run, so the task/run identity and the
+    compiled execution contract remain part of the receipt key.
     """
     payload = {
         "protocol": CONTINUATION_PROTOCOL,
@@ -73,146 +71,6 @@ def continuation_receipt_id(
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
-
-def phase_continuation_record(
-    logger: RunLogger, *, phase_id: str, receipt_id: str,
-) -> Optional[JsonDict]:
-    state = _tc().load_task_state(logger)
-    phase_state = _tc()._phase_state(state, phase_id)
-    controls = (
-        phase_state.get("continuation_controls")
-        if isinstance(phase_state, dict) else None
-    )
-    record = controls.get(receipt_id) if isinstance(controls, dict) else None
-    return copy.deepcopy(record) if isinstance(record, dict) else None
-
-
-def reserve_phase_continuation(
-    logger: RunLogger,
-    *,
-    phase_id: str,
-    receipt_id: str,
-    max_automatic_attempts: int,
-) -> JsonDict:
-    """Reserve one durable continuation budget unit, failing closed on replay."""
-    # The state writer uses an RLock, so this covers the preceding read and
-    # budget calculation as one same-process critical section as well as the
-    # nested atomic write. Cross-process crash windows still fail closed via
-    # reserved/uncertain and do not claim exactly-once dispatch.
-    with _tc()._TASK_STATE_WRITE_LOCK:
-        return _reserve_phase_continuation_locked(
-            logger,
-            phase_id=phase_id,
-            receipt_id=receipt_id,
-            max_automatic_attempts=max_automatic_attempts,
-        )
-
-
-def _reserve_phase_continuation_locked(
-    logger: RunLogger,
-    *,
-    phase_id: str,
-    receipt_id: str,
-    max_automatic_attempts: int,
-) -> JsonDict:
-    state = _tc().load_task_state(logger)
-    phase_state = _tc()._phase_state(state, phase_id)
-    if not isinstance(phase_state, dict):
-        return {"status": "missing", "reason": "phase_not_in_state"}
-    controls = phase_state.get("continuation_controls")
-    if not isinstance(controls, dict):
-        return {"status": "missing", "reason": "continuation_receipt_not_recorded"}
-    record = controls.get(receipt_id)
-    if not isinstance(record, dict):
-        return {"status": "missing", "reason": "continuation_receipt_not_recorded"}
-    prior_status = str(record.get("status") or "")
-    if prior_status != "received":
-        existing = copy.deepcopy(record)
-        existing["reservationAcquired"] = False
-        if prior_status == "reserved" and not existing.get("reason"):
-            existing["reason"] = "continuation_reservation_already_exists"
-        return existing
-    spent = sum(
-        1 for value in controls.values()
-        if isinstance(value, dict)
-        and str(value.get("status") or "") in {
-            "reserved", "dispatched", "uncertain",
-        }
-    )
-    if spent >= max(0, int(max_automatic_attempts or 0)):
-        record["status"] = "rejected"
-        record["reason"] = "automatic_continuation_budget_reached"
-        record["settledAt"] = _tc().utc_now_iso()
-        _tc().write_task_state(logger, state)
-        return copy.deepcopy(record)
-    record["status"] = "reserved"
-    record["automaticAttempt"] = spent + 1
-    record["reservedAt"] = _tc().utc_now_iso()
-    record["reservationId"] = hashlib.sha256(
-        f"{receipt_id}:{spent + 1}".encode("utf-8")
-    ).hexdigest()
-    _tc().write_task_state(logger, state)
-    acquired = copy.deepcopy(record)
-    acquired["reservationAcquired"] = True
-    return acquired
-
-
-def settle_phase_continuation(
-    logger: RunLogger,
-    *,
-    phase_id: str,
-    receipt_id: str,
-    status: str,
-    worker_id: str = "",
-    reason: str = "",
-) -> JsonDict:
-    """Commit a reservation outcome without treating absence as permission."""
-    normalized = str(status or "")
-    if normalized not in {"dispatched", "rejected", "uncertain"}:
-        return {"status": "invalid", "reason": "invalid_settlement_status"}
-    state = _tc().load_task_state(logger)
-    phase_state = _tc()._phase_state(state, phase_id)
-    controls = (
-        phase_state.get("continuation_controls")
-        if isinstance(phase_state, dict) else None
-    )
-    record = controls.get(receipt_id) if isinstance(controls, dict) else None
-    if not isinstance(record, dict):
-        return {"status": "missing", "reason": "continuation_receipt_not_recorded"}
-    if str(record.get("status") or "") not in {"reserved", normalized}:
-        return copy.deepcopy(record)
-    record["status"] = normalized
-    record["settledAt"] = _tc().utc_now_iso()
-    if worker_id:
-        record["dispatchedWorkerId"] = str(worker_id)
-    if reason:
-        record["reason"] = str(reason)[:500]
-    _tc().write_task_state(logger, state)
-    return copy.deepcopy(record)
-
-
-def record_phase_dispatch_input(
-    logger: RunLogger, *, phase_id: str, dispatch_input: JsonDict,
-) -> None:
-    """Keep the accepted dispatch template available after process restart."""
-    state = _tc().load_task_state(logger)
-    phase_state = _tc()._phase_state(state, phase_id)
-    if not isinstance(phase_state, dict):
-        return
-    # This is executable state, not a model-facing preview. Truncation changes
-    # contracts and breaks continuation identity after a process restart.
-    phase_state["continuation_dispatch_input"] = copy.deepcopy(dispatch_input)
-    _tc().write_task_state(logger, state)
-
-
-def phase_dispatch_input(logger: RunLogger, *, phase_id: str) -> JsonDict:
-    state = _tc().load_task_state(logger)
-    phase_state = _tc()._phase_state(state, phase_id)
-    value = (
-        phase_state.get("continuation_dispatch_input")
-        if isinstance(phase_state, dict) else None
-    )
-    return copy.deepcopy(value) if isinstance(value, dict) else {}
 
 def record_phase_execution_contract(
     logger: RunLogger, *, phase_id: Optional[str], worker_id: str,
@@ -231,7 +89,6 @@ def record_phase_execution_contract(
         "workerContract": copy.deepcopy(worker_contract),
         "phaseHash": _tc().contract_hash_for_phase(phase, {}),
         "contractHash": _tc().contract_hash_for_phase(phase, worker_contract),
-        "dispatchInput": copy.deepcopy(phase_state.get("continuation_dispatch_input") or {}),
     }
     _tc().write_task_state(logger, state)
 
@@ -298,50 +155,6 @@ RESUME_REACTIVATABLE_HITL_STATUSES = frozenset({
 })
 
 
-def reactivate_resumable_hitl_phases(
-    logger: RunLogger,
-    *,
-    plan: Optional[JsonDict],
-) -> List[str]:
-    """Reopen HITL-interrupted phases after an explicit keep-plan resume.
-
-    The previous attempt remains in the audit trail. Only execution state is
-    reset: the accepted phase id, evidence contract, dependencies and artifact
-    lineage are unchanged, so rebuilding the plan would add no authorization
-    or semantic review value.
-    """
-
-    if not isinstance(plan, dict):
-        return []
-    plan_ids = {
-        str(phase.get("id") or "")
-        for phase in plan.get("phases") or []
-        if isinstance(phase, dict) and str(phase.get("id") or "")
-    }
-    resumable_statuses = RESUME_REACTIVATABLE_HITL_STATUSES
-    state = _tc().load_task_state(logger)
-    phases = state.get("phases") if isinstance(state.get("phases"), dict) else {}
-    reactivated: List[str] = []
-    for phase_id in sorted(plan_ids):
-        phase_state = phases.get(phase_id)
-        if not isinstance(phase_state, dict):
-            continue
-        prior_status = str(phase_state.get("status") or "")
-        if prior_status not in resumable_statuses:
-            continue
-        phase_state["status"] = "pending"
-        phase_state["resume_reset_from"] = prior_status
-        reactivated.append(phase_id)
-    if not reactivated:
-        return []
-    state["current_phase"] = _tc()._first_active_phase_id(plan, phases)
-    _tc().write_task_state(logger, state)
-    logger.write("resume.hitl_phases_reactivated", {
-        "phaseIds": reactivated,
-        "reason": "explicit_keep_plan_resume",
-    })
-    return reactivated
-
 def mark_phase_result(
     logger: RunLogger,
     *,
@@ -401,22 +214,6 @@ def mark_phase_result(
         decision = trim_large_strings(copy.deepcopy(continuation), 4000)
         attempt["continuation"] = decision
         attempt["continuationReceiptId"] = receipt_id
-        controls = phase_state.setdefault("continuation_controls", {})
-        if isinstance(controls, dict):
-            controls.setdefault(receipt_id, {
-                "receiptId": receipt_id,
-                "protocol": CONTINUATION_PROTOCOL,
-                "status": "received",
-                "sourceWorkerId": str(worker_id),
-                "phaseId": str(phase_id),
-                "planVersion": state.get("plan_version"),
-                "contractHash": execution_hash or _tc().contract_hash_for_phase(
-                    phase, worker_contract if isinstance(worker_contract, dict) else {},
-                ),
-                "decision": decision,
-                "receivedAt": _tc().utc_now_iso(),
-            })
-
     if result_status in _tc().RECOVERABLE_ROUTING_PHASE_STATUSES:
         phase_state["status"] = result_status
         phase_state["last_failure"] = [{
@@ -1107,10 +904,8 @@ def prepare_resume_state(
     # A pure recovery resume (no new user instruction) means "continue this
     # task".  HITL terminal statuses are execution interrupts, not evidence
     # failures, so those phases are reopened here and the accepted plan stays
-    # spawnable without a replan.  When a new instruction IS present the
-    # resume-instruction gate owns that decision instead (resume_keep_plan
-    # reopens them explicitly), because the instruction may deliberately
-    # abandon the interrupted phases.
+    # spawnable without a replan. Resumption never changes the user's goal;
+    # a new task is required for a different objective.
     hitl_reactivated: List[str] = []
     if not str(instruction or "").strip():
         effective_ids = {
@@ -1296,10 +1091,10 @@ def _dependency_blocker(
             "type": "dependency_not_ready",
             "dependencyPhaseId": dep_id,
             "dependencyStatus": dep_status or "pending",
+            "dependencyLastAttemptStatus": str(((dep_state or {}).get("attempts") or [{}])[-1].get("status") or ""),
             "blocking": False,
             "message": (
-                f"Dependency phase {dep_id} is not validated yet; wait for it"
-                " before spawning this phase."
+                f"Dependency phase {dep_id} has no accepted validated result."
             ),
         }
     return None
@@ -1346,6 +1141,7 @@ def phase_start_rejection(
     *,
     phase_id: Optional[str],
     worker_contract: Optional[JsonDict] = None,
+    persist_dependency_failure: bool = True,
 ) -> Optional[JsonDict]:
     if not plan or not phase_id:
         return None
@@ -1378,9 +1174,8 @@ def phase_start_rejection(
             "tool_was_executed": False,
             "next_instruction": (
                 "Do not spawn this phase: it is in a terminal state. Redoing"
-                " its work takes a replacement plan — emit_task_plan with a new"
-                " phase id/objective AND a non-empty plan.replan_reason, which"
-                " is required because a plan is already accepted. Otherwise"
+                " its work requires a reviewed replacement assignment with a new"
+                " phase id/objective and explicit reason. Otherwise use"
                 " final_answer with the blocker."
             ),
         }
@@ -1420,7 +1215,7 @@ def phase_start_rejection(
         }
     blocker = _dependency_blocker(target_phase, phases, prior_ids)
     if blocker is not None:
-        if blocker.get("blocking"):
+        if blocker.get("blocking") and persist_dependency_failure:
             _mark_phase_blocked_by_dependency(phases, str(phase_id), blocker)
             state["current_phase"] = _tc()._first_active_phase_id(plan, phases)
             _tc().write_task_state(logger, state)
@@ -1436,18 +1231,23 @@ def phase_start_rejection(
         if blocker.get("blocking"):
             next_instruction = (
                 "Do not spawn this phase: its dependency ended in a terminal"
-                " failure and will not recover on its own. Emit a revised"
-                " task_plan that fixes or replaces the dependency phase —"
-                " a replan resets blocked_by_dependency and re-derives it"
-                " from the new plan — or final_answer with the blocker."
+                " failure. Review the failure evidence and revise the dependency"
+                " or provide an authorized replacement input. Report unresolved work accurately."
+            )
+        elif (blocker.get("dependencyStatus") != "running"
+              and blocker.get("dependencyLastAttemptStatus")):
+            next_instruction = (
+                "The dependency worker already returned. Inspect its artifacts and validation"
+                " findings; use revalidate_phase_artifacts with the current plan version if"
+                " the existing evidence satisfies its contract, or continue/revise that"
+                " assignment. Waiting alone cannot validate a returned partial result."
             )
         else:
             next_instruction = (
                 f"Dependency phase {blocker.get('dependencyPhaseId')} is"
                 f" {blocker.get('dependencyStatus') or 'pending'}, not failed."
-                " Do NOT replan and do not re-spawn in a loop: wait for it"
-                " (wait_browser_agents if it is running), then spawn this"
-                " phase once the dependency is validated_done."
+                " Run the accepted dependency if pending, or wait_browser_agents if running."
+                " Resume this assignment once the dependency is validated_done."
             )
         return {
             "status": (

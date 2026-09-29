@@ -1,7 +1,7 @@
 ---
 id: browser.collection-materialization
 audience: browser
-version: "2026-09-15"
+version: "2026-09-22"
 description: Collect repeated page records with bounded evidence cycles and distinguish an incomplete surface from a confirmed absence.
 sources:
   - harness/observation/content_completeness.py
@@ -16,8 +16,6 @@ related_tools:
   - visual_verify
 related_methods:
   - DOM.getAXTree
-  - DOM.getText
-  - DOM.getAttribute
   - Input.scroll
 error_codes:
   - route_recovery_required
@@ -64,6 +62,11 @@ its markers, counts, exhaustion receipts and attempted actions with other live
 evidence, then choose a falsifiable next experiment. Persist the relevant
 observation through record_extraction before handing it to Lead.
 
+When the output needs `href`, `src`, `id`, `aria-*`, `data-*`, or `value`, read
+the attribute from the same observed item or control as its visible label.
+Keep the source node and page URL in the extraction evidence. Do not infer an
+attribute or join a label to an unrelated row from visual position alone.
+
 ## Empty values and validation order
 
 record_extraction persists observed rows and returns validation feedback; do
@@ -96,3 +99,14 @@ route_recovery_required receipt. Screenshots, when available, answer a bounded
 visual question; they are neither mandatory for every empty value nor proof of
 absence by themselves. Never interpret an AX target-resolution failure as
 proof that the business content is absent.
+
+The harness raises route_recovery_required from heuristic absence only after
+the missing regions survive a full DOM.getAXTree view read after an
+Input.scroll, Page.wheel or click on that page, with the page at its bottom,
+or after a collect_items run; until then `decision` stays `inconclusive`. At
+the bottom means the main-document root line has no `down` in
+`scroll{can=...}`; a root without `scroll{}` fits in view. Content that loads
+on the way down puts `down` back, so keep scrolling. A bounded query, or a
+view read before the scroll, does not count, and inner scroll containers are
+not judged. Once such a read happens, materializationAttempts lists
+`axtree_at_page_bottom`.

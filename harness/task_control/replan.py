@@ -332,13 +332,6 @@ def record_replan_checkpoint(
             return None
     else:
         cohort_key = computed_cohort_key
-    if not str(phase.get("task_type") or "").strip():
-        logger.write("fast_path.replan_checkpoint_contract_degraded", {
-            "phaseId": phase_id,
-            "workerId": worker_id,
-            "reason": "task_type_missing_defaulted_to_web_scrape",
-            "cohortKey": cohort_key,
-        })
     progress = state.setdefault("batch_progress", {}).setdefault(
         cohort_key,
         {
@@ -472,11 +465,6 @@ def record_replan_checkpoint(
         "executionProfile": {
             "stageHint": str(
                 contract.get("stage_hint") or phase.get("stage_hint") or ""
-            ),
-            "strategyIds": sorted(
-                str(item)
-                for item in (contract.get("strategy_ids") or [])
-                if str(item).strip()
             ),
             "completedRole": role,
         },
@@ -887,8 +875,6 @@ def replan_checkpoint_plan_errors(
             expected_business if isinstance(expected_business, dict) else {}
         )
         if expected_business:
-            # phase.task_type is the sole policy authority. Never reconstruct a
-            # missing worker value from plan.task_type at this fence.
             actual_business = _tc()._canonical_fast_path_business_contract(
                 phase,
                 dict(contract),

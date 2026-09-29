@@ -24,7 +24,6 @@ related_methods:
   - Download.remove
   - DOM.getAXTree
 error_codes:
-  - page_changed_during_read
   - page_still_loading
   - page_state_resync_required
   - page_axtree_refresh_required
@@ -66,12 +65,22 @@ existing page identity and do not wait for a load that cannot arrive.
 
 Page.navigate, reload, a navigating Page.go, recovered feedback, Page.create,
 Page.switchTo, Page.close, Runtime.evaluate, HITL transitions and Input actions
-can invalidate epoch-bound AX/DOM ids and geometry. PageId itself remains the
+can make the held page view and geometry stale. Node ids die with their
+document: a navigation, reload, recovery or new page retires them, while an
+Input action on the same document leaves them resolvable. PageId itself remains the
 same through navigation and stops being usable only after close, authoritative
 replacement, or an authoritative inventory that no longer contains it.
 
-Call Page.list once only when a receipt says pageInventoryChanged or a
-navigation-like click did not visibly move the source page. Never re-click
+At task entry, honor pinned or explicitly delegated pages. Otherwise, unless
+the task explicitly requires a new page, call Page.list in assignedFleetId
+before creating one. Prefer a page matching the task's site and purpose only
+when claimable=true, busy=false and quarantined=false. Claim with Page.switchTo,
+then verify Page.getState and fresh DOM evidence; a matching URL does not prove
+login or task state. Create a page if no suitable candidate exists. Do not
+navigate an unrelated existing page or inherit another worker's observations.
+
+During execution, call Page.list once when a receipt says pageInventoryChanged
+or a navigation-like click did not visibly move the source page. Never re-click
 first. Claim the destination in the assigned Fleet, pass the prescribed
 navigation_context on its first Page.getState, and then refresh state/AX
 evidence. A click gate's short no-navigation observation is not proof of
@@ -84,13 +93,59 @@ from that current list when more than one is pending. Refresh state after
 handling one. Never retain `Page.handleDialog.userInput` in reasoning,
 artifacts, or output.
 
+## Human decisions when the task no longer determines the next action
+
+Preserve the original target identity, ranking/list evidence, source URL and
+actual destination before escalating. Once a settled destination is an advert or
+promotion instead of the requested detail, call Hitl.requestPause with that page
+and the evidence. Offer skipping this target or supplying a new task based on the
+landing page. Do not re-search, re-page, replace the target with the same rank in
+a new list, or keep retrying the advertising link. A tracking URL alone does not
+prove an advertising landing page; inspect the actual destination first.
+
+Use the same human-decision boundary when fresh evidence leaves a business choice
+that the task and prior authorization do not resolve:
+
+- Target validity changed: the original target no longer exists, is unavailable,
+  or has materially changed so the requested operation no longer applies. First
+  use stable identifiers and available evidence to recover the same target. If
+  continuation requires substitution or a changed goal, ask to skip, designate a
+  replacement, or revise the task; never silently substitute a different target.
+- Target identity is ambiguous: multiple candidates satisfy the description and
+  existing context cannot uniquely identify the intended one. First use stable
+  identifiers and available context to disambiguate. If different choices would
+  affect the result, present their distinguishing facts and ask which to use.
+- Material conditions changed: cost, scope, timing, access, obligations or other
+  conditions differ from the authorized task. Present the change and its effect
+  before taking an action that commits the user to it.
+- Existing user content conflicts with the requested write, or continuing would
+  overwrite/delete it without authorization: ask to retain, replace or revise.
+- A paywall, new terms, identity verification or missing user-only information
+  requires a decision or human interaction: explain the exact requirement.
+- A required deliverable is unavailable and only a materially different format,
+  scope or lower-quality substitute is possible: ask to accept that change or skip.
+- Submission outcome remains uncertain after read-only reconciliation and retry
+  could duplicate an external effect or persistent change: explain the evidence and ask for
+  a decision before replaying the effect.
+
+Use the existing HITL mechanism; keep the affected branch paused until an explicit
+resolution arrives. Record a skip as user-directed, not successful extraction or
+confirmed_absent. New requirements must be handed to the Lead to update the plan
+and contract before resuming. Existing task authorization resolves choices already
+made by the user; do not ask again. Stale DOM, schema errors, page-state sync and
+bounded recoverable navigation failures are technical recovery, not user decisions.
+READ and WRITE path authorization remain separate permissions.
+
 ## File choosers and downloads are not document loads
 
-After `Input.click`, `Input.press`, or `Page.click` activates an upload control,
-call `File.handleChooser` with a current target. Do not wait for a chooser event
-and do not repeat the activating action. If the target was stale, refresh page
-state and DOM targets, then make one chooser call with the fresh target. A
-directory chooser requires HITL.
+For a known file input, call `File.handleChooser` with its current target;
+there is no required preliminary click. If a wrapper must be activated to
+expose the input, use one `Input.click`, `Input.press`, or `Page.click` and follow
+its file-upload feedback without repeating that action. Do not wait for a
+chooser event. If the target was stale, refresh page state and DOM targets.
+File assignment does not confirm that the page accepted or uploaded the file;
+use the result-bearing page state and, when needed, a permitted
+`Network.readApi` read. A directory chooser requires HITL.
 
 `Download.remove` is record cleanup, not cancellation and not file deletion.
 Before removing a record, inspect current download evidence: only completed,
@@ -100,22 +155,15 @@ that terminal state first.
 ## Refresh identities when the next action uses them
 
 After navigation or recovery, first settle loading and synchronize Page.getState.
-Refresh DOM.getAXTree when deriving canonical AX ids or querying find_in_axtree.
-Selector-only reads, DOM.getText, DOM.getAttribute and root DOM.getSemanticTree
-can run on a settled page without a preceding AXTree. They do not make old AX
-ids current. Target identity, ownership and actual readiness checks still apply.
+Refresh DOM.getAXTree when deriving node ids or querying find_in_axtree.
+Selector-targeted actions and `DOM.getAXTree` queries by selector can run on a
+settled page without a preceding full read. They do not make old ids current. Target identity, ownership and actual readiness checks still apply.
 
 Workflow has the same distinction: navigation settlement followed by
-Page.getState is sufficient for a text/selector read or to end the segment.
-When later steps use AX ids, derive them from a current tree; a tree call does
-not make a hard-coded old id fresh. Workflow action execution and live handle
-resolution remain WebCross's responsibility.
-
-If the page's lifecycle generation moved while that tree was being read, the
-receipt comes back as `page_changed_during_read` with `stableEvidence: false`.
-The call did run, so do not replay it blindly; the tree simply describes a
-document you were not asking about. Re-observe the settled page instead of
-recording it.
+Page.getState is sufficient for a selector-targeted step or to end the segment.
+Workflow action execution and live handle resolution remain WebCross's responsibility.
+A workflow can read leased observation content with `$cache.observation` or `$last`
+and use `transform`; the artifact path field itself is metadata only.
 
 ## No dispatch, load failure and snapshot freshness
 

@@ -364,7 +364,7 @@ def render_hints_markdown(knowledge: Dict[str, Any], *, provenance: str = "") ->
     if perception.get("axtree_calls"):
         lines.append(
             f"- 感知: 成功运行拉了 {perception['axtree_calls']} 次 DOM.getAXTree"
-            "（发现期用；抽取期优先定向工具 DOM.getText/getAttribute）"
+            "（发现期读完整视图；抽取期优先 text/attributes 定向查询）"
         )
     baseline = knowledge.get("steps_baseline") or {}
     if baseline.get("tool_calls"):

@@ -17,7 +17,6 @@ from harness.context.offload import offload_large_tool_result
 from harness.context.offload import preserve_complete_tool_payload
 from harness.observation.browser_call import build_browser_call_runner
 from harness.tools.runtime_evaluation import RuntimeEvaluationService
-from harness.planning.task_types import resolve_task_type_fail_closed
 from harness.tools.tool_policy import redact_params_for_display
 from harness.tools.tool_policy import sensitive_browser_method_params
 from harness.tools.argument_pipeline import apply_required_schema_defaults
@@ -32,14 +31,14 @@ from harness.utils import JsonDict
 from harness.utils import optional_int
 from harness.workflow.workflow_runtime import workflow_execution_disabled_result
 from harness.workflow.workflow_runtime import workflow_execution_enabled
-from .axtree_state import _axtree_nodes_from_lines
+from .axtree_state import _current_axtree_lines, _current_axtree_nodes
 from .axtree_state import _browser_side_rematch_mode
 from .axtree_state import _check_stale_axtree_target
 from .axtree_state import _observe_axtree_state_after
 from .axtree_state import _precompute_axtree_snapshot
 from harness.workflow.workflow_policy import validate_workflow_params
 from harness.observation.exec_observer import ExecObserver
-from harness.workflow.workflow_projection import project_workflow_receipt
+from harness.workflow.workflow_projection import project_workflow_receipt, workflow_execution_facts
 
 def _bt():
     import harness.tools.browser_tools as bt
@@ -62,11 +61,34 @@ def _mark_axtree_parse_inconsistency(
 
     if method != "DOM.getAXTree" or not isinstance(snapshot, dict):
         return False
+    response = result.get("response")
+    data = response.get("data") if isinstance(response, dict) else None
+    observation_error = data.get("observationError") if isinstance(data, dict) else None
+    if isinstance(observation_error, dict):
+        # The platform published a view, but its artifact could not be read
+        # back and verified (expired, retired, or not what the reference
+        # promised). That is a missing observation, never an empty page.
+        result.update({
+            "status": "failed",
+            "error": (
+                "DOM.getAXTree artifact could not be read: "
+                f"{observation_error.get('code')}"
+            ),
+            "axtreeDataError": {
+                "code": "axtree_artifact_unreadable",
+                "artifactError": observation_error.get("code"),
+                "parsedNodeCount": 0,
+            },
+            "next_instruction": (
+                "The page view could not be read back from its artifact. Call"
+                " DOM.getAXTree again; do not use a prior AXTree id or infer"
+                " absence from this read."
+            ),
+        })
+        return True
     nodes = snapshot.get("nodes")
     if isinstance(nodes, list) and nodes:
         return False
-    response = result.get("response")
-    data = response.get("data") if isinstance(response, dict) else None
     node_count = optional_int(
         data.get("nodeCount") if isinstance(data, dict) else None,
         0,
@@ -200,21 +222,22 @@ async def _execute_browser_capability_tool(
         return result, False
 
     method_input_schema = capability_input_schema(agent.method_schemas, method)
-
-    params, shadow_dom_defaulted = _bt()._default_semantic_tree_shadow_dom(
-        method,
-        params,
-        getattr(agent, "method_schemas", {}),
+    from harness.tools.capability_repairs import prepare_capability_arguments
+    params, argument_repairs, repair_issues = prepare_capability_arguments(
+        method, params, method_input_schema,
     )
-    if shadow_dom_defaulted:
-        agent.logger.write(
-            "semantic_tree.shadow_dom_defaulted",
-            {
-                "method": method,
-                "pageId": str(params.get("pageId") or ""),
-                "includeShadowDom": True,
-            },
-        )
+    if repair_issues:
+        result = capability_argument_error(tool_name, method, repair_issues)
+        attach_method_schema(result, method, agent.method_schemas)
+        agent.logger.write("browser.call.schema_rejected", result)
+        agent.trace.append({"type": "browser_call_schema_rejected", "result": result})
+        return result, False
+    if argument_repairs:
+        # Paths only: never duplicate credentials or user text into audit logs.
+        agent.logger.write("browser.call.arguments_repaired", {
+            "method": method, "repairs": argument_repairs,
+        })
+
     params, image_output_receipt = _bt()._normalize_dom_get_img_output(
         agent, method, params,
     )
@@ -280,6 +303,18 @@ async def _execute_browser_capability_tool(
             params["returnByValue"] = True
 
     if method == "Workflow.execute":
+        if "workflow" in params:
+            wire_issues = validate_schema(params, method_input_schema)
+            if wire_issues:
+                return capability_argument_error(tool_name, method, wire_issues), False
+            document = params["workflow"]
+            params = {
+                "description": document.get("description") or document.get("name"),
+                "steps": document.get("steps"),
+                "variables": document.get("initialVariables", {}),
+                "timeout": document.get("timeoutMs", 600000),
+                **params.get("binding", {}),
+            }
         if not workflow_execution_enabled(agent):
             disabled = workflow_execution_disabled_result(
                 source="browser_call.Workflow.execute"
@@ -291,13 +326,9 @@ async def _execute_browser_capability_tool(
             })
             return disabled, False
         contract = getattr(agent, "worker_contract", None)
-        task_type = resolve_task_type_fail_closed(
-            contract.get("task_type") if isinstance(contract, dict) else None
-        )
         normalized_workflow, workflow_error = validate_workflow_params(
             params,
             capability_methods=getattr(agent, "capability_methods", set()),
-            task_type=task_type,
             allow_runtime=False,
             enforce_lifecycle=True,
         )
@@ -307,6 +338,20 @@ async def _execute_browser_capability_tool(
             agent.trace.append({"type": "workflow_policy_rejected", "result": workflow_error})
             return workflow_error, False
         params = dict(normalized_workflow)
+        from harness.tools.capability_repairs import prepare_workflow_literal_arguments
+        params, workflow_repairs, workflow_repair_issues = prepare_workflow_literal_arguments(
+            params, agent.method_schemas,
+        )
+        if workflow_repair_issues:
+            result = capability_argument_error(tool_name, method, workflow_repair_issues)
+            agent.logger.write("workflow.execute.rejected", result)
+            agent.trace.append({"type": "workflow_policy_rejected", "result": result})
+            return result, False
+        if workflow_repairs:
+            argument_repairs.extend(workflow_repairs)
+            agent.logger.write("browser.call.arguments_repaired", {
+                "method": method, "repairs": workflow_repairs,
+            })
 
     contract_result = _bt()._check_worker_contract(agent, method)
     if contract_result is not None:
@@ -379,19 +424,10 @@ async def _execute_browser_capability_tool(
         agent, method
     )
 
-    # Model path only. The internal composite path keeps the strict gate: it
-    # does not render the bypass or the post-call lifecycle state back to the
-    # model, so an exemption there would be silent.
-    lifecycle_guard = await _bt()._page_lifecycle_guard_before(
-        agent,
-        method,
-        params,
-        allow_target_independent_document_read=True,
-    )
-    # Issued by the guard at the moment it approved, so the token describes the
-    # state the decision was actually made on rather than one read beforehand.
-    ax_bypass_before = _bt()._take_pending_ax_bypass(agent)
+    lifecycle_guard = await _bt()._page_lifecycle_guard_before(agent, method, params)
     if lifecycle_guard is not None:
+        if method == "Workflow.execute":
+            lifecycle_guard["isError"] = True
         agent.logger.write("browser.call.lifecycle_gated", lifecycle_guard)
         agent.trace.append({
             "type": "page_lifecycle_gate",
@@ -462,7 +498,13 @@ async def _execute_browser_capability_tool(
             "browser.call.arguments_prepared",
             {"method": method, "defaultedFields": defaulted_fields},
         )
-    method_issues = validate_schema(params, method_input_schema)
+    # Policies and page guards consume the harness shape; the live schema
+    # describes the wire shape. Validate exactly what ABCPClient will send.
+    schema_params = params
+    if method == "Workflow.execute":
+        from harness.workflow.workflow_wire import to_platform_execute_params
+        schema_params = to_platform_execute_params(params)
+    method_issues = validate_schema(schema_params, method_input_schema)
     if method_issues:
         result = capability_argument_error(
             tool_name,
@@ -531,12 +573,11 @@ async def _execute_browser_capability_tool(
     page_create_should_stop = False
     hitl_pause_succeeded = False
     page_list_shown: Optional[List[JsonDict]] = None
-    # See the note on the same construct in _invoke_browser_method: a
-    # Workflow.execute answers once at the end and its failure envelope keeps
-    # almost nothing, so the Workflow.progress notification stream is the only
-    # record of what ran. This is the model-facing dispatch, which reaches the
-    # same platform call by a different route and therefore needs its own
-    # observer.
+    full_view_response: Optional[JsonDict] = None
+    workflow_failure_details: Optional[JsonDict] = None
+    # Progress events record execution timing; WebCross 0.9.3 failure details
+    # supply completed results and variable values. Both dispatch paths need
+    # an observer and must preserve those details.
     exec_observer = (
         ExecObserver(
             agent.browser, page_id=str(params.get("pageId") or "") or None
@@ -744,6 +785,8 @@ async def _execute_browser_capability_tool(
                     dict(row) for row in shown_sidecar if isinstance(row, dict)
                 ]
         axtree_snapshot = _precompute_axtree_snapshot(method, params, response)
+        full_view_response = _bt()._full_view_evidence(method, response)
+        response = _bt()._project_observation_for_model(agent, method, params, response, step)
         response = agent._offload_response(method, params, response, step)
         _bt()._annotate_axtree_offload(response, axtree_snapshot)
 
@@ -751,7 +794,14 @@ async def _execute_browser_capability_tool(
             method == "Hitl.requestPause" and _bt()._hitl_pause_succeeded(response)
         )
         if hitl_pause_succeeded:
-            response = await _bt()._enrich_pause_with_wait(agent, params, response, step)
+            response = await _bt()._enrich_pause_with_wait(
+                agent, params, response, step,
+                assistance_kind=(
+                    str(tool_input.get("hitl_assistance_kind") or "")
+                    if method == "Hitl.requestPause" and tool_name == "browser_call"
+                    else ""
+                ),
+            )
 
         result = {
             "method": method,
@@ -825,6 +875,10 @@ async def _execute_browser_capability_tool(
             **_bt()._transport_error_metadata(method, exc),
         }
         attach_method_schema(result, method, agent.method_schemas)
+        rpc_data = getattr(exc, "rpc_data", None)
+        if method == "Workflow.execute" and isinstance(rpc_data, dict):
+            details = rpc_data.get("details")
+            workflow_failure_details = details if isinstance(details, dict) else None
     finally:
         # The subscription has to be dropped on EVERY exit, not just the two
         # this function turns into a result. A connection-fatal transport error
@@ -840,6 +894,7 @@ async def _execute_browser_capability_tool(
         _attach_exec_trace(
             result, exec_observer.trace, agent, step,
             workflow_params=params if method == "Workflow.execute" else None,
+            failure_details=workflow_failure_details,
         )
         _project_workflow_result(result, agent, step)
 
@@ -924,6 +979,10 @@ async def _execute_browser_capability_tool(
         result,
         step,
         content_binding=raw_content_binding,
+        observed_result=(
+            {**result, "response": full_view_response}
+            if full_view_response is not None else None
+        ),
     )
     if navigation_context:
         source_page_id = str(navigation_context.get("sourcePageId") or "")
@@ -1028,7 +1087,10 @@ async def _execute_browser_capability_tool(
             ) or 24000
         ),
     )
+    if argument_repairs:
+        result["argumentRepairs"] = argument_repairs
     agent.logger.write("browser.call.result", agent._trim_for_log(result))
+    workflow_facts = workflow_execution_facts(result) if method == "Workflow.execute" else None
     model_result = agent._clean_for_model(result)
     model_result = offload_large_tool_result(
         logger=agent.logger,
@@ -1038,15 +1100,9 @@ async def _execute_browser_capability_tool(
         prefix=agent.runtime.agent_id,
         threshold_bytes=agent.runtime.harness.tool_result_offload_threshold_bytes,
     )
+    if workflow_facts is not None and isinstance(model_result, dict):
+        model_result["workflowExecution"] = workflow_facts
     model_result = _attach_complete_payload(model_result, complete_payload)
-    # After the offload, deliberately. DOM.getSemanticTree is in OFFLOAD_METHODS
-    # and is the heaviest read on the surface, so a document-root tree is
-    # essentially always replaced by a stub here - annotating the pre-offload
-    # response put the bypass receipt on an object the model never sees, which
-    # is the same silent exemption in a different place.
-    _bt()._annotate_target_independent_read(
-        agent, method, params, model_result, ax_bypass_before,
-    )
     _bt()._observe_progress_after(agent, method, model_result)
     agent.trace.append({
         "type": "browser_call",
@@ -1182,13 +1238,17 @@ def _attach_exec_trace(
     agent: Any = None,
     step: Any = None,
     workflow_params: Optional[JsonDict] = None,
+    failure_details: Any = None,
 ) -> None:
     """Put the reconstructed execution record on a Workflow.execute result.
 
     On success the platform's own envelope already carries results/variables, so
-    the trace adds the per-step timing and the page events around it. On failure
-    it is the entire record, which is why `failedStepPath` and the completed
-    steps are lifted to the top level where the caller already looks for them.
+    the trace adds the per-step timing and the page events around it. On
+    failure, WebCross 0.9.3 returns the whole workflow result in the error's
+    details (workflowId, variables, store, completed step results) while
+    Workflow.progress carries only variable NAMES; the details are lifted to
+    the top level where the caller already looks, the trace filling in only
+    what they lack.
     """
     if not isinstance(result, dict):
         return
@@ -1227,19 +1287,27 @@ def _attach_exec_trace(
             pass
     if not result.get("error"):
         return
+    details = failure_details if isinstance(failure_details, dict) else {}
     failure = trace.failure or {}
-    if trace.workflow_id:
-        result.setdefault("workflowId", trace.workflow_id)
-    step_path = failure.get("stepPath")
+    workflow_id = details.get("workflowId") or trace.workflow_id
+    if workflow_id:
+        result.setdefault("workflowId", workflow_id)
+    step_path = details.get("failedStepPath") or failure.get("stepPath")
     if step_path:
         result.setdefault("failedStepPath", step_path)
-    if failure.get("errorCode"):
-        result.setdefault("failedErrorCode", failure["errorCode"])
-    if trace.variables:
-        result.setdefault("variablesAtFailure", trace.variables)
-    completed = trace.completed_steps
+    error_code = failure.get("errorCode") or details.get("failedActionCode")
+    if error_code:
+        result.setdefault("failedErrorCode", error_code)
+    variables = details.get("variables") if isinstance(details.get("variables"), dict) else trace.variables
+    if variables:
+        result.setdefault("variablesAtFailure", variables)
+    if isinstance(details.get("store"), dict) and details["store"]:
+        result.setdefault("storeAtFailure", details["store"])
+    completed = details.get("results") if isinstance(details.get("results"), list) else trace.completed_steps
     if completed:
         result.setdefault("completedSteps", completed)
+    from harness.workflow.nested_failure import attach_nested_action_failure
+    attach_nested_action_failure(result, details, receipt)
 
 
 async def _invoke_browser_method(
@@ -1348,14 +1416,9 @@ async def _invoke_browser_method(
     if hitl_claim_guard is not None:
         return hitl_claim_guard
     hitl_pause_succeeded = False
-    # A Workflow.execute answers only once, when the run is over, and on
-    # failure that answer carries neither results nor variables. Its
-    # Workflow.progress events, however, arrive on the notification channel
-    # while the run is still going, demultiplexed off the background reader.
-    # That stream is the ONLY place the workflowId, the completed steps and the
-    # failure-time variable values exist when the call raises: the -32005 error
-    # carries just a step path, and getStatus (which needs a workflowId to begin
-    # with) returns variable NAMES and a result count.
+    workflow_failure_details: Optional[JsonDict] = None
+    # Progress events provide execution timing and a fallback trace. The
+    # WebCross 0.9.3 error details supply results and variable values on failure.
     # See docs/workflow-execute-live-contract.md.
     exec_observer = (
         ExecObserver(
@@ -1445,6 +1508,12 @@ async def _invoke_browser_method(
             **_bt()._transport_error_metadata(method, exc),
         }
         attach_method_schema(result, method, agent.method_schemas)
+        rpc_data = getattr(exc, "rpc_data", None)
+        if method == "Workflow.execute" and isinstance(rpc_data, dict):
+            # The public projection keeps scalars only; the workflow result
+            # a failure carries (variables, store, step results) is read here.
+            details = rpc_data.get("details")
+            workflow_failure_details = details if isinstance(details, dict) else None
     finally:
         # The subscription has to be dropped on EVERY exit, not just the two
         # this function turns into a result. A connection-fatal transport error
@@ -1460,6 +1529,7 @@ async def _invoke_browser_method(
         _attach_exec_trace(
             result, exec_observer.trace, agent, step,
             workflow_params=params if method == "Workflow.execute" else None,
+            failure_details=workflow_failure_details,
         )
         _project_workflow_result(result, agent, step)
 
@@ -1628,10 +1698,7 @@ def _find_in_axtree(agent: Any, tool_input: JsonDict) -> JsonDict:
             "next_instruction": "Call DOM.getAXTree to refresh the AXTree before searching it.",
         }
 
-    nodes = list(getattr(agent, "axtree_nodes", []) or [])
-    if not nodes:
-        lines = list(getattr(agent, "axtree_lines", []) or [])
-        nodes = _axtree_nodes_from_lines(lines)
+    nodes = _current_axtree_nodes(agent)
     if not nodes:
         return {
             "status": "needs_fresh_axtree",
@@ -1681,7 +1748,7 @@ def _find_in_axtree(agent: Any, tool_input: JsonDict) -> JsonDict:
             return bool(query_re.search(value))
         return needle in candidate
 
-    lines = list(getattr(agent, "axtree_lines", []) or [])
+    lines = _current_axtree_lines(agent)
     current_ids = set(getattr(agent, "axtree_ids", set()) or set())
     matches: List[JsonDict] = []
     for node in nodes:
@@ -1729,7 +1796,7 @@ def _find_in_axtree(agent: Any, tool_input: JsonDict) -> JsonDict:
         "count": len(matches),
         "matches": matches,
         "next_instruction": (
-            "Use a returned full id with DOM.getText/DOM.getAttribute/Input.*."
+            "Use a returned full id with Input.* or a bounded DOM.getAXTree query."
             if matches
             else "No matching node exists in the current AXTree snapshot; refresh or change query."
         ),

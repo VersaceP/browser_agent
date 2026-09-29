@@ -5,12 +5,14 @@ import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from harness.observation.axtree_format import (
-    AXTREE_FLAG_GROUP_RE,
+    AX_NODE_ID_ANYWHERE_RE,
+    AX_NODE_ID_RE,
+    AX_NODE_ID_TOKEN_RE,
     AXTREE_KNOWN_FLAGS,
     AXTREE_LAYOUT_FLAGS,
+    AXTREE_LINE_RE,
     AXTREE_RECT_RE,
     AXTREE_STATE_FLAGS,
-    AXTREE_Z_FLAG_RE,
     axtree_flags_and_rect,
     parse_axtree_line,
 )
@@ -26,23 +28,12 @@ def _response_data(result: JsonDict) -> JsonDict:
     return data if isinstance(data, dict) else {}
 
 
-AXTREE_ID_RE = re.compile(r"^\d+:-?\d+:-?\d+$")
-AXTREE_ID_TOKEN_RE = re.compile(r"\[(\d+:-?\d+:-?\d+)\]")
-AXTREE_ID_ANYWHERE_RE = re.compile(r"\b\d+:-?\d+:-?\d+\b")
-# Two live line formats: legacy indent-based (`  [30:553:553] link "TAAFT" #`)
-# and the current depth-prefixed one (`3 [3:426:426] link "TAAFT" # @10,0,106,94`)
-# where the leading integer is the node's depth in the ORIGINAL (unfiltered) AX
-# tree — folding noise nodes keeps original depth values, so gaps like 0→3 are
-# normal and consecutive depths are NOT contiguous.
-AXTREE_LINE_RE = re.compile(
-    r"^(?:(?P<depth>\d+)\s+)?(?P<indent>\s*)\[(?P<id>\d+:-?\d+:-?\d+)\]\s+"
-    r"(?P<role>[^\s\"]+)(?:\s+\"(?P<name>.*?)\")?(?P<rest>.*)$"
-)
-
-# The compact-line format itself lives in harness.observation.axtree_format so the AX cache
-# and the fleet auth verifier read it through one parser (px space of the rect
-# is a pending live probe; see abcp-panel-quirks #11). Re-exported here because
-# these names are part of this module's existing surface.
+# Node ids are opaque `n_<hex>` tokens from the page observation artifact
+# (harness.observation.axtree_format owns the grammar). Re-exported here under
+# this module's long-standing names.
+AXTREE_ID_RE = AX_NODE_ID_RE
+AXTREE_ID_TOKEN_RE = AX_NODE_ID_TOKEN_RE
+AXTREE_ID_ANYWHERE_RE = AX_NODE_ID_ANYWHERE_RE
 _axtree_flags_and_rect = axtree_flags_and_rect
 
 AXTREE_INVALIDATING_METHODS = {
@@ -262,6 +253,36 @@ def _axtree_lines_from_value(value: Any, *, limit: int = 10000) -> List[str]:
     return lines
 
 
+def _saved_page_view_path(result: Any) -> str:
+    """Where this response's full view was stored, when it was stored at all."""
+    blob = _response_data(result).get("lines")
+    if not isinstance(blob, dict):
+        return ""
+    return str(blob.get("savedPath") or "")
+
+
+def _current_axtree_lines(agent: Any) -> List[str]:
+    """The held page view, from memory or from the file it was written to."""
+    lines = list(getattr(agent, "axtree_lines", []) or [])
+    if lines:
+        return lines
+    path = str(getattr(agent, "axtree_saved_path", "") or "")
+    if not path:
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read().splitlines()
+    except OSError:
+        return []
+
+
+def _current_axtree_nodes(agent: Any) -> List[JsonDict]:
+    nodes = list(getattr(agent, "axtree_nodes", []) or [])
+    if nodes:
+        return nodes
+    return _axtree_nodes_from_lines(_current_axtree_lines(agent))
+
+
 def _axtree_nodes_from_lines(lines: List[str]) -> List[JsonDict]:
     nodes: List[JsonDict] = []
     for index, line in enumerate(lines, start=1):
@@ -368,6 +389,20 @@ def _check_stale_axtree_target(
         # _apply_recovered_target and by the caller's verifier.
         passthrough("axtree.stale_guard.rematch_passthrough")
         return None
+    elif (
+        current_ids
+        and invalidated
+        and unbacked_ids <= seen
+        and _browser_side_rematch_mode(agent) != "off"
+    ):
+        # The snapshot's CONTENT is stale after a page action, but node ids
+        # outlive content changes within their document: the platform resolves
+        # an id this document has shown, or reports it removed with a public
+        # stale-target code. The history holds only the current document, and a
+        # navigation is gated separately by the page lifecycle tracker.
+        # browser_side_rematch="off" keeps the old block-everything posture.
+        passthrough("axtree.stale_guard.same_document_passthrough")
+        return None
     elif not current_ids or invalidated:
         reason = "axtree_snapshot_invalidated" if invalidated else "no_current_axtree_snapshot"
         missing = missing_unbacked
@@ -389,9 +424,9 @@ def _check_stale_axtree_target(
     )
     if workflow_execution_enabled(agent):
         next_instruction += (
-            " When this action is one of several already decided, put the"
-            " fresh DOM.getAXTree read, a transform search of it, and those"
-            " actions in one execute_browser_workflow segment instead of"
+            " When this action is one of several already decided, read"
+            " DOM.getAXTree once, then put those actions - by the ids it"
+            " returns - in one execute_browser_workflow segment instead of"
             " spending a turn per call."
         )
     return {
@@ -533,6 +568,10 @@ def _observe_axtree_state_after(
     page_before: Optional[str] = None,
 ) -> None:
     _observe_page_url(agent, params, result)
+    if method == "DOM.getAXTree" and _response_data(result).get("mode") == "detail":
+        # A bounded query about known targets is a read, not a page view: it
+        # neither replaces the held snapshot nor makes it stale.
+        return
     if method == "DOM.getAXTree":
         data_error = result.get("axtreeDataError")
         if isinstance(data_error, dict):
@@ -566,9 +605,23 @@ def _observe_axtree_state_after(
             agent.axtree_ids = ids
             agent.axtree_page_id = page_id
             agent.axtree_invalidated = False
-            agent.axtree_lines = list(snapshot.get("lines") or _axtree_lines_from_value(result))
-            agent.axtree_nodes = list(snapshot.get("nodes") or _axtree_nodes_from_lines(agent.axtree_lines))
-            _record_axtree_history(agent, page_id, agent.axtree_nodes, ids)
+            lines = list(snapshot.get("lines") or _axtree_lines_from_value(result))
+            nodes = list(snapshot.get("nodes") or _axtree_nodes_from_lines(lines))
+            agent.axtree_saved_path = _saved_page_view_path(result)
+            # The view that went to disk is read back from there. Holding a
+            # second parsed copy per agent bought nothing once the file became
+            # one stable path per page.
+            keep_in_memory = not agent.axtree_saved_path
+            agent.axtree_lines = lines if keep_in_memory else []
+            agent.axtree_nodes = nodes if keep_in_memory else []
+            observation = _response_data(result).get("observation")
+            _record_axtree_history(
+                agent, page_id, nodes, ids,
+                document_epoch=(
+                    str(observation.get("documentEpoch") or "")
+                    if isinstance(observation, dict) else ""
+                ),
+            )
             logger = getattr(agent, "logger", None)
             if logger is not None:
                 logger.write(
@@ -650,14 +703,29 @@ def _record_axtree_history(
     page_id: str,
     nodes: Optional[List[JsonDict]],
     ids: Set[str],
+    *,
+    document_epoch: str = "",
 ) -> None:
     """Keep a bounded per-page history of recent snapshot ids with their
-    role/name signatures. The stale guard uses it to distinguish "id from a
-    recent snapshot of this page" (eligible for browser-side rematch) from
-    "id we never saw" (always blocked), and rematch validation uses the
-    signatures even after the live snapshot has been invalidated."""
+    role/name signatures, for the CURRENT document only.
+
+    Node ids are stable for the life of their document and die with it, so a
+    snapshot from a new document epoch starts the page's history afresh. The
+    stale guard uses it to tell "id this document has shown" (the platform
+    resolves it, or reports it removed) from "id we never saw" (always
+    blocked), and rematch validation uses the signatures even after the live
+    snapshot has been invalidated."""
     if not page_id:
         return
+    epochs_by_page = getattr(agent, "axtree_document_epochs", None)
+    if not isinstance(epochs_by_page, dict):
+        epochs_by_page = {}
+        agent.axtree_document_epochs = epochs_by_page
+    if document_epoch and epochs_by_page.get(page_id) != document_epoch:
+        history = getattr(agent, "axtree_seen_history", None)
+        if isinstance(history, dict):
+            history.pop(page_id, None)
+        epochs_by_page[page_id] = document_epoch
     signatures: Dict[str, JsonDict] = {}
     for node in nodes or []:
         node_id = str(node.get("id") or "")
@@ -922,10 +990,24 @@ def _validate_rematch(
     return True
 
 
+# Methods that can replace the page's document. Ids from before them are dead
+# even when no later snapshot has yet reported the new document epoch.
+_DOCUMENT_REPLACING_METHODS = frozenset({
+    "Page.create", "Page.navigate", "Page.reload", "Page.go",
+    "Page.recovered", "Page.close",
+})
+
+
 def _invalidate_axtree_snapshot(agent: Any, method: str, params: JsonDict) -> None:
     agent.axtree_invalidated = True
     agent.axtree_lines = []
     agent.axtree_nodes = []
+    agent.axtree_saved_path = ""
+    if method in _DOCUMENT_REPLACING_METHODS and isinstance(params, dict):
+        page_id = str(params.get("pageId") or "")
+        history = getattr(agent, "axtree_seen_history", None)
+        if page_id and isinstance(history, dict):
+            history.pop(page_id, None)
     logger = getattr(agent, "logger", None)
     if logger is not None:
         logger.write(

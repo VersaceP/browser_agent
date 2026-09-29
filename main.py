@@ -28,6 +28,7 @@ from agent_harness import (
 from harness.storage import create_storage_from_config
 from harness.storage.base import StorageError
 from harness.storage.factory import resolve_sqlite_path
+from harness.storage.virtual_fs import db_authoritative_for
 from harness.utils import JsonDict, RunLogger
 from harness.version import HARNESS_VERSION
 from harness.runtime.resume_state import (
@@ -50,12 +51,8 @@ from harness.task_control import (
     prepare_resume_state,
     write_task_state,
 )
-from harness.planning.task_classifier import (
-    classify_browser_task,
-    extract_fleet_reference,
-    synthesize_direct_input,
-)
-from harness.tools.lead_tools import LEAD_TOOLS, _run_direct_worker
+from harness.planning.fleet_reference import extract_fleet_reference
+from harness.tools.lead_tools import _lead_spawn_browser_agent, _lead_wait_browser_agents
 from harness.tools.registry import ToolContext
 from llm import (
     LLMConnectionError,
@@ -1565,114 +1562,54 @@ def read_task(args: argparse.Namespace) -> str:
         return line
 
 
-def _plan_phase_targets(phase: Dict[str, Any]) -> str:
-    contract = phase.get("worker_contract")
-    contract = contract if isinstance(contract, dict) else {}
-    source = contract.get("batch_source")
-    source = source if isinstance(source, dict) else {}
-    selector = source.get("selector") or source.get("cohort_selector")
-    selector = selector if isinstance(selector, dict) else {}
-    values = selector.get("values")
-    if isinstance(values, list) and values:
-        return ", ".join(str(value) for value in values)
-    indices = selector.get("indices")
-    if isinstance(indices, list) and indices and all(
-        isinstance(value, int) and not isinstance(value, bool) and value >= 0
-        for value in indices
-    ):
-        # Selectors are zero-based because they address an artifact array; the
-        # operator review is one-based because it describes the visible page
-        # allocation.  Rendering this explicitly prevents a [2,3] batch from
-        # looking like an unexplained one-row phase in the approval table.
-        return "输入行 " + "、".join(str(value + 1) for value in indices)
-    rows = contract.get("batch_rows")
-    if isinstance(rows, list) and rows:
-        labels = []
-        for index, row in enumerate(rows, 1):
-            if not isinstance(row, dict):
-                labels.append(str(index))
-                continue
-            label = next((
-                row.get(key) for key in
-                ("rank", "id", "name", "title", "url", "detailUrl")
-                if row.get(key) not in (None, "")
-            ), index)
-            labels.append(str(label))
-        return ", ".join(labels)
-    offset, limit = selector.get("offset"), selector.get("limit")
-    if isinstance(limit, int):
-        start = int(offset or 0) + 1
-        return f"输入行 {start}-{start + limit - 1}"
-    expected = phase.get("expected_artifact")
-    expected = expected if isinstance(expected, dict) else {}
-    count = expected.get("exact_rows")
-    return f"{count} 行" if isinstance(count, int) else str(
-        phase.get("objective") or "-"
-    )[:42]
 
 
-def _plan_phase_round(phase: Dict[str, Any], first_phase_id: str) -> str:
-    wave = phase.get("dispatch_wave")
-    if isinstance(wave, int) and not isinstance(wave, bool):
-        return f"第{wave}轮"
-    role = str(phase.get("execution_role") or "").strip()
-    phase_id = str(phase.get("id") or "")
-    dependencies = phase.get("depends_on")
-    dependencies = dependencies if isinstance(dependencies, list) else []
-    if role == "probe" or phase_id == first_phase_id:
-        return "第一轮"
-    if first_phase_id and first_phase_id in dependencies:
-        return "第二轮"
-    return "按依赖"
 
 
 def _print_task_plan_review(plan: Dict[str, Any], candidate_hash: str) -> None:
-    phases = [item for item in plan.get("phases", []) if isinstance(item, dict)]
-    first_phase_id = str(phases[0].get("id") or "") if phases else ""
-    print("\n[TaskPlan] 执行计划等待确认", flush=True)
-    print(f"目标: {plan.get('goal') or '-'}", flush=True)
-    print(f"候选版本: {candidate_hash[:12] or '-'}", flush=True)
-    source_plan = plan.get("_sourcePlan")
-    source_plan = source_plan if isinstance(source_plan, dict) else {}
-    shared_contracts = source_plan.get("output_contracts")
-    if isinstance(shared_contracts, dict) and shared_contracts:
-        print(
-            "共享输出合同: " + ", ".join(sorted(str(name) for name in shared_contracts)),
-            flush=True,
-        )
-    print(
-        f"{'轮次':<8} {'Phase':<22} {'页面/实体分配':<22} {'Fleet':<14} 执行方式",
-        flush=True,
-    )
-    for phase in phases:
-        phase_id = str(phase.get("id") or "-")
-        round_label = _plan_phase_round(phase, first_phase_id)
-        targets = _plan_phase_targets(phase)
-        fleet = "运行时 @Fleet（如有）"
-        expected = phase.get("expected_artifact")
-        expected = expected if isinstance(expected, dict) else {}
-        mode = (
-            "单 worker 完整采集并验证"
-            if expected.get("exact_rows") == 1
-            else "单 worker 组内串行"
-        )
-        print(
-            f"{round_label:<8} {phase_id[:20]:<22} {targets[:20]:<22} "
-            f"{fleet[:12]:<14} {mode}",
-            flush=True,
-        )
-    print(
-        "输入“确认”或“确定”开始执行；输入修改意见让 Lead 重做计划；"
-        "输入“详情”查看完整 JSON；输入“取消”停止。",
-        flush=True,
-    )
+    from harness.planning.context import approval_view
+    view = approval_view(plan)
+    print("\n[Assignment] 委派等待确认", flush=True)
+    print(f"候选版本: {candidate_hash[:12]}", flush=True)
+    print(json.dumps(view, ensure_ascii=False, indent=2), flush=True)
+    print("确认/确定执行；修改意见交给 Lead；详情查看完整记录；取消停止。", flush=True)
 
 
 async def _terminal_plan_approval(
     plan: Dict[str, Any], candidate_hash: str,
     *, runtime: Optional[RuntimeConfig] = None, logger: Any = None,
-) -> Dict[str, str]:
+) -> Dict[str, Any]:
     _print_task_plan_review(plan, candidate_hash)
+    input_records: List[Dict[str, Any]] = []
+
+    def record_input(answer: str, decision: str, error: str = "") -> Dict[str, Any]:
+        record = {
+            "inputId": uuid.uuid4().hex,
+            "candidateHash": candidate_hash,
+            "text": answer,
+            "decision": decision,
+            "error": error,
+            "receivedAt": datetime.now(timezone.utc).isoformat(),
+        }
+        input_records.append(record)
+        if logger is not None:
+            logger.write("task_plan.approval_input_received", record)
+        return record
+
+    def unresolved_feedback() -> str:
+        return "\n".join(
+            item["text"] for item in input_records
+            if item["decision"] in {"clarify", "revision"}
+        )
+
+    def unresolved_records() -> List[Dict[str, Any]]:
+        return [item for item in input_records
+                if item["decision"] in {"clarify", "revision"}]
+
+    def has_unclassified_feedback() -> bool:
+        return any(item.get("error") or item.get("errorCode")
+                   for item in unresolved_records())
+
     while True:
         answer = (await asyncio.to_thread(input, "计划审阅> ")).strip()
         normalized = answer.lower()
@@ -1681,24 +1618,57 @@ async def _terminal_plan_approval(
         # form feedback makes a user-approved candidate go back through the
         # Lead and be submitted a second time.
         if normalized in {"确认", "确定", "同意", "执行", "y", "yes"}:
-            return {"decision": "approved"}
+            record_input(answer, "approved")
+            feedback = unresolved_feedback()
+            if feedback and has_unclassified_feedback():
+                # An unclassified response may change the candidate. A
+                # classifier error cannot authorize discarding that input.
+                return {"decision": "revision", "feedback": feedback,
+                        "inputRecords": input_records}
+            return ({"decision": "approved", "inputRecords": input_records}
+                    if feedback else {"decision": "approved"})
         if normalized in {"取消", "停止", "n", "no", "cancel"}:
+            record_input(answer, "cancelled")
             return {"decision": "cancelled"}
         if normalized in {"详情", "detail", "details", "json"}:
+            record_input(answer, "details")
             print(json.dumps(plan, ensure_ascii=False, indent=2), flush=True)
             continue
         if answer:
+            prior_unresolved = bool(unresolved_records())
+            record = record_input(answer, "received")
             if runtime is None:
+                record["decision"] = "clarify"
+                record["error"] = "classifier_unavailable"
+                if logger is not None:
+                    logger.write("task_plan.approval_input_classified", record)
                 print("无法进行语义确认，请输入明确的确认、取消或详情命令。", flush=True)
                 continue
             from harness.planning.approval_intent import classify_approval_intent
-            outcome = await classify_approval_intent(answer, plan, candidate_hash, runtime, logger)
+            outcome = await classify_approval_intent(
+                answer, plan, candidate_hash, runtime, logger, prior_inputs=input_records[:-1],
+            )
+            record["decision"] = str(outcome.get("decision") or "clarify")
+            record["error"] = str(outcome.get("error") or "")
+            record["errorCode"] = str(outcome.get("errorCode") or "")
+            if logger is not None:
+                logger.write("task_plan.approval_input_classified", record)
             if outcome["decision"] == "details":
                 print(json.dumps(plan, ensure_ascii=False, indent=2), flush=True)
                 continue
             if outcome["decision"] == "clarify":
-                print("尚未确认计划：请明确确认、取消，或说明需要修改的内容。", flush=True)
-                continue
+                return {"decision": "revision", "feedback": unresolved_feedback(),
+                        "inputRecords": input_records}
+            if outcome["decision"] == "revision":
+                outcome["feedback"] = unresolved_feedback()
+                outcome["inputRecords"] = input_records
+            elif (outcome["decision"] == "approved" and unresolved_feedback()
+                  and has_unclassified_feedback()):
+                return {"decision": "revision",
+                        "feedback": unresolved_feedback(),
+                        "inputRecords": input_records}
+            elif outcome["decision"] == "approved" and prior_unresolved:
+                outcome["inputRecords"] = input_records
             return outcome
         print("空输入不会确认计划。请输入“确认”、修改意见、“详情”或“取消”。", flush=True)
 
@@ -1882,7 +1852,9 @@ def _open_task_storage(logger, runtime) -> None:
         raise
 
 
-def _close_task_storage(logger, *, status: str) -> List[str]:
+def _close_task_storage(
+    logger, *, status: str, error: Optional[JsonDict] = None,
+) -> List[str]:
     """Close the run row and, in dual mode, report whether the backends agree.
 
     Verification runs before the handles are released. Failures are returned
@@ -1896,7 +1868,7 @@ def _close_task_storage(logger, *, status: str) -> List[str]:
     errors: List[str] = []
     try:
         storage.finish_run(
-            task_id=logger.task_id, run_id=logger.run_id, status=status
+            task_id=logger.task_id, run_id=logger.run_id, status=status, error=error,
         )
         verify = getattr(storage, "verify", None)
         if callable(verify):
@@ -2328,6 +2300,116 @@ def _pending_human_interventions(
     return [found[phase_id] for phase_id in wanted if phase_id in found]
 
 
+def _operator_input_receipts(
+    run_jsonl: Path,
+    *,
+    storage: Any = None,
+    task_id: str = "",
+    max_inline: int = 32,
+) -> Dict[str, Any]:
+    """Project durable human text into resume context without inferring consent.
+
+    The full ordered record remains in the run log. The bounded prompt copy
+    lets Lead see recent answers, their request identity and classification;
+    older inputs remain available at the source path for a concrete question.
+    """
+    result: Dict[str, Any] = {
+        "source": str(run_jsonl), "total": 0, "recent": [], "truncated": False,
+    }
+    records: Dict[str, Dict[str, Any]] = {}
+
+    def events():
+        if storage is not None and task_id:
+            after_id = 0
+            while True:
+                page = storage.read_events(
+                    task_id=task_id, after_event_id=after_id, limit=1000,
+                )
+                if not page:
+                    return
+                for row in page:
+                    kind = row.get("event_type")
+                    if kind not in {
+                        "task_plan.approval_input_received",
+                        "task_plan.approval_input_classified",
+                        "hitl.feedback_received",
+                    }:
+                        continue
+                    payload = row.get("payload_json")
+                    resource_id = row.get("payload_resource_id")
+                    if payload is None and resource_id:
+                        from harness.storage.sqlite_store import build_resource_uri
+                        resource = storage.read_resource(
+                            current_task_id=task_id,
+                            resource_uri=build_resource_uri(task_id, str(resource_id)),
+                        )
+                        payload = (resource or {}).get("content_json")
+                    if isinstance(payload, str):
+                        try:
+                            payload = json.loads(payload)
+                        except json.JSONDecodeError:
+                            payload = None
+                    yield {
+                        "type": kind,
+                        "payload": payload,
+                        "ts": row.get("event_time"),
+                        "eventUid": row.get("event_uid"),
+                    }
+                after_id = int(page[-1]["event_id"])
+        elif run_jsonl.is_file():
+            with run_jsonl.open("r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    if ("task_plan.approval_input_" not in line
+                            and "hitl.feedback_received" not in line):
+                        continue
+                    try:
+                        yield json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+    try:
+        for event in events():
+            if not isinstance(event, dict):
+                continue
+            kind = str(event.get("type") or "")
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if kind == "task_plan.approval_input_received":
+                input_id = str(payload.get("inputId") or event.get("eventUid") or "")
+                records[input_id] = {
+                    "kind": "plan_approval", "inputId": input_id,
+                    "candidateHash": payload.get("candidateHash"),
+                    "text": payload.get("text"),
+                    "receivedAt": payload.get("receivedAt") or event.get("ts"),
+                    "decision": payload.get("decision"),
+                }
+            elif kind == "task_plan.approval_input_classified":
+                input_id = str(payload.get("inputId") or "")
+                if input_id in records:
+                    records[input_id].update({
+                        "decision": payload.get("decision"),
+                        "errorCode": payload.get("errorCode"),
+                    })
+            elif kind == "hitl.feedback_received":
+                input_id = str(payload.get("feedbackId") or event.get("eventUid") or "")
+                records[input_id] = {
+                    "kind": "hitl_feedback", "inputId": input_id,
+                    "pageId": payload.get("pageId"),
+                    "pauseId": payload.get("pauseId"),
+                    "assistanceKind": payload.get("assistanceKind"),
+                    "requestPurpose": payload.get("requestPurpose"),
+                    "text": payload.get("text"),
+                    "receivedAt": event.get("ts"),
+                }
+    except Exception as exc:
+        result["readError"] = type(exc).__name__
+    result["total"] = len(records)
+    result["recent"] = list(records.values())[-max_inline:]
+    result["truncated"] = len(records) > max_inline
+    return result
+
+
 def _resume_phase_summary(
     task_dir: Path,
     plan: Dict[str, Any],
@@ -2413,6 +2495,7 @@ _BROWSER_MODE_STATUS_LABELS = {
     "partial": "部分完成",
     "incomplete": "未完成",
     "failed": "失败",
+    "cancelled": "已取消",
 }
 
 
@@ -2455,13 +2538,23 @@ def _print_browser_mode_summary(result: JsonDict, task_dir: str) -> None:
                 print(f"产物: {path}", flush=True)
         else:
             print(answer, flush=True)
-    elif str(result.get("error") or "").strip():
-        # A pre-flight abort carries no answer at all. Its `error` is the only
-        # sentence that says what happened, and printing nothing left the
-        # reason readable only inside the machine receipt's JSON escapes.
-        print(f"原因: {str(result.get('error')).strip()}", flush=True)
+    error = result.get("error")
+    reason = error.get("message") if isinstance(error, dict) else error
+    reason = str(reason or result.get("reason") or "").strip()
+    if reason:
+        # A worker may return an answer alongside a failure. Show both instead
+        # of hiding the failure reason inside the following machine receipt.
+        print(f"原因: {reason}", flush=True)
         for item in result.get("errors") or []:
             print(f"  · {item}", flush=True)
+        review = result.get("review")
+        verdict = review.get("verdict") if isinstance(review, dict) else None
+        if isinstance(verdict, dict):
+            for finding in verdict.get("findings") or []:
+                if isinstance(finding, dict) and finding.get("blocking"):
+                    print(f"  · {finding.get('reason') or finding}", flush=True)
+        if isinstance(review, dict) and review.get("auditPath"):
+            print(f"审核记录: {review['auditPath']}", flush=True)
     if status in {"done", "completed", "validated_done"}:
         return
     # Resume reads task_plan.json. A run that died before a plan was accepted
@@ -2524,9 +2617,10 @@ async def _run_browser_mode(
     """Run the explicit browser entry without a Lead model turn.
 
     LeadAgent remains the shared execution host because the direct worker path
-    uses its coordinator, lifecycle, plan-review and persistence methods.  No
-    ``LeadAgent.run`` call is made here; the only model call is the bounded
-    classifier below, followed by the existing direct-plan handler.
+    uses its coordinator, lifecycle, assignment review and persistence methods.
+    Dispatch acknowledges startup; this entry must collect the worker's actual
+    result before the CLI can finish the run. It makes no Lead model turn and
+    never automatically dispatches a continuation.
     """
     if resume_context is not None:
         if str(resume_context.instruction or "").strip():
@@ -2539,31 +2633,30 @@ async def _run_browser_mode(
         phases = plan.get("phases") if isinstance(plan, dict) else None
         if (
             not isinstance(plan, dict)
-            or plan.get("execution_mode") != "direct_worker"
+            or plan.get("execution_mode") not in {"delegated", "direct_worker"}
             or not isinstance(phases, list)
             or len(phases) != 1
         ):
             return _browser_mode_failure(
                 harness,
                 code="browser_mode_resume_plan_unsupported",
-                error="browser mode resume requires one accepted direct_worker phase",
+                error="browser mode resume requires one accepted delegated phase",
             )
         harness.original_user_task = str(resume_context.original_user_task or task)
         harness.spawner.root_task = harness.original_user_task
         await harness._bootstrap_schema_cache()
-        result = await _run_direct_worker(
-            ToolContext(
-                agent=harness,
-                tool_call={"name": "resume_direct_worker", "id": "browser-resume"},
-                tool_input={},
-                step=0,
+        result = await _lead_spawn_browser_agent(ToolContext(
+            agent=harness,
+            tool_call={"name": "spawn_browser_agent", "id": "browser-resume"},
+            tool_input={"phase_id": str(phases[0].get("id") or "")},
+            step=0,
+        ))
+        if not isinstance(result, dict):
+            return _browser_mode_failure(
+                harness, code="browser_mode_resume_no_receipt",
+                error="direct resume returned no receipt",
             )
-        )
-        return result if isinstance(result, dict) else _browser_mode_failure(
-            harness,
-            code="browser_mode_resume_no_receipt",
-            error="direct resume returned no receipt",
-        )
+        return await _wait_for_browser_mode_result(harness, result)
 
     fleet_reference = str(
         getattr(harness, "task_fleet_reference", "") or ""
@@ -2580,163 +2673,133 @@ async def _run_browser_mode(
         # Keep direct programmatic callers on the same control-plane route.
         harness.task_fleet_reference = fleet_reference or ""
 
-    classification, classify_error = await classify_browser_task(
-        original_task, harness.runtime, harness.logger,
-    )
-    classifier_enabled = bool(
-        getattr(getattr(harness.runtime, "task_classifier", None), "enabled", False)
-    )
-    if classification is None and classifier_enabled:
-        # Browser mode has no Lead turn to recover a transient provider failure
-        # or a structurally invalid classifier answer. Give the same bounded
-        # classifier one fresh attempt before abandoning the run. This is kept
-        # outside classify_browser_task so the later plan-repair call still has
-        # exactly its existing one-call budget.
-        first_error = classify_error or "browser task classification failed"
-        harness.logger.write("direct_mode.classification_retry_started", {
-            "attempt": 2,
-            "reason": first_error,
-        })
-        classification, retry_error = await classify_browser_task(
-            original_task,
-            harness.runtime,
-            harness.logger,
-            repair_feedback=(
-                "The previous classification failed before a plan could be "
-                f"synthesized: {first_error}"
-            ),
-        )
-        if classification is not None:
-            harness.logger.write("direct_mode.classification_retry_recovered", {
-                "attempt": 2,
-                "firstError": first_error,
-            })
-            classify_error = None
-        else:
-            second_error = retry_error or "browser task classification failed"
-            harness.logger.write("direct_mode.classification_retry_abandoned", {
-                "attempt": 2,
-                "firstError": first_error,
-                "secondError": second_error,
-            })
-            classify_error = (
-                f"classification failed twice; first: {first_error}; "
-                f"second: {second_error}"
-            )
-    if classification is None:
-        return _browser_mode_failure(
-            harness,
-            code="browser_mode_classification_failed",
-            error=classify_error or "browser task classification failed",
-        )
-
-    def _synthesize(result: JsonDict) -> JsonDict:
-        return synthesize_direct_input(original_task, result)
-
-    plan_input = _synthesize(classification)
-    harness.logger.write("direct_mode.plan_synthesized", {
-        "taskType": classification.get("task_type"),
-        "stageHint": classification.get("stage_hint"),
-        "itemCount": len(classification.get("literal_items") or []),
+    harness.logger.write("direct_mode.assignment_started", {
         "fleetReferenceSource": "task_text" if fleet_reference else None,
     })
     harness.original_user_task = str(original_task or task)
     harness.spawner.root_task = harness.original_user_task
     await harness._bootstrap_schema_cache()
-    if LEAD_TOOLS.get("emit_direct_task_plan") is None:
+    result = await _submit_direct_plan(harness, original_task)
+    return await _wait_for_browser_mode_result(harness, result)
+
+
+async def _wait_for_browser_mode_result(
+    harness: LeadAgent, spawned: JsonDict,
+) -> JsonDict:
+    """Collect exactly the dispatched worker, preserving its evidence and status.
+
+    The spawn tool stays asynchronous for Lead orchestration. Waiting here has
+    no polling or replay policy; cancellation is handled by the CLI owner while
+    storage is still open.
+    """
+    if spawned.get("status") != "running":
+        return spawned
+    worker_id = spawned.get("workerId")
+    if not isinstance(worker_id, str) or not worker_id.strip():
         return _browser_mode_failure(
-            harness,
-            code="browser_mode_direct_tool_missing",
-            error="emit_direct_task_plan is unavailable",
+            harness, code="browser_mode_worker_receipt_invalid",
+            error="Worker startup returned running without a workerId.",
+            tool_was_executed=True,
         )
-    result = await _submit_direct_plan(harness, plan_input, attempt=1)
-    errors = _direct_plan_rejection_reasons(result)
-    if errors:
-        # One bounded repair round. Both plan gates publish repair guidance that
-        # only a model can act on, and browser mode has no Lead turn to act on
-        # it, so a single refusal ended the whole run before it touched the
-        # browser — run c7c931b7 on a missing contract field, run 8615032d on an
-        # auditor verdict. The classifier that produced the contract is the
-        # actor that can fix it; it gets the gate's own words and one more call.
-        harness.logger.write("direct_mode.plan_repair_started", {
-            "errorCount": len(errors),
-            "errors": errors,
-        })
-        repaired, repair_error = await classify_browser_task(
-            original_task, harness.runtime, harness.logger,
-            repair_feedback="\n".join(f"- {item}" for item in errors),
+    waited = await _lead_wait_browser_agents(ToolContext(
+        agent=harness,
+        tool_call={"name": "wait_browser_agents", "id": "browser-wait"},
+        tool_input={"worker_ids": [worker_id], "mode": "all"},
+        step=0,
+    ))
+    completed = waited.get("completed") if isinstance(waited, dict) else None
+    matches = [item for item in (completed if isinstance(completed, list) else [])
+               if isinstance(item, dict) and item.get("workerId") == worker_id]
+    phase_id = spawned.get("phaseId")
+    if (len(matches) != 1
+            or worker_id in (waited.get("pending") or [])
+            or not matches[0].get("status")
+            or matches[0]["status"] == "running"
+            or (phase_id and matches[0].get("phaseId") != phase_id)):
+        return _browser_mode_failure(
+            harness, code="browser_mode_worker_receipt_invalid",
+            error=f"Wait returned no consistent terminal receipt for {worker_id}.",
+            tool_was_executed=True,
         )
-        if repaired is None:
-            harness.logger.write("direct_mode.plan_repair_abandoned", {
-                "reason": repair_error or "reclassification failed",
-            })
-            return result
-        plan_input = _synthesize(repaired)
-        harness.logger.write("direct_mode.plan_resynthesized", {
-            "taskType": repaired.get("task_type"),
-            "stageHint": repaired.get("stage_hint"),
-            "itemCount": len(repaired.get("literal_items") or []),
-            "fleetReferenceSource": "task_text" if fleet_reference else None,
-        })
-        result = await _submit_direct_plan(harness, plan_input, attempt=2)
+    result = dict(matches[0])
+    worker_status = result["status"]
+    # Preserve the former direct entry's contract requirement without treating
+    # contract validation alone as proof of goal completion.
+    if worker_status == "done" and result.get("validatedStatus") != "validated_done":
+        result["status"] = "incomplete"
+        result["reason"] = (
+            "Worker reported done, but the assignment contract was not validated "
+            f"(validatedStatus={result.get('validatedStatus') or 'missing'})."
+        )
+    result["directExecution"] = {
+        "mode": "browser", "workerId": worker_id,
+        "phaseId": phase_id, "workerStatus": worker_status,
+    }
+    for key in ("assignmentId", "assignmentAccepted", "assignmentReview", "budget"):
+        if key in spawned:
+            result[key] = spawned[key]
+    for key in ("connectionRecovery", "operatorInputRecords", "scheduleSnapshot"):
+        if key in waited:
+            result[key] = waited[key]
     return result
 
 
-def _direct_plan_rejection_reasons(result: Any) -> List[str]:
-    """Actionable reasons a submitted direct plan was refused, if it was.
-
-    Two gates can refuse it and both publish repair guidance meant for a model:
-    the mechanical validator lists schema errors, and the independent
-    PlanValidator returns a summary plus blocking semantic findings. Only the
-    first was read back at first, so run 8615032d cleared mechanical validation
-    and then died on an auditor verdict nobody fed to anyone.
-    """
-    if not isinstance(result, dict):
-        return []
-    if str(result.get("errorCode") or "") == "task_plan_schema_invalid":
-        return [
-            str(item) for item in (result.get("errors") or [])
-            if str(item).strip()
-        ]
-    review = result.get("planValidator")
-    if not isinstance(review, dict) or review.get("status") != "rejected":
-        return []
-    verdict = review.get("verdict")
-    verdict = verdict if isinstance(verdict, dict) else {}
-    reasons = [str(verdict.get("summary") or "").strip()]
-    for finding in verdict.get("semanticFindings") or []:
-        if isinstance(finding, dict) and finding.get("blocking"):
-            reasons.append(str(finding.get("reason") or "").strip())
-    return [reason for reason in reasons if reason]
+def _browser_mode_terminal_error(result: JsonDict) -> Optional[JsonDict]:
+    """A durable reason for a non-success receipt, without inventing a cause."""
+    status = str(result.get("status") or "unknown")
+    if status in {"done", "completed", "validated_done"}:
+        return None
+    error = result.get("error")
+    detail = error.get("message") if isinstance(error, dict) else error
+    failure = {
+        "code": result.get("code") or "browser_mode_not_completed",
+        "message": str(detail or result.get("reason")
+                       or f"Browser execution ended with status={status}.")[:2000],
+        "status": status,
+        "workerId": result.get("workerId"),
+        "validatedStatus": result.get("validatedStatus"),
+    }
+    review = result.get("review")
+    if isinstance(review, dict):
+        failure["review"] = {
+            key: review[key] for key in ("status", "auditPath", "errors", "verdict")
+            if key in review
+        }
+    if isinstance(result.get("errors"), list):
+        failure["errors"] = result["errors"]
+    return failure
 
 
-async def _submit_direct_plan(
-    harness: LeadAgent, plan_input: JsonDict, *, attempt: int,
-) -> JsonDict:
-    action = LEAD_TOOLS.get("emit_direct_task_plan")
-    if action is None:
-        return _browser_mode_failure(
-            harness,
-            code="browser_mode_direct_tool_missing",
-            error="emit_direct_task_plan is unavailable",
-        )
-    result = await action.handler(
-        ToolContext(
-            agent=harness,
-            tool_call={
-                "name": "emit_direct_task_plan",
-                "id": f"browser-direct-{attempt}",
-            },
-            tool_input=plan_input,
-            step=0,
-        )
-    )
+async def _shutdown_browser_mode(harness: LeadAgent) -> bool:
+    """Drain cancellation records before storage closes, even on another cancel."""
+    shutdown = asyncio.create_task(harness.spawner.shutdown())
+    cancelled = False
+    while True:
+        try:
+            await asyncio.shield(shutdown)
+            return cancelled
+        except asyncio.CancelledError:
+            if shutdown.done():
+                # An internal shutdown cancellation is a cleanup failure, not
+                # permission to quietly close storage with unfinished workers.
+                shutdown.result()
+                return True
+            cancelled = True
+
+
+async def _submit_direct_plan(harness: LeadAgent, original_task: str) -> JsonDict:
+    assignment = {"task": str(original_task or "").strip()}
+    result = await _lead_spawn_browser_agent(ToolContext(
+        agent=harness,
+        tool_call={"name": "spawn_browser_agent", "id": "browser-assignment"},
+        tool_input={"assignment": assignment},
+        step=0,
+    ))
     return result if isinstance(result, dict) else _browser_mode_failure(
         harness,
         code="browser_mode_direct_pipeline_no_receipt",
         error="browser mode direct pipeline returned no receipt",
     )
-
 
 async def _run_cli_impl(args: argparse.Namespace) -> int:
     global _CANCELLED_LOGGED, _LAST_LOGGER
@@ -2801,11 +2864,13 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
         _hint_matching_skills(task)
 
     logger: Optional[RunLogger] = None
+    harness: Optional[LeadAgent] = None
     run_lock: Optional[RunLock] = None
     resume_context: Optional[ResumeContext] = None
     task_for_agent = task
     run_started = False
     run_status = "interrupted"
+    run_error: Optional[JsonDict] = None
     answer = ""
     exit_code = 0
     cleanup_errors: List[str] = []
@@ -2923,6 +2988,13 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                             for item in report.get("hitlReactivatedPhases") or []
                             if str(item)
                         ],
+                    )
+                )
+                prompt_report["operatorInputReceipts"] = (
+                    _operator_input_receipts(
+                        task_dir / "run.jsonl",
+                        storage=logger.storage if db_authoritative_for(logger) else None,
+                        task_id=logger.task_id,
                     )
                 )
                 prompt_report["browserRecovery"] = {
@@ -3164,22 +3236,35 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
             )
             answer = json.dumps(browser_result, ensure_ascii=False, default=str)
             result_status = str(browser_result.get("status") or "failed").lower()
+            run_error = _browser_mode_terminal_error(browser_result)
             run_status = (
                 "completed"
                 if result_status in {"done", "completed", "validated_done"}
+                else "cancelled" if result_status == "cancelled"
                 else "failed"
             )
-            if run_status != "completed":
+            if run_status == "cancelled":
+                exit_code = CLI_CANCELLED_EXIT_CODE
+            elif run_status != "completed":
                 exit_code = CLI_ERROR_EXIT_CODE
+            logger.write("direct_mode.final", {
+                "status": result_status,
+                "workerId": browser_result.get("workerId"),
+                "phaseId": browser_result.get("phaseId"),
+                "directExecution": browser_result.get("directExecution"),
+                "validatedStatus": browser_result.get("validatedStatus"),
+                "error": run_error,
+            })
         else:
             answer = await harness.run(task_for_agent)
         terminal_error = getattr(harness, "terminal_error", None)
         if agent_mode == "browser":
-            # The direct finalizer owns the browser-mode receipt and status;
+            # The browser entry owns the worker receipt and status;
             # LeadAgent.final_status is intentionally untouched because no
             # LeadAgent.run() turn was made.
             pass
         elif isinstance(terminal_error, dict):
+            run_error = terminal_error
             run_status = "failed"
             exit_code = LLM_TEMPORARY_FAILURE_EXIT_CODE
             _safe_logger_write(logger, "run.rate_limited", terminal_error)
@@ -3209,6 +3294,7 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                     details={"trigger": lead_trigger},
                 )
                 failure["answer"] = answer
+                run_error = failure["error"]
                 answer = json.dumps(failure, ensure_ascii=False)
                 _safe_logger_write(
                     logger,
@@ -3228,14 +3314,16 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
             _cancelled_cli_result(str(exc) or "Task execution was cancelled."),
             ensure_ascii=False,
         )
+        run_error = json.loads(answer)["error"]
         _safe_logger_write(
             logger,
             "run.cancelled",
-            exception_payload(exc, mode="lead", task=task_for_agent),
+            exception_payload(exc, mode=agent_mode, task=task_for_agent),
         )
     except Exception as exc:
         run_status = "failed"
         failure, exit_code = _classify_cli_exception(exc, phase="run")
+        run_error = failure.get("error") or failure
         answer = json.dumps(failure, ensure_ascii=False, default=str)
         event_type = (
             "run.rate_limited"
@@ -3246,11 +3334,25 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
             logger,
             event_type,
             {
-                **exception_payload(exc, mode="lead", task=task_for_agent),
+                **exception_payload(exc, mode=agent_mode, task=task_for_agent),
                 "terminal": failure.get("error"),
             },
         )
     finally:
+        # LeadAgent.run owns its spawner cleanup. Browser mode skips that method,
+        # so the CLI must explicitly join workers before closing the audit store.
+        if agent_mode == "browser" and harness is not None:
+            try:
+                cancelled = await _shutdown_browser_mode(harness)
+                if cancelled and exit_code == 0:
+                    run_status = "cancelled"
+                    exit_code = CLI_CANCELLED_EXIT_CODE
+                    failure = _cancelled_cli_result("Cancelled during browser cleanup.")
+                    run_error = failure["error"]
+                    answer = json.dumps(failure, ensure_ascii=False)
+                    _safe_logger_write(logger, "run.cancelled", run_error)
+            except (Exception, asyncio.CancelledError) as exc:
+                cleanup_errors.append(f"browser shutdown failed: {type(exc).__name__}: {exc}")
         if logger is not None and run_started:
             try:
                 logger.write_usage_summary()
@@ -3258,10 +3360,18 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                 cleanup_errors.append(
                     f"usage summary failed: {type(exc).__name__}: {exc}"
                 )
-            if cleanup_errors and exit_code == 0:
-                run_status = "failed"
+            if cleanup_errors:
+                _safe_logger_write(logger, "run.cleanup_failed", {"errors": cleanup_errors})
+                if exit_code == 0:
+                    run_status = "failed"
+                    exit_code = CLI_IO_FAILURE_EXIT_CODE
+                if run_error is None:
+                    run_error = {"code": "cleanup_error", "message": "; ".join(cleanup_errors)}
+            _safe_logger_write(logger, "run.finished", {
+                "status": run_status, "exitCode": exit_code, "error": run_error,
+            })
             cleanup_errors.extend(
-                _close_task_storage(logger, status=run_status)
+                _close_task_storage(logger, status=run_status, error=run_error)
             )
         if run_lock is not None:
             try:
@@ -3275,11 +3385,6 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                     cleanup_errors.append("run lock release failed")
 
     if cleanup_errors:
-        _safe_logger_write(
-            logger,
-            "run.cleanup_failed",
-            {"errors": cleanup_errors},
-        )
         if exit_code == 0:
             exit_code = CLI_IO_FAILURE_EXIT_CODE
         _print_json_result(

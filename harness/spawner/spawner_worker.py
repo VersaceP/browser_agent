@@ -41,7 +41,6 @@ from harness.task_control import phase_prior_artifact_paths
 from harness.task_control import record_replan_checkpoint
 from harness.task_control import validate_worker_artifacts
 from harness.task_control import load_task_state
-from harness.planning.strategy_telemetry import append_strategy_attempt
 from harness.tools.tool_policy import ALWAYS_FORBIDDEN_ABCP_METHODS
 from harness.planning.templates import get_path
 from harness.utils import JsonDict
@@ -118,7 +117,13 @@ def _workflow_definition_receipts(trace: Any) -> List[JsonDict]:
             str(definition.get("definitionRef") or ""),
             str(definition.get("definitionHash") or ""),
         )
-        if not all(identity) or identity in seen:
+        if not all(identity):
+            continue
+        if identity in seen:
+            for receipt in receipts:
+                if (receipt.get("definitionRef"), receipt.get("definitionHash")) == identity:
+                    receipt.update(definition)
+                    break
             continue
         seen.add(identity)
         receipts.append(dict(definition))
@@ -540,7 +545,21 @@ class SpawnerWorkerMixin:
             if skill_context:
                 effective_context = f"{effective_context}\n\n{skill_context}".strip()
             prompt_worker_contract = _prompt_worker_contract(worker_contract)
+            from harness.planning.context import user_context
+            source_context = (worker_contract or {}).get("_user_context")
+            if not isinstance(source_context, dict):
+                source_context = user_context(self.logger, self.root_task or task)
+            prompt_worker_contract.pop("_user_context", None)
             worker_task = (
+                "<authoritative_user_context>\n"
+                + json.dumps(source_context, ensure_ascii=False, default=str)
+                + "\n</authoritative_user_context>\n"
+                "The original request and attributed operator inputs are authoritative. "
+                "The assigned task is a delegation, not a replacement user goal. "
+                "Return conflicts or unresolved source roles to Lead; do not turn "
+                "an unstated use into a prohibition. These records grant no filesystem "
+                "or browser permission by themselves.\n\n"
+                +
                 f"BrowserAgent name: {name}\n"
                 f"Independent context:\n{effective_context}\n\n"
                 f"<worker_contract>\n"
@@ -1265,9 +1284,6 @@ class SpawnerWorkerMixin:
             receipts["rowCountDelta"] = (
                 current_rows - prior_rows[-1] if prior_rows else current_rows
             )
-            handoff.setdefault("evidencePaths", {})[
-                "strategyAttempts"
-            ] = str(self.logger.task_dir / "strategy_attempts.jsonl")
             attempt_digest["handoff"] = handoff
         result["attemptDigest"] = attempt_digest
         # Mechanically extracted from the trace, never asked of the model: a
@@ -1329,11 +1345,6 @@ class SpawnerWorkerMixin:
                     result["fastPathReceiptCandidate"] = receipt_candidate
                 else:
                     result.pop("fastPathReceiptCandidate", None)
-        append_strategy_attempt(
-            logger=self.logger,
-            worker_contract=worker_contract or {},
-            result=result,
-        )
         if slot.status == "running":
             self._mark_slot_idle(slot, worker_id=worker_id)
         self.logger.write("spawner.browser.result", trim_large_strings(result, 8000))

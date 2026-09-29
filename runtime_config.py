@@ -489,6 +489,13 @@ class ClaimExtractorConfig(PlanValidatorConfig):
     # unavailable" and silently fails the gate open (task 857616aa).
     max_tokens: int = 16000
 
+    def model_config(self) -> ModelConfig:
+        # Transport selection is permissive; numeric_facts still requires
+        # exactly one valid claim tool response and checks span coverage.
+        model = super().model_config()
+        model.extra_params["tool_choice"] = "auto"
+        return model
+
     @classmethod
     def derived_from(
         cls, validator: "PlanValidatorConfig",
@@ -521,39 +528,6 @@ class ClaimExtractorConfig(PlanValidatorConfig):
                 validator.llm_timeout_retry_interval_seconds
             ),
             extra_params=extra,
-        )
-
-
-@dataclass
-class TaskClassifierConfig(PlanValidatorConfig):
-    """Small, non-deliberative classifier used by explicit browser mode."""
-
-    enabled: bool = True
-    max_tokens: int = 4096
-
-    def model_config(self) -> ModelConfig:
-        # Classification is a bounded routing lookup.  Inheriting the lead's
-        # thinking/reasoning switches can turn a sub-second call into another
-        # planning pass, so remove every known deliberation parameter.
-        extra_params = {
-            key: value
-            for key, value in (self.extra_params or {}).items()
-            if key not in _REASONING_PARAM_KEYS
-        }
-        extra_params["max_tokens"] = int(self.max_tokens)
-        extra_params["tool_choice"] = "required"
-        # See PlanValidatorConfig.model_config: temperature is never injected.
-        return ModelConfig(
-            provider=self.provider,
-            api=self.api,
-            model_id=self.model_id,
-            api_key=self.api_key,
-            base_url=self.base_url,
-            extra_params=extra_params,
-            llm_api_timeout_seconds=min(self.llm_api_timeout_seconds, 20.0),
-            llm_timeout_max_retries=0,
-            llm_timeout_backoff_seconds=0.0,
-            llm_timeout_retry_interval_seconds=None,
         )
 
 
@@ -756,7 +730,7 @@ class VLConfig:
     # Second, independent arming condition: tool calls made without persisting
     # anything (ProgressAccountant.turns_since_artifact_progress). The
     # shortfall streak only counts tools that report a row yield, so a worker
-    # looping on DOM.getAXTree / DOM.getSemanticTree / local_fs_read spends its
+    # looping on perception reads (DOM.getAXTree / local_fs_read) spends its
     # whole budget with the streak at 0 and the check never arms — seen live in
     # task e3173b5b. Kept below PRODUCTIVE_WITHOUT_ARTIFACT_HARD_LIMIT (30) so
     # the visual second opinion arrives while the worker can still act on it,
@@ -896,28 +870,6 @@ class HarnessConfig:
     # A screenshot is attached only for the immediately following model call;
     # the raw file-size bound caps request growth before base64 expansion.
     browser_agent_max_multimodal_image_bytes: int = 4 * 1024 * 1024
-    # Harness-owned phase continuation. When a phase's worker ends in a bounded,
-    # mechanically continuable state, the harness re-dispatches that same phase
-    # itself instead of returning the decision to the Lead model.
-    #
-    # Measured on 272 worker->worker handoffs: the gap between one worker ending
-    # and the next starting is p50 96.0s (p50 122.0s when the previous worker
-    # died on its step cap), and it costs on average 4.2 Lead LLM calls and
-    # 8,586 output tokens. Rebuilding the worker itself accounts for 28.4s of
-    # that; the rest is the round trip. Lead rule 11 already tells the model to
-    # continue serially in exactly these cases, so automating it removes a
-    # deliberation whose outcome the prompt had already fixed.
-    #
-    # The cap is separate from phase.max_attempts on purpose: a `partial`
-    # attempt does not consume the phase budget (_count_budgeted_phase_attempts
-    # excludes it), so the phase budget alone cannot bound a partial loop.
-    phase_auto_continuation_enabled: bool = True
-    phase_auto_continuation_max_attempts: int = 2
-    # When an event wait observes completed work, dispatch the next approved
-    # scheduling wave through the normal spawn gate. Multiple phases fan out
-    # only when the plan explicitly assigns one common dispatch_wave, and the
-    # running count is capped by max_browser_agents.
-    phase_auto_downstream_dispatch_enabled: bool = True
     # Reusable slot-retention target. Effective pool capacity is never smaller
     # than max_browser_agents, which is the authoritative concurrency limit.
     max_browser_agent_instances: int = 4
@@ -1074,7 +1026,6 @@ class HarnessConfig:
     # A trusted deployment-owned, stable system-prompt suffix. Dynamic task
     # facts do not belong here because they would defeat prefix cache reuse.
     append_system_prompt: str = ""
-    strategy_bank_path: str = "strategy_bank/strategy_bank.json"
     memory_context: str = (
         "ABCP agent harness: drive the browser only through ABCP atomic capabilities. "
         "Trust the cached System.describeAction schemas (global_schema_cache/schemas/<Method>.json) "
@@ -1105,6 +1056,9 @@ class HarnessConfig:
     workflow_result_projection_enabled: bool = True
     workflow_result_inline_bytes: int = DEFAULT_WORKFLOW_INLINE_RESULT_BYTES
     local_fs_max_read_bytes: int = DEFAULT_LOCAL_FS_READ_BYTES
+    # Trusted application configuration, never model-supplied. Packaged apps
+    # must include the WebCross installation root as well as other private data.
+    protected_local_roots: List[str] = field(default_factory=list)
     model_context_window_tokens: int = 262144
     context_compaction_threshold_ratio: float = 0.85
     # Complete initial message groups permanently retained before the
@@ -1216,11 +1170,23 @@ class HarnessConfig:
     progress_local_fs_without_extraction_limit: int = 5
     progress_no_artifact_limit: int = 8
     # Browser-side stale-id rematch policy:
-    #   "off"            -> stale guard blocks every stale id (legacy behavior)
+    #   "off"            -> stale guard blocks every stale id (legacy behavior),
+    #                       including ids the current document has already
+    #                       shown once a page action has made the snapshot stale
     #   "composite_only" -> only harness composite tools may pass previously
     #                       seen stale ids through to the browser rematch
     #   "on"             -> model-initiated calls may pass them through too
     browser_side_rematch: str = "composite_only"
+    # Page observation delivery. After a worker has received one complete
+    # DOM.getAXTree view of a page, later reads show only the platform's
+    # change records when the version chain is provably continuous (the full
+    # view still goes to disk and to find_in_axtree). False shows every read
+    # in full, the pre-diff behaviour.
+    observation_diff_view: bool = True
+    # watch_nodes: how often the harness re-reads a watched page while any
+    # watch on it is active, and the longest lifetime a watch may request.
+    observation_watch_poll_interval_ms: int = 1500
+    observation_watch_max_ttl_seconds: int = 600
     # Auto-intercept policy for overlay occlusion (Phase 7.2). When a browser
     # action is blocked by an overlay, how aggressively the harness handles it:
     #   "off"     -> no hint, no auto-run (legacy: model sees the raw error)
@@ -1237,20 +1203,6 @@ class HarnessConfig:
     # harness choosing and performing a page action on the model's behalf,
     # which is a different thing from a mechanical check, so it is opt-in.
     auto_intercept: str = "suggest"
-    # DOM.getSemanticTree usage policy (Phase B). The MODEL may now call it
-    # directly as a diagnostic (un-banned in tool_policy; the model prompt limits
-    # it to local diagnostics when AXTree is insufficient). It is still 3.65x
-    # heavier than AXTree with no href/name/aria, so its results are offloaded.
-    # This flag is independent of the model surface and only governs the
-    # HARNESS-INTERNAL auto-digest path:
-    #   "off"      -> never used, even internally (current safe default)
-    #   "internal" -> harness may make a one-shot, redaction-wrapped call to
-    #                 derive a tiny structure digest (scroll containers via
-    #                 isScrollable, bounds) that never enters model context. The
-    #                 raw tree is digested and discarded; never per-iteration.
-    # NOTE: shadow-host mapping is NOT supported (getSemanticTree does not
-    # traverse shadow roots on this build — see abcp-panel-quirks #8).
-    semantic_tree: str = "off"
 
     # Where task process data (events, traces, state, offloaded resources) is
     # written.
@@ -1321,24 +1273,6 @@ class HarnessConfig:
                         "browser_agent_max_multimodal_image_bytes",
                         cls.browser_agent_max_multimodal_image_bytes,
                     )
-                )
-            ),
-            phase_auto_continuation_enabled=bool(
-                data.get(
-                    "phase_auto_continuation_enabled",
-                    cls.phase_auto_continuation_enabled,
-                )
-            ),
-            phase_auto_continuation_max_attempts=max(0, min(6, int(
-                data.get(
-                    "phase_auto_continuation_max_attempts",
-                    cls.phase_auto_continuation_max_attempts,
-                )
-            ))),
-            phase_auto_downstream_dispatch_enabled=bool(
-                data.get(
-                    "phase_auto_downstream_dispatch_enabled",
-                    cls.phase_auto_downstream_dispatch_enabled,
                 )
             ),
             max_browser_agent_instances=int(
@@ -1556,10 +1490,6 @@ class HarnessConfig:
                 if isinstance(data.get("append_system_prompt"), str)
                 else ""
             ),
-            strategy_bank_path=data.get(
-                "strategy_bank_path",
-                cls.strategy_bank_path,
-            ),
             memory_context=data.get("memory_context", cls.memory_context),
             events_lifecycle_enabled=bool(
                 data.get("events_lifecycle_enabled", cls.events_lifecycle_enabled)
@@ -1597,6 +1527,7 @@ class HarnessConfig:
             local_fs_max_read_bytes=int(
                 data.get("local_fs_max_read_bytes", cls.local_fs_max_read_bytes)
             ),
+            protected_local_roots=[str(p) for p in data.get("protected_local_roots", [])],
             model_context_window_tokens=int(
                 data.get(
                     "model_context_window_tokens",
@@ -1754,17 +1685,26 @@ class HarnessConfig:
                 in {"off", "composite_only", "on"}
                 else cls.browser_side_rematch
             ),
+            observation_diff_view=bool(
+                data.get("observation_diff_view", cls.observation_diff_view)
+            ),
+            observation_watch_poll_interval_ms=max(500, min(10_000, int(
+                data.get(
+                    "observation_watch_poll_interval_ms",
+                    cls.observation_watch_poll_interval_ms,
+                )
+            ))),
+            observation_watch_max_ttl_seconds=max(30, min(3600, int(
+                data.get(
+                    "observation_watch_max_ttl_seconds",
+                    cls.observation_watch_max_ttl_seconds,
+                )
+            ))),
             auto_intercept=(
                 str(data.get("auto_intercept", cls.auto_intercept))
                 if str(data.get("auto_intercept", cls.auto_intercept))
                 in {"off", "suggest", "p0", "p0p1"}
                 else cls.auto_intercept
-            ),
-            semantic_tree=(
-                str(data.get("semantic_tree", cls.semantic_tree))
-                if str(data.get("semantic_tree", cls.semantic_tree))
-                in {"off", "internal"}
-                else cls.semantic_tree
             ),
             # Deliberately fail-fast, unlike most options here: this one
             # decides where a task's only copy of its data goes. Falling back
@@ -1815,9 +1755,6 @@ class RuntimeConfig:
     claim_extractor: ClaimExtractorConfig = field(
         default_factory=ClaimExtractorConfig
     )
-    task_classifier: TaskClassifierConfig = field(
-        default_factory=TaskClassifierConfig
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1830,7 +1767,6 @@ _TOP_LEVEL_KEYS = {
     "vl",
     "plan_validator",
     "claim_extractor",
-    "task_classifier",
     "lead",
     "worker",
     "browser",
@@ -1896,11 +1832,6 @@ def audit_config_keys(raw: JsonDict) -> List[str]:
         "claim_extractor",
         raw.get("claim_extractor"),
         _field_names(ClaimExtractorConfig),
-    )
-    check(
-        "task_classifier",
-        raw.get("task_classifier"),
-        _field_names(TaskClassifierConfig),
     )
     for _role in ("lead", "worker"):
         check(_role, raw.get(_role), _field_names(ModelConfig) | _MODEL_SECTION_KEYS)
@@ -1972,9 +1903,6 @@ def load_runtime_config(config_path: str, *, warn: bool = True) -> RuntimeConfig
         plan_validator=plan_validator,
         claim_extractor=ClaimExtractorConfig.from_dict(
             raw.get("claim_extractor", {})
-        ),
-        task_classifier=TaskClassifierConfig.from_dict(
-            raw.get("task_classifier", {})
         ),
     )
 

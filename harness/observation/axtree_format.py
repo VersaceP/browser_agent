@@ -1,211 +1,314 @@
-"""The AXTree compact-line format: one parser, shared by every reader.
+"""The page-observation node-line format: one parser, shared by every reader.
 
-`DOM.getAXTree` renders each node as::
+`DOM.getAXTree` publishes an immutable text artifact (WebCross unified page
+observation, schemaVersion 2). Each node is one line, written by the
+platform's `formatNodeLine`::
 
-    depth [frame:ax:dom] role "label" [flags...] #|~ @x,y,w,h (+N omitted)
+    depth [n_<16 hex>] role "name" description="…" ariaValueText="…"
+        [flag,flag,ev{a|b}] @x,y,w,h text="…" vis=↓|∅ state{k=v}
+        scroll{k=v} attrs{k="v"} rel{name:[id,null]} component=c_… truncated{"f"}
 
-Only `depth`, the canonical id and the role are always present. The flag group,
-the target marker, the rect and the omitted-children suffix are all optional.
+Only `depth`, the id and the role are always present, and the optional parts
+always appear in that order. Every free-text value (name, description,
+ariaValueText, text) is a JSON string, so a label containing quotes, brackets
+or `@` can no longer be mistaken for the grammar around it.
 
-This module exists because the format was parsed in two places. When the panel
-moved every flag into a single bracket group, both copies broke - and they broke
-differently: the AX cache silently reported no flags at all, while the auth
-verifier failed OPEN and began accepting `[hidden]` nodes as proof of a live
-session. Neither had a test that used a real line, so both stayed green. Keep
-the format knowledge here, and a future change is caught in one place.
+This module exists because the format used to be parsed in several places and
+each copy drifted differently when the panel changed it. Keep the format
+knowledge here, and a future change is caught in one place.
+
+Node ids are opaque and carry no frame: frame membership comes from the
+artifact's `frame [f_…] root=[n_…]` records (see page_observation).
 """
 
 from __future__ import annotations
 
+import json
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from harness.utils import JsonDict
 
 
-# Generic AX state, exposed only where the state APPLIES to the node. Positive
-# and negative forms are both explicit, so `unchecked` is a positive report that
-# the node is unchecked - which is NOT the same as the flag being absent, and
-# absent means AX never exposed that state for this node at all.
-# `enabled`/`disabled` ride on interactive nodes; native inertness is reported
-# separately as `inert`; `popup` appears only when true.
+# The platform issues 16 hex digits today; its design document specifies 32.
+# Accept exactly one of the two so neither a rollout nor a truncated token
+# slips past, and never the retired `frame:ax:dom` form.
+AX_NODE_ID_PATTERN = r"n_[0-9a-f]{16}(?:[0-9a-f]{16})?"
+AX_FRAME_ID_PATTERN = r"f_[0-9a-f]{32}"
+AX_NODE_ID_RE = re.compile(rf"^{AX_NODE_ID_PATTERN}$")
+AX_NODE_ID_TOKEN_RE = re.compile(rf"\[({AX_NODE_ID_PATTERN})\]")
+AX_NODE_ID_ANYWHERE_RE = re.compile(rf"(?<![0-9a-z_]){AX_NODE_ID_PATTERN}(?![0-9a-z_])")
+
+# Head of a node line. The name, when present, is a JSON string, so the
+# pattern for it is the JSON string grammar rather than "up to the last quote".
+AXTREE_LINE_RE = re.compile(
+    rf'^(?P<depth>\d+) \[(?P<id>{AX_NODE_ID_PATTERN})\] (?P<role>[^\s"\[]+)'
+    r'(?: (?P<name>"(?:[^"\\]|\\.)*"))?(?P<rest>.*)$'
+)
+AXTREE_RECT_RE = re.compile(
+    r"@(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?),(\d+(?:\.\d+)?),(\d+(?:\.\d+)?)"
+)
+
+# State the platform writes into the flag group, translated to the vocabulary
+# the harness has always reasoned in. Positive and negative forms stay
+# explicit: `unchecked` is a positive report, which is NOT the same as the
+# flag being absent (absent means the state does not apply to the node).
 AXTREE_STATE_FLAGS = frozenset({
     "checked", "unchecked", "mixed",
-    "enabled", "disabled", "inert",
     "selected", "unselected",
     "expanded", "collapsed",
-    "multi", "single",
-    "popup",
+    "disabled", "focused", "required", "invalid", "valueRedacted",
 })
 
-# Layout evidence, SPARSE by contract: a missing layout flag does not prove the
-# negative. These may never be read as "not hidden" or "not occluded" - only a
-# present flag says anything. `zN` encodes stacking order.
-AXTREE_LAYOUT_FLAGS = frozenset({
-    "hidden", "off", "blocked", "scroll", "sticky", "clip",
-})
+# Layout evidence, SPARSE by contract: a missing flag does not prove the
+# negative. `hidden` is the platform's not-rendered marker (vis=∅), `off` its
+# out-of-view marker (vis=↓, offscreen or clipped), `scroll` a node that is
+# actually scrollable.
+AXTREE_LAYOUT_FLAGS = frozenset({"hidden", "off", "scroll"})
 
-AXTREE_KNOWN_FLAGS = AXTREE_STATE_FLAGS | AXTREE_LAYOUT_FLAGS
+# Target evidence. `targetable` means the platform can locate the node;
+# `actionable` and `candidate` are its interaction verdicts. None of them
+# proves a click would land - the platform says so itself.
+AXTREE_TARGET_FLAGS = frozenset({"targetable", "actionable", "candidate", "ignored"})
 
-AXTREE_Z_FLAG_RE = re.compile(r"^z-?\d+$")
-AXTREE_RECT_RE = re.compile(r"@(-?\d+),(-?\d+),(\d+),(\d+)")
+AXTREE_KNOWN_FLAGS = AXTREE_STATE_FLAGS | AXTREE_LAYOUT_FLAGS | AXTREE_TARGET_FLAGS
 
-# Current builds emit every flag inside ONE bracket group - `[checked enabled]`,
-# `[enabled collapsed single popup]`, `[off]`. Splitting such a tail on
-# whitespace yields `[checked` and `enabled]`, and a whitelist of bare words
-# matches neither, so the group's first token (always carrying `[`) and its last
-# (always carrying `]`) are both lost - which for a two-token group is the whole
-# group.
-#
-# Older builds emitted each STATE in its own group and the layout flags bare,
-# all on the same line: `[checked] [disabled] hidden off`. So the tail is a
-# SEQUENCE of groups and bare tokens, not one group, and "trust the bracket,
-# ignore the rest" drops exactly the layout flags the auth check depends on.
-AXTREE_FLAG_GROUP_RE = re.compile(r"\[([^\[\]]*)\]")
-
-# Head of a line: optional depth, optional legacy indent, the canonical id.
-# The id's own brackets are the one unambiguous anchor on the left - the
-# pattern inside them cannot occur in a role or an accessible name.
-AXTREE_HEAD_RE = re.compile(
-    r"^(?:(?P<depth>\d+)\s+)?(?P<indent>\s*)\[(?P<id>\d+:-?\d+:-?\d+)\]\s+(?P<body>.*)$"
-)
-_OMITTED_SUFFIX_RE = re.compile(r"\s*\(\+\d+\s+omitted\)$")
-_RECT_SUFFIX_RE = re.compile(r"\s*@(-?\d+),(-?\d+),(\d+),(\d+)$")
-_MARKER_SUFFIX_RE = re.compile(r"(?:^|\s)([#~])$")
-_TRAILING_GROUP_RE = re.compile(r"\s*\[([^\[\]]*)\]$")
-_TRAILING_TOKEN_RE = re.compile(r"\s+(\S+)$")
+_FLAG_TRANSLATION = {
+    "checked": "checked",
+    "checked=false": "unchecked",
+    "checked=mixed": "mixed",
+    "selected": "selected",
+    "selected=false": "unselected",
+    "expanded": "expanded",
+    "expanded=false": "collapsed",
+}
+_VISIBILITY = {"↓": "out-of-view", "∅": "not-rendered"}
+_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
+_JSON = json.JSONDecoder()
 
 
-def axtree_flags_and_rect(rest: str) -> Tuple[List[str], Optional[JsonDict]]:
-    """Parse the flag list and the rect out of a line's tail.
-
-    `rest` is the text AFTER the accessible name, so it never contains the
-    canonical id's brackets or the name's quotes. Prefer `parse_axtree_line`,
-    which does not need the caller to have found the name's end; this exists
-    for callers that already hold only a tail.
-
-    Shares `_peel_tail` with the whole-line parser, so both read a mixed
-    `[checked] hidden` tail identically. Unknown tokens are ignored rather than
-    fatal in either entry point.
-    """
-    flags, rect, _marker, _remainder = _peel_tail(rest)
-    return flags, rect
+def _skip_spaces(text: str, index: int) -> int:
+    while index < len(text) and text[index] == " ":
+        index += 1
+    return index
 
 
-def _is_flag(token: str) -> bool:
-    return token in AXTREE_KNOWN_FLAGS or bool(AXTREE_Z_FLAG_RE.match(token))
+def _read_json(text: str, index: int) -> Tuple[Any, int]:
+    value, end = _JSON.raw_decode(text, index)
+    return value, end
 
 
-def _peel_tail(body: str) -> Tuple[List[str], Optional[JsonDict], str, str]:
-    """Strip the fixed grammar off the right of a line body.
-
-    Returns ``(flags, rect, marker, remainder)``, where the remainder is
-    whatever the grammar stopped consuming - the role and the accessible name.
-
-    The one parser for the tail, so the whole-line reader and the tail-only
-    helper cannot disagree about the same characters. They did: one read
-    `[checked] hidden` as both flags and the other as `checked` alone.
-    """
-    body = _OMITTED_SUFFIX_RE.sub("", str(body or "").rstrip())
-
-    rect: Optional[JsonDict] = None
-    rect_match = _RECT_SUFFIX_RE.search(body)
-    if rect_match:
-        x, y, w, h = (int(group) for group in rect_match.groups())
-        rect = {"x": x, "y": y, "w": w, "h": h}
-        body = body[: rect_match.start()].rstrip()
-
-    marker = ""
-    marker_match = _MARKER_SUFFIX_RE.search(body)
-    if marker_match:
-        marker = marker_match.group(1)
-        body = body[: marker_match.start(1)].rstrip()
-
-    # Flag segments, innermost last. Current builds emit one group; older ones
-    # emitted a group per state plus bare layout words, and mixed both on the
-    # same line - so this consumes whichever comes next until the name is
-    # reached. Ending with `"` means the name ends the line and nothing further
-    # can be a flag, which is what stops a label like `"Save [enabled]"` from
-    # donating a flag it never had.
-    flags: List[str] = []
-    while body and not body.endswith('"'):
-        group = _TRAILING_GROUP_RE.search(body)
-        if group is not None:
-            # A group outside the name IS the flag group, so consume it whole
-            # and keep the tokens we recognise. An unknown token is ignored,
-            # never fatal: a flag added by a future platform build must not
-            # take the role, the name and every other flag down with it.
-            flags = [t for t in group.group(1).split() if _is_flag(t)] + flags
-            body = body[: group.start()].rstrip()
+def _read_braced(text: str, index: int) -> Tuple[str, int]:
+    """Return the `{…}` block starting at `index` (inclusive), string-aware."""
+    if index >= len(text) or text[index] != "{":
+        raise ValueError("expected {")
+    depth = 0
+    position = index
+    while position < len(text):
+        char = text[position]
+        if char == '"':
+            _value, position = _read_json(text, position)
             continue
-        token = _TRAILING_TOKEN_RE.search(body)
-        # `\s+` in that pattern is the role guard: the first token of the body
-        # has no whitespace before it, so a role spelled like a flag is never
-        # eaten and the line cannot be left without one.
-        if token is None or not _is_flag(token.group(1)):
-            break
-        flags.insert(0, token.group(1))
-        body = body[: token.start()].rstrip()
+        if char in "{[":
+            depth += 1
+        elif char in "}]":
+            depth -= 1
+            if depth == 0:
+                return text[index:position + 1], position + 1
+        position += 1
+    raise ValueError("unterminated {")
 
-    return flags, rect, marker, body
+
+def parse_compact_object(block: str) -> Any:
+    """Parse the platform's compact `{k=v,…}` / `{name:[ids]}` / `{"a","b"}`.
+
+    Keys are bare identifiers or JSON strings; values are JSON (numbers,
+    strings, booleans, objects) or, for relations, a `[id,null]` list of bare
+    ids. A block whose items have no `=`/`:` is a list (truncated fields).
+    """
+    inner = block[1:-1]
+    result: Dict[str, Any] = {}
+    items: List[Any] = []
+    index = 0
+    while index < len(inner):
+        index = _skip_spaces(inner, index)
+        if index >= len(inner):
+            break
+        if inner[index] == '"':
+            key, index = _read_json(inner, index)
+        else:
+            match = _KEY_RE.match(inner, index)
+            if match is None:
+                raise ValueError(f"bad key at {index}")
+            key, index = match.group(0), match.end()
+        if index >= len(inner) or inner[index] == ",":
+            items.append(key)
+            index += 1
+            continue
+        separator = inner[index]
+        index += 1
+        if separator == ":" and index < len(inner) and inner[index] == "[":
+            end = inner.index("]", index)
+            result[str(key)] = [
+                None if token == "null" else token
+                for token in (part.strip() for part in inner[index + 1:end].split(","))
+                if token
+            ]
+            index = end + 1
+        elif separator in "=:":
+            value, index = _read_json(inner, index)
+            result[str(key)] = value
+        else:
+            raise ValueError(f"bad separator {separator!r}")
+        index = _skip_spaces(inner, index)
+        if index < len(inner) and inner[index] == ",":
+            index += 1
+    if items and not result:
+        return items
+    return result
+
+
+def _translate_flags(raw_flags: List[str]) -> Tuple[List[str], List[str]]:
+    flags: List[str] = []
+    sources: List[str] = []
+    for raw in raw_flags:
+        token = raw.strip()
+        if not token:
+            continue
+        if token.startswith("ev{") and token.endswith("}"):
+            sources.extend(part for part in token[3:-1].split("|") if part)
+            continue
+        translated = _FLAG_TRANSLATION.get(token, token)
+        if translated in AXTREE_KNOWN_FLAGS and translated not in flags:
+            flags.append(translated)
+    return flags, sources
+
+
+def _parse_tail(rest: str, node: JsonDict) -> None:
+    index = 0
+    while True:
+        index = _skip_spaces(rest, index)
+        if index >= len(rest):
+            return
+        for key in ("description", "ariaValueText", "text"):
+            prefix = key + "="
+            if rest.startswith(prefix, index) and rest[index + len(prefix): index + len(prefix) + 1] == '"':
+                node[key], index = _read_json(rest, index + len(prefix))
+                break
+        else:
+            char = rest[index]
+            if char == "[":
+                end = rest.index("]", index)
+                flags, sources = _translate_flags(rest[index + 1:end].split(","))
+                node["flags"].extend(flag for flag in flags if flag not in node["flags"])
+                node["interactionSources"] = sources
+                index = end + 1
+                continue
+            if char == "@":
+                match = AXTREE_RECT_RE.match(rest, index)
+                if match is None:
+                    raise ValueError("bad rect")
+                x, y, w, h = (float(group) for group in match.groups())
+                node["rect"] = {
+                    key: int(value) if value.is_integer() else value
+                    for key, value in (("x", x), ("y", y), ("w", w), ("h", h))
+                }
+                index = match.end()
+                continue
+            if rest.startswith("vis=", index):
+                token_end = rest.find(" ", index)
+                token_end = len(rest) if token_end < 0 else token_end
+                node["visibility"] = _VISIBILITY.get(rest[index + 4:token_end], rest[index + 4:token_end])
+                index = token_end
+                continue
+            if rest.startswith("component=", index):
+                token_end = rest.find(" ", index)
+                token_end = len(rest) if token_end < 0 else token_end
+                node["component"] = rest[index + len("component="):token_end]
+                index = token_end
+                continue
+            for key in ("state", "scroll", "attrs", "rel", "truncated"):
+                if rest.startswith(key + "{", index):
+                    block, index = _read_braced(rest, index + len(key))
+                    node[key] = parse_compact_object(block)
+                    break
+            else:
+                # An unknown field added by a future platform build must not
+                # take the rest of the line down with it: skip one token.
+                token_end = rest.find(" ", index)
+                index = len(rest) if token_end < 0 else token_end
 
 
 def parse_axtree_line(line: str) -> Optional[JsonDict]:
-    """Parse one compact AXTree line into its parts, or None if it is not one.
+    """Parse one node line, or None if it is not one.
 
-    Returns ``{depth, id, role, name, flags, rect, marker}`` where `marker` is
-    ``"#"``, ``"~"`` or ``""``.
+    Returns the long-standing reader keys ``{depth, id, role, name, flags,
+    rect, marker}`` - `role` casefolded, `marker` is ``"#"`` for an actionable node, ``"~"`` for
+    a candidate, else ``""`` - plus the richer fields the platform now
+    publishes: ``visibility`` (visible/out-of-view/not-rendered), ``state``,
+    ``attrs``, ``text``, ``description``, ``ariaValueText``, ``scroll``,
+    ``rel``, ``component``, ``truncated`` and ``interactionSources``.
 
-    Parsed RIGHT to left, which is what makes an accessible name safe. The name
-    is the only free-text field on the line and the formatter does not escape
-    it, so a label may legally contain `"`, `[`, `]`, `#` and `@`. Scanning
-    left to right for the name's closing quote therefore truncates the name and
-    hands the leftovers to the flag parser, which then reads fragments of the
-    LABEL as flags. Everything to the right of the name is a fixed grammar, so
-    peeling it off from the end never has to guess where the name ended: what
-    remains when the grammar stops matching IS the name.
-
-    The stop rule is one line: once the remainder ends with `"`, the name ends
-    the line and nothing further can be a flag. That is what keeps a label like
-    `"Save [enabled]"` from donating a flag it never had.
+    A malformed tail keeps the head (id, role, name) and whatever parsed
+    before the fault, flagged with ``tailError``, rather than dropping a
+    node the platform did publish.
     """
-    head = AXTREE_HEAD_RE.match(line if isinstance(line, str) else "")
+    head = AXTREE_LINE_RE.match(line if isinstance(line, str) else "")
     if not head:
         return None
-    flags, rect, marker, body = _peel_tail(str(head.group("body") or ""))
-
-    name = ""
-    if body.endswith('"'):
-        opening = body.find('"')
-        if opening >= 0 and opening < len(body) - 1:
-            # Greedy: first quote to last quote, so quotes INSIDE the name are
-            # kept rather than ending it.
-            name = body[opening + 1: -1]
-            body = body[:opening].rstrip()
-    role = body.strip()
-
-    depth_prefix = head.group("depth")
-    return {
-        "depth": (
-            int(depth_prefix)
-            if depth_prefix is not None
-            else len(str(head.group("indent") or "")) // 2
-        ),
+    name_token = head.group("name")
+    node: JsonDict = {
+        "depth": int(head.group("depth")),
         "id": head.group("id"),
-        "role": role,
-        "name": name,
-        "flags": flags,
-        "rect": rect,
-        "marker": marker,
+        # Casefolded: the platform now writes Chromium roles in camelCase
+        # (`rootWebArea`, `checkBox`), every reader compares them lowercase.
+        "role": head.group("role").casefold(),
+        "name": json.loads(name_token) if name_token else "",
+        "flags": [],
+        "rect": None,
+        "marker": "",
+        "visibility": "visible",
+        "interactionSources": [],
     }
+    try:
+        _parse_tail(str(head.group("rest") or ""), node)
+    except (ValueError, json.JSONDecodeError) as exc:
+        node["tailError"] = str(exc)[:120]
+    if node["visibility"] == "not-rendered":
+        node["flags"].append("hidden")
+    elif node["visibility"] == "out-of-view":
+        node["flags"].append("off")
+    if isinstance(node.get("scroll"), dict):
+        node["flags"].append("scroll")
+    if "actionable" in node["flags"]:
+        node["marker"] = "#"
+    elif "candidate" in node["flags"]:
+        node["marker"] = "~"
+    return node
+
+
+def axtree_flags_and_rect(rest: str) -> Tuple[List[str], Optional[JsonDict]]:
+    """Flags and rect from the tail AFTER a line's name.
+
+    Prefer `parse_axtree_line`; this exists for callers that hold only a tail.
+    """
+    node: JsonDict = {"flags": [], "rect": None, "visibility": "visible"}
+    try:
+        _parse_tail(str(rest or ""), node)
+    except (ValueError, json.JSONDecodeError):
+        pass
+    if node["visibility"] == "not-rendered":
+        node["flags"].append("hidden")
+    elif node["visibility"] == "out-of-view":
+        node["flags"].append("off")
+    if isinstance(node.get("scroll"), dict):
+        node["flags"].append("scroll")
+    return node["flags"], node["rect"]
 
 
 def axtree_layout_flags(flags: List[str]) -> List[str]:
-    """The layout subset of a parsed flag list, `zN` included."""
-    return [
-        flag for flag in flags
-        if flag in AXTREE_LAYOUT_FLAGS or AXTREE_Z_FLAG_RE.match(flag)
-    ]
+    """The layout subset of a parsed flag list."""
+    return [flag for flag in flags if flag in AXTREE_LAYOUT_FLAGS]
 
 
 def axtree_state_flags(flags: List[str]) -> List[str]:

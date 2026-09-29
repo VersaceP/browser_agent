@@ -13,7 +13,10 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 from urllib.parse import urlsplit, urlunsplit
 
 from harness.results.call_outcome import evaluate_grant
-from harness.observation.semantic_frames import response_node_count
+from harness.observation.page_observation import (
+    main_document_can_scroll_down,
+    response_node_count,
+)
 from harness.utils import JsonDict
 
 
@@ -29,9 +32,6 @@ CONTENT_MATERIALIZED = "content_materialized"
 # it saw, so only reads which could have produced fresh region evidence count.
 STRUCTURED_BINDING_AGING_METHODS = frozenset({
     "DOM.getAXTree",
-    "DOM.getSemanticTree",
-    "DOM.getText",
-    "DOM.getAttribute",
     "Runtime.evaluate",
     "collect_items",
 })
@@ -1141,12 +1141,8 @@ class ContentCompletenessTracker:
 
     @staticmethod
     def _materialization_ready(state: PageContentState) -> bool:
-        return (
-            "collect_items" in state.materialization_attempts
-            or (
-                "semantic_tree" in state.materialization_attempts
-                and bool({"scroll", "click"} & state.materialization_attempts)
-            )
+        return bool(
+            {"collect_items", "axtree_at_page_bottom"} & state.materialization_attempts
         )
 
     def observe(
@@ -1378,8 +1374,14 @@ class ContentCompletenessTracker:
             state.materialization_attempts.add("scroll")
         if method == "DOM.getAXTree":
             state.materialization_attempts.add("axtree")
-        if method == "DOM.getSemanticTree":
-            state.materialization_attempts.add("semantic_tree")
+            # Only a full view read AFTER a scroll/click counts, and only when
+            # the page has nothing left below: lazy content that loaded on the
+            # way down puts `down` back on the root and withholds it.
+            if (
+                {"scroll", "click"} & state.materialization_attempts
+                and main_document_can_scroll_down(_response_data(result).get("lines")) is False
+            ):
+                state.materialization_attempts.add("axtree_at_page_bottom")
         if (
             method == "collect_items"
             and isinstance(result, dict)
@@ -1421,20 +1423,10 @@ class ContentCompletenessTracker:
 
         # A fresh, classifiable state/DOM observation discharges an earlier
         # upstream auth/challenge/lifecycle exclusion for this page.
-        if method in {
-            "Page.getState",
-            "DOM.getAXTree",
-            "DOM.getSemanticTree",
-            "DOM.getText",
-        }:
+        if method in {"Page.getState", "DOM.getAXTree"}:
             state.upstream_blocker = ""
 
-        if method in {
-            "DOM.getAXTree",
-            "DOM.getSemanticTree",
-            "DOM.getText",
-            "Runtime.evaluate",
-        }:
+        if method in {"DOM.getAXTree", "Runtime.evaluate"}:
             dom_text, node_count = _dom_snapshot(result)
             self._evaluate(state, result)
             state.last_dom_text = dom_text
@@ -1492,10 +1484,7 @@ class ContentCompletenessTracker:
                 "reason": "invalid_content_binding",
                 "validRegionIds": sorted(expected_ids),
             }
-        if method not in {
-            "DOM.getText", "DOM.getAttribute", "DOM.getSemanticTree",
-            "DOM.getAXTree", "Runtime.evaluate", "collect_items",
-        }:
+        if method not in {"DOM.getAXTree", "Runtime.evaluate", "collect_items"}:
             return {
                 "status": "rejected",
                 "reason": "content_binding_requires_structured_read",
@@ -1673,9 +1662,9 @@ class ContentCompletenessTracker:
             for spec in expected
             if any(str(marker).casefold() in haystack for marker in spec["markers"])
         }
-        # A focused DOM.getText may omit a region already established by a
-        # full SemanticTree. Completion evidence is monotonic within one
-        # document epoch; navigation above clears it authoritatively.
+        # A bounded query may omit a region already established by a full
+        # view. Completion evidence is monotonic within one document epoch;
+        # navigation above clears it authoritatively.
         state.observed_regions.update(marker_regions)
         for spec in expected:
             region_id = str(spec["id"])
@@ -2000,7 +1989,7 @@ class ContentCompletenessTracker:
         if state.shell_present and missing_enough and route_candidate:
             # A confirmatory server/page signal can prove route suppression
             # without further DOM work.  Heuristic absence must first survive
-            # one semantic-tree read plus a bounded reveal/scroll attempt.
+            # a full view read at the page bottom after a scroll/click.
             state.decision = (
                 ROUTE_RECOVERY_REQUIRED
                 if confirmatory or materialization_ready

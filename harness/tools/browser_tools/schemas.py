@@ -26,24 +26,32 @@ def _workflow_condition_schema() -> JsonDict:
 #: The measurements behind these sentences live with the regression tests.
 _TRANSFORM_OP_NOTES = {
     "find": (
-        "Returns the FIRST matching item and does not check uniqueness; an"
-        " empty string when nothing matches, which then fails downstream"
-        " rather than here. A bare visible label is rarely unique in an AXTree"
-        " — the same text appears on a control, on its label, and on any"
-        " heading that mentions it. Narrow with mode=regex, combining the"
-        " parts each line carries: its role, its full quoted accessible name,"
-        " and its bracketed state. Read them off the tree you just captured"
-        " rather than assuming which role a control uses."
+        "Returns an array of every matching line/item, or [] on a miss."
+        " Use the complete $cache.observation or $last reference after"
+        " DOM.getAXTree to search leased artifact text. Only select index 0"
+        " when the observed evidence establishes a unique match; otherwise"
+        " end the segment for model judgment."
     ),
     "regex": (
-        "Applied to the current value as text. Use group to lift a canonical"
-        " id out of a matched AXTree line: ids are"
-        " frameId:axNodeId:domNodeId inside square brackets, e.g."
-        " '\\[([0-9]+:[0-9]+:[0-9]+)\\]' with group 1."
+        "Extracts the requested capture group; array input produces array"
+        " output. After find, use jsonpath path '0' only when the observation"
+        " establishes exactly one matching target. Guard the scalar id with"
+        " a matches condition; a miss can produce an empty string."
+    ),
+    "jsonpath": (
+        "Reads a dot-separated property path or numeric array index (for"
+        " example '0'); it is not a full JSONPath implementation."
+    ),
+    "join": (
+        "Joins array items into a string with the requested separator."
+    ),
+    "decode": (
+        "Decodes JSON-escaped observation text; array input is decoded itemwise."
     ),
     "querySelector": (
-        "Matched against a simplified semantic tree by tag/class/id, not"
-        " against AXTree lines and not by visible text."
+        "Matched by tag/class/id against an in-memory tree value. No Action"
+        " on the current platform returns such a tree, so this op has nothing"
+        " to run on in practice."
     ),
 }
 
@@ -105,7 +113,14 @@ def _workflow_step_definitions() -> JsonDict:
     extract_schema: JsonDict = {
         "type": "object",
         "additionalProperties": {"type": "string", "minLength": 1},
-        "description": "Map workflow variable names to result/event dot paths.",
+        "description": (
+            "Map workflow variable names to dot paths in the Action's data"
+            " (`url`, not `data.url`) or the event result. Inside Workflow.execute,"
+            " DOM.getAXTree returns the platform's raw artifact reference: a"
+            " detail query has summary and artifact but no records array."
+            " Standalone browser_call may show data.records after Harness"
+            " hydration; do not use `records` as a workflow extract path."
+        ),
     }
     action_step: JsonDict = {
         "type": "object",
@@ -118,7 +133,11 @@ def _workflow_step_definitions() -> JsonDict:
                 "description": "ABCP action such as Page.getState.",
             },
             "params": {"type": "object", "additionalProperties": True},
-            "purpose": {"type": "string", "minLength": 1},
+            "purpose": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Why this step runs; the platform audits every Action step by it.",
+            },
             "extract": extract_schema,
             "onError": {
                 "type": "string",
@@ -131,7 +150,7 @@ def _workflow_step_definitions() -> JsonDict:
                 ),
             },
         },
-        "required": ["action"],
+        "required": ["action", "purpose"],
         "additionalProperties": False,
     }
     # Mirrors the platform's workflowWaitEventStepSchema. The harness used to
@@ -276,9 +295,13 @@ def _workflow_step_definitions() -> JsonDict:
                 "description": (
                     "Workflow reference supplying the input. The roots are"
                     " $last (the PRECEDING step's result), $cache, $store and"
-                    " $vars.NAME — there is no $steps[N]. To search an"
-                    " observation, put this step directly after the read and"
-                    " use $last.lines."
+                    " $vars.NAME — there is no $steps[N]. A DOM.getAXTree step"
+                    " inside a workflow returns a leased artifact reference; use the complete"
+                    " $cache.observation or $last reference with transform to read its text."
+                    " A standalone browser_call may show hydrated data.records,"
+                    " but the raw workflow Action result has no records field."
+                    " $cache.observation.artifact.path remains metadata only."
+                    " After navigation, never reuse ids from the old document."
                 ),
             },
             "ops": {
@@ -361,6 +384,18 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                 "reason": {
                     "type": "string",
                     "description": "Short reason for this call (used in logs and as fallback for the `purpose` field).",
+                },
+                "hitl_assistance_kind": {
+                    "type": "string",
+                    "enum": ["browser_state", "information_request", "other_human_action"],
+                    "description": (
+                        "Harness-only intent for Hitl.requestPause; never forwarded"
+                        " to ABCP and never grants permission. Use browser_state"
+                        " when the person must resolve login, verification or a"
+                        " page challenge. Use information_request when asking"
+                        " for task facts. Omit when the reason is uncertain;"
+                        " observed challenge state can still trigger recovery."
+                    ),
                 },
                 "runtime_policy": {
                     "type": "object",
@@ -571,7 +606,7 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                         "Regex searched against the final URL. Pass \"\" to accept"
                         " the requested URL itself (compared after normalizing"
                         " host case, default port, and a bare trailing slash)."
-                        " Write it as a plain regex: \"1688\\\\.com\" in JSON means"
+                        " Write it as a plain regex: \"example\\\\.org\" in JSON means"
                         " a literal backslash and can never match a URL."
                     ),
                 },
@@ -767,7 +802,7 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                 "expected": {
                     "type": "object",
                     "additionalProperties": True,
-                    "description": "Expected visible state, e.g. {\"target\":\"JobBuddy\",\"state\":\"product detail page\"}.",
+                    "description": "Expected visible state, e.g. {\"target\":\"requested record\",\"state\":\"detail view\"}.",
                 },
                 "repair_targets": {
                     "type": "array",
@@ -893,7 +928,7 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Short dataset name, e.g. \"trending-week-products\".",
+                    "description": "Short dataset name, e.g. \"observed-records\".",
                 },
                 "rows": {
                     "type": "array",
@@ -1007,6 +1042,59 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
             ],
             "additionalProperties": False,
         },
+        "await_node_change": {
+            "type": "object",
+            "properties": {
+                "pageId": {
+                    "type": "string",
+                    "description": "Page to watch. Required unless closing a background watch by watchId.",
+                },
+                "nodeIds": {
+                    "type": ["array", "null"],
+                    "items": {"type": "string"},
+                    "maxItems": 16,
+                    "description": "Up to 16 node ids (n_...) from your latest view of this page. Give these or selector.",
+                },
+                "selector": {
+                    "type": ["string", "null"],
+                    "description": "CSS selector resolved for you, so a watch needs no preparatory read. Give this or nodeIds.",
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["node", "subtree"],
+                    "description": "node: the targets themselves (a value, a state, a name). subtree: also their descendants, for a region that grows.",
+                },
+                "timeoutSeconds": {
+                    "type": ["number", "null"],
+                    "minimum": 0,
+                    "maximum": 120,
+                    "description": "How long to block; null for 15. Ignored when background is true.",
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "false blocks until a comparable change, a first current sample, or timeout, then closes. An observed first sample does not prove change. true returns at once and delivers samples/changes as `watchEvents` on later results.",
+                },
+                "close": {
+                    "type": "boolean",
+                    "description": "true closes a background watch named by watchId, or every watch on pageId.",
+                },
+                "watchId": {
+                    "type": ["string", "null"],
+                    "description": "The background watch to close.",
+                },
+            },
+            "required": [
+                "pageId",
+                "nodeIds",
+                "selector",
+                "scope",
+                "timeoutSeconds",
+                "background",
+                "close",
+                "watchId",
+            ],
+            "additionalProperties": False,
+        },
         "local_fs_search": {
             "type": "object",
             "properties": {
@@ -1015,10 +1103,14 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                     "default": "",
                     "description": "Regex grep; pass an empty string to list matches by glob / event_type only.",
                 },
+                "path": {
+                    "type": "string", "default": ".",
+                    "description": "Authorized directory to search; external directories require terminal approval.",
+                },
                 "glob": {
                     "type": "string",
                     "default": "**/*",
-                    "description": "Glob relative to the current task worktree, e.g. observations/*.json or **/*.json.",
+                    "description": "Glob relative to path, e.g. observations/*.json or **/*.json.",
                 },
                 "event_type": {
                     "type": ["string", "null"],
@@ -1030,6 +1122,7 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                 "max_total_bytes": {"type": "integer", "minimum": 1000, "maximum": 200000, "default": 20000},
             },
             "required": [
+                "path",
                 "pattern",
                 "glob",
                 "event_type",
@@ -1090,7 +1183,7 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                         "properties": {
                             "op": {
                                 "type": "string",
-                                "enum": ["mkdir", "write_text", "write_json", "copy", "stat"],
+                                "enum": ["mkdir", "write_text", "write_json", "copy", "stat", "list"],
                             },
                             "path": {"type": "string"},
                             "base": {
@@ -1101,6 +1194,7 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                                     " Desktop/... is also accepted as a Desktop-relative alias."
                                 ),
                             },
+                            "recursive": {"type": "boolean", "default": False},
                             "source": {"type": ["string", "null"]},
                             "content": {},
                             "overwrite": {"type": "boolean"},

@@ -192,7 +192,7 @@ def _route_forced_collection(
 ) -> "tuple[Optional[Any], str, List[str], List[Dict[str, Any]]]":
     """A 方案：一组强制 skill 按 THIS phase 的四维路由到唯一成员。
 
-    区分维是 stage_hint + fields（domain/task_type 在同一技能组内通常一致、不
+    区分维是 stage_hint + fields（domain 在同一技能组内通常一致、不
     区分——已验证 collection.fields ⊆ detail_phase.fields 的子集关系让 fields
     单独会误命中，靠 stage_hint 精确相等拆开）。用 s.matches(domain=s.domain,…)
     让 domain 自匹配（跳过组内 domain 区分——用户选 suite 已隐含 domain scope）。
@@ -204,7 +204,6 @@ def _route_forced_collection(
     0 或最终仍并列才不盖章走慢路径。ranking 已按实际竞选顺序排列，可直接
     用于日志，避免重复读取 health。"""
     phase = phase or {}
-    task_type = str(worker_contract.get("task_type") or phase.get("task_type") or "")
     stage_hint = str(phase.get("stage_hint") or worker_contract.get("stage_hint") or "")
     expected = phase.get("expected_artifact")
     if not isinstance(expected, dict):
@@ -218,7 +217,7 @@ def _route_forced_collection(
         fields = set(field_names_from_specs(expected.get("fields")))
     matched = [
         s for s in skills
-        if s.matches(domain=s.domain, task_type=task_type,
+        if s.matches(domain=s.domain,
                      stage_hint=stage_hint, fields=fields or None)
     ]
     ranked = [
@@ -495,7 +494,6 @@ def build_skill_selection_request(
         stage_hint = str(worker_contract.get("stage_hint") or "")
         candidates = registry.soft_candidates(
             domain=domain,
-            task_type=str(worker_contract.get("task_type") or ""),
             stage_hint=stage_hint,
             fields=fields,
             text=text,
@@ -656,7 +654,6 @@ def selected_skill_context(
         "sourcePath": str(skill.directory / "SKILL.md") if skill.directory else "",
         "frontmatter": {
             "domain": skill.domain,
-            "task_type": skill.task_type,
             "stage_hint": skill.stage_hint,
             "fields": sorted(skill.fields),
             "description": skill.description,
@@ -752,7 +749,6 @@ def build_known_skills_digest(
                     else "workflow"
                 ),
                 "domain": skill.domain,
-                "task_type": skill.task_type,
                 "stage_hint": skill.stage_hint,
                 "fields": sorted(skill.fields),
                 "input_variables": sorted(_referenced_vars(skill)),
@@ -803,7 +799,6 @@ def _skill_candidate_payload(
         "sourcePath": str(skill.directory / "SKILL.md") if skill.directory else "",
         "frontmatter": {
             "domain": skill.domain,
-            "task_type": skill.task_type,
             "stage_hint": skill.stage_hint,
             "fields": sorted(skill.fields),
             "description": skill.description,

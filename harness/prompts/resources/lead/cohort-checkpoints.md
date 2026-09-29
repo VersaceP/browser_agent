@@ -9,10 +9,9 @@ sources:
   - harness/tools/lead_tools.py
 emitter_sources:
   - harness/task_control/replan.py
+  - harness/delegation.py
   - harness/tools/lead_tools.py
 related_tools:
-  - emit_task_plan
-  - repair_task_plan
   - spawn_browser_agent
 related_methods: []
 error_codes:

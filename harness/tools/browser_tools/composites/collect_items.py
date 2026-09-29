@@ -68,10 +68,6 @@ def _record_extraction_persisted(result: JsonDict) -> bool:
     return _bt()._record_extraction_persisted(result)
 
 
-async def discover_selector_candidates(*args: Any, **kwargs: Any) -> List[JsonDict]:
-    return await _bt().discover_selector_candidates(*args, **kwargs)
-
-
 COLLECT_ITEMS_MAX_ROUNDS = 12
 COLLECT_ITEMS_STABILITY_THRESHOLD = 3
 COLLECT_ITEMS_MAX_DURATION_MS = 120000
@@ -603,15 +599,15 @@ def _collect_contract_warning(
 def _wheel_axis_and_sign(direction: str) -> tuple:
     """Map a compass direction onto the Page.wheel delta field and its sign.
 
-    Positive `scrollX` scrolls right and positive `scrollY` scrolls down, per
+    Positive `deltaX` scrolls right and positive `deltaY` scrolls down, per
     the live Action schema, so up/left are the negative directions.
     """
     return {
-        "down": ("scrollY", 1.0),
-        "up": ("scrollY", -1.0),
-        "right": ("scrollX", 1.0),
-        "left": ("scrollX", -1.0),
-    }.get(str(direction or "").strip().lower(), ("scrollY", 1.0))
+        "down": ("deltaY", 1.0),
+        "up": ("deltaY", -1.0),
+        "right": ("deltaX", 1.0),
+        "left": ("deltaX", -1.0),
+    }.get(str(direction or "").strip().lower(), ("deltaY", 1.0))
 
 
 async def _collect_items_materialize(
@@ -680,7 +676,7 @@ async def _collect_items_materialize(
     if container:
         method = "Input.scroll"
         params = {"pageId": page_id, "direction": direction or "down",
-                  "amount": amount, "container": container,
+                  "distance": amount, "container": container,
                   "purpose": "collect_items: scroll"}
     else:
         # Page.wheel is a real wheel gesture at a point, so it needs one inside
@@ -688,7 +684,7 @@ async def _collect_items_materialize(
         # propagation carries it to the nearest scrollable ancestor.
         method = "Page.wheel"
         axis, sign = _wheel_axis_and_sign(direction or "down")
-        params = {"pageId": page_id, "x": 0, "y": 0, "scrollX": 0, "scrollY": 0,
+        params = {"pageId": page_id, "x": 0, "y": 0, "deltaX": 0, "deltaY": 0,
                   "purpose": "collect_items: scroll"}
         params[axis] = sign * float(amount)
     result = await _invoke_browser_method(
@@ -1246,55 +1242,6 @@ async def _collect_items(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
             "More matched items exist than were harvested (raise harvestLimit or"
             " harvestMaxWindows, or narrow the selector); collection is incomplete."
         )
-    # Offer repeated-row selector candidates ONLY on a genuine selector-no-match
-    # terminal: 0 rows, a clean "done" exhaustion (not blocked/interrupted), no
-    # truncation, and no overlay blocker — otherwise the real blocker (overlay,
-    # time budget, harvest limit) must stand, not be masked by "try another
-    # selector". Gated internal getSemanticTree, one-shot+cached, digest only.
-    selector_no_match = (
-        not collected
-        and result["status"] == "done"
-        and collection_state == "materialization_stalled"
-        and stop_reason in {
-            "stagnant",
-            "max_rounds",
-            "load_more_click_failed",
-            "materialization_action_failed",
-        }
-        and not truncated
-        and overlay_encountered is None
-    )
-    if selector_no_match:
-        candidates = await discover_selector_candidates(agent, page_id)
-        if candidates:
-            result["selectorCandidates"] = candidates
-            # Only recommend USABLE (non-truncated) selectors for a retry; a
-            # truncated one is incomplete CSS.
-            usable = [c for c in candidates if not c.get("truncated")][:3]
-            action_failure_prefix = (
-                f"Materialization action failed ({stop_reason}). "
-                if stop_reason in {
-                    "load_more_click_failed",
-                    "materialization_action_failed",
-                }
-                else ""
-            )
-            if usable:
-                top = ", ".join(f"{c['cssSelector']} (x{c['count']})" for c in usable)
-                result["next_step"] = (
-                    f"{action_failure_prefix}Selector {selector!r} matched 0 rows."
-                    " Repeated page structures"
-                    f" suggest these row selectors: {top}. Re-call collect_items with"
-                    " one of them (verify it carries the fields you need)."
-                )
-            else:
-                result["next_step"] = (
-                    f"{action_failure_prefix}Selector {selector!r} matched 0 rows."
-                    " Repeated structures exist"
-                    " but their class selectors are abnormally long/unstable; inspect"
-                    " the page or use a structural (nth-child/tag) selector."
-                )
-
     rows_to_record: List[JsonDict]
     if collection_field and base_row is not None:
         outer_row = dict(base_row)
@@ -1324,9 +1271,6 @@ async def _collect_items(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
             agent, result=result, record_result=record_result
         )
         if contract_warning is not None:
-            candidates = await discover_selector_candidates(agent, page_id, top=5)
-            if candidates:
-                contract_warning["selectorCandidates"] = candidates[:5]
             result["contractWarning"] = contract_warning
             result["next_step"] = contract_warning["next_instruction"]
         if _record_extraction_persisted(record_result):

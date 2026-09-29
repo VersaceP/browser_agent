@@ -375,7 +375,7 @@ async def _visual_verify(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
             "reason": "browser_agent_multimodal_enabled",
             "next_instruction": (
                 "Use Page.screenshot for a bounded visual observation, then "
-                "re-observe DOM.getAXTree or DOM.getSemanticTree before acting."
+                "re-observe DOM.getAXTree before acting."
             ),
         }
     vl_config = getattr(agent.runtime.harness, "vl", None)
@@ -400,8 +400,7 @@ async def _visual_verify(agent: Any, tool_input: JsonDict, step: int) -> JsonDic
             "reason": "vl.visual_locate_enabled is false",
             "next_instruction": (
                 "Visual locate is turned off for this deployment. Re-observe"
-                " with DOM.getAXTree / DOM.getSemanticTree and act on a"
-                " canonical id."
+                " with DOM.getAXTree and act on a canonical id."
             ),
         }
     selector = str(tool_input.get("selector") or "").strip()
@@ -775,7 +774,7 @@ def _attach_visual_recovery_hint(
             "Use this after the deterministic recovery this receipt already"
             " describes has been tried and the target is still unreachable,"
             " AND you have reason to believe the target is visible on screen"
-            " while the structured surfaces (AXTree / SemanticTree) cannot"
+            " while the structured surface (DOM.getAXTree) cannot"
             " name it. It is not a shortcut past re-observing the page."
         ),
         "call": {
@@ -816,7 +815,7 @@ def _attach_visual_recovery_hint(
             ),
             "coordinateRefused": (
                 "The geometry could not be proven, so no point is offered."
-                " Re-observe with DOM.getAXTree / DOM.getSemanticTree. Do not"
+                " Re-observe with DOM.getAXTree. Do not"
                 " invent a coordinate and do not reuse a point from an earlier"
                 " call."
             ),
@@ -1156,8 +1155,7 @@ async def _maybe_reality_check(
             )
 
         # Two independent ways to be stuck, and the second one has no yield to
-        # count: a worker looping on DOM.getAXTree / DOM.getSemanticTree /
-        # local_fs_read produces nothing the shortfall streak can see, so
+        # count: a worker looping on DOM.getAXTree / local_fs_read produces nothing the shortfall streak can see, so
         # before this it could spend its whole budget with the streak at 0 and
         # the check never armed (observed live in task e3173b5b).
         armed_by = ""
@@ -1542,18 +1540,13 @@ async def _read_page_scroll(
     silently disabling cssPoint promotion. `Page.wheel` is where root-viewport
     scrolling went, and `x`/`y` must be inside the viewport, so the capture's
     own origin is used rather than a fixed guess.
-
-    The alternative, a Semantic Tree read, keeps the instrument independent but
-    costs an entire document to obtain two numbers, twice per promotion. This
-    matches `harness/vl/capture_geometry.py`, which already reasons from scroll
-    receipts, so the two paths agree about what a scroll receipt means.
     """
     from harness.vl.locate import _scroll_position_from_state_read
 
     try:
         resp = await _bt()._invoke_browser_method(
             agent, "Page.wheel",
-            {"pageId": page_id, "x": 0, "y": 0, "scrollX": 0, "scrollY": 0,
+            {"pageId": page_id, "x": 0, "y": 0, "deltaX": 0, "deltaY": 0,
              "purpose": "read the scroll offset for VL coordinate mapping"},
             step,
             internal=True,
@@ -1740,21 +1733,13 @@ async def _promote_visual_locate(
             reported_height=shot_data.get("height"),
             scale_factor=shot_data.get("scaleFactor"),
         )
-        # The same receipt also proves WHERE the crop started. An element
-        # capture carries the target's Semantic Tree and a region capture echoes
-        # its requested x/y, so a cropped capture no longer has to be refused —
-        # its point is translated into viewport space instead.
+        # The same receipt also proves WHERE the crop started: an element
+        # capture carries the target's bounds and a region capture echoes its
+        # requested x/y, so a cropped capture's point is translated into
+        # viewport space instead of being refused.
         origin_receipt = capture_origin(
-            scope=screenshot_scope, shot_data=shot_data,
+            scope=screenshot_scope, shot_data=shot_data, scroll=scroll,
         )
-        if not origin_receipt.get("scrollProven"):
-            # Containment needs the scroll offset, and an element capture's own
-            # Semantic Tree only states it when that tree is rooted at the
-            # document — for a deeply nested target it is truncated to `body`,
-            # which is not the scrolling element and reports a genuine 0.
-            origin_receipt = capture_origin(
-                scope=screenshot_scope, shot_data=shot_data, scroll=scroll,
-            )
         promo = promote_locate(
             lines, verdict["point"], shot_w=shot_w, shot_h=shot_h,
             dpr_receipt=dpr_receipt, scope=screenshot_scope,
@@ -1858,7 +1843,7 @@ async def _promote_visual_locate(
             out["resolvedLabel"] = promo.get("label")
             out["next_instruction"] = (
                 f"Located and promoted to durable id {promo.get('id')!r}. Act on"
-                f" that id (Input.click / DOM.getText with id) — it survives a"
+                f" that id (Input.click, or a bounded DOM.getAXTree query) — it survives a"
                 f" relayout that a coordinate does not. No coordinate is needed"
                 f" or offered here."
             )
@@ -1873,8 +1858,8 @@ async def _promote_visual_locate(
                 "The target was located visually, but it could not be promoted"
                 " to a durable id and the capture's scale/origin could not be"
                 f" proven ({promo.get('coordinateRefused')}), so NO coordinate"
-                " is offered. Re-observe with DOM.getAXTree or"
-                " DOM.getSemanticTree and act on an id. Do not invent a point"
+                " is offered. Re-observe with DOM.getAXTree"
+                " and act on an id. Do not invent a point"
                 " and do not reuse one from an earlier call."
             )
         else:
@@ -1928,7 +1913,7 @@ async def _promote_visual_locate(
         out["next_instruction"] = (
             "The target was located visually but the geometry translation"
             f" failed ({exc}), so no coordinate is offered. Re-observe with"
-            " DOM.getAXTree or DOM.getSemanticTree and act on an id."
+            " DOM.getAXTree and act on an id."
         )
         return out
 

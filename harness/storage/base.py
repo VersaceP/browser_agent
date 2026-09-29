@@ -478,17 +478,6 @@ class Storage(ABC):
     ) -> List[JsonDict]:
         """Read trace steps in sequence order."""
 
-    # -- strategy telemetry ------------------------------------------------
-    @abstractmethod
-    def append_strategy_attempt(
-        self,
-        *,
-        task_id: str,
-        run_id: str,
-        payload: JsonDict,
-    ) -> None:
-        """Record one strategy attempt for cross-task analysis."""
-
     # -- lifecycle ---------------------------------------------------------
     @abstractmethod
     def close(self) -> None:

@@ -12,84 +12,40 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from harness.utils import JsonDict, read_artifact_text, open_artifact_binary
 
 
-def terminal_consistency_contradictions(
-    *,
-    state: Any,
-    plan: Any,
-    final_status: str,
-) -> List[JsonDict]:
-    """Return mechanical contradictions between a done claim and raw attempts.
+def phase_outcome_facts(state: Any) -> List[JsonDict]:
+    """Preserve phase history without deciding the user's current goal.
 
-    This is deliberately not a completeness proof.  It only rejects the
-    impossible combination "done" + a required artifact phase whose latest
-    worker did not itself finish with a schema-valid artifact.
+    A later user instruction or page observation can make the task complete
+    even when an earlier worker returned partial. The Lead must see that
+    history, but a raw worker status cannot veto its semantic conclusion.
     """
-    if str(final_status or "").strip() != "done":
+    phases = state.get("phases") if isinstance(state, dict) else None
+    if not isinstance(phases, dict):
         return []
-    task_state = state if isinstance(state, dict) else {}
-    phase_states = (
-        task_state.get("phases")
-        if isinstance(task_state.get("phases"), dict)
-        else {}
-    )
-    phases = plan.get("phases") if isinstance(plan, dict) else []
-    if not isinstance(phases, list) or not phases:
-        # Resume/compatibility callers may only have persisted phase state.
-        # Use a contract only when that state explicitly carries one; never
-        # infer "artifact required" merely from a zero receipt.
-        phases = []
-        for phase_id, phase_state in phase_states.items():
-            if not isinstance(phase_state, dict):
-                continue
-            expected = (
-                phase_state.get("expected_artifact")
-                if isinstance(phase_state.get("expected_artifact"), dict)
-                else phase_state.get("expectedArtifact")
-            )
-            if isinstance(expected, dict):
-                phases.append({"id": phase_id, "expected_artifact": expected})
-    contradictions: List[JsonDict] = []
-    for phase in phases if isinstance(phases, list) else []:
-        if not isinstance(phase, dict):
+    facts: List[JsonDict] = []
+    for phase_id, phase_state in phases.items():
+        if not isinstance(phase_state, dict):
             continue
-        expected = phase.get("expected_artifact")
-        if not isinstance(expected, dict) or not expected:
-            continue
-        # An artifact declaration with no name, fields, or row constraint is
-        # not an output requirement.
-        if not any(
-            expected.get(key)
-            for key in (
-                "name", "fields", "required_fields", "exact_rows",
-                "min_rows", "max_rows", "count_range",
-            )
-        ):
-            continue
-        phase_id = str(phase.get("id") or "")
-        phase_state = phase_states.get(phase_id)
-        phase_state = phase_state if isinstance(phase_state, dict) else {}
         attempts = phase_state.get("attempts")
         attempts = attempts if isinstance(attempts, list) else []
-        latest = next(
-            (item for item in reversed(attempts) if isinstance(item, dict)),
-            {},
-        )
+        latest = next((item for item in reversed(attempts) if isinstance(item, dict)), {})
         validation = latest.get("validation")
         validation = validation if isinstance(validation, dict) else {}
-        raw_status = str(latest.get("status") or "")
-        from harness.task_control.revalidate import accepted_revalidation
-        if accepted_revalidation(task_state, phase_state, latest):
-            continue
-        if raw_status == "done" and validation.get("status") == "done":
-            continue
-        contradictions.append({
-            "phaseId": phase_id,
-            "rawStatus": raw_status or None,
-            "validationStatus": validation.get("status"),
+        facts.append({
+            "phaseId": str(phase_id),
             "phaseStatus": phase_state.get("status"),
+            "supersededBy": phase_state.get("superseded_by"),
             "attemptCount": len(attempts),
+            "latestWorkerId": latest.get("workerId"),
+            "latestWorkerStatus": latest.get("status"),
+            "latestValidationStatus": validation.get("status"),
+            "revalidationDecision": (
+                (phase_state.get("artifactRevalidation") or {}).get("decision")
+                if isinstance(phase_state.get("artifactRevalidation"), dict)
+                else None
+            ),
         })
-    return contradictions
+    return facts
 
 
 def _finished_worker_entries(spawner: Any) -> Iterable[Tuple[str, JsonDict]]:
@@ -241,13 +197,22 @@ def _apply_supersessions(state: JsonDict, paths: List[str], logger: Any = None) 
 
 
 def _validated_artifacts(state: JsonDict, logger: Any = None) -> List[str]:
+    phases = state.get("phases") if isinstance(state.get("phases"), dict) else {}
+    owners: Dict[str, List[JsonDict]] = {}
+    for phase in phases.values():
+        if isinstance(phase, dict):
+            for value in phase.get("validated_artifacts") or []:
+                owners.setdefault(str(value), []).append(phase)
+    def current(value):
+        sources = owners.get(str(value)) or []
+        return not sources or any(not p.get("superseded_by") for p in sources)
     active_ledger = state.get("artifacts")
     if isinstance(active_ledger, list) and active_ledger:
         # task_state.artifacts is the coordinator's active validated generation
         # ledger. Prefer it over historical per-phase paths so replacements are
         # not double-counted across replans/remediation.
         return _apply_supersessions(state, list(dict.fromkeys(
-            str(value) for value in active_ledger if value
+            str(value) for value in active_ledger if value and current(value)
         )), logger)
     paths: List[str] = []
     phases = state.get("phases") if isinstance(state.get("phases"), dict) else {}
@@ -359,6 +324,7 @@ def _build_completion_receipt_from_results(
         },
         "source": "harness_mechanical_state",
         "modelOverrideAllowed": False,
+        "phaseOutcomes": phase_outcome_facts(task_state),
     }
 
 

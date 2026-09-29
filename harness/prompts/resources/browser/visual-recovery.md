@@ -14,7 +14,6 @@ related_tools:
   - browser_call
 related_methods:
   - DOM.getAXTree
-  - DOM.getSemanticTree
   - Input.click
 error_codes:
   - mixed_bindings

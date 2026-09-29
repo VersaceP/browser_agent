@@ -2,7 +2,7 @@
 harness.diagnostics.selector_audit - Post-run audit of element targeting.
 
 For every method that takes an element handle (Input.click / Input.type /
-Input.drag / DOM.getText / DOM.getAttribute), classify what the model
+Input.drag / DOM.inspectSelect), classify what the model
 actually passed (axtree_id, css selector, fake jQuery-style pseudo, or
 an "other_string" the model invented) and pair each call with its outcome.
 
@@ -31,6 +31,8 @@ from __future__ import annotations
 import argparse
 import json
 import re
+
+from harness.observation.axtree_format import AX_NODE_ID_RE
 import statistics
 import sys
 from collections import Counter, defaultdict
@@ -46,17 +48,15 @@ ELEMENT_TARGETED_METHODS = frozenset({
     "Input.type",
     "Input.drag",
     "DOM.inspectSelect",
-    "DOM.getText",
-    "DOM.getAttribute",
 })
 INTERACTION_METHODS = frozenset({
     "Input.click", "Input.select", "Input.type", "Input.press",
 })
 FIND_TOOLS = frozenset({"local_fs_search", "local_fs_read"})
-AXTREE_METHODS = frozenset({"DOM.getAXTree", "DOM.getSemanticTree"})
+AXTREE_METHODS = frozenset({"DOM.getAXTree"})
 RENDER_RECOVERY_EVENT_TYPES = frozenset({"browser.call.recovery_result"})
 
-AXTREE_ID_RE = re.compile(r"^\d+:-?\d+:-?\d+$")
+AXTREE_ID_RE = AX_NODE_ID_RE
 FAKE_PSEUDO_RE = re.compile(r":(text|contains|has)\b")
 XPATH_RE = re.compile(r"\bxpath\b", re.I)
 CSS_TAG_RE = re.compile(r"^([a-z][a-z0-9-]*)(?:[#.:\[\s>+~]|$)")

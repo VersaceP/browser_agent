@@ -77,19 +77,26 @@ def resolve_required_field_specs(expected_artifact: Any) -> JsonDict:
         raw_required = raw_fields
 
     specs: JsonDict = {}
+    declarations: JsonDict = {}
     unresolved: List[str] = []
     for item in raw_required if isinstance(raw_required, list) else []:
         name = field_name_from_spec(item)
         if not name or name in specs or name in unresolved:
             continue
-        # An object in required_fields overrides the base spec; a bare name
-        # refers to it.
-        spec = item if isinstance(item, dict) and item.get("type") else base.get(name)
+        # A bare name refers to fields; an inline object refines that same
+        # declaration. All readers (types, licences and diagnostics) must see
+        # the same resolved specification.
+        spec = dict(base.get(name) or {})
+        if isinstance(item, dict):
+            spec.update(item)
+        if spec:
+            declarations[name] = spec
         if isinstance(spec, dict) and str(spec.get("type") or "").strip():
             specs[name] = spec
         else:
             unresolved.append(name)
-    return {"specs": specs, "unresolved": unresolved, "declared": declared}
+    return {"specs": specs, "declarations": declarations,
+            "unresolved": unresolved, "declared": declared}
 
 
 def current_row_structure_failures(raw_rows: Any, expected: Any) -> List[JsonDict]:
@@ -121,8 +128,12 @@ def current_row_structure_failures(raw_rows: Any, expected: Any) -> List[JsonDic
             if value is None and spec.get("nullable") is True:
                 continue
             if not isinstance(value, types[kind]) or (kind in {"integer", "number"} and isinstance(value, bool)):
+                pointer = name.replace("~", "~0").replace("/", "~1")
                 failures.append({"type": "schema", "row": index, "field": name,
-                                 "expectedType": kind, "message": "declared field type mismatch"})
+                                 "path": f"/rows/{index}/{pointer}",
+                                 "expectedType": kind,
+                                 "actualType": type(value).__name__,
+                                 "message": "declared field type mismatch"})
     return failures
 
 

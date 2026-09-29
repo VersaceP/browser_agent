@@ -188,6 +188,11 @@ class PageLifecycleTracker:
             state.status = "failed"
             self._record_failure(state, page_failure(payload))
             self._set_settled_event(state)
+        elif name == "Page.close":
+            state.status = "closed"
+            state.requires_state_resync = True
+            state.requires_ax_refresh = True
+            self._set_settled_event(state)
         elif name == "Page.crashed":
             state.status = "crashed"
             self._record_failure(

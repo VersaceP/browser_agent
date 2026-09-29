@@ -953,12 +953,25 @@ def make_browser_event_logger(
     enabled: bool,
     prefix: str = "browser.transport",
 ) -> Optional[Any]:
-    if not enabled:
-        return None
-
     def on_event(event_type: str, payload: JsonDict) -> None:
+        # A disabled payload trace still needs one compact failure record.
+        # The client constructs this from typed transport/protocol facts;
+        # ordinary request, response and notification bodies remain disabled.
+        if not enabled and event_type not in {"failure", "orphan_response"}:
+            return
+        if not enabled:
+            # The payload switch may be off precisely to avoid free text from
+            # actions or sites. Keep typed codes and routing facts in that mode.
+            payload = {
+                key: value for key, value in payload.items()
+                if key not in {"message", "platformMessage", "publicErrorMessage"}
+            }
         logger.write(f"{prefix}.{event_type}", payload)
 
+    # ABCPClient checks this before collecting or scrubbing a large response.
+    # A failure-only logger must not pay full payload logging costs on success.
+    if not enabled:
+        on_event.abcp_event_types = frozenset({"failure", "orphan_response"})
     return on_event
 
 

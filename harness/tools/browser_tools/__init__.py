@@ -66,7 +66,6 @@ from harness.observation.overlay_detector import (
     detect_overlay_from_result,
     title_looks_like_auth_page,
 )
-from harness.observation.semantic_index import discover_selector_candidates
 from harness.observation.page_lifecycle import (
     AUTOMATION_UNAVAILABLE_FAILURE,
     PageLifecycleTracker,
@@ -92,10 +91,8 @@ from harness.task_control import (
     phase_prior_artifact_paths,
     validate_worker_artifacts,
 )
-from harness.planning.task_types import resolve_task_type_fail_closed
 from harness.tools.tool_policy import (
     disabled_reason_for_method,
-    hidden_harness_tools_for_task_type,
     mask_params,
 )
 from harness.tools.loop_guard import check_tool_call_loop
@@ -127,6 +124,8 @@ from .axtree_state import (
     _axtree_ids_from_value,
     _axtree_lines_from_value,
     _axtree_nodes_from_lines,
+    _current_axtree_lines,
+    _current_axtree_nodes,
     _axtree_seen_ids,
     _axtree_seen_signature,
     _browser_side_rematch_mode,
@@ -187,6 +186,13 @@ from .bindings import (  # noqa: F401
     _shown_page_inventory_rows,
     _workflow_auth_started_generation,
 )
+from .observation_view import (  # noqa: F401
+    _attach_watch_events,
+    _close_agent_watches,
+    _full_view_evidence,
+    _project_observation_for_model,
+    _await_node_change,
+)
 from .capability import (  # noqa: F401
     _TRUSTED_COLLECTION_RUNTIME_TOKEN,
     _execute_browser_capability_tool,
@@ -220,9 +226,6 @@ from .dispatch import (  # noqa: F401
     _page_lifecycle_after_action,
     _page_lifecycle_before_action,
     _page_lifecycle_guard_before,
-    _take_pending_ax_bypass,
-    _annotate_target_independent_read,
-    target_independent_document_read,
     _prepare_navigation_context,
     _prepare_runtime_evaluation,
     _record_selected_skill_tool_trace,
@@ -397,7 +400,6 @@ from .validation import (  # noqa: F401
     _check_nested_id_format,
     _check_scroll_param_requirements,
     _check_target_param_requirements,
-    _default_semantic_tree_shadow_dom,
     _non_empty_param,
     _non_negative_numeric_param,
     _normalize_dom_get_img_output,

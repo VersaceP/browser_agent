@@ -119,14 +119,14 @@ def _check_nested_id_format(method: str, params: JsonDict) -> Optional[JsonDict]
             "params": params,
             "status": "invalid_params",
             "error": (
-                f"{method} params.{param_path} is not a valid canonical element"
-                " id (expected frameId:axNodeId:domNodeId)."
+                f"{method} params.{param_path} is not a valid node id (expected"
+                " an opaque n_<hex> id from the current page observation)."
             ),
             "tool_was_executed": False,
             "invalidParam": param_path,
             "next_instruction": (
                 "Re-read the active page with DOM.getAXTree and copy a current"
-                " canonical id verbatim, or drop the id and locate by selector."
+                " node id verbatim, or drop the id and locate by selector."
             ),
         }
     return None
@@ -137,8 +137,8 @@ def _check_id_param_format(
     method_schemas: Optional[dict],
 ) -> Optional[JsonDict]:
     """Validate a supplied canonical element `id` against the describeAction
-    schema pattern. A truncated/fabricated id (e.g. "2:5367" where the schema
-    requires "^\\d+:\\d+:\\d+$") is caught here with an actionable error
+    schema pattern. A truncated/fabricated id (e.g. "n_5367" where the schema
+    requires "^n_[0-9a-f]{16}$") is caught here with an actionable error
     instead of reaching the browser and returning a raw -32602 Invalid params.
     Only fires when an `id` is actually supplied; a missing id is handled by the
     selector/id presence check. Returns None when no pattern is available
@@ -189,13 +189,13 @@ DOM_GET_IMG_MAX_TARGETS = 32
 
 _SCROLL_MODE_INSTRUCTION = (
     "Input.scroll has three schema branches and no top-level locator. Target mode:"
-    " target={id?,selector?} (plus optional container) with amount as the"
-    " per-step cap and NO direction — the browser derives it and success means"
+    " target={id?,selector?} (plus optional container) with NO distance or"
+    " direction — the browser derives the movement and success means"
     " targetVisible=true. Container-distance mode: container={id?,selector?}"
-    " with direction and amount. Container-edge mode: container={id?,selector?}"
+    " with direction and distance. Container-edge mode: container={id?,selector?}"
     " with edge=start|end and axis=vertical|horizontal (vertical by default)."
     " Root-viewport scrolling is Page.wheel with current in-viewport x/y and"
-    " explicit scrollX/scrollY (positive = right/down) or edge/axis. Page.wheel"
+    " explicit deltaX/deltaY (positive = right/down) or edge/axis. Page.wheel"
     " reports movement as observedDelta against requestedDelta — NOT as"
     " totalDelta, which is Input.scroll's name for it. Read that field plus"
     " completedReason before deciding whether another wheel action is needed."
@@ -207,11 +207,9 @@ def _check_scroll_param_requirements(
 ) -> Optional[JsonDict]:
     """Reject Input.scroll shapes that do not express one supported mode.
 
-    Some malformed shapes are rejected by the platform, while unknown keys are
-    permissive on ABCP 1.1.9. In particular the obsolete
-    ``viewport={direction, amount}`` object is silently ignored, after which
-    the action falls back to its top-level defaults (down, 300). Catch these
-    locally so an explicit amount=0/1200 cannot masquerade as a 300px scroll.
+    Check locator presence and mutually exclusive modes before dispatch.
+    Container distance uses the public ``distance`` field; ``amount`` belongs
+    to the native bridge and is not a public Action parameter.
     """
     if method != "Input.scroll":
         return None
@@ -255,14 +253,14 @@ def _check_scroll_param_requirements(
                 f"Input.scroll params.{key} requires id or selector.", key
             )
 
-    amount = params.get("amount")
-    numeric_amount = (
-        float(amount)
-        if isinstance(amount, (int, float)) and not isinstance(amount, bool)
+    distance = params.get("distance")
+    numeric_distance = (
+        float(distance)
+        if isinstance(distance, (int, float)) and not isinstance(distance, bool)
         else None
     )
-    if numeric_amount is not None and numeric_amount < 0:
-        return invalid("Input.scroll amount must not be negative.", "amount")
+    if numeric_distance is not None and numeric_distance < 0:
+        return invalid("Input.scroll distance must not be negative.", "distance")
     if target is None and container is None:
         return invalid(
             "Input.scroll requires target reveal or an explicit container; use"
@@ -281,12 +279,11 @@ def _check_scroll_param_requirements(
                 " params.direction or switch to container mode.",
                 "direction",
             )
-        if numeric_amount is not None and numeric_amount <= 0:
+        if distance is not None:
             return invalid(
-                "Input.scroll target mode needs a positive amount (the cap on"
-                " each smooth-scroll step). amount=0 reads state and is valid"
-                " only for container mode.",
-                "amount",
+                "Input.scroll target mode derives its own movement; drop"
+                " params.distance or switch to container-distance mode.",
+                "distance",
             )
     if edge is not None:
         if container is None:
@@ -294,10 +291,10 @@ def _check_scroll_param_requirements(
                 "Input.scroll edge mode requires a container locator.",
                 "container",
             )
-        if _non_empty_param(params, "direction") or amount is not None:
+        if _non_empty_param(params, "direction") or distance is not None:
             return invalid(
-                "Input.scroll container-edge mode does not accept direction or amount.",
-                "direction" if _non_empty_param(params, "direction") else "amount",
+                "Input.scroll container-edge mode does not accept direction or distance.",
+                "direction" if _non_empty_param(params, "direction") else "distance",
             )
     elif _non_empty_param(params, "axis"):
         return invalid(
@@ -320,7 +317,7 @@ def _check_target_param_requirements(
     if scroll_error is not None:
         return scroll_error
     has_selector_or_id = _non_empty_param(params, "selector") or _non_empty_param(params, "id")
-    batch_methods = {"DOM.getText", "DOM.getAttribute", "DOM.getImg"}
+    batch_methods = {"DOM.getImg"}
     raw_targets = params.get("targets")
     has_batch_targets = isinstance(raw_targets, list) and bool(raw_targets)
     if method in batch_methods and has_batch_targets:
@@ -395,8 +392,6 @@ def _check_target_param_requirements(
             "missingAnyOf": [["targets"]],
         }
     if method in {
-        "DOM.getText",
-        "DOM.getAttribute",
         "DOM.inspectSelect",
         "Input.select",
         "Input.type",
@@ -470,7 +465,7 @@ def _check_target_param_requirements(
 def _annotate_dom_batch_response(method: str, response: Any) -> Any:
     """Add a compact receipt without changing the native ordered item envelope."""
 
-    if method not in {"DOM.getText", "DOM.getAttribute", "DOM.getImg"}:
+    if method != "DOM.getImg":
         return response
     if not isinstance(response, dict):
         return response
@@ -505,33 +500,6 @@ def _annotate_dom_batch_response(method: str, response: Any) -> Any:
         "targetOrderPreserved": True,
     }
     return copied
-
-def _default_semantic_tree_shadow_dom(
-    method: str,
-    params: JsonDict,
-    method_schemas: Any,
-) -> Tuple[JsonDict, bool]:
-    """Include shadow content unless the caller explicitly opts out.
-
-    An omitted flag makes a rendered custom-element host look like an empty
-    subtree, which led workers to classify tall v-detail-* hosts as a platform
-    limitation and skip exportable images. This default is applied only when
-    the connected schema advertises the parameter, so older ABCP versions do
-    not receive an invented argument. Explicit false remains an escape hatch
-    for a deliberately light diagnostic.
-    """
-    if method != "DOM.getSemanticTree" or "includeShadowDom" in params:
-        return params, False
-    schema = (
-        method_schemas.get(method)
-        if isinstance(method_schemas, dict) else None
-    )
-    schema_param_names = set(schema_param_specs(schema)) if isinstance(schema, dict) else set()
-    if not schema_param_names or "includeShadowDom" not in schema_param_names:
-        return params, False
-    normalized = dict(params)
-    normalized["includeShadowDom"] = True
-    return normalized, True
 
 def _normalize_screenshot_output(
     method: str,

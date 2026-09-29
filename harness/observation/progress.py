@@ -19,9 +19,6 @@ NO_ARTIFACT_DIAGNOSTIC_TOOLS = frozenset({
     "search_harness_guides",
     "visual_verify",
     "DOM.getAXTree",
-    "DOM.getSemanticTree",
-    "DOM.getText",
-    "DOM.getAttribute",
     "Input.scroll",
     "Page.wheel",
     "Input.press",
@@ -57,8 +54,6 @@ ARTIFACT_PROGRESS_TOOLS = {
     # budget would reject legitimate image-heavy pages.  Keep it behind the
     # worker step/loop bounds, but never treat it as no-artifact diagnostics.
     "DOM.getImg",
-    "DOM.getText",
-    "DOM.getAttribute",
     "Input.click",
     "Page.click",
     "Input.type",
@@ -71,8 +66,6 @@ ARTIFACT_PROGRESS_TOOLS = {
 
 PRODUCTIVE_PRIMITIVE_TOOLS = {
     "DOM.getAXTree",
-    "DOM.getText",
-    "DOM.getAttribute",
     "Input.click",
     "Page.click",
     "Input.type",
@@ -90,10 +83,6 @@ MAX_HISTORY_NAVIGATION_CREDITS = 12
 # cheap state/DOM reads they must not receive an unlimited bypass.  Counts are
 # scoped to a page navigation epoch; a verified navigation resets that page.
 HEAVY_DIAGNOSTIC_LIMITS = {
-    # A review drawer can require several scroll -> SemanticTree rounds before
-    # the requested record count materializes.  Keep this bounded, but leave
-    # enough room for the verified 5-round flow plus re-perception.
-    "DOM.getSemanticTree": 12,
     "Page.screenshot": 3,
     "visual_verify": 3,
     "Page.reload": 2,
@@ -163,7 +152,6 @@ class ProgressAccountant:
     repair_progress_signatures: Set[str] = field(default_factory=set)
     navigation_epochs: Dict[str, int] = field(default_factory=dict)
     heavy_diagnostic_counts: Dict[str, int] = field(default_factory=dict)
-    last_diagnostic_allowance: Optional[JsonDict] = None
     history_navigation_credit_limit: int = MIN_HISTORY_NAVIGATION_CREDITS
     history_navigation_credits_used: int = 0
     mandatory_recovery_credits_used: Set[str] = field(default_factory=set)
@@ -241,7 +229,6 @@ class ProgressAccountant:
             self.extraction_artifact_count,
             artifact_count,
         )
-        self.last_diagnostic_allowance = None
         self.last_mandatory_recovery_allowance = None
         if (
             requires_artifact
@@ -265,16 +252,7 @@ class ProgressAccountant:
                     "diagnosticUses": used,
                     "diagnosticLimit": limit,
                 }, step)
-            used += 1
-            self.heavy_diagnostic_counts[key] = used
-            self.last_diagnostic_allowance = {
-                "tool": tool_name,
-                "pageId": str(page_id or "") or None,
-                "diagnosticScope": scope,
-                "navigationEpoch": self.navigation_epochs.get(scope, 0),
-                "diagnosticUses": used,
-                "diagnosticLimit": limit,
-            }
+            self.heavy_diagnostic_counts[key] = used + 1
         if (
             requires_artifact
             and artifact_count == 0
@@ -409,7 +387,7 @@ class ProgressAccountant:
             self.history_navigation_credits_used = 0
             return
         self.turns_since_artifact_progress += 1
-        if tool_name in {"DOM.getAXTree", "DOM.getSemanticTree"} and _tool_result_success(result):
+        if tool_name == "DOM.getAXTree" and _tool_result_success(result):
             # A fresh DOM snapshot (and its offload file) makes follow-up
             # local file reads legitimate perception work again. Without this
             # reset the counter is sticky until record_extraction, which
@@ -507,11 +485,6 @@ class ProgressAccountant:
             "toolCalls": self.tool_calls,
             "navigationEpoch": self.navigation_epochs[scope],
         }
-
-    def consume_diagnostic_allowance(self) -> Optional[JsonDict]:
-        value = self.last_diagnostic_allowance
-        self.last_diagnostic_allowance = None
-        return value
 
     def notify_repair_progress(self, applied: Any) -> JsonDict:
         """Credit new manifest-authorized fields without crediting the artifact.

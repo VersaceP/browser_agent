@@ -7,11 +7,10 @@ prompts talk about ``run.jsonl`` and ``traces/*.jsonl``. Changing that contract
 would mean rewriting prompts, so instead the database is presented through the
 same names it replaced.
 
-Three tables back three path families:
+Two event tables back two path families:
 
     run.jsonl                 -> run_events
     traces/<worker>.jsonl     -> worker_trace_events
-    strategy_attempts.jsonl   -> strategy_attempts
     everything else           -> task_resources, keyed by logical_path
 
 Rendering reproduces the exact line a file backend would have written, so a
@@ -48,7 +47,6 @@ _ENVELOPE_KEYS = (
     ("messageId", "message_id"),
     ("toolCallId", "tool_call_id"),
 )
-STRATEGY_ATTEMPTS_PATH = "strategy_attempts.jsonl"
 TRACES_PREFIX = "traces/"
 
 # One row per logical_path: the newest run wins, then the newest version within
@@ -126,13 +124,6 @@ class VirtualTaskFs:
         ).fetchall():
             files.append((f"{TRACES_PREFIX}{trace_row[0]}.jsonl", int(trace_row[1]), True))
 
-        row = connection.execute(
-            "SELECT COUNT(*) FROM strategy_attempts WHERE task_id = ?",
-            (self.task_id,),
-        ).fetchone()
-        if row and int(row[0]) > 0:
-            files.append((STRATEGY_ATTEMPTS_PATH, int(row[0]) * 400, True))
-
         # Resources are unique per (task, run, logical_path), so a resumed task
         # legitimately holds several rows for the same path. A path names one
         # file to a reader, so collapse to the newest run's newest version -
@@ -196,8 +187,6 @@ class VirtualTaskFs:
         path = str(logical_path or "").strip()
         if path == RUN_EVENTS_PATH:
             return self._iter_run_events()
-        if path == STRATEGY_ATTEMPTS_PATH:
-            return self._iter_strategy_attempts()
         if path.startswith(TRACES_PREFIX) and path.endswith(".jsonl"):
             worker_id = path[len(TRACES_PREFIX):-len(".jsonl")]
             return self._iter_worker_trace(worker_id)
@@ -282,31 +271,6 @@ class VirtualTaskFs:
             for row in rows:
                 cursor = int(row["trace_event_id"])
                 yield str(row["trace_json"]) + "\n"
-
-    def _iter_strategy_attempts(self) -> Iterator[str]:
-        rows = self._connection.execute(
-            "SELECT * FROM strategy_attempts WHERE task_id = ? ORDER BY attempt_id",
-            (self.task_id,),
-        ).fetchall()
-        for row in rows:
-            record = dict(row)
-            try:
-                strategy_ids = json.loads(record.get("strategy_ids_json") or "[]")
-            except (TypeError, ValueError):
-                strategy_ids = []
-            yield _dump({
-                "ts": record.get("created_at"),
-                "taskId": self.task_id,
-                "phaseId": record.get("phase_id"),
-                "workerId": record.get("worker_id"),
-                "strategy_ids": strategy_ids,
-                "status": record.get("status"),
-                "statusCategory": record.get("status_category"),
-                "validatedStatus": record.get("validated_status"),
-                "failureClassification": record.get("failure_classification"),
-                "rowCount": record.get("row_count"),
-                "artifactCount": record.get("artifact_count"),
-            }) + "\n"
 
     def _iter_resource(self, logical_path: str) -> Optional[Iterator[str]]:
         row = self._connection.execute(

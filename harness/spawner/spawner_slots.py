@@ -969,9 +969,6 @@ class SpawnerSlotsMixin:
             score += 40
         elif phase_text and _phase_family(slot.last_phase_id) == _phase_family(phase_text):
             score += 24
-        task_type = str(worker_contract.get("task_type") or "")
-        if task_type and slot.last_task_type == task_type:
-            score += 12
         overlap = task_origins.intersection(slot.origins)
         score += min(len(overlap), 3) * 8
         if slot.last_result_summary.get("validatedStatus") == "validated_done":
@@ -1357,6 +1354,12 @@ class SpawnerSlotsMixin:
                         "attempt": attempt,
                         "maxAttempts": attempts,
                         "error": str(exc)[:500],
+                        "transportCode": getattr(exc, "transport_code", None),
+                        "rpcCode": getattr(exc, "rpc_code", None),
+                        "requestId": getattr(exc, "request_id", "") or None,
+                        "requestSent": getattr(exc, "request_sent", None),
+                        "connection": getattr(exc, "connection_details", None)
+                            or getattr(client, "connection_details", {}),
                     },
                 )
                 if attempt < attempts and backoff > 0:

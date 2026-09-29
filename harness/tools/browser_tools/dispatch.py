@@ -22,7 +22,9 @@ from harness.runtime.lifecycle import LifecycleContext
 from harness.runtime.lifecycle import lifecycle_for
 from harness.tools.local_fs import local_fs_read
 from harness.tools.local_fs import local_fs_search
+from harness.tools.local_fs import local_fs_list
 from harness.tools.file_tools import local_fs_batch
+from harness.tools.path_authorization import authorize_tool_call
 from harness.prompts import read_harness_guide
 from harness.prompts import search_harness_guides
 from harness.observation.page_lifecycle import PageLifecycleTracker
@@ -32,7 +34,6 @@ from harness.tools.runtime_evaluation import RuntimeEvaluationService
 from harness.results.call_outcome import replay_forbidden
 from harness.workflow.workflow_schema_source import contract_stamp
 from harness.tools.tool_policy import collect_sensitive_replacements
-from harness.tools.tool_policy import hidden_harness_tools_for_task_type
 from harness.tools.tool_policy import redact_values
 from harness.tools.tool_policy import sensitive_browser_method_params
 from harness.tools.argument_pipeline import SchemaIssue
@@ -130,114 +131,10 @@ def _lifecycle_page_id(agent: Any, params: Any) -> str:
         return str(params.get("pageId") or "").strip()
     return str(getattr(agent, "axtree_page_id", "") or "").strip()
 
-def target_independent_document_read(method: str, params: Any) -> bool:
-    """True for a read that names no element and therefore cannot go stale.
-
-    Deliberately one method, not a rule about a missing `target` key. Locators
-    are not uniform across the protocol - `id`, `selector`, `targets`,
-    `target`, `container`, `toId`, `toSelector` all appear - so "no target
-    field" is not a decidable property of an arbitrary call. `DOM.getText`
-    cannot even be expressed without one. `DOM.getSemanticTree` is the case
-    the schema defines: omitting both `id` and `selector` IS the document-root
-    request, so there is no prior element for a navigation to invalidate.
-    """
-
-    if method != "DOM.getSemanticTree" or not isinstance(params, dict):
-        return False
-    return not str(params.get("id") or "").strip() and not str(
-        params.get("selector") or ""
-    ).strip()
-
-
-def _take_pending_ax_bypass(agent: Any) -> Optional[JsonDict]:
-    """Pop the token the lifecycle guard issued when it approved a bypass.
-
-    The snapshot used to be taken by the CALLER, before the guard ran. That
-    read a state the guard was still free to change: a page that begins
-    `loading` yields no snapshot, then the guard's own one-shot Page.getState
-    settles it and approves the read - and the annotation, holding `None`,
-    attached nothing. The exemption went out silently, which is the one thing
-    it is not allowed to do. Issuing the token inside the decision makes the
-    approval and the state it was based on a single act.
-    """
-
-    token = getattr(agent, "_ax_refresh_bypass_pending", None)
-    agent._ax_refresh_bypass_pending = None
-    return token if isinstance(token, dict) else None
-
-
-def _annotate_target_independent_read(
-    agent: Any,
-    method: str,
-    params: Any,
-    response: Any,
-    before: Optional[JsonDict],
-) -> None:
-    """Record that the AX-refresh obligation was bypassed, and still stands.
-
-    The bypass buys one page-wide look at structure. It does NOT clear
-    `requires_ax_refresh`: a document-root read does not refresh cached AX
-    handles. Calls using those handles still need a current AXTree; selectors
-    and other targets remain subject to their own identity checks.
-    """
-
-    if not before or not isinstance(response, dict):
-        return
-    tracker = getattr(agent, "page_lifecycle", None)
-    if not isinstance(tracker, PageLifecycleTracker):
-        return
-    page_id = str(before.get("pageId") or "")
-    state = tracker.state(page_id)
-    generation = int(getattr(state, "generation", -1) or 0) if state else -1
-    status = getattr(state, "status", "") if state else ""
-    resync_now = bool(getattr(state, "requires_state_resync", True)) if state else True
-    # Generation is the coarse signal; the obligations are the fine one. A
-    # change can re-establish a resync duty without advancing the generation,
-    # and that alone makes the tree unsafe to record. `requires_ax_refresh` is
-    # deliberately NOT compared: this read never discharges it, so it standing
-    # or being discharged elsewhere says nothing about this tree's stability.
-    stable = (
-        state is not None
-        and generation == before.get("generation")
-        and status == before.get("status")
-        and status == "settled"
-        and not resync_now
-    )
-    response["pageLifecycle"] = tracker.receipt(page_id)
-    response["axRefreshBypass"] = {
-        "reason": "target_independent_document_read",
-        "doesNotClearAXRefresh": True,
-        "note": (
-            "A document-root read needs no prior element, so it ran without the"
-            " AXTree refresh. The refresh obligation is unchanged: call"
-            " DOM.getAXTree before reusing an AX handle."
-        ),
-        "stableEvidence": bool(stable),
-    }
-    if not stable:
-        # Executed, so not a rejection - but the tree may describe a document
-        # the model was not asking about.
-        response["status"] = "page_changed_during_read"
-        response["stableEvidence"] = False
-        response["next_instruction"] = (
-            "The page lifecycle moved while this document-root tree was read."
-            " Do not record it as evidence; re-observe the settled page."
-        )
-    agent.logger.write("page.lifecycle.ax_refresh_bypass", {
-        "method": method,
-        "pageId": page_id,
-        "generationBefore": before.get("generation"),
-        "generationAfter": generation,
-        "stableEvidence": bool(stable),
-    })
-
-
 async def _page_lifecycle_guard_before(
     agent: Any,
     method: str,
     params: JsonDict,
-    *,
-    allow_target_independent_document_read: bool = False,
 ) -> Optional[JsonDict]:
     """Event-driven pre-call gate.
 
@@ -245,8 +142,6 @@ async def _page_lifecycle_guard_before(
     Page.getState call.  Re-perception obligations are then exposed as explicit
     guards so the model cannot continue with stale DOM handles.
     """
-    # Cleared first so a token can only ever describe THIS decision.
-    agent._ax_refresh_bypass_pending = None
     tracker = getattr(agent, "page_lifecycle", None)
     if not isinstance(tracker, PageLifecycleTracker):
         return None
@@ -349,12 +244,6 @@ async def _page_lifecycle_guard_before(
             return {"status": "page_axtree_refresh_required", "tool_was_executed": False,
                     "pageLifecycle": tracker.receipt(page_id),
                     "next_instruction": "Refresh the AX evidence before using handles from the previous document."}
-        if target_independent_document_read(method, params):
-            agent._ax_refresh_bypass_pending = {
-                "pageId": page_id, "generation": int(state.generation),
-                "status": state.status, "requiresStateResync": state.requires_state_resync,
-                "requiresAXTreeRefresh": state.requires_ax_refresh,
-            }
     return None
 
 def _page_lifecycle_before_action(agent: Any, method: str, params: JsonDict) -> None:
@@ -458,6 +347,7 @@ def _sensitive_transport_metadata(metadata: JsonDict) -> JsonDict:
         "connectionFatal",
         "requestSent",
         "rpcCode",
+        "requestId",
         "tool_was_executed",
         "retryable",
         "quarantined",
@@ -630,6 +520,26 @@ def build_browser_tool_dispatcher(agent: Any) -> BrowserToolDispatcher:
                 )
                 _record_tool_argument_rejection(agent, result)
                 return result, False
+            authorization_error = await authorize_tool_call(agent, effective_call)
+            if authorization_error is not None:
+                if authorization_error.get("status") == "needs_human":
+                    agent.diagnostics.local_path_authorization_pending = dict(authorization_error)
+                    # Finish this attempt so the spawner wakes the Lead rather
+                    # than letting the model retry an unanswered consent prompt.
+                    return {
+                        **authorization_error,
+                        "status": "hitl_required",
+                        "answer": (
+                            "Local file authorization is required in the task terminal: "
+                            f"{authorization_error.get('mode')} {authorization_error.get('path')}. "
+                            "No file operation was executed. Resume after explicit user consent; "
+                            "browser HITL resume does not grant file permissions."
+                        ),
+                    }, True
+                if authorization_error.get("code") == "external_path_access_denied":
+                    return {**authorization_error, "status": "incomplete",
+                            "answer": "User denied local file access. The requested tool and remaining calls in this batch were not executed. Do not retry through another tool."}, True
+                return authorization_error, False
             result, should_stop = await execute_browser_tool(
                 agent, effective_call, step
             )
@@ -737,7 +647,21 @@ async def execute_browser_tool(agent: Any, tool_call: JsonDict, step: int) -> Tu
     agent._pending_progress_observations = []
     agent._pending_loop_observations = []
     trace_start = len(getattr(agent, "trace", []) or [])
-    result, should_stop = await _bt()._execute_browser_tool_impl(agent, tool_call, step)
+    # Hold off pollers during ordinary tools, but not during their consumer's
+    # wait: otherwise a blocking await_node_change prevents the very reads
+    # it waits for.
+    # A concurrent ordinary tool still owns its own depth contribution.
+    blocks_observation = str(tool_call.get("name") or "") != "await_node_change"
+    if blocks_observation:
+        agent._observation_tool_depth = int(getattr(agent, "_observation_tool_depth", 0) or 0) + 1
+    try:
+        result, should_stop = await _bt()._execute_browser_tool_impl(agent, tool_call, step)
+    finally:
+        if blocks_observation:
+            agent._observation_tool_depth -= 1
+    _bt()._attach_watch_events(agent, result, str(tool_call.get("name") or ""))
+    if should_stop:
+        _bt()._close_agent_watches(agent)
     observations = list(
         getattr(agent, "_pending_progress_observations", None) or []
     )
@@ -905,7 +829,7 @@ async def _execute_browser_tool_impl(
     description=(
         "Invoke a single ABCP Browser atomic capability and return the browser observation/data."
         " Derive params from live feedback: previous response.data handles, current"
-        " DOM.getAXTree ids, DOM.getText/DOM.getAttribute evidence, worker_contract,"
+        " DOM.getAXTree node ids and query records, worker_contract,"
         " or cited record_extraction artifacts."
     ),
     input_schema=_browser_schema_for("browser_call"),
@@ -1155,6 +1079,55 @@ async def _browser_execute_selected_skill(ctx: ToolContext) -> JsonDict:
     _record_selected_skill_tool_trace(agent, result)
     return result
 
+def _workflow_definition_outcome(ctx: ToolContext, receipt: JsonDict, result: JsonDict) -> None:
+    """A stored definition is not evidence of successful execution.
+
+    Capability results may expose a platform response envelope rather than a
+    top-level status. Project the actual Workflow receipt so reuse sees
+    ``succeeded``/``failed`` and the workflow id instead of ``unknown``.
+    """
+    execution = result.get("workflowExecution") if isinstance(result, dict) else None
+    execution = execution if isinstance(execution, dict) else {}
+    response = result.get("response") if isinstance(result, dict) else None
+    response = response if isinstance(response, dict) else {}
+    data = response.get("data") if isinstance(response.get("data"), dict) else {}
+    details = result.get("rpcData") if isinstance(result, dict) else None
+    details = details if isinstance(details, dict) else {}
+    detail_data = details.get("details") if isinstance(details.get("details"), dict) else details
+    status = (
+        execution.get("status")
+        or result.get("status")
+        or data.get("status")
+        or detail_data.get("status")
+        or ("failed" if result.get("error") else "unknown")
+    )
+    executed = execution.get("tool_was_executed")
+    if executed is None:
+        executed = result.get("tool_was_executed")
+    if executed is None:
+        executed = bool(data.get("workflowId") or detail_data.get("workflowId"))
+    outcome = {
+        "status": status,
+        "workflowId": execution.get("workflowId") or data.get("workflowId") or detail_data.get("workflowId"),
+        "tool_was_executed": executed,
+        "issues": result.get("issues", []),
+        "errors": result.get("errors", []),
+        "failedStepPath": execution.get("failedStepPath") or result.get("failedStepPath") or detail_data.get("failedStepPath"),
+        "failedErrorCode": execution.get("failedErrorCode") or result.get("failedErrorCode") or detail_data.get("failedActionCode"),
+        "next_instruction": result.get("next_instruction") or response.get("suggested_prompt"),
+    }
+    receipt["lastAttempt"] = outcome
+    receipt["reuseGuidance"] = (
+        "Stored does not mean validated or succeeded. Correct reported issues/errors "
+        "before retrying invalid parameters; for page-state gates synchronize the "
+        "page first. Do not replay completed side effects."
+    )
+    ctx.agent.trace.append({
+        "type": "workflow_definition_outcome",
+        "result": {"workflowDefinition": dict(receipt)},
+    })
+
+
 def _record_workflow_definition_before_dispatch(ctx: ToolContext, receipt: JsonDict) -> None:
     """Keep a small recovery reference even when execution raises or is cancelled."""
     record = {
@@ -1178,15 +1151,17 @@ def _record_workflow_definition_before_dispatch(ctx: ToolContext, receipt: JsonD
         " A complete definition is saved before dispatch and its receipt returns"
         " definitionRef/definitionHash; later calls may reuse that pair with"
         " optional local operations instead of copying the full steps. Use it"
-        " when the upcoming actions are decided — including"
-        " targets whose ids are not known yet but a step inside the segment can"
-        " resolve: read DOM.getAXTree, transform-search that reading, and act"
-        " on what it found. It cannot call harness-local tools or"
-        " Runtime.evaluate, and navigation must be followed by Page.loaded and"
-        " Page.getState, then DOM.getAXTree when later steps target AX ids."
-        " End the segment at the next point"
-        " that needs exploration, a screenshot judgment, or a decision you"
-        " cannot express mechanically; use single browser_call steps there."
+        " when the upcoming actions and target-selection rules are decided;"
+        " target ids may be discovered inside the segment. A Workflow"
+        " segment can read a leased page observation: after DOM.getAXTree, use"
+        " the complete `$cache.observation` or `$last` reference with transform"
+        " to search artifact text and extract a current id."
+        " `$cache.observation.artifact.path` is metadata only. It cannot call"
+        " Harness-local tools or Runtime.evaluate. After navigation, read"
+        " terminal load events, wait only if needed, handle failure/timeout,"
+        " and synchronize Page.getState before DOM/Input. End the segment at the"
+        " next point that needs model judgment, a screenshot, a Harness-only"
+        " tool, an expired artifact, or recovery from a failed workflow."
     ),
     input_schema=_browser_schema_for("execute_browser_workflow"),
     contract_check=True,
@@ -1241,10 +1216,11 @@ async def _browser_execute_browser_workflow(ctx: ToolContext) -> JsonDict:
         ctx.step,
     )
     if isinstance(result, dict):
+        _workflow_definition_outcome(ctx, definition_receipt, result)
         result["workflowDefinition"] = definition_receipt
         ctx.agent.logger.write("workflow.definition.used", {
             **definition_receipt,
-            "workflowStatus": result.get("status"),
+            "workflowStatus": definition_receipt["lastAttempt"]["status"],
         })
     return result
 
@@ -1276,6 +1252,23 @@ async def _browser_execute_saved_browser_workflow(ctx: ToolContext) -> JsonDict:
     definition_ref = str(ctx.tool_input.get("definitionRef") or "").strip()
     definition_hash = str(ctx.tool_input.get("definitionHash") or "").strip()
     operations = ctx.tool_input.get("operations") or []
+    previous_attempt = None
+    for entry in reversed(getattr(ctx.agent, "trace", [])):
+        previous = (entry.get("result") or {}).get("workflowDefinition") or {}
+        if previous.get("definitionHash") == definition_hash and previous.get("lastAttempt"):
+            previous_attempt = previous["lastAttempt"]
+            break
+    if (previous_attempt and previous_attempt.get("status") == "invalid_params"
+            and not operations and not ctx.tool_input.get("variables")):
+        return {
+            "status": "workflow_definition_correction_required",
+            "isError": True,
+            "tool_was_executed": False,
+            "definitionRef": definition_ref,
+            "definitionHash": definition_hash,
+            "lastAttempt": previous_attempt,
+            "next_instruction": "Correct the reported parameter paths using operations or send a corrected full definition. An unchanged saved definition repeats the failure.",
+        }
     loaded, load_error = load_workflow_definition(
         ctx.agent.logger,
         definition_ref=definition_ref,
@@ -1367,10 +1360,13 @@ async def _browser_execute_saved_browser_workflow(ctx: ToolContext) -> JsonDict:
         ctx.step,
     )
     if isinstance(result, dict):
+        if previous_attempt:
+            definition_receipt["previousAttempt"] = previous_attempt
+        _workflow_definition_outcome(ctx, definition_receipt, result)
         result["workflowDefinition"] = definition_receipt
         ctx.agent.logger.write("workflow.definition.used", {
             **definition_receipt,
-            "workflowStatus": result.get("status"),
+            "workflowStatus": definition_receipt["lastAttempt"]["status"],
         })
     return result
 
@@ -1477,11 +1473,13 @@ async def _browser_dismiss_overlay(ctx: ToolContext) -> JsonDict:
         " grows through ONE scroll container or ONE load-more control, without"
         " burning a model step per round. Harvests rows every round and dedups"
         " by a stable key, so lazy-loaded and virtualized rows can be retained."
-        " On an unknown site, first probe DOM/SemanticTree to identify the"
+        " On an unknown site, first read DOM.getAXTree (plus a `dom` query when"
+        " needed) to identify the"
         " repeated-item selector and the actual scroll container/load-more"
         " control; do not guess them."
         " Use this only when the collection cannot be read from one DOM snapshot;"
-        " otherwise enumerate canonical ids and batch DOM.getText/DOM.getAttribute."
+        " otherwise enumerate node ids and read them with one batched"
+        " DOM.getAXTree `text`/`attributes` query."
         " Persists through record_extraction"
         " only after target_reached or mechanically evidenced exhaustion; stalled"
         " or blocked partial rows are not persisted. When content completeness is"
@@ -1663,17 +1661,19 @@ async def _browser_record_extraction(ctx: ToolContext) -> JsonDict:
     name="find_in_axtree",
     description=(
         "Search the current DOM.getAXTree snapshot by role/name/text and return"
-        " complete canonical AXTree ids with line context. Use this instead of"
-        " grepping offloaded AXTree text when locating an element in a large"
-        " accessibility tree. Matches include the line's `flags` and its `rect`"
-        " viewport box when present. `flags` carries both generic AX state"
-        " (checked/unchecked/mixed, enabled/disabled, inert,"
-        " selected/unselected, expanded/collapsed, multi/single, popup) and"
-        " layout state (hidden/off/blocked/scroll/sticky/clip/zN) — avoid"
-        " hidden/blocked targets, but note layout flags are sparse, so their"
-        " ABSENCE does not prove a target is clear. Use `rect` for spatial"
+        " node ids (n_…) with line context. Use this instead of grepping"
+        " offloaded page text when locating an element in a large page view;"
+        " it also covers the full view saved behind a change list. Matches"
+        " include the line's `flags` and its `rect` viewport box (CSS pixels)"
+        " when present. `flags` carries target evidence (targetable,"
+        " actionable, candidate, ignored), explicit state"
+        " (checked/unchecked/mixed, selected/unselected, expanded/collapsed,"
+        " disabled, focused, required, invalid, valueRedacted) and layout"
+        " (hidden = not rendered, off = out of view, scroll) — never target a"
+        " hidden node; flags are sparse, so their ABSENCE proves nothing, and"
+        " the page view does not report occlusion. Use `rect` for spatial"
         " reasoning only, not for deriving click coordinates (act on the id)."
-        " It is read-only and requires a fresh current DOM.getAXTree snapshot."
+        " It is read-only and requires a current DOM.getAXTree snapshot."
     ),
     input_schema=_browser_schema_for("find_in_axtree"),
     contract_check=True,
@@ -1683,8 +1683,38 @@ async def _browser_find_in_axtree(ctx: ToolContext) -> JsonDict:
     return _bt()._find_in_axtree(ctx.agent, ctx.tool_input)
 
 @BROWSER_TOOLS.register(
+    name="await_node_change",
+    description=(
+        "Wait for named page content to change, in one call: it registers the"
+        " watch, blocks until a change or timeoutSeconds (default 15, max 120),"
+        " and closes itself. Target up to 16 nodes by id, or pass a selector"
+        " and the harness resolves it, so no preparatory read is needed."
+        " scope=node follows the targets themselves (a value, a state, an"
+        " accessible name, the node leaving the tree); scope=subtree also"
+        " follows their descendants, for a region that grows. USE IT when you"
+        " have acted and the result appears later: lazy content after a"
+        " scroll, a control that enables after validation, a list that refills"
+        " after a filter, a status that settles. DO NOT use it to wait for a"
+        " document to load (that is Page.getState and the page events), and do"
+        " not use it where the answer is already on the page - read it. It is"
+        " the harness reading the page for you: prefer it over a Runtime.evaluate"
+        " poll of your own for anything the page view describes, and over"
+        " re-reading the page yourself in a loop. status=timeout means nothing"
+        " changed in that window, which is not proof that nothing will."
+        " background=true instead returns at once for a wait longer than one"
+        " call can hold; its changes ride your later tool results and you close"
+        " it with close=true and its watchId."
+    ),
+    input_schema=_browser_schema_for("await_node_change"),
+    contract_check=True,
+    trace_type="await_node_change",
+)
+async def _browser_await_node_change(ctx: ToolContext) -> JsonDict:
+    return await _bt()._await_node_change(ctx.agent, ctx.tool_input)
+
+@BROWSER_TOOLS.register(
     name="local_fs_search",
-    description="Read-only search across files inside the current task worktree; supports glob, JSONL event-type filtering, and per-hit / total output caps.",
+    description="Read-only search under an authorized directory; external roots require terminal confirmation. If multiple sibling directories or the full tree are needed, request the common parent explicitly first; a parent READ grant covers descendants, while a child grant covers neither siblings nor the parent. Supports glob, JSONL event-type filtering, and per-hit / total output caps.",
     input_schema=_browser_schema_for("local_fs_search"),
     contract_check=True,
     progress_check=True,
@@ -1694,6 +1724,8 @@ async def _browser_local_fs_search(ctx: ToolContext) -> JsonDict:
     tool_input = ctx.tool_input
     return local_fs_search(
         ctx.agent.logger,
+        agent=ctx.agent,
+        path=str(tool_input.get("path") or "."),
         glob_pattern=str(tool_input.get("glob") or "**/*"),
         pattern=(
             str(tool_input.get("pattern"))
@@ -1714,7 +1746,7 @@ async def _browser_local_fs_search(ctx: ToolContext) -> JsonDict:
 
 @BROWSER_TOOLS.register(
     name="local_fs_read",
-    description="Read-only line-range read of a file inside the current task worktree; well suited to JSONL traces and AXTree lines.txt offload files.",
+    description="Read-only line-range read under an authorized task or user directory; external roots require terminal confirmation. Request only the needed child, or explicitly request its common parent first when several sibling paths are required; READ grants are task-scoped and do not cover WRITE.",
     input_schema=_browser_schema_for("local_fs_read"),
     contract_check=True,
     progress_check=True,
@@ -1724,6 +1756,7 @@ async def _browser_local_fs_read(ctx: ToolContext) -> JsonDict:
     tool_input = ctx.tool_input
     return local_fs_read(
         ctx.agent.logger,
+        agent=ctx.agent,
         path=str(tool_input.get("path") or ""),
         line_offset=optional_int(tool_input.get("line_offset"), 0) or 0,
         line_limit=optional_int(tool_input.get("line_limit"), 200) or 200,
@@ -1740,11 +1773,13 @@ async def _browser_local_fs_read(ctx: ToolContext) -> JsonDict:
 @BROWSER_TOOLS.register(
     name="local_fs_batch",
     description=(
-        "Batch bounded local file operations for task delivery: create directories, write UTF-8"
-        " text/JSON, stat/hash files, or copy files while preserving their source. Destinations"
-        " are limited to task-owned output directories and Desktop delivery folders. Returns a"
-        " persisted manifest and registers successful output files for contract validation."
-        " It cannot delete/move files, execute code, or modify Harness control/source files."
+        "Batch bounded local file operations: list, create directories, write UTF-8 text/JSON,"
+        " stat/hash files, or copy files while preserving their source. External material and"
+        " delivery roots require terminal approval. Request the common parent explicitly when"
+        " multiple sibling paths are needed; same-mode parent grants cover descendants, while"
+        " child grants do not cover siblings or the parent. READ and WRITE approvals are separate;"
+        " protected application/source paths are denied."
+        " It cannot delete/move files, execute code, or modify protected Harness control files."
     ),
     input_schema=_browser_schema_for("local_fs_batch"),
     contract_check=True,
@@ -1793,13 +1828,11 @@ async def _browser_search_harness_guides(ctx: ToolContext) -> JsonDict:
 
 def build_browser_agent_tool_specs(
     capability_methods: Set[str],
-    task_type: Any = "web_scrape",
     *,
     workflow_enabled: bool = False,
     step_extension_enabled: bool = False,
     multimodal_enabled: bool = False,
 ) -> List[JsonDict]:
-    hidden = hidden_harness_tools_for_task_type(task_type)
     # A live capability does not authorize Harness execution by itself. Both
     # the control-plane master switch and the ABCP capability must be present.
     workflow_visible = bool(
@@ -1808,8 +1841,7 @@ def build_browser_agent_tool_specs(
     return [
         spec
         for spec in BROWSER_TOOLS.tool_specs(capability_methods)
-        if spec.get("name") not in hidden
-        and (
+        if (
             step_extension_enabled
             or spec.get("name") != "request_step_extension"
         )

@@ -18,7 +18,6 @@ from typing import Tuple
 from urllib.parse import urlsplit
 from harness.evidence.extraction_artifacts import field_names_from_specs
 from harness.evidence.artifact_evidence import VALIDATOR_SCOPE
-from harness.planning.task_types import normalize_task_type
 from harness.utils import JsonDict
 from harness.utils import RunLogger
 from harness.utils import load_task_json
@@ -51,7 +50,6 @@ _AUTO_BIND_EXCLUDED_STAGES = frozenset({
     "computed_relationship",
     "form_interaction",
 })
-_AUTO_BIND_TASK_TYPES = frozenset({"web_search", "web_scrape"})
 
 
 def _auto_bind_exact_row_count(
@@ -207,8 +205,6 @@ def assess_batch_source_binding(
         return {"status": "not_applicable"}
     if not isinstance(plan, dict):
         return {"status": "not_applicable"}
-    if normalize_task_type(phase.get("task_type")) not in _AUTO_BIND_TASK_TYPES:
-        return {"status": "not_applicable", "reason": "task_type_not_read_only"}
     if str(phase.get("stage_hint") or "") in _AUTO_BIND_EXCLUDED_STAGES:
         return {"status": "not_applicable"}
     # A join/fanout is not a simple one-source, row-preserving transformation.
@@ -847,10 +843,6 @@ def _canonical_fast_path_business_contract(
         obligations.update(_fast_path_validator_obligations(normalized))
 
     return {
-        "taskType": _tc()._first_valid_task_type(
-            phase.get("task_type"),
-            "web_scrape",
-        ),
         "expectedArtifact": expected,
         "validators": [
             validator_tokens[token] for token in sorted(validator_tokens)
@@ -887,10 +879,6 @@ def _fast_path_business_contract_fence_errors(
     actual: JsonDict,
 ) -> List[str]:
     errors: List[str] = []
-    if str(actual.get("taskType") or "") != str(expected.get("taskType") or ""):
-        errors.append(
-            "task_type changed across the checkpoint"
-        )
     if actual.get("expectedArtifact") != expected.get("expectedArtifact"):
         errors.append(
             "merged expected_artifact changed across the checkpoint"

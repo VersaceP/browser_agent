@@ -29,7 +29,9 @@ def _current_ax_target_fact(agent, params: dict) -> dict:
     target_id = str(params.get("id") or target.get("id") or container.get("id") or "")
     if not target_id or str(getattr(agent, "axtree_page_id", "") or "") != page_id:
         return {"status": "unknown", "reason": "no_matching_current_ax_observation"}
-    nodes = list(getattr(agent, "axtree_nodes", []) or [])
+    from .axtree_state import _current_axtree_nodes
+
+    nodes = _current_axtree_nodes(agent)
     node = next((item for item in nodes if str(item.get("id") or "") == target_id), None)
     if not isinstance(node, dict):
         return {"status": "unknown", "reason": "target_absent_from_cached_ax_observation"}

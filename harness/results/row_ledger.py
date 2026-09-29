@@ -103,17 +103,27 @@ def field_absence_accepted(
         return {"accepted": False, "reason": "field_not_declared_emptiable", "field": field}
     row = row if isinstance(row, dict) else {}
     declaration = row.get(absence_field_name(field))
+    invalid_declaration_type = declaration is not None and not isinstance(declaration, dict)
     declaration = dict(declaration) if isinstance(declaration, dict) else {}
     # Historical rows used a sibling outcome/evidence field. Preserve that
     # documented shape without interpreting arbitrary flags or prose as truth.
     declaration.setdefault("outcome", row.get(f"{field}Outcome"))
     declaration.setdefault("evidenceText", row.get(f"{field}EvidenceText"))
     proof = absence_proof(declaration)
+    accepted = proof["state"] == "declared"
     return {
-        "accepted": proof["state"] == "declared",
-        "reason": "" if proof["state"] == "declared" else "absence_declaration_missing",
+        "accepted": accepted,
+        "reason": (
+            "" if accepted else
+            "absence_declaration_invalid_type" if invalid_declaration_type else
+            "absence_declaration_missing"
+        ),
         "field": field,
         "absenceProof": proof,
+        **({"expectedDeclaration": (
+            f"{absence_field_name(field)} object with outcome/evidenceText, "
+            f"or sibling {field}Outcome and {field}EvidenceText"
+        )} if not accepted else {}),
     }
 
 

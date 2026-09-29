@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -660,14 +661,40 @@ async def extract_numeric_claims(
                 "Return the complete corrected claims array. Do not omit valid "
                 "claims merely because another entry needs correction."
             )
-        _text, tool_calls, _stop, usage = await provider.generate_response(
-            system_prompt=system_prompt,
-            messages=[{
-                "role": "user",
-                "content": json.dumps(request_payload, ensure_ascii=False, sort_keys=True),
-            }],
-            tools=[numeric_claim_tool(subjects, fields)],
-        )
+        started = time.monotonic()
+        _text, tool_calls, stop, failure = "", None, None, None
+        try:
+            _text, tool_calls, stop, usage = await provider.generate_response(
+                system_prompt=system_prompt,
+                messages=[{
+                    "role": "user",
+                    "content": json.dumps(request_payload, ensure_ascii=False, sort_keys=True),
+                }],
+                tools=[numeric_claim_tool(subjects, fields)],
+            )
+        except Exception as exc:
+            from llm.base import LLMRateLimitError
+            failure = {"errorType": type(exc).__name__,
+                       **({"providerFailure": exc.to_payload()} if isinstance(exc, LLMRateLimitError) else {})}
+            raise
+        finally:
+            if logger is not None and hasattr(logger, "write"):
+                model_config = getattr(provider, "config", None)
+                extra_params = getattr(model_config, "extra_params", {}) or {}
+                logger.write("numeric_claim_extractor.call", {
+                    "status": "error" if failure else "returned",
+                    **(failure or {}),
+                    "repair": bool(repair_errors),
+                    "spanCount": len(spans),
+                    "configuredMaxTokens": extra_params.get("max_tokens"),
+                    "configuredTimeoutSeconds": getattr(model_config, "llm_api_timeout_seconds", None),
+                    "durationMs": int((time.monotonic() - started) * 1000),
+                    "stopReason": stop,
+                    "toolCallCount": len(tool_calls) if isinstance(tool_calls, list) else None,
+                    "toolNames": [str(call.get("name") or "") for call in (tool_calls or [])
+                                  if isinstance(call, dict)],
+                    "textChars": len(str(_text or "")),
+                })
         if logger is not None and hasattr(logger, "record_llm_usage"):
             logger.record_llm_usage(
                 source=(
@@ -772,6 +799,10 @@ async def extract_numeric_claims(
 # excluded by the surrounding-character guard below rather than by a list of
 # things to ignore, which could never be exhaustive.
 _NUMBER_SPAN_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
+# A numbered Markdown list marker is document structure, not an asserted
+# quantity. Anchor the pattern to the start of a line so ordinary "item 3."
+# and Chinese quantities remain in the work list.
+_MARKDOWN_LIST_MARKER_RE = re.compile(r"(?m)^[ \t]{0,3}\d{1,4}\.[ \t]+")
 # Contexts that make a digit run something other than an asserted quantity.
 _SPAN_LEFT_SKIP = "#v-/.:@=_%$¥€£"
 _SPAN_RIGHT_SKIP = "-/.:%°"
@@ -824,9 +855,12 @@ def numeric_spans(answer: str) -> List[JsonDict]:
     exist is what allowed the one unchecked figure to be the wrong one.
     """
     text = str(answer or "")
+    list_markers = [(match.start(), match.end()) for match in _MARKDOWN_LIST_MARKER_RE.finditer(text)]
     spans: List[JsonDict] = []
     for match in _NUMBER_SPAN_RE.finditer(text):
         start, end = match.start(), match.end()
+        if any(marker_start <= start and end < marker_end for marker_start, marker_end in list_markers):
+            continue
         left = text[start - 1] if start else ""
         right = text[end] if end < len(text) else ""
         after_right = text[end + 1] if end + 1 < len(text) else ""

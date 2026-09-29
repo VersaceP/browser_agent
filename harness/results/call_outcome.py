@@ -422,13 +422,8 @@ def route_recovery_claim_evidence_ok(page_id: str, result: Any) -> bool:
 
 
 _STRUCTURED_READ_EVIDENCE_KEYS = {
-    "DOM.getText": {"items", "text", "textContent"},
-    "DOM.getAttribute": {"items", "attributes", "value", "values"},
-    # getSemanticTree returns a frame graph: the payload lives in `frames`,
-    # the count in `summary`. Neither `tree` nor a top-level `nodeCount`
-    # appears, so scoring this read by those keys marks every success empty.
-    "DOM.getSemanticTree": {"frames", "rootFrameId", "summary"},
-    "DOM.getAXTree": {"lines", "nodeCount", "nodes", "outline", "tree"},
+    # `records` is what a bounded text/state/attributes query returns.
+    "DOM.getAXTree": {"lines", "nodeCount", "nodes", "outline", "tree", "records"},
 }
 
 

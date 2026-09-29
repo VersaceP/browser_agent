@@ -21,7 +21,6 @@ related_tools:
 related_methods: []
 error_codes:
   - tool_exception
-  - blocked_cross_task_type_required
   - context_limit_exceeded
   - page_crashed
   - step_budget_exhausted
@@ -64,8 +63,7 @@ For `page_crashed`, recreate a page only in the same allowed Fleet/session when
 routing allows it; distinguish loss of required unsaved page-local state from
 ordinary renderer recovery. HITL and session-continuity outcomes require the
 structured routing instruction, not a fresh Fleet escape. A
-`blocked_cross_task_type_required` result needs a new phase with the correct
-task type. `collection_contract_replan_required` must change the immutable
+`collection_contract_replan_required` must change the immutable
 artifact shape - replan expected_artifact.fields with the nested array
 expectedShape the receipt reports, because the worker cannot repair its own
 contract; respawning it unchanged repeats the same refusal.

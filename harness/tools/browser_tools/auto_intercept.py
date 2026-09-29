@@ -422,7 +422,7 @@ async def _maybe_auto_intercept_overlay(
         )
         candidate_data = _bt()._response_data(fresh)
         fresh_data = candidate_data if isinstance(candidate_data, dict) else {}
-        fresh_lines = list(getattr(agent, "axtree_lines", []) or [])
+        fresh_lines = _bt()._current_axtree_lines(agent)
         tree_refreshed = bool(fresh_lines)
     outcome = (
         "resolved" if resolved
@@ -451,7 +451,7 @@ async def _maybe_auto_intercept_overlay(
             else:
                 new_data = dict(response["data"])
             new_data["lines"] = fresh_lines
-            new_data["nodes"] = list(getattr(agent, "axtree_nodes", []) or [])
+            new_data["nodes"] = _bt()._current_axtree_nodes(agent)
             response["data"] = new_data
     enriched["autoIntercept"] = {
         "trigger": trigger,

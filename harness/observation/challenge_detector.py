@@ -9,10 +9,11 @@ when visual adjudication is unavailable.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import re
 from typing import Any, Dict, List, Optional
 
 from harness.constants import CHALLENGE_KEYWORDS, NAVIGATION_CHALLENGE_TITLE_KEYWORDS
+from harness.observation.axtree_format import parse_axtree_line
+from harness.observation.page_observation import node_document_roots
 from harness.utils import JsonDict
 
 
@@ -53,10 +54,6 @@ STRUCTURAL_CHALLENGE_ROOT_MARKERS = tuple(dict.fromkeys((
     "安全检查",
 )))
 
-_AX_LINE_RE = re.compile(
-    r'^\s*(?P<depth>\d+)\s+\[(?P<id>\d+:-?\d+:\d+)\]\s+'
-    r'(?P<role>[a-zA-Z][a-zA-Z0-9_-]*)(?:\s+"(?P<label>[^"]*)")?'
-)
 _STRUCTURAL_ACTION_ROLES = {
     "button",
     "checkbox",
@@ -408,69 +405,57 @@ def detect_structural_challenge_from_lines(
     """Detect a visible embedded challenge frame from compact AXTree lines.
 
     A keyword anywhere on a normal page is not enough.  The evidence must be a
-    depth-0 ``rootwebarea`` whose own label is challenge-like, plus an
-    actionable verification control in that frame.  This catches small or
-    visually unobtrusive CAPTCHA iframes without treating documentation text as
-    a blocking challenge.
+    document root (``rootwebarea``) whose own label is challenge-like, plus an
+    actionable verification control inside that same document.  This catches
+    small or visually unobtrusive CAPTCHA iframes without treating
+    documentation text as a blocking challenge.
+
+    Node ids carry no frame, so "inside that document" is the node's nearest
+    rootwebarea ancestor (page_observation.node_document_roots).
     """
     if not isinstance(lines, list):
         return None
     normalized = [str(line) for line in lines if isinstance(line, str)]
-    roots: List[int] = []
-    parsed: List[Optional[re.Match[str]]] = []
-    for index, line in enumerate(normalized):
-        match = _AX_LINE_RE.match(line)
-        parsed.append(match)
-        if (
-            match is not None
-            and match.group("depth") == "0"
-            and match.group("role").casefold() == "rootwebarea"
-        ):
-            roots.append(index)
-
-    for root_position, start in enumerate(roots):
-        root_match = parsed[start]
-        if root_match is None:
-            continue
+    documents = node_document_roots(normalized)
+    parsed = [parse_axtree_line(line) for line in normalized]
+    roots = [
+        index for index, node in enumerate(parsed)
+        if node is not None and node["role"] == "rootwebarea"
+    ]
+    for start in roots:
+        root = parsed[start]
         root_line = normalized[start]
-        root_label = str(root_match.group("label") or "").strip()
+        root_label = str(root.get("name") or "").strip()
         root_haystack = f"{root_label} {root_line}".casefold()
         if not any(
             marker.casefold() in root_haystack
             for marker in STRUCTURAL_CHALLENGE_ROOT_MARKERS
         ):
             continue
-        if re.search(r"(?:^|\s)(?:hidden|off)(?:\s|$)", root_line.casefold()):
+        if {"hidden", "off"} & set(root.get("flags") or []):
             continue
-
-        end = roots[root_position + 1] if root_position + 1 < len(roots) else len(normalized)
-        frame_id = root_match.group("id").split(":", 1)[0]
         controls: List[JsonDict] = []
-        for index in range(start + 1, end):
-            match = parsed[index]
-            if match is None:
+        for index, node in enumerate(parsed):
+            if node is None or index == start:
                 continue
-            node_id = match.group("id")
-            if node_id.split(":", 1)[0] != frame_id:
+            if documents.get(node["id"]) != root["id"]:
                 continue
-            role = match.group("role").casefold()
-            if role not in _STRUCTURAL_ACTION_ROLES:
+            if node["role"] not in _STRUCTURAL_ACTION_ROLES:
                 continue
-            label = str(match.group("label") or "").strip()
+            label = str(node.get("name") or "").strip()
             line_haystack = f"{label} {normalized[index]}".casefold()
             if not any(
                 marker.casefold() in line_haystack
                 for marker in STRUCTURAL_CHALLENGE_CONTROL_MARKERS
             ):
                 continue
-            controls.append({"id": node_id, "role": role, "label": label})
+            controls.append({"id": node["id"], "role": node["role"], "label": label})
 
         if controls:
             return {
                 "kind": "embedded_challenge_frame",
                 "sourceMethod": source_method,
-                "frameId": frame_id,
-                "rootId": root_match.group("id"),
+                "rootId": root["id"],
                 "rootLabel": root_label,
                 "controls": controls[:5],
             }

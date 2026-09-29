@@ -16,17 +16,17 @@ from __future__ import annotations
 
 import inspect
 import json
-import re
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from harness.vl.capture_geometry import (
     CAPTURE_PROVEN,
     region_in_capture,
 )
+from harness.observation.axtree_format import AX_NODE_ID_RE
 from harness.vl.locate import capture_origin
 
 
-_CANONICAL_ID_RE = re.compile(r"^\d+:\d+:\d+$")
+_CANONICAL_ID_RE = AX_NODE_ID_RE
 _REGION_KEYS = ("x", "y", "width", "height")
 
 
@@ -329,7 +329,7 @@ def _capture_geometry(scope: str, receipt: Dict[str, Any]) -> Dict[str, Any]:
         "reason": coverage.get("reason"),
         "receiptBound": bound,
         "originSource": origin.get("source"),
-        # A receipt binds image geometry to the Semantic Tree returned by the
+        # A receipt binds image geometry to the target detail returned by the
         # same action, but ABCP does not expose one shared layout/tree revision
         # or capture timestamp. This remains deliberately false.
         "sameMomentProven": False,

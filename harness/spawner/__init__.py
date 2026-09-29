@@ -84,7 +84,6 @@ from harness.task_control import (
     load_task_state,
     write_task_state,
 )
-from harness.planning.strategy_telemetry import append_strategy_attempt
 from harness.tools.tool_policy import ALWAYS_FORBIDDEN_ABCP_METHODS
 from harness.planning.templates import get_path
 from harness.utils import (

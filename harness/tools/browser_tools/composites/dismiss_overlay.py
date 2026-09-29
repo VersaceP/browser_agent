@@ -278,7 +278,7 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
             break
 
         close = find_close_control(
-            list(getattr(agent, "axtree_nodes", []) or []),
+            _bt()._current_axtree_nodes(agent),
             subtype=overlay.get("subtype") if isinstance(overlay, dict) else None,
         )
         if close is not None:

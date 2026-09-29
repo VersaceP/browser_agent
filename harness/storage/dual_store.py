@@ -129,52 +129,6 @@ def _resource_fingerprint(
     return {"path": logical_path, "type": resource_type, "kind": kind, "digest": digest}
 
 
-def _strategy_fingerprint(payload: JsonDict) -> JsonDict:
-    """Digest a strategy attempt twice, once per backend's storage shape.
-
-    The file backend appends the whole payload; the table keeps a projection
-    of it in typed columns. Hashing the payload alone would make every
-    database row look wrong, and hashing the projection alone would let the
-    file copy drift - so both are recorded and each side is checked against
-    the one it actually promises to preserve.
-    """
-
-    return {
-        "payload": semantic_sha256(payload),
-        "projected": semantic_sha256([
-            payload.get("phaseId"),
-            payload.get("workerId"),
-            payload.get("strategy_ids") or [],
-            payload.get("status"),
-            payload.get("statusCategory"),
-            payload.get("validatedStatus"),
-            payload.get("failureClassification"),
-            payload.get("rowCount"),
-            int(payload.get("artifactCount") or 0),
-        ]),
-    }
-
-
-def _strategy_row_projection(row: JsonDict) -> str:
-    ids = row.get("strategy_ids_json")
-    if isinstance(ids, str):
-        try:
-            ids = json.loads(ids)
-        except (TypeError, ValueError):
-            ids = []
-    return semantic_sha256([
-        row.get("phase_id"),
-        row.get("worker_id"),
-        ids or [],
-        row.get("status"),
-        row.get("status_category"),
-        row.get("validated_status"),
-        row.get("failure_classification"),
-        row.get("row_count"),
-        int(row.get("artifact_count") or 0),
-    ])
-
-
 def _trace_digest(rows: List[JsonDict]) -> str:
     parts: List[Any] = []
     for row in rows:
@@ -662,23 +616,6 @@ class DualStore(Storage):
             task_id=task_id, run_id=run_id, worker_id=worker_id, limit=limit
         )
 
-    # -- strategy telemetry ------------------------------------------------
-    def append_strategy_attempt(
-        self,
-        *,
-        task_id: str,
-        run_id: str,
-        payload: JsonDict,
-    ) -> None:
-        self.primary.append_strategy_attempt(
-            task_id=task_id, run_id=run_id, payload=payload
-        )
-        self._mirror("append_strategy_attempt", task_id, lambda: self.secondary.append_strategy_attempt(
-            task_id=task_id, run_id=run_id, payload=payload
-        ))
-        self._record_written(task_id, run_id, "strategy", _strategy_fingerprint(payload))
-        self._count(task_id, "strategy")
-
     # -- verification ------------------------------------------------------
     def verify(self, *, task_id: str, run_id: Optional[str] = None) -> JsonDict:
         """Compare both backends against what this run actually wrote.
@@ -741,7 +678,6 @@ class DualStore(Storage):
                sorted(self._trace_entry_digest(row) for row in db_trace))
 
         self._verify_resources(task_id, scope, record)
-        self._verify_strategy(task_id, scope, record)
 
         for version in self._plan_versions_seen(task_id):
             file_record = self.primary.load_plan_version(task_id=task_id, version=version)
@@ -851,65 +787,6 @@ class DualStore(Storage):
         record("resources.missingOnDisk", [], missing_on_disk)
         record("resources.file.content", [], disk_content_differs)
 
-    def _verify_strategy(
-        self, task_id: str, scope: Optional[str], record: Callable[[str, Any, Any], None]
-    ) -> None:
-        expected = [
-            entry for entry in self._expected(task_id, scope, "strategy")
-            if isinstance(entry, dict)
-        ]
-        if not expected:
-            return
-
-        db_attempts = self._mirror(
-            "verify.strategy_attempts", task_id,
-            lambda: self._list_strategy_attempts(self.secondary, task_id), default=None,
-        )
-        if db_attempts is not None:
-            rows = [
-                row for row in db_attempts
-                if scope is None or str(row.get("run_id") or "") == scope
-            ]
-            actual = Counter(_strategy_row_projection(row) for row in rows)
-            wanted = Counter(str(entry["projected"]) for entry in expected)
-            if scope is None:
-                # Not run-scoped: earlier runs' rows are legitimately present,
-                # so require containment rather than an exact match.
-                record("strategy.db.contains", [], sorted((wanted - actual).elements()))
-            else:
-                record("strategy.db", sorted(wanted.elements()), sorted(actual.elements()))
-
-        file_digests = self._mirror(
-            "verify.strategy_file", task_id,
-            lambda: self._file_strategy_digests(task_id), default=None,
-        )
-        if file_digests is not None:
-            # The JSONL accumulates across runs and carries no run column, so
-            # containment is the strongest claim it supports.
-            missing = Counter(str(entry["payload"]) for entry in expected) - file_digests
-            record("strategy.file.contains", [], sorted(missing.elements()))
-
-    def _file_strategy_digests(self, task_id: str) -> Optional[Counter]:
-        from harness.storage.file_store import STRATEGY_ATTEMPTS_FILE
-
-        task_dir = getattr(self.primary, "task_dir", None)
-        if task_dir is None:
-            return None
-        path = Path(task_dir(task_id)) / STRATEGY_ATTEMPTS_FILE
-        if not path.is_file():
-            return Counter()
-        digests: Counter = Counter()
-        with path.open("r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    digests[semantic_sha256(json.loads(line))] += 1
-                except (TypeError, ValueError):
-                    continue
-        return digests
-
     @staticmethod
     def _stored_resource_digest(row: JsonDict, kind: str) -> str:
         if kind == "external":
@@ -1011,13 +888,6 @@ class DualStore(Storage):
                     collected.append(row)
             cursor = int(rows[-1]["event_id"])
         return collected
-
-    @staticmethod
-    def _list_strategy_attempts(store: Storage, task_id: str) -> Optional[List[JsonDict]]:
-        lister = getattr(store, "list_strategy_attempts", None)
-        if not callable(lister):
-            return None
-        return lister(task_id=task_id)
 
     def _plan_versions_seen(self, task_id: str) -> List[int]:
         versions: List[int] = []

@@ -5,30 +5,27 @@ control), VL points at it visually; the harness then PROMOTES that pixel back to
 durable canonical id by reverse-looking-up the AXTree bbox that contains it, so
 subsequent actions use a stable handle (id / role+name) instead of raw coordinates.
 
-LIVE-VERIFIED foundation (2026-08-31 matrix probe, superseding the 2026-06-27
-reading that the two spaces were simply equal):
-  - `DOM.getAXTree` lines carry `# @x,y,w,h` on positioned/interactive
-    elements, e.g. `[3:13:13] link "Learn more" # @512,398,164,39`. The rect is
-    `(viewport position + root scroll) x captureScale`, in device pixels. That
-    equals the DOCUMENT position for elements in normal flow — after scrolling
-    300px an in-flow button's bbox was unchanged at `@440,7440` — but NOT for a
-    fixed element, a stuck sticky element, or one inside a nested scroll
-    container, all of which keep a viewport position the page scroll does not
-    describe. Measured on all four (probe_capture_topology).
+LIVE-VERIFIED foundation (WebCross 0.9.3 unified page observation, measured
+2026-09-21; this replaces the 2026-08-31 reading of the retired AX format):
+  - `DOM.getAXTree` node lines carry `@x,y,w,h`, the node's box in VIEWPORT
+    CSS pixels: rootWebArea is `@0,0,1224,724` beside a 2448x1448 PNG at
+    scaleFactor 2, and an in-flow paragraph moved from y=5156 to y=3156 when
+    the page scrolled 2000px. The retired format was device pixels offset by
+    the root scroll; neither translation applies any more.
   - The screenshot is device pixels of the CROP, whose (0,0) is the crop's own
-    corner, and `Input.click` takes VIEWPORT CSS pixels.
-  - The three coincide only on an unscrolled, uncropped page, which is why the
-    original reading held for so long. See `capture_origin` and `promote_locate`
-    for the two translations that connect them.
-  - An iframe's boxes are FRAME-LOCAL and carry that frame's own seq in their
-    canonical id, so they must never win a main-document containment test —
-    `point_to_id` filters them out by frame.
+    corner, and `Input.click` takes the same VIEWPORT CSS pixels as the boxes.
+    See `capture_origin` and `promote_locate` for the one translation left.
+  - An iframe's boxes are FRAME-LOCAL (its button sat at `@8,8` inside a frame
+    placed far down the page), so they must never win a main-document
+    containment test — `point_to_id` filters them out by document.
 
-SCOPE of that verification (probe_capture_geometry + probe_capture_topology):
-the main document, nested scroll containers, fixed/sticky positioning,
-same-page iframes, CSS transforms, and open Shadow DOM. A closed shadow root is
-not exposed at all, which is the safe outcome — a node the harness cannot name
-is one whose origin it cannot prove.
+SCOPE of that verification: the main document scrolled and unscrolled, a
+same-page iframe, fixed and stuck-sticky positioning, a nested scroll
+container, a CSS transform (the painted box, 180x60 for a scaled 120x40
+button) and an open shadow root, with viewport / region / element captures.
+Element captures scroll the page to reveal their target (1107 -> 400 for a
+fixed button), and both the capture and the AXTree rect are the integer rect
+enclosing the element's fractional box.
 
 NOT covered, and not claimed: browser zoom (the Action catalog has no setter,
 so it can only be recorded); a relayout that leaves both the scroll offset and
@@ -44,10 +41,12 @@ caller fall back to a one-shot coordinate action.
 """
 from __future__ import annotations
 
+import math
 import re
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from harness.observation.axtree_format import parse_axtree_line
+from harness.observation.page_observation import node_document_roots
 from harness.observation.scroll_receipt import STATE_READ_REASONS, scroll_state_read_position
 
 # Page-level containers are never a useful click target — resolving a pixel to one
@@ -60,10 +59,11 @@ MAIN_FRAME = "auto"
 
 def parse_axtree_bboxes(lines: List[Any]) -> List[Dict[str, Any]]:
     """Parse rect-bearing AXTree lines into
-    {id, frame, depth, role, name, x, y, w, h, area}. `frame` is the first
-    canonical-id segment: nodes from embedded iframes carry a DIFFERENT frame seq
-    and their bbox is FRAME-LOCAL (starts at 0,0 inside the iframe), not
-    screen-space. `depth` is the leading original-tree depth when present.
+    {id, frame, depth, role, name, x, y, w, h, area}. `frame` identifies the
+    document that holds the node - the id of its nearest `rootWebArea`
+    ancestor, since ids no longer encode a frame. Nodes of an embedded iframe
+    belong to that iframe's document and their bbox is FRAME-LOCAL (starts at
+    0,0 inside the iframe), not viewport-space.
 
     Reads the line through the shared parser rather than a local regex. The
     local one searched for the first `@x,y,w,h` ANYWHERE after the name, and an
@@ -74,20 +74,22 @@ def parse_axtree_bboxes(lines: List[Any]) -> List[Dict[str, Any]]:
     promotes a VL point to an element it never touched.
     """
     out: List[Dict[str, Any]] = []
-    for ln in lines or []:
-        parsed = parse_axtree_line(ln) if isinstance(ln, str) else None
+    text_lines = [ln for ln in lines or [] if isinstance(ln, str)]
+    documents = node_document_roots(text_lines)
+    for ln in text_lines:
+        parsed = parse_axtree_line(ln)
         if parsed is None:
             continue
         rect = parsed["rect"]
         if not isinstance(rect, dict):
             continue
         gid = str(parsed["id"])
-        x, y = int(rect["x"]), int(rect["y"])
-        w, h = int(rect["w"]), int(rect["h"])
-        out.append({"id": gid, "frame": gid.split(":", 1)[0],
+        x, y = float(rect["x"]), float(rect["y"])
+        w, h = float(rect["w"]), float(rect["h"])
+        out.append({"id": gid, "frame": documents.get(gid),
                     "depth": parsed["depth"],
                     "role": parsed["role"], "name": parsed["name"],
-                    "x": x, "y": y, "w": w, "h": h, "area": max(0, w) * max(0, h)})
+                    "x": x, "y": y, "w": w, "h": h, "area": max(0.0, w) * max(0.0, h)})
     return out
 
 
@@ -165,107 +167,6 @@ COORDINATE_SAFE_SCOPES = frozenset({"", "viewport", "viewport_fallback"})
 # element pass the identity check.
 _SIZE_MATCH_TOLERANCE = 1.0
 
-# A capture may legitimately be SHORTER or NARROWER than the node's visible box
-# by the width of a scrollbar: `visibleBounds` clips to the layout viewport
-# while the capture clips to what was actually painted. Measured at 15px on this
-# build (a 1400px-tall element in an 800px viewport reported 785). Anything
-# beyond this is a layout that no longer matches the capture.
-_SCROLLBAR_ALLOWANCE = 20.0
-
-
-def _fits_capture(bounds: Any, width: Any, height: Any) -> bool:
-    """The node's visible box still describes what was captured."""
-    if not isinstance(bounds, dict):
-        return False
-    try:
-        dw = float(bounds.get("width")) - float(width)
-        dh = float(bounds.get("height")) - float(height)
-    except (TypeError, ValueError):
-        return False
-    return (
-        -_SIZE_MATCH_TOLERANCE <= dw <= _SCROLLBAR_ALLOWANCE
-        and -_SIZE_MATCH_TOLERANCE <= dh <= _SCROLLBAR_ALLOWANCE
-    )
-
-
-def tree_scroll(tree: Any) -> Optional[Dict[str, float]]:
-    """The document scroll offset a Semantic Tree carries on its root node.
-
-    Needed because an AXTree bbox is `(viewport + root scroll) x scale` while a
-    screenshot is viewport-relative — verified live: after scrolling 300px an
-    in-flow button's bbox was unchanged at `@440,7440`, and `rootwebarea`
-    stayed `@0,0,2560,1600`, so neither the boxes nor the root reveal the
-    offset. It is
-    not on `Page.getState` either. `Input.scroll` with top-level `amount: 0`
-    also reports it without moving on 1.1.9, but the Semantic Tree keeps this
-    geometry read independent of the scroll action being diagnosed.
-
-    The frame is resolved through `rootFrameId` rather than taken as `frames[0]`:
-    on a page with iframes the first entry need not be the anchored document,
-    and an iframe's scroll offset is not the main document's.
-
-    Returns None unless the resolved root really is the document node, because
-    only the scrolling element reports the scroll — see the note in the body.
-    """
-    from harness.observation.semantic_frames import root_tree
-
-    root = root_tree(tree)
-    if not isinstance(root, dict):
-        return None
-    # The root of a tree that came back with an ELEMENT CAPTURE is the target's
-    # ancestor chain truncated to a depth limit, so for a deeply nested target
-    # it is `body`, not `#document` — and `body` is not the scrolling element,
-    # so its `scroll.top` is a genuine 0 while the page is scrolled 1107px
-    # (measured). Reading that as the document offset shifts every promotion by
-    # the whole scroll distance, silently. Only the document node states the
-    # document's own offset.
-    if str(root.get("tag") or "").lower() not in ("#document", "html"):
-        return None
-    scroll = root.get("scroll")
-    if not isinstance(scroll, dict):
-        return None
-    # Fail closed on a scroll object that does not actually state the offset:
-    # `{}` means "this payload did not say", not "the page is at the top", and
-    # reading it as (0,0) is the silent-zero this whole receipt chain exists to
-    # avoid.
-    if scroll.get("left") is None or scroll.get("top") is None:
-        return None
-    try:
-        return {"x": float(scroll["left"]), "y": float(scroll["top"])}
-    except (TypeError, ValueError):
-        return None
-
-
-def _tree_nodes(node: Any, depth: int = 0):
-    """Every dict node in a Semantic Tree payload.
-
-    The tree that rides along with an element capture is the WHOLE document
-    (`{rootFrameId, frames: [{frameId, tree}]}`), not the target's subtree
-    (verified live), so finding the target means walking all of it.
-    """
-    if depth > 40:
-        return
-    if isinstance(node, dict):
-        yield node
-        for value in node.values():
-            yield from _tree_nodes(value, depth + 1)
-    elif isinstance(node, list):
-        for item in node:
-            yield from _tree_nodes(item, depth + 1)
-
-
-def _bounds_match(bounds: Any, width: Any, height: Any) -> bool:
-    if not isinstance(bounds, dict):
-        return False
-    try:
-        return (
-            abs(float(bounds.get("width")) - float(width)) <= _SIZE_MATCH_TOLERANCE
-            and abs(float(bounds.get("height")) - float(height)) <= _SIZE_MATCH_TOLERANCE
-        )
-    except (TypeError, ValueError):
-        return False
-
-
 def capture_origin(
     *,
     scope: str,
@@ -280,13 +181,13 @@ def capture_origin(
     build (2026-08-31, catalogRevision sha256:cfd8fb90…) showed it is carried by
     the capture's own receipt:
 
-      * element — the target's node in the returned Semantic Tree, whose
-        `visibleBounds` is the origin. Note `visibleBounds`, NOT `bounds`: the
-        two differ exactly when the element is taller than the viewport, which
-        is the case that matters. A 300x1400 element reported `width`/`height`
-        of 300x800 and `visibleBounds` of 300x800 while `bounds` still said
-        1400, because the platform clips the capture to the viewport. An
-        element below the fold is scrolled into view first rather than clipped.
+      * element — `targetDetail.info.boundsInWidget` of the captured node, in
+        viewport CSS pixels. Measured on WebCross 0.9.3 (2026-09-21): the
+        platform scrolls an out-of-view element into view before capturing and
+        reports the box at its capture-time position (a button at viewport
+        y=2621 was captured at y=342). The box is the element's FULL rect; the
+        capture is that rect clipped to the viewport, so the origin is its
+        near edge clamped at 0.
       * region — the requested `x`/`y`, echoed on `target`. Measured to be CSS
         pixels and viewport-relative: after the page scrolled 1660px the same
         request captured a different part of the document.
@@ -298,7 +199,7 @@ def capture_origin(
     reports. Returns ``{"x", "y", "source", "proven"}``; an unproven origin must
     withhold the coordinate rather than fall back to (0, 0).
 
-    RESIDUAL RACE, unmitigated: the platform reads the Semantic Tree AFTER
+    RESIDUAL RACE, unmitigated: the platform reads the target detail AFTER
     taking the image, so an element that translated in between keeps both its
     identity and its size while its reported x/y no longer describe the crop.
     Nothing in the receipt exposes that, so this returns `proven` for it, and
@@ -322,9 +223,12 @@ def capture_origin(
     and nothing here should be read as claiming it is.
     """
     data = shot_data if isinstance(shot_data, dict) else {}
-    # The scroll offset either comes with the capture (element captures carry a
-    # Semantic Tree) or is supplied by a caller that read it separately.
-    offset = scroll or tree_scroll(data.get("semanticTree"))
+    # `scroll` is the bracketed scroll offset (`scroll_bracket`): present only
+    # when the reads taken after the capture and after the AXTree agree. Both
+    # the capture and the AXTree are viewport-relative, so the offset itself
+    # is not needed; its presence is the evidence that the page did not scroll
+    # between them.
+    offset = scroll
 
     def _out(x, y, source, proven):
         receipt = {"x": x, "y": y, "source": source, "proven": proven}
@@ -367,65 +271,55 @@ def capture_origin(
     if str(scope) != "element":
         return _out(0.0, 0.0, f"unsupported_scope:{scope}", False)
 
-    tree = data.get("semanticTree")
-    if tree is None or width is None or height is None:
+    detail = data.get("targetDetail") if isinstance(data.get("targetDetail"), dict) else None
+    if detail is None or width is None or height is None:
         return _out(0.0, 0.0, "element_receipt_incomplete", False)
-    # Identity has to come from a canonical id. A selector capture echoes only
-    # the selector, and matching on the capture's size instead proves the wrong
-    # thing: a size is not an identity. An element that moved between the
-    # capture and the tree read keeps its width and height, so a size match
-    # would hand back a confidently wrong x/y — the exact failure mode this
-    # whole receipt chain exists to prevent.
-    #
-    # `recoveredTarget.currentId` is authoritative when present: the platform
-    # reads the tree for that same recovered node (`resolveSemanticTreeTarget`
-    # prefers `recoveredTarget.currentId` over the requested id/selector), so it
-    # names what was actually captured.
-    recovered = data.get("recoveredTarget")
-    if isinstance(recovered, dict) and recovered.get("currentId"):
-        wanted = str(recovered["currentId"])
-    elif target.get("id"):
-        wanted = str(target["id"])
-    else:
-        return _out(0.0, 0.0, "element_no_canonical_id", False)
-
-    bounds = None
-    node_bounds = None
-    for node in _tree_nodes(tree):
-        if str(node.get("id") or "") != wanted:
-            continue
-        candidate = node.get("visibleBounds")
-        if isinstance(candidate, dict):
-            bounds = candidate
-        node_bounds = node.get("bounds")
-        break
-    if bounds is None:
+    # Identity has to come from a node id, never from a matching size: an
+    # element that moved between the capture and the detail read keeps its
+    # width and height, so a size match would hand back a confidently wrong
+    # x/y. The platform reads the detail for the node it actually captured and
+    # names it in `context.targetId`; a requested id must agree with it.
+    context = detail.get("context") if isinstance(detail.get("context"), dict) else {}
+    info = detail.get("info") if isinstance(detail.get("info"), dict) else {}
+    requested = str(target.get("id") or "")
+    captured = str(context.get("targetId") or "")
+    if requested and captured and requested != captured:
         return _out(0.0, 0.0, "element_node_unmatched", False)
-    if not _fits_capture(bounds, width, height):
-        # The node is the right one but its visible box no longer describes
-        # what was captured, so the capture and the tree disagree about layout.
-        return _out(0.0, 0.0, "element_bounds_stale", False)
+    wanted = requested or captured
+    if not wanted:
+        return _out(0.0, 0.0, "element_no_canonical_id", False)
+    bounds = info.get("boundsInWidget")
+    if not isinstance(bounds, dict):
+        return _out(0.0, 0.0, "element_node_unmatched", False)
     try:
-        receipt = _out(float(bounds.get("x")), float(bounds.get("y")),
-                       "element_visible_bounds", True)
-    except (TypeError, ValueError):
+        bx, by = float(bounds["x"]), float(bounds["y"])
+        bw, bh = float(bounds["width"]), float(bounds["height"])
+        got_w, got_h = float(width), float(height)
+    except (KeyError, TypeError, ValueError):
         return _out(0.0, 0.0, "element_bounds_invalid", False)
+    # The capture is the element's box clipped to the viewport (measured: the
+    # platform scrolls the element into view first, then reports its
+    # `boundsInWidget` in viewport CSS pixels). An overhang past the near edge
+    # moves the origin to 0 and shortens the capture; one past the far edge
+    # only shortens it. A capture LARGER than the visible box is a layout that
+    # no longer matches the detail read.
+    visible_w = bw - max(0.0, -bx)
+    visible_h = bh - max(0.0, -by)
+    if not (0 < got_w <= visible_w + _ENCLOSING_RECT_SLACK
+            and 0 < got_h <= visible_h + _ENCLOSING_RECT_SLACK):
+        return _out(0.0, 0.0, "element_bounds_stale", False)
+    # The capture is the integer rect enclosing the box, so its pixel (0,0)
+    # sits at the box's near edges rounded DOWN (y=517.5 captured from 517).
+    receipt = _out(
+        float(math.floor(max(0.0, bx))), float(math.floor(max(0.0, by))),
+        "element_target_detail", True,
+    )
     # Carried so the promotion can ask, from the AXTree it already reads,
-    # whether this element is still where the capture found it. The FULL box,
-    # not the visible one: `visibleBounds` is the crop origin, but the AXTree
-    # stores the whole painted rect — measured, a button overflowing the left
-    # edge reported `visibleBounds.x = 0` against an AXTree x of -120 device
-    # px. Comparing the two would call every clipped element "moved".
+    # whether this element is still where the capture found it. The FULL box:
+    # the AXTree also stores the unclipped rect, so comparing it with the
+    # clipped origin would call every overhanging element "moved".
     receipt["nodeId"] = wanted
-    full = node_bounds if isinstance(node_bounds, dict) else None
-    if full is not None:
-        try:
-            receipt["nodeBounds"] = {
-                "x": float(full["x"]), "y": float(full["y"]),
-                "width": float(full["width"]), "height": float(full["height"]),
-            }
-        except (KeyError, TypeError, ValueError):
-            pass
+    receipt["nodeBounds"] = {"x": bx, "y": by, "width": bw, "height": bh}
     return receipt
 
 
@@ -442,8 +336,8 @@ def _coordinate_fallback(
 ) -> Dict[str, Any]:
     """Build the no-promotion result, refusing coordinates unless they are safe.
 
-    `Input.click` takes CSS pixels while the AXTree bbox and the screenshot are
-    both device pixels, so the fallback needs a proven scale AND a provable
+    `Input.click` takes viewport CSS pixels while the screenshot is device
+    pixels of a crop, so the fallback needs a proven scale AND a provable
     origin. Missing either, the point is withheld: a wrong coordinate click
     lands on a real element and reports success, which is worse than no
     fallback at all. `refuse` withholds it for a reason the receipts cannot
@@ -482,15 +376,17 @@ def _coordinate_fallback(
     return out
 
 
-# Sub-pixel layout rounding, in DEVICE pixels: anything larger is the element
-# actually having moved.
+# Both the AXTree rect and the capture are the integer rect ENCLOSING the
+# element's fractional box (measured: a box at y=337.5 h=50 read `@0,337,140,51`
+# and captured 51px tall), so each edge may round once - up to ~2 CSS px per
+# dimension. Anything larger is the element actually having moved.
 _TARGET_DRIFT_TOLERANCE = 2.0
+_ENCLOSING_RECT_SLACK = 2.0
 
 
 def _capture_target_moved(
     bboxes: List[Dict[str, Any]],
     origin: Dict[str, Any],
-    scale: float,
 ) -> Optional[Dict[str, Any]]:
     """Whether the captured element's rect has changed since the capture.
 
@@ -498,9 +394,9 @@ def _capture_target_moved(
     current rect, and the receipt recorded the one the capture saw. If they
     disagree, the crop's geometry describes a layout that has moved on.
 
-    Both rects must be the SAME rect. The AXTree stores the full painted box,
-    so this compares against the receipt's `nodeBounds`, never the
-    `visibleBounds` that supplied the crop origin — those two diverge exactly
+    Both rects must be the SAME rect, and both are viewport CSS pixels: the
+    AXTree stores the full box, so this compares against the receipt's full
+    `nodeBounds`, never the clamped crop origin — those two diverge exactly
     when the element is clipped by the viewport, which is the shape a dropdown
     popup usually has. Width and height are compared too: a popup that loads
     more options grows downward without its origin moving at all.
@@ -517,16 +413,50 @@ def _capture_target_moved(
     if box is None:
         return None
     expected = {
-        "x": (float(recorded["x"]) + float(origin.get("scrollX") or 0.0)) * scale,
-        "y": (float(recorded["y"]) + float(origin.get("scrollY") or 0.0)) * scale,
-        "w": float(recorded["width"]) * scale,
-        "h": float(recorded["height"]) * scale,
+        "x": float(recorded["x"]),
+        "y": float(recorded["y"]),
+        "w": float(recorded["width"]),
+        "h": float(recorded["height"]),
     }
     found = {"x": box["x"], "y": box["y"], "w": box["w"], "h": box["h"]}
     if all(abs(found[k] - expected[k]) <= _TARGET_DRIFT_TOLERANCE
            for k in ("x", "y", "w", "h")):
         return None
     return {"capturedAt": expected, "foundAt": found}
+
+
+# The two axes of a derived scale must agree this closely; a capture whose axes
+# scale differently is not a uniform rescale of the root box.
+_ROOT_SCALE_AXIS_TOLERANCE = 0.02
+
+
+def _root_scale(
+    bboxes: List[Dict[str, Any]],
+    shot_w: float,
+    shot_h: float,
+) -> Optional[Dict[str, Any]]:
+    """Device-pixel ratio of a viewport capture, from the main root box.
+
+    The main document's rootWebArea box is the viewport in CSS pixels and a
+    viewport capture is the same area in device pixels, so their ratio is the
+    scale - but only when both axes give the same answer.
+    """
+    main = main_frame_id(bboxes)
+    root = next(
+        (b for b in bboxes
+         if b.get("frame") == main and str(b.get("role", "")).lower() in _NON_PROMOTABLE_ROLES
+         and b["w"] > 0 and b["h"] > 0),
+        None,
+    )
+    if root is None or not shot_w or not shot_h:
+        return None
+    scale_x = float(shot_w) / root["w"]
+    scale_y = float(shot_h) / root["h"]
+    if abs(scale_x - scale_y) > _ROOT_SCALE_AXIS_TOLERANCE * max(scale_x, scale_y):
+        return None
+    if not (_MIN_PROVABLE_DPR <= scale_x <= _MAX_PROVABLE_DPR):
+        return None
+    return {"dpr": (scale_x + scale_y) / 2, "source": "png_vs_axtree_root", "proven": True}
 
 
 def promote_locate(
@@ -546,28 +476,21 @@ def promote_locate(
       {resolved:False, cssPoint, pxPoint, reason:"no_bbox_contains"} — coords fallback
       {resolved:False, pxPoint, coordinateRefused:"..."}             — no safe point
 
-    Containment is tested in DEVICE pixels, not CSS: on this platform the AXTree
-    `# @x,y,w,h` rect and the saved PNG occupy the same device-pixel space
-    (verified live — rootwebarea `@0,0,2448,1452` against a 2448x1452 PNG whose
-    receipt reports 1224x726 CSS). Converting before the hit test would miss
-    every box.
+    Containment is tested in VIEWPORT CSS pixels. Measured on WebCross 0.9.3
+    (2026-09-21): every AXTree rect is the node's box in viewport CSS pixels -
+    rootWebArea `@0,0,1224,724` beside a 2448x1448 PNG at scaleFactor 2 - and
+    it follows scrolling (an in-flow paragraph moved from y=5156 to y=3156
+    across a 2000px scroll). The screenshot is device pixels of the crop, so a
+    pixel maps to `origin + px/scale`, which is also the point `Input.click`
+    takes. An iframe's boxes stay frame-local and are excluded by document.
 
-    Two translations stand between a screenshot pixel and a bbox, and both were
-    measured rather than assumed:
+    The scale is the capture's proven device-pixel ratio. A viewport capture
+    whose ratio is unproven derives it from the PNG against the main document's
+    root box, accepted only when both axes agree.
 
-      * the crop origin — a crop's pixel (0,0) is its own corner, not the
-        viewport's (`capture_origin`);
-      * the scroll offset — an AXTree bbox is `(viewport + root scroll) x
-        scale` while a screenshot is viewport-relative. Verified live on an
-        in-flow button (bbox unchanged at `@440,7440` across a 300px scroll), a
-        fixed button, a sticky one and one inside a nested scroll container.
-        The two spaces coincide only at scroll 0, which is why this went
-        unnoticed.
-
-    So containment happens at `(scroll + origin + px/scale) * scale`, while
-    `cssPoint` stays `origin + px/scale` because `Input.click` takes VIEWPORT
-    CSS pixels — also verified live, by clicking a button's viewport centre on
-    a page scrolled to 3407px and having the page report that button.
+    The bracketed scroll read (`scrollProven`) no longer translates anything:
+    it is the evidence that the page did not scroll between the capture and
+    the AXTree read, without which the boxes describe another viewport.
 
     An unproven scroll costs only the promotion: the coordinate is still exact,
     so the result degrades to the coordinate fallback instead of refusing."""
@@ -581,15 +504,8 @@ def promote_locate(
     # the whole viewport, so an untranslated crop-local pixel lands on whatever
     # unrelated node happens to occupy those coordinates and comes back as a
     # confident — and wrong — durable id.
-    #
-    # A viewport capture needs no translation and therefore no scale: its origin
-    # is (0,0) and its pixels are already in the AXTree's space. Only a genuine
-    # crop has to convert its CSS origin into device pixels, and only that case
-    # depends on a proven scale.
     offset_x = float(origin.get("x") or 0.0)
     offset_y = float(origin.get("y") or 0.0)
-    scroll_x = float(origin.get("scrollX") or 0.0)
-    scroll_y = float(origin.get("scrollY") or 0.0)
     if not origin.get("proven"):
         return _coordinate_fallback(
             px, py,
@@ -598,11 +514,13 @@ def promote_locate(
             scope=scope,
             origin_receipt=origin,
         )
-    # The scale is only needed to convert the CSS offsets into device pixels.
-    # A viewport capture of an unscrolled page has none, so it still promotes
-    # without a proven scale, exactly as it did before crops were supported.
-    needs_scale = bool(offset_x or offset_y or scroll_x or scroll_y)
-    if needs_scale and not (dpr_receipt or {}).get("proven"):
+    bboxes = parse_axtree_bboxes(axtree_lines)
+    viewport_capture = str(scope or "") in COORDINATE_SAFE_SCOPES
+    if not (dpr_receipt or {}).get("proven") and viewport_capture:
+        derived = _root_scale(bboxes, shot_w, shot_h)
+        if derived is not None:
+            dpr_receipt = derived
+    if not (dpr_receipt or {}).get("proven"):
         return _coordinate_fallback(
             px, py,
             reason="crop_scale_unprovable",
@@ -611,8 +529,8 @@ def promote_locate(
             origin_receipt=origin,
         )
     if not origin.get("scrollProven"):
-        # Without the scroll the point cannot be placed in the AXTree's
-        # document space. The coordinate does not need it, so hand back the
+        # Without a stable scroll the boxes may describe another viewport than
+        # the image. The coordinate does not depend on them, so hand back the
         # exact viewport point rather than refusing outright.
         return _coordinate_fallback(
             px, py,
@@ -622,20 +540,19 @@ def promote_locate(
             origin_receipt=origin,
         )
     scale = float((dpr_receipt or {}).get("dpr") or 1.0) or 1.0
-    hit_x = (scroll_x + offset_x) * scale + px
-    hit_y = (scroll_y + offset_y) * scale + py
-    bboxes = parse_axtree_bboxes(axtree_lines)
-    moved = _capture_target_moved(bboxes, origin, scale)
+    hit_x = offset_x + px / scale
+    hit_y = offset_y + py / scale
+    moved = _capture_target_moved(bboxes, origin)
     if moved is not None:
         # The element the crop was taken of is no longer where the receipt put
         # it, so the origin describes a layout that has since changed — and
         # both products of that origin are wrong, the durable id and the
         # coordinate alike. This covers the window holding the visual-locate
         # call, where a popup animating into place or a list reflowing does its
-        # damage — but ONLY for an element capture whose target has a canonical
-        # id AND appears in the AXTree. A popup the accessibility tree cannot
-        # see gets no guard at all, and that is one of the main reasons visual
-        # recovery exists, so this is a narrow mitigation, not a solved race.
+        # damage — but ONLY for an element capture whose target has an id AND
+        # appears in the AXTree. A popup the accessibility tree cannot see gets
+        # no guard at all, and that is one of the main reasons visual recovery
+        # exists, so this is a narrow mitigation, not a solved race.
         return _coordinate_fallback(
             px, py,
             reason="capture_target_moved",
@@ -646,15 +563,14 @@ def promote_locate(
             extra={"capturedAt": moved["capturedAt"],
                    "foundAt": moved["foundAt"]},
         )
-    # Promotion only trusts main-frame boxes: iframe bboxes are frame-local, and
-    # iframe elements have no screen-space rect in the AXTree on this build, so a
-    # genuine iframe target correctly falls through to the cssPoint fallback
-    # (coordinate clicks are screen-space and hit iframe content just fine).
+    # Promotion only trusts main-document boxes: iframe boxes are frame-local,
+    # so a genuine iframe target correctly falls through to the cssPoint
+    # fallback (coordinate clicks are viewport-space and reach iframe content).
     # A crop is smaller than the viewport, so its dimensions must not be used
-    # to pick the main frame — the root bbox would never look closest to them.
+    # to pick the main document — the root box would never look closest.
     frame = (
-        main_frame_id(bboxes, shot_w=shot_w, shot_h=shot_h)
-        if str(scope or "") in COORDINATE_SAFE_SCOPES
+        main_frame_id(bboxes, shot_w=shot_w / scale, shot_h=shot_h / scale)
+        if viewport_capture
         else main_frame_id(bboxes)
     )
     hit = point_to_id(bboxes, hit_x, hit_y, frame=frame)
@@ -662,7 +578,8 @@ def promote_locate(
         return {"resolved": True, "id": hit["id"], "label": hit["name"],
                 "role": hit["role"], "bbox": hit,
                 "pxPoint": {"x": px, "y": py},
-                "documentPxPoint": {"x": hit_x, "y": hit_y},
+                "viewportCssPoint": {"x": hit_x, "y": hit_y},
+                "dpr": dpr_receipt,
                 "origin": origin}
     return _coordinate_fallback(
         px, py,
@@ -997,16 +914,15 @@ async def read_scroll(browser: Any, page_id: str) -> Optional[Dict[str, float]]:
     Root-viewport scrolling moved to `Page.wheel`, whose `x`/`y` must be inside
     the viewport.
 
-    `Page.getState` carries no scroll field on this build, and a Semantic Tree
-    read costs a whole document.
+    `Page.getState` carries no scroll field on this build.
     """
     try:
         resp = await browser.call("Page.wheel", {
             "pageId": page_id,
             "x": 0,
             "y": 0,
-            "scrollX": 0,
-            "scrollY": 0,
+            "deltaX": 0,
+            "deltaY": 0,
             "purpose": "read the scroll offset for VL coordinate mapping",
         })
     except Exception:

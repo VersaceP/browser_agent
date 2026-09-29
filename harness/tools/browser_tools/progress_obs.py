@@ -7,7 +7,6 @@ from typing import Any
 from typing import Optional
 from harness.observation.page_lifecycle import PageLifecycleTracker
 from harness.observation.progress import extraction_artifact_count
-from harness.planning.task_types import resolve_task_type_fail_closed
 from harness.tools.tool_policy import disabled_reason_for_method
 from harness.utils import JsonDict
 from harness.utils import optional_int
@@ -90,6 +89,9 @@ def _annotate_axtree_offload(response: Any, snapshot: Optional[JsonDict]) -> Non
         return
     blob = data.get("lines")
     if not isinstance(blob, dict) or not blob.get("_offloaded"):
+        return
+    if blob.get("delivery") == "changes":
+        # A change view already says where the complete view lives.
         return
     blob["liveQuery"] = {
         "tool": "find_in_axtree",
@@ -207,35 +209,18 @@ def _check_worker_contract(agent: Any, method_or_tool: str) -> Optional[JsonDict
             "next_instruction": "Choose an allowed method or finalize with a blocker.",
         }
 
-    resolved_contract_task_type = resolve_task_type_fail_closed(
-        contract.get("task_type")
-    )
-    disabled_reason = ""
-    if "." in str(method_or_tool):
-        disabled_reason = disabled_reason_for_method(
-            method_or_tool,
-            resolved_contract_task_type,
-        )
+    disabled_reason = disabled_reason_for_method(method_or_tool)
     if disabled_reason:
         return {
             "status": "contract_violation",
             "method": method_or_tool,
             "error": disabled_reason,
-            "task_type": resolved_contract_task_type,
             "classification": {
-                "category": "blocked_cross_task_type_required",
-                "hint": (
-                    "This phase needs a method outside its task_type policy."
-                ),
+                "category": "blocked_infrastructure",
+                "hint": "This method is blocked by a universal Harness restriction.",
                 "method": method_or_tool,
-                "task_type": resolved_contract_task_type,
             },
-            "next_instruction": (
-                "Use a method allowed by the task_type policy, or finalize with"
-                " a blocker if this task really requires the disabled domain."
-                " In final_answer, report blocked_cross_task_type_required so"
-                " LeadAgent can emit a new phase with the appropriate task_type."
-            ),
+            "next_instruction": "Report the restriction; changing the assignment label cannot grant this method.",
         }
 
     max_attempts = contract.get("max_surface_attempts")
@@ -359,12 +344,6 @@ def _observe_progress_before(
             "progress.mandatory_recovery_credit_used",
             dict(mandatory_allowance),
         )
-    allowance = (
-        progress.consume_diagnostic_allowance()
-        if hasattr(progress, "consume_diagnostic_allowance") else None
-    )
-    if isinstance(allowance, dict) and tool_name == "DOM.getSemanticTree":
-        agent.logger.write("semantic_tree.diagnostic_bypass", allowance)
     if result is None:
         return None
     # Saves that carried schemaWarnings were persisted but deliberately NOT

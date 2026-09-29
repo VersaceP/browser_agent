@@ -155,7 +155,7 @@ def region_in_capture(
 
     ``receipt_bound`` is the stronger evidence used by visual contracts.  It
     means the *same Page.screenshot receipt* tied this crop to its requested
-    region or to a canonical element node in the receipt's Semantic Tree.  It
+    region or to a canonical element node in the receipt's target detail.  It
     deliberately defaults to ``None`` for older callers: an element screenshot
     remains self-evidencing under the legacy contract, while a new caller that
     has inspected the receipt can say ``False`` and prevent a selector-shaped,
@@ -179,7 +179,7 @@ def region_in_capture(
     }:
         # A selector can resolve more than one similarly shaped node over the
         # lifetime of a page.  If this capture did not return a canonical id +
-        # matching Semantic Tree geometry, the picture is useful to VL but is
+        # matching target geometry, the picture is useful to VL but is
         # not proof that it shows the declared element/region.
         return {
             "state": CAPTURE_UNPROVEN,

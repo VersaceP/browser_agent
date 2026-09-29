@@ -95,7 +95,6 @@ def select_skill(
         return registry.get(skill_id)  # explicit /skill <id> — human opted in
     if mode != "auto":
         return None
-    task_type = str(worker_contract.get("task_type") or "")
     stage_hint = str(worker_contract.get("stage_hint") or "")
     fields = _contract_fields(worker_contract) or None
     # Guard against a DOMAIN-ONLY auto-match: with no task dimension, a same-domain
@@ -103,11 +102,11 @@ def select_skill(
     # possibly tripping a challenge, burning a slot, AND recording a health failure
     # on the inevitable contract-unmet that could rot/disable a perfectly good skill
     # (doc §5.2: deterministic prefilter needs a task_plan; bare domain ⇒ slow path).
-    if not (task_type or stage_hint or fields):
+    if not stage_hint or not fields:
         return None
     domain = _host_of(target_url) or str(worker_contract.get("domain") or "")
     return registry.match(
-        domain=domain, task_type=task_type, stage_hint=stage_hint, fields=fields,
+        domain=domain, stage_hint=stage_hint, fields=fields,
     )
 
 

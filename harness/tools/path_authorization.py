@@ -246,14 +246,74 @@ def requests(call):
             elif isinstance(node, list):
                 for item in node:
                     yield from walk(item)
-        if name in {'browser_call', 'execute_saved_browser_workflow', 'navigate_verified'} or '.' in name:
+        if name in {'browser_call', 'execute_browser_workflow', 'execute_saved_browser_workflow', 'navigate_verified'} or '.' in name:
             yield from walk(args)
+
+
+def normalize_local_access_intent(value):
+    """Validate declared phase scopes, not infer or grant permissions."""
+    if not isinstance(value, list) or len(value) > 32:
+        raise ValueError('local_access_intent must be an array of at most 32 scopes')
+    normalized = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {'path', 'modes', 'reason'}:
+            raise ValueError('local_access_intent entries require only path, modes and reason')
+        path, modes, reason = item['path'], item['modes'], item['reason']
+        if (not isinstance(path, str) or not path.strip()
+                or not Path(path).is_absolute() or '..' in Path(path).parts):
+            raise ValueError('local_access_intent.path must be an absolute literal path without ..')
+        if (not isinstance(modes, list) or not modes
+                or any(mode not in ('read', 'write') for mode in modes)):
+            raise ValueError('local_access_intent.modes must contain read and/or write')
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError('local_access_intent.reason must explain the task need')
+        normalized.append({'path': path, 'modes': list(dict.fromkeys(modes)), 'reason': reason.strip()})
+    return normalized
 
 
 async def authorize_tool_call(agent, call):
     await wait_for_local_authorization(agent)
     try:
-        for raw, mode, base in requests(call):
+        path_requests = list(requests(call))
+        contract = getattr(agent, 'worker_contract', None) or {}
+        intent = contract.get('local_access_intent')
+        if path_requests and intent is not None:
+            scopes = normalize_local_access_intent(intent)
+            # Preflight only on a call involving a declared scope. Do not ask
+            # for external permission merely to read internal observations.
+            # Select the narrowest matching declaration per actual request;
+            # one output call must not preflight unrelated inputs or ancestors.
+            selected = []
+            for raw, mode, base in path_requests:
+                requested = canonical(agent, raw, base)
+                matches = [scope for scope in scopes
+                           if mode in scope['modes'] and inside(
+                               requested, canonical(agent, scope['path']))]
+                if matches:
+                    scope = max(matches, key=lambda item: len(
+                        canonical(agent, item['path']).parts))
+                    request_scope = (scope, mode)
+                    if request_scope not in selected:
+                        selected.append(request_scope)
+            if selected:
+                for scope, mode in selected:
+                    root = canonical(agent, scope['path'])
+                    # A declaration is not a request for every listed mode.
+                    # Ask for READ only when this call actually reads, and
+                    # WRITE only when it writes. Keep child denials intact.
+                    if any(m == mode and (inside(Path(p), root) or inside(root, Path(p)))
+                           for p, m in state(agent)['denied']):
+                        return {'status': 'failed', 'code': 'external_path_access_denied',
+                                'tool_was_executed': False}
+                    if not allowed(agent, root, mode):
+                        _log(agent, 'local_path.access_intent.preflight', {
+                            'phaseId': contract.get('phase_id'), 'path': str(root),
+                            'mode': mode, 'reason': scope['reason'],
+                        })
+                    error = await authorize_path(agent, scope['path'], mode)
+                    if error:
+                        return error
+        for raw, mode, base in path_requests:
             error = await authorize_path(agent, raw, mode, base)
             if error:
                 return error

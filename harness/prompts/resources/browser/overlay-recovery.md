@@ -66,7 +66,9 @@ An ordinary sign-in link or a nonblocking embedded login panel is not enough
 for HITL. A current authentication/verification surface with concrete login
 controls, together with evidence that it blocks the intended target, is enough:
 call `Hitl.requestPause` in the current worker with the page id and the human
-action needed. Do not first try the dismissal ladder or another equivalent
+action needed. Set `browser_call.hitl_assistance_kind` to `browser_state` for
+this page-state intervention; this hint stays in Harness and is not a permission
+grant. Do not first try the dismissal ladder or another equivalent
 button behind that cover.
 
 Reuse current action receipts and DOM/AX evidence. Repeating `Page.getState`

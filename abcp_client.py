@@ -80,6 +80,7 @@ class ABCPTransportError(RuntimeError):
         connection_fatal: bool = False,
         request_sent: Optional[bool] = None,
         connection_details: Optional[JsonDict] = None,
+        request_id: str = "",
     ) -> None:
         super().__init__(message)
         self.rpc_code = rpc_code
@@ -90,6 +91,7 @@ class ABCPTransportError(RuntimeError):
         # ``None`` means a send failed while its delivery was indeterminate.
         self.request_sent = request_sent if isinstance(request_sent, bool) else None
         self.connection_details = dict(connection_details or {})
+        self.request_id = str(request_id or "")
 
 
 @dataclass
@@ -390,12 +392,91 @@ class ABCPClient:
                    "errno": getattr(exc, "errno", None)}
         # Only local validation errors contain messages we construct ourselves.
         reason = f" ({exc})" if type(exc) is ValueError else ""
-        raise ABCPTransportError(
+        failure = ABCPTransportError(
             f"Unable to connect to ABCP Browser: {details['endpoint']}"
             f" [{details.get('stage', 'connect')}: {details['errorType']}]" + reason,
             transport_code=ABCP_TRANSPORT_CONNECT_FAILED,
             connection_fatal=True, request_sent=False, connection_details=details,
-        ) from exc
+        )
+        # Descriptor lookup and local socket open have not reached the peer.
+        # During a local/WS handshake this exception alone cannot distinguish
+        # a rejected frame from a partial reply or a timeout.
+        response_observed = (
+            False if details.get("stage") == "runtime_descriptor"
+            or (details.get("transport") == "local" and details.get("stage") == "connect")
+            else None
+        )
+        self._emit_failure(
+            failure, origin="connection_attempt",
+            server_response_received=response_observed,
+        )
+        raise failure from exc
+
+    def _emit_failure(
+        self,
+        exc: ABCPTransportError,
+        *,
+        origin: str,
+        method: str = "",
+        request_id: str = "",
+        secrets: Optional[Dict[str, str]] = None,
+        response_error: Optional[JsonDict] = None,
+        server_response_received: Optional[bool] = False,
+        already_redacted: bool = False,
+    ) -> None:
+        """Record observed protocol facts without copying an arbitrary body.
+
+        This is diagnostic only: a logging failure cannot replace the original
+        transport exception or change whether a browser action may be retried.
+        """
+        connection = exc.connection_details or self.connection_details
+        safe_connection = {
+            key: connection[key]
+            for key in ("transport", "endpoint", "source", "instanceId", "stage", "errorType", "errno")
+            if key in connection
+        }
+        payload: JsonDict = {
+            "origin": origin,
+            "transportCode": exc.transport_code,
+            "connectionFatal": exc.connection_fatal,
+            "requestSent": exc.request_sent,
+            "serverResponseReceived": (
+                True if response_error is not None else server_response_received
+            ),
+            "connection": safe_connection,
+        }
+        if method or exc.rpc_method:
+            payload["method"] = method or exc.rpc_method
+        if request_id or exc.request_id:
+            payload["requestId"] = request_id or exc.request_id
+        if isinstance(exc.rpc_code, int) and not isinstance(exc.rpc_code, bool):
+            payload["rpcCode"] = exc.rpc_code
+        if response_error is None:
+            payload["message"] = str(exc)[:1000]
+        else:
+            code = response_error.get("code")
+            if isinstance(code, (str, int)) and not isinstance(code, bool):
+                payload["responseCode"] = str(code)[:80]
+            # Network.readApi errors can contain text first seen in a site's
+            # response body. Codes remain useful, but free text cannot be
+            # declared safe merely by scrubbing the original request.
+            include_response_text = method != "Network.readApi"
+            message = response_error.get("message")
+            if include_response_text and isinstance(message, str):
+                payload["platformMessage"] = message[:1000]
+            data = response_error.get("data")
+            public_error = data.get("error") if isinstance(data, dict) else None
+            if isinstance(public_error, dict):
+                public_code = public_error.get("code")
+                if isinstance(public_code, str):
+                    payload["publicErrorCode"] = public_code[:80]
+                public_message = public_error.get("message")
+                if include_response_text and isinstance(public_message, str):
+                    payload["publicErrorMessage"] = public_message[:1000]
+        try:
+            self._emit("failure", payload, secrets, already_redacted=already_redacted)
+        except Exception:
+            pass
 
     async def _connect_websocket(self) -> None:
         self.connection_details["stage"] = "connect"
@@ -469,29 +550,42 @@ class ABCPClient:
         platform echoes them back in.
         """
         if self._ws is None:
-            raise ABCPTransportError(
+            failure = ABCPTransportError(
                 "WebSocket is not connected",
+                rpc_method=method,
                 transport_code=ABCP_TRANSPORT_NOT_CONNECTED,
                 connection_fatal=True,
                 request_sent=False,
             )
+            self._emit_failure(failure, origin="local_transport", method=method)
+            raise failure
         if self._closed:
-            raise ABCPTransportError(
+            failure = ABCPTransportError(
                 "WebSocket has been closed",
+                rpc_method=method,
                 transport_code=ABCP_TRANSPORT_CLOSED,
                 connection_fatal=True,
                 request_sent=False,
             )
+            self._emit_failure(failure, origin="local_transport", method=method)
+            raise failure
         if self._reader_failure is not None:
-            raise ABCPTransportError(
+            failure = ABCPTransportError(
                 f"WebSocket background reader failed: {self._reader_failure}",
                 rpc_method=method,
                 transport_code=ABCP_TRANSPORT_READER_FAILED,
                 connection_fatal=True,
                 request_sent=False,
             )
+            self._emit_failure(failure, origin="local_transport", method=method)
+            raise failure
 
         request_id = str(uuid.uuid4())
+        if method == "Workflow.execute":
+            # Harness code speaks the flat request; the platform takes a
+            # versioned document plus a runtime binding.
+            from harness.workflow.workflow_wire import to_platform_execute_params
+            params = to_platform_execute_params(params)
         payload = self._build_payload(request_id, method, params or {})
         # Derived once from the request: the response has to be scrubbed with
         # the request's secrets, because the platform echoes typed values back
@@ -526,27 +620,63 @@ class ABCPClient:
                     transport_code=ABCP_TRANSPORT_CALL_TIMEOUT,
                     request_sent=True,
                 ) from exc
+        except ABCPTransportError as exc:
+            exc.request_id = request_id
+            self._emit_failure(
+                exc, origin="local_transport", method=method,
+                request_id=request_id, secrets=secrets,
+            )
+            raise
         finally:
             self._pending.pop(request_id, None)
 
+        if method == "Network.readApi":
+            # This Action can return credentials first seen in the site's
+            # response body. Scrub before the transport event hook, before
+            # JSON-RPC error formatting, and before any model/offload consumer.
+            from harness.tools.tool_policy import sanitize_network_read_api_response
+            raw_response = sanitize_network_read_api_response(raw_response, secrets)
+
         if "error" in raw_response and not self._is_implicit_error_envelope(raw_response):
-            self._emit("response", raw_response, secrets)
+            self._emit(
+                "response", raw_response, secrets,
+                already_redacted=method == "Network.readApi",
+            )
             rpc_error = (
                 raw_response.get("error")
                 if isinstance(raw_response.get("error"), dict)
                 else {}
             )
             raw_code = rpc_error.get("code")
-            raise ABCPTransportError(
+            failure = ABCPTransportError(
                 self._format_jsonrpc_error(method, raw_response),
                 rpc_code=raw_code if isinstance(raw_code, int) else None,
                 rpc_method=method,
                 rpc_data=rpc_error.get("data"),
                 transport_code=ABCP_RPC_ERROR,
                 request_sent=True,
+                request_id=request_id,
             )
+            self._emit_failure(
+                failure, origin="webcross_response", method=method,
+                request_id=request_id, secrets=secrets,
+                response_error=rpc_error,
+                already_redacted=method == "Network.readApi",
+            )
+            raise failure
         response = self._unwrap_response(raw_response)
-        self._emit("response", response, secrets)
+        self._emit(
+            "response", response, secrets,
+            already_redacted=method == "Network.readApi",
+        )
+        if method == "DOM.getAXTree":
+            # The page view arrives as host artifact files that the platform
+            # retires on its own schedule; read them now, for every caller,
+            # after the transport log has kept the original references.
+            from harness.observation.observation_channel import record_hydrated_response
+            from harness.observation.page_observation import hydrate_axtree_response
+            response = hydrate_axtree_response(params, response)
+            record_hydrated_response(params, response)
         if (method == "System.register" and isinstance(self._ws, LocalControlSocket)
                 and not self._ws.watching):
             # Unlike WS, local-control does not install a default subscription
@@ -720,6 +850,20 @@ class ABCPClient:
                 except Exception as exc:
                     if not self._closed:
                         self._reader_failure = exc
+                        if not self._pending:
+                            self._emit_failure(
+                                ABCPTransportError(
+                                    str(exc) or "transport reader failed",
+                                    transport_code=ABCP_TRANSPORT_READER_FAILED,
+                                    connection_fatal=True, request_sent=None,
+                                    connection_details={
+                                        **self.connection_details,
+                                        "errorType": type(exc).__name__,
+                                        "errno": getattr(exc, "errno", None),
+                                    },
+                                ),
+                                origin="local_transport",
+                            )
                     self._fail_pending(exc)
                     return
                 message = self._decode_message(raw)
@@ -744,7 +888,7 @@ class ABCPClient:
                 entry.future.set_result(message)
             else:
                 # The caller already gave up (timeout); the answer is late.
-                self._emit("orphan_response", message)
+                self._emit("orphan_response", self._orphan_diagnostic(message, entry.method))
             return
         if self._looks_like_response(message):
             # Response-shaped but matching no pending id: a late answer to a
@@ -754,11 +898,27 @@ class ABCPClient:
             # It is emitted rather than dropped so that "the platform stopped
             # echoing ids" shows up in the transport log instead of as calls
             # mysteriously timing out.
-            self._emit("orphan_response", message)
+            self._emit("orphan_response", self._orphan_diagnostic(message))
             return
         self._emit("notify", message)
         if self.notifications.publish_once(message):
             self.set_event_cursor(self._event_cursor_from_message(message))
+
+    @staticmethod
+    def _orphan_diagnostic(message: JsonDict, method: str = "") -> JsonDict:
+        """Log response identity without an unowned response body.
+
+        A late Network.readApi result has no active caller to perform its
+        method-specific sanitization. No orphan result is delivered to a
+        caller, so its payload is unnecessary in the transport event log.
+        """
+        error = message.get("error")
+        return {
+            "id": message.get("id"),
+            "method": method or None,
+            "errorCode": error.get("code") if isinstance(error, dict) else None,
+            "hasResult": "result" in message,
+        }
 
     @staticmethod
     def _event_cursor_value(value: Any) -> Optional[int]:
@@ -839,7 +999,17 @@ class ABCPClient:
             if entry.future.done():
                 continue
             if isinstance(exc, ABCPTransportError):
-                entry.future.set_exception(exc)
+                # Each in-flight request needs its own failure identity. A
+                # shared exception would let concurrent callers overwrite the
+                # request id while recording their independent failures.
+                entry.future.set_exception(ABCPTransportError(
+                    str(exc), rpc_code=exc.rpc_code, rpc_method=entry.method,
+                    rpc_data=exc.rpc_data, transport_code=exc.transport_code,
+                    connection_fatal=exc.connection_fatal,
+                    request_sent=exc.request_sent,
+                    connection_details=exc.connection_details,
+                    request_id=entry.request_id,
+                ))
             else:
                 entry.future.set_exception(ABCPTransportError(
                     str(exc) or "transport failure",
@@ -847,6 +1017,12 @@ class ABCPClient:
                     transport_code=ABCP_TRANSPORT_READER_FAILED,
                     connection_fatal=True,
                     request_sent=True,
+                    request_id=entry.request_id,
+                    connection_details={
+                        **self.connection_details,
+                        "errorType": type(exc).__name__,
+                        "errno": getattr(exc, "errno", None),
+                    },
                 ))
 
     def _build_payload(self, request_id: str, method: str, params: JsonDict) -> JsonDict:
@@ -907,6 +1083,8 @@ class ABCPClient:
         event_type: str,
         payload: JsonDict,
         secrets: Optional[Dict[str, str]] = None,
+        *,
+        already_redacted: bool = False,
     ) -> None:
         """Hand one transport frame to the event hook, scrubbed and bounded.
 
@@ -921,8 +1099,14 @@ class ABCPClient:
         """
         if not self.on_event:
             return
+        event_types = getattr(self.on_event, "abcp_event_types", None)
+        if event_types is not None and event_type not in event_types:
+            return
         collect, sanitize = _redactors()
-        table = dict(collect(payload))
-        if secrets:
+        # Network.readApi has already parsed and sanitized its JSON bodies.
+        # Scanning their serialized text as one URL can treat closing JSON
+        # syntax as a query value and corrupt the diagnostic response.
+        table = {} if already_redacted else dict(collect(payload))
+        if secrets and not already_redacted:
             table.update(secrets)
         self.on_event(event_type, sanitize(payload, table))

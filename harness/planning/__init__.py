@@ -1,3 +1,3 @@
 """
-harness.planning - Plan validation and its live canary.
+harness.planning - Task classification, assignment review and approval context.
 """

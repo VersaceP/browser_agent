@@ -34,7 +34,6 @@ from typing import Any, Dict, List, Optional
 
 from harness.fleet.runtime import FleetClickGateTimeout
 from harness.observation.exec_observer import ExecObserver
-from harness.planning.task_types import resolve_task_type_fail_closed
 from harness.workflow.workflow_policy import validate_workflow_params
 from harness.workflow.workflow_runtime import (
     workflow_execution_disabled_result,
@@ -124,9 +123,6 @@ async def run_skill_workflow(
         normalized, policy_error = validate_workflow_params(
             params,
             capability_methods=capability_methods,
-            task_type=resolve_task_type_fail_closed(
-                getattr(skill, "task_type", None)
-            ),
             allow_runtime=False,
             enforce_lifecycle=True,
         )
@@ -174,45 +170,56 @@ async def run_skill_workflow(
             "exc": str(exc),
             **exc.receipt,
         }
-    except Exception as exc:  # execute throws on failure; rich payload not in the error
+    except Exception as exc:  # execute throws on failure
         trace = observer.trace
         receipt = trace.to_receipt()
-        # The error itself carries failedStepPath and nothing else; the event
-        # stream carries the rest. getStatus only adds terminal status/timing,
-        # and only when the event stream gave us a workflowId to ask about.
+        # WebCross 0.9.3 returns the whole workflow result in the failure's
+        # details - workflowId, variables, store, and every completed step's
+        # result - while Workflow.progress now carries only variable NAMES
+        # (measured 2026-09-21). The details are the primary source; the event
+        # trace and getStatus fill in only what an older platform left out.
         details = getattr(exc, "rpc_data", None)
         details = details.get("details") if isinstance(details, dict) else None
-        error_step_path = (
-            details.get("failedStepPath") if isinstance(details, dict) else None
-        )
+        details = details if isinstance(details, dict) else {}
+        error_step_path = details.get("failedStepPath")
+        workflow_id = details.get("workflowId") or trace.workflow_id
         snapshot: Dict[str, Any] = {}
-        if trace.workflow_id:
+        if workflow_id and not details.get("status"):
             try:
                 status = await browser.call(
-                    "Workflow.getStatus", {"workflowId": trace.workflow_id}
+                    "Workflow.getStatus", {"workflowId": workflow_id}
                 )
                 snapshot = (status or {}).get("data") or {}
             except Exception:  # pragma: no cover - getStatus best-effort
                 snapshot = {}
         failure = trace.failure or {}
+        detail_results = details.get("results")
         return {
             "succeeded": False,
             "runId": run_id,
-            "workflowId": trace.workflow_id,
-            "status": snapshot.get("status") or trace.phase,
+            "workflowId": workflow_id,
+            "status": details.get("status") or snapshot.get("status") or trace.phase,
             "failedStepPath": (
                 error_step_path
                 or failure.get("stepPath")
                 or snapshot.get("currentStepPath")
             ),
             "failedError": failure.get("error") or snapshot.get("lastFailure"),
-            "failedErrorCode": failure.get("errorCode"),
+            "failedErrorCode": failure.get("errorCode") or details.get("failedActionCode"),
             "failedPurpose": _purpose_at_step_path(
                 params.get("steps"), error_step_path or failure.get("stepPath")
             ),
-            # Values, not just names: getStatus would only give variableKeys.
-            "variables": trace.variables or {},
-            "priorResults": trace.completed_steps,
+            "variables": (
+                details.get("variables")
+                if isinstance(details.get("variables"), dict)
+                else trace.variables or {}
+            ),
+            "store": details.get("store") if isinstance(details.get("store"), dict) else {},
+            "storeRevision": details.get("storeRevision"),
+            "priorResults": (
+                detail_results if isinstance(detail_results, list)
+                else trace.completed_steps
+            ),
             "trace": receipt,
             "exc": str(exc),
         }

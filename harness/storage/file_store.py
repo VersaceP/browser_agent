@@ -41,7 +41,6 @@ TRACES_DIR = "traces"
 SNAPSHOTS_DIR = "snapshots"
 PLAN_HISTORY_DIR = "task_plan_history"
 PLAN_REVIEW_DIR = "task_plan_reviews"
-STRATEGY_ATTEMPTS_FILE = "strategy_attempts.jsonl"
 
 SNAPSHOT_FILES = {
     SNAPSHOT_KEY_TASK_STATE: TASK_STATE_FILE,
@@ -690,32 +689,6 @@ class FileStore(Storage):
                     if len(results) >= limit:
                         return results
         return results
-
-    # -- strategy telemetry ------------------------------------------------
-    def append_strategy_attempt(
-        self,
-        *,
-        task_id: str,
-        run_id: str,
-        payload: JsonDict,
-    ) -> None:
-        """Written twice, as today: once per task, once at the repo root.
-
-        The root copy is what gives cross-task visibility in file mode; the
-        database backend gets that from a single table instead.
-        """
-
-        line = _dump_line(payload)
-        for path in (
-            self.task_dir(task_id) / STRATEGY_ATTEMPTS_FILE,
-            Path.cwd() / STRATEGY_ATTEMPTS_FILE,
-        ):
-            try:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                with path.open("a", encoding="utf-8") as handle:
-                    handle.write(line + "\n")
-            except OSError:
-                continue
 
     def close(self) -> None:
         return None

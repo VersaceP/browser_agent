@@ -22,6 +22,7 @@ from harness.evidence.extraction_artifacts import ARRAY_FIELD_TYPES
 from harness.evidence.extraction_artifacts import NON_NUMERIC_CONTAINER_FIELD_TYPES
 from harness.evidence.extraction_artifacts import field_name_from_spec
 from harness.evidence.extraction_artifacts import field_names_from_specs
+from harness.evidence.extraction_artifacts import resolve_required_field_specs
 from harness.evidence.artifact_evidence import VALIDATOR_TYPES
 from harness.evidence.artifact_evidence import cumulative_row_key as _cumulative_row_key
 from harness.evidence.artifact_evidence import detect_placeholder_rows
@@ -146,6 +147,8 @@ def _run_validator(validator: JsonDict, rows: List[JsonDict]) -> List[JsonDict]:
                             "field": field,
                             "reason": verdict["reason"],
                             "absenceProof": verdict["absenceProof"],
+                            **({"expectedDeclaration": verdict["expectedDeclaration"]}
+                               if verdict.get("expectedDeclaration") else {}),
                         })
                 confirmed_empty = remaining
             if confirmed_empty or unverified:
@@ -872,11 +875,7 @@ def _normalize_expected_artifact_contract(
     phase_id: str,
     phase_index: Optional[int] = None,
     repair_issues: Optional[List[JsonDict]] = None,
-    task_type: str = "",
     stage_hint: str = "",
-    allow_legacy_missing_required_controls: bool = False,
-    allow_legacy_non_form_required_controls: bool = False,
-    allow_legacy_empty_outcomes: bool = False,
     validate_empty_outcomes: bool = True,
 ) -> JsonDict:
     """Recover one canonical expected-artifact shape from equivalent inputs.
@@ -911,7 +910,6 @@ def _normalize_expected_artifact_contract(
         })
 
     phase_path = f"/phases/{phase_index}" if phase_index is not None else ""
-    task_type_path = f"{phase_path}/task_type" if phase_path else ""
     stage_hint_path = f"{phase_path}/stage_hint" if phase_path else ""
     declared_empty_outcomes = expected.get("allow_empty_with_outcome")
     empty_outcome_path = (
@@ -919,35 +917,7 @@ def _normalize_expected_artifact_contract(
         if phase_path else "/expected_artifact/allow_empty_with_outcome"
     )
     if validate_empty_outcomes and declared_empty_outcomes is not None:
-        is_current_shape = (
-            isinstance(declared_empty_outcomes, dict)
-            and bool(declared_empty_outcomes)
-            and all(
-                isinstance(raw, list)
-                and bool(raw)
-                and all(
-                    isinstance(item, str)
-                    and item.strip() == OUTCOME_CONFIRMED_ABSENT
-                    for item in raw
-                )
-                for raw in declared_empty_outcomes.values()
-            )
-        )
-        if allow_legacy_empty_outcomes:
-            if not is_current_shape:
-                warnings.append({
-                    "type": "legacy_empty_outcome_contract_preserved",
-                    "phase": phase_id,
-                    "path": empty_outcome_path,
-                    "message": (
-                        "An immutable accepted extension prefix carries a"
-                        " historical empty-value outcome declaration. It"
-                        " remains byte-for-byte unchanged so its contract hash"
-                        " and validated evidence are preserved; new or changed"
-                        " phases must use confirmed_absent only."
-                    ),
-                })
-        elif isinstance(declared_empty_outcomes, dict):
+        if isinstance(declared_empty_outcomes, dict):
             canonical_outcomes: JsonDict = {}
             for raw_name, raw_outcomes in declared_empty_outcomes.items():
                 field = str(raw_name or "").strip()
@@ -1046,115 +1016,7 @@ def _normalize_expected_artifact_contract(
         f"{phase_path}/expected_artifact/exact_rows"
         if phase_path and "exact_rows" in expected else ""
     )
-    is_form_interaction = (
-        task_type == "form_filling" and stage_hint == "form_interaction"
-    )
-    if (
-        raw_controls is None
-        and is_form_interaction
-    ):
-        if allow_legacy_missing_required_controls:
-            warnings.append({
-                "type": "legacy_required_controls_missing",
-                "phase": phase_id,
-                "message": (
-                    "An already accepted historical form phase has no"
-                    " expected_artifact.requiredControls contract. It remains"
-                    " valid only as an immutable prefix of this extension; new"
-                    " or changed form phases must declare stable controlKey"
-                    " values."
-                ),
-            })
-        else:
-            errors.append(
-                f"phase {phase_id}: form_filling/form_interaction requires "
-                "expected_artifact.requiredControls with stable controlKey values "
-                "when its artifact is a row-per-control form-completion receipt; "
-                "if controls only enable search/listing extraction, classify that "
-                "phase as web_search/collection or split the form and collection "
-                "work into separate phases"
-            )
-            append_repair_issue(
-                code="form_interaction_missing_required_controls",
-                paths=[],
-                repair_options=[{
-                    "id": "listing_collection",
-                    "description": (
-                        "Use this when the phase collects search or listing rows; "
-                        "it is not a row-per-control form-completion receipt."
-                    ),
-                    "operations": [
-                        {
-                            "op": "set",
-                            "path": task_type_path,
-                            "value": "web_search",
-                        },
-                        {
-                            "op": "set",
-                            "path": stage_hint_path,
-                            "value": "collection",
-                        },
-                    ] if task_type_path and stage_hint_path else [],
-                }, {
-                    "id": "form_control_receipts",
-                    "description": (
-                        "Use this only when the deliverable really is one receipt "
-                        "per form control. Submit a complete revised plan that adds "
-                        "a non-empty requiredControls contract."
-                    ),
-                    "requiresCompletePlan": True,
-                    "operations": [],
-                }],
-            )
-    if raw_controls is not None and not is_form_interaction:
-        if allow_legacy_non_form_required_controls:
-            warnings.append({
-                "type": "legacy_required_controls_outside_form_phase",
-                "phase": phase_id,
-                "message": (
-                    "An already accepted historical phase carries "
-                    "expected_artifact.requiredControls outside "
-                    "form_filling/form_interaction. It remains valid only as "
-                    "an immutable prefix of this extension; new or changed "
-                    "phases must remove it."
-                ),
-            })
-        else:
-            errors.append(
-                f"phase {phase_id}: expected_artifact.requiredControls is only "
-                "valid for task_type='form_filling' with "
-                "stage_hint='form_interaction'; it means one artifact row per "
-                "controlKey, not fields within each product/file/listing row. "
-                "Remove it and use fields/required_fields for required row "
-                "fields, nonempty_fields only for values that must be non-empty, "
-                "and allow_empty_with_outcome for evidence-backed omissions."
-            )
-            append_repair_issue(
-                code="required_controls_outside_form_phase",
-                paths=[controls_path] if controls_path else [],
-                repair_options=[{
-                    "id": "remove_controls_from_data_rows",
-                    "description": (
-                        "Remove requiredControls: it describes one receipt row per "
-                        "form control, not fields required within each extracted row."
-                    ),
-                    # The only repair the controller applies without asking. The
-                    # field is inert outside a form phase, so removing it changes
-                    # nothing the plan could have meant; every other option here
-                    # picks between two readings of the deliverable and stays with
-                    # the model. Auto-application is opt-in per option, never
-                    # inferred from an operation list's shape.
-                    "autoApplicable": True,
-                    "operations": [{
-                        "op": "remove",
-                        "path": controls_path,
-                        "value": None,
-                    }] if controls_path else [],
-                }],
-            )
-    if raw_controls is not None and (
-        is_form_interaction or allow_legacy_non_form_required_controls
-    ):
+    if raw_controls is not None:
         if not isinstance(raw_controls, list) or not raw_controls:
             errors.append(
                 f"phase {phase_id}: expected_artifact.requiredControls must be a non-empty array"
@@ -1193,56 +1055,9 @@ def _normalize_expected_artifact_contract(
                 if exact and exact != declared_count:
                     errors.append(
                         f"phase {phase_id}: exact_rows={exact} conflicts with "
-                        f"requiredControls count={declared_count}; "
-                        "requiredControls makes each artifact row a form-control "
-                        "receipt keyed by controlKey. Either make exact_rows match "
-                        "the controls and emit controlKey/filledValue rows, or for "
-                        "search/listing extraction use task_type='web_search' with "
-                        "stage_hint='collection' and remove requiredControls; split "
-                        "the phases if both deliverables are independently needed."
-                    )
-                    append_repair_issue(
-                        code="required_controls_row_identity_conflict",
-                        paths=[
-                            path for path in (controls_path, exact_rows_path) if path
-                        ],
-                        repair_options=[{
-                            "id": "listing_collection",
-                            "description": (
-                                "Use this when the controls only initiate search or "
-                                "listing collection. Keep the listing row count, remove "
-                                "the form-control receipt contract, and classify the phase "
-                                "as web_search/collection."
-                            ),
-                            "operations": [
-                                {
-                                    "op": "remove",
-                                    "path": controls_path,
-                                    "value": None,
-                                },
-                                {
-                                    "op": "set",
-                                    "path": task_type_path,
-                                    "value": "web_search",
-                                },
-                                {
-                                    "op": "set",
-                                    "path": stage_hint_path,
-                                    "value": "collection",
-                                },
-                            ] if (
-                                controls_path and task_type_path and stage_hint_path
-                            ) else [],
-                        }, {
-                            "id": "form_control_receipts",
-                            "description": (
-                                "Use this only when the deliverable really is one row per "
-                                "form control. Submit a complete revised plan whose row "
-                                "identity, exact_rows, and fields match that contract."
-                            ),
-                            "requiresCompletePlan": True,
-                            "operations": [],
-                        }],
+                        f"requiredControls count={declared_count}; each controlKey"
+                        " is one artifact row. Revise the count or remove the"
+                        " control-receipt contract."
                     )
                 expected["exact_rows"] = declared_count
                 for field_key in ("fields", "required_fields"):
@@ -1496,13 +1311,19 @@ def _normalize_validators(
             # set_equals prevents a partial subset from satisfying a row-count
             # contract; unique prevents duplicate rows from impersonating two
             # controls.  Both are existing validators with normal receipts.
+            control_nonempty: JsonDict = {
+                "type": "field_nonempty",
+                "fields": ["controlKey", "filledValue"],
+            }
+            allowance = _allow_empty_with_outcome_from_expected(
+                expected_artifact, fields, control_nonempty["fields"],
+            )
+            if allowance:
+                control_nonempty["allow_empty_with_outcome"] = allowance
             normalized.extend((
                 {"type": "set_equals", "field": "controlKey", "values": control_keys},
                 {"type": "unique", "fields": ["controlKey"]},
-                {
-                    "type": "field_nonempty",
-                    "fields": ["controlKey", "filledValue"],
-                },
+                control_nonempty,
             ))
 
     for index, validator in enumerate(validators):
@@ -1586,17 +1407,10 @@ def _normalize_validators(
 
 def _declared_field_types(expected_artifact: JsonDict) -> Dict[str, str]:
     """Return only explicit field types; bare names remain intentionally unknown."""
-    declared: Dict[str, str] = {}
-    for key in ("fields", "required_fields"):
-        values = expected_artifact.get(key)
-        for spec in values if isinstance(values, list) else []:
-            if not isinstance(spec, dict):
-                continue
-            name = field_name_from_spec(spec)
-            field_type = str(spec.get("type") or "").strip().lower()
-            if name and field_type:
-                declared[name] = field_type
-    return declared
+    return {
+        name: str(spec.get("type") or "").strip().lower()
+        for name, spec in resolve_required_field_specs(expected_artifact)["specs"].items()
+    }
 
 
 def _validate_range_validator_compatibility(
@@ -1691,13 +1505,9 @@ def _allow_empty_with_outcome_from_expected(
     if isinstance(declared, dict):
         for name, raw in declared.items():
             _record(name, raw)
-    if isinstance(fields, list):
-        for spec in fields:
-            if isinstance(spec, dict):
-                _record(
-                    field_name_from_spec(spec),
-                    spec.get("allow_empty_with_outcome"),
-                )
+    resolved = resolve_required_field_specs(expected_artifact)
+    for name, spec in resolved["declarations"].items():
+        _record(name, spec.get("allow_empty_with_outcome"))
     return allowance
 
 def _nonempty_fields_from_expected(expected_artifact: JsonDict, fields: Any) -> List[str]:
@@ -1706,13 +1516,17 @@ def _nonempty_fields_from_expected(expected_artifact: JsonDict, fields: Any) -> 
         explicit = expected_artifact.get("field_nonempty")
     out = field_names_from_specs(explicit if isinstance(explicit, list) else [])
     seen = set(out)
-    if not isinstance(fields, list):
-        return out
     scalar_types = {"str", "string", "text", "number", "integer", "int", "float", "url"}
-    for spec in fields:
-        if not isinstance(spec, dict):
-            continue
-        name = field_name_from_spec(spec)
+    # Preserve the historical distinction: a bare required_fields name
+    # requires presence, not an implicit non-empty value. Explicit nonempty
+    # declarations on the referenced spec still take effect.
+    raw_required = expected_artifact.get("required_fields")
+    bare_required = {
+        field_name_from_spec(item)
+        for item in (raw_required if isinstance(raw_required, list) else [])
+        if not isinstance(item, dict)
+    }
+    for name, spec in resolve_required_field_specs(expected_artifact)["declarations"].items():
         if not name or name in seen:
             continue
         if spec.get("allow_empty") is True or spec.get("optional_empty") is True:
@@ -1722,7 +1536,8 @@ def _nonempty_fields_from_expected(expected_artifact: JsonDict, fields: Any) -> 
             seen.add(name)
             continue
         type_name = str(spec.get("type") or "").strip().lower()
-        if type_name in scalar_types and spec.get("nullable") is not True:
+        if (name not in bare_required and type_name in scalar_types
+                and spec.get("nullable") is not True):
             out.append(name)
             seen.add(name)
     return out

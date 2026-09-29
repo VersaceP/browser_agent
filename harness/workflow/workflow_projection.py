@@ -56,6 +56,34 @@ from harness.utils import (
 DEFAULT_INLINE_RESULT_BYTES = 4000
 
 
+def workflow_execution_facts(result: Any) -> JsonDict:
+    """Extract stable execution facts before a large receipt is offloaded."""
+    if not isinstance(result, dict):
+        return {"status": "unknown", "workflowId": None, "tool_was_executed": False}
+    response = result.get("response")
+    response = response if isinstance(response, dict) else {}
+    data = response.get("data")
+    data = data if isinstance(data, dict) else {}
+    rpc_data = result.get("rpcData")
+    rpc_data = rpc_data if isinstance(rpc_data, dict) else {}
+    details = rpc_data.get("details")
+    details = details if isinstance(details, dict) else rpc_data
+    workflow_id = data.get("workflowId") or details.get("workflowId")
+    executed = result.get("tool_was_executed")
+    if executed is None:
+        executed = bool(workflow_id)
+    return {
+        "status": data.get("status") or details.get("status") or result.get("status")
+                  or ("failed" if result.get("error") else "unknown"),
+        "workflowId": workflow_id,
+        "tool_was_executed": bool(executed),
+        "failedStepPath": data.get("failedStepPath") or result.get("failedStepPath")
+                          or details.get("failedStepPath"),
+        "failedErrorCode": data.get("failedErrorCode") or data.get("failedActionCode")
+                           or result.get("failedErrorCode") or details.get("failedActionCode"),
+    }
+
+
 def project_workflow_receipt(
     *,
     logger: Optional[RunLogger],

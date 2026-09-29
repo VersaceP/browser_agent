@@ -320,7 +320,7 @@ async def _native_axtree_snapshot(
     )
     if bt._invoke_result_failed(tree):
         return {"status": "unavailable", "reason": "DOM.getAXTree failed"}
-    lines = list(getattr(agent, "axtree_lines", []) or bt._axtree_lines_from_value(tree))
+    lines = bt._current_axtree_lines(agent) or bt._axtree_lines_from_value(tree)
     bboxes = parse_axtree_bboxes(lines)
     if not lines or not bboxes:
         return {"status": "unavailable", "reason": "AXTree contained no positioned nodes"}

@@ -131,11 +131,20 @@ MIGRATION_0004_EVENT_ENVELOPE = Migration(
     ],
 )
 
+# Retire the old, task-type-selected strategy telemetry. Existing databases
+# lose these rows; task runs, event logs and extraction evidence are untouched.
+MIGRATION_0005_DROP_STRATEGY_ATTEMPTS = Migration(
+    version=5,
+    name="drop_strategy_attempts",
+    statements=["DROP TABLE IF EXISTS strategy_attempts"],
+)
+
 MIGRATIONS: List[Migration] = [
     _load_initial_migration(),
     MIGRATION_0002_GIT_SHA,
     MIGRATION_0003_STORED_SIZE,
     MIGRATION_0004_EVENT_ENVELOPE,
+    MIGRATION_0005_DROP_STRATEGY_ATTEMPTS,
 ]
 
 SCHEMA_VERSION = max(migration.version for migration in MIGRATIONS)

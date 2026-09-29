@@ -18,7 +18,6 @@ config.json
 probe/
 probe_tests/
 .pytest_cache/
-strategy_attempts.jsonl
 claude_code_scrape/
 .claude
 .codebuddy

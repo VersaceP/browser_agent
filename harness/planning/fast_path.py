@@ -233,18 +233,12 @@ def assess_fast_path_candidate(
 
     collection = successful[-1]
     contract = worker_contract if isinstance(worker_contract, dict) else {}
-    strategy_ids = [
-        str(item)
-        for item in (contract.get("strategy_ids") or [])
-        if str(item).strip()
-    ]
     candidate = {
         "version": "v1",
         "status": "candidate",
         "executionPolicy": "not_executable_stage_6b_a",
         "coverage": "collection_contract_only",
         "requiresGuidedPrefixDiscovery": True,
-        "strategyIds": strategy_ids,
         "route": _route_candidate(trace_summary),
         "detailReadyMarkers": _declared_ready_markers(
             contract,

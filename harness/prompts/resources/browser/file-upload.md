@@ -1,8 +1,8 @@
 ---
 id: browser.file-upload
 audience: browser
-version: "2026-09-09"
-description: Complete a native file chooser after an upload control was activated, without repeating the input action or waiting on chooser events.
+version: "2026-09-26"
+description: Assign files to a current upload input, then verify page acceptance and diagnose an unconfirmed result.
 sources:
   - abcp-platform/resources/skills/webcross-browser/SKILL.md
   - harness/tools/browser_tools/axtree_state.py
@@ -19,6 +19,7 @@ related_methods:
   - File.handleChooser
   - Page.getState
   - DOM.getAXTree
+  - Network.readApi
 topics:
   - file upload
   - file chooser
@@ -32,20 +33,38 @@ aliases:
 ---
 # File upload
 
-Use this guide after a real page interaction has activated a file-upload
-control.
+Use the current page view to identify the actual file input and the result
+region. Read the input's `accept`, `multiple` and related visible requirements
+when they matter to the files being assigned. Do not infer support from a
+filename alone.
 
-1. Keep the current upload target reference from the latest AXTree or DOM
-   observation.
-2. Call `File.handleChooser` directly with that target and the files required
-   by the task.
-3. Do not wait for `File.chooserOpened` or `File.chooserClosed`, and do not
-   repeat the click, key press, or coordinate click that opened the chooser.
-4. If the chooser call reports a stale target or the page epoch changed, refresh
-   `Page.getState` and `DOM.getAXTree`, derive a fresh upload target, then make
-   one new `File.handleChooser` call.
-5. Re-observe the page's upload state before treating the upload as complete.
+1. When the actual file input is known, call `File.handleChooser` with its
+   current id or unique selector. A preceding click is not required by this
+   Action. If a visible wrapper must be activated to expose the input, click it
+   once and follow the returned file-upload target without repeating the click.
+2. Do not wait for `File.chooserOpened` or `File.chooserClosed`. If the target
+   is stale or the document changed, refresh `Page.getState` and `DOM.getAXTree`
+   to obtain a current input before assigning files.
+3. Verify the page's result region: accepted count, thumbnails, upload status,
+   error text or the next required submit step. `handled` and
+   `selectedFileCount` confirm the assignment request, not page acceptance.
+4. When that result remains unconfirmed, inspect only the missing evidence.
+   The input's attributes, visible requirements and current error can explain
+   a client-side refusal. `Network.readApi` can inspect Fetch/XHR/Beacon
+   requests initiated since the operation, if this page and task permit it.
+   Call it directly, outside `Workflow.execute`, so its result is sanitized
+   before logging or delivery.
+   Start with the time window and no success/failure `responsePattern`; narrow
+   by URL only after observing the request. Check `pendingCount`,
+   `collectionStartedAt`, `oldestAvailableAt` and `evictedCount` before treating
+   an empty match as evidence that no request was captured.
+5. Interpret HTTP status, available business response and the page result
+   together. HTTP 200 alone does not establish acceptance. Missing captured
+   requests do not establish why an upload failed. Avoid repeating an
+   uncertain assignment until fresh evidence supports a safe next attempt.
 
-The native chooser is an attachment mechanism, not page-state proof. A handled
-chooser receipt proves the selection attempt; verify any user-visible upload
-status separately. Directory uploads require HITL.
+Network request bodies and credential fields in JSON response bodies are
+redacted by the harness; unstructured text bodies may be withheld. Use the
+remaining metadata and page state for the decision. If the accepted result
+cannot be established, keep the upload objective open and report the evidence
+and blocker to Lead. Directory uploads require HITL.

@@ -55,12 +55,13 @@ Use this guide when a native or custom select needs interpretation beyond the
 live method schema, or when an `Input.select` / `DOM.inspectSelect` receipt is
 not self-explanatory.
 
-Start with `DOM.inspectSelect` when choices are unknown. It returns the actual
-control id/kind, selection mode and the currently observed choices. A custom
-control inspection may drive its menu with real key presses, so previously
-captured element ids can already be stale; refresh the AX tree before acting on
-another target. Copy the returned option id, exact label or explicit value to
-`Input.select` without converting it. Native selects require their value.
+When choices are unknown, open the observed control and read the freshly
+rendered page-wide AX surface, including listboxes mounted outside the control
+subtree. Use a fresh actionable option target and verify the selected value.
+If that surface exposes no actionable choices, `DOM.inspectSelect` is a
+conditional diagnostic. It may change the menu state, so refresh the AX tree
+before another action. Copy any returned option id, exact label or explicit
+value without converting it. Native selects require their value.
 
 An Input.select success on a custom control proves recorded keyboard activity,
 not necessarily a final committed value. If later work depends on that choice,
@@ -158,15 +159,16 @@ unavailable for it. Operate it as ordinary UI, one verified step per visible
 level: open it with `Input.click`, re-observe to enumerate the options that are
 now rendered, then choose with `Input.click`, `Input.type` when the control is
 observably editable, or `Input.press`. A custom menu is often portal-rendered
-OUTSIDE the control's own subtree, so when a fresh `DOM.getAXTree` does not show
-the options, read a page-wide `DOM.getSemanticTree` before concluding they are
-absent. Verify the control's value afterwards - nothing in this path reports the
+OUTSIDE the control's own subtree, so look for the options across the whole
+fresh page view (its change list shows what appeared after the click), and
+follow the control's `rel{aria-controls|aria-owns|aria-activedescendant}` or its
+`component=` members, before concluding they are absent. Verify the control's value afterwards - nothing in this path reports the
 selection for you.
 
 If a level is plainly on screen and no structured surface can name it,
 `visual_verify mode=visual_locate` may locate it. That is the only sanctioned
-source of a coordinate: a rect from an AXTree line and a position from a
-Semantic Tree are spatial evidence, not click targets.
+source of a coordinate: a rect from a page-view line or a query record is
+spatial evidence, not a click target.
 
 `select-target-not-select` is a verdict about the element, not a failure to
 recover from - but two different situations reach it, so settle which one
@@ -205,6 +207,7 @@ there.
 
 `select-final-state-unproven` means the keyboard operation recorded the choice
 but the final control state could not be proven. Read the control's own value
-first - inspect it, or `DOM.getAttribute` - BEFORE issuing any correction. A
+first - inspect it, or a `DOM.getAXTree` `state` query on it - BEFORE issuing
+any correction. A
 corrective selection against an unknown state can undo a selection that in
 fact succeeded.

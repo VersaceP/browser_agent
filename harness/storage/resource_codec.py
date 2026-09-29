@@ -6,7 +6,7 @@ A JSON resource has two representations and they are deliberately different:
 * the **logical file** is what a reader sees - pretty-printed with ``indent=2``,
   exactly the bytes the file backend writes.  Line numbers, read budgets,
   ``local_fs_search`` line hits and the artifact SHA-256 all describe this form.
-* the **stored column** is compact.  Indentation is 76% of a semantic tree's
+* the **stored column** is compact.  Indentation was 76% of a nested page-structure read's
   bytes and buys nothing in a database, where nobody reads the column directly.
 
 Everything that needs either form goes through this module.  The writer sizes

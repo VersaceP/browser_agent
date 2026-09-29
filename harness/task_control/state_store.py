@@ -278,7 +278,6 @@ def contract_hash_for_phase(
     worker_contract = worker_contract if isinstance(worker_contract, dict) else {}
     payload = {
         "phaseId": str(phase.get("id") or worker_contract.get("phase_id") or ""),
-        "taskType": str(phase.get("task_type") or "web_scrape"),
         "stageHint": str(
             worker_contract.get("stage_hint")
             or phase.get("stage_hint")
@@ -291,7 +290,8 @@ def contract_hash_for_phase(
         ),
         "workerTask": str(task or phase.get("worker_task") or ""),
         "resultContract": str(result_contract or ""),
-        "workerContract": worker_contract,
+        "workerContract": {key: value for key, value in worker_contract.items()
+                           if key not in {"_user_context", "task_type"}},
         "expectedArtifact": (
             worker_contract.get("expected_artifact")
             if isinstance(worker_contract.get("expected_artifact"), dict)

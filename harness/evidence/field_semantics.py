@@ -61,7 +61,7 @@ def _is_evidence_key(field: str) -> bool:
     return field.endswith("EvidenceText") or field.endswith("Evidence")
 
 
-SEMANTIC_PROJECTION_VERSION = "actual-values-v1"
+SEMANTIC_PROJECTION_VERSION = "assignment-values-v2"
 MAX_VALUE_CHARS = 2400
 
 
@@ -88,7 +88,8 @@ def build_semantic_fact_index(state: Any, *, logger: Any = None) -> JsonDict:
             receipt = {}
             phases = state.get("phases", {}) if isinstance(state, dict) else {}
             for phase_id, phase_state in phases.items():
-                if not isinstance(phase_state, dict) or str(path) not in phase_state.get("validated_artifacts", []):
+                if (not isinstance(phase_state, dict) or phase_state.get("superseded_by")
+                        or str(path) not in phase_state.get("validated_artifacts", [])):
                     continue
                 attempts = phase_state.get("attempts") or []
                 attempt = attempts[-1] if attempts and isinstance(attempts[-1], dict) else {}
@@ -226,7 +227,7 @@ def array_fields_without_semantic_evidence(
 
 
 def field_semantic_tool(entry_ids: List[str]) -> JsonDict:
-    """Force one verdict per entry, the way objectiveChecks does for objectives.
+    """Declare one verdict per supplied field-evidence entry.
 
     The id enum plus a required entry per id is what makes coverage checkable:
     free-form prose back from the reviewer would have to be parsed, and a
@@ -293,7 +294,11 @@ _REVIEWER_SYSTEM_PROMPT = (
     "Do not infer missing content from truncation or counts. Use unclear and state which sourceRef/content is needed if supplied content is insufficient; do not claim full-array verification from an excerpt.\n"
     "Empty values can be deliberate absence judgments. Evaluate the supplied evidence, not fixed counts of scrolls, screenshots or flags. A claim is not mechanically proven merely because its declaration is well-formed. Use unclear when its evidence is insufficient.\n"
     "Judge ONE thing: does the subject described by the evidence text match the"
-    " subject the original user task asks that field to be about?\n"
+    " subject requested in userContext (original request plus ordered user clarifications)? "
+    "assignmentContext identifies the producing assignment and its declared output. "
+    "An intermediate observation receipt need not be the final business deliverable. "
+    "Judge the value in its declared role without letting an assignment override the user. "
+    "This review does not decide whether the whole user goal is complete.\n"
     "- A metric about the seller, shop, listing, page, or category is a"
     " different subject from one about the item itself.\n"
     "- A count, a rate, a range, or a date is a different kind of quantity from"
@@ -319,14 +324,21 @@ def normalize_field_review(
     findings: List[JsonDict] = []
     seen: set = set()
     errors: List[str] = []
+    if not isinstance(raw, dict) or set(raw) != {"findings"} or not isinstance(findings_raw, list):
+        errors.append("review must contain exactly a findings array")
     for item in findings_raw if isinstance(findings_raw, list) else []:
-        if not isinstance(item, dict):
+        if (not isinstance(item, dict)
+                or set(item) != {"entryId", "assessment", "requestedSubject", "evidenceSubject", "reason"}
+                or any(not isinstance(value, str) for value in item.values())):
+            errors.append("invalid finding shape")
             continue
         entry_id = str(item.get("entryId") or "")
         assessment = str(item.get("assessment") or "")
         if entry_id not in expected or assessment not in FIELD_ASSESSMENTS:
+            errors.append("unknown entryId or assessment")
             continue
         if entry_id in seen:
+            errors.append("duplicate entryId")
             continue
         seen.add(entry_id)
         findings.append({
@@ -339,6 +351,10 @@ def normalize_field_review(
     missing = sorted(expected - seen)
     if missing:
         errors.append(f"reviewer omitted entries: {missing[:10]}")
+    if errors:
+        return {"status": "unavailable", "reason": "review_protocol_invalid",
+                "coverageErrors": errors, "entriesReviewed": 0,
+                "entriesSupplied": len(entries), "mismatches": [], "unclear": []}
     by_entry = {str(item["entryId"]): item for item in entries}
     mismatches = [
         {
@@ -375,7 +391,7 @@ def normalize_field_review(
 async def review_field_semantics(
     provider: Any,
     *,
-    user_task: str,
+    user_context: JsonDict,
     entries: List[JsonDict],
     logger: Any = None,
     provider_name: str = "",
@@ -399,17 +415,9 @@ async def review_field_semantics(
     reports: List[JsonDict] = []
     for batch_index, batch in enumerate(batches):
         payload = {
-            "originalUserTask": user_task,
+            "userContext": user_context,
             "batch": {"index": batch_index + 1, "count": len(batches)},
-            "entries": [
-                {
-                    "entryId": item["entryId"],
-                    "field": item["field"],
-                    "value": item["value"],
-                    "evidenceText": item["evidenceText"],
-                }
-                for item in batch
-            ],
+            "entries": batch,
         }
         try:
             _text, tool_calls, _stop, usage = await provider.generate_response(
@@ -444,9 +452,9 @@ async def review_field_semantics(
             }
         matching = [
             call for call in tool_calls or []
-            if str(call.get("name") or "") == "submit_field_semantic_review"
+            if isinstance(call, dict) and call.get("name") == "submit_field_semantic_review"
         ]
-        if len(matching) != 1:
+        if len(matching) != 1 or len(tool_calls or []) != 1:
             return {
                 "status": "unavailable",
                 "reason": "no_review_tool_call",
@@ -461,7 +469,7 @@ async def review_field_semantics(
         reports.append(normalize_field_review(matching[0].get("input"), batch))
 
     return {
-        "status": "reviewed",
+        "status": "unavailable" if any(item.get("coverageErrors") for item in reports) else "reviewed",
         "entriesReviewed": sum(item.get("entriesReviewed", 0) for item in reports),
         "entriesSupplied": len(entries),
         "batchCount": len(batches),

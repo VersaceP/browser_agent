@@ -76,12 +76,6 @@ from harness.planning.pacing import (
     normalized_pacing,
     parse_utc_timestamp,
 )
-from harness.planning.task_types import (
-    VALID_TASK_TYPES,
-    normalize_task_type,
-    resolve_task_type_fail_closed,
-    task_type_choices_for_error,
-)
 from harness.utils import (
     JsonDict,
     RunLogger,
@@ -151,7 +145,6 @@ from .fingerprints import (  # noqa: F401
     spawn_acquisition_rejection,
 )
 from .phase_lifecycle import (  # noqa: F401
-    CONTINUATION_CONTROL_STATES,
     CONTINUATION_PROTOCOL,
     _artifact_recorded_digest,
     _artifact_sha256,
@@ -180,14 +173,8 @@ from .phase_lifecycle import (  # noqa: F401
     phase_pacing_remaining_seconds,
     phase_prior_artifact_paths,
     dispatch_wave_blockers,
-    phase_continuation_record,
-    phase_dispatch_input,
     phase_start_rejection,
     prepare_resume_state,
-    reactivate_resumable_hitl_phases,
-    record_phase_dispatch_input,
-    reserve_phase_continuation,
-    settle_phase_continuation,
 )
 from .plan_validation import (  # noqa: F401
     AXTREE_ID_ANYWHERE_RE,
@@ -225,7 +212,6 @@ from .plan_validation import (  # noqa: F401
     _canonical_identity_url,
     _declared_batch_size,
     _effective_dependency_ids,
-    _first_valid_task_type,
     _identity_value_is_explicit_in_task,
     _instruction_assigns_blocker_to_business_field,
     _merged_expected_artifact,
@@ -240,9 +226,7 @@ from .plan_validation import (  # noqa: F401
     _validate_execution_role_dependencies,
     _validate_empty_value_license_outcomes,
     _validate_pacing,
-    _validate_task_type_capability_match,
     _validate_worker_contract_methods,
-    _validated_task_type,
     accept_task_plan,
     canonical_identity_url,
     direct_batch_rows_provenance_errors,

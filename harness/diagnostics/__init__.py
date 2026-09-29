@@ -56,7 +56,7 @@ from harness.constants import (
     WORKER_STATUS_UNKNOWN,
 )
 from harness.results.call_outcome import public_action_failure
-from harness.observation.semantic_frames import response_node_count
+from harness.observation.page_observation import response_node_count
 
 
 @dataclass
@@ -65,6 +65,8 @@ class WorkerDiagnostics:
 
     last_exception_type: Optional[str] = None
     last_exception_message: Optional[str] = None
+    # File consent is independent of browser pause/resume generations.
+    local_path_authorization_pending: Optional[Dict[str, Any]] = None
 
     # HITL bookkeeping. ``hitl_resumed_observed`` is lifetime telemetry, not
     # authority for the current pause.  The local generation pair prevents a
@@ -203,6 +205,7 @@ class WorkerDiagnostics:
 
     def to_log_payload(self) -> Dict[str, Any]:
         return {
+            "local_path_authorization_pending": self.local_path_authorization_pending,
             "last_exception_type": self.last_exception_type,
             "last_exception_message": (self.last_exception_message or "")[:500],
             "last_pause_pageId": self.last_pause_pageId,
@@ -239,6 +242,9 @@ def classify_terminal_status(
     override_reason is non-None only when a hard signal overrode a model-
     reported soft status (caller can log it for visibility).
     """
+    if diagnostics.local_path_authorization_pending is not None:
+        return WORKER_STATUS_HITL_REQUIRED, "local file authorization requires user action"
+
     hard = _classify_hard(diagnostics, reached_step_cap, has_extraction_artifact)
 
     if model_reported_status:

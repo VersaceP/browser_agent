@@ -57,7 +57,6 @@ from harness.skill.registry import (
     validate_row_contract,
 )
 from harness.skill.structured_output import validate_structured_output_workflow
-from harness.planning.task_types import resolve_task_type_fail_closed
 from harness.skill.workflow import (
     check_persisted_contract,
     check_success_contract,
@@ -268,10 +267,6 @@ def recheck_source_context(skill: Skill) -> Dict[str, Any]:
         "phase_id": phase_id,
         "phase": phase,
         "expected_rows": _expected_rows_of_phase(phase),
-        # Phase-only: plan.task_type is audit classification and must never be
-        # inherited as the source worker policy. Missing phase provenance stays
-        # visibly empty so the recheck can classify it as inconclusive.
-        "task_type": str(phase.get("task_type") or ""),
         "goal": str(plan.get("goal") or ""),
     }
 
@@ -307,7 +302,6 @@ _DEDUP_JUDGE_LIMIT = 3
 def _dedup_evidence(
     skill: Skill,
     *,
-    task_type: str,
     stage_hint: str,
     fields: List[str],
 ) -> Dict[str, Any]:
@@ -318,7 +312,6 @@ def _dedup_evidence(
         "skill_id": skill.skill_id,
         "domain": skill.domain,
         "stage_hint_match": bool(stage_hint and skill.stage_hint == stage_hint),
-        "task_type_match": bool(task_type and skill.task_type == task_type),
         "field_overlap": overlap,
         "is_draft": skill.is_draft,
         "description": str(skill.description or "").strip(),
@@ -1526,7 +1519,6 @@ def _render_skill_md(
     skill_id: str,
     description: str,
     domain: str,
-    task_type: str,
     stage_hint: str,
     fields: List[str],
     provenance: Dict[str, Any],
@@ -1543,11 +1535,10 @@ def _render_skill_md(
 name: {skill_id}
 description: |
   {description}
-  Triggers on: domain={domain or '<host>'}, task_type={task_type},
+  Triggers on: domain={domain or '<host>'},
   stage_hint={stage_hint or '<stage_hint>'}, artifact fields ⊇ {{{fields_line}}}.
 version: 1
 domain: {domain or '<host>'}
-task_type: {task_type}
 stage_hint: {stage_hint}
 fields: [{fields_line}]
 allow_auto_captcha: false
@@ -1639,7 +1630,7 @@ takeover:
   on_contract_unmet:
     from_step: len(results)
     reason: postcondition_unmet
-    recover_with: [DOM.getAXTree, DOM.getText]
+    recover_with: [DOM.getAXTree]
     then: self_heal_workflow_v2
 
 hitl_boundary:
@@ -1730,7 +1721,6 @@ def create_skill_from_task(
     best = candidates[0]
 
     phase = _phase_of(plan, best["phase_id"])
-    task_type = resolve_task_type_fail_closed(phase.get("task_type"))
     stage_hint = str(phase.get("stage_hint") or "")
     expected_raw = phase.get("expected_artifact")
     expected = expected_raw if isinstance(expected_raw, dict) else {}
@@ -1784,7 +1774,7 @@ def create_skill_from_task(
     # Non-draft first: a calibrated skill is the reference to optimize against;
     # a draft only surfaces as "已有草稿" when nothing better covers the domain.
     evidence_list = sorted(
-        (_dedup_evidence(s, task_type=task_type, stage_hint=stage_hint, fields=fields)
+        (_dedup_evidence(s, stage_hint=stage_hint, fields=fields)
          for s in same_domain),
         key=lambda e: (e["is_draft"], not e["stage_hint_match"], -len(e["field_overlap"])),
     )
@@ -1798,7 +1788,7 @@ def create_skill_from_task(
         existing = explicit_existing
         evidence = next(
             (e for e in evidence_list if e["skill_id"] == existing.skill_id),
-            _dedup_evidence(existing, task_type=task_type, stage_hint=stage_hint, fields=fields),
+            _dedup_evidence(existing, stage_hint=stage_hint, fields=fields),
         )
         judgment = _judge_objective(objective_judge, objective, evidence)
         judgments.append({"skill_id": existing.skill_id, **judgment})
@@ -1827,8 +1817,7 @@ def create_skill_from_task(
         # 两条设置 existing 的路径都同时设了 evidence/judgment；这里做防御性收窄
         # （也让类型检查不再对 Optional 报警）
         if evidence is None:
-            evidence = _dedup_evidence(existing, task_type=task_type,
-                                       stage_hint=stage_hint, fields=fields)
+            evidence = _dedup_evidence(existing,                                        stage_hint=stage_hint, fields=fields)
         if judgment is None:
             judgment = {"verdict": "uncertain", "reason": ""}
         if covered:
@@ -1922,7 +1911,7 @@ def create_skill_from_task(
     # scaffold a new draft skill (quality gates first)
     # ------------------------------------------------------------------
     new_id = requested_skill_id if requested_skill_id else _slugify_id(
-        f"{domain}-{stage_hint or task_type}")
+        f"{domain}-{stage_hint or "task"}")
     target = skills_dir / new_id
     if target.exists() and not overwrite:
         suggested_id = _next_available_skill_id(new_id, skills_dir)
@@ -2031,7 +2020,7 @@ def create_skill_from_task(
     (target / "SKILL.md").write_text(
         _render_skill_md(
             skill_id=new_id, description=objective, domain=domain,
-            task_type=task_type, stage_hint=stage_hint, fields=fields,
+            stage_hint=stage_hint, fields=fields,
             provenance=provenance, notes=best["notes"],
             tested=tested, quality_lines=quality_lines, suite=suite,
         ), encoding="utf-8")
@@ -2159,7 +2148,6 @@ def _render_guidance_skill_md(
     skill_id: str,
     description: str,
     domain: str,
-    task_type: str,
     stage_hint: str,
     fields: List[str],
     provenance: Dict[str, Any],
@@ -2172,11 +2160,10 @@ def _render_guidance_skill_md(
 name: {skill_id}
 description: |
   {description}
-  Triggers on: domain={domain or '<host>'}, task_type={task_type},
+  Triggers on: domain={domain or '<host>'},
   stage_hint={stage_hint or '<stage_hint>'}, artifact fields ⊇ {{{fields_line}}}.
 version: 1
 domain: {domain or '<host>'}
-task_type: {task_type}
 stage_hint: {stage_hint}
 fields: [{fields_line}]
 allow_auto_captcha: false
@@ -2294,7 +2281,6 @@ def create_guidance_skill_from_task(
                              "（无 URL/选择器/负知识/遮罩记录），未生成任何文件"]}
 
     phase = _phase_of(plan, best["phase_id"])
-    task_type = resolve_task_type_fail_closed(phase.get("task_type"))
     stage_hint = str(phase.get("stage_hint") or "")
     expected_raw = phase.get("expected_artifact")
     expected = expected_raw if isinstance(expected_raw, dict) else {}
@@ -2372,7 +2358,7 @@ def create_guidance_skill_from_task(
         same_domain = [s for s in registry.all()
                        if domain and _domain_matches(s.domain, domain)]
         evidence_list = sorted(
-            (_dedup_evidence(s, task_type=task_type, stage_hint=stage_hint, fields=fields)
+            (_dedup_evidence(s, stage_hint=stage_hint, fields=fields)
              for s in same_domain),
             key=lambda e: (e["is_draft"], not e["stage_hint_match"], -len(e["field_overlap"])),
         )
@@ -2423,7 +2409,7 @@ def create_guidance_skill_from_task(
             }
 
     # scaffold 新 hints-only skill（无 workflow.json）
-    new_id = requested_skill_id or _slugify_id(f"{domain}-{stage_hint or task_type}")
+    new_id = requested_skill_id or _slugify_id(f"{domain}-{stage_hint or "task"}")
     target = skills_dir / new_id
     if target.exists() and not overwrite:
         suggested_id = _next_available_skill_id(new_id, skills_dir)
@@ -2447,7 +2433,7 @@ def create_guidance_skill_from_task(
     (target / "SKILL.md").write_text(
         _render_guidance_skill_md(
             skill_id=new_id, description=objective, domain=domain,
-            task_type=task_type, stage_hint=stage_hint, fields=fields,
+            stage_hint=stage_hint, fields=fields,
             provenance=provenance, hints_section=section, suite=suite,
         ), encoding="utf-8")
     default_guidance_health().mark_reviewed(new_id)

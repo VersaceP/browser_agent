@@ -29,6 +29,8 @@ analysis).
 
 import asyncio
 import time
+import uuid
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from abcp_client import ABCPClient
@@ -636,6 +638,19 @@ async def wait_for_hitl_resume(
     input_task = asyncio.create_task(handler(page_id, pause_reason))
     started = time.monotonic()
     feedback = None
+    input_record = None
+
+    def retain_feedback(text):
+        nonlocal input_record
+        if not text or input_record is not None:
+            return
+        input_record = {"inputId": uuid.uuid4().hex, "source": "terminal_hitl",
+                        "pageId": page_id, "question": pause_reason, "text": text,
+                        "receivedAt": datetime.now(timezone.utc).isoformat()}
+        if logger is not None and getattr(logger, "task_dir", None) is not None:
+            from harness.planning.context import retain_operator_inputs
+            retain_operator_inputs(logger, [input_record])
+            logger.write("hitl.operator_input_received", input_record)
     try:
         done, _ = await asyncio.wait(
             {event_task, input_task}, return_when=asyncio.FIRST_COMPLETED,
@@ -651,6 +666,7 @@ async def wait_for_hitl_resume(
                 feedback = feedback.strip()
             else:
                 feedback = None
+        retain_feedback(feedback)
         if event_task in done or not feedback:
             outcome = await event_task
         else:
@@ -676,8 +692,9 @@ async def wait_for_hitl_resume(
             except Exception:
                 pass
         if feedback:
+            retain_feedback(feedback)
             outcome = {**outcome, "userFeedback": feedback,
-                       "feedbackSource": "terminal_user"}
+                       "feedbackSource": "terminal_user", "operatorInputRecords": [input_record]}
         return outcome
     finally:
         for task in (event_task, input_task):

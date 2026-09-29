@@ -1,251 +1,125 @@
 ---
 id: lead.plan-contracts
 audience: lead
-version: "2026-09-16"
-description: Complete task-plan examples, file validator parameters, independent dependencies and minimal contract repairs.
+version: "2026-09-28"
+description: Delegation contracts at spawn, output/evidence schemas, revisions and recovery.
 sources:
-  - harness/tools/lead_tools.py
+  - harness/delegation.py
   - harness/task_control/plan_validation.py
   - harness/task_control/validators.py
 emitter_sources:
+  - harness/delegation.py
   - harness/tools/lead_tools.py
 related_tools:
-  - emit_task_plan
-  - begin_task_plan_draft
-  - append_task_plan_draft
-  - submit_task_plan_draft
-  - repair_task_plan
+  - spawn_browser_agent
+  - wait_browser_agents
 error_codes:
-  - task_plan_schema_invalid
-  - mechanical_invalid
+  - assignment_rejected
+  - assignment_input_invalid
 topics:
-  - planning examples
-  - output_contract
-  - additional_checks
+  - delegation examples
+  - output contract
   - file_integrity
-  - path_pattern
   - depends_on
 aliases:
   - 计划合同示例
   - few shot
   - validator 参数
 ---
-# Plan contracts: worked examples
+# Delegation contracts
 
-Examples teach syntax and reasoning, not additional user requirements. Use the
-live tool schema as authority. Copy only constraints justified by the original
-request. Prefer one compact output_contract over duplicating expected_artifact
-and validators. Use emit_direct_task_plan for a single coherent deliverable;
-the emit_task_plan examples below demonstrate phase contracts. Large plans use
-the same phase objects through the draft tools.
+The original request and attributed user supplements define the goal. A worker
+assignment describes the work delegated now, not the whole task's completion
+standard. Harness records, reviews and obtains required approval at spawn.
+There is no separate plan submission, draft, repair or approval tool.
 
-## Draft progress: create metadata, append phases, submit
+Use `spawn_browser_agent` with a new `assignment`, or an existing `phase_id` to
+continue it. Do not send both. It returns an assignment ID even if accepted work
+must wait for a dependency or a slot. Reuse that ID; do not register it again.
 
-For a plan too large for one reliable call, use this sequence:
+## Structured collection
 
-1. `begin_task_plan_draft({"draft_id":"delivery-v1","plan":{"goal":"Collect the requested records"}})`
-   returns `draftState="metadata_only", phaseCount=0, planSubmitted=false`.
-   Only an empty draft exists; `status="done"` describes this tool operation.
-2. `append_task_plan_draft({"draft_id":"delivery-v1","phases":[...]})`
-   adds actual phase objects, such as the complete collection example below.
-3. Add any remaining phases to **delivery-v1**, then
-   `submit_task_plan_draft({"draft_id":"delivery-v1"})` for validation and approval.
-
-Wrong: begin delivery-v1, then begin delivery-v2, then begin delivery-final without
-appending phases. Each begin creates a separate empty draft; naming one “final”
-does not submit it. Continue the returned draftId. Another draft is appropriate
-when you intentionally redesign the plan, not merely to advance the current one.
-After a submitted candidate is rejected, use its structured repair guidance and
-candidateHash instead of assuming a new draft is required.
-
-## Collection: count, identity and evidence
-
-User: On the results page at https://example.org collect exactly the second
-and fourth cards' titles and URLs in visible card order.
-
-Correct emit_task_plan arguments:
+For a user explicitly requesting titles for IDs A and B, declare those identities
+and attach page provenance. This example adds no default collection requirement.
 
 ```json
-{"plan":{"goal":"Collect exactly cards 2 and 4 with page evidence.","phases":[{"id":"collect","task_type":"web_scrape","stage_hint":"collection","task":"Open https://example.org and identify cards 2 and 4 from the rendered card sequence. Record rank, title and URL with page evidence. Do not substitute unrelated links.","depends_on":[],"output_contract":{"name":"cards","rows":{"exact":2,"identity":{"field":"rank","values":[2,4]}},"fields":{"rank":{"type":"integer","required":true,"empty":"forbid","provenance":true},"title":{"type":"string","required":true,"empty":"forbid","provenance":true},"url":{"type":"url","required":true,"empty":"forbid","provenance":true}}}}]}}
+{"assignment":{"task":"Read the titles for user-supplied items A and B with page evidence.","stage_hint":"collection","output":{"name":"titles","fields":["itemId","title"],"required_fields":["itemId","title"],"nonempty_fields":["itemId","title"],"exact_rows":2,"provenance_required":["title"]},"checks":[{"type":"set_equals","field":"itemId","values":["A","B"]},{"type":"unique","field":"itemId"}]}}
 ```
 
-Wrong: rows.exact=2 alone does not identify which two cards. Fix: declare the
-rank identity and evidence. The compiler derives cardinality, set and
-uniqueness validators. A schema-valid plan can still lack semantic coverage;
-do not claim that mechanical approval proves the requested identities.
-For “up to two”, use rows.max=2 instead; for a query-driven search phase use
-web_search. URLs in prose should be separated from surrounding words and
-sentence punctuation by whitespace; never include explanatory text in a URL.
+`output.fields` is an array of names or field specifications. Required presence,
+nonempty value, row count and nested array length are different checks. Only
+use constraints justified by the request. See lead.artifact-validation for
+absence outcomes. Objects must never be written into fields declared string.
 
-When resubmitting an existing normalized plan, preserve its evidence settings.
-`field_provenance.fields` accepts either a field-name array or an object keyed
-by field name with per-field evidence settings (`evidence_field`,
-`evidence_aliases`, `source_tool_field`, `selector_field`, and `require_*`).
-Other multi-field validators (`required_fields`, `field_nonempty`, `unique`)
-use field-name arrays. Do not delete evidence requirements to repair a type
-error. Optional normalized values may be null: `depends_on: null` keeps the
-implicit serial dependencies, whereas `depends_on: []` declares independence.
-Retain normalized batch identity and observation metadata when copying a plan;
-new compact plans should declare their output contracts and let the compiler
-derive common validators.
+## File delivery
 
-## Listing-derived details: preserve the entry requirement
-
-User: Search for products, then click the selected result cards to enter their
-details and save the requested content.
-
-Correct: retain click-through in both the phase objective and worker_task. Carry
-observed sourcePageId/sourceUrl, query/page, item identity and verbatim card href
-through existing artifacts or continuation context. The detail instruction must
-continue on the source listing, or return to it and revalidate the listing and
-item identity, then click a fresh target. Use existing page reuse controls when
-available; do not require a particular worker slot or invent handles in advance.
-Coordinate phases that mutate the same listing. Independent landing pages can
-still be processed concurrently.
-
-Wrong: "Open productUrl directly; if it is not the detail page, return to the
-listing and click the card." That reverses the requested entry route even when
-the URL is a verbatim href. Matching titles, URLs and delivery fields do not
-preserve the user's click requirement. If clicking cannot be completed, report
-the blocker rather than silently treating direct access as equivalent.
-
-When the user specifies no entry route, default to source-card click-through
-when the listing is available. Direct navigation from an observed href is an
-allowed fallback when evidence establishes that clicking is unavailable or
-unsuitable; record the reason. Standalone supplied URLs and explicit requests
-for direct navigation do not need a listing. This default preference is not an
-immutable user constraint. Express it in existing task instructions and context;
-do not invent navigation_policy fields or new reuse_scope values. page_policy
-selects page reuse, not the entry method, and historical AX ids are not durable
-click targets.
-
-## Download: validator type versus parameter
-
-User: Download the supplied file https://example.org/manual.pdf into the
-specified /tmp/example-delivery directory and verify it exists and is nonempty.
-The directory here is an example user requirement, not a default destination.
-
-Correct emit_task_plan arguments:
+For a user requesting the supplied PDF at /tmp/example-delivery/manual.pdf:
 
 ```json
-{"plan":{"goal":"Save the supplied PDF in the requested directory.","phases":[{"id":"download","task_type":"file_download","stage_hint":"generic","task":"Download https://example.org/manual.pdf to /tmp/example-delivery/manual.pdf . Prepare the parent directory with available file tools, verify the physical file and record savedPath. Do not report an internal artifact path as the delivered file.","depends_on":[],"output_contract":{"name":"files","rows":{"exact":1},"fields":{"savedPath":{"type":"string","required":true,"empty":"forbid"}}},"additional_checks":[{"type":"file_integrity","path_fields":["savedPath"],"min_files":1,"min_bytes":1,"path_pattern":"^/tmp/example-delivery/"}]}]}}
+{"assignment":{"task":"Download https://example.org/manual.pdf to /tmp/example-delivery/manual.pdf. Verify the physical file and record savedPath.","output":{"name":"files","fields":["savedPath"],"required_fields":["savedPath"],"nonempty_fields":["savedPath"],"exact_rows":1},"checks":[{"type":"file_integrity","path_fields":["savedPath"],"min_files":1,"min_bytes":1,"path_pattern":"^/tmp/example-delivery/"}],"policy":{"local_access_intent":[{"path":"/tmp/example-delivery","modes":["read","write"],"reason":"Save and verify the requested PDF"}]}}}
 ```
 
-Wrong: `{"type":"path_pattern","pattern":"..."}`. The mechanical
-validator rejects the unknown type with an error naming the phase and
-validator index and listing valid types. `path_pattern` belongs inside
-file_integrity. `field_pattern` instead checks a row field's text using
-`field` and `pattern`; it does not prove that a physical file exists.
+`path_pattern` is a parameter of `file_integrity`, not a validator type. A
+`field_pattern` check validates text, not file existence. Local access intent is
+not consent; Harness separately enforces read/write grants for exact paths.
 
-Minimal repair: use the rejected candidateHash with repair_task_plan, replacing
-the offending existing object via `op:"set"` at its actual reported JSON
-pointer with the complete file_integrity object above. Keep other constraints.
-If a file_integrity object already exists, set its path_pattern property using
-`add` when absent. Removing an extra array element is structural: submit the
-revised complete plan. Never invent a hash or assume a compiled validator index
-is the original additional_checks index. Use repairIssues paths where present.
-Successful repair still needs review/approval; an approval is followed by
-execution, not another emit of the same plan.
+## Independent work and receipts
 
-## Independent branches: data dependency versus wave
-
-User: Read one title from each of two supplied pages. The pages can be read
-independently and neither requires shared mutable page state.
-
-Correct emit_task_plan arguments:
+For an ordinary page operation, an observation/evidence receipt is sufficient
+unless a structured deliverable is requested. Omitting output supplies that
+receipt contract. It does not prove that the original goal was completed.
 
 ```json
-{"plan":{"goal":"Read both supplied pages independently.","output_contracts":{"title":{"rows":{"exact":1},"fields":{"title":{"type":"string","required":true,"empty":"forbid","provenance":true}}}},"phases":[{"id":"a","task_type":"web_scrape","stage_hint":"detail_sections","task":"Read the title from https://example.org/a with page evidence.","depends_on":[],"dispatch_wave":1,"output_ref":"title","output_contract":{"name":"title_a"}},{"id":"b","task_type":"web_scrape","stage_hint":"detail_sections","task":"Read the title from https://example.org/b with page evidence.","depends_on":[],"dispatch_wave":1,"output_ref":"title","output_contract":{"name":"title_b"}}]}}
+{"assignment":{"task":"Inspect the user-supplied page and report the visible form state with evidence."}}
 ```
 
-Wrong: omit b.depends_on and expect parallel execution. Omission creates serial
-dependencies, even with the same wave. Minimal repair: set depends_on=[] when
-independence is justified; use the receipt's candidateHash or accepted plan's
-basePlanVersion and replan_reason as appropriate. Runtime max_browser_agents
-still limits concurrent workers.
+Independent assignments can be spawned concurrently within runtime capacity.
+Omitting depends_on means independent; name existing producer IDs only for real
+dependencies. For discovered inputs use
+`inputs.artifact:{phase_id,artifact_name,selector?}`; the producer dependency is
+derived. For user-supplied row identities use `inputs.direct:{rows,identity_fields}`.
+Never invent page handles or convert transient AX IDs into durable identities.
 
-For discovered pages, each consumer declares inputs.artifact with the actual
-producer phase_id/artifact_name and depends_on:[producer]. A download consuming
-only detail_a depends on detail_a, not detail_b. Put independent delivery and
-detail branches in the same wave when the user has not requested a stage
-barrier. Shared mutable state or real dependencies can require serialization;
-matching task types alone do not justify parallelism.
+If the user requires source-card clicking, preserve that entry route and the
+observed source identity. Directly navigating to a guessed/deep URL is not an
+equivalent substitute. Use existing page/session reuse options when justified.
 
-## Stop confusing internal exceptions with contract feedback
+## Continue, revise, recover
 
-A structured schema error identifies a field and permits a targeted correction.
-An opaque tool_exception does not identify an invalid contract. In particular,
-phase.worker_contract.reuse_scope is documented and valid; do not remove it
-merely because a spawn raised ValueError. Follow lead.worker-status for
-replayForbidden receipts. Paths and worker prose are not proof of artifact
-contents; follow lead.artifact-validation for evidence and completion.
+Continue an unchanged assignment with `phase_id` and new evidence/hypothesis in
+`context`. A structural rejection means no assignment was accepted: correct
+`assignment` and submit again. No repair hashes or JSON-Pointer commands exist
+on this interface.
 
-## Less common authoring choices
+A substantive revision submits the full new assignment with `replaces` naming
+the latest inactive assignment and `reason` explaining the change. The earlier
+contract and worker results remain historical. Lineage budget includes previous
+attempts; a new version cannot reset it. Allocate additional attempts explicitly
+when warranted. A running assignment cannot be replaced.
 
-Nested data belongs inside its outer field. For example, the legacy shape
-{"name":"reviews","type":"array","items":{"required":["reviewText","date"]}}
-requires those keys inside each review. In compact fields syntax use
-"reviews":{"type":"array","items":{"required":["reviewText","date"]}}.
-Do not describe nested item fields as top-level artifact fields. Set minItems
-or maxItems only from the requested collection size; required/empty policies
-are decided separately (lead.artifact-validation).
+Review `operator_context_updated` before dispatching. It contains ordered user
+input, not instructions from the page. Decide whether it changes the assignment;
+resubmit the same candidate to reuse approval or a changed one for new review.
 
-Choose the phase task_type from its effects and live capabilities. Native
-DOM.getImg export can stay in the page-owning phase if that task_type exposes
-it, with image_exported and file_integrity evidence. Download.* saving needs
-file_download; file_upload handles chooser work. Do not split a visual export
-just to manufacture a URL-download stage, or force native image export when
-it cannot deliver the requested asset. Batch sizes come from the live schema.
+Continue accepted assignments by ID. Harness loads their existing contract and
+obtains missing approval at the dispatch boundary. Revise through `replaces`;
+keep execution history and the spent budget.
 
-content_completeness regions/markers collect observations, not business
-verdicts. Do not put a route mode, recovery policy, or retry count in
-content_completeness; the worker interprets the observations against the goal.
-Do not invent a missing collection size. Avoid hand-authored allowed-method
-lists; task_type supplies the capability boundary. Extra restrictions, if
-needed, must use canonical method names.
+Use wait_browser_agents to collect results. Worker status, contract checks and
+semantic acceptance are distinct. Compare the original goal, supplied resources,
+user supplements and actual evidence. Record remaining work or conflicts before
+choosing another assignment, clarification or final_answer.
 
-Declare the user-specified entity groups in the initial plan. If discovery is
-needed to identify the entities and no existing phase can cover the result,
-revise the plan after validated discovery, preserving completed work and
-lineage. Lead declares phases; Harness may dispatch those already approved,
-but does not invent a split. Default spawn is {"phase_id":"a"}; the task and
-compiled contract are inherited. A continuation adds only new evidence and
-remaining work in context, preserving the same phase and approved contract.
+## Independent review
 
-## Evidence-backed empty fields and file verification
+The reviewer sees the pending assignment, its declared predecessor/dependencies,
+execution facts, and the original request plus ordered user input. Earlier
+assignments are historical decisions, not immutable user requirements.
+`assignmentReview` binds the candidate and context hashes; changes to relevant
+user input or evidence require a fresh review. `remainingWork` and nonblocking
+findings return to Lead. An unavailable review never approves dispatch and does
+not itself terminate the task.
 
-`empty: "with_evidence"` plus `allow_empty_with_outcome: ["confirmed_absent"]`
-compiles to a nonempty check WITH an exception. These are one conditional rule,
-not a contradiction. Do not remove the nonempty rule and leave only its exception:
-that makes emptiness pass without the evidence the declaration promises.
-
-For an optional video-file array, reason about three cases:
-- Files exist: record the observed paths and verify actual files with file_integrity.
-- No video exists: use only the contract's complete absence evidence; no invented paths.
-- Nothing was collected and absence is unproven: incomplete, not confirmed_absent.
-
-File integrity checks declared paths, existence, size and hashes. min_files is
-an explicit quantity constraint (default 0); an explicitly empty path_fields
-population never borrows unrelated screenshots. Use a separate explicit count
-when the user requires files. Every claimed file must still exist.
-
-Conditional absence uses <field>Absence with outcome=confirmed_absent and
-evidenceText. It records a worker judgment; no fixed proof flags or visual
-ritual is required. Review adequacy against the original goal. allowed_domain
-is retired; legacy declarations and ordinary business URL/field patterns are
-advisory. field_pattern/url_pattern/cross_field_contains can use
-enforcement="literal" only for an unambiguous literal user/protocol requirement,
-never as a substitute domain affiliation gate.
-
-
-## Preserve the user's selection scope
-
-Carry page, ordering, range, identity, time window and destination qualifiers into worker instructions without changing their meaning. A numeric set alone does not preserve its scope.
-
-- User: “page 2, positions 30–32.” Correct: locate positions 30–32 within page 2 using observed pagination/list order. Incorrect: reinterpret as global positions 30–32 and take page 1. Repair the instruction, not just the numeric validator.
-- User: “last month's transactions.” Do not substitute the latest available transactions when that period is missing.
-- User: “save each file on Desktop.” Internal worktree receipts do not replace physical delivery at the requested destination.
-
-Absence of a displayed rank label is not itself ambiguity: observed ordering and pagination may be sufficient. If available evidence cannot resolve materially different targets, or continuing requires changing scope, report the evidence and ask the user to clarify. Do not silently substitute an easier target. These are semantic decisions, not site-specific gates.
-
-On recovery, consult structured receipts and existing artifact references first. Search logs only for a specific missing fact; reuse earlier verified locations and do not repeatedly retrieve the same unchanging evidence. Changing final-answer wording does not fix a rejected artifact field.
+`wait_browser_agents` only collects results and facts. It never dispatches the
+next assignment. Read returned operatorInputRecords, evidence and continuation
+before choosing the next explicit action.

@@ -14,13 +14,12 @@ the whole skill (fail loud, not silently hints-only).
 
 Match dims (SKILL.md frontmatter vs task descriptor):
   domain      exact or wildcard (*.example.com) vs the task's target host
-  task_type   exact
   stage_hint  exact
   fields      SKILL.md fields must be a subset of the task's expected fields
 
 Usage:
     reg = SkillRegistry.load()
-    skill = reg.match(domain="theresanaiforthat.com", task_type="web_scrape",
+    skill = reg.match(domain="theresanaiforthat.com",
                       stage_hint="detail_sections", fields={"reviews","prosCons","qa"})
     skill = reg.get("taaft-detail-extract")        # manual /skill <id>
     python -m harness.skill.registry                # list + self-check
@@ -37,7 +36,6 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 import yaml
 
 from harness.skill.structured_output import validate_structured_output_workflow
-from harness.planning.task_types import normalize_task_type
 
 SKILLS_DIR_DEFAULT = Path(__file__).resolve().parent.parent.parent / "skills"
 
@@ -230,10 +228,6 @@ class Skill:
         return str(self.frontmatter.get("domain") or "")
 
     @property
-    def task_type(self) -> str:
-        return str(self.frontmatter.get("task_type") or "")
-
-    @property
     def stage_hint(self) -> str:
         return str(self.frontmatter.get("stage_hint") or "")
 
@@ -310,17 +304,10 @@ class Skill:
         self,
         *,
         domain: str = "",
-        task_type: str = "",
         stage_hint: str = "",
         fields: Optional[Set[str]] = None,
     ) -> bool:
         if not _domain_matches(self.domain, domain):
-            return False
-        if (
-            self.task_type
-            and task_type
-            and normalize_task_type(self.task_type) != normalize_task_type(task_type)
-        ):
             return False
         if self.stage_hint and stage_hint and self.stage_hint != stage_hint:
             return False
@@ -448,7 +435,6 @@ class SkillRegistry:
         self,
         *,
         domain: str = "",
-        task_type: str = "",
         stage_hint: str = "",
         fields: Optional[Set[str]] = None,
         include_drafts: bool = False,
@@ -456,7 +442,7 @@ class SkillRegistry:
         return [
             s for s in self._skills
             if (include_drafts or not s.is_draft)
-            and s.matches(domain=domain, task_type=task_type,
+            and s.matches(domain=domain,
                           stage_hint=stage_hint, fields=fields)
         ]
 
@@ -464,7 +450,6 @@ class SkillRegistry:
         self,
         *,
         domain: str = "",
-        task_type: str = "",
         stage_hint: str = "",
         fields: Optional[Set[str]] = None,
         text: str = "",
@@ -486,7 +471,6 @@ class SkillRegistry:
             score, reasons = _soft_skill_score(
                 skill,
                 domain=domain,
-                task_type=task_type,
                 stage_hint=stage_hint,
                 fields=fields or set(),
                 text=text,
@@ -500,7 +484,6 @@ class SkillRegistry:
         self,
         *,
         domain: str = "",
-        task_type: str = "",
         stage_hint: str = "",
         fields: Optional[Set[str]] = None,
     ) -> Optional[Skill]:
@@ -510,8 +493,9 @@ class SkillRegistry:
         over self.candidates(...)); no silent guessing. Drafts never auto-match
         (candidates() excludes them); explicit get() is the only draft entry.
         """
-        hits = self.candidates(domain=domain, task_type=task_type,
-                               stage_hint=stage_hint, fields=fields)
+        hits = [s for s in self.candidates(
+            domain=domain, stage_hint=stage_hint, fields=fields,
+        ) if stage_hint and s.stage_hint == stage_hint and fields and s.fields]
         return hits[0] if len(hits) == 1 else None
 
 
@@ -633,7 +617,6 @@ def _soft_skill_score(
     skill: Skill,
     *,
     domain: str,
-    task_type: str,
     stage_hint: str,
     fields: Set[str],
     text: str,
@@ -649,14 +632,6 @@ def _soft_skill_score(
             score += 4
             reasons.append(f"domain is related to {skill.domain}")
 
-    if (
-        task_type
-        and skill.task_type
-        and normalize_task_type(task_type) == normalize_task_type(skill.task_type)
-    ):
-        score += 3
-        reasons.append(f"task_type matches {normalize_task_type(task_type)}")
-
     if stage_hint and skill.stage_hint and stage_hint == skill.stage_hint:
         score += 4
         reasons.append(f"stage_hint matches {stage_hint}")
@@ -671,7 +646,6 @@ def _soft_skill_score(
     haystack = " ".join([
         skill.skill_id,
         skill.domain,
-        skill.task_type,
         skill.stage_hint,
         skill.description,
         " ".join(skill.fields),
@@ -697,14 +671,14 @@ def _self_check() -> int:
     print(f"loaded {len(skills)} skill(s) from {SKILLS_DIR_DEFAULT}")
     for s in skills:
         layer = "hints-only" if s.is_hints_only else f"steps={len(s.steps)}"
-        print(f"  - {s.skill_id}: domain={s.domain!r} task_type={s.task_type!r} "
+        print(f"  - {s.skill_id}: domain={s.domain!r} "
               f"stage_hint={s.stage_hint!r} fields={sorted(s.fields)} {layer}")
     # demonstrate a deterministic match against a TAAFT-like task descriptor
-    hit = reg.match(domain="theresanaiforthat.com", task_type="web_scrape",
+    hit = reg.match(domain="theresanaiforthat.com",
                     stage_hint="detail_sections",
                     fields={"rank", "productName", "detailUrl", "reviews", "prosCons", "qa"})
     print(f"\nmatch(TAAFT detail task) -> {hit.skill_id if hit else None}")
-    miss = reg.match(domain="example.com", task_type="web_scrape", stage_hint="collection")
+    miss = reg.match(domain="example.com", stage_hint="collection")
     print(f"match(unrelated task)    -> {miss.skill_id if miss else None}")
     return 0
 

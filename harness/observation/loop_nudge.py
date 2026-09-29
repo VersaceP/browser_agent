@@ -162,6 +162,7 @@ def normalize_action_params(label: str, params: Any) -> Any:
         return {
             "pageId": params.get("pageId"),
             "direction": params.get("direction"),
+            "distance": params.get("distance"),
             "edge": params.get("edge"),
             "axis": params.get("axis"),
             "containerId": (
@@ -225,17 +226,14 @@ def normalize_action_params(label: str, params: Any) -> Any:
         return {
             "pageId": params.get("pageId"),
             "point": {"x": params.get("x"), "y": params.get("y")},
-            "delta": {"x": params.get("scrollX"), "y": params.get("scrollY")},
+            "delta": {"x": params.get("deltaX"), "y": params.get("deltaY")},
             "edge": params.get("edge"),
             "axis": params.get("axis"),
         }
-    if label in {"DOM.getText", "DOM.getAttribute"}:
-        return {
-            "pageId": params.get("pageId"),
-            "target": params.get("id") or params.get("nodeId") or params.get("selector"),
-            "attribute": params.get("attribute") or params.get("name"),
-        }
-    if label in {"DOM.getAXTree", "Page.getState"}:
+    if label == "DOM.getAXTree":
+        # Bounded queries for different targets are different reads.
+        return {"pageId": params.get("pageId"), "query": params.get("query")}
+    if label == "Page.getState":
         return {"pageId": params.get("pageId")}
     if label.startswith("local_fs_"):
         return {

@@ -213,7 +213,7 @@ def _derive(path: Path) -> WorkflowContract:
         raise PlatformSchemaUnavailable(f"{path} is not valid JSON: {exc}") from exc
     if not isinstance(parsed, dict) or not isinstance(parsed.get("inputSchema"), dict):
         raise PlatformSchemaUnavailable(f"{path} has no inputSchema")
-    schema = parsed["inputSchema"]
+    schema = _harness_execute_view(parsed["inputSchema"])
     defs = schema.get("$defs") or {}
     members = _step_union_members(schema, defs)
     return WorkflowContract(
@@ -230,6 +230,47 @@ def _derive(path: Path) -> WorkflowContract:
         transform_ops=_transform_ops(members),
         condition_operators=_condition_operators(members, defs),
     )
+
+
+# WorkflowDefinitionV1 field -> the flat harness param it arrives from.
+# `schemaVersion` and `name` are filled by harness.workflow.workflow_wire.
+_WIRE_TO_FLAT = {
+    "description": "description",
+    "steps": "steps",
+    "initialVariables": "variables",
+    "timeoutMs": "timeout",
+}
+
+
+def _harness_execute_view(schema: JsonDict) -> JsonDict:
+    """Present a versioned Workflow.execute schema in the harness's flat terms.
+
+    WebCross 0.9.3 nests the recipe under ``workflow`` and the resources under
+    ``binding``; the harness builds, validates and fences the flat request and
+    translates it on the wire (workflow_wire), so the contract it derives has
+    to describe that flat request. A schema that is already flat is returned
+    unchanged.
+    """
+    properties = schema.get("properties") or {}
+    workflow = properties.get("workflow")
+    workflow_properties = workflow.get("properties") if isinstance(workflow, dict) else None
+    if not isinstance(workflow_properties, dict) or "steps" not in workflow_properties:
+        return schema
+    binding = properties.get("binding")
+    binding_properties = (binding.get("properties") or {}) if isinstance(binding, dict) else {}
+    flat: JsonDict = {
+        flat_name: workflow_properties[wire_name]
+        for wire_name, flat_name in _WIRE_TO_FLAT.items()
+        if wire_name in workflow_properties
+    }
+    for key in ("pageId", "fleetId"):
+        if key in binding_properties:
+            flat[key] = binding_properties[key]
+    required = [
+        _WIRE_TO_FLAT[name] for name in workflow.get("required") or ()
+        if name in _WIRE_TO_FLAT
+    ]
+    return {**schema, "properties": flat, "required": required}
 
 
 def _step_union_members(schema: JsonDict, defs: JsonDict) -> List[JsonDict]:

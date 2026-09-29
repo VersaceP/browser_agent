@@ -339,15 +339,20 @@ class SpawnerRegistryMixin:
         else:
             payload["reuseRules"].extend([
                 (
-                    "This assignment reuses only the browser connection. Begin"
-                    " on a fresh page; Page.list may also reveal a result tab"
-                    " opened by your action. A same-fleet row is usable only"
-                    " when claimable=true and quarantined=false."
+                    "Previous page handles are not delegated by this assignment."
+                    " Unless the task explicitly requires a new page, first call"
+                    " Page.list in assignedFleetId and look for a page matching"
+                    " the task's site and purpose. Reuse only a same-fleet row"
+                    " with claimable=true, busy=false and quarantined=false;"
+                    " claim it with Page.switchTo, then verify Page.getState"
+                    " and fresh DOM evidence before acting."
                 ),
                 (
-                    "Use Page.create for a fresh task page. If an action opens a"
-                    " new tab, call Page.list and address its pageId on first use;"
-                    " the harness atomically claims it."
+                    "Use Page.create when no suitable claimable page exists or"
+                    " the task explicitly requires a new page. Do not navigate"
+                    " an unrelated existing page or infer login from its URL."
+                    " If an action opens a new tab, call Page.list and address"
+                    " its pageId on first use; the harness atomically claims it."
                 ),
             ])
         return (
@@ -766,7 +771,6 @@ class SpawnerRegistryMixin:
         if trace is not None:
             self._update_slot_registry_from_trace(slot, trace)
         slot.last_phase_id = phase_id
-        slot.last_task_type = str(worker_contract.get("task_type") or "")
         slot.last_result_summary = {
             "workerId": worker_id,
             "phaseId": phase_id,
@@ -962,7 +966,6 @@ class SpawnerRegistryMixin:
             "currentWorkerId": slot.current_worker_id,
             "lastWorkerId": slot.last_worker_id,
             "lastPhaseId": slot.last_phase_id,
-            "lastTaskType": slot.last_task_type,
             "fleetIds": sorted(slot.fleet_ids),
             "origins": sorted(slot.origins),
             "pages": [
@@ -991,9 +994,8 @@ class SpawnerRegistryMixin:
             "status": slot.status,
             "lastWorkerId": slot.last_worker_id,
             "lastPhaseId": slot.last_phase_id,
-            "lastTaskType": slot.last_task_type,
             "pageReuseMode": (
-                "explicit_continuation" if expose_reusable_pages else "fresh_page_required"
+                "explicit_continuation" if expose_reusable_pages else "discover_claimable_pages"
             ),
             "existingPageCount": len(slot.page_registry),
             "quarantinedPageCount": len(slot.page_quarantine),
@@ -1013,7 +1015,7 @@ class SpawnerRegistryMixin:
             payload["pageReuseMode"] = (
                 "explicit_page_continuation"
                 if expose_reusable_pages
-                else "fresh_page_same_fleet"
+                else "discover_claimable_pages_same_fleet"
             )
         if not expose_reusable_pages:
             return payload

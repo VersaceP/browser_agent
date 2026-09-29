@@ -21,6 +21,7 @@ from urllib.parse import parse_qsl
 from urllib.parse import urlencode
 from urllib.parse import urlsplit
 from urllib.parse import urlunsplit
+from harness.observation.axtree_format import AX_NODE_ID_ANYWHERE_RE
 from harness.observation.content_completeness import content_completeness_config_errors
 from harness.observation.content_completeness import normalize_content_completeness_config
 from harness.evidence.extraction_artifacts import field_name_from_spec
@@ -41,10 +42,6 @@ from harness.planning.pacing import MAX_PACING_INTERVAL_SECONDS
 from harness.planning.pacing import PACING_FIELDS
 from harness.planning.pacing import PACING_INTERVAL_FIELDS
 from harness.planning.pacing import normalized_pacing
-from harness.planning.task_types import VALID_TASK_TYPES
-from harness.planning.task_types import normalize_task_type
-from harness.planning.task_types import resolve_task_type_fail_closed
-from harness.planning.task_types import task_type_choices_for_error
 from harness.utils import JsonDict
 from harness.utils import RunLogger
 from harness.utils import contains_affirmative_semantic_marker
@@ -93,6 +90,7 @@ SEMANTIC_TERMINAL_CLASSIFICATIONS = frozenset({
 
 TERMINAL_PHASE_STATUSES = frozenset({
     "validated_done",
+    "superseded",
     "phase_failed",
     "contract_invalid",
     "blocked_by_challenge",
@@ -237,7 +235,7 @@ def _validate_empty_value_license_outcomes(
             issue.setdefault("affectedPhases", []).append(phase_id)
     return None
 
-AXTREE_ID_ANYWHERE_RE = re.compile(r"\b\d+:-?\d+:-?\d+\b")
+AXTREE_ID_ANYWHERE_RE = AX_NODE_ID_ANYWHERE_RE
 
 VOLATILE_HANDLE_KEYS = {
     "pageId",
@@ -272,57 +270,6 @@ VALID_STAGE_HINTS = {
 # finish N detail rows" has no unique answer at plan time, so it belongs to the
 # semantic auditor, with these numbers in front of it.
 DETAIL_PHASE_SPLIT_ADVISORY_ROWS = 1
-
-# Read-only task types are the only ones whose per-row work is a page read.
-# A per-row download or upload is a different stage question entirely.
-_ROWWISE_SHAPE_TASK_TYPES = frozenset({"web_search", "web_scrape"})
-
-
-def _upstream_rowwise_shape(
-    raw_phase: JsonDict,
-    raw_phases: Any,
-) -> Optional[JsonDict]:
-    """Is this phase, by its OWN declarations, one output row per upstream row?
-
-    Plan-side only: the same shape `assess_batch_source_binding` later proves
-    against the real artifact, minus everything that needs the artifact to
-    exist. Nothing here reads a field name or a URL, so it carries no site or
-    schema knowledge -- only the plan's own wiring.
-    """
-    if normalize_task_type(raw_phase.get("task_type")) not in _ROWWISE_SHAPE_TASK_TYPES:
-        return None
-    references = raw_phase.get("input_artifacts")
-    if not isinstance(references, list) or len(references) != 1:
-        return None
-    reference = references[0]
-    if not isinstance(reference, dict):
-        return None
-    source_id = str(reference.get("phase_id") or "").strip()
-    if not source_id:
-        return None
-    depends_on = raw_phase.get("depends_on")
-    if not isinstance(depends_on, list) or source_id not in {
-        str(item).strip() for item in depends_on if isinstance(item, str)
-    }:
-        return None
-    expected = raw_phase.get("expected_artifact")
-    rows = (expected or {}).get("exact_rows") if isinstance(expected, dict) else None
-    if not isinstance(rows, int) or isinstance(rows, bool) or rows <= 0:
-        return None
-    for candidate in raw_phases if isinstance(raw_phases, list) else []:
-        if not isinstance(candidate, dict):
-            continue
-        if str(candidate.get("id") or "").strip() != source_id:
-            continue
-        source_expected = candidate.get("expected_artifact")
-        source_rows = (
-            source_expected.get("exact_rows")
-            if isinstance(source_expected, dict) else None
-        )
-        if source_rows == rows:
-            return {"sourcePhaseId": source_id, "rows": rows}
-        return None
-    return None
 
 SENSITIVE_PROVENANCE_FIELD_MARKERS = {
     "rank",
@@ -636,69 +583,6 @@ def _reject_phase_execution_integrity(
             ),
         })
 
-def _validate_task_type_capability_match(
-    *,
-    phase_id: str,
-    task_type: str,
-    objective: str,
-    worker_task: str,
-    stage_hint_reason: str,
-    validators: List[JsonDict],
-    errors: List[str],
-    warnings: List[JsonDict],
-) -> None:
-    """Hard-reject structured contradictions; warn on prose heuristics.
-
-    Validators are mechanically decidable and may safely gate execution.
-    Natural-language intent is not: DOM.getImg and record_extraction both write
-    harness-managed files without requiring Download.*, while ordinary phrasing
-    varies too much to classify without false positives/negatives. Prose can
-    therefore request Lead review but never reject a plan.
-    """
-    validator_types = {
-        str(item.get("type") or "").strip()
-        for item in validators
-        if isinstance(item, dict)
-    }
-    image_export = "image_exported" in validator_types
-    if "download_completed" in validator_types and task_type != "file_download":
-        errors.append(
-            f"phase {phase_id}: validator download_completed requires task_type"
-            f" 'file_download'; got {task_type!r}"
-        )
-    upload_validators = validator_types & {"upload_selected", "upload_confirmed"}
-    if upload_validators and task_type not in {"file_upload", "form_filling"}:
-        errors.append(
-            f"phase {phase_id}: validators {sorted(upload_validators)} require"
-            " task_type 'file_upload' or 'form_filling'"
-            f"; got {task_type!r}"
-        )
-    declared_work = " ".join((objective, worker_task, stage_hint_reason))
-    lowered_work = declared_work.lower()
-    harness_managed_write = (
-        ("dom.getimg" in lowered_work or "record_extraction" in lowered_work)
-        and "download." not in lowered_work
-        and not _NON_IMAGE_ASSET_TOKEN_RE.search(declared_work)
-    )
-    if (
-        _NON_IMAGE_FILE_SAVE_RE.search(declared_work)
-        and task_type != "file_download"
-        and not harness_managed_write
-    ):
-        warnings.append({
-            "type": "task_type_file_intent_review",
-            "phaseId": phase_id,
-            "taskType": task_type,
-            "message": (
-                f"phase {phase_id}: prose may request a non-image file save,"
-                f" but task_type is {task_type!r}. This is advisory because"
-                " prose is not a mechanical capability contract. If the phase"
-                " uses Download.*, re-emit it as file_download and add"
-                " download_completed + file_integrity validators; DOM.getImg"
-                " and record_extraction do not require file_download."
-            ),
-        })
-
 def _reject_serial_auth_handoff(phases: List[JsonDict], errors: List[str]) -> None:
     """Legacy entry point: prose cannot mechanically reject a plan."""
     return None
@@ -706,40 +590,6 @@ def _reject_serial_auth_handoff(phases: List[JsonDict], errors: List[str]) -> No
 
 def utc_now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
-
-def _validated_task_type(
-    raw: Any,
-    *,
-    errors: List[str],
-    warnings: List[JsonDict],
-    where: str,
-) -> str:
-    """Alias-normalize + membership-check ONE task_type field ('' when absent).
-    Unknown values must error everywhere the field is accepted: the policy
-    layer looks task_type up (TASK_TYPE_DISABLED_DOMAINS.get) and an unknown
-    value silently disables NOTHING — a typo would grant a worker every method
-    domain (review P2: worker_contract.task_type was never checked)."""
-    text = str(raw or "").strip()
-    if not text:
-        return ""
-    canonical = normalize_task_type(text)
-    if canonical != text:
-        warnings.append({
-            "type": "task_type_alias",
-            "field": where,
-            "input": text,
-            "canonical": canonical,
-            "message": (
-                f"{where}: {text!r} is accepted as an alias; use canonical"
-                f" task_type {canonical!r} in future plans."
-            ),
-        })
-        text = canonical
-    if text not in VALID_TASK_TYPES:
-        errors.append(
-            f"{where} must be one of {task_type_choices_for_error()}; got {text!r}"
-        )
-    return text
 
 def _validate_pacing(value: Any, errors: List[str], *, where: str) -> JsonDict:
     if value is None:
@@ -1300,10 +1150,9 @@ def _singleton_cohort_key(
     fields = sorted(field_names_from_specs(expected.get("fields") or []))
     contract = phase.get("worker_contract")
     contract = dict(contract) if isinstance(contract, dict) else {}
-    for key in ("batch_rows", "batch_source", "batch_policy"):
+    for key in ("batch_rows", "batch_source", "batch_policy", "task_type"):
         contract.pop(key, None)
     payload = {
-        "taskType": str(phase.get("task_type") or ""),
         "stage": str(phase.get("stage_hint") or ""),
         "depends": effective_dependencies,
         "sources": _tc()._normalized_source_urls(
@@ -1447,7 +1296,6 @@ def _compile_output_contract(
     source_path: str = "",
     field_source_paths: Optional[Dict[str, str]] = None,
     repair_issues: Optional[List[JsonDict]] = None,
-    allow_legacy_empty_outcomes: bool = False,
     warnings: Optional[List[JsonDict]] = None,
 ) -> Tuple[JsonDict, List[JsonDict]]:
     """Compile concise output syntax to the existing artifact/validator form.
@@ -1535,29 +1383,6 @@ def _compile_output_contract(
                 and raw_spec.get("empty") == "with_evidence"
                 else None
             )
-            if allow_legacy_empty_outcomes:
-                if not (
-                    isinstance(raw_outcomes, list)
-                    and raw_outcomes
-                    and all(
-                        isinstance(item, str)
-                        and item.strip() == OUTCOME_CONFIRMED_ABSENT
-                        for item in raw_outcomes
-                    )
-                ) and warnings is not None:
-                    warnings.append({
-                        "type": "legacy_empty_outcome_contract_preserved",
-                        "phase": phase_id,
-                        "path": outcome_path,
-                        "message": (
-                            "An immutable accepted extension prefix carries an"
-                            " empty-value outcome declaration that the current"
-                            " runtime vocabulary would reject. It remains"
-                            " unchanged for compatibility; new or changed"
-                            " phases must use confirmed_absent only."
-                        ),
-                    })
-                continue
             normalized_outcomes = _validate_empty_value_license_outcomes(
                 raw_outcomes,
                 phase_id=phase_id,
@@ -1605,60 +1430,33 @@ def _compile_output_contract(
                     spec["nonempty"] = True
                     inline_outcomes = spec.get("allow_empty_with_outcome")
                     if inline_outcomes is not None:
-                        if allow_legacy_empty_outcomes:
-                            if not (
-                                isinstance(inline_outcomes, list)
-                                and inline_outcomes
-                                and all(
-                                    isinstance(item, str)
-                                    and item.strip() == OUTCOME_CONFIRMED_ABSENT
-                                    for item in inline_outcomes
-                                )
-                            ) and warnings is not None:
-                                warnings.append({
-                                    "type": "legacy_empty_outcome_contract_preserved",
-                                    "phase": phase_id,
-                                    "path": (
-                                        f"{field_path}/allow_empty_with_outcome"
-                                    ),
-                                    "message": (
-                                        "An immutable accepted extension prefix"
-                                        " carries an empty-value outcome"
-                                        " declaration that the current runtime"
-                                        " vocabulary would reject. It remains"
-                                        " unchanged for compatibility; new or"
-                                        " changed phases must use"
-                                        " confirmed_absent only."
-                                    ),
-                                })
-                        else:
-                            normalized_inline = (
-                                _validate_empty_value_license_outcomes(
-                                    inline_outcomes,
-                                    phase_id=phase_id,
-                                    field=name,
-                                    path=(
-                                        f"{field_path}/"
-                                        "allow_empty_with_outcome"
-                                    ),
-                                    errors=errors,
-                                    repair_issues=repair_issues,
-                                    forbid_operations=[
-                                        {
-                                            "op": "set",
-                                            "path": f"{field_path}/empty",
-                                            "value": "forbid",
-                                        },
-                                        {
-                                            "op": "remove",
-                                            "path": f"{field_path}/allow_empty_with_outcome",
-                                            "value": None,
-                                        },
-                                    ],
-                                )
+                        normalized_inline = (
+                            _validate_empty_value_license_outcomes(
+                                inline_outcomes,
+                                phase_id=phase_id,
+                                field=name,
+                                path=(
+                                    f"{field_path}/"
+                                    "allow_empty_with_outcome"
+                                ),
+                                errors=errors,
+                                repair_issues=repair_issues,
+                                forbid_operations=[
+                                    {
+                                        "op": "set",
+                                        "path": f"{field_path}/empty",
+                                        "value": "forbid",
+                                    },
+                                    {
+                                        "op": "remove",
+                                        "path": f"{field_path}/allow_empty_with_outcome",
+                                        "value": None,
+                                    },
+                                ],
                             )
-                            if normalized_inline is not None:
-                                inline_outcomes = normalized_inline
+                        )
+                        if normalized_inline is not None:
+                            inline_outcomes = normalized_inline
                     mapped_outcomes = canonical_outcomes.get(name)
                     outcomes = inline_outcomes or mapped_outcomes
                     if not isinstance(outcomes, list) or not outcomes:
@@ -1757,7 +1555,6 @@ def _compile_phase_plan_shorthand(
     phase_index: int,
     errors: List[str],
     repair_issues: Optional[List[JsonDict]] = None,
-    allow_legacy_empty_outcomes: bool = False,
     warnings: Optional[List[JsonDict]] = None,
 ) -> JsonDict:
     """Expand the concise Lead-facing plan syntax before normal validation."""
@@ -1840,7 +1637,6 @@ def _compile_phase_plan_shorthand(
             source_path=contract_source_path,
             field_source_paths=field_source_paths,
             repair_issues=repair_issues,
-            allow_legacy_empty_outcomes=allow_legacy_empty_outcomes,
             warnings=warnings,
         )
         phase["expected_artifact"] = expected
@@ -1851,7 +1647,6 @@ def _compile_phase_plan_shorthand(
             output_override, phase_id=phase_id, errors=errors,
             source_path=f"/phases/{phase_index}/output_contract",
             repair_issues=repair_issues,
-            allow_legacy_empty_outcomes=allow_legacy_empty_outcomes,
             warnings=warnings,
         )
         phase["expected_artifact"] = expected
@@ -1918,9 +1713,6 @@ def validate_task_plan(
     known_abcp_methods: Optional[AbstractSet[str]] = None,
     known_harness_tools: Optional[AbstractSet[str]] = None,
     user_task: str = "",
-    legacy_required_controls_phase_ids: Optional[AbstractSet[str]] = None,
-    legacy_non_form_required_controls_phase_ids: Optional[AbstractSet[str]] = None,
-    legacy_empty_outcome_phase_ids: Optional[AbstractSet[str]] = None,
     repair_issues: Optional[List[JsonDict]] = None,
     collection_facts: Optional[List[JsonDict]] = None,
 ) -> Tuple[Optional[JsonDict], List[str]]:
@@ -1940,21 +1732,10 @@ def validate_task_plan(
         return None, ["plan must be a JSON object"]
 
     warnings: List[JsonDict] = []
-    legacy_empty_outcome_phase_ids = {
-        str(item).strip()
-        for item in (legacy_empty_outcome_phase_ids or set())
-        if str(item).strip()
-    }
     plan_pacing = _validate_pacing(raw_plan.get("pacing"), errors, where="pacing")
     goal = str(raw_plan.get("goal") or "").strip()
     if not goal:
         errors.append("goal is required")
-
-    task_type = str(raw_plan.get("task_type") or "").strip()
-    if task_type:
-        task_type = _validated_task_type(
-            task_type, errors=errors, warnings=warnings, where="task_type",
-        )
 
     raw_phases = raw_plan.get("phases")
     if not isinstance(raw_phases, list) or not raw_phases:
@@ -1995,9 +1776,6 @@ def validate_task_plan(
             phase_index=index,
             errors=errors,
             repair_issues=repair_issues,
-            allow_legacy_empty_outcomes=(
-                phase_id in legacy_empty_outcome_phase_ids
-            ),
             warnings=warnings,
         ))
     raw_phases = expanded_raw_phases
@@ -2034,16 +1812,6 @@ def validate_task_plan(
 
     phases: List[JsonDict] = []
     seen_ids = set()
-    legacy_required_controls_phase_ids = {
-        str(item).strip()
-        for item in (legacy_required_controls_phase_ids or set())
-        if str(item).strip()
-    }
-    legacy_non_form_required_controls_phase_ids = {
-        str(item).strip()
-        for item in (legacy_non_form_required_controls_phase_ids or set())
-        if str(item).strip()
-    }
     for index, raw_phase in enumerate(raw_phases):
         if not isinstance(raw_phase, dict):
             errors.append(f"phases[{index}] must be an object")
@@ -2102,70 +1870,9 @@ def validate_task_plan(
             phase_id=phase_id,
             phase_index=index,
             repair_issues=repair_issues,
-            # Phase-level type is the authorization boundary.  The plan-level
-            # type has not yet been derived here and may describe another
-            # phase, so it must not decide a form completion contract.
-            task_type=normalize_task_type(raw_phase.get("task_type")),
             stage_hint=stage_hint,
-            allow_legacy_missing_required_controls=(
-                phase_id in legacy_required_controls_phase_ids
-            ),
-            allow_legacy_non_form_required_controls=(
-                phase_id in legacy_non_form_required_controls_phase_ids
-            ),
-            allow_legacy_empty_outcomes=(
-                phase_id in legacy_empty_outcome_phase_ids
-            ),
             validate_empty_outcomes=not empty_outcomes_prevalidated,
         )
-        # `generic` is the fallback stage, and this phase's own declared shape
-        # says a more specific one applies.
-        #
-        # Unlike the row-count question below, this IS decidable: a read-only
-        # phase that names exactly one input artifact, depends on that
-        # artifact's producer, and claims the same row count has declared a
-        # row-wise transformation of an upstream collection. Nothing else in
-        # the stage vocabulary describes that, so while the rule cannot say
-        # WHICH specific stage applies, it can say the fallback does not.
-        #
-        # It matters because stage_hint is a dispatch key, not a label. In task
-        # b9a91fd2 all seven phases were `generic`, which silently disabled
-        # skill matching (a skill declaring a stage cannot match a phase
-        # declaring another), guidance health accounting, strategy-bank reuse,
-        # detail-phase sizing triage, and half the pathfinder/sibling grouping
-        # -- none of which reports a failure when it simply never fires.
-        if str(raw_phase.get("stage_hint") or "").strip() == "generic":
-            shape = _upstream_rowwise_shape(raw_phase, raw_phases)
-            if shape is not None:
-                errors.append(
-                    f"phase {phase_id}: stage_hint='generic', but this phase"
-                    " declares a row-wise transformation of phase"
-                    f" {shape['sourcePhaseId']!r}'s artifact -- one input"
-                    " artifact reference, that phase as a dependency, and the"
-                    f" same {shape['rows']} rows. A read-only phase of that"
-                    " shape is detail_sections, attribute_links or"
-                    " computed_relationship; 'generic' is the fallback and it"
-                    " is a dispatch key, so declaring it silently disables"
-                    " skill matching, strategy reuse, pathfinder grouping and"
-                    " phase sizing for this phase."
-                )
-                if repair_issues is not None:
-                    repair_issues.append({
-                        "code": "generic_stage_hint_on_rowwise_phase",
-                        "phaseId": phase_id,
-                        "paths": [f"/phases/{index}/stage_hint"],
-                        "repairOptions": [{
-                            "action": "set_specific_stage_hint",
-                            "candidates": [
-                                "detail_sections",
-                                "attribute_links",
-                                "computed_relationship",
-                            ],
-                            "sourcePhaseId": shape["sourcePhaseId"],
-                            "rows": shape["rows"],
-                        }],
-                    })
-
         # Detail-phase sizing is REPORTED, never refused here.
         #
         # An earlier revision made this a hard rejection at more than one row.
@@ -2239,6 +1946,14 @@ def validate_task_plan(
             errors.append(f"phase {phase_id}: worker_contract must be an object")
             worker_contract = None
         if isinstance(worker_contract, dict):
+            if "local_access_intent" in worker_contract:
+                from harness.tools.path_authorization import normalize_local_access_intent
+                try:
+                    worker_contract["local_access_intent"] = normalize_local_access_intent(
+                        worker_contract["local_access_intent"]
+                    )
+                except ValueError as exc:
+                    errors.append(f"phase {phase_id}: worker_contract.{exc}")
             _validate_worker_contract_methods(
                 worker_contract,
                 errors,
@@ -2247,13 +1962,7 @@ def validate_task_plan(
                 known_harness_tools=known_harness_tools,
                 warnings=warnings,
             )
-            if worker_contract.get("task_type") is not None:
-                worker_contract["task_type"] = _validated_task_type(
-                    worker_contract.get("task_type"),
-                    errors=errors,
-                    warnings=warnings,
-                    where=f"phase {phase_id}: worker_contract.task_type",
-                )
+            worker_contract.pop("task_type", None)  # legacy plans carry no authority.
             if (
                 "needs_isolated_session" in worker_contract
                 and not isinstance(worker_contract.get("needs_isolated_session"), bool)
@@ -2390,59 +2099,9 @@ def validate_task_plan(
                 f"phase {phase_id}: dispatch_wave must be a positive integer"
             )
 
-        # phase_contract consumes phase.task_type (contract > phase > plan),
-        # but normalization used to drop it silently — a per-phase override
-        # the model emitted at the sanctioned granularity simply vanished
-        # (review P2). Preserve it, validated.
-        #
-        # REQUIRED, not inherited: silent inheritance made the plan's single
-        # task_type decide method access for every phase, so one classification
-        # covering a whole multi-stage goal disabled domains a later phase
-        # needed. Task b37bac2a planned "scrape listings AND export media" as
-        # web_scrape, which disabled Download for the export phase; the worker
-        # never saw the method and reported the videos as un-downloadable.
-        # Making each phase state its own type puts the choice next to the
-        # phase objective that justifies it.
-        phase_task_type = _validated_task_type(
-            raw_phase.get("task_type"),
-            errors=errors,
-            warnings=warnings,
-            where=f"phase {phase_id}: task_type",
-        )
-        # Absence only — an unknown value already produced its own, more
-        # specific error inside _validated_task_type (which also returns "").
-        if not str(raw_phase.get("task_type") or "").strip():
-            errors.append(
-                f"phase {phase_id}: task_type is required and is NOT inherited"
-                " from the plan; declare what this phase itself does"
-                f" (one of {task_type_choices_for_error()}). A phase that saves"
-                " a non-image file needs file_download, not web_scrape."
-            )
-        if isinstance(worker_contract, dict) and worker_contract.get("task_type"):
-            contract_task_type = str(worker_contract.get("task_type") or "")
-            if phase_task_type and contract_task_type != phase_task_type:
-                errors.append(
-                    f"phase {phase_id}: worker_contract.task_type cannot override"
-                    f" phase.task_type ({contract_task_type!r} !="
-                    f" {phase_task_type!r}); revise phase.task_type and re-emit"
-                    " the plan instead"
-                )
-        if phase_task_type:
-            _validate_task_type_capability_match(
-                phase_id=phase_id,
-                task_type=phase_task_type,
-                objective=objective,
-                worker_task=worker_task,
-                stage_hint_reason=stage_hint_reason,
-                validators=validators,
-                errors=errors,
-                warnings=warnings,
-            )
-
         phases.append({
             "id": phase_id,
             "type": phase_type,
-            "task_type": phase_task_type or None,
             "objective": objective,
             "worker_task": worker_task,
             **(
@@ -2590,21 +2249,9 @@ def validate_task_plan(
     _reject_singleton_phase_fragmentation(phases, errors, warnings)
     _reject_serial_auth_handoff(phases, errors)
 
-    if not task_type:
-        phase_task_types = {
-            str(phase.get("task_type") or "") for phase in phases
-            if str(phase.get("task_type") or "")
-        }
-        task_type = (
-            next(iter(phase_task_types))
-            if len(phase_task_types) == 1
-            else "general"
-        )
-
     normalized = {
         "version": "v1",
         "goal": goal,
-        "task_type": task_type,
         "pacing": plan_pacing,
         **(
             {"output_contracts": copy.deepcopy(output_contracts)}
@@ -2622,9 +2269,9 @@ def validate_task_plan(
     # single-worker path after the same approval gate.  Ordinary plans omit it.
     execution_mode = str(raw_plan.get("execution_mode") or "").strip()
     if execution_mode:
-        if execution_mode not in {"direct_worker", "lead_orchestration"}:
+        if execution_mode not in {"direct_worker", "lead_orchestration", "delegated"}:
             errors.append(
-                "execution_mode must be 'direct_worker' or 'lead_orchestration'"
+                "execution_mode must be direct_worker, lead_orchestration or delegated"
             )
         else:
             normalized["execution_mode"] = execution_mode
@@ -2648,8 +2295,8 @@ def _validate_worker_contract_methods(
     forbidden_methods (deny-list): forbidding a method that does not exist is
     a no-op — rejecting the whole plan over it cost task 2ed5a466 a full plan
     round-trip on 'Download.save' (×4 phases). Unknown deny entries are
-    DROPPED with a warning receipt instead; task_type policy already disables
-    whole method domains worker-side, so the deny-list is only ever an extra."""
+    DROPPED with a warning receipt instead; only known deny entries can
+    constrain execution."""
     harness_tools = known_harness_tools or set()
     for key in ("allowed_methods", "forbidden_methods"):
         raw_methods = worker_contract.get(key)
@@ -2670,8 +2317,7 @@ def _validate_worker_contract_methods(
                         "method": method,
                         "note": (
                             "Not a known method, so it forbids nothing —"
-                            " dropped. task_type policy already disables whole"
-                            " method domains worker-side; use canonical names"
+                            " dropped. Use canonical names"
                             " or Domain.* wildcards for extra restrictions."
                         ),
                     })
@@ -2705,20 +2351,6 @@ def _validate_worker_contract_methods(
             kept.append(method)
         if tolerant:
             worker_contract[key] = kept
-
-def _first_valid_task_type(*candidates: Any) -> str:
-    """Return the first known candidate, else the restricted web_scrape type.
-
-    Explicit ``general`` is valid, but missing/garbage must never become an
-    implicit all-domain grant if a future internal caller bypasses validation.
-    """
-    for candidate in candidates:
-        if candidate is None or str(candidate).strip() == "":
-            continue
-        canonical = normalize_task_type(candidate)
-        if canonical in VALID_TASK_TYPES:
-            return canonical
-    return "web_scrape"
 
 def _merged_expected_artifact(
     phase: JsonDict,
@@ -2766,29 +2398,19 @@ def phase_contract(
             phase_id=phase_id or "worker",
         )
 
-    # phase.task_type is the sole authority for method policy. A spawn-time
-    # worker_contract must not silently broaden/narrow the reviewed plan, and a
-    # plan-level classification must not leak into a phase that omitted its own
-    # type. New plans cannot reach this function without a valid phase type,
-    # but legacy/internal callers fail closed to web_scrape rather than the
-    # unrestricted general policy if they omit or corrupt it. An explicitly
-    # reviewed phase.task_type="general" remains valid.
-    resolved_task_type = resolve_task_type_fail_closed(phase.get("task_type"))
     file_only_contract = bool(validators) and all(
         str(item.get("type") or "") in FILE_RECEIPT_ONLY_VALIDATOR_TYPES
         for item in validators
         if isinstance(item, dict)
     )
     default_must_record = not (
-        resolved_task_type in {"file_download", "file_upload"}
-        and file_only_contract
+        file_only_contract
         and not expected_artifact.get("fields")
         and not expected_artifact.get("required_fields")
     )
     payload: JsonDict = {
         "version": "v1",
         "phase_id": phase_id,
-        "task_type": resolved_task_type,
         "stage_hint": str(contract.get("stage_hint") or phase.get("stage_hint") or "generic"),
         "execution_role": str(
             contract.get("execution_role") or phase.get("execution_role") or ""
@@ -2853,7 +2475,7 @@ def phase_contract(
         "batch_source",
         "batch_policy", "replan_checkpoint_id", "skill_selection", "domain",
         "needs_isolated_session", "reuse_scope", "session_key", "page_policy",
-        "content_completeness",
+        "content_completeness", "local_access_intent",
     ):
         value = contract.get(skill_key)
         if value is not None:
@@ -2895,6 +2517,8 @@ def accept_task_plan(
     extension_decision: Optional[JsonDict] = None,
     user_approval: Optional[JsonDict] = None,
     source_plan: Optional[JsonDict] = None,
+    preserve_execution: bool = False,
+    _locked: bool = False,
 ) -> Tuple[str, JsonDict, JsonDict]:
     """Publish one plan generation: version record, alias and reset state.
 
@@ -2904,6 +2528,17 @@ def accept_task_plan(
     whole generation at once where it can.
     """
 
+    if preserve_execution and not _locked:
+        # Refresh under the same lock used by Worker result writers. Appending
+        # an independent assignment must not replace a concurrently returned result.
+        with _tc()._TASK_STATE_WRITE_LOCK:
+            return accept_task_plan(
+                logger, plan, previous_plan=previous_plan, replan_reason=replan_reason,
+                user_task=user_task, validator_review=validator_review,
+                preserve_from=_tc().load_task_state(logger), extension_decision=extension_decision,
+                user_approval=user_approval, source_plan=source_plan,
+                preserve_execution=True, _locked=True,
+            )
     from harness.planning.validator import build_plan_version_record
 
     record = build_plan_version_record(
@@ -2933,6 +2568,7 @@ def accept_task_plan(
         replan_reason=replan_reason,
         plan_version=record,
         user_approval=user_approval,
+        preserve_execution=preserve_execution,
         persist=False,
     )
     storage, task_id = storage_for_logger(logger)
@@ -2977,6 +2613,7 @@ def initialize_task_state(
     plan_version: Optional[JsonDict] = None,
     user_approval: Optional[JsonDict] = None,
     persist: bool = True,
+    preserve_execution: bool = False,
 ) -> JsonDict:
     previous_phases_raw = preserve_from.get("phases") if isinstance(preserve_from, dict) else None
     previous_phases: JsonDict = previous_phases_raw if isinstance(previous_phases_raw, dict) else {}
@@ -3008,13 +2645,10 @@ def initialize_task_state(
         previous = previous_phases.get(phase_id)
         if isinstance(previous, dict):
             previous_status = str(previous.get("status") or "")
-            if previous_status in REPLAN_RESET_STATUSES:
+            if previous_status in REPLAN_RESET_STATUSES and not preserve_execution:
                 phases_state[phase_id] = _tc()._empty_phase_state()
                 # Reset execution status, not spent resources or crash evidence.
                 # Old decisions retain their planVersion/contractHash fences.
-                for key in ("continuation_controls", "continuation_dispatch_input"):
-                    if key in previous:
-                        phases_state[phase_id][key] = copy.deepcopy(previous[key])
                 if replan_audit is not None:
                     replan_audit["reset_phase_failed"].append({
                         "phaseId": phase_id,
@@ -3023,7 +2657,7 @@ def initialize_task_state(
                     })
             else:
                 preserved = copy.deepcopy(previous)
-                if preserved.get("status") == "running":
+                if preserved.get("status") == "running" and not preserve_execution:
                     preserved["status"] = "pending"
                     preserved["replan_reset_from"] = "running"
                 _tc()._ensure_phase_state_defaults(preserved)
@@ -3038,6 +2672,20 @@ def initialize_task_state(
             phases_state[phase_id] = _tc()._empty_phase_state()
             if replan_audit is not None:
                 replan_audit["new_phases"].append(phase_id)
+
+    if preserve_execution:
+        for phase in plan_phases:
+            meta = (phase.get("worker_contract") or {}).get("_delegation") or {}
+            previous_id = meta.get("replaces")
+            if previous_id and previous_id in phases_state:
+                predecessor = phases_state[previous_id]
+                # The accept preflight rejects live predecessors. Historical
+                # worker status/attempt evidence remains intact and queryable.
+                if predecessor.get("status") == "running":
+                    raise ValueError("cannot supersede a running assignment")
+                predecessor.setdefault("status_before_supersession", predecessor.get("status"))
+                predecessor["status"] = "superseded"
+                predecessor["superseded_by"] = phase["id"]
 
     state = {
         "version": "v1",
@@ -3112,6 +2760,18 @@ def initialize_task_state(
         # identity after this process exits.
         "plan_replan_reason": replan_reason or "",
     }
+    # Approval may arrive before the first assignment is accepted. Preserve
+    # those ordered user records without importing unrelated stale phase state
+    # into a fresh plan generation.
+    input_source = preserve_from
+    if not isinstance(input_source, dict):
+        try:
+            input_source = _tc().load_task_state(logger)
+        except Exception:
+            input_source = {}
+    for key in ("operator_inputs", "delegations"):
+        state[key] = copy.deepcopy((input_source or {}).get(key) or {})
+    state["operator_input_order"] = list((input_source or {}).get("operator_input_order") or [])
     # Approval is bound to the immutable candidate hash and committed with the
     # plan generation.  It is control-plane state, not part of the plan body:
     # adding it to the plan would change the very candidate the user approved.

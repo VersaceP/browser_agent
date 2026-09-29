@@ -16,7 +16,6 @@ emitter_sources:
 related_tools:
   - lead_save_artifact
   - spawn_browser_agent
-  - repair_task_plan
 related_methods: []
 error_codes:
   - is_placeholder
@@ -74,7 +73,7 @@ named cohort also needs its declared identity/set and uniqueness evidence.
 Never turn a missing value into a failure narrative in a data field or relax a
 validator merely to accept a partial artifact.
 
-For complete plan-authoring calls and validator-parameter repairs, read
+For delegation calls and validator parameters, read
 `lead.plan-contracts`. In particular, `path_pattern` is a file-validator
 parameter; `field_pattern` checks text and does not verify disk delivery.
 

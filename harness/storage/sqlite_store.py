@@ -58,6 +58,42 @@ EVENT_PAYLOAD_OFFLOAD_THRESHOLD = 65536
 
 RESOURCE_TYPE_EVENT_PAYLOAD = "event_payload"
 
+# Resource kinds whose superseded versions keep only their metadata. A page
+# view is re-read rather than revisited: nothing addresses the older bytes.
+DISCARD_SUPERSEDED_CONTENT_TYPES = frozenset({"observation"})
+
+
+def _prune_superseded_content(connection, resource_id: str) -> None:
+    """Drop a superseded page view's bytes, keeping the row as provenance.
+
+    Only the current version of a logical path answers a read, so the older
+    bytes are unreachable — one 400KB tree per read, kept forever. `byte_size`
+    and `sha256` still say what that version held; `contentPruned` says the
+    bytes are gone rather than the view having been empty. One content column
+    must stay non-null, which is what the empty text is for.
+    """
+    row = connection.execute(
+        "SELECT metadata_json FROM task_resources WHERE resource_id = ?",
+        (resource_id,),
+    ).fetchone()
+    try:
+        metadata = json.loads(row["metadata_json"]) if row and row["metadata_json"] else {}
+    except (TypeError, ValueError):
+        metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    metadata["contentPruned"] = True
+    connection.execute(
+        "UPDATE task_resources SET content_json = NULL, content_blob = NULL,"
+        " content_text = '', content_encoding = ?, stored_byte_size = 0,"
+        " metadata_json = ? WHERE resource_id = ?",
+        (
+            ENCODING_IDENTITY,
+            json.dumps(metadata, ensure_ascii=False, default=str),
+            resource_id,
+        ),
+    )
+
 
 def build_resource_uri(task_id: str, resource_id: str) -> str:
     return f"{RESOURCE_URI_PREFIX}{task_id}/resources/{resource_id}"
@@ -712,6 +748,8 @@ class SqliteStore(Storage):
                 "UPDATE task_resources SET is_current = 0 WHERE resource_id = ?",
                 (supersedes,),
             )
+            if resource_type in DISCARD_SUPERSEDED_CONTENT_TYPES:
+                _prune_superseded_content(connection, supersedes)
         connection.execute(
             "INSERT INTO task_resources("
             " resource_id, task_id, run_id, resource_type, logical_path, media_type,"
@@ -940,26 +978,6 @@ class SqliteStore(Storage):
             worker_id=worker_id,
             limit=limit,
         )
-
-    # -- strategy telemetry ------------------------------------------------
-    def append_strategy_attempt(
-        self,
-        *,
-        task_id: str,
-        run_id: str,
-        payload: JsonDict,
-    ) -> None:
-        dao.insert_strategy_attempt(
-            self.connection, task_id=task_id, run_id=run_id, payload=payload
-        )
-
-    def list_strategy_attempts(
-        self,
-        *,
-        task_id: Optional[str] = None,
-        limit: int = 200,
-    ) -> List[JsonDict]:
-        return dao.list_strategy_attempts(self.connection, task_id=task_id, limit=limit)
 
     def close(self) -> None:
         self.registry.close_all()

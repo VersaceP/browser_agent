@@ -25,7 +25,7 @@ from harness.constants import (
     OFFLOAD_METHODS,
     SCREENSHOT_METHODS,
 )
-from harness.observation.semantic_frames import response_node_count
+from harness.observation.page_observation import response_node_count
 from harness.utils import (
     JsonDict,
     RunLogger,
@@ -85,6 +85,23 @@ def serialized_offload_text(content: Any) -> str:
     if isinstance(content, str):
         return content
     return json.dumps(content, ensure_ascii=False, indent=2, default=str)
+
+
+def page_view_blob_path(observations_dir: Path, prefix: str, page_id: str) -> Path:
+    """Where one page's current full view lives: the same path on every read.
+
+    A read-scoped name stored the same page once per read — five reads of one
+    unchanged search page cost five ~400KB files and five database rows, and
+    every superseded copy was unreachable, because only the current version of
+    a logical path answers local_fs_read.
+    """
+    parts = [part for part in (
+        safe_path_component(prefix, "agent") if prefix else "",
+        "DOM-getAXTree",
+        safe_path_component(page_id or "no-page", "page"),
+        "lines",
+    ) if part]
+    return observations_dir / ("-".join(parts) + ".txt")
 
 
 def store_offloaded_payload(
@@ -276,10 +293,8 @@ def compact_model_facing_tool_result(
             # A dedicated 200-character cap used to truncate the success-path
             # `suggested_prompt`. It cost more than it saved: on 1.1.9 the most
             # informative prompts are the longest ones, and the cut landed
-            # mid-sentence on exactly the operative half — DOM.getAXTree lost
-            # "use DOM.getSemanticTree for raw DOM, Shadow DOM, or selector
-            # diagnostics" (211 chars) and Page.screenshot lost "before
-            # continuing interaction" (213), to save eleven characters. The
+            # mid-sentence on exactly the operative half — Page.screenshot lost
+            # "before continuing interaction" (213), to save eleven characters. The
             # general `max_observation_chars` budget (24,000) already bounds
             # this field, so the platform's advice now passes through whole.
             # An all-whitespace prompt is still dropped: it is not advice.
@@ -641,18 +656,21 @@ def offload_large_response_fields(
         if copied is None:
             copied = copy.deepcopy(response)
             data = copied.get("data", {})
-        safe_method = safe_path_component(method.replace(".", "-"), "method")
-        safe_page = safe_path_component(page_id, "page")
-        safe_prefix = safe_path_component(prefix, "agent") if prefix else ""
-        suffix = "txt" if field in OFFLOAD_FIELDS_AS_TEXT else "json"
-        filename_parts = [part for part in (
-            safe_prefix,
-            f"{safe_method}-step{step or 0}",
-            safe_page,
-            safe_path_component(field, "field"),
-            uuid.uuid4().hex[:8],
-        ) if part]
-        path = observations_dir / ("-".join(filename_parts) + f".{suffix}")
+        if method == "DOM.getAXTree" and field == "lines":
+            path = page_view_blob_path(observations_dir, prefix, str(page_id))
+        else:
+            safe_method = safe_path_component(method.replace(".", "-"), "method")
+            safe_page = safe_path_component(page_id, "page")
+            safe_prefix = safe_path_component(prefix, "agent") if prefix else ""
+            suffix = "txt" if field in OFFLOAD_FIELDS_AS_TEXT else "json"
+            filename_parts = [part for part in (
+                safe_prefix,
+                f"{safe_method}-step{step or 0}",
+                safe_page,
+                safe_path_component(field, "field"),
+                uuid.uuid4().hex[:8],
+            ) if part]
+            path = observations_dir / ("-".join(filename_parts) + f".{suffix}")
         output_format, query_with, outline, facts = write_offloaded_blob(
             logger, path, field, blob,
         )
@@ -684,7 +702,7 @@ SCREENSHOT_VISIBILITY_NOTICE: JsonDict = {
         " a saved file path instead."
     ),
     "forVisualJudgement": "visual_verify",
-    "forPageContent": ["DOM.getAXTree", "DOM.getText", "DOM.getAttribute"],
+    "forPageContent": ["DOM.getAXTree"],
 }
 
 

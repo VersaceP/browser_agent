@@ -134,7 +134,6 @@ def validate_workflow_params(
     params: Any,
     *,
     capability_methods: Optional[Iterable[str]],
-    task_type: str,
     allow_runtime: bool = False,
     enforce_lifecycle: bool = True,
     max_steps: int = 100,
@@ -159,7 +158,6 @@ def validate_workflow_params(
         path="steps",
         errors=errors,
         known=known,
-        task_type=task_type,
         allow_runtime=allow_runtime,
         enforce_lifecycle=enforce_lifecycle,
         count=count,
@@ -260,7 +258,6 @@ def _validate_sequence(
     path: str,
     errors: List[str],
     known: Set[str],
-    task_type: str,
     allow_runtime: bool,
     enforce_lifecycle: bool,
     count: List[int],
@@ -309,11 +306,19 @@ def _validate_sequence(
         if action:
             if action == "Workflow.execute":
                 errors.append(f"{step_path}: nested Workflow.execute is forbidden")
+            if action == "Network.readApi":
+                # Workflow runs child Actions inside WebCross and can store their
+                # raw results before ABCPClient sees a response. Direct calls
+                # cross the response-body sanitizer before logging or delivery.
+                errors.append(
+                    f"{step_path}: Network.readApi must be called directly so"
+                    " its response body is sanitized before logging or delivery"
+                )
             if action == "Runtime.evaluate" and not allow_runtime:
                 errors.append(f"{step_path}: Runtime.evaluate is forbidden in model-authored workflows")
             if known and action not in known:
                 errors.append(f"{step_path}: unknown ABCP action {action!r}")
-            disabled = disabled_reason_for_method(action, task_type)
+            disabled = disabled_reason_for_method(action)
             if disabled:
                 errors.append(f"{step_path}: {disabled}")
             if enforce_lifecycle:
@@ -355,7 +360,7 @@ def _validate_sequence(
                     continue
                 _validate_sequence(
                     nested, path=f"{step_path}.{branch}", errors=errors,
-                    known=known, task_type=task_type, allow_runtime=allow_runtime,
+                    known=known, allow_runtime=allow_runtime,
                     enforce_lifecycle=enforce_lifecycle, count=count,
                     max_loop_iterations=max_loop_iterations,
                 )
@@ -372,7 +377,7 @@ def _validate_sequence(
             else:
                 _validate_sequence(
                     body, path=f"{step_path}.body", errors=errors,
-                    known=known, task_type=task_type, allow_runtime=allow_runtime,
+                    known=known, allow_runtime=allow_runtime,
                     enforce_lifecycle=enforce_lifecycle, count=count,
                     max_loop_iterations=max_loop_iterations,
                 )
@@ -442,7 +447,7 @@ def _error(errors: List[str]) -> JsonDict:
         "errors": errors,
         "tool_was_executed": False,
         "next_instruction": (
-            "Use only task-type-allowed ABCP actions. After navigation wait for"
+            "Use only available ABCP actions. After navigation wait for"
             " Page.loaded or Page.loadFailed with a waitEvent step. After"
             " Page.loaded call"
             " Page.getState, then DOM.getAXTree when later steps target AX ids;"

@@ -6,6 +6,7 @@ import asyncio
 import copy
 import sys
 import time
+import uuid
 from typing import Any
 from typing import Dict
 from typing import List
@@ -1300,7 +1301,7 @@ async def _request_hitl_for_challenge(
                 "Page.getState",
                 "DOM.getAXTree",
                 "retry_original_materialization_if_needed",
-                "DOM.getSemanticTree",
+                "DOM.getAXTree",
                 "validate_requested_record_count",
             ],
             "successCondition": (
@@ -1481,13 +1482,13 @@ async def _verify_and_open_fleet_auth_barrier(
         ) or 0.0))
     except (TypeError, ValueError):
         poll_seconds = 2.0
+    try:
+        settlement_seconds = max(0.0, float(getattr(
+            harness_config, "page_settlement_timeout_seconds", 15.0,
+        ) or 0.0))
+    except (TypeError, ValueError):
+        settlement_seconds = 15.0
     if poll_seconds > 0:
-        try:
-            settlement_seconds = max(0.0, float(getattr(
-                harness_config, "page_settlement_timeout_seconds", 15.0,
-            ) or 0.0))
-        except (TypeError, ValueError):
-            settlement_seconds = 15.0
         # Use the existing page-settlement window as the time boundary. The
         # three-round challenge adjudication setting is not necessarily long
         # enough for a real post-HITL navigation, while introducing a second
@@ -1508,7 +1509,23 @@ async def _verify_and_open_fleet_auth_barrier(
     tree: JsonDict = {}
     state_data: JsonDict = {}
     loading_statuses = {"loading", "navigating", "startedloading", "pending"}
+    tracker = getattr(agent, "page_lifecycle", None)
+    deadline = time.monotonic() + settlement_seconds
     for round_index in range(max_rounds):
+        # Reuse the subscriber's state: it includes Page.loaded/loadFailed
+        # received BEFORE Hitl.resumed. Do not subscribe after resume or wait
+        # for an event that has already arrived. Unknown state gets one probe;
+        # a known loading page waits without polling the browser.
+        settlement = None
+        if tracker is not None:
+            settlement = await tracker.wait_for_settlement(
+                page_id, max(0.0, deadline - time.monotonic()),
+            )
+            if settlement == "closed":
+                return {
+                    "enabled": True, "opened": False, "reason": "page_closed",
+                    "confirmationAttempts": attempts,
+                }
         state = await _bt()._post_hitl_raw_browser_call(
             agent,
             "Page.getState",
@@ -1528,6 +1545,8 @@ async def _verify_and_open_fleet_auth_barrier(
             })
         else:
             state_data = _bt()._response_data(state)
+            if tracker is not None:
+                tracker.observe_state_response(page_id, state)
             hitl = (
                 state_data.get("hitl")
                 if isinstance(state_data.get("hitl"), dict) else {}
@@ -1543,6 +1562,16 @@ async def _verify_and_open_fleet_auth_barrier(
                     }],
                 }
             lifecycle = str(state_data.get("status") or "").strip().lower()
+            if lifecycle in {"failed", "loadfailed", "error", "crashed", "closed"}:
+                return {
+                    "enabled": True, "opened": False,
+                    "reason": "page_not_available",
+                    "state": state,
+                    "confirmationAttempts": attempts + [{
+                        "round": round_index + 1, "status": "page_not_available",
+                        "lifecycle": lifecycle,
+                    }],
+                }
             if lifecycle in loading_statuses:
                 attempts.append({
                     "round": round_index + 1,
@@ -1575,7 +1604,22 @@ async def _verify_and_open_fleet_auth_barrier(
                     "status": "tree_unavailable",
                     "lifecycle": lifecycle or None,
                 })
-        if round_index < max_rounds - 1 and poll_seconds > 0:
+        if tracker is not None and (
+            settlement == "timeout" or time.monotonic() >= deadline
+        ):
+            return {
+                "enabled": True, "opened": False,
+                "reason": "clearance_confirmation_timeout",
+                "confirmationAttempts": attempts,
+            }
+        tracked = tracker.state(page_id) if tracker is not None else None
+        # Loading is event-driven on the next iteration. Poll only when the
+        # lifecycle channel cannot currently resolve readiness (legacy client,
+        # failed state probe or an AX read race after apparent settlement).
+        if (
+            round_index < max_rounds - 1 and poll_seconds > 0
+            and (tracked is None or tracked.status != "loading")
+        ):
             await asyncio.sleep(poll_seconds)
     else:
         return {
@@ -1716,7 +1760,7 @@ def _hitl_resumed_suggested_prompt(wait_result: Any) -> str:
             " blocking structural challenge. Re-check Page.getState and"
             " DOM.getAXTree, then resume the original business checkpoint. If"
             " target content is still a skeleton, retry its reveal/materialize"
-            " action once and verify with DOM.getSemanticTree plus the requested"
+            " action once and verify with a fresh DOM.getAXTree plus the requested"
             " record count; do not finalize from page title or drawer shell alone."
         )
     return (
@@ -1724,15 +1768,22 @@ def _hitl_resumed_suggested_prompt(wait_result: Any) -> str:
         " before resuming the original business checkpoint; this resume receipt"
         " does not by itself prove that every prior challenge surface or target"
         " skeleton has disappeared. Retry the original reveal/materialize action"
-        " when needed and verify the requested content with DOM.getSemanticTree."
+        " when needed and verify the requested content with a fresh DOM.getAXTree."
     )
 
-def _pause_needs_browser_assistance(params: JsonDict) -> bool:
-    text = " ".join(str(params.get(key) or "") for key in ("purpose", "reason")).lower()
-    return any(word in text for word in (
-        "captcha", "challenge", "verification", "authentication", "login",
-        "sign in", "登录", "登陆", "验证码", "滑块", "扫码", "二次验证",
-    ))
+def _pause_needs_browser_assistance(
+    params: JsonDict,
+    *,
+    agent: Any = None,
+    assistance_kind: str = "",
+) -> bool:
+    """Use explicit model intent or observed challenge state, not prose words."""
+    page_id = str(params.get("pageId") or "") if isinstance(params, dict) else ""
+    tracker = getattr(agent, "challenge_tracker", None)
+    state = tracker.get_state(page_id) if tracker is not None and page_id else None
+    if state is not None and (state.structural_challenge or state.high_confidence_hit):
+        return True
+    return assistance_kind == "browser_state"
 
 
 async def _enrich_pause_with_wait(
@@ -1740,6 +1791,8 @@ async def _enrich_pause_with_wait(
     params: JsonDict,
     response: JsonDict,
     step: int,
+    *,
+    assistance_kind: str = "",
 ) -> JsonDict:
     """When Hitl.requestPause succeeds, harness takes over the wait so the
     model doesn't burn steps polling broken APIs. The pause response is
@@ -1750,6 +1803,11 @@ async def _enrich_pause_with_wait(
         return response
     diagnostics = getattr(agent, "diagnostics", None)
     harness_cfg = agent.runtime.harness
+    browser_assistance = _pause_needs_browser_assistance(
+        params, agent=agent, assistance_kind=assistance_kind,
+    )
+    pause_data = response.get("data") if isinstance(response.get("data"), dict) else {}
+    pause_id = str(pause_data.get("pauseId") or "")
     wait_result = await _bt().wait_for_hitl_resume(
         browser=agent.browser,
         page_id=str(page_id),
@@ -1760,7 +1818,7 @@ async def _enrich_pause_with_wait(
         # A normal page refresh cannot answer a business clarification.
         challenge_verifier=(
             _make_hitl_challenge_verifier(agent, str(page_id), step)
-            if _pause_needs_browser_assistance(params) else None
+            if browser_assistance else None
         ),
         pause_snapshot=_hitl_pause_snapshot(agent, str(page_id)),
         pause_reason=str(params.get("reason") or params.get("purpose") or "等待确认"),
@@ -1768,12 +1826,24 @@ async def _enrich_pause_with_wait(
     )
     feedback = wait_result.get("userFeedback")
     if feedback:
+        feedback_id = uuid.uuid4().hex
+        feedback_record = {
+            "feedbackId": feedback_id,
+            "pageId": str(page_id),
+            "pauseId": pause_id,
+            "assistanceKind": assistance_kind or "unspecified",
+            "requestPurpose": str(params.get("purpose") or params.get("reason") or ""),
+            "text": feedback,
+            "feedbackSource": wait_result.get("feedbackSource") or "unknown",
+        }
+        if getattr(agent, "logger", None) is not None:
+            agent.logger.write("hitl.feedback_received", feedback_record)
         pending = getattr(agent, "hitl_user_messages", None)
         if pending is None:
             pending = []
             agent.hitl_user_messages = pending
-        pending.append({"pageId": str(page_id), "text": feedback})
-    if wait_result.get("status") == "resumed" and _pause_needs_browser_assistance(params):
+        pending.append(feedback_record)
+    if wait_result.get("status") == "resumed" and browser_assistance:
         wait_result = await _post_hitl_recovery_loop(
             agent,
             str(page_id),
@@ -1788,6 +1858,12 @@ async def _enrich_pause_with_wait(
             step,
         )
     enriched = dict(response)
+    enriched["hitlRequestBinding"] = {
+        "pageId": str(page_id), "pauseId": pause_id or None,
+        "assistanceKind": assistance_kind or "unspecified",
+        "browserAssistanceRequired": browser_assistance,
+        "feedbackReceived": bool(feedback),
+    }
     enriched["hitl_wait"] = wait_result
     if wait_result.get("status") == "resumed":
         _clear_challenge_state_after_recovery(

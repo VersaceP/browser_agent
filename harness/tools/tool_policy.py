@@ -3,20 +3,14 @@ harness.tools.tool_policy - Shared tool policy for BrowserAgent workers.
 
 `allowed_methods` from an LLM-authored worker contract is intentionally not
 used as a hard allow-list for ABCP atomic methods. The stable policy is owned
-by the harness: task_type narrows obviously irrelevant domains, explicit
-forbidden_methods still wins, and progress/loop guards handle overuse.
+by the harness: universal method restrictions, explicit forbidden_methods,
+path and page authorization, and progress/loop guards.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, FrozenSet, Iterable, Optional, Set, Tuple
-
-from harness.planning.task_types import (
-    TASK_TYPE_SCENARIOS,
-    TASK_TYPE_SELECTION_RULE,
-    VALID_TASK_TYPES,
-    resolve_task_type_fail_closed,
-)
+import json
+from typing import Any, Dict, FrozenSet, Iterable, Optional, Set
 
 
 # ABCP method params that carry a secret. The browser still receives the real
@@ -25,23 +19,6 @@ from harness.planning.task_types import (
 SENSITIVE_BROWSER_METHOD_PARAMS: Dict[str, FrozenSet[str]] = {
     "Page.handleDialog": frozenset({"userInput"}),
 }
-
-# Harness composite tools hidden from the model tool surface for task types
-# where they have no legitimate use — pure schema-token/choice-noise savings.
-# Mirrors the ABCP-method task_type policy: explicit general remains broad, but
-# missing/unknown values resolve to restricted web_scrape defense-in-depth.
-# Empty since fill_field_verified was removed; the gate stays as the hook.
-HARNESS_TOOLS_HIDDEN_BY_TASK_TYPE: Dict[str, FrozenSet[str]] = {}
-
-
-def hidden_harness_tools_for_task_type(task_type: object) -> Set[str]:
-    return set(
-        HARNESS_TOOLS_HIDDEN_BY_TASK_TYPE.get(
-            resolve_task_type_fail_closed(task_type)
-        )
-        or frozenset()
-    )
-
 
 def sensitive_browser_method_params(method: Any) -> Set[str]:
     """Declared secret-bearing parameters for one ABCP method."""
@@ -265,6 +242,100 @@ def redact_values(value: Any, secrets: Any) -> Any:
     return _redact_values(value, substring, exact, depth=0)
 
 
+# Network.readApi returns response bodies supplied by the site, including
+# credentials that did not appear in the Action's input. Mask declared
+# credential fields before either transport logging or model/offload delivery.
+# Request bodies are not needed to establish whether an upload was attempted
+# or accepted and may include form secrets or entire file payloads.
+NETWORK_CREDENTIAL_KEYS: FrozenSet[str] = frozenset({
+    "accesstoken", "apikey", "auth", "authorization", "clientsecret",
+    "cookie", "credential", "credentials", "idtoken", "password", "passwd",
+    "pwd", "refreshtoken", "secret", "session", "sessionid",
+    "setcookie", "sig", "signature", "token",
+})
+
+
+def _network_safe_json(value: Any, *, depth: int = 0) -> Any:
+    if depth > 24:
+        return "<redacted deep network value>"
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            normalized = "".join(
+                char for char in str(key).lower() if char.isalnum()
+            )
+            if normalized in NETWORK_CREDENTIAL_KEYS:
+                out[key] = "<redacted credential>"
+            elif normalized in {"requestbody", "responsebody"}:
+                out[key] = "<redacted nested body>"
+            else:
+                out[key] = _network_safe_json(item, depth=depth + 1)
+        return out
+    if isinstance(value, list):
+        return [_network_safe_json(item, depth=depth + 1) for item in value]
+    return value
+
+
+def sanitize_network_read_api_response(
+    response: Any, secrets: Any = None,
+) -> Any:
+    """Return the diagnostic response without raw request or credential bodies.
+
+    JSON responses retain business codes/messages and other noncredential
+    fields. Non-JSON text cannot be separated reliably into diagnostic facts
+    and secrets, so only its availability/HTTP metadata remains. Keep this at
+    the transport entry point so log, model, trace and offload see the same copy.
+    """
+    if not isinstance(response, dict):
+        return response
+
+    def visit(value: Any, *, depth: int = 0) -> Any:
+        if depth > 24:
+            return "<redacted deep network value>"
+        if isinstance(value, dict):
+            out = {}
+            for key, item in value.items():
+                if key == "requestBody" and item is not None:
+                    out[key] = "<redacted request body>"
+                elif key == "responseBody" and item:
+                    if not isinstance(item, str):
+                        out[key] = "<redacted unexpected response body>"
+                    else:
+                        try:
+                            parsed = json.loads(item)
+                        except (ValueError, TypeError):
+                            out[key] = "<redacted non-JSON response body>"
+                        else:
+                            if not isinstance(parsed, dict):
+                                out[key] = "<redacted non-object JSON response body>"
+                            else:
+                                safe = _network_safe_json(parsed)
+                                safe = redact_values(
+                                    safe, collect_sensitive_replacements(safe)
+                                )
+                                safe = redact_values(safe, secrets)
+                                out[key] = json.dumps(safe, ensure_ascii=False)
+                elif (
+                    "".join(char for char in str(key).lower() if char.isalnum())
+                    in NETWORK_CREDENTIAL_KEYS
+                ):
+                    out[key] = "<redacted credential>"
+                else:
+                    out[key] = visit(item, depth=depth + 1)
+            return out
+        if isinstance(value, list):
+            return [visit(item, depth=depth + 1) for item in value]
+        if isinstance(value, str):
+            safe = redact_values(value, collect_sensitive_replacements(value))
+            return redact_values(safe, secrets)
+        return value
+
+    # Do not run URL substitution over the *serialized* responseBody: parsing
+    # its whole JSON string as one URL could consume the closing quotes and
+    # break otherwise useful business-error evidence.
+    return visit(response)
+
+
 def _redact_values(
     value: Any,
     substring: list,
@@ -370,6 +441,7 @@ HARNESS_DEFAULT_ALLOWED_TOOLS: FrozenSet[str] = frozenset({
     "read_harness_guide",
     "search_harness_guides",
     "find_in_axtree",
+    "await_node_change",
     "navigate_verified",
     "visual_verify",
     "dismiss_overlay",
@@ -381,16 +453,6 @@ HARNESS_TOOL_NAMES: FrozenSet[str] = frozenset({
     *HARNESS_DEFAULT_ALLOWED_TOOLS,
 })
 
-# DOM.getSemanticTree is NO LONGER globally forbidden: crash-boundary probes on
-# current ABCP builds did not reproduce the historical renderer crash, and the
-# model needs it as a diagnostic when AXTree is insufficient (tag hierarchy,
-# complete local bounds, selector debugging). It is heavy (~3.65x AXTree) so its
-# results are offloaded (constants.OFFLOAD_METHODS) and the model prompt limits
-# it to local diagnostics. Keeping it out of this set also lets it appear in
-# worker_contract.forbidden_methods without tripping the unknown-method check
-# (it is now a known capability method). HARNESS-INTERNAL auto-digest use stays
-# separately gated by HarnessConfig.semantic_tree.
-#
 # `Fleet.status` was quarantined here (2026-08-23) because it tore down the
 # caller's WebSocket: reading status went through `sendAndWait`, which woke a
 # stopped Client. ABCP 1.1.9 reads it from durable state instead
@@ -411,181 +473,36 @@ HARNESS_TOOL_NAMES: FrozenSet[str] = frozenset({
 # resolvePause only, and wait/resume is owned by harness/runtime/hitl.py.
 ALWAYS_FORBIDDEN_ABCP_METHODS: FrozenSet[str] = frozenset({
     "Memory.delete",
+    # A worker cannot safely change or disclose the shared Fleet's cookie jar,
+    # interception rules or cache for sibling workers. These are session-wide
+    # effects, independent of the business task or its description. A future
+    # owner-scoped API can expose them after binding the affected Fleet and
+    # obtaining explicit authorization for that scope.
+    "Network.clearCache",
+    "Network.getCookies",
+    "Network.setCookies",
+    "Network.setInterception",
 })
 
-# Network is disabled for every declared task_type: cookie read/write and
-# request interception are not part of any current business flow, and the
-# fleet shares one cookie jar — a single worker mutating it would silently
-# change every sibling worker's session. `general` is deliberately absent for
-# explicitly reviewed unclassified work; missing/unknown values are resolved
-# to web_scrape before this table is consulted.
-TASK_TYPE_DISABLED_DOMAINS = {
-    "web_search": frozenset({"Bookmark", "Download", "File", "History", "Memory", "Network"}),
-    "web_scrape": frozenset({"Bookmark", "Download", "File", "History", "Memory", "Network"}),
-    "form_filling": frozenset({"Bookmark", "Download", "File", "History", "Memory", "Network"}),
-    "file_download": frozenset({"Bookmark", "File", "History", "Memory", "Network"}),
-    "file_upload": frozenset({"Bookmark", "Download", "File", "History", "Memory", "Network"}),
-    "browser_state_management": frozenset({
-        "Bookmark", "Download", "File", "History", "Memory", "Network",
-    }),
-}
-
-# Exceptions are matched by FULL METHOD NAME, so every entry here must exist in
-# the live System.getCapabilities surface. ABCP v1.1.5 (2026-07-31, capability
-# 58 -> 60) consolidated the Bookmark/History APIs; the stale pre-v1.1.5 names
-# that used to live here silently disabled browser_state_management's own core
-# methods (upsert/folder/rename/History.remove) for four weeks, because a name
-# that matches nothing cannot exempt anything from the domain rule above.
-TASK_TYPE_ALLOWED_EXCEPTIONS = {
-    "web_search": frozenset({"Memory.get", "Memory.save"}),
-    "web_scrape": frozenset({"Memory.get", "Memory.save"}),
-    "form_filling": frozenset({"File.handleChooser", "Memory.get", "Memory.save"}),
-    # Downloads run through the Download.* domain, which is not disabled for
-    # this task_type; the File domain only carries handleChooser (an upload
-    # affordance), so nothing from File needs an exception here.
-    "file_download": frozenset({"Memory.get", "Memory.save"}),
-    "file_upload": frozenset({"File.handleChooser", "Memory.get", "Memory.save"}),
-    "browser_state_management": frozenset({
-        "Bookmark.folder",
-        "Bookmark.list",
-        "Bookmark.remove",
-        "Bookmark.rename",
-        "Bookmark.upsert",
-        "History.list",
-        "History.remove",
-        "Memory.get",
-        "Memory.list",
-        "Memory.save",
-    }),
-}
-
-
-def describe_task_types() -> str:
-    """Render the task_type menu the planner picks from, deriving every
-    capability consequence from the tables above.
-
-    Hand-written capability prose in a tool schema goes stale the moment a
-    domain moves between task types, and a planner that trusts stale prose
-    silently loses a method domain worker-side. Generating it means the schema
-    the model reads and the policy the worker runs under are the same fact.
-    """
-    # Exceptions granted to EVERY task type (Memory.get/save today) carry no
-    # signal for choosing between them, and listing them on all seven lines
-    # buries the one exception that does discriminate. Computed, not hardcoded,
-    # so a future universally-granted method drops out on its own.
-    # Only task types that actually carry an exception list take part: a type
-    # that disables nothing (general) has no exceptions by construction, and
-    # counting its empty set would make the intersection empty every time.
-    exception_sets = [
-        set(exceptions)
-        for exceptions in TASK_TYPE_ALLOWED_EXCEPTIONS.values()
-        if exceptions
-    ]
-    universal = set.intersection(*exception_sets) if exception_sets else set()
-    lines = []
-    for task_type in sorted(VALID_TASK_TYPES):
-        scenario = TASK_TYPE_SCENARIOS.get(task_type, "")
-        disabled = sorted(TASK_TYPE_DISABLED_DOMAINS.get(task_type, frozenset()))
-        exceptions = sorted(
-            set(TASK_TYPE_ALLOWED_EXCEPTIONS.get(task_type) or frozenset()) - universal
-        )
-        detail = (
-            f"disabled: {', '.join(disabled)}"
-            if disabled else "disables nothing"
-        )
-        if exceptions:
-            detail += f", except {', '.join(exceptions)}"
-        lines.append(f"{task_type} — {scenario} [{detail}]")
-    return (
-        "Pick the value that matches what THIS phase does; a wrong pick removes"
-        " method domains from the worker and cannot be recovered without a"
-        " replan. "
-        + TASK_TYPE_SELECTION_RULE
-        + " Options: "
-        + " | ".join(lines)
-    )
-
-
-def method_domain(method: str) -> str:
-    text = str(method or "").strip()
-    return text.split(".", 1)[0] if "." in text else ""
-
-
-def _task_type_policy_profile(task_type: str) -> Tuple[FrozenSet[str], FrozenSet[str]]:
-    """(disabled domains, full-name exceptions) for one task type.
-
-    A type absent from both tables (general) disables nothing and therefore
-    needs no exceptions — the widest possible surface.
-    """
-    return (
-        frozenset(TASK_TYPE_DISABLED_DOMAINS.get(task_type) or frozenset()),
-        frozenset(TASK_TYPE_ALLOWED_EXCEPTIONS.get(task_type) or frozenset()),
-    )
-
-
-def task_type_capability_covers(task_type: str, other: str) -> bool:
-    """True when `task_type` can call everything `other` can.
-
-    Derived from the two policy tables above rather than declared, because a
-    hand-written containment table states a fact those tables own: move one
-    domain between task types and the hand-written copy silently keeps
-    promising the old shape. Inputs are alias-normalized and fail closed;
-    otherwise an unknown value absent from both tables would look identical to
-    the intentionally unrestricted ``general`` type.
-    """
-    task_type = resolve_task_type_fail_closed(task_type)
-    other = resolve_task_type_fail_closed(other)
-    disabled, exceptions = _task_type_policy_profile(task_type)
-    other_disabled, other_exceptions = _task_type_policy_profile(other)
-    if not disabled <= other_disabled:
-        return False
-    # An exception `other` holds only has to be matched where `task_type` still
-    # disables that whole domain. Where `task_type` leaves the domain enabled it
-    # already covers every method in it, exception or not.
-    still_gated = {
-        method for method in other_exceptions
-        if method_domain(method) in disabled
-    }
-    return still_gated <= exceptions
-
-
-def derive_task_type_capability_bases() -> Dict[str, FrozenSet[str]]:
-    """task_type -> every other type whose capability surface it fully covers."""
-    return {
-        task_type: frozenset(
-            other for other in VALID_TASK_TYPES
-            if other != task_type and task_type_capability_covers(task_type, other)
-        )
-        for task_type in VALID_TASK_TYPES
-    }
-
-
-def disabled_reason_for_method(method: str, task_type: object) -> str:
+def disabled_reason_for_method(method: str) -> str:
+    """Objective restrictions independent of an assignment's business label."""
     method = str(method or "").strip()
-    if not method:
-        return ""
     if method in ALWAYS_FORBIDDEN_ABCP_METHODS:
         return f"{method} is globally disabled by harness policy"
-    normalized = resolve_task_type_fail_closed(task_type)
-    exceptions = TASK_TYPE_ALLOWED_EXCEPTIONS.get(normalized, frozenset())
-    if method in exceptions:
-        return ""
-    domain = method_domain(method)
-    disabled_domains = TASK_TYPE_DISABLED_DOMAINS.get(normalized, frozenset())
-    if domain in disabled_domains:
-        return (
-            f"{method} belongs to disabled domain {domain!r} for task_type"
-            f" {normalized!r}"
-        )
     return ""
 
 
-def filter_capability_methods_for_task_type(
-    methods: Iterable[str],
-    task_type: object,
-) -> Set[str]:
+def filter_capability_methods(methods: Iterable[str]) -> Set[str]:
     return {
         method
         for method in {str(item).strip() for item in methods if str(item).strip()}
-        if not disabled_reason_for_method(method, task_type)
+        if not disabled_reason_for_method(method)
+    }
+
+
+def capability_policy_facts() -> Dict[str, Any]:
+    """Describe universal policy, without implying platform or path availability."""
+    return {
+        "globallyDisabledMethods": sorted(ALWAYS_FORBIDDEN_ABCP_METHODS),
+        "scope": "harness_method_policy_only; platform availability, page binding and path grants are separate",
     }

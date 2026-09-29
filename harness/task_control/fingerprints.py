@@ -16,7 +16,6 @@ from urllib.parse import parse_qsl
 from urllib.parse import urlencode
 from urllib.parse import urlparse
 from urllib.parse import urlsplit
-from harness.planning.task_types import normalize_task_type
 from harness.utils import JsonDict
 from harness.utils import RunLogger
 from harness.utils import trim_large_strings
@@ -113,7 +112,9 @@ def _canonical_resume_contract_value(value: Any) -> Any:
         )
     return value
 
-def evidence_contract_fingerprint(phase: Optional[JsonDict]) -> str:
+def evidence_contract_fingerprint(
+    phase: Optional[JsonDict], *, legacy_task_type: bool = False,
+) -> str:
     """Stable identity of evidence that can mechanically validate a phase.
 
     Natural-language objectives are deliberately excluded.  Source URLs are
@@ -141,7 +142,11 @@ def evidence_contract_fingerprint(phase: Optional[JsonDict]) -> str:
             "source_url": phase.get("source_url"),
             "source_urls": phase.get("source_urls"),
             "input_artifacts": phase.get("input_artifacts"),
-            "worker_contract": phase.get("worker_contract"),
+            "worker_contract": phase.get("worker_contract") if legacy_task_type else (
+                {key: value for key, value in phase["worker_contract"].items()
+                 if key != "task_type"}
+                if isinstance(phase.get("worker_contract"), dict) else phase.get("worker_contract")
+            ),
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -164,7 +169,6 @@ def evidence_contract_fingerprint(phase: Optional[JsonDict]) -> str:
         )
         source_urls = [primary_source] if primary_source else []
     payload = {
-        "taskType": normalize_task_type(phase.get("task_type")),
         "sourceUrls": source_urls,
         "inputArtifacts": _canonical_resume_contract_value(
             phase.get("input_artifacts")
@@ -178,6 +182,16 @@ def evidence_contract_fingerprint(phase: Optional[JsonDict]) -> str:
             _tc()._normalized_depends_on(phase.get("depends_on"))
         ),
     }
+    if legacy_task_type:
+        # Read only: accept pre-migration revalidation receipts after checking
+        # the same artifact digests and source worker identity.
+        old_type = str(phase.get("task_type") or "general").strip() or "general"
+        payload["taskType"] = {
+            "browser_data_collection": "web_scrape",
+            "browser_action": "form_filling",
+            "form_fill": "form_filling",
+            "download_file": "file_download",
+        }.get(old_type, old_type)
     canonical = json.dumps(
         payload,
         ensure_ascii=False,
@@ -193,13 +207,15 @@ def execution_contract_fingerprint(phase: Optional[JsonDict]) -> str:
     if not isinstance(phase, dict):
         return ""
     payload = {
-        "taskType": phase.get("task_type"),
         "objective": phase.get("objective"),
         "workerTask": phase.get("worker_task"),
         "stageHint": phase.get("stage_hint"),
         "stageHintReason": phase.get("stage_hint_reason"),
         "dispatchWave": phase.get("dispatch_wave"),
-        "workerContract": phase.get("worker_contract"),
+        "workerContract": {
+            key: value for key, value in (phase.get("worker_contract") or {}).items()
+            if key != "task_type"
+        } if isinstance(phase.get("worker_contract"), dict) else phase.get("worker_contract"),
     }
     canonical = json.dumps(
         payload,
@@ -688,7 +704,6 @@ def _classification_hint_key(classification: JsonDict) -> str:
         "expectedArtifactName",
         "workerStatus",
         "source",
-        "task_type",
     ):
         value = str(classification.get(key) or "").strip()
         if value:
