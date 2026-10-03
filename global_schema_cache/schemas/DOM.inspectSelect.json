@@ -2,7 +2,7 @@
   "method": "DOM.inspectSelect",
   "description": "Reads the type and current options or value constraints of a native select, date, datetime-local, time, month, week, or color control without changing it.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:57787ad534cac0789a4ec5118fb0a773583a9790bab09bbabd5f03df913b3180",
+  "catalogRevision": "sha256:ceccd4cf3cd46954290b4ff6547bffaaa32f0836d6047d3f30ae72b459f15d73",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",

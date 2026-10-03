@@ -2,7 +2,7 @@
   "method": "Page.getState",
   "description": "Returns the current lifecycle, blocking, crash, failure, and human-intervention state of a page.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:57787ad534cac0789a4ec5118fb0a773583a9790bab09bbabd5f03df913b3180",
+  "catalogRevision": "sha256:ceccd4cf3cd46954290b4ff6547bffaaa32f0836d6047d3f30ae72b459f15d73",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -31,40 +31,50 @@
     "type": "object",
     "properties": {
       "pageId": {
-        "description": "Page ID whose state was read.",
-        "type": "string"
-      },
-      "lifecycle": {
-        "description": "Page lifecycle state.",
-        "type": "string"
+        "type": "string",
+        "description": "Page ID whose state was read."
       },
       "status": {
-        "description": "Page runtime status.",
-        "type": "string"
+        "type": "string",
+        "enum": [
+          "loading",
+          "ready",
+          "failed",
+          "crashed"
+        ],
+        "description": "Page runtime status."
       },
       "url": {
-        "description": "Current page URL.",
-        "type": "string"
+        "type": "string",
+        "description": "Current page URL."
       },
       "title": {
-        "description": "Current document title.",
+        "type": "string",
+        "description": "Current document title."
+      },
+      "faviconUrl": {
+        "description": "Current page favicon URL, when available.",
         "type": "string"
       },
-      "blocking": {
-        "description": "Active dialog or other blocking state.",
-        "type": "object",
-        "propertyNames": {
-          "type": "string"
-        },
-        "additionalProperties": {}
+      "zoomLevel": {
+        "type": "number",
+        "description": "Current page zoom level."
       },
-      "crash": {
-        "description": "Page crash state, when present.",
-        "type": "object",
-        "propertyNames": {
-          "type": "string"
-        },
-        "additionalProperties": {}
+      "isPinned": {
+        "type": "boolean",
+        "description": "Whether the page is pinned."
+      },
+      "isAudible": {
+        "type": "boolean",
+        "description": "Whether the page is producing audio."
+      },
+      "isMuted": {
+        "type": "boolean",
+        "description": "Whether the page audio is muted."
+      },
+      "isBlocked": {
+        "type": "boolean",
+        "description": "Whether the page currently has a blocking dialog."
       },
       "failure": {
         "description": "Latest public page failure, when present.",
@@ -150,15 +160,52 @@
         ]
       },
       "hitl": {
-        "description": "Human-intervention pause state, when present.",
         "type": "object",
-        "propertyNames": {
-          "type": "string"
+        "properties": {
+          "isPaused": {
+            "type": "boolean",
+            "description": "Whether the page is paused for human intervention."
+          },
+          "pauseReason": {
+            "description": "Reason supplied when the page was paused.",
+            "type": "string"
+          }
         },
-        "additionalProperties": {}
+        "required": [
+          "isPaused"
+        ],
+        "additionalProperties": false,
+        "description": "Human-intervention pause state."
+      },
+      "blockingInteractions": {
+        "type": "object",
+        "properties": {
+          "hasPendingDialog": {
+            "type": "boolean",
+            "description": "Whether a native modal dialog is pending."
+          }
+        },
+        "required": [
+          "hasPendingDialog"
+        ],
+        "additionalProperties": false,
+        "description": "Active blocking interaction state."
       }
     },
-    "additionalProperties": {}
+    "required": [
+      "pageId",
+      "status",
+      "url",
+      "title",
+      "zoomLevel",
+      "isPinned",
+      "isAudible",
+      "isMuted",
+      "isBlocked",
+      "hitl",
+      "blockingInteractions"
+    ],
+    "additionalProperties": false
   },
   "outputSchema": {
     "type": "object",
@@ -176,40 +223,50 @@
         "type": "object",
         "properties": {
           "pageId": {
-            "description": "Page ID whose state was read.",
-            "type": "string"
-          },
-          "lifecycle": {
-            "description": "Page lifecycle state.",
-            "type": "string"
+            "type": "string",
+            "description": "Page ID whose state was read."
           },
           "status": {
-            "description": "Page runtime status.",
-            "type": "string"
+            "type": "string",
+            "enum": [
+              "loading",
+              "ready",
+              "failed",
+              "crashed"
+            ],
+            "description": "Page runtime status."
           },
           "url": {
-            "description": "Current page URL.",
-            "type": "string"
+            "type": "string",
+            "description": "Current page URL."
           },
           "title": {
-            "description": "Current document title.",
+            "type": "string",
+            "description": "Current document title."
+          },
+          "faviconUrl": {
+            "description": "Current page favicon URL, when available.",
             "type": "string"
           },
-          "blocking": {
-            "description": "Active dialog or other blocking state.",
-            "type": "object",
-            "propertyNames": {
-              "type": "string"
-            },
-            "additionalProperties": {}
+          "zoomLevel": {
+            "type": "number",
+            "description": "Current page zoom level."
           },
-          "crash": {
-            "description": "Page crash state, when present.",
-            "type": "object",
-            "propertyNames": {
-              "type": "string"
-            },
-            "additionalProperties": {}
+          "isPinned": {
+            "type": "boolean",
+            "description": "Whether the page is pinned."
+          },
+          "isAudible": {
+            "type": "boolean",
+            "description": "Whether the page is producing audio."
+          },
+          "isMuted": {
+            "type": "boolean",
+            "description": "Whether the page audio is muted."
+          },
+          "isBlocked": {
+            "type": "boolean",
+            "description": "Whether the page currently has a blocking dialog."
           },
           "failure": {
             "description": "Latest public page failure, when present.",
@@ -295,15 +352,52 @@
             ]
           },
           "hitl": {
-            "description": "Human-intervention pause state, when present.",
             "type": "object",
-            "propertyNames": {
-              "type": "string"
+            "properties": {
+              "isPaused": {
+                "type": "boolean",
+                "description": "Whether the page is paused for human intervention."
+              },
+              "pauseReason": {
+                "description": "Reason supplied when the page was paused.",
+                "type": "string"
+              }
             },
-            "additionalProperties": {}
+            "required": [
+              "isPaused"
+            ],
+            "additionalProperties": false,
+            "description": "Human-intervention pause state."
+          },
+          "blockingInteractions": {
+            "type": "object",
+            "properties": {
+              "hasPendingDialog": {
+                "type": "boolean",
+                "description": "Whether a native modal dialog is pending."
+              }
+            },
+            "required": [
+              "hasPendingDialog"
+            ],
+            "additionalProperties": false,
+            "description": "Active blocking interaction state."
           }
         },
-        "additionalProperties": {},
+        "required": [
+          "pageId",
+          "status",
+          "url",
+          "title",
+          "zoomLevel",
+          "isPinned",
+          "isAudible",
+          "isMuted",
+          "isBlocked",
+          "hitl",
+          "blockingInteractions"
+        ],
+        "additionalProperties": false,
         "description": "Validated business result returned by the Action."
       }
     },

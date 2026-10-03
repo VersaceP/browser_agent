@@ -62,6 +62,10 @@ On success and failure, read the Action result, `observation`, and `suggested_pr
 - Use live schemas for names, arguments, defaults, results, and failures. `System.getCapabilities` provides summaries; describe an unfamiliar Action or event before using it.
 - When required, provide a non-empty `purpose` explaining how the call advances the user's goal, and follow `purposeHint`.
 
+### Network request interception
+
+For `Network.setInterception`, `urlPattern` matches the complete request URL. Use an exact URL, or use `*` to match any sequence of characters; all other characters are literal, and matching is case-sensitive. This is not a regular expression: use `*acceptance=token*`, not `.*acceptance=token.*`. `patternsSet` counts patterns accepted for installation, not requests that matched. Confirm the relevant request outcome before relying on a rule.
+
 ## 3. Events and Page Lifecycle
 
 The event delivery method depends on the current transport: a connection may push events proactively, or the Agent may read them from a cursor through a dedicated event-reading operation. Do not treat subscription as a universal prerequisite.

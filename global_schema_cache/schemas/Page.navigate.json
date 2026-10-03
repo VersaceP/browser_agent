@@ -2,7 +2,7 @@
   "method": "Page.navigate",
   "description": "Starts navigation of an existing page to the specified URL.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:57787ad534cac0789a4ec5118fb0a773583a9790bab09bbabd5f03df913b3180",
+  "catalogRevision": "sha256:ceccd4cf3cd46954290b4ff6547bffaaa32f0836d6047d3f30ae72b459f15d73",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -42,20 +42,37 @@
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "properties": {
-      "pageId": {
-        "description": "Page ID whose navigation was requested.",
-        "type": "string"
-      },
       "url": {
-        "description": "Destination URL accepted by the browser.",
-        "type": "string"
+        "type": "string",
+        "description": "Destination URL dispatched to the browser."
       },
-      "navigationStarted": {
-        "description": "Whether navigation was dispatched.",
-        "type": "boolean"
+      "title": {
+        "type": "string",
+        "description": "Document title observed immediately after dispatch; it may still belong to the previous document."
+      },
+      "status": {
+        "type": "string",
+        "enum": [
+          "loading",
+          "ready",
+          "failed",
+          "crashed"
+        ],
+        "description": "Page lifecycle status observed immediately after dispatch; later events may advance it."
+      },
+      "accepted": {
+        "type": "boolean",
+        "const": true,
+        "description": "Whether the navigation request was dispatched to the browser."
       }
     },
-    "additionalProperties": {}
+    "required": [
+      "url",
+      "title",
+      "status",
+      "accepted"
+    ],
+    "additionalProperties": false
   },
   "outputSchema": {
     "type": "object",
@@ -72,20 +89,37 @@
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "properties": {
-          "pageId": {
-            "description": "Page ID whose navigation was requested.",
-            "type": "string"
-          },
           "url": {
-            "description": "Destination URL accepted by the browser.",
-            "type": "string"
+            "type": "string",
+            "description": "Destination URL dispatched to the browser."
           },
-          "navigationStarted": {
-            "description": "Whether navigation was dispatched.",
-            "type": "boolean"
+          "title": {
+            "type": "string",
+            "description": "Document title observed immediately after dispatch; it may still belong to the previous document."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "loading",
+              "ready",
+              "failed",
+              "crashed"
+            ],
+            "description": "Page lifecycle status observed immediately after dispatch; later events may advance it."
+          },
+          "accepted": {
+            "type": "boolean",
+            "const": true,
+            "description": "Whether the navigation request was dispatched to the browser."
           }
         },
-        "additionalProperties": {},
+        "required": [
+          "url",
+          "title",
+          "status",
+          "accepted"
+        ],
+        "additionalProperties": false,
         "description": "Validated business result returned by the Action."
       }
     },
