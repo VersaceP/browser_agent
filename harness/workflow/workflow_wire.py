@@ -55,6 +55,13 @@ def to_platform_execute_params(params: Any) -> Any:
     """Translate flat harness params; params already in wire form pass through."""
     if not isinstance(params, dict) or "workflow" in params:
         return params
+    preserved = params.get("_platformWorkflow")
+    if isinstance(preserved, dict):
+        binding = {
+            key: params[key] for key in ("pageId", "fleetId")
+            if isinstance(params.get(key), str) and params[key].strip()
+        }
+        return {"workflow": copy.deepcopy(preserved), "binding": binding}
     description = str(params.get("description") or "").strip()
     workflow: JsonDict = {
         "schemaVersion": WORKFLOW_SCHEMA_VERSION,

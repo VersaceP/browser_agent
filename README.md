@@ -6,7 +6,7 @@ ABCP Agent Harness connects LLM tool calling to ABCP Browser's WebSocket capabil
 
 ## Requirements
 
-- Python 3.9 or newer.
+- Python 3.9 or newer for Browser/Lead; Skill Builder requires Python 3.12 or newer.
 - An ABCP Browser service reachable over WebSocket.
 - An OpenAI-compatible or Anthropic API key.
 
@@ -24,10 +24,16 @@ Start or point to your ABCP Browser service. The default config expects:
 ws://127.0.0.1:61168/ws
 ```
 
-Set the model API key expected by your `config.json`:
+For a new setup, copy [`config example.json`](config%20example.json) to `config.json`.
+Existing configurations remain supported. Fill in the model connections for
+`lead`, `worker` and `plan_validator`, then check that `browser.ws_url` points
+to the running browser. See the [model configuration guide](docs/provider-model-configuration.md).
+
+When using `api_key_env`, set the named variable in the launch terminal. For example,
+the template's validator credentials use:
 
 ```bash
-export OPENAI_API_KEY="your-openai-key"
+export PLAN_VALIDATOR_API_KEY="your-validator-key"
 ```
 
 Run a task:
@@ -36,11 +42,14 @@ Run a task:
 python main.py --task "Open https://example.com and summarize the page title and main text."
 ```
 
-The CLI prints the final answer, task id, task directory, and run log path. Runtime logs and artifacts are written under:
+The CLI prints the final answer and task id. Run logs, TODOs and review evidence
+are stored in SQLite by default:
 
 ```text
-worktree/<task_id>/
+worktree/harness.db
 ```
+
+Use the actual returned file paths for deliverables.
 
 ## Configuration
 
@@ -92,63 +101,35 @@ If your ABCP service expects JSON-RPC requests:
 }
 ```
 
-### Harness
+### Harness (optional)
 
-Common harness options:
+You may omit `harness`. Internal thresholds, reuse and recovery use defaults
+from `runtime_config.py`; existing explicit overrides remain supported.
+Add these common options only when needed:
 
 ```json
 {
   "harness": {
     "lead_max_steps": 20,
     "worker_max_steps": 30,
-    "max_browser_agent_instances": 3,
     "max_browser_agents": 3,
-    "fleet_reuse_enabled": true,
-    "similar_task_fleet_reuse_enabled": true,
-    "similar_task_reuse_threshold": 0.78,
-    "similar_task_running_stale_seconds": 86400,
-    "same_fleet_multiworker_enabled": false,
     "max_task_fleets": 3,
-    "fleet_auth_barrier_enabled": true,
-    "fleet_auth_barrier_wait_seconds": 120,
-    "auth_fleet_ledger_path": ".auth_fleet_ledger.json",
-    "fleet_slot_reconnect_attempts": 2,
-    "fleet_slot_reconnect_backoff_seconds": 0.25,
-    "fleet_slot_manual_reset_after_failures": 3,
-    "hitl_poll_interval_seconds": 2,
     "hitl_wait_timeout_seconds": 600,
-    "worktree_dir": "worktree",
-    "context_file": null,
-    "project_context_files": [
-      {"path": "ORG_INSTRUCTIONS.md", "scope": "organization"},
-      {"path": "CLAUDE.md", "scope": "project"}
-    ],
-    "append_system_prompt": ""
+    "worktree_dir": "worktree"
   }
 }
 ```
 
-- `lead_max_steps`: maximum LeadAgent decision rounds.
-- `worker_max_steps`: maximum BrowserAgent rounds.
-- `max_browser_agent_instances`: target number of live BrowserAgent slots kept in the reusable pool. Idle slots keep their ABCP connection and page registry. The effective pool is raised to at least `max_browser_agents`.
-- `max_browser_agents`: authoritative maximum number of concurrently running browser workers.
-- `fleet_reuse_enabled`: deterministically assign each worker a fleet and force `Page.create` into it. Generic work may reuse an eligible slot fleet; a new `session_key` or isolated worker gets a fresh fleet. An existing Fleet is bound only when the original user task contains `@<full UUID or unique prefix>`; the runtime resolves it from authoritative inventory and never creates a replacement. Named/isolated fleets never become the generic slot default. Lost named sessions fail with `session_fleet_lost` instead of silently rebinding. Model-initiated `Fleet.create`/`Fleet.close` and out-of-assignment fleet ids fail closed; explicit page continuations may receive prior page candidates.
-- `similar_task_fleet_reuse_enabled`: before the first successful Fleet acquisition of an unconstrained task, compare the original user objective with the trusted harness-owned task index in current Fleet memory. A match reuses the Fleet only and always opens a fresh page. Resume, task-level `@Fleet` routing, session/continuation routing, plus phase-declared isolation, take precedence. Active lifecycle is keyed by top-level task plus worker so one worker cannot mark a Fleet completed while another worker still uses it. Terminal history collapses by task and keeps the latest 12 tasks. Running identity keeps at most 32 worker records plus one backward-compatible synthetic running fence for overflow; the fence cannot release before every omitted finite lease expires, and untrustworthy or non-expiring overflow remains permanently fail-closed. Admission requires a completed task record and a versioned Fleet-level policy that has never been blocked by named-session, task-bound, or hard-isolation use; identity-free legacy history and foreign memory are not candidates. A stopped `prepared` Fleet may auto-wake through readiness, while a real readiness failure falls back once to ordinary routing/Fleet creation without committing the candidate.
-- `similar_task_reuse_threshold`: deterministic normalized text/character-ngram ranking threshold in `[0, 1]`, default `0.78`. It cannot grant reuse by itself: normalized tasks must first be equal or a high-overlap contiguous extension, explicit URL origins must not conflict, and numeric tokens must agree when both tasks contain them. Reuse transfers browser context only—prior pages and results are never accepted as current evidence.
-- `similar_task_running_stale_seconds`: lease TTL for a `running` Fleet-memory record, default `86400` (24 hours). A worker entering through similar-task reuse must save its initial lease before browser work starts. Eligible live workers then refresh the lease in the background and stop heartbeating before terminal state is written; cancellation and failure paths also attempt a bounded terminal checkpoint. Positive configured values are clamped to at least `60` seconds to avoid expiring inside one write and to bound write amplification. Set it to `0` to disable expiry and retain indefinite fail-closed blocking.
-- `same_fleet_multiworker_enabled`: opt-in canary for sharing one task/session fleet across parallel slots while keeping separate pages. It defaults to `false`; when enabled, the owner socket remains authoritative, notifications are relayed to delegates, and equal-page calls are serialized.
-- `max_task_fleets`: ceiling on how many distinct fleets (browser instances) one task may occupy; `0` disables it. The harness never closes a fleet, so one it opens holds its budget slot until the platform stops reporting it — a fleet that disappears from the owner inventory releases its slot again. Counted over fleets bound to this task's workers, never over the Agent-global `Fleet.list`. A Fleet named by task-level `@<id>`, a bound `session_key`, or `reuse_from_worker_id` consumes the budget and is honored if current authoritative inventory confirms it. At the ceiling a fleetless worker reuses one of the task's existing fleets, preferring one no running worker holds, and deployment-default `worker_session_isolation_enabled` yields to the cap. Two cases cannot be served that way and get a `task_fleet_limit_reached` receipt instead: a spawn demanding a separate identity (a phase-declared `needs_isolated_session`, or a new `session_key`), and a ceiling where every task fleet is bound to a named session, since a logged-in cookie jar is never lent to a generic worker. Waiting does not clear either one — the harness closes no fleets and a session binding outlives its worker — so the receipt tells the Lead to continue on an existing fleet, release a session binding through auth recovery, or raise the ceiling. Before refusing, the cap re-reads the authoritative `Fleet.list` once. The dispatcher answers that from the whole fleets table with no per-connection scoping, so one successful read both finds a fleet another slot created seconds ago and retires any fleet the platform has dropped — whichever slot owned it — handing its budget back. A failed read is never treated as proof of disappearance.
-- `fleet_auth_barrier_enabled`: make login/CAPTCHA resolution fleet-wide and fail closed for non-resolver workers. `fleet_auth_barrier_wait_seconds` controls the bounded wait.
-- `auth_fleet_ledger_path`: persistent, non-secret verified session index, relative to `worktree_dir` unless absolute. Reclaimed fleets are quarantined until ledger reconciliation restores their restrictions.
-- `fleet_slot_reconnect_attempts`: bounded reconnect attempts per recovery cycle. Each reconnect must retain the server-assigned protocol identity before an authenticated fleet binding is reused; transport loss never proves that the fleet is lost.
-- `fleet_slot_reconnect_backoff_seconds`: base delay between those reconnect attempts. Failed browser mutations are never replayed.
-- `fleet_slot_manual_reset_after_failures`: recovery cycles before spawn returns `session_manual_reset_required`. The binding remains fail-closed until a host/operator explicitly resets it with the reported fleet id and generation.
-- `hitl_poll_interval_seconds`: polling interval after `Hitl.requestPause`.
-- `hitl_wait_timeout_seconds`: maximum wait time for human intervention.
-- `worktree_dir`: root directory for run logs and artifacts.
-- `context_file`: legacy optional single static prompt-context file. It remains supported; prefer `project_context_files` for new configuration.
-- `project_context_files`: ordered static project-instruction files. An item is either a path string or `{ "path": "...", "scope": "..." }`. The harness emits them as escaped `<project_context><project_instructions ...>` XML in that order; duplicate files are injected once. Use stable files only.
-- `append_system_prompt`: trusted deployment-owned static suffix, emitted before project context as escaped `<append_system_prompt>`. It is for stable policy additions, never task-specific facts.
+- `lead_max_steps` / `worker_max_steps`: decision rounds for Lead and its delegated workers. Standalone `/browser` has neither of these step limits.
+- `max_browser_agents` / `max_task_fleets`: concurrent workers and browser instances per task.
+- `hitl_wait_timeout_seconds`: maximum wait for human assistance.
+- `worktree_dir`: root directory for the SQLite database and deliverable files.
+
+Standalone `/browser` maintains a persistent TODO and triggers independent evidence
+review on checklist changes, explicit review requests and completion submissions.
+Completion requires final review. No checklist or review tuning is needed for setup.
+See [advanced Harness configuration](docs/harness-advanced-configuration.md#english-reference)
+for deployment policies, project instructions and detailed options.
 
 ## Running Tasks
 
@@ -175,24 +156,32 @@ task: type `/browser` for one direct BrowserAgent, or `/lead` for planning,
 parallel work, and aggregation. The prompt confirms the choice for this run;
 it does not modify `config.json`.
 
-Resume an interrupted task at phase granularity:
+Resume a task at phase granularity, optionally adding a user instruction under
+the same task ID:
 
 ```bash
 python main.py --resume worktree/<task_id> --task "Additional instruction"
 ```
 
-At the interactive prompt, the equivalent form is `/resume <task-directory>
-[additional instruction]`. Validated phases and their active artifacts are
-preserved; an unfinished phase is restarted as a whole. A phase that was live
+At the interactive prompt, the equivalent form is
+`/resume <task-directory> [additional instruction]`; omit the instruction for recovery of the original
+task alone. The task manifest keeps the original request, while the amendment
+is recorded as attributed user input. Browser mode continues an open phase or
+creates a new continuation after a terminal phase without replaying its old
+side effects. An amendment saved before a startup failure remains available to
+the next plain resume. An existing task cannot be rebound to a different
+explicit `@Fleet` reference through an amendment. Lead mode evaluates the new instruction and routes new or revised
+assignments through review and any required approval. Validated phases and
+their active artifacts are preserved; an unfinished phase requires fresh
+verification before repeating its actions. A phase that was live
 when the process stopped requires confirmation before it is replayed. For
 unattended use, pass `--resume-retry-interrupted` explicitly. Live Fleet/page
 handles are reused only as best-effort task-owned hints and are revalidated
 against the browser inventory; stale hints fall back to normal routing.
 
-Resume fails closed if the task directory, `task_plan.json`, or
-`task_state.json` was deleted or is malformed. Validation happens before a
-`RunLogger` is created, so a deleted worktree is never silently recreated as
-an empty task.
+DB mode resumes from SQLite task records without requiring a physical task
+directory. Missing or malformed plan/state records fail closed and never
+silently create an empty task. File mode still requires the original directory.
 
 ## Tests and Acceptance
 
@@ -211,15 +200,19 @@ skipped, and subtest counts.
 
 ## Logs and Artifacts
 
-Each run creates a task directory:
+Both Browser and Lead store task records in SQLite. DB mode creates no task
+or log subdirectories in advance. Locks live in a shared control directory;
+task directories are created only for actual downloads, screenshots, local
+intermediate files, or deliverables:
 
 ```text
-worktree/<task_id>/
-  run.jsonl
-  artifacts/
+worktree/harness.db
+worktree/.run-locks/<task_id>/owner.json  # Exists only while running
+worktree/<task_id>/...                  # Actual files, created as needed
 ```
 
-`run.jsonl` is JSON Lines. Important event types include:
+The task's events are SQLite rows, available through the virtual `run.jsonl`
+view for task-scoped readers. Important event types include:
 
 - `lead.model` / `agent.model`: model text and tool calls.
 - `browser.call.result`: ABCP method call result.

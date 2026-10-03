@@ -64,11 +64,27 @@ def local_fs_search(
     # than Path.glob. They agreed with each other and disagreed with this
     # branch, so the identical search returned different files in file mode
     # and db mode - the switch is meant to be invisible.
+    from harness.storage.virtual_fs import db_authoritative_for, virtual_fs_for
+
+    task_root = logger.task_dir.resolve()
+    in_task = root.is_relative_to(task_root)
+    db_authoritative = in_task and db_authoritative_for(logger)
+    view = virtual_fs_for(logger) if in_task else None
+    virtual_files = []
+    for logical_path, size, approximate in view.list_files() if view is not None else []:
+        candidate = task_root / logical_path
+        if (candidate.is_relative_to(root) and candidate != root
+                and candidate.resolve() == candidate and allowed(access, candidate, "read")):
+            relative = str(candidate.relative_to(root))
+            virtual_files.append((logical_path, relative, size, approximate))
     try:
-        candidates = sorted(
-            item for item in _walk_authorized(access, root, recursive=True)
-            if glob_matches(glob_pattern, str(item.relative_to(root)))
-        )
+        if db_authoritative and not root.exists() and (root == task_root or virtual_files):
+            candidates = []
+        else:
+            candidates = sorted(
+                item for item in _walk_authorized(access, root, recursive=True)
+                if glob_matches(glob_pattern, str(item.relative_to(root)))
+            )
     except (OSError, ValueError) as exc:
         return {"status": "failed", "error": f"invalid glob: {exc}"}
 
@@ -79,14 +95,7 @@ def local_fs_search(
         except re.error as exc:
             return {"status": "failed", "error": f"invalid grep pattern: {exc}"}
 
-    from harness.storage.virtual_fs import db_authoritative_for, virtual_fs_for
-
-    db_authoritative = root == logger.task_dir.resolve() and db_authoritative_for(logger)
-    virtual_paths = set()
-    if db_authoritative:
-        view = virtual_fs_for(logger)
-        if view is not None:
-            virtual_paths = {path for path, _size, _approximate in view.list_files()}
+    virtual_paths = {relative for _, relative, _, _ in virtual_files}
 
     results: List[JsonDict] = []
     total_bytes = 0
@@ -183,13 +192,14 @@ def local_fs_search(
             total_bytes += hit_bytes
             results.append(hit)
 
-    if root == logger.task_dir.resolve() and not truncated and len(results) < max_results:
+    if in_task and not truncated and len(results) < max_results:
         # DB-only rows are added after physical files. In db mode all logical
         # DB paths were removed from the physical scan above; in dual/file
         # mode the existing FileStore-primary behaviour remains unchanged.
         seen = {str(hit.get("relativePath") or "") for hit in results}
         results, total_bytes, truncated = _search_virtual_files(
             logger,
+            virtual_files=virtual_files,
             already_seen=seen,
             results=results,
             regex=regex,
@@ -216,6 +226,7 @@ def local_fs_search(
 def _search_virtual_files(
     logger: RunLogger,
     *,
+    virtual_files,
     already_seen,
     results: List[JsonDict],
     regex,
@@ -234,16 +245,16 @@ def _search_virtual_files(
     if view is None:
         return results, total_bytes, False
 
-    root = logger.task_dir.resolve()
+    task_root = logger.task_dir.resolve()
     truncated = False
-    for logical_path, size, approximate in view.match_files(glob_pattern):
-        if logical_path in already_seen:
+    for logical_path, relative, size, approximate in virtual_files:
+        if relative in already_seen or not glob_matches(glob_pattern, relative):
             continue
         if len(results) >= max_results:
             return results, total_bytes, True
         base: JsonDict = {
-            "path": str(root / logical_path),
-            "relativePath": logical_path,
+            "path": str(task_root / logical_path),
+            "relativePath": relative,
             "byteSize": size,
             "storage": "sqlite",
         }
@@ -308,19 +319,44 @@ def _walk_authorized(access, root, *, recursive):
 
 
 def local_fs_list(agent, path, *, base=None, recursive=False):
-    """List an authorized user directory without reading file contents."""
-    from harness.tools.path_authorization import resolve_authorized_path
+    """List authorized physical outputs and authoritative DB task paths."""
+    from harness.tools.path_authorization import allowed, resolve_authorized_path
     try:
         root = resolve_authorized_path(agent, path, mode="read", base=base)
-        if not root.is_dir():
+        from harness.storage.virtual_fs import db_authoritative_for, virtual_fs_for
+
+        logger = getattr(agent, "logger", agent)
+        task_root = logger.task_dir.resolve()
+        virtual_root = root.is_relative_to(task_root) and db_authoritative_for(logger)
+        view = virtual_fs_for(logger) if virtual_root else None
+        virtual_files = [(task_root / name, size, approximate)
+                         for name, size, approximate in (view.list_files() if view is not None else [])
+                         if (task_root / name).is_relative_to(root) and task_root / name != root]
+        if not root.is_dir() and not (virtual_root and not root.exists()
+                                      and (root == task_root or virtual_files)):
             return {"status": "failed", "error": "path is not a directory", "path": str(root)}
-        iterator = _walk_authorized(agent, root, recursive=recursive)
-        entries = []
+        iterator = _walk_authorized(agent, root, recursive=recursive) if root.is_dir() else ()
+        entries = {}
         for item in sorted(iterator, key=lambda p: str(p)):
-            entries.append({"name": item.name, "path": str(item),
+            entries[str(item)] = {"name": item.name, "path": str(item),
                             "kind": "directory" if item.is_dir() else "file",
-                            "byteSize": item.stat().st_size if item.is_file() else None})
-        return {"status": "done", "path": str(root), "entries": entries}
+                            "byteSize": item.stat().st_size if item.is_file() else None}
+        for item, size, approximate in virtual_files:
+            if item.resolve() != item or not allowed(agent, item, "read"):
+                continue
+            relative = item.relative_to(root)
+            for depth in range(1, len(relative.parts)):
+                directory = root.joinpath(*relative.parts[:depth])
+                if not recursive and depth > 1:
+                    break
+                if allowed(agent, directory, "read"):
+                    entries[str(directory)] = {"name": directory.name, "path": str(directory),
+                        "kind": "directory", "byteSize": None, "storage": "database"}
+            if recursive or len(relative.parts) == 1:
+                entries[str(item)] = {"name": item.name, "path": str(item), "kind": "file",
+                    "byteSize": size, "sizeApproximate": approximate, "storage": "database"}
+        return {"status": "done", "path": str(root),
+                "entries": [entries[key] for key in sorted(entries)]}
     except (OSError, ValueError) as exc:
         return {"status": "failed", "error": str(exc)}
 

@@ -389,8 +389,13 @@ def hydrate_axtree_response(params: Any, response: Any) -> Any:
     out = hydrated["data"]
     try:
         if out["mode"] == "detail":
-            _meta, body, end = read_artifact(out["artifact"], kind="detail", page_id=page_id)
+            meta, body, end = read_artifact(out["artifact"], kind="detail", page_id=page_id)
             out["records"] = [record for record in map(parse_detail_line, body) if record is not None]
+            out["observation"] = {
+                key: meta.get(key) for key in (
+                    "documentEpoch", "version", "capturedAt", "freshness",
+                )
+            }
             out["artifact"] = _public_reference(out["artifact"])
             return hydrated
         meta, body, end = read_artifact(out["artifact"], kind="full", page_id=page_id)

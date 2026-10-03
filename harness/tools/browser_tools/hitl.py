@@ -345,6 +345,54 @@ async def _post_hitl_structural_challenge_check(
     step: int,
     round_index: int,
 ) -> JsonDict:
+    # Human control returning does not establish renderer readiness. Use the
+    # existing lifecycle subscriber and settlement window before reading DOM;
+    # a missed Page.loaded gets one state confirmation, not another HITL.
+    tracker = getattr(agent, "page_lifecycle", None)
+    try:
+        timeout = max(0.0, float(getattr(
+            agent.runtime.harness, "page_settlement_timeout_seconds", 15.0,
+        )))
+    except (TypeError, ValueError):
+        timeout = 15.0
+    deadline = time.monotonic() + timeout
+    settlement = None
+    if tracker is not None:
+        settlement = await tracker.wait_for_settlement(page_id, timeout)
+        if settlement == "closed":
+            return {"status": "check_failed", "round": round_index,
+                    "reason": "page_closed"}
+    state = await _bt()._post_hitl_raw_browser_call(
+        agent, "Page.getState",
+        {"pageId": page_id, "purpose": "Confirm DOM readiness after HITL resume."},
+        step,
+    )
+    if not _bt()._invoke_result_failed(state) and tracker is not None:
+        tracker.observe_state_response(page_id, state)
+        tracked = tracker.state(page_id)
+        if (tracked is not None and tracked.status == "loading"
+                and settlement != "timeout"):
+            settlement = await tracker.wait_for_settlement(
+                page_id, max(0.0, deadline - time.monotonic()),
+            )
+            if settlement == "closed":
+                return {"status": "check_failed", "round": round_index,
+                        "reason": "page_closed"}
+            state = await _bt()._post_hitl_raw_browser_call(
+                agent, "Page.getState",
+                {"pageId": page_id, "purpose": "Confirm post-HITL page settlement."},
+                step,
+            )
+            tracker.observe_state_response(page_id, state)
+    state_data = _bt()._response_data(state)
+    lifecycle = str(state_data.get("status") or "").strip().lower().replace("_", "")
+    pause = state_data.get("hitl")
+    if (_bt()._invoke_result_failed(state)
+            or lifecycle in {"loading", "navigating", "startedloading", "pending",
+                             "failed", "loadfailed", "error", "crashed", "closed"}
+            or isinstance(pause, dict) and pause.get("isPaused") is True):
+        return {"status": "check_failed", "round": round_index,
+                "reason": "page_not_ready", "state": state}
     tree = await _bt()._post_hitl_raw_browser_call(
         agent,
         "DOM.getAXTree",
@@ -1838,6 +1886,14 @@ async def _enrich_pause_with_wait(
         }
         if getattr(agent, "logger", None) is not None:
             agent.logger.write("hitl.feedback_received", feedback_record)
+            if getattr(agent, "standalone_browser_mode", False):
+                # Only the wait channel supplies these records. Model summaries
+                # and a bare resume/timeout cannot become operator decisions.
+                from harness.planning.context import retain_operator_inputs
+                retain_operator_inputs(agent.logger, [{
+                    **feedback_record, "inputId": feedback_id,
+                    "source": "hitl_user_feedback",
+                }])
         pending = getattr(agent, "hitl_user_messages", None)
         if pending is None:
             pending = []
@@ -1865,6 +1921,14 @@ async def _enrich_pause_with_wait(
         "feedbackReceived": bool(feedback),
     }
     enriched["hitl_wait"] = wait_result
+    if getattr(agent, "standalone_browser_mode", False):
+        if wait_result.get("status") == "timeout":
+            agent.standalone_hitl_timeout = {
+                "pageId": str(page_id), "pauseId": pause_id,
+                "assistanceKind": assistance_kind,
+            }
+        elif wait_result.get("status") == "resumed":
+            agent.standalone_hitl_timeout = None
     if wait_result.get("status") == "resumed":
         _clear_challenge_state_after_recovery(
             agent, str(page_id), event="challenge.hitl_resume_cleared"
@@ -1883,12 +1947,23 @@ async def _enrich_pause_with_wait(
                 " continue from a fresh page/fleet."
             )
         else:
-            enriched["suggested_prompt"] = (
-                "Post-HITL recovery did not confirm a usable page. Do NOT call"
-                " more browser tools or Hitl.* methods in this worker; call"
-                " final_answer(status=\"incomplete\") and report hitl_wait.status,"
-                " postHitlRecovery evidence, screenshotPath, and pageId to LeadAgent."
-            )
+            if getattr(agent, "standalone_browser_mode", False):
+                enriched["suggested_prompt"] = (
+                    "Post-HITL verification did not confirm a usable page."
+                    " Inspect hitl_wait and postHitlRecovery evidence to choose"
+                    " safe recovery; a resumed human pause and a loading page"
+                    " are different facts. Use existing lifecycle readiness"
+                    " checks before DOM reads. Do not infer that the human"
+                    " failed or request another pause without fresh evidence."
+                    " Report incomplete only for a concrete unresolved blocker."
+                )
+            else:
+                enriched["suggested_prompt"] = (
+                    "Post-HITL recovery did not confirm a usable page. Do NOT call"
+                    " more browser tools or Hitl.* methods in this worker; call"
+                    " final_answer(status=\"incomplete\") and report hitl_wait.status,"
+                    " postHitlRecovery evidence, screenshotPath, and pageId to LeadAgent."
+                )
     elif wait_result.get("status") == "page_settled_after_hitl":
         enriched["suggested_prompt"] = (
             "The page appears to be past the challenge, but ABCP still reports"

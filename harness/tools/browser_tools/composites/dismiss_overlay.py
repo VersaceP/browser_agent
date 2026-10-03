@@ -1,6 +1,7 @@
 """dismiss_overlay composite tool."""
 
 import asyncio
+import io
 from typing import Any, List, Optional, Tuple
 
 from harness.results.call_outcome import replay_forbidden
@@ -22,7 +23,7 @@ from harness.observation.verifiers import (
     probe_occluder_trusted,
     probe_viewport_metrics_trusted,
 )
-from harness.utils import JsonDict, optional_int
+from harness.utils import JsonDict, optional_int, open_artifact_binary, read_task_file_text
 
 
 def _bt() -> Any:
@@ -64,6 +65,32 @@ def _log_dismiss_overlay(
     )
 
 
+def _observed_dialogs_absent(result: JsonDict, ids: frozenset[str], *, logger=None) -> bool:
+    """Require the actual refreshed view, never a preview or an unread file."""
+    data = _bt()._response_data(result)
+    observation = data.get("observation") or {}
+    if (not ids or result.get("axtreeDataError") or data.get("observationError")
+            or data.get("mode") == "detail" or data.get("truncated")
+            or observation.get("completeness") not in {None, "complete"}
+            or observation.get("freshness") not in {None, "current"}
+            or observation.get("pendingChanges")):
+        return False
+    lines = data.get("lines")
+    if isinstance(lines, list) and all(isinstance(line, str) for line in lines):
+        return not any(node_id in line for line in lines for node_id in ids)
+    if isinstance(lines, dict) and lines.get("format") == "text_lines" and lines.get("savedPath"):
+        try:
+            if logger is not None:
+                text = read_task_file_text(logger, lines["savedPath"])
+                return text is not None and not any(node_id in text for node_id in ids)
+            with open_artifact_binary(None, lines["savedPath"]) as resource:
+                with io.TextIOWrapper(resource, encoding="utf-8") as handle:
+                    return not any(node_id in line for line in handle for node_id in ids)
+        except (OSError, UnicodeError):
+            pass
+    return False
+
+
 async def _verify_overlay_gone_native(
     agent: Any,
     page_id: str,
@@ -71,6 +98,7 @@ async def _verify_overlay_gone_native(
     *,
     blocked_target: str = "",
     blocked_method: str = "",
+    observed_dialog_ids: frozenset[str] = frozenset(),
 ) -> VerifierResult:
     """Did the overlay actually go away?
 
@@ -88,7 +116,8 @@ async def _verify_overlay_gone_native(
     it either succeeds (the obstruction is gone, and the action the caller
     wanted is now done) or reports occlusion again (it is still there). The
     replay is bounded by the same sensitivity gate as the final retry, and a
-    caller with no blocked target keeps the detector-only behaviour.
+    caller with no safe blocked target can establish removal only for dialog
+    nodes actually observed before the action. Target access stays unverified.
     """
     inspect = await _invoke_browser_method(
         agent,
@@ -104,7 +133,7 @@ async def _verify_overlay_gone_native(
             method="native_axtree_unavailable",
             reason="DOM.getAXTree failed while verifying overlay state",
         )
-    overlay = detect_overlay_from_result(inspect)
+    overlay = detect_overlay_from_result(inspect, logger=getattr(agent, "logger", None))
     if isinstance(overlay, dict):
         # A recognised overlay is still on the page: decisive, no probe needed.
         return VerifierResult(
@@ -115,12 +144,18 @@ async def _verify_overlay_gone_native(
             reason="overlay still present",
         )
     if not blocked_target or _target_replay_is_unsafe(agent, page_id, blocked_target, blocked_method):
+        if _observed_dialogs_absent(inspect, observed_dialog_ids, logger=getattr(agent, "logger", None)):
+            return VerifierResult(
+                ok=True, confidence=CONFIDENCE_MEDIUM, method="observed_dialog_removed",
+                evidence={"removedDialogIds": sorted(observed_dialog_ids), "targetAccess": "unverified"},
+                reason="previously observed dialog nodes are absent in the refreshed full view; target was not replayed",
+            )
         return VerifierResult(
-            ok=True,
-            confidence=CONFIDENCE_MEDIUM,
-            method="native_axtree",
-            evidence={"overlay": None},
-            reason="no overlay in refreshed AXTree",
+            ok=False,
+            confidence=CONFIDENCE_LOW,
+            method="native_axtree_unverified",
+            evidence={"overlay": None, "targetAccess": "unverified"},
+            reason="detector found no recognized overlay; no safe target probe established access",
         )
     probe = await _invoke_browser_method(
         agent,
@@ -157,14 +192,13 @@ async def _verify_overlay_gone_native(
             evidence={"overlay": None, "stillOccluded": True},
             reason="the blocked action is still occluded",
         )
-    # Failed for some other reason: that says nothing about the obstruction, so
-    # fall back to what the detector saw rather than inventing a verdict.
+    # An unrelated failure also leaves target access unverified.
     return VerifierResult(
-        ok=True,
+        ok=False,
         confidence=CONFIDENCE_LOW,
         method="native_axtree",
         evidence={"overlay": None, "replayFailedUnrelated": True},
-        reason="no overlay in refreshed AXTree; replay failed for an unrelated reason",
+        reason="overlay state unverified; replay failed for an unrelated reason",
     )
 
 
@@ -253,9 +287,13 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
         # (collect_items recovery, the model) stop instead of clicking a paused page.
         _log_dismiss_overlay(agent, page_id, str(interrupt.get("status")), None, attempts)
         return {**interrupt, "attempts": attempts}
-    overlay = detect_overlay_from_result(inspect)
+    overlay = detect_overlay_from_result(inspect, logger=getattr(agent, "logger", None))
     layers = _layers_from_result(inspect)
     occluded_frames = visible_layers_occluded(layers)
+    observed_dialog_ids = frozenset(
+        str(n["id"]) for n in _bt()._current_axtree_nodes(agent)
+        if n.get("id") and str(n.get("role") or "").lower() in {"dialog", "alertdialog"}
+    )
 
     policy_subtype = (
         str(overlay.get("subtype"))
@@ -306,6 +344,7 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
             last_verdict = await _verify_overlay_gone_native(
                 agent, page_id, step,
                 blocked_target=target_id, blocked_method=target_method,
+                observed_dialog_ids=observed_dialog_ids,
             )
             if last_verdict.ok:
                 success = True
@@ -333,6 +372,7 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
         last_verdict = await _verify_overlay_gone_native(
             agent, page_id, step,
             blocked_target=target_id, blocked_method=target_method,
+            observed_dialog_ids=observed_dialog_ids,
         )
         if last_verdict.ok:
             success = True
@@ -351,7 +391,7 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
         # with a login wall.
         if asyncio.get_running_loop().time() < deadline:
             backdrop_ok, backdrop_meta = await _backdrop_dismiss(
-                agent, page_id, step, target_id, target_method,
+                agent, page_id, step, target_id, target_method, observed_dialog_ids,
             )
             attempts.append({"attempt": "backdrop", **backdrop_meta})
             if backdrop_ok:
@@ -374,6 +414,7 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
         vl_ok, vl_arbiter_meta = await _vl_overlay_arbiter(
             agent, page_id, oracle=None, step=step,
             blocked_target=target_id, blocked_method=target_method,
+            observed_dialog_ids=observed_dialog_ids,
         )
         attempts.append({"attempt": "vl_arbiter", **vl_arbiter_meta})
         if vl_ok:
@@ -425,10 +466,10 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
         return {
             "status": "failed",
             "overlay": overlay,
-            "overlayPresent": True,
+            "overlayPresent": True if isinstance(overlay, dict) else None,
             "dismissAttempted": bool(safe_rungs),
             "dismissOutcome": (
-                "blocked_after_ladder" if safe_rungs else "not_attempted"
+                "unverified_after_ladder" if safe_rungs else "not_attempted"
             ),
             "targetAccess": "unverified",
             "occludedFrameCount": len(occluded_frames),
@@ -436,11 +477,14 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
             "vlArbiter": vl_arbiter_meta,
                 "backdrop": backdrop_meta,
             "next_instruction": (
-                "Native close-control and Escape attempts did not clear the"
-                " overlay. Coordinate backdrop and VL clicks were not attempted"
-                " because no independent native point hit-test is available."
-                " Refresh DOM.getAXTree, request HITL when human action is"
-                " genuinely required, or report a blocker."
+                "The attempted recovery did not establish access to the target."
+                " An unrecognized overlay is not proof that it disappeared;"
+                " consult the individual attempt receipts. Inspect the current"
+                " modal and its parent/siblings: an unnamed generic container"
+                " can be a close control outside the content subtree. If using"
+                " a screenshot, map its pixel coordinates to the returned CSS"
+                " viewport and verify the outcome. Request HITL only when"
+                " the remaining blocker actually needs user input/action."
             ),
         }
 
@@ -495,6 +539,7 @@ async def _backdrop_dismiss(
     step: int,
     blocked_target: str = "",
     blocked_method: str = "",
+    observed_dialog_ids: frozenset[str] = frozenset(),
 ) -> Tuple[bool, JsonDict]:
     """Rung 3: click the modal's own backdrop, proven by an element hit test.
 
@@ -558,6 +603,7 @@ async def _backdrop_dismiss(
     verdict = await _verify_overlay_gone_native(
         agent, page_id, step,
         blocked_target=blocked_target, blocked_method=blocked_method,
+        observed_dialog_ids=observed_dialog_ids,
     )
     meta: JsonDict = {
         "rung": "backdrop",
@@ -612,6 +658,7 @@ async def _vl_overlay_arbiter(
     subtype: Optional[str] = None,
     blocked_target: str = "",
     blocked_method: str = "",
+    observed_dialog_ids: frozenset[str] = frozenset(),
 ) -> Tuple[bool, JsonDict]:
     """Rung 4: see the close control, when no structural surface names it.
 
@@ -697,6 +744,7 @@ async def _vl_overlay_arbiter(
     verdict = await _verify_overlay_gone_native(
         agent, page_id, step,
         blocked_target=blocked_target, blocked_method=blocked_method,
+        observed_dialog_ids=observed_dialog_ids,
     )
     meta: JsonDict = {
         "rung": "vl_arbiter",
@@ -719,7 +767,8 @@ async def _maybe_retry_original_action(
     already_performed: bool = False,
 ) -> JsonDict:
     if not target_id:
-        return {"status": "dismissed", "retried": False, "reason": "no original target supplied"}
+        return {"status": "dismissed", "retried": False, "targetAccess": "unverified",
+                "reason": "observed dialog closed; no original target supplied"}
     signature = _axtree_seen_signature(agent, target_id, page_id) or {}
     role = str(signature.get("role") or "")
     name = str(signature.get("name") or "")
@@ -727,6 +776,7 @@ async def _maybe_retry_original_action(
         return {
             "status": "dismissed_pending_action",
             "retried": False,
+            "targetAccess": "unverified",
             "target": {"id": target_id, "method": target_method, "role": role, "name": name},
             "next_instruction": (
                 "Overlay dismissed. The original action is not auto-retry-safe"

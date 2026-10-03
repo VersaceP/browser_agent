@@ -159,7 +159,7 @@ class PageObservationTracker:
         previous = self.axtree_snapshots[-1] if self.axtree_snapshots else None
         self.axtree_snapshots.append((step, fingerprint))
         overlay = (
-            detect_overlay_from_result(result)
+            detect_overlay_from_result(result, logger=getattr(agent, "logger", None))
             if fingerprint.source == "DOM.getAXTree" else None
         )
         page_stats = self._maybe_page_stats(step, fingerprint, overlay=overlay)
@@ -284,6 +284,7 @@ def page_fingerprint_from_result(
         semantic_counts=semantic_counts,
         limit_ids=5000,
         limit_semantic=1000,
+        logger=getattr(agent, "logger", None),
     )
     if not ids:
         agent_ids = getattr(agent, "axtree_ids", None)
@@ -479,13 +480,14 @@ def _collect_from_any(
     semantic_counts: Counter[str],
     limit_ids: int,
     limit_semantic: int,
+    logger: Any = None,
 ) -> None:
     def visit(item: Any) -> None:
         if isinstance(item, dict):
             path = item.get("savedPath")
             parsed_text_lines_file = False
             if isinstance(path, str) and item.get("format") == "text_lines":
-                text = _read_text_file_cached(path)
+                text = _read_text_file_cached(path, logger=logger)
                 if text is not None:
                     parsed_text_lines_file = True
                     _collect_from_text(
@@ -553,7 +555,13 @@ def _collect_from_text(
         semantic_counts[f"{role}:{name}"] += 1
 
 
-def _read_text_file_cached(path_text: str) -> Optional[str]:
+def _read_text_file_cached(path_text: str, *, logger: Any = None) -> Optional[str]:
+    if logger is not None:
+        from harness.storage.virtual_fs import db_authoritative_for
+        from harness.utils import read_task_file_text
+        if db_authoritative_for(logger):
+            # Disk timestamps cannot identify a DB observation or its revision.
+            return read_task_file_text(logger, path_text)
     try:
         path = Path(path_text).resolve(strict=False)
         if not path.exists() or not path.is_file():

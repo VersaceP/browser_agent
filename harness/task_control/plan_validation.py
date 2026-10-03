@@ -2772,6 +2772,9 @@ def initialize_task_state(
     for key in ("operator_inputs", "delegations"):
         state[key] = copy.deepcopy((input_source or {}).get(key) or {})
     state["operator_input_order"] = list((input_source or {}).get("operator_input_order") or [])
+    state["resume_input_bindings"] = copy.deepcopy(
+        (input_source or {}).get("resume_input_bindings") or {}
+    )
     # Approval is bound to the immutable candidate hash and committed with the
     # plan generation.  It is control-plane state, not part of the plan body:
     # adding it to the plan would change the very candidate the user approved.

@@ -48,8 +48,9 @@ class RuntimeEvaluationService:
         # JSON extraction envelope keep working. It is not authorization data:
         # no field can narrow or widen what JavaScript may do.
         legacy_policy = policy if isinstance(policy, dict) else {}
+        record_name = str(legacy_policy.get("record_name") or "").strip() or None
         result_mode = (
-            "json" if legacy_policy.get("result_mode") == "json" else "raw"
+            "json" if record_name or legacy_policy.get("result_mode") == "json" else "raw"
         )
         prepared = dict(params)
         requested_world = str(prepared.get("world") or "auto").strip() or "auto"
@@ -59,11 +60,7 @@ class RuntimeEvaluationService:
             "executedWorld": None,
             "dispatchPolicy": "platform_schema",
             "resultMode": result_mode,
-            "recordName": (
-                str(legacy_policy.get("record_name") or "") or None
-                if result_mode == "json"
-                else None
-            ),
+            "recordName": record_name,
             "legacyPolicySupplied": bool(legacy_policy),
             "attempts": [],
         }

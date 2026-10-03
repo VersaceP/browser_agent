@@ -616,9 +616,11 @@ def _session_path(logger: Any, page_id: str) -> Path:
 def load_page_session(logger: Any, page_id: str) -> Optional[JsonDict]:
     path = _session_path(logger, str(page_id or ""))
     try:
-        if not path.exists():
+        from harness.utils import read_task_file_text
+        content = read_task_file_text(logger, str(path))
+        if content is None:
             return None
-        loaded = json.loads(path.read_text(encoding="utf-8"))
+        loaded = json.loads(content)
     except (OSError, ValueError):
         return None
     return loaded if isinstance(loaded, dict) else None
@@ -667,10 +669,19 @@ def record_page_sessions(
                 session["url"] = url_updates[page_id]
             merged = merge_page_session(existing, session)
             path = _session_path(logger, page_id)
-            path.write_text(
-                json.dumps(merged, ensure_ascii=False, indent=2, default=str),
-                encoding="utf-8",
-            )
+            from harness.storage.virtual_fs import db_authoritative_for
+            if db_authoritative_for(logger):
+                logger.storage.save_resource(
+                    task_id=logger.task_id, run_id=str(logger.run_id or ""),
+                    resource_type="page_session",
+                    logical_path=str(path.relative_to(logger.task_dir)),
+                    media_type="application/json", content=merged,
+                )
+            else:
+                path.write_text(
+                    json.dumps(merged, ensure_ascii=False, indent=2, default=str),
+                    encoding="utf-8",
+                )
             written.append(page_id)
         logger.write("page_session.recorded", {
             "workerId": str(worker_id or ""),

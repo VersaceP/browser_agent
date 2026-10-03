@@ -234,7 +234,7 @@ offload 阈值 `EVENT_PAYLOAD_OFFLOAD_THRESHOLD = 64KB`（实测 run.jsonl 行 p
 
 并发控制的分层（从宽到窄）：
 
-1. `.run.lock` 保证两个 harness 进程不同跑一个任务；
+1. `worktree/.run-locks/<task_id>` 保证两个 harness 进程不同跑一个任务，兼容检查旧任务的 `.run.lock`；
 2. 调用方的进程内锁串行化线程；
 3. `merge(base, current, proposed)` 把基于过期快照的编辑折叠到不同字段；
 4. **revision CAS 是最后一道闸**，捕获跨连接的任何写入。
@@ -290,6 +290,10 @@ traces/<worker>.jsonl    -> worker_trace_events
 ```
 
 渲染复刻文件后端本会写出的逐行字节，使 `db` 模式下模型看到与 `file` 模式相同的内容；`local_fs_read` / `local_fs_search` 的路径/glob 契约不变，prompt 与 skill 无需改动。
+
+Browser 任务最终回执列出的 `record_extraction` 产物会从 SQLite 按原 `savedPath` 导出为可打开的交付副本，并核对字节数与哈希。数据库仍是权威来源；未交付的提取结果、运行日志、上下文和观察记录继续只保存在数据库中。
+
+Browser 独立复核的 AX 原始响应完整保存为任务资源。成功读取平台 artifact 后，模型可见内容保留页面状态和 AX 内容，移除已不适用的外部文件读取指引；读取失败仍返回失败。`review_query_observation` 对完整 AX 捕获搜索解码后的 `data.lines`，JSON key 查询仍读取原始响应；返回 `searchSource` 标明字符偏移的基准。每次最多 8 个 patterns 和 8 个 keys，每项 1–200 字符，`limit` 为 1–10（默认 10），通过 `nextOffset` 分页。
 
 ### 6.7 dual_store — 双写校验
 

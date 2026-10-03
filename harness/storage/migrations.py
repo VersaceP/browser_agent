@@ -139,12 +139,68 @@ MIGRATION_0005_DROP_STRATEGY_ATTEMPTS = Migration(
     statements=["DROP TABLE IF EXISTS strategy_attempts"],
 )
 
+
+MIGRATION_0006_SKILL_BUILDER = Migration(
+    version=6,
+    name="skill_builder_index",
+    statements=[
+        """CREATE TABLE skill_index (
+            skill_id TEXT PRIMARY KEY,
+            relative_path TEXT NOT NULL,
+            current_version TEXT NOT NULL,
+            current_hash TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            deleted INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1)),
+            updated_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE skill_versions (
+            skill_id TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            version TEXT NOT NULL,
+            snapshot_path TEXT NOT NULL,
+            files_json TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            source_task_id TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (skill_id, content_hash)
+        )""",
+        """CREATE TABLE skill_invocations (
+            invocation_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            skill_id TEXT NOT NULL,
+            skill_hash TEXT NOT NULL,
+            skill_version TEXT NOT NULL,
+            input_ref TEXT,
+            status TEXT NOT NULL,
+            result_ref TEXT,
+            started_at TEXT NOT NULL,
+            finished_at TEXT
+        )""",
+        "CREATE INDEX idx_skill_invocations_task ON skill_invocations(task_id, started_at)",
+        """CREATE TABLE skill_builder_sessions (
+            builder_task_id TEXT PRIMARY KEY,
+            source_task_id TEXT NOT NULL,
+            source_invocation_id TEXT,
+            source_skill_id TEXT,
+            source_skill_hash TEXT,
+            base_current_hash TEXT,
+            draft_hash TEXT,
+            work_rel_path TEXT NOT NULL,
+            status TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (builder_task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
+        )""",
+    ],
+)
+
 MIGRATIONS: List[Migration] = [
     _load_initial_migration(),
     MIGRATION_0002_GIT_SHA,
     MIGRATION_0003_STORED_SIZE,
     MIGRATION_0004_EVENT_ENVELOPE,
     MIGRATION_0005_DROP_STRATEGY_ATTEMPTS,
+    MIGRATION_0006_SKILL_BUILDER,
 ]
 
 SCHEMA_VERSION = max(migration.version for migration in MIGRATIONS)

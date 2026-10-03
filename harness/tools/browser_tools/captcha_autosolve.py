@@ -144,21 +144,26 @@ def skill_forbids_autosolve(agent: Any) -> Optional[JsonDict]:
     Default-deny is preserved: a worker bound to a skill may auto-solve only when
     that skill opts in. A worker with no skill is governed by config alone.
     """
-    contract = getattr(agent, "worker_contract", None)
-    skill_id = ""
-    if isinstance(contract, dict):
-        skill_id = str(contract.get("skill_id") or "").strip()
+    config = getattr(getattr(agent, "runtime", None), "harness", None)
+    skill_id = str(getattr(config, "forced_skill_id", "") or "").strip()
+    skill_hash = str(getattr(config, "forced_skill_hash", "") or "").strip()
     if not skill_id:
         return None
     try:
-        from harness.skill.registry import SkillRegistry
-
-        skill = SkillRegistry().get(skill_id)
+        from pathlib import Path
+        from harness.skill_builder.catalog import SkillCatalog, inspect_skill
+        from harness.storage.factory import resolve_sqlite_path
+        catalog = SkillCatalog(
+            Path(__file__).resolve().parents[3] / "skills",
+            resolve_sqlite_path(config.storage_sqlite_path, config.worktree_dir),
+        )
+        try:
+            snapshot = catalog.version_path(skill_id, skill_hash)
+            frontmatter = inspect_skill(snapshot)["metadata"] if snapshot else {}
+        finally:
+            catalog.close()
     except Exception:
-        skill = None
-    if skill is None:
-        return None
-    frontmatter = getattr(skill, "frontmatter", None) or {}
+        frontmatter = {}
     if bool(frontmatter.get("allow_auto_captcha", False)):
         return None
     return {

@@ -124,6 +124,8 @@ async def _execute_browser_capability_tool(
     tool_name: str,
     tool_input: JsonDict,
     step: int,
+    *,
+    published_skill_workflow: bool = False,
 ) -> Tuple[JsonDict, bool]:
     direct_method = str(tool_name or "").strip()
     if tool_name == "browser_call":
@@ -315,6 +317,10 @@ async def _execute_browser_capability_tool(
                 "timeout": document.get("timeoutMs", 600000),
                 **params.get("binding", {}),
             }
+            if published_skill_workflow:
+                params["_platformWorkflow"] = document
+        elif published_skill_workflow:
+            return {"status": "invalid_skill_workflow", "tool_was_executed": False}, False
         if not workflow_execution_enabled(agent):
             disabled = workflow_execution_disabled_result(
                 source="browser_call.Workflow.execute"
@@ -325,33 +331,46 @@ async def _execute_browser_capability_tool(
                 "result": disabled,
             })
             return disabled, False
-        contract = getattr(agent, "worker_contract", None)
-        normalized_workflow, workflow_error = validate_workflow_params(
-            params,
-            capability_methods=getattr(agent, "capability_methods", set()),
-            allow_runtime=False,
-            enforce_lifecycle=True,
-        )
-        if workflow_error is not None:
-            attach_method_schema(workflow_error, method, agent.method_schemas)
-            agent.logger.write("workflow.execute.rejected", workflow_error)
-            agent.trace.append({"type": "workflow_policy_rejected", "result": workflow_error})
-            return workflow_error, False
-        params = dict(normalized_workflow)
-        from harness.tools.capability_repairs import prepare_workflow_literal_arguments
-        params, workflow_repairs, workflow_repair_issues = prepare_workflow_literal_arguments(
-            params, agent.method_schemas,
-        )
-        if workflow_repair_issues:
-            result = capability_argument_error(tool_name, method, workflow_repair_issues)
-            agent.logger.write("workflow.execute.rejected", result)
-            agent.trace.append({"type": "workflow_policy_rejected", "result": result})
-            return result, False
-        if workflow_repairs:
-            argument_repairs.extend(workflow_repairs)
-            agent.logger.write("browser.call.arguments_repaired", {
-                "method": method, "repairs": workflow_repairs,
-            })
+        if published_skill_workflow:
+            from harness.skill_builder.workflow_scope import workflow_action_scope_error
+            scope_error = workflow_action_scope_error(
+                params["_platformWorkflow"],
+                capability_methods=getattr(agent, "capability_methods", set()),
+                page_id=str(params.get("pageId") or ""),
+                fleet_id=str(params.get("fleetId") or ""),
+            )
+            if scope_error:
+                result = {"status": "permission_denied", "tool_was_executed": False,
+                          "error": scope_error}
+                agent.logger.write("skill.workflow.scope_rejected", result)
+                return result, False
+        else:
+            normalized_workflow, workflow_error = validate_workflow_params(
+                params,
+                capability_methods=getattr(agent, "capability_methods", set()),
+                allow_runtime=False,
+                enforce_lifecycle=True,
+            )
+            if workflow_error is not None:
+                attach_method_schema(workflow_error, method, agent.method_schemas)
+                agent.logger.write("workflow.execute.rejected", workflow_error)
+                agent.trace.append({"type": "workflow_policy_rejected", "result": workflow_error})
+                return workflow_error, False
+            params = dict(normalized_workflow)
+            from harness.tools.capability_repairs import prepare_workflow_literal_arguments
+            params, workflow_repairs, workflow_repair_issues = prepare_workflow_literal_arguments(
+                params, agent.method_schemas,
+            )
+            if workflow_repair_issues:
+                result = capability_argument_error(tool_name, method, workflow_repair_issues)
+                agent.logger.write("workflow.execute.rejected", result)
+                agent.trace.append({"type": "workflow_policy_rejected", "result": result})
+                return result, False
+            if workflow_repairs:
+                argument_repairs.extend(workflow_repairs)
+                agent.logger.write("browser.call.arguments_repaired", {
+                    "method": method, "repairs": workflow_repairs,
+                })
 
     contract_result = _bt()._check_worker_contract(agent, method)
     if contract_result is not None:
@@ -1091,7 +1110,31 @@ async def _execute_browser_capability_tool(
         result["argumentRepairs"] = argument_repairs
     agent.logger.write("browser.call.result", agent._trim_for_log(result))
     workflow_facts = workflow_execution_facts(result) if method == "Workflow.execute" else None
-    model_result = agent._clean_for_model(result)
+    model_source = result
+    if (
+        method == "Runtime.evaluate"
+        and complete_payload
+        and _bt()._record_extraction_persisted(result.get("recordExtraction"))
+        and "runtimeValue" in result
+        and not result.get("runtimeJSONError")
+    ):
+        # The extraction holds the rows and the complete receipt holds all
+        # source data/metadata. Do not inline two more copies of those rows
+        # into the model context after successfully persisting both.
+        model_source = dict(result)
+        model_source.pop("runtimeValue", None)
+        source_response = result.get("response")
+        if isinstance(source_response, dict):
+            model_source["response"] = {
+                **source_response,
+                "data": {
+                    "_offloaded": True,
+                    "format": "json_response",
+                    "query_with": "local_fs_read",
+                    "savedPath": complete_payload["savedPath"],
+                },
+            }
+    model_result = agent._clean_for_model(model_source)
     model_result = offload_large_tool_result(
         logger=agent.logger,
         tool_name=method or str(tool_name or "browser_call"),

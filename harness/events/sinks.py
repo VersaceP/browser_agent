@@ -136,11 +136,9 @@ class TraceProjectionSink:
     than a limitation: the other trace entries are NOT duplicates of run
     events. ``browser_call`` carries the post-offload model copy of a result
     while the matching ``browser.call.result`` log carries a differently
-    trimmed pre-offload copy, and three consumers read those entries for their
-    CONTENT - the worker handoff summary, the step-extension loop-nudge
-    lookback, and skills/_tools/distill_trace.py, which reads the on-disk
-    file. Collapsing them into one record would have to pick one fidelity and
-    silently change all three.
+    trimmed pre-offload copy. The worker handoff summary and step-extension
+    loop-nudge lookback still read those entries for their content. Collapsing
+    them into one record would change their fidelity.
     """
 
     def __init__(

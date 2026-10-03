@@ -149,13 +149,9 @@ from .spawner_helpers import (  # noqa: F401
     URL_RE,
     _SessionStartLock,
     _TaskContextTrackingBrowserClient,
-    _effective_worker_status,
-    _finalize_skill_execution_metadata,
     _fresh_click_settlement_class,
     _is_fleet_open_timeout,
     _prompt_worker_contract,
-    _skill_execution_metadata,
-    _unresolved_repair_visual_evidence,
     _verified_workflow_hitl_settlement,
 )
 from .spawner_registry import (  # noqa: F401

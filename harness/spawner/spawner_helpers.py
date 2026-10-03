@@ -15,7 +15,6 @@ from typing import Optional
 from typing import Set
 from abcp_client import ABCPClient
 from abcp_client import ABCPTransportError
-from harness.constants import WORKER_STATUS_DONE
 from harness.fleet.runtime import PageLeasedBrowserClient
 from runtime_config import RuntimeConfig
 from harness.utils import JsonDict
@@ -124,101 +123,6 @@ def _prompt_worker_contract(worker_contract: Any) -> JsonDict:
         key: value for key, value in worker_contract.items()
         if not str(key).startswith("_")
     }
-
-def _skill_execution_metadata(skill_outcome: Any) -> JsonDict:
-    if not isinstance(skill_outcome, dict):
-        return {
-            "executionMode": "browser_slow_path",
-            "fastPathRows": 0,
-            "repairRows": 0,
-        }
-    completed_rows = optional_int(skill_outcome.get("completedRows"), 0) or 0
-    if skill_outcome.get("handled"):
-        mode = "skill_fast_path"
-        repair_rows = 0
-    elif isinstance(skill_outcome.get("repair_manifest"), dict):
-        mode = "skill_repair"
-        repairs = skill_outcome["repair_manifest"].get("repairs")
-        repair_rows = len(repairs) if isinstance(repairs, list) else 0
-    else:
-        mode = "browser_slow_path"
-        repair_rows = 0
-    return {
-        "executionMode": mode,
-        "fastPathRows": max(0, completed_rows),
-        "repairRows": repair_rows,
-    }
-
-def _effective_worker_status(current_status: str, skill_answer: Any) -> str:
-    # A handled fast path deliberately skips BrowserAgent.run(), whose terminal
-    # transition normally changes the constructor default from running -> done.
-    # Validation remains a separate dimension in validatedStatus.
-    return WORKER_STATUS_DONE if skill_answer is not None else current_status
-
-def _finalize_skill_execution_metadata(
-    metadata: JsonDict,
-    harness: Any,
-) -> JsonDict:
-    """Repair mode can disable itself during record_extraction when its trusted
-    baseline becomes unreadable/inconsistent. Re-derive telemetry after the LLM
-    run so reports describe the actual full slow-path replacement, while keeping
-    fastPathRows as useful history.
-    """
-    out = dict(metadata)
-    contract = getattr(harness, "worker_contract", None)
-    manifest = (
-        contract.get("_repair_manifest") if isinstance(contract, dict) else None
-    )
-    disabled_reason = (
-        str(manifest.get("disabledReason") or "").strip()
-        if isinstance(manifest, dict) else ""
-    )
-    if disabled_reason:
-        out["executionMode"] = "browser_slow_path"
-        out["skillRepairFallback"] = True
-        out["repairFallbackReason"] = disabled_reason
-    trace = getattr(harness, "trace", None)
-    selected_workflow_calls = sum(
-        1
-        for item in (trace if isinstance(trace, list) else [])
-        if isinstance(item, dict) and item.get("type") == "execute_selected_skill"
-    )
-    if selected_workflow_calls:
-        # Keep executionMode honest: the BrowserAgent LLM still orchestrated
-        # this path, so it is not the zero-LLM fast path. This companion field
-        # proves the frozen registry recipe ran instead of being reconstructed.
-        out["selectedSkillWorkflowCalls"] = selected_workflow_calls
-        out["skillAssistedSlowPath"] = True
-    return out
-
-def _unresolved_repair_visual_evidence(harness: Any) -> List[JsonDict]:
-    contract = getattr(harness, "worker_contract", None)
-    manifest = (
-        contract.get("_repair_manifest") if isinstance(contract, dict) else None
-    )
-    if isinstance(manifest, dict) and manifest.get("disabledReason"):
-        # Full slow-path replacement abandoned the baseline repair contract;
-        # visual obligations tied to that baseline no longer govern completion.
-        return []
-    pending = (
-        manifest.get("visualEvidencePending")
-        if isinstance(manifest, dict) else None
-    )
-    if not isinstance(pending, list) or not pending:
-        return []
-    satisfied = (
-        manifest.get("visualEvidenceSatisfied")
-        if isinstance(manifest, dict) else None
-    )
-    satisfied_signatures = set(satisfied) if isinstance(satisfied, dict) else set()
-    return [
-        dict(item) for item in pending
-        if isinstance(item, dict)
-        and (
-            not str(item.get("signature") or "")
-            or str(item.get("signature")) not in satisfied_signatures
-        )
-    ]
 
 @dataclass
 class BrowserAgentHandle:

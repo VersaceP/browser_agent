@@ -901,30 +901,28 @@ def prepare_resume_state(
         )
     ] if isinstance(supersessions, list) else []
 
-    # A pure recovery resume (no new user instruction) means "continue this
-    # task".  HITL terminal statuses are execution interrupts, not evidence
-    # failures, so those phases are reopened here and the accepted plan stays
-    # spawnable without a replan. Resumption never changes the user's goal;
-    # a new task is required for a different objective.
+    # HITL terminal statuses are execution interrupts, not evidence failures.
+    # A genuine resume amendment may answer the pending question; the worker
+    # still has to verify that answer and the live page before acting. Reopen
+    # these phases for both plain recovery and amended continuations.
     hitl_reactivated: List[str] = []
-    if not str(instruction or "").strip():
-        effective_ids = {
-            str(phase.get("id") or "")
-            for phase in effective_plan.get("phases") or []
-            if isinstance(phase, dict) and str(phase.get("id") or "")
-        }
-        for phase_id in sorted(effective_ids):
-            if phase_id in invalidated:
-                continue
-            phase_state = phases_state.get(phase_id)
-            if not isinstance(phase_state, dict):
-                continue
-            prior_status = str(phase_state.get("status") or "")
-            if prior_status not in RESUME_REACTIVATABLE_HITL_STATUSES:
-                continue
-            phase_state["status"] = "pending"
-            phase_state["resume_reset_from"] = prior_status
-            hitl_reactivated.append(phase_id)
+    effective_ids = {
+        str(phase.get("id") or "")
+        for phase in effective_plan.get("phases") or []
+        if isinstance(phase, dict) and str(phase.get("id") or "")
+    }
+    for phase_id in sorted(effective_ids):
+        if phase_id in invalidated:
+            continue
+        phase_state = phases_state.get(phase_id)
+        if not isinstance(phase_state, dict):
+            continue
+        prior_status = str(phase_state.get("status") or "")
+        if prior_status not in RESUME_REACTIVATABLE_HITL_STATUSES:
+            continue
+        phase_state["status"] = "pending"
+        phase_state["resume_reset_from"] = prior_status
+        hitl_reactivated.append(phase_id)
     state["current_phase"] = _tc()._first_active_phase_id(effective_plan, phases_state)
     audited_reset_phases = list(reset_phases)
     audited_reset_phases.extend(

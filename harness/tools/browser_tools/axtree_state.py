@@ -262,13 +262,20 @@ def _saved_page_view_path(result: Any) -> str:
 
 
 def _current_axtree_lines(agent: Any) -> List[str]:
-    """The held page view, from memory or from the file it was written to."""
+    """The held page view, from memory or its authoritative task storage."""
     lines = list(getattr(agent, "axtree_lines", []) or [])
     if lines:
         return lines
     path = str(getattr(agent, "axtree_saved_path", "") or "")
     if not path:
         return []
+    logger = getattr(agent, "logger", None)
+    if getattr(logger, "task_dir", None) is not None:
+        from harness.utils import read_task_file_text
+
+        content = read_task_file_text(logger, path)
+        return content.splitlines() if content is not None else []
+    # Standalone callers without task storage retain the file-backed reader.
     try:
         with open(path, "r", encoding="utf-8") as handle:
             return handle.read().splitlines()
@@ -351,6 +358,17 @@ def _check_stale_axtree_target(
     unbacked_ids = _bare_ids(params)
     page_mismatch = bool(page_id and current_page_id and page_id != current_page_id)
     seen = _axtree_seen_ids(agent, page_id or current_page_id)
+    detail = getattr(agent, "axtree_detail_targets", {}).get(page_id, {})
+    detail_ids = set(detail.get("ids", set()))
+    detail_current = (
+        bool(page_id and detail.get("documentEpoch"))
+        and detail.get("documentEpoch") == getattr(agent, "axtree_document_epochs", {}).get(page_id)
+        and detail.get("eventSerial") == int(getattr(agent, "axtree_event_serial", 0) or 0)
+    )
+    # A current, page/document-bound query proves only the nodes it returned.
+    # It does not refresh the unrelated full-page snapshot.
+    if detail_current and target_ids <= detail_ids:
+        return None
     # Backed: the selector is a real fallback, so the snapshot's epoch does not
     # matter — but the id must be one THIS page produced.
     unsafe_backed = sorted(backed_ids - seen)
@@ -569,8 +587,34 @@ def _observe_axtree_state_after(
 ) -> None:
     _observe_page_url(agent, params, result)
     if method == "DOM.getAXTree" and _response_data(result).get("mode") == "detail":
-        # A bounded query about known targets is a read, not a page view: it
-        # neither replaces the held snapshot nor makes it stale.
+        data = _response_data(result)
+        page_id = str(params.get("pageId") or "")
+        observation = data.get("observation") or {}
+        document_epoch = str(observation.get("documentEpoch") or "")
+        serial = int(getattr(agent, "axtree_event_serial", 0) or 0)
+        if (not page_id or str(data.get("pageId") or page_id) != page_id
+                or not document_epoch or data.get("observationError")
+                or observation.get("freshness") not in {None, "current"}
+                or (event_serial_before is not None and serial != event_serial_before)):
+            return
+        # Never register request IDs echoed by failed query records as evidence.
+        ids: Set[str] = set()
+        for record in data.get("records") or []:
+            if isinstance(record, dict) and record.get("ok") is True:
+                ids.update(_axtree_ids_from_value(record.get("value")))
+        if ids:
+            details = getattr(agent, "axtree_detail_targets", None)
+            if not isinstance(details, dict):
+                details = agent.axtree_detail_targets = {}
+            old_epoch = getattr(agent, "axtree_document_epochs", {}).get(page_id)
+            if old_epoch and old_epoch != document_epoch:
+                _invalidate_axtree_snapshot(agent, "Page.recovered", {"pageId": page_id})
+                agent.axtree_ids = set()
+            _record_axtree_history(agent, page_id, [], ids, document_epoch=document_epoch)
+            details[page_id] = {
+                "ids": ids, "documentEpoch": document_epoch,
+                "eventSerial": serial,
+            }
         return
     if method == "DOM.getAXTree":
         data_error = result.get("axtreeDataError")
@@ -601,6 +645,7 @@ def _observe_axtree_state_after(
         if not page_id:
             page_id = str(_response_data(result).get("pageId") or "")
         if ids:
+            getattr(agent, "axtree_detail_targets", {}).pop(page_id, None)
             agent.axtree_epoch = int(getattr(agent, "axtree_epoch", 0) or 0) + 1
             agent.axtree_ids = ids
             agent.axtree_page_id = page_id
@@ -999,6 +1044,7 @@ _DOCUMENT_REPLACING_METHODS = frozenset({
 
 
 def _invalidate_axtree_snapshot(agent: Any, method: str, params: JsonDict) -> None:
+    getattr(agent, "axtree_detail_targets", {}).pop(str(params.get("pageId") or ""), None)
     agent.axtree_invalidated = True
     agent.axtree_lines = []
     agent.axtree_nodes = []

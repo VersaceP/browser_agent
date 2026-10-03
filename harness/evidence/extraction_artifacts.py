@@ -4,13 +4,89 @@ harness.evidence.extraction_artifacts - Shared extraction artifact persistence.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any, List, Optional
 
 from harness.context.offload import store_offloaded
 from harness.utils import JsonDict
+
+
+def export_extraction_artifacts_for_delivery(logger: Any, paths: List[str]) -> List[str]:
+    """Materialize DB-backed extraction deliverables cited by a final result.
+
+    The database remains authoritative for reads and resume. Internal logs and
+    observations stay virtual; only extraction artifacts exposed to the user
+    get an actual file at the path already present in the worker receipt.
+    """
+
+    from harness.storage.virtual_fs import db_authoritative_for
+    from harness.utils import read_task_file_text, storage_for_logger
+
+    if not db_authoritative_for(logger):
+        return []
+    storage, task_id = storage_for_logger(logger)
+    task_dir = Path(logger.task_dir).resolve()
+    exported: List[str] = []
+    for raw_path in dict.fromkeys(str(path) for path in paths if isinstance(path, str)):
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            continue
+        try:
+            relative = candidate.relative_to(task_dir)
+        except ValueError:
+            continue
+        if (len(relative.parts) != 3 or relative.parts[:2] != ("artifacts", "extractions")
+                or not relative.name.endswith(".json")):
+            continue
+        rows = storage.search_resources(task_id=task_id, path_glob=str(relative), max_results=2)
+        matches = [row for row in rows if row.get("logical_path") == str(relative)
+                   and row.get("resource_type") == "extraction"]
+        if len(matches) != 1:
+            raise ValueError(f"extraction delivery resource missing: {relative}")
+        record = storage.read_resource(
+            current_task_id=task_id, resource_uri=str(matches[0]["saved_path"]))
+        if not isinstance(record, dict) or record.get("resource_type") != "extraction":
+            raise ValueError(f"extraction delivery resource unavailable: {relative}")
+        text = read_task_file_text(logger, str(candidate))
+        if text is None:
+            raise ValueError(f"extraction delivery content unavailable: {relative}")
+        content = text.encode("utf-8")
+        digest = hashlib.sha256(content).hexdigest()
+        if digest != record.get("sha256") or len(content) != record.get("byte_size"):
+            raise ValueError(f"extraction delivery content mismatch: {relative}")
+
+        target = task_dir / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.parent.resolve() != task_dir / "artifacts" / "extractions":
+            raise ValueError(f"extraction delivery directory is redirected: {relative}")
+        if target.is_symlink():
+            raise ValueError(f"extraction delivery path is a symlink: {relative}")
+        if target.exists():
+            if not target.is_file() or hashlib.sha256(target.read_bytes()).hexdigest() != digest:
+                raise ValueError(f"extraction delivery path already contains different data: {relative}")
+        else:
+            fd, temporary = tempfile.mkstemp(prefix=".delivery-", dir=target.parent)
+            try:
+                with os.fdopen(fd, "wb") as output:
+                    output.write(content)
+                    output.flush()
+                    os.fsync(output.fileno())
+                try:
+                    os.link(temporary, target)  # Never overwrite a user-edited file.
+                except FileExistsError:
+                    if (target.is_symlink() or not target.is_file()
+                            or hashlib.sha256(target.read_bytes()).hexdigest() != digest):
+                        raise ValueError(
+                            f"extraction delivery path already contains different data: {relative}")
+            finally:
+                os.unlink(temporary)
+        exported.append(str(target))
+    return exported
 
 
 def field_name_from_spec(value: Any) -> str:
@@ -205,7 +281,6 @@ def save_extraction_artifact(
         or "."
     )
     out_dir = task_dir / "artifacts" / "extractions"
-    out_dir.mkdir(parents=True, exist_ok=True)
     file_path = out_dir / f"{safe_name}-{uuid.uuid4().hex[:8]}.json"
 
     warnings = list(schema_warnings or [])

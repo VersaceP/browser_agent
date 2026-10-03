@@ -18,12 +18,16 @@ try:
 except ImportError:
     pass
 
-from agent_harness import (
-    LeadAgent,
-    ResumeContext,
-    exception_payload,
-    lead_agent_model_config,
-    llm_rate_limit_terminal_result,
+from harness.agents.lead.agent import LeadAgent
+from harness.runtime.resume_context import ResumeContext
+from harness.runtime.model_config import lead_agent_model_config
+from harness.runtime.model_support import llm_rate_limit_terminal_result
+from harness.utils import exception_payload
+from harness.agents.browser.task import (
+    BrowserTaskRunner, _run_browser_mode, _browser_mode_terminal_error,
+    _shutdown_browser_mode, _submit_direct_plan, _wait_for_browser_mode_result,
+    _browser_mode_failure, _submit_browser_resume_amendment,
+    _unbound_browser_resume_inputs, _bind_browser_resume_inputs,
 )
 from harness.storage import create_storage_from_config
 from harness.storage.base import StorageError
@@ -37,9 +41,12 @@ from harness.runtime.resume_state import (
     RunLockError,
     acquire_run_lock,
     configure_resume_storage,
+    database_has_task,
+    resume_worktree_dir,
     load_task_manifest,
     load_task_plan_strict,
     load_task_state_strict,
+    promote_legacy_task_to_database,
     recover_legacy_user_task,
     reconcile_torn_plan_alias,
     release_run_lock,
@@ -48,12 +55,11 @@ from harness.runtime.resume_state import (
 )
 from harness.task_control import (
     TERMINAL_PHASE_STATUSES,
+    load_task_state,
     prepare_resume_state,
     write_task_state,
 )
 from harness.planning.fleet_reference import extract_fleet_reference
-from harness.tools.lead_tools import _lead_spawn_browser_agent, _lead_wait_browser_agents
-from harness.tools.registry import ToolContext
 from llm import (
     LLMConnectionError,
     LLMEmptyResponseError,
@@ -283,6 +289,49 @@ class ConsoleProgressReporter:
             print(message, flush=True)
 
     def _format(self, event_type: str, payload: Dict[str, Any]) -> Optional[str]:
+        if event_type == "browser.task_review.start":
+            return f"[BrowserReview] 开始 {payload.get('phase')} 复核，Browser 步骤 {payload.get('step')}"
+        if event_type == "browser.task_review.model":
+            return f"[BrowserReview {payload.get('reviewId')}] 第 {payload.get('round')} 轮：请求模型..."
+        if event_type == "browser.task_review.tool":
+            result = payload.get("result") or {}
+            method = (payload.get("input") or {}).get("method")
+            detail = result.get("reason") or result.get("error") or ""
+            if payload.get("tool") in {"review_search_text", "review_list_files"} \
+                    and result.get("status") == "done":
+                detail = (f"{result.get('count', 0)} 条"
+                          f"，续查 {result.get('nextLineOffset') or result.get('nextOffset')}"
+                          if result.get("truncated") else f"{result.get('count', 0)} 条")
+            return (f"[BrowserReview {payload.get('reviewId')}] {payload.get('tool')}"
+                    f"{(' ' + str(method)) if method else ''}: {result.get('status')}"
+                    f" {self._short_text(detail, 160)}").rstrip()
+        if event_type == "browser.task_review.verdict":
+            errors = (payload.get("validation") or {}).get("errors")
+            if errors:
+                return f"[BrowserReview] 判决协议需修正: {self._short_text('; '.join(errors), 350)}"
+            return None  # the completion event prints the verdict once
+        if event_type == "browser.task_review":
+            return (f"[BrowserReview] {payload.get('verdict') or payload.get('status')}"
+                    f"，模型 {payload.get('modelCalls', '?')} 轮，耗时 {payload.get('durationMs', '?')}ms"
+                    f"，问题 {len(payload.get('issues') or [])} 项："
+                    f"{self._short_text(payload.get('reason'), 240)}")
+        if event_type == "browser.task_review.skipped":
+            return f"[BrowserReview] 未启动：{payload.get('reason')}"
+        if event_type == "assignment_review.start":
+            return f"[PlanValidator] 开始{'协议修正' if payload.get('repair') else '复核'} {payload.get('assignmentId')}"
+        if event_type == "assignment_review.call":
+            return f"[PlanValidator] 模型调用结束，耗时 {payload.get('durationMs')}ms"
+        if event_type == "assignment_review.result":
+            return (f"[PlanValidator] {payload.get('status')}，记录：{payload.get('auditPath')}"
+                    f" {self._short_text(payload.get('errors') or '', 240)}").rstrip()
+        if event_type in {"assignment_review.cache_hit", "assignment_review.service_unavailable"}:
+            return f"[PlanValidator] {event_type.rsplit('.', 1)[-1]}: {payload.get('assignmentId') or payload.get('candidateHash')}"
+        if event_type == "llm.usage" and payload.get("source") in {
+            "browser_task_reviewer", "plan_validator", "plan_validator_repair",
+        }:
+            return (f"[LLM {payload.get('source')}] cache_read={payload.get('cache_read', 0)} "
+                    f"cache_creation={payload.get('cache_creation', 0)} "
+                    f"uncached_input={payload.get('uncached_input', 0)} output={payload.get('output', 0)}")
         if event_type == "lifecycle.compaction.start":
             return (
                 "[Compaction] 开始: "
@@ -776,167 +825,75 @@ class ConsoleProgressReporter:
         )
 
 
-def _available_skill_ids() -> List[str]:
+def _skill_catalog_for_runtime(runtime: Any):
+    from harness.skill_builder.catalog import SkillCatalog
+    from harness.storage.factory import resolve_sqlite_path
+    return SkillCatalog(
+        Path(__file__).resolve().parent / "skills",
+        resolve_sqlite_path(runtime.harness.storage_sqlite_path,
+                            runtime.harness.worktree_dir),
+    )
+
+
+def _selected_skill_version(runtime: Any, skill_id: str) -> str:
+    from harness.skill_builder.catalog import inspect_skill
+    catalog = _skill_catalog_for_runtime(runtime)
     try:
-        from harness.skill.registry import SkillRegistry
-        return [s.skill_id for s in SkillRegistry.load().all()]
+        catalog.sync_existing()
+        row = catalog.get(skill_id)
+        if row is None or row["deleted"]:
+            raise ValueError(f"未知 Skill: {skill_id}")
+        content_hash = str(row["current_hash"])
+        try:
+            current_hash = inspect_skill(catalog.root / skill_id)["hash"]
+        except Exception as exc:
+            raise ValueError(f"Skill {skill_id} 的正式文件不可读取: {exc}") from exc
+        if current_hash != content_hash:
+            raise ValueError(f"Skill {skill_id} 的正式文件与索引不一致")
+        if catalog.version_path(skill_id, content_hash) is None:
+            raise ValueError(f"Skill {skill_id} 的版本快照不可用")
+        return content_hash
+    finally:
+        catalog.close()
+
+
+def _available_skill_lines(config_path: str = "config.json") -> List[str]:
+    try:
+        from runtime_config import load_runtime_config
+        catalog = _skill_catalog_for_runtime(load_runtime_config(config_path))
+        try:
+            catalog.sync_existing()
+            return [_skill_listing(item) for item in catalog.list()]
+        finally:
+            catalog.close()
     except Exception:
         return []
 
 
-def _available_suite_names() -> List[str]:
-    try:
-        from harness.skill.registry import SkillRegistry
-        return sorted({s.suite for s in SkillRegistry.load().all() if s.suite})
-    except Exception:
-        return []
+def _skill_listing(row: Dict[str, Any]) -> str:
+    metadata = json.loads(row.get("metadata_json") or "{}")
+    description = str(metadata.get("description") or "").strip().replace("\n", " ")
+    suffix = f" — {description[:120]}" if description else ""
+    return (f"{row['skill_id']} @{row['current_hash']}"
+            f" (version {row['current_version']}){suffix}")
 
 
-def _expand_skill_selection(name: str) -> "tuple[List[str], bool]":
-    """把 /skill <name> 的 name 解析成 (skill_id 列表, 是否为 suite)。
-
-    name 是 skill_id → ([name], False)；是 suite 名 → (成员 ids, True)；
-    都不是 → ([], False)（未知）。展开逻辑复用 registry.expand_selection。"""
-    try:
-        from harness.skill.registry import SkillRegistry
-        reg = SkillRegistry.load()
-        ids = {s.skill_id for s in reg.all()}
-        expanded = reg.expand_selection(name)
-        if name in ids:
-            return [name], False
-        if name in _available_suite_names() and expanded:
-            return expanded, True
-        return [], False
-    except Exception:
-        return [], False
-
-
-def _is_truthy_flag(value: Any) -> bool:
-    return value is True or str(value).strip().lower() in ("true", "1", "yes")
-
-
-def _skill_display_line(skill: Any) -> str:
-    """Skill id + trust markers for the /skill list: [draft] means the SKILL.md
-    calibration checklist has not been signed off; [未试运行] means no live
-    generality trial has passed; [质量门未过] means the last create/recheck
-    left the skill blocked (see its .create_report.json)."""
-    frontmatter = getattr(skill, "frontmatter", None) or {}
-    marks: List[str] = []
-    if getattr(skill, "is_hints_only", False):
-        marks.append("hints")
-    if _is_truthy_flag(frontmatter.get("draft")):
-        marks.append("draft")
-    if "tested" in frontmatter and not _is_truthy_flag(frontmatter.get("tested")):
-        marks.append("未试运行")
-    try:
-        from harness.skill.registry import load_create_report
-        status = str(load_create_report(getattr(skill, "directory", None)).get("status") or "")
-        if status in ("draft_blocked", "revision_blocked", "recheck_failed"):
-            marks.append("质量门未过")
-    except Exception:
-        pass
-    try:
-        from harness.skill.guidance import default_guidance_health
-        if default_guidance_health().needs_review(skill.skill_id):
-            marks.append("hints待复审")
-    except Exception:
-        pass
-    return skill.skill_id + (f" [{','.join(marks)}]" if marks else "")
-
-
-def _skill_display_lines() -> List[str]:
-    try:
-        from harness.skill.registry import SkillRegistry
-        return [_skill_display_line(s) for s in SkillRegistry.load().all()]
-    except Exception:
-        return []
-
-
-def _hint_matching_skills(task: str) -> None:
-    """Passive hint (manual selection mode): if the task's URL host matches a
-    known skill's domain, say so — never auto-engage."""
-    try:
-        match = re.search(r"https?://([^/\s\"'<>]+)", str(task or ""))
-        if not match:
-            return
-        host = match.group(1).lower()
-        host = host[4:] if host.startswith("www.") else host
-        from harness.skill.registry import SkillRegistry, _domain_matches
-        hits = [s for s in SkillRegistry.load().all() if _domain_matches(s.domain, host)]
-        if hits:
-            print(
-                "提示: 检测到同域技能 "
-                + ", ".join(_skill_display_line(s) for s in hits)
-                + "（手动模式不会自动启用；如需使用请以 --skill <id> 重新运行，"
-                "或交互模式先输 /skill <id>）",
-                flush=True,
-            )
-    except Exception:
-        pass
-
-
-def _skill_create_tokens(line: str) -> List[str]:
-    # IME 全角空格(U+3000)/NBSP 不在 shlex 的分隔符集里——路径后跟中文说明时
-    # 会被粘成一个 token（07-06 事故），先归一成半角空格再切。
-    line = line.replace("　", " ").replace("\xa0", " ")
-    try:
-        return shlex.split(line)
-    except ValueError:
-        return []
-
-
-# 三个蒸馏/维护命令共享 /skill-create 前缀（识别需前缀匹配，勿用 ==）。
-# -workflow 蒸 workflow skill（快路径），-guidance 蒸 hints 层，裸 /skill-create
-# 保留给 --recheck/--retry 维护操作。
-_SKILL_CREATE_COMMANDS = (
-    "/skill-create-workflow", "/skill-create-guidance", "/skill-create",
-)
-
-
-def _skill_create_command_of(tokens: List[str]) -> str:
-    return tokens[0] if tokens and tokens[0] in _SKILL_CREATE_COMMANDS else ""
-
-
-def _is_skill_create_command(line: str) -> bool:
-    return bool(_skill_create_command_of(_skill_create_tokens(line)))
-
-
-def _extract_flag_value(tokens: List[str], flag: str) -> "tuple[Optional[str], List[str]]":
-    """取 `--flag <value>` 的值并把这两个 token 从列表摘掉。
-
-    返回 (value, tokens_without)。flag 未出现 → ("", tokens 原样)；flag 出现但
-    缺值（末尾或后跟另一个 --flag）→ (None, tokens) 让调用方判用法错误。这样
-    值（如 phase id p1_collection、含连字符的 skill/suite 名）不会漏进 positional。"""
-    if flag not in tokens:
-        return "", tokens
-    i = tokens.index(flag)
-    if i + 1 >= len(tokens) or tokens[i + 1].startswith("--"):
-        return None, tokens
-    return tokens[i + 1], tokens[:i] + tokens[i + 2:]
-
-
-# skill-id 必须是 slug（字母开头 + 字母数字-_）；中文任务说明之类的自由文本
-# 绝不能被当成第二个位置参数吞进 skill_id。
-_SKILL_ID_TOKEN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
-# CJK 文字/标点/全角符号的起点 = 路径与粘连说明文字的切割边界
 _CJK_BOUNDARY_RE = re.compile(r"[　-〿㐀-鿿豈-﫿！-～]")
 
 
 def _existing_task_path(candidate: str) -> Optional[str]:
-    """Resolve against cwd first, then the project root (main.py's dir), so a
-    relative worktree/<id> works no matter where the CLI was launched from."""
-    p = Path(candidate).expanduser()
-    if p.exists():
-        return str(p)
-    if not p.is_absolute():
-        rooted = Path(__file__).resolve().parent / candidate
-        if rooted.exists():
+    """Recognize physical task directories and DB-only task paths."""
+    path = Path(candidate).expanduser()
+    if path.is_dir():
+        return str(path)
+    if not path.is_absolute():
+        rooted = Path(__file__).resolve().parent / path
+        if rooted.is_dir():
             return str(rooted)
-        if re.fullmatch(r"[0-9a-fA-F]{32}", candidate):
-            task = Path(__file__).resolve().parent / "worktree" / candidate.lower()
-            if task.is_dir():
-                return str(task)
-    return None
+    try:
+        return str(_resolve_resume_directory(candidate))
+    except ValueError:
+        return None
 
 
 def _recover_task_path(positional: List[str]) -> "tuple[str, List[str]]":
@@ -961,38 +918,6 @@ def _recover_task_path(positional: List[str]) -> "tuple[str, List[str]]":
     return positional[0], positional[1:]
 
 
-_SKILL_CREATE_USAGE = (
-    "用法:\n"
-    "  /skill-create-workflow <任务目录或trace.jsonl> [--skill <名称>] [--suite <名称>]"
-    " [--phase <phaseId>] [--optimize|--new] [--no-test] [--no-judge] [--no-harden] [--verbose]\n"
-    "      从任务蒸馏 workflow skill（快路径，happy-path 零 LLM）\n"
-    "  /skill-create-guidance <任务目录或trace.jsonl> [--skill <名称>] [--suite <名称>]"
-    " [--phase <phaseId>] [--optimize|--new] [--allow-unvalidated] [--no-judge] [--verbose]\n"
-    "      从任务蒸馏 hints（页面知识）层：--skill 已存在则写进其 SKILL.md（双层），否则新建 hints-only\n"
-    "  /skill-create --recheck <skill-id> [--no-test]\n"
-    "      workflow 默认执行静态检查 + live canary 并写真实 health；--no-test 仅静态检查\n"
-    "  /skill-create --retry <skill-id>     按生成记录重新蒸馏（原目录覆盖）\n"
-    "提示: 含空格的路径请加引号；--suite 让多个 skill 组成技能组，"
-    "跑任务时 /skill <suite名> 一次选中整组（各 phase 按四维路由到对应成员）\n"
-    "退出码: 0=created/revision_candidate/hints_updated/复检通过 1=error 2=用法错误"
-    " 3=needs_decision 4=质量门未过 5=aborted"
-)
-
-# Scripts/CI must be able to tell "skill ready" from "nothing usable was
-# created": needs_decision is zero-write, *_blocked failed the dry-run gate,
-# aborted is an explicit quit. Unknown statuses fail toward 1.
-_SKILL_CREATE_EXIT_CODES = {
-    "created": 0,
-    "revision_candidate": 0,
-    "hints_updated": 0,
-    "error": 1,
-    "needs_decision": 3,
-    "draft_blocked": 4,
-    "revision_blocked": 4,
-    "aborted": 5,
-}
-
-
 def _run_coro_blocking(coro: Any) -> Any:
     """Run a coroutine from sync CLI code, even when an event loop is already
     running (read_task's input() executes inside run_cli's loop): fall back to a
@@ -1006,444 +931,17 @@ def _run_coro_blocking(coro: Any) -> Any:
         return pool.submit(asyncio.run, coro).result()
 
 
-def _build_objective_judge(config_path: Optional[str]):
-    """LLM judge for /skill-create dedup: is the new task's objective the SAME
-    business task as an existing same-domain skill's? Best-effort — any failure
-    returns uncertain and the human decides."""
-
-    def judge(objective: str, existing: Dict[str, Any]) -> Dict[str, str]:
-        async def _call() -> Dict[str, str]:
-            runtime = load_runtime_config(config_path or "config.json")
-            provider = LLMFactory.create_provider(lead_agent_model_config(runtime))
-            system_prompt = (
-                "你是浏览器自动化技能库的守门人。判断【新任务目标】与【已有技能】是否是"
-                "同一个业务任务（同一站点上抓取/操作同一类页面的同一类产出，字段命名差异、"
-                "行数/排名范围差异不算业务不同）。只输出 JSON："
-                '{"verdict": "same|different|uncertain", "reason": "简短中文理由"}'
-            )
-            payload = json.dumps(
-                {"新任务目标": objective, "已有技能": existing},
-                ensure_ascii=False,
-            )
-            text, _tool_calls, _stop, _usage = await provider.generate_response(
-                system_prompt, [{"role": "user", "content": payload}], []
-            )
-            match = re.search(r"\{.*\}", text or "", re.DOTALL)
-            data = json.loads(match.group(0)) if match else {}
-            return {"verdict": str(data.get("verdict") or "uncertain"),
-                    "reason": str(data.get("reason") or "")}
-
-        try:
-            return _run_coro_blocking(_call())
-        except Exception as exc:
-            return {"verdict": "uncertain", "reason": f"LLM 判断失败: {exc}"}
-
-    return judge
-
-
-def _build_trial_runner(config_path: Optional[str]):
-    """Live trial runner for /skill-create quality gate (panel required;
-    degrades to attempted=False when unreachable)."""
-
-    def run(workflow: Dict[str, Any], rows: List[Dict[str, str]]) -> Dict[str, Any]:
-        async def _run() -> Dict[str, Any]:
-            from harness.skill.create import trial_workflow_live
-            runtime = load_runtime_config(config_path or "config.json")
-            return await trial_workflow_live(
-                workflow,
-                rows,
-                ws_config=runtime.browser,
-                workflow_runtime=runtime,
-            )
-
-        try:
-            return _run_coro_blocking(_run())
-        except Exception as exc:
-            return {"attempted": False, "runs": [], "error": str(exc)}
-
-    return run
-
-
-def _build_recheck_trial_runner(config_path: Optional[str]):
-    """Full-contract live canary used by workflow ``--recheck``."""
-
-    def run(skill: Any, source_context: Dict[str, Any]) -> Dict[str, Any]:
-        async def _run() -> Dict[str, Any]:
-            from harness.skill.create import recheck_skill_live
-            runtime = load_runtime_config(config_path or "config.json")
-            return await recheck_skill_live(
-                skill,
-                source_context,
-                ws_config=runtime.browser,
-                workflow_runtime=runtime,
-            )
-
-        try:
-            return _run_coro_blocking(_run())
-        except Exception as exc:
-            return {
-                "status": "inconclusive",
-                "attempted": False,
-                "reason": f"live recheck 启动失败: {exc}",
-            }
-
-    return run
-
-
-def _confirm_skill_create(payload: Dict[str, Any]) -> str:
-    """Interactive dedup decision: optimize the existing skill / create new / quit."""
-    existing = payload.get("existing") or {}
-    judgment = payload.get("judgment") or {}
-    print(f"同域已有 skill `{existing.get('skill_id')}`：")
-    print(f"  stage_hint 一致: {existing.get('stage_hint_match')}；"
-          f"字段重叠(归一后): {', '.join(existing.get('field_overlap') or []) or '无'}")
-    if existing.get("description"):
-        print(f"  该 skill 目标: {existing['description'][:160]}")
-    print(f"  新任务目标: {str(payload.get('objective') or '')[:160]}")
-    print(f"  LLM 判断: {judgment.get('verdict')}"
-          + (f" — {judgment.get('reason')}" if judgment.get("reason") else ""))
-    prompt = ("[o]把 hints 写进该 skill（双层） / [n]确认业务不同,新建 hints-only / [q]放弃 > "
-              if payload.get("mode") == "guidance"
-              else "[o]基于已有 skill 优化 / [n]确认业务不同,新建 / [q]放弃 > ")
-    while True:
-        choice = input(prompt).strip().lower()
-        if choice in ("o", "optimize"):
-            return "optimize"
-        if choice in ("n", "new"):
-            return "new"
-        if choice in ("q", "quit", ""):
-            return "quit"
-
-
-def _print_skill_create_report(report: Dict[str, Any], *, verbose: bool = False) -> int:
-    """Print a create/retry report and map its status to the exit code. The
-    distiller notes are developer detail — folded unless --verbose (they are
-    always written into SKILL.md)."""
-    for message in report.get("messages") or []:
-        print(message)
-    notes = report.get("notes") or []
-    if notes and report.get("status") in (
-        "created", "draft_blocked", "revision_candidate", "revision_blocked",
-    ):
-        if verbose:
-            print("蒸馏器 notes:")
-            for note in notes:
-                print(f"  - {note}")
-        else:
-            print("（技术细节已写入 SKILL.md；加 --verbose 查看蒸馏器 notes）")
-    return _SKILL_CREATE_EXIT_CODES.get(str(report.get("status") or ""), 1)
-
-
-def _handle_skill_recheck(
-    skill_id: str,
-    *,
-    config_path: Optional[str] = None,
-    no_test: bool = False,
-    skills_dir: Optional[str] = None,
-    trial_runner: Optional[Any] = None,
-    health: Any = None,
-) -> int:
-    """Recheck an existing skill.
-
-    Workflow skills run a static gate followed by a live full-contract canary
-    by default. ``--no-test`` is the explicit static-only escape hatch. Only a
-    conclusive live outcome enters workflow health; infrastructure/challenge
-    failures remain inconclusive and never poison the ledger.
-    """
+def _handle_skill_builder_command(line: str, *, config_path: str = "config.json") -> int:
+    if sys.version_info < (3, 12):
+        print("Skill Builder 需要 Python 3.12+；当前解释器: " + sys.version.split()[0],
+              flush=True)
+        return 2
+    from harness.skill_builder.commands import execute
     try:
-        from harness.skill import create as skill_create
-        from harness.skill.registry import SKILLS_DIR_DEFAULT, SkillRegistry
-        skill = SkillRegistry.load(skills_dir or SKILLS_DIR_DEFAULT).get(skill_id)
-        if skill is None:
-            print(f"未知技能 {skill_id!r}。可用: {', '.join(_available_skill_ids()) or '(无)'}")
-            return 2
-        if getattr(skill, "is_hints_only", False):
-            # guidance skill 没有 workflow 契约可模拟；复检 = 确认 hints 小节
-            # 存在 + 人工看过后清 needs_review（stale 上报的人工闭环终点）。
-            from harness.skill.guidance import default_guidance_health, extract_hints_section
-            ok = bool(extract_hints_section(skill.skill_md))
-            if ok:
-                default_guidance_health().mark_reviewed(skill_id)
-                print(f"✅ guidance skill 复检通过: {skill_id}"
-                      "（hints 小节存在；needs_review 标记已清）")
-                print(f"下一步: 任务开始前输入 /skill {skill_id} 即可使用")
-            else:
-                print(f"⚠️ guidance skill {skill_id} 的 SKILL.md 没有 hints 小节"
-                      "（## 页面知识）——补写后重跑本命令，"
-                      f"或重新蒸馏: /skill-create --guidance --retry {skill_id}")
-            if skill.directory is not None:
-                skill_create.write_create_report(skill.directory, {
-                    "status": "recheck_passed" if ok else "recheck_failed",
-                    "mode": "guidance",
-                    "cold_start_eligible": False,
-                    "updated_at": datetime.now().isoformat(timespec="seconds"),
-                })
-            return 0 if ok else 4
-        source_context = skill_create.recheck_source_context(skill)
-        sim = skill_create.simulate_persisted_contract(
-            skill.skill_id,
-            skill.workflow,
-            skill.success_contract,
-            skill.row_contract,
-            expected_rows=source_context.get("expected_rows"),
-        )
-        failure_human = skill_create._humanize_failed_checks(sim["failed_checks"])
-        now = datetime.now().isoformat(timespec="seconds")
-        if not sim["ok"]:
-            print(f"⚠️ 质量门复检未过: {skill_id}")
-            for line in failure_human:
-                print(f"  原因: {line}")
-            print(f"  修复 skills/{skill_id}/workflow.json 或 fallback.yaml 后重跑本命令；"
-                  f"或按生成记录重新蒸馏: /skill-create --retry {skill_id}")
-            if skill.directory is not None:
-                skill_create.write_create_report(skill.directory, {
-                    "status": "recheck_failed",
-                    "cold_start_eligible": False,
-                    "updated_at": now,
-                    "failed_checks": sim["failed_checks"],
-                    "failure_human": failure_human,
-                })
-            return 4
-
-        if no_test:
-            print(f"⚠️ 静态检查通过，但未执行真实试运行: {skill_id}")
-            print("不会生成 health 记录，也不会授予完整冷启动资格。")
-            if skill.directory is not None:
-                skill_create.write_create_report(skill.directory, {
-                    "status": "recheck_static_passed",
-                    "cold_start_eligible": False,
-                    "updated_at": now,
-                    "failed_checks": [],
-                    "failure_human": [],
-                })
-            return 0
-
-        runner = trial_runner or _build_recheck_trial_runner(config_path)
-        try:
-            live = runner(skill, source_context)
-            if asyncio.iscoroutine(live):
-                live = _run_coro_blocking(live)
-        except Exception as exc:
-            live = {"status": "inconclusive", "attempted": False, "reason": str(exc)}
-        live = live if isinstance(live, dict) else {}
-        live_status = str(live.get("status") or "inconclusive")
-        if live_status not in {"passed", "failed", "inconclusive"}:
-            live_status = "inconclusive"
-
-        if health is None:
-            from harness.skill.health import default_health
-            health = default_health()
-        if live_status == "passed":
-            if hasattr(health, "reset"):
-                # A successful recheck is the explicit recovery path for a
-                # previously rot-disabled workflow. Reset first, then record
-                # this real canary so totals still include the new success.
-                health.reset(skill.skill_id)
-            health.record(skill, True)
-            skill_create.mark_skill_live_tested(skill)
-            print(f"✅ 质量门复检通过（含 live canary）: {skill_id}")
-            print(f"下一步: 输入 /skill {skill_id} 可直接使用；suite 路由将读取真实 health。")
-            report_status = "recheck_passed"
-            code = 0
-            try:
-                from harness.skill.guidance import default_guidance_health
-                default_guidance_health().mark_reviewed(skill_id)
-            except Exception:
-                pass
-        elif live_status == "failed":
-            health.record(skill, False)
-            print(f"⚠️ live canary 未通过: {skill_id}")
-            if live.get("reason"):
-                print(f"  原因: {live['reason']}")
-            report_status = "recheck_failed"
-            code = 4
-        else:
-            print(f"⚠️ live canary 无法得出结论: {skill_id}")
-            print(f"  原因: {live.get('reason') or '浏览器/来源任务不可用'}")
-            print("未写入成功或失败 health，请排除环境问题后重试。")
-            report_status = "recheck_inconclusive"
-            code = 4
-
-        if skill.directory is not None:
-            skill_create.write_create_report(skill.directory, {
-                "status": report_status,
-                # A conclusive live run already created health; no synthetic
-                # cold-start priority is needed. Inconclusive remains inert.
-                "cold_start_eligible": False,
-                "updated_at": now,
-                "failed_checks": list(live.get("failed_checks") or []),
-                "failure_human": [str(live.get("reason") or "")] if live.get("reason") else [],
-                "live_recheck": live,
-            })
-        return code
-    except Exception as exc:  # CLI must never crash the prompt loop
-        print(f"recheck 失败: {exc}")
+        return execute(line, config_path=config_path, run_blocking=_run_coro_blocking)
+    except Exception as exc:
+        print(f"Skill Builder 无法完成: {type(exc).__name__}: {exc}", flush=True)
         return 1
-
-
-def _handle_skill_retry(
-    skill_id: str,
-    *,
-    config_path: Optional[str] = None,
-    no_test: bool = False,
-    no_judge: bool = False,
-    verbose: bool = False,
-    skills_dir: Optional[str] = None,
-    harden: bool = True,
-) -> int:
-    """/skill-create --retry <id>: regenerate a machine-generated skill in place
-    from the source task recorded in its .create_report.json (human-triggered —
-    generation failures are never retried automatically)."""
-    try:
-        from harness.skill.create import (
-            create_guidance_skill_from_task,
-            create_skill_from_task,
-        )
-        from harness.skill.registry import (
-            SKILLS_DIR_DEFAULT,
-            SkillRegistry,
-            load_create_report,
-        )
-        root = Path(skills_dir) if skills_dir else Path(SKILLS_DIR_DEFAULT)
-        report_data = load_create_report(root / skill_id)
-        source = str(report_data.get("source_task") or "")
-        if not source:
-            print(f"{skill_id!r} 没有生成记录（.create_report.json），无法自动重试。")
-            print("请提供原任务目录，并根据要重新蒸馏的层运行：")
-            skill = SkillRegistry.load(root).get(skill_id)
-            modes: List[str] = []
-            if skill is None or skill.has_workflow:
-                modes.append("workflow")
-            if skill is None or skill.is_hints_only or bool(skill.hints):
-                modes.append("guidance")
-            for mode in modes:
-                print(
-                    f"  /skill-create-{mode} <任务目录> "
-                    f"--skill {skill_id} --optimize"
-                )
-            return 2
-        print(f"按生成记录重新蒸馏: 来源任务 {source}")
-        if str(report_data.get("mode") or "") == "guidance":
-            # hints_updated 的目标可能是手写 workflow skill —— 只重写 hints 小节
-            # （overwrite=False 走 update 路径）；hints-only scaffold 才整目录覆盖。
-            report = create_guidance_skill_from_task(
-                source,
-                skill_id=skill_id,
-                skills_dir=root,
-                phase_id=str(report_data.get("phase") or ""),
-                overwrite=str(report_data.get("status") or "") == "created",
-                objective_judge=None if no_judge else _build_objective_judge(config_path),
-            )
-        else:
-            report = create_skill_from_task(
-                source,
-                skill_id=skill_id,
-                skills_dir=root,
-                phase_id=str(report_data.get("phase") or ""),
-                overwrite=True,
-                objective_judge=None if no_judge else _build_objective_judge(config_path),
-                trial_runner=None if no_test else _build_trial_runner(config_path),
-                run_trial=not no_test,
-                harden=harden,
-            )
-    except Exception as exc:  # CLI must never crash the prompt loop
-        print(f"retry 失败: {exc}")
-        return 1
-    return _print_skill_create_report(report, verbose=verbose)
-
-
-def _handle_skill_create_command(line: str, *, config_path: Optional[str] = None) -> int:
-    """Route the three /skill-create* commands.
-
-    -workflow / -guidance distill a past task into a draft skill (dedup first,
-    then quality gates); skill/suite names come from --skill/--suite flags (no
-    longer positional — avoids the 07-06 "CJK note swallowed as skill_id" trap).
-    Bare /skill-create keeps --recheck/--retry for maintaining an existing dir."""
-    tokens = _skill_create_tokens(line)
-    cmd = _skill_create_command_of(tokens)
-    if not cmd:
-        print(_SKILL_CREATE_USAGE)
-        return 2
-    optimize = "--optimize" in tokens or "--force" in tokens  # --force: legacy alias
-    force_new = "--new" in tokens
-    no_test = "--no-test" in tokens
-    no_judge = "--no-judge" in tokens
-    no_harden = "--no-harden" in tokens
-    verbose = "--verbose" in tokens
-    allow_unvalidated = "--allow-unvalidated" in tokens
-    recheck = "--recheck" in tokens
-    retry = "--retry" in tokens
-    # 取值 flag（缺值 → None → 用法错误）
-    skill_id, tokens = _extract_flag_value(tokens, "--skill")
-    suite, tokens = _extract_flag_value(tokens, "--suite")
-    phase_id, tokens = _extract_flag_value(tokens, "--phase")
-    if skill_id is None or suite is None or phase_id is None:
-        print(_SKILL_CREATE_USAGE)
-        return 2
-    positional = [t for t in tokens[1:] if not t.startswith("--")]
-
-    # 裸 /skill-create：只做维护（recheck/retry），新建蒸馏引导到两个显式命令
-    if cmd == "/skill-create":
-        if recheck or retry:
-            if (recheck and retry) or not positional:
-                print(_SKILL_CREATE_USAGE)
-                return 2
-            target = skill_id or positional[0]  # --skill 或位置参数皆可
-            if recheck:
-                return _handle_skill_recheck(
-                    target,
-                    config_path=config_path,
-                    no_test=no_test,
-                )
-            return _handle_skill_retry(target, config_path=config_path,
-                                       no_test=no_test, no_judge=no_judge,
-                                       verbose=verbose, harden=not no_harden)
-        print("蒸馏新技能请用显式命令：")
-        print("  /skill-create-workflow <任务目录> [--skill <名称>] [--suite <名称>] [--phase <phaseId>]")
-        print("  /skill-create-guidance <任务目录> [--skill <名称>] [--suite <名称>] [--phase <phaseId>]")
-        print(_SKILL_CREATE_USAGE)
-        return 2
-
-    if not positional or (optimize and force_new):
-        print(_SKILL_CREATE_USAGE)
-        print("示例: /skill-create-workflow worktree/5d69c57de8c0454893ea782940b97a1d"
-              " --skill taaft-detail-extract --suite taaft-trending")
-        return 2
-    path, rest = _recover_task_path(positional)
-    if rest:  # skill/suite 走 flag 了，剩下的 positional 都是被忽略的附加说明
-        print("已忽略附加说明: " + " ".join(rest))
-    decision = "optimize" if optimize else ("new" if force_new else "")
-    try:
-        if cmd == "/skill-create-guidance":
-            from harness.skill.create import create_guidance_skill_from_task
-            report = create_guidance_skill_from_task(
-                path,
-                skill_id=skill_id,
-                suite=suite,
-                phase_id=phase_id,
-                decision=decision,
-                confirm=_confirm_skill_create if sys.stdin.isatty() else None,
-                objective_judge=None if no_judge else _build_objective_judge(config_path),
-                allow_unvalidated=allow_unvalidated,
-            )
-        else:  # /skill-create-workflow
-            from harness.skill.create import create_skill_from_task
-            report = create_skill_from_task(
-                path,
-                skill_id=skill_id,
-                suite=suite,
-                phase_id=phase_id,
-                decision=decision,
-                confirm=_confirm_skill_create if sys.stdin.isatty() else None,
-                objective_judge=None if no_judge else _build_objective_judge(config_path),
-                trial_runner=None if no_test else _build_trial_runner(config_path),
-                run_trial=not no_test,
-                harden=not no_harden,
-            )
-    except Exception as exc:  # CLI must never crash the prompt loop
-        print(f"skill-create 失败: {exc}")
-        return 1
-    return _print_skill_create_report(report, verbose=verbose)
 
 
 def _handle_skill_command(line: str, args: argparse.Namespace) -> str:
@@ -1452,34 +950,31 @@ def _handle_skill_command(line: str, args: argparse.Namespace) -> str:
     tokens = line.split()
     arg = tokens[1] if len(tokens) > 1 else ""
     inline_task = " ".join(tokens[2:]).strip()
-    ids = _available_skill_ids()
-    suites = _available_suite_names()
+    from runtime_config import load_runtime_config
+    runtime = load_runtime_config(getattr(args, "config", "config.json"))
+    catalog = _skill_catalog_for_runtime(runtime)
+    try:
+        catalog.sync_existing()
+        rows = catalog.list()
+    finally:
+        catalog.close()
+    ids = [row["skill_id"] for row in rows]
     if not arg or arg in ("list", "ls", "?"):
-        print("可用技能:", ", ".join(_skill_display_lines()) or "(无)")
-        if suites:
-            print("可用技能组(suite):", ", ".join(suites))
+        print("可用技能:", "\n".join(_skill_listing(row) for row in rows) or "(无)")
         if args.skill:
             print(f"当前已选: {args.skill}")
-        print("用法: /skill <id|suite> 选取；/skill off 取消；/skill 列出；"
-              "/skill-create-workflow|-guidance <任务目录> 从历史任务蒸馏新技能")
+        print("用法: /skill <确切Skill名> 选取；/skill off 取消；"
+              "/skill-create @<task_id> 需求；/<某个Skill名> @<task_id> 修复建议")
         return ""
     if arg in ("off", "none", "clear", "-"):
         args.skill = ""
         print("已取消技能强制。")
         return inline_task
-    # /skill <name>：name 可以是单个 skill_id 或一个 suite 名（展开成成员集合）。
-    # forced_skill_id 携逗号分隔集合串，spawn 时按 phase 四维路由到唯一成员。
-    expanded, is_suite = _expand_skill_selection(arg)
-    if not expanded:
-        avail = ", ".join(ids) + (f"；技能组: {', '.join(suites)}" if suites else "")
-        print(f"未知技能/技能组 {arg!r}。可用: {avail or '(无)'}")
+    if arg not in ids:
+        print(f"未知 Skill {arg!r}。可用: {', '.join(ids) or '(无)'}")
         return ""
-    args.skill = ",".join(expanded)
-    if is_suite:
-        print(f"已选技能组: {arg} → {', '.join(expanded)}"
-              "（各阶段按四维路由到对应成员；不匹配的阶段自动回落）")
-    else:
-        print(f"已选技能: {arg}（本次运行强制使用；变量无法派生的阶段会自动回落）")
+    args.skill = arg
+    print(f"已选 Skill: {arg}（执行时绑定当前版本）")
     return inline_task
 
 
@@ -1532,16 +1027,16 @@ def read_task(args: argparse.Namespace) -> str:
         print(f"当前配置默认：{configured_mode}；请选择后再输入任务。")
     while True:
         prompt = (
-            f"[{selected_mode}] 请输入浏览器任务（/resume <任务目录> 恢复未完成的原任务；"
-            "可先用 /skill <id|suite> 指定技能，/skill 列出，"
-            "/skill-create-workflow|-guidance <任务目录> 蒸馏新技能）: "
+            f"[{selected_mode}] 请输入浏览器任务（/resume <任务目录> [补充指令]；"
+            "可先用 /skill <确切名称> 指定技能，/skill 列出；"
+            "/skill-create @<task_id> 创建，/<确切Skill名> @<task_id> 修复）: "
             if selected_mode
             else "模式未选择> "
         )
         line = input(prompt).strip()
-        # /skill-create* must route BEFORE /skill (shared prefix)
-        if _is_skill_create_command(line):
-            _handle_skill_create_command(line, config_path=getattr(args, "config", None))
+        from harness.skill_builder.commands import recognizes as is_builder_command
+        if is_builder_command(line, config_path=getattr(args, "config", "config.json")):
+            _handle_skill_builder_command(line, config_path=getattr(args, "config", "config.json"))
             continue
         if _handle_agent_mode_command(line, args):
             selected_mode = str(getattr(args, "agent_mode", "") or "").strip().lower()
@@ -1560,10 +1055,6 @@ def read_task(args: argparse.Namespace) -> str:
                 return resumed
             continue
         return line
-
-
-
-
 
 
 def _print_task_plan_review(plan: Dict[str, Any], candidate_hash: str) -> None:
@@ -1685,15 +1176,12 @@ def _handle_resume_command(
         print(f"/resume 参数错误: {exc}")
         return None
     if len(tokens) < 2:
-        print("用法: /resume <worktree任务目录>（仅恢复原任务）")
+        print("用法: /resume <worktree任务目录> [补充指令]")
         return None
     path, rest = _recover_task_path(tokens[1:])
-    if rest:
-        print("/resume 仅恢复原任务，不接受新指令。新目标请新建任务。")
-        return None
     args.resume = path
-    args.resume_instruction = ""
-    return ""
+    args.resume_instruction = " ".join(rest).strip()
+    return args.resume_instruction
 
 
 def _validate_resume_mode(manifest: Optional[JsonDict], plan: JsonDict, selected: str) -> str:
@@ -1711,7 +1199,7 @@ def _validate_resume_mode(manifest: Optional[JsonDict], plan: JsonDict, selected
 
 
 def _resolve_resume_directory(raw_path: str) -> Path:
-    """Resolve an existing task directory without ever creating it."""
+    """Resolve a registered DB task or existing directory without creating it."""
 
     raw = str(raw_path or "").strip()
     if not raw:
@@ -1721,16 +1209,20 @@ def _resolve_resume_directory(raw_path: str) -> Path:
     if not candidate.is_absolute():
         candidates.append(Path(__file__).resolve().parent / candidate)
         if re.fullmatch(r"[0-9a-fA-F]{32}", raw):
-            candidates.append(Path(__file__).resolve().parent / "worktree" / raw.lower())
+            root = resume_worktree_dir() or Path(__file__).resolve().parent / "worktree"
+            candidates.insert(0, root / raw.lower())
     for item in candidates:
         try:
-            resolved = item.resolve(strict=True)
-        except (FileNotFoundError, OSError):
+            resolved = item.resolve(strict=False)
+        except OSError:
             continue
         if resolved.is_dir():
             return resolved
+        if not resolved.exists() and database_has_task(resolved):
+            return resolved
     raise ValueError(
-        "worktree 目录不存在或已被删除；无法恢复，也不会自动重建空任务目录"
+        "任务在数据库中不存在，且 worktree 目录不存在或已被删除；"
+        "无法恢复，也不会自动重建空任务目录"
     )
 
 
@@ -1807,6 +1299,28 @@ def _new_run_id(*, resumed: bool) -> str:
     return f"{prefix}-{timestamp}-{uuid.uuid4().hex[:8]}"
 
 
+def _create_task_logger(runtime, *, task_id: Optional[str] = None) -> RunLogger:
+    """Select storage before the logger decides whether it needs directories."""
+
+    storage = create_storage_from_config(
+        runtime.harness,
+        worktree_dir=runtime.harness.worktree_dir,
+        on_revision_conflict=lambda detail: logger.write("storage.revision_conflict", detail),
+        on_verify=lambda report: logger.write("storage.dual_verify", report),
+    )
+    try:
+        logger = RunLogger(
+            runtime.harness.worktree_dir,
+            task_id=task_id,
+            on_event=ConsoleProgressReporter(),
+            storage=storage,
+        )
+    except Exception:
+        storage.close()
+        raise
+    return logger
+
+
 def _open_task_storage(logger, runtime) -> None:
     """Attach the configured backend and open this launch's run row.
 
@@ -1816,7 +1330,7 @@ def _open_task_storage(logger, runtime) -> None:
     """
 
     def _report_revision_conflict(detail: JsonDict) -> None:
-        # Raised outside the failed transaction. With .run.lock holding other
+        # Raised outside the failed transaction. With the run lock holding other
         # processes off, this normally means two callbacks inside this process
         # raced - worth seeing, not worth failing over.
         logger.write("storage.revision_conflict", detail)
@@ -1824,13 +1338,16 @@ def _open_task_storage(logger, runtime) -> None:
     def _report_verification(report: JsonDict) -> None:
         logger.write("storage.dual_verify", report)
 
-    storage = create_storage_from_config(
-        runtime.harness,
-        worktree_dir=runtime.harness.worktree_dir,
-        on_revision_conflict=_report_revision_conflict,
-        on_verify=_report_verification,
-    )
-    logger.attach_storage(storage)
+    if logger.storage_attached:
+        storage = logger.storage
+    else:
+        storage = create_storage_from_config(
+            runtime.harness,
+            worktree_dir=runtime.harness.worktree_dir,
+            on_revision_conflict=_report_revision_conflict,
+            on_verify=_report_verification,
+        )
+        logger.attach_storage(storage)
     try:
         storage.create_task(
             task_id=logger.task_id,
@@ -1850,6 +1367,14 @@ def _open_task_storage(logger, runtime) -> None:
         except Exception:
             pass
         raise
+
+
+def _run_log_location(logger, runtime) -> str:
+    if db_authoritative_for(logger):
+        database = resolve_sqlite_path(
+            runtime.harness.storage_sqlite_path, runtime.harness.worktree_dir)
+        return f"SQLite {database}（任务 {logger.task_id}）"
+    return str(logger.path)
 
 
 def _close_task_storage(
@@ -2499,7 +2024,7 @@ _BROWSER_MODE_STATUS_LABELS = {
 }
 
 
-def _print_browser_mode_summary(result: JsonDict, task_dir: str) -> None:
+def _print_browser_mode_summary(result: JsonDict, task_dir: str, *, logger=None) -> None:
     """Human summary printed before the machine receipt of browser mode.
 
     The browser-mode CLI result is a machine receipt (an embedding host parses
@@ -2529,15 +2054,31 @@ def _print_browser_mode_summary(result: JsonDict, task_dir: str) -> None:
         if isinstance(parsed, dict) and (parsed.get("blockers") or parsed.get("next_steps")):
             # The synthesized fallback receipt: unwrap its human fields
             # instead of printing one escaped JSON line.
-            for blocker in parsed.get("blockers") or []:
-                print(f"阻塞: {blocker}", flush=True)
-            for step_text in parsed.get("next_steps") or []:
-                print(f"下一步: {step_text}", flush=True)
+            for key, label in (("blockers", "阻塞"), ("next_steps", "下一步")):
+                items = parsed.get(key) or []
+                for item in items[:4]:
+                    if isinstance(item, dict):
+                        item = item.get("detail") or item.get("reason") or item.get("message") or item.get("type") or "见完整回执"
+                    print(f"{label}: {str(item)[:400]}", flush=True)
+                if len(items) > 4:
+                    print(f"其余 {len(items) - 4} 项见完整回执。", flush=True)
         elif isinstance(parsed, dict) and parsed.get("evidence"):
             for path in parsed.get("evidence") or []:
-                print(f"产物: {path}", flush=True)
+                if isinstance(path, str) and (path.startswith(("/", "https://", "http://"))):
+                    print(f"产物: {path}", flush=True)
+        elif isinstance(parsed, dict):
+            if parsed.get("summary"):
+                print(str(parsed["summary"]), flush=True)
         else:
             print(answer, flush=True)
+    delivery = result.get("artifactDelivery")
+    if isinstance(delivery, dict) and delivery.get("status") == "failed":
+        print(
+            "产物导出失败：有提取文件路径无法直接打开；"
+            "数据仍保存在任务数据库中。"
+            f" 原因：{delivery.get('error')}",
+            flush=True,
+        )
     error = result.get("error")
     reason = error.get("message") if isinstance(error, dict) else error
     reason = str(reason or result.get("reason") or "").strip()
@@ -2554,7 +2095,9 @@ def _print_browser_mode_summary(result: JsonDict, task_dir: str) -> None:
                 if isinstance(finding, dict) and finding.get("blocking"):
                     print(f"  · {finding.get('reason') or finding}", flush=True)
         if isinstance(review, dict) and review.get("auditPath"):
-            print(f"审核记录: {review['auditPath']}", flush=True)
+                print(f"审核记录: {review['auditPath']}", flush=True)
+    if result.get("receiptPath"):
+        print(f"完整回执: {result['receiptPath']}", flush=True)
     if status in {"done", "completed", "validated_done"}:
         return
     # Resume reads task_plan.json. A run that died before a plan was accepted
@@ -2562,7 +2105,10 @@ def _print_browser_mode_summary(result: JsonDict, task_dir: str) -> None:
     # different error (verified on run c7c931b7: ResumeStateError, "task plan
     # is missing").
     plan_path = Path(task_dir) / "task_plan.json" if task_dir else None
-    if plan_path is not None and plan_path.exists():
+    from harness.utils import task_file_exists
+    plan_exists = (task_file_exists(logger, str(plan_path)) if logger is not None and plan_path is not None
+                   else plan_path is not None and plan_path.is_file())
+    if plan_exists:
         print(
             "\n继续: python main.py --config config.json"
             f"\n然后输入 /browser，再输入 /resume {task_dir}",
@@ -2575,231 +2121,6 @@ def _print_browser_mode_summary(result: JsonDict, task_dir: str) -> None:
             flush=True,
         )
 
-
-def _browser_mode_failure(
-    harness: LeadAgent,
-    *,
-    code: str,
-    error: str,
-    tool_was_executed: bool = False,
-) -> JsonDict:
-    """Single logged exit for every terminal browser-mode abort.
-
-    Run 18daa415 ended on a structured early return that wrote no event at
-    all, leaving run.jsonl with nothing to diagnose beyond an empty usage
-    summary. Every failure exit from browser mode goes through here so a
-    failed run always says why it failed in its own log.
-    """
-    _safe_logger_write(
-        harness.logger,
-        "direct_mode.failed",
-        {
-            "code": code,
-            "error": error,
-            "toolWasExecuted": tool_was_executed,
-        },
-    )
-    return {
-        "status": "failed",
-        "error": error,
-        "code": code,
-        "tool_was_executed": tool_was_executed,
-    }
-
-
-async def _run_browser_mode(
-    harness: LeadAgent,
-    *,
-    task: str,
-    original_task: str,
-    resume_context: Optional[ResumeContext],
-) -> JsonDict:
-    """Run the explicit browser entry without a Lead model turn.
-
-    LeadAgent remains the shared execution host because the direct worker path
-    uses its coordinator, lifecycle, assignment review and persistence methods.
-    Dispatch acknowledges startup; this entry must collect the worker's actual
-    result before the CLI can finish the run. It makes no Lead model turn and
-    never automatically dispatches a continuation.
-    """
-    if resume_context is not None:
-        if str(resume_context.instruction or "").strip():
-            return _browser_mode_failure(
-                harness,
-                code="browser_mode_resume_instruction_unsupported",
-                error="browser mode cannot apply a new instruction to a resumed plan",
-            )
-        plan = resume_context.current_plan
-        phases = plan.get("phases") if isinstance(plan, dict) else None
-        if (
-            not isinstance(plan, dict)
-            or plan.get("execution_mode") not in {"delegated", "direct_worker"}
-            or not isinstance(phases, list)
-            or len(phases) != 1
-        ):
-            return _browser_mode_failure(
-                harness,
-                code="browser_mode_resume_plan_unsupported",
-                error="browser mode resume requires one accepted delegated phase",
-            )
-        harness.original_user_task = str(resume_context.original_user_task or task)
-        harness.spawner.root_task = harness.original_user_task
-        await harness._bootstrap_schema_cache()
-        result = await _lead_spawn_browser_agent(ToolContext(
-            agent=harness,
-            tool_call={"name": "spawn_browser_agent", "id": "browser-resume"},
-            tool_input={"phase_id": str(phases[0].get("id") or "")},
-            step=0,
-        ))
-        if not isinstance(result, dict):
-            return _browser_mode_failure(
-                harness, code="browser_mode_resume_no_receipt",
-                error="direct resume returned no receipt",
-            )
-        return await _wait_for_browser_mode_result(harness, result)
-
-    fleet_reference = str(
-        getattr(harness, "task_fleet_reference", "") or ""
-    ).strip()
-    if not fleet_reference:
-        fleet_reference, fleet_error = extract_fleet_reference(original_task)
-        if fleet_error:
-            return _browser_mode_failure(
-                harness,
-                code="browser_mode_fleet_reference_invalid",
-                error=fleet_error,
-            )
-        # Normal CLI construction sets this once before the Lead is created.
-        # Keep direct programmatic callers on the same control-plane route.
-        harness.task_fleet_reference = fleet_reference or ""
-
-    harness.logger.write("direct_mode.assignment_started", {
-        "fleetReferenceSource": "task_text" if fleet_reference else None,
-    })
-    harness.original_user_task = str(original_task or task)
-    harness.spawner.root_task = harness.original_user_task
-    await harness._bootstrap_schema_cache()
-    result = await _submit_direct_plan(harness, original_task)
-    return await _wait_for_browser_mode_result(harness, result)
-
-
-async def _wait_for_browser_mode_result(
-    harness: LeadAgent, spawned: JsonDict,
-) -> JsonDict:
-    """Collect exactly the dispatched worker, preserving its evidence and status.
-
-    The spawn tool stays asynchronous for Lead orchestration. Waiting here has
-    no polling or replay policy; cancellation is handled by the CLI owner while
-    storage is still open.
-    """
-    if spawned.get("status") != "running":
-        return spawned
-    worker_id = spawned.get("workerId")
-    if not isinstance(worker_id, str) or not worker_id.strip():
-        return _browser_mode_failure(
-            harness, code="browser_mode_worker_receipt_invalid",
-            error="Worker startup returned running without a workerId.",
-            tool_was_executed=True,
-        )
-    waited = await _lead_wait_browser_agents(ToolContext(
-        agent=harness,
-        tool_call={"name": "wait_browser_agents", "id": "browser-wait"},
-        tool_input={"worker_ids": [worker_id], "mode": "all"},
-        step=0,
-    ))
-    completed = waited.get("completed") if isinstance(waited, dict) else None
-    matches = [item for item in (completed if isinstance(completed, list) else [])
-               if isinstance(item, dict) and item.get("workerId") == worker_id]
-    phase_id = spawned.get("phaseId")
-    if (len(matches) != 1
-            or worker_id in (waited.get("pending") or [])
-            or not matches[0].get("status")
-            or matches[0]["status"] == "running"
-            or (phase_id and matches[0].get("phaseId") != phase_id)):
-        return _browser_mode_failure(
-            harness, code="browser_mode_worker_receipt_invalid",
-            error=f"Wait returned no consistent terminal receipt for {worker_id}.",
-            tool_was_executed=True,
-        )
-    result = dict(matches[0])
-    worker_status = result["status"]
-    # Preserve the former direct entry's contract requirement without treating
-    # contract validation alone as proof of goal completion.
-    if worker_status == "done" and result.get("validatedStatus") != "validated_done":
-        result["status"] = "incomplete"
-        result["reason"] = (
-            "Worker reported done, but the assignment contract was not validated "
-            f"(validatedStatus={result.get('validatedStatus') or 'missing'})."
-        )
-    result["directExecution"] = {
-        "mode": "browser", "workerId": worker_id,
-        "phaseId": phase_id, "workerStatus": worker_status,
-    }
-    for key in ("assignmentId", "assignmentAccepted", "assignmentReview", "budget"):
-        if key in spawned:
-            result[key] = spawned[key]
-    for key in ("connectionRecovery", "operatorInputRecords", "scheduleSnapshot"):
-        if key in waited:
-            result[key] = waited[key]
-    return result
-
-
-def _browser_mode_terminal_error(result: JsonDict) -> Optional[JsonDict]:
-    """A durable reason for a non-success receipt, without inventing a cause."""
-    status = str(result.get("status") or "unknown")
-    if status in {"done", "completed", "validated_done"}:
-        return None
-    error = result.get("error")
-    detail = error.get("message") if isinstance(error, dict) else error
-    failure = {
-        "code": result.get("code") or "browser_mode_not_completed",
-        "message": str(detail or result.get("reason")
-                       or f"Browser execution ended with status={status}.")[:2000],
-        "status": status,
-        "workerId": result.get("workerId"),
-        "validatedStatus": result.get("validatedStatus"),
-    }
-    review = result.get("review")
-    if isinstance(review, dict):
-        failure["review"] = {
-            key: review[key] for key in ("status", "auditPath", "errors", "verdict")
-            if key in review
-        }
-    if isinstance(result.get("errors"), list):
-        failure["errors"] = result["errors"]
-    return failure
-
-
-async def _shutdown_browser_mode(harness: LeadAgent) -> bool:
-    """Drain cancellation records before storage closes, even on another cancel."""
-    shutdown = asyncio.create_task(harness.spawner.shutdown())
-    cancelled = False
-    while True:
-        try:
-            await asyncio.shield(shutdown)
-            return cancelled
-        except asyncio.CancelledError:
-            if shutdown.done():
-                # An internal shutdown cancellation is a cleanup failure, not
-                # permission to quietly close storage with unfinished workers.
-                shutdown.result()
-                return True
-            cancelled = True
-
-
-async def _submit_direct_plan(harness: LeadAgent, original_task: str) -> JsonDict:
-    assignment = {"task": str(original_task or "").strip()}
-    result = await _lead_spawn_browser_agent(ToolContext(
-        agent=harness,
-        tool_call={"name": "spawn_browser_agent", "id": "browser-assignment"},
-        tool_input={"assignment": assignment},
-        step=0,
-    ))
-    return result if isinstance(result, dict) else _browser_mode_failure(
-        harness,
-        code="browser_mode_direct_pipeline_no_receipt",
-        error="browser mode direct pipeline returned no receipt",
-    )
 
 async def _run_cli_impl(args: argparse.Namespace) -> int:
     global _CANCELLED_LOGGED, _LAST_LOGGER
@@ -2816,9 +2137,8 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
     # that was actually parsed rather than letting them re-guess it.
     configure_resume_storage(
         backend=runtime.harness.storage_backend,
-        sqlite_path=resolve_sqlite_path(
-            runtime.harness.storage_sqlite_path, runtime.harness.worktree_dir
-        ),
+        worktree_dir=runtime.harness.worktree_dir,
+        sqlite_path=runtime.harness.storage_sqlite_path,
     )
     if args.agent_id:
         runtime.agent_id = args.agent_id
@@ -2834,34 +2154,23 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
         runtime.harness.agent_mode = requested_mode
     agent_mode = str(getattr(runtime.harness, "agent_mode", "lead") or "lead").strip().lower()
     resume_requested = bool(str(getattr(args, "resume", "") or "").strip())
-    if resume_requested and str(task or "").strip():
-        print("/resume 仅恢复原任务，不接受 --task 或附加新指令；请新建任务。", flush=True)
-        return CLI_INPUT_ERROR_EXIT_CODE
     if not task and not resume_requested:
         print("没有收到任务。")
         return 2
-    if _is_skill_create_command(task):
-        return _handle_skill_create_command(task, config_path=getattr(args, "config", None))
-    # --skill / interactive /skill both land on args.skill; force it for this run
-    # without editing config. A name may be a skill_id OR a suite; expand each
-    # segment to member ids (idempotent — interactive /skill already comma-joins,
-    # and skill_id→itself), dedup preserving order. forced_skill_id then carries
-    # the collection string that apply_forced_skill routes per phase.
+    from harness.skill_builder.commands import recognizes as is_builder_command
+    if is_builder_command(task, config_path=args.config):
+        return _handle_skill_builder_command(task, config_path=args.config)
+    # Explicit selection binds one immutable Skill version for this task.
     forced_skill = str(getattr(args, "skill", "") or "").strip()
-    if forced_skill:
-        seen: set = set()
-        final: List[str] = []
-        for part in (p.strip() for p in forced_skill.split(",") if p.strip()):
-            exp, _is_suite = _expand_skill_selection(part)
-            for sid in (exp or [part]):
-                if sid not in seen:
-                    seen.add(sid)
-                    final.append(sid)
-        forced_skill = ",".join(final)
+    if forced_skill and not resume_requested:
+        try:
+            forced_hash = _selected_skill_version(runtime, forced_skill)
+        except ValueError as exc:
+            print(str(exc), flush=True)
+            return CLI_INPUT_ERROR_EXIT_CODE
         runtime.harness.forced_skill_id = forced_skill
-        print(f"技能强制: {forced_skill}", flush=True)
-    elif not resume_requested:
-        _hint_matching_skills(task)
+        runtime.harness.forced_skill_hash = forced_hash
+        print(f"已选 Skill: {forced_skill}@{forced_hash[:12]}", flush=True)
 
     logger: Optional[RunLogger] = None
     harness: Optional[LeadAgent] = None
@@ -2878,12 +2187,37 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
         if resume_requested:
             try:
                 task_dir = _resolve_resume_directory(args.resume)
+                runtime.harness.worktree_dir = str(task_dir.parent)
+                configure_resume_storage(
+                    backend=runtime.harness.storage_backend,
+                    worktree_dir=runtime.harness.worktree_dir,
+                    sqlite_path=runtime.harness.storage_sqlite_path,
+                )
                 # The lock is acquired before reading the generation so a live
                 # process cannot change plan/state between validation and use.
                 run_lock = acquire_run_lock(task_dir)
+                promote_legacy_task_to_database(task_dir)
                 current_plan = load_task_plan_strict(task_dir)
                 prior_state = load_task_state_strict(task_dir)
                 manifest = load_task_manifest(task_dir)
+                if manifest is not None:
+                    runtime.harness.worktree_dir = str(task_dir.parent)
+                    saved_skill = str(manifest.get("forced_skill_id") or "")
+                    saved_hash = str((manifest.get("startup_args") or {}).get("forced_skill_hash") or "")
+                    if forced_skill and forced_skill != saved_skill:
+                        raise ResumeStateError("恢复任务不能改选 Skill")
+                    if saved_skill:
+                        if not saved_hash:
+                            raise ResumeStateError("旧任务未绑定 Skill 版本，无法安全恢复")
+                        catalog = _skill_catalog_for_runtime(runtime)
+                        try:
+                            if catalog.version_path(saved_skill, saved_hash) is None:
+                                raise ResumeStateError("恢复任务的 Skill 版本快照不可用")
+                        finally:
+                            catalog.close()
+                        runtime.harness.forced_skill_id = saved_skill
+                        runtime.harness.forced_skill_hash = saved_hash
+                        forced_skill = saved_skill
                 _validate_resume_mode(manifest, current_plan, agent_mode)
                 current_plan, plan_alias_recovery = reconcile_torn_plan_alias(
                     task_dir,
@@ -2916,15 +2250,28 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                             "恢复原始任务；请在交互模式下重述原始任务"
                         )
 
+                if str(task or "").strip():
+                    original_fleet, original_fleet_error = extract_fleet_reference(
+                        original_user_task)
+                    amendment_fleet, amendment_fleet_error = extract_fleet_reference(task)
+                    if original_fleet_error or amendment_fleet_error:
+                        raise ResumeStateError(original_fleet_error or amendment_fleet_error)
+                    if amendment_fleet and not (
+                        original_fleet and (
+                            original_fleet.startswith(amendment_fleet)
+                            or amendment_fleet.startswith(original_fleet)
+                        )
+                    ):
+                        raise ResumeStateError(
+                            "补充指令不能将已恢复任务改绑到其他 @Fleet；"
+                            "请沿用原任务的 Fleet 或创建新任务"
+                        )
+
                 initial_plan, initial_plan_recovered = _load_initial_plan(
                     task_dir, current_plan,
                 )
                 runtime.harness.worktree_dir = str(task_dir.parent)
-                logger = RunLogger(
-                    str(task_dir.parent),
-                    task_id=task_dir.name,
-                    on_event=ConsoleProgressReporter(),
-                )
+                logger = _create_task_logger(runtime, task_id=task_dir.name)
                 logger.run_id = _new_run_id(resumed=True)
                 logger.context_run_id = logger.run_id
                 logger.resumed_from = str(task_dir.resolve())
@@ -2948,6 +2295,16 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
 
                 reconciled_state = report["state"]
                 write_task_state(logger, reconciled_state)
+                if str(task or "").strip():
+                    from harness.planning.context import retain_operator_inputs
+                    input_record = {
+                        "inputId": f"resume:{logger.run_id}",
+                        "source": "resume_cli", "taskId": logger.task_id,
+                        "runId": logger.run_id, "text": task,
+                        "receivedAt": datetime.now(timezone.utc).isoformat(),
+                    }
+                    retain_operator_inputs(logger, [input_record])
+                    logger.write("resume.instruction_received", input_record)
                 if manifest is None:
                     write_task_manifest(
                         logger,
@@ -2997,6 +2354,9 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                         task_id=logger.task_id,
                     )
                 )
+                from harness.planning.context import user_context
+                prompt_report["operatorInputs"] = user_context(
+                    logger, original_user_task)["operatorInputs"]
                 prompt_report["browserRecovery"] = {
                     "candidateRecorded": bool(browser_hint),
                     "status": (
@@ -3069,10 +2429,7 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                 print(f"无法恢复任务: {exc}", flush=True)
                 return 2
         else:
-            logger = RunLogger(
-                runtime.harness.worktree_dir,
-                on_event=ConsoleProgressReporter(),
-            )
+            logger = _create_task_logger(runtime)
             logger.run_id = _new_run_id(resumed=False)
             run_lock = acquire_run_lock(logger.task_dir)
             _open_task_storage(logger, runtime)
@@ -3087,6 +2444,7 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                 startup_args={
                     "max_steps": getattr(args, "max_steps", None),
                     "agent_mode": agent_mode,
+                    "forced_skill_hash": str(getattr(runtime.harness, "forced_skill_hash", "") or ""),
                 },
             )
             runtime.harness.runs_dir = str(logger.task_dir)
@@ -3199,29 +2557,33 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
             print(f"任务已创建: {logger.task_id}", flush=True)
         print(f"模式: {agent_mode}", flush=True)
         print(f"任务目录: {logger.task_dir}", flush=True)
-        print(f"运行日志: {logger.path}", flush=True)
+        print(f"运行日志: {_run_log_location(logger, runtime)}", flush=True)
         if resume_context is not None:
-            print("按原计划恢复：先检查浏览器连接；连接不可用时停止，不调用模型或派发 worker。", flush=True)
+            label = "带补充指令继续" if resume_context.instruction else "按原计划恢复"
+            print(f"{label}：先检查浏览器连接；连接不可用时停止，不调用模型或派发 worker。", flush=True)
         elif agent_mode == "browser":
-            print("Browser 模式：先做轻量任务分类，再进入直达 worker。", flush=True)
+            print("Browser 模式：直接启动 BrowserAgent，执行中维护任务清单。", flush=True)
         elif sys.stdin.isatty():
             print("开始生成执行计划；确认前不会启动 BrowserAgent。", flush=True)
         else:
             print("开始执行，关键进度会在这里显示。", flush=True)
 
-        provider = LLMFactory.create_provider(lead_agent_model_config(runtime))
-        harness = LeadAgent(
-            provider,
-            runtime,
-            logger,
-            resume=resume_context,
-            task_fleet_reference=task_fleet_reference or "",
-            plan_approval_handler=(
-                (lambda plan, candidate_hash: _terminal_plan_approval(
-                    plan, candidate_hash, runtime=runtime, logger=logger
-                )) if sys.stdin.isatty() else None
-            ),
-        )
+        if agent_mode == "browser":
+            harness = BrowserTaskRunner(
+                runtime, logger, resume=resume_context,
+                task_fleet_reference=task_fleet_reference or "",
+            )
+        else:
+            harness = LeadAgent(
+                LLMFactory.create_provider(lead_agent_model_config(runtime)),
+                runtime, logger, resume=resume_context,
+                task_fleet_reference=task_fleet_reference or "",
+                plan_approval_handler=(
+                    (lambda plan, candidate_hash: _terminal_plan_approval(
+                        plan, candidate_hash, runtime=runtime, logger=logger
+                    )) if sys.stdin.isatty() else None
+                ),
+            )
         if agent_mode == "browser":
             browser_result = await _run_browser_mode(
                 harness,
@@ -3229,12 +2591,48 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                 original_task=task,
                 resume_context=resume_context,
             )
-            # Human summary first; the machine receipt JSON follows below and
-            # remains the parseable contract for embedding hosts.
-            _print_browser_mode_summary(
-                browser_result, str(logger.task_dir or ""),
+            # Browser receipts still use savedPath for extraction evidence.
+            # In DB mode those paths are virtual during execution; export only
+            # the final receipt's extraction artifacts so a user can open the
+            # paths it presents without mirroring task logs to the worktree.
+            from harness.evidence.extraction_artifacts import (
+                export_extraction_artifacts_for_delivery,
             )
-            answer = json.dumps(browser_result, ensure_ascii=False, default=str)
+            try:
+                delivered = export_extraction_artifacts_for_delivery(
+                    logger, browser_result.get("artifacts") or [])
+            except Exception as exc:
+                detail = f"{type(exc).__name__}: {exc}"
+                browser_result["artifactDelivery"] = {
+                    "status": "failed", "error": detail,
+                }
+                logger.write("artifact.delivery_failed", {"error": detail})
+            else:
+                if delivered:
+                    browser_result["artifactDelivery"] = {
+                        "status": "done", "paths": delivered,
+                    }
+                    logger.write("artifact.delivery_exported", {
+                        "count": len(delivered), "paths": delivered,
+                    })
+            result_resource = logger.storage.save_resource(
+                task_id=logger.task_id, run_id=str(logger.run_id or ""),
+                resource_type="browser_task_result", logical_path="artifacts/browser-result.json",
+                media_type="application/json", content=json.dumps(browser_result, ensure_ascii=False, default=str),
+            )
+            output_mode = getattr(args, "output", "auto")
+            human_output = output_mode == "text" or output_mode == "auto" and sys.stdout.isatty()
+            if human_output or output_mode == "auto":
+                _print_browser_mode_summary(
+                    {**browser_result, "receiptPath": result_resource.get("saved_path") or
+                        f"数据库任务 {logger.task_id} / artifacts/browser-result.json"},
+                    str(logger.task_dir or ""),
+                    logger=logger,
+                )
+            if human_output:
+                answer = ""
+            else:
+                answer = json.dumps(browser_result, ensure_ascii=False, default=str)
             result_status = str(browser_result.get("status") or "failed").lower()
             run_error = _browser_mode_terminal_error(browser_result)
             run_status = (
@@ -3373,6 +2771,13 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
             cleanup_errors.extend(
                 _close_task_storage(logger, status=run_status, error=run_error)
             )
+        elif logger is not None and logger.storage_attached:
+            # Storage is selected before lock acquisition now; release handles
+            # even when startup fails before a run row can be opened.
+            try:
+                logger.storage.close()
+            except Exception as exc:
+                cleanup_errors.append(f"storage close failed: {type(exc).__name__}: {exc}")
         if run_lock is not None:
             try:
                 released = release_run_lock(run_lock)
@@ -3406,7 +2811,7 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
             return CLI_IO_FAILURE_EXIT_CODE
         if not _print_text(f"\n任务目录: {logger.task_dir}"):
             return CLI_IO_FAILURE_EXIT_CODE
-        if not _print_text(f"\n运行日志: {logger.path}"):
+        if not _print_text(f"\n运行日志: {_run_log_location(logger, runtime)}"):
             return CLI_IO_FAILURE_EXIT_CODE
     return exit_code
 
@@ -3436,6 +2841,8 @@ async def run_cli(args: argparse.Namespace) -> int:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="ABCP Browser Agent Harness")
+    parser.add_argument("--output", choices=("auto", "text", "json"), default="auto",
+                        help="Browser 结果格式：auto 在终端显示简报，管道保留 JSON；完整回执始终保存。")
     parser.add_argument("task", nargs="?", help="要交给浏览器 agent 完成的任务")
     parser.add_argument("--task", dest="task_option", help="要交给浏览器 agent 完成的任务")
     parser.add_argument("--config", default="config.json", help="配置文件路径")
@@ -3468,25 +2875,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def _main_impl(argv: Optional[Sequence[str]] = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
-    if raw_argv and raw_argv[0] in _SKILL_CREATE_COMMANDS:
+    from harness.skill_builder.commands import recognizes as is_builder_command
+    if raw_argv and is_builder_command(" ".join(shlex.quote(part) for part in raw_argv)):
         line = " ".join(shlex.quote(part) for part in raw_argv)
-        return _handle_skill_create_command(line)
+        return _handle_skill_builder_command(line)
     if raw_argv and raw_argv[0] == "/resume":
         if len(raw_argv) < 2:
-            print("用法: /resume <worktree任务目录>（仅恢复原任务）")
+            print("用法: /resume <worktree任务目录> [补充指令]")
             return 2
         path, rest = _recover_task_path(raw_argv[1:])
         raw_argv = ["--resume", path]
         if rest:
-            print("/resume 仅恢复原任务，不接受新指令；请新建任务。")
-            return CLI_INPUT_ERROR_EXIT_CODE
+            raw_argv.extend(["--task", " ".join(rest)])
         argv = raw_argv
 
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     if getattr(args, "list_skills", False):
-        ids = _available_skill_ids()
-        print("可用技能:", ", ".join(ids) or "(无)")
+        print("可用技能:", "\n".join(_available_skill_lines(args.config)) or "(无)")
         return 0
     try:
         asyncio.get_running_loop()

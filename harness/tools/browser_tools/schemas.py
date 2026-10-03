@@ -400,18 +400,28 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                 "runtime_policy": {
                     "type": "object",
                     "description": (
-                        "Optional legacy Runtime.evaluate metadata. It is never"
+                        "Optional Runtime.evaluate JSON recording. It is never"
                         " forwarded to ABCP and does not authorize, restrict, or"
-                        " classify the expression. result_mode=json and record_name"
-                        " retain the legacy JSON extraction envelope."
+                        " classify the expression. Set record_name to persist"
+                        " returned row objects directly, without copying them"
+                        " into a separate record_extraction call."
                     ),
                     "properties": {
                         "result_mode": {
                             "type": "string",
                             "enum": ["raw", "json"],
-                            "description": "Optional legacy JSON extraction envelope.",
+                            "description": "JSON result decoding; record_name automatically enables json mode.",
                         },
-                        "record_name": {"type": "string"},
+                        "record_name": {
+                            "type": "string",
+                            "description": (
+                                "Dataset name for direct persistence of Runtime results."
+                                " Return a row-object array or {rows:[...]} from the"
+                                " expression, without JSON.stringify; nested values"
+                                " are preserved. Inspect recordExtraction status and"
+                                " reuse its savedPath. Recording does not prove coverage."
+                            ),
+                        },
                     },
                     "additionalProperties": True,
                 },
@@ -460,39 +470,6 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                 },
             },
             "required": ["method", "params", "reason"],
-            "additionalProperties": False,
-        },
-        "execute_selected_skill": {
-            "type": "object",
-            "properties": {
-                "pageId": {
-                    "type": "string",
-                    "description": "Live pageId for the selected skill's frozen workflow.",
-                },
-                "fleetId": {
-                    "type": "string",
-                    "description": "Live fleetId for the page; pass \"\" only when unavailable.",
-                },
-                "variables": {
-                    "type": "object",
-                    "description": (
-                        "One workflow input row. Use this OR rows; pass {} when using rows."
-                    ),
-                    "additionalProperties": True,
-                },
-                "rows": {
-                    "type": "array",
-                    "description": (
-                        "Multiple workflow input rows executed strictly serially on the warm tab."
-                        " Use this OR variables; pass [] when using variables."
-                    ),
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": True,
-                    },
-                },
-            },
-            "required": ["pageId", "fleetId", "variables", "rows"],
             "additionalProperties": False,
         },
         "execute_browser_workflow": {

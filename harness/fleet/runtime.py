@@ -1520,9 +1520,67 @@ class PageLeasedBrowserClient:
 
     @staticmethod
     def _literal_page_ids(method: str, payload: Dict[str, Any]) -> set[str]:
-        """Collect explicit page handles without guessing Workflow variables."""
+        """Collect page handles, resolving only references known at admission.
+
+        Leave execution-dependent references guarded as before: an opaque
+        Workflow does not give us its future variables or step results.
+        """
 
         found: set[str] = set()
+        workflow = method == "Workflow.execute"
+        document = payload.get("workflow") or payload.get("_platformWorkflow")
+        variables = (
+            document.get("initialVariables", {})
+            if isinstance(document, dict) else payload.get("variables", {})
+        )
+        binding = payload.get("binding") or payload
+        written_variables: set[str] = set()
+
+        def collect_writes(steps: Any) -> None:
+            for step in steps if isinstance(steps, list) else ():
+                if not isinstance(step, dict):
+                    continue
+                extracts = step.get("extract")
+                if isinstance(extracts, dict):
+                    written_variables.update(extracts)
+                if step.get("type") == "transform" and isinstance(step.get("output"), str):
+                    written_variables.add(step["output"])
+                for branch in ("then", "else", "body"):
+                    collect_writes(step.get(branch))
+
+        collect_writes(document.get("steps") if isinstance(document, dict) else payload.get("steps"))
+
+        def page_handle(candidate: str) -> str:
+            if not workflow or not candidate.startswith("$"):
+                return candidate
+            if candidate.startswith("$context."):
+                value, path = binding, candidate[9:]
+            elif candidate in {"$last", "$cache", "$context", "$store"} or candidate.startswith(
+                ("$last.", "$cache.", "$store.")
+            ):
+                return candidate
+            else:
+                value = variables
+                path = candidate[6:] if candidate.startswith("$vars.") else candidate[1:]
+                # Workflow variables can have an exact dotted key as well as
+                # a nested object/array path; match the platform's precedence.
+                variable = path if isinstance(value, dict) and path in value else path.split(".")[0]
+                if variable in written_variables:
+                    return candidate
+                if isinstance(value, dict) and path in value:
+                    value, path = value[path], ""
+            for key in path.split(".") if path else ():
+                if isinstance(value, dict):
+                    value = value.get(key)
+                elif isinstance(value, list) and key.isascii() and key.isdigit():
+                    try:
+                        index = int(key)
+                    except ValueError:
+                        return candidate
+                    value = value[index] if index < len(value) else None
+                else:
+                    return candidate
+            return value.strip() if isinstance(value, str) and value.strip() else candidate
 
         def visit(value: Any) -> None:
             if isinstance(value, dict):
@@ -1530,7 +1588,7 @@ class PageLeasedBrowserClient:
                     if key in {"pageId", "page_id"} and isinstance(nested, str):
                         candidate = nested.strip()
                         if candidate and "${" not in candidate:
-                            found.add(candidate)
+                            found.add(page_handle(candidate))
                     elif method == "Workflow.execute" or key not in {"params"}:
                         visit(nested)
             elif isinstance(value, list):

@@ -297,6 +297,23 @@ class SpawnerRegistryMixin:
             expose_reusable_pages=expose_reusable_pages,
             assignment=assignment,
         )
+        hint = getattr(self, "resume_browser_hint", None)
+        if (getattr(self, "standalone_resuming", False)
+                and getattr(self.runtime.harness, "agent_mode", "") == "browser"
+                and assignment is not None and hint is not None
+                and hint.fleet_id == assignment.fleet_id and hint.page_id):
+            page = slot.page_registry.get(hint.page_id)
+            payload["resumePageCandidate"] = {
+                "pageId": hint.page_id, "fleetId": hint.fleet_id,
+                "currentlyListed": bool(isinstance(page, dict)
+                                        and page.get("fleetId") == hint.fleet_id),
+                "authority": "historical task state only; not a page binding",
+                "interpretation": (
+                    "Verify against current Fleet/Page state before any side effect."
+                    " A temporarily absent Page.list row does not prove the"
+                    " previous page or unsaved form was deleted."
+                ),
+            }
         payload["reuseRules"] = [
             (
                 "A live worker holds a persistent page lease. Another worker's"

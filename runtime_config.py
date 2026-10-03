@@ -10,6 +10,9 @@ config.json 的配置表全部定义在这一个文件里：
     "browser": {...}        -> ABCPClientConfig    （ABCP WebSocket 连接）
     "harness": {...}        -> HarnessConfig       （编排/步数预算/offload/HITL/skill 等运行时行为）
 
+内部阈值与恢复调参使用 HarnessConfig 的内置默认值，入门 config.json 无需重复填写。
+已有配置仍可显式覆写这些字段；运行默认值只在本文件维护。
+
 历史位置 llm/config.py、abcp_client.py、harness/config.py 仍从这里 re-export，
 旧 import 路径全部兼容。load_runtime_config() 是唯一装载入口；装载时对
 config.json 里不认识的字段打印告警，不再静默吞掉写了也不生效的键。
@@ -106,11 +109,6 @@ def _int_config(value: Any, default: int, *, minimum: int = 0, maximum: int = 10
     except (TypeError, ValueError):
         return default
     return max(minimum, min(maximum, parsed))
-
-
-def _normalize_selection_mode(value: Any) -> str:
-    mode = str(value or "").strip().lower()
-    return mode if mode in ("manual", "auto") else "manual"
 
 
 HITL_ATTENDED = "attended"
@@ -1073,23 +1071,13 @@ class HarnessConfig:
     # Separate bound for the checkpoint itself; otherwise accumulated facts
     # can consume the same budget reserved for recent raw turns.
     context_compaction_checkpoint_max_tokens: int = 12000
-    cache_pressure_uncached_input_threshold: int = 10000
-    cache_pressure_consecutive_steps: int = 2
+    # Internal tuning, omitted from user setup. Preserve the deployed 40000/3
+    # policy when removing its redundant config.json overrides.
+    cache_pressure_uncached_input_threshold: int = 40000
+    cache_pressure_consecutive_steps: int = 3
     cache_pressure_min_remaining_steps: int = 2
     lead_model_timeout_step_retries: int = 1
     log_browser_payloads: bool = True
-    # Subordinate future flag: try a matching skill's frozen Workflow.execute
-    # fast path before the worker LLM loop. It has no effect while the master
-    # workflow_execution_enabled switch is false.
-    skill_fast_path_enabled: bool = True
-    # How a skill gets selected for a run. "manual" (default, 2026-07-06 user
-    # decision): ONLY an explicit user choice (`--skill <id>` / `/skill <id>` →
-    # forced_skill_id, or an explicit worker_contract.skill_id) engages a skill —
-    # registry auto-match, the LeadAgent skill_selection_required gate, and
-    # enrich auto-stamping are all disabled, so an uncalibrated draft can never
-    # steal execution. "auto": restore the pre-07-06 behavior (deterministic
-    # unique match + Lead selection gate).
-    skill_selection_mode: str = "manual"
     # Master control-plane gate for every Harness-owned Workflow.execute path.
     #
     # CANARY, default OFF. Opt in per deployment with config.json.
@@ -1111,38 +1099,9 @@ class HarnessConfig:
     #     cannot hand those 7 rows back;
     #   - no real-task A/B yet.
     workflow_execution_enabled: bool = False
-    # Runtime-only operator override (NOT read from config.json): set per run from
-    # the terminal via `--skill <id>` or the interactive `/skill <id>` command,
-    # which main.run_cli writes here. When set, it forces that skill for every
-    # browser worker spawn, bypassing auto-match, LeadAgent selection, and decline;
-    # a phase whose required variables are not derivable falls back to the normal
-    # loop (fail-safe). Empty = off.
+    # Runtime-only explicit Skill selection and immutable version binding.
     forced_skill_id: str = ""
-    # When the enabled skill fast path falls back AND the BrowserAgent slow path then
-    # succeeds for a degraded (recently-failed) skill, distill the successful
-    # trace into a candidate workflow and run skill_heal (write candidate →
-    # canary → promote). Closes the rotted-skill self-healing loop; best-effort,
-    # gated, and canary-validated so a bad candidate never promotes.
-    # It is also subordinate to workflow_execution_enabled.
-    skill_auto_heal_enabled: bool = True
-    # Guidance (hints) 层的防腐弱信号：worker 结束后把「结局 + 步数 + agent 上报
-    # 的 guidance_stale」记进 skills/.guidance_health.json（独立软通道——显式
-    # 选择绕过 .skill_health.json，07-07 语义保持）。只标 needs_review 供人工
-    # 复审（/skill-create --recheck），永不禁用/否决。纯被动记账，默认开。
-    skill_guidance_signal_enabled: bool = True
-    # Open a SECOND ABCP connection (control channel) so the harness can issue
-    # control calls (Workflow.pause/resume, Hitl.*) WHILE a skill's Workflow.execute
-    # is still running. The original blocker — the primary client's global call lock
-    # — was removed on 2026-09-12, so in-band control is no longer impossible; what
-    # remains is that Workflow.pause/resume are session-bound to the run's owner.
-    # This has NOT been retested since the lock came out. When a challenge/pause is
-    # observed mid-execute, the
-    # control channel actively pauses → resolves (human/VL) → resumes the workflow,
-    # so it finishes its remaining steps instead of handing off. Default OFF:
-    # cross-connection runId/page reachability is panel-unverified; any control
-    # failure degrades to the observe-only hand-off (skill_pause). Flip on once the
-    # panel confirms cross-connection control works.
-    skill_workflow_active_control_enabled: bool = False
+    forced_skill_hash: str = ""
     hitl_poll_interval_seconds: float = 2.0
     # Whether a human is actually reachable for this deployment. There is no
     # platform signal to infer it from (ABCP exposes only Hitl.requestPause /
@@ -1591,30 +1550,11 @@ class HarnessConfig:
             log_browser_payloads=bool(
                 data.get("log_browser_payloads", cls.log_browser_payloads)
             ),
-            skill_auto_heal_enabled=bool(
-                data.get("skill_auto_heal_enabled", cls.skill_auto_heal_enabled)
-            ),
             workflow_execution_enabled=bool(
                 data.get(
                     "workflow_execution_enabled",
                     cls.workflow_execution_enabled,
                 )
-            ),
-            skill_guidance_signal_enabled=bool(
-                data.get(
-                    "skill_guidance_signal_enabled",
-                    cls.skill_guidance_signal_enabled,
-                )
-            ),
-            skill_workflow_active_control_enabled=bool(
-                data.get("skill_workflow_active_control_enabled",
-                         cls.skill_workflow_active_control_enabled)
-            ),
-            skill_fast_path_enabled=bool(
-                data.get("skill_fast_path_enabled", cls.skill_fast_path_enabled)
-            ),
-            skill_selection_mode=_normalize_selection_mode(
-                data.get("skill_selection_mode", cls.skill_selection_mode)
             ),
             hitl_poll_interval_seconds=float(
                 data.get(

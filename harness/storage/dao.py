@@ -294,7 +294,7 @@ def save_snapshot(
 
     Layering, from widest to narrowest:
 
-    * ``.run.lock`` keeps two harness processes off the same task;
+    * the task run lock keeps two harness processes off the same task;
     * the caller's in-process lock serialises threads within one process;
     * ``merge`` folds edits made from stale snapshots into different fields;
     * this CAS is the last gate, catching anything that crossed connections.

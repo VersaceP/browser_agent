@@ -16,7 +16,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from harness.utils import JsonDict
+from harness.utils import JsonDict, open_artifact_binary
 from harness.context.offload import store_offloaded
 
 
@@ -116,8 +116,18 @@ def _destination_path(
             return None, (
                 "task-worktree writes are limited to observations/, deliverables/, or scratchpad/"
             )
+        if getattr(agent, "standalone_browser_mode", False):
+            control = task_dir / "scratchpad"
+            versions = control / "todo_versions"
+            if (candidate in {control / "todo.md", control / "review-latest.json",
+                              control / "review-session.json", versions}
+                    or _inside(candidate, versions)):
+                return None, "standalone Browser control file; use update_task_todo for the checklist"
         allowed_root = task_dir / relative.parts[0]
-        security_root = task_dir
+        # DB-only tasks may have no physical directory yet. Anchor inspection
+        # at the existing ancestor; the output-root containment check below
+        # still constrains the destination to this task's allowed directory.
+        security_root = _nearest_existing(task_dir) or task_dir
     else:
         # Use the approved external write root, not the destination itself, so
         # one directory approval covers all files below it.
@@ -159,7 +169,7 @@ def _stat_path(
     task_dir = Path(agent.logger.task_dir).resolve()
     desktop = (Path.home() / "Desktop").resolve()
     try:
-        resolved = candidate.resolve(strict=True)
+        resolved = candidate.resolve(strict=False)
     except OSError as exc:
         return None, f"path cannot be resolved: {exc}"
     if any(
@@ -168,7 +178,16 @@ def _stat_path(
     ):
         return None, "hidden or sensitive path components are not allowed"
     if _inside(resolved, task_dir):
+        from harness.storage.virtual_fs import virtual_fs_for
+        view = virtual_fs_for(agent.logger)
+        logical = str(resolved.relative_to(task_dir))
+        if not resolved.exists() and not (view is not None and
+                (resolved == task_dir or view.exists(logical) or
+                 any(name.startswith(logical + "/") for name, _, _ in view.list_files()))):
+            return None, "path cannot be resolved: path does not exist"
         return resolved, None
+    if not resolved.exists():
+        return None, "path cannot be resolved: path does not exist"
     if _inside(resolved, desktop):
         workspace = _workspace_root(task_dir)
         if workspace is not None and _inside(resolved, workspace):
@@ -195,10 +214,13 @@ def _source_path(agent: Any, raw_path: Any) -> Tuple[Optional[Path], Optional[st
         return None, str(exc)
     task_dir = Path(agent.logger.task_dir).resolve()
     try:
-        resolved = candidate.resolve(strict=True)
+        resolved = candidate.resolve(strict=False)
     except OSError as exc:
         return None, f"source cannot be resolved: {exc}"
-    if not resolved.is_file():
+    from harness.storage.virtual_fs import virtual_fs_for
+    view = virtual_fs_for(agent.logger) if _inside(resolved, task_dir) else None
+    virtual_file = view is not None and view.exists(str(resolved.relative_to(task_dir)))
+    if not resolved.is_file() and not virtual_file:
         return None, "source must be a regular file"
     if _inside(resolved, task_dir):
         return resolved, None
@@ -210,8 +232,10 @@ def _source_path(agent: Any, raw_path: Any) -> Tuple[Optional[Path], Optional[st
     return resolved, None
 
 
-def _file_facts(path: Path, *, operation: str, source: Optional[Path] = None) -> JsonDict:
-    data = path.read_bytes()
+def _file_facts(path: Path, *, operation: str, source: Optional[Path] = None,
+                logger: Any = None) -> JsonDict:
+    with open_artifact_binary(logger, path) as handle:
+        data = handle.read()
     result: JsonDict = {
         "path": str(path.resolve()),
         "byteSize": len(data),
@@ -223,10 +247,19 @@ def _file_facts(path: Path, *, operation: str, source: Optional[Path] = None) ->
     return result
 
 
-def _stat_facts(path: Path) -> JsonDict:
-    stat = path.stat()
+def _stat_facts(path: Path, *, logger: Any = None) -> JsonDict:
+    from harness.storage.virtual_fs import db_authoritative_for, virtual_fs_for
+    if logger is not None and db_authoritative_for(logger) and path.is_relative_to(logger.task_dir.resolve()):
+        view = virtual_fs_for(logger)
+        logical = str(path.relative_to(logger.task_dir.resolve()))
+        if view is not None and view.exists(logical):
+            return {**_file_facts(path, operation="stat", logger=logger), "storage": "sqlite"}
+        if not path.exists():
+            return {"path": str(path), "kind": "directory", "byteSize": None,
+                    "operation": "stat", "storage": "sqlite"}
     if path.is_file():
         return _file_facts(path, operation="stat")
+    stat = path.stat()
     return {
         "path": str(path.resolve()),
         "kind": "directory" if path.is_dir() else "other",
@@ -285,7 +318,7 @@ def local_fs_batch(agent: Any, operations: Any) -> JsonDict:
                 )
                 if error or source is None:
                     raise ValueError(error)
-                facts = _stat_facts(source)
+                facts = _stat_facts(source, logger=agent.logger)
                 results.append({"index": index, "op": op, "status": "done", **facts})
                 continue
 
@@ -295,8 +328,16 @@ def local_fs_batch(agent: Any, operations: Any) -> JsonDict:
             if error or target is None:
                 raise ValueError(error)
             overwrite = bool(raw.get("overwrite", False))
-            if target.exists() and not overwrite:
+            from harness.utils import task_file_exists
+            if (target.exists() or task_file_exists(agent.logger, str(target))) and not overwrite:
                 raise FileExistsError("destination exists; set overwrite=true to replace it")
+            source = None
+            if op == "copy":
+                source, source_error = _source_path(agent, raw.get("source"))
+                if source_error or source is None:
+                    raise ValueError(source_error)
+                if source == target:
+                    raise shutil.SameFileError("source and destination are the same file")
             target.parent.mkdir(parents=True, exist_ok=True)
             if op == "write_text":
                 content = raw.get("content")
@@ -317,10 +358,11 @@ def local_fs_batch(agent: Any, operations: Any) -> JsonDict:
                 target.write_bytes(encoded)
                 facts = _file_facts(target, operation=op)
             elif op == "copy":
-                source, source_error = _source_path(agent, raw.get("source"))
-                if source_error or source is None:
-                    raise ValueError(source_error)
-                shutil.copy2(source, target)
+                with open_artifact_binary(agent.logger, source) as input_file:
+                    with target.open("wb") as output_file:
+                        shutil.copyfileobj(input_file, output_file)
+                    if getattr(input_file, "name", None) == str(source):
+                        shutil.copystat(source, target)
                 facts = _file_facts(target, operation=op, source=source)
             else:
                 raise ValueError("op must be mkdir, write_text, write_json, copy, or stat")
@@ -332,7 +374,6 @@ def local_fs_batch(agent: Any, operations: Any) -> JsonDict:
 
     task_dir = Path(agent.logger.task_dir).resolve()
     manifest_dir = task_dir / "artifacts" / "file_manifests"
-    manifest_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = manifest_dir / f"file-batch-{uuid.uuid4().hex[:8]}.json"
     manifest: JsonDict = {
         "protocol": "browser-file-manifest-v1",

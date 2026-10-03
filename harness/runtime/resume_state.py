@@ -1,8 +1,8 @@
-"""Strict, filesystem-only helpers used to bootstrap task resumption.
+"""Strict helpers used to bootstrap task resumption from files or SQLite.
 
 This module intentionally does not construct a ``RunLogger``.  Resume callers
-must validate an existing task directory before anything has a chance to
-recreate a deleted worktree.
+validate an existing task record before constructing a logger. DB tasks use
+logical paths and do not need a physical task directory.
 """
 
 from __future__ import annotations
@@ -50,6 +50,7 @@ class RunLock:
     lock_dir: Path
     owner_token: str
     owner: JsonDict
+    legacy_lock: Optional[RunLock] = None
 
 
 def _task_dir(value: TaskDirLike) -> Path:
@@ -59,11 +60,20 @@ def _task_dir(value: TaskDirLike) -> Path:
 
 def _require_task_dir(value: TaskDirLike) -> Path:
     task_dir = _task_dir(value)
-    if not task_dir.is_dir():
-        raise ResumeStateError(
-            f"resume worktree does not exist or is not a directory: {task_dir}"
-        )
-    return task_dir
+    if task_dir.is_dir():
+        return task_dir
+    if not task_dir.exists():
+        if getattr(value, "storage_attached", False):
+            from harness.storage.virtual_fs import db_authoritative_for
+
+            if (db_authoritative_for(value)
+                    and _database_owns_task(value.storage, task_dir.name)):
+                return task_dir
+        if database_has_task(task_dir):
+            return task_dir
+    raise ResumeStateError(
+        f"resume task is missing from storage or is not a directory: {task_dir}"
+    )
 
 
 def _load_json_object_strict(path: Path, *, label: str) -> JsonDict:
@@ -144,34 +154,53 @@ def load_task_state_strict(value: TaskDirLike) -> JsonDict:
 # runtime. Resume runs before a logger exists, so without this it would have to
 # re-guess the configuration - and guessing "config.json in the cwd" ignores
 # --config entirely.
-_RESUME_STORAGE: Dict[str, Any] = {"backend": None, "sqlite_path": None}
+_RESUME_STORAGE: Dict[str, Any] = {
+    "backend": None, "sqlite_path": None, "worktree_dir": None,
+}
 
 
-def configure_resume_storage(*, backend: str, sqlite_path: Any) -> None:
+def configure_resume_storage(
+    *, backend: str, sqlite_path: Any, worktree_dir: Any = None,
+) -> None:
     """Tell the resume loaders which backend and database the run is using."""
 
     _RESUME_STORAGE["backend"] = str(backend or "") or None
     _RESUME_STORAGE["sqlite_path"] = Path(sqlite_path) if sqlite_path else None
+    _RESUME_STORAGE["worktree_dir"] = Path(worktree_dir) if worktree_dir else None
 
 
 def resume_storage_backend() -> Optional[str]:
     return _RESUME_STORAGE.get("backend")
 
 
+def resume_worktree_dir() -> Optional[Path]:
+    return _RESUME_STORAGE.get("worktree_dir")
+
+
+def database_has_task(value: TaskDirLike) -> bool:
+    """Check configured DB identity without creating a task directory."""
+
+    task_dir = _task_dir(value)
+    if not _database_is_authoritative(task_dir):
+        return False
+    with _worktree_database(task_dir) as store:
+        return store is not None and _database_owns_task(store, task_dir.name)
+
+
 def resume_sqlite_path(task_dir: Path) -> Path:
     """Where this worktree's database lives.
 
-    Prefers the path main resolved from the active config; falls back to the
-    conventional location beside the task directories only when nothing has
-    been configured (a bare CLI call into these helpers).
+    Uses the active config's path. Relative paths follow the resumed task's
+    worktree root; absolute database paths stay fixed. Without configuration,
+    use the conventional location beside the logical task directories.
     """
 
-    configured = _RESUME_STORAGE.get("sqlite_path")
-    if configured is not None:
-        return Path(configured)
     from harness.storage.factory import DEFAULT_SQLITE_PATH, resolve_sqlite_path
 
-    return resolve_sqlite_path(DEFAULT_SQLITE_PATH, str(task_dir.parent))
+    configured = _RESUME_STORAGE.get("sqlite_path")
+    return resolve_sqlite_path(
+        configured or DEFAULT_SQLITE_PATH, str(task_dir.parent),
+    )
 
 
 @contextmanager
@@ -376,7 +405,20 @@ def write_task_manifest(
 
     task_dir = _require_task_dir(value)
     path = task_dir / TASK_MANIFEST_FILE
-    if path.exists():
+    from harness.storage.sqlite_store import SqliteStore
+    store = getattr(value, "storage", None) if not isinstance(value, Path) else None
+    database_owned = isinstance(store, SqliteStore)
+    if database_owned:
+        from harness.storage.virtual_fs import VirtualTaskFs
+        lines = VirtualTaskFs(store, task_dir.name).iter_lines(TASK_MANIFEST_FILE)
+        if lines is not None:
+            existing = json.loads("".join(lines))
+            if not isinstance(existing, dict):
+                raise ResumeStateError("task manifest in database is not an object")
+            if str(existing.get("taskId") or task_dir.name) != task_dir.name:
+                raise ResumeStateError("task manifest identity differs from database task")
+            return existing
+    elif path.exists():
         return _load_json_object_strict(path, label="task manifest")
     task_text = str(original_user_task or "").strip()
     if not task_text:
@@ -392,6 +434,16 @@ def write_task_manifest(
     }
     if isinstance(startup_args, dict) and startup_args:
         payload["startup_args"] = dict(startup_args)
+    if database_owned:
+        store.save_resource(
+            task_id=task_dir.name,
+            run_id=str(getattr(value, "run_id", "") or ""),
+            resource_type="task_manifest",
+            logical_path=TASK_MANIFEST_FILE,
+            media_type="application/json",
+            content=payload,
+        )
+        return payload
     if _atomic_create_json(path, payload):
         return payload
     # A concurrent creator won.  Its immutable identity is authoritative.
@@ -438,12 +490,22 @@ def reconcile_torn_plan_alias(
     history_dir = task_dir / "task_plan_history"
     state_path = history_dir / f"plan.{recorded_version:04d}.json"
     next_path = history_dir / f"plan.{recorded_version + 1:04d}.json"
-    state_record = _load_json_object_strict(
-        state_path, label="state plan history record"
-    )
-    next_record = _load_json_object_strict(
-        next_path, label="interrupted replan history record"
-    )
+    database_owned = _database_is_authoritative(task_dir)
+    if database_owned:
+        with _worktree_database(task_dir) as store:
+            if store is None or not _database_owns_task(store, task_dir.name):
+                raise ResumeStateError("task database is unavailable during plan recovery")
+            state_record = store.load_plan_version(task_id=task_dir.name, version=recorded_version)
+            next_record = store.load_plan_version(task_id=task_dir.name, version=recorded_version + 1)
+        if not isinstance(state_record, dict) or not isinstance(next_record, dict):
+            raise ResumeStateError("plan history is missing from task database")
+    else:
+        state_record = _load_json_object_strict(
+            state_path, label="state plan history record"
+        )
+        next_record = _load_json_object_strict(
+            next_path, label="interrupted replan history record"
+        )
     state_plan = state_record.get("plan")
     next_plan = next_record.get("plan")
     if not isinstance(state_plan, dict) or not isinstance(state_plan.get("phases"), list):
@@ -457,14 +519,22 @@ def reconcile_torn_plan_alias(
         previous_version = int(next_record.get("previousVersion"))
     except (TypeError, ValueError):
         previous_version = 0
-    later_records = []
-    for candidate in history_dir.glob("plan.*.json"):
-        try:
-            candidate_version = int(candidate.stem.split(".")[-1])
-        except (TypeError, ValueError):
-            continue
-        if candidate_version > recorded_version + 1:
-            later_records.append(candidate)
+    if database_owned:
+        with _worktree_database(task_dir) as store:
+            later_records = store.connection.execute(
+                "SELECT plan_version FROM task_plan_versions"
+                " WHERE task_id = ? AND plan_version > ? LIMIT 1",
+                (task_dir.name, recorded_version + 1),
+            ).fetchall()
+    else:
+        later_records = []
+        for candidate in history_dir.glob("plan.*.json"):
+            try:
+                candidate_version = int(candidate.stem.split(".")[-1])
+            except (TypeError, ValueError):
+                continue
+            if candidate_version > recorded_version + 1:
+                later_records.append(candidate)
     mechanically_torn = (
         state_record_hash == recorded_hash
         and plan_hash(state_plan) == recorded_hash
@@ -481,7 +551,25 @@ def reconcile_torn_plan_alias(
             "not match the recoverable one-step replan crash window"
         )
 
-    _atomic_write_json(task_dir / TASK_PLAN_FILE, state_plan)
+    if database_owned:
+        with _worktree_database(task_dir) as store:
+            prior, _revision = store.load_snapshot(
+                task_id=task_dir.name, snapshot_key="current_task_plan")
+            if prior != current_plan:
+                raise ResumeStateError("plan changed during database recovery")
+            run = store.connection.execute(
+                "SELECT run_id FROM task_runs WHERE task_id = ?"
+                " ORDER BY run_number DESC LIMIT 1", (task_dir.name,),
+            ).fetchone()
+            if run is None:
+                raise ResumeStateError("task database has no run for plan recovery")
+            store.save_snapshot(
+                task_id=task_dir.name, snapshot_key="current_task_plan",
+                base=current_plan, proposed=state_plan,
+                updated_run_id=str(run["run_id"]), replace=True,
+            )
+    else:
+        _atomic_write_json(task_dir / TASK_PLAN_FILE, state_plan)
     return state_plan, {
         "status": "rolled_back_interrupted_replan_alias",
         "restoredPlanVersion": recorded_version,
@@ -497,9 +585,157 @@ def load_task_manifest(
 ) -> Optional[JsonDict]:
     task_dir = _require_task_dir(value)
     path = task_dir / TASK_MANIFEST_FILE
+    if _database_is_authoritative(task_dir):
+        from harness.storage.virtual_fs import VirtualTaskFs
+        with _worktree_database(task_dir) as store:
+            if store is not None and _database_owns_task(store, task_dir.name):
+                lines = VirtualTaskFs(store, task_dir.name).iter_lines(TASK_MANIFEST_FILE)
+                if lines is not None:
+                    try:
+                        value = json.loads("".join(lines))
+                    except json.JSONDecodeError as exc:
+                        raise ResumeStateError("malformed task manifest in database") from exc
+                    if isinstance(value, dict):
+                        if str(value.get("taskId") or task_dir.name) != task_dir.name:
+                            raise ResumeStateError("task manifest identity differs from database task")
+                        return value
+                    raise ResumeStateError("task manifest in database is not an object")
+                if required:
+                    raise ResumeStateError("task manifest is missing from task database")
+                return None
+        raise ResumeStateError("task database is unavailable for task manifest")
     if not path.exists() and not required:
         return None
     return _load_json_object_strict(path, label="task manifest")
+
+
+def promote_legacy_task_to_database(value: TaskDirLike) -> bool:
+    """Verify a legacy task before making its SQLite mirror authoritative.
+
+    Called under the run lock, before any resume state is read.  The manifest
+    resource is written last and serves as the promotion marker.  A partial
+    import therefore cannot make the next attempt skip verification.
+    """
+    if not _database_is_authoritative(_task_dir(value)):
+        return False
+    task_dir = _require_task_dir(value)
+    task_id = task_dir.name
+    from hashlib import sha256
+    from itertools import zip_longest
+    from harness.storage.base import canonical_json
+    from harness.storage.virtual_fs import VirtualTaskFs
+
+    def equal_json_lines(path: Path, lines: Any, label: str) -> None:
+        if lines is None or not path.is_file():
+            raise ResumeStateError(f"legacy {label} is missing from SQLite or worktree")
+        with path.open("r", encoding="utf-8") as source:
+            for number, (disk, database) in enumerate(zip_longest(source, lines), 1):
+                if disk is None or database is None:
+                    raise ResumeStateError(f"legacy {label} row count differs at {number}")
+                try:
+                    same = canonical_json(json.loads(disk)) == canonical_json(json.loads(database))
+                except (TypeError, ValueError) as exc:
+                    raise ResumeStateError(f"legacy {label} has invalid JSON at {number}") from exc
+                if not same:
+                    raise ResumeStateError(f"legacy {label} differs at row {number}")
+
+    with _worktree_database(task_dir) as store:
+        if store is None or not _database_owns_task(store, task_id):
+            raise ResumeStateError(
+                "legacy task has no SQLite record; a verified import is required before resume"
+            )
+        view = VirtualTaskFs(store, task_id)
+        if view.exists(TASK_MANIFEST_FILE):
+            return False
+        manifest_path = task_dir / TASK_MANIFEST_FILE
+        manifest = _load_json_object_strict(manifest_path, label="legacy task manifest")
+        if str(manifest.get("taskId") or task_id) != task_id:
+            raise ResumeStateError("legacy task manifest identity differs from directory")
+        plan, _ = store.load_snapshot(task_id=task_id, snapshot_key="current_task_plan")
+        state, _ = store.load_snapshot(task_id=task_id, snapshot_key="task_state")
+        if not isinstance(plan.get("phases"), list) or not isinstance(state.get("phases"), dict):
+            raise ResumeStateError("legacy task plan or state is missing from SQLite")
+
+        # A run.jsonl identifies a file/dual task.  A former db task can have
+        # only a file manifest because earlier db-mode writes bypassed storage.
+        legacy_events = task_dir / "run.jsonl"
+        if not legacy_events.is_file() and any((task_dir / name).exists() for name in (
+                TASK_PLAN_FILE, TASK_STATE_FILE, "traces")):
+            raise ResumeStateError("legacy file task has no run.jsonl for SQLite verification")
+        if legacy_events.is_file():
+            for key, filename in (("current_task_plan", TASK_PLAN_FILE),
+                                  ("task_state", TASK_STATE_FILE)):
+                path = task_dir / filename
+                disk = _load_json_object_strict(path, label=filename)
+                database = plan if key == "current_task_plan" else state
+                if canonical_json(disk) != canonical_json(database):
+                    raise ResumeStateError(f"legacy {filename} differs from SQLite")
+            equal_json_lines(legacy_events, view.iter_lines("run.jsonl"), "run.jsonl")
+            disk_traces = {str(p.relative_to(task_dir))
+                           for p in (task_dir / "traces").glob("*.jsonl")}
+            db_traces = {path for path, _size, _approx in view.list_files()
+                         if path.startswith("traces/") and path.endswith(".jsonl")}
+            if disk_traces != db_traces:
+                raise ResumeStateError("legacy trace listing differs from SQLite")
+            for relative in sorted(disk_traces):
+                equal_json_lines(task_dir / relative, view.iter_lines(relative), relative)
+            history = sorted((task_dir / "task_plan_history").glob("plan.*.json"))
+            if not history:
+                raise ResumeStateError("legacy plan history is missing")
+            for path in history:
+                try:
+                    version = int(path.stem.split(".")[-1])
+                except ValueError as exc:
+                    raise ResumeStateError("legacy plan history has an invalid name") from exc
+                disk = _load_json_object_strict(path, label="legacy plan history")
+                database = store.load_plan_version(task_id=task_id, version=version)
+                if not isinstance(database, dict) or canonical_json(disk.get("plan")) != canonical_json(database.get("plan")):
+                    raise ResumeStateError(f"legacy plan version {version} differs from SQLite")
+            resource_rows = store.search_resources(task_id=task_id, max_results=100000)
+            if len(resource_rows) >= 100000:
+                raise ResumeStateError("legacy resource verification limit reached")
+            for row in resource_rows:
+                record = store.read_resource(current_task_id=task_id,
+                                             resource_uri=str(row.get("saved_path") or ""))
+                if not isinstance(record, dict):
+                    raise ResumeStateError("legacy SQLite resource cannot be read")
+                if record.get("external_path") or record.get("resource_type") == "event_payload":
+                    continue
+                relative = str(record.get("logical_path") or "")
+                path = (task_dir / relative).resolve()
+                if not path.is_relative_to(task_dir.resolve()) or not path.is_file():
+                    raise ResumeStateError(f"legacy resource is missing: {relative}")
+                if sha256(path.read_bytes()).hexdigest() != record.get("sha256"):
+                    raise ResumeStateError(f"legacy resource differs from SQLite: {relative}")
+
+        run = store.connection.execute(
+            "SELECT run_id FROM task_runs WHERE task_id = ? ORDER BY run_number DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if run is None:
+            raise ResumeStateError("legacy task has no SQLite run")
+        run_id = str(run["run_id"])
+        # These paths were written directly to files even in db mode.  Keep
+        # their historical bytes before the database becomes the only reader.
+        import_paths = [*(task_dir / "contexts").glob("*.json"),
+                        *(task_dir / "page_sessions").glob("*.json")]
+        if legacy_events.is_file():
+            import_paths.extend((task_dir / "task_plan_history").glob("plan.*.json"))
+        for path in import_paths:
+            relative = str(path.relative_to(task_dir))
+            if view.exists(relative):
+                continue
+            store.save_resource(
+                task_id=task_id, run_id=run_id,
+                resource_type="legacy_task_record", logical_path=relative,
+                media_type="application/json", content=path.read_text(encoding="utf-8"),
+            )
+        store.save_resource(
+            task_id=task_id, run_id=run_id, resource_type="task_manifest",
+            logical_path=TASK_MANIFEST_FILE, media_type="application/json",
+            content=manifest_path.read_text(encoding="utf-8"),
+        )
+        return True
 
 
 def _message_text(value: Any) -> str:
@@ -644,11 +880,38 @@ def _cleanup_stale_ownerless_lock(lock_dir: Path) -> bool:
     return True
 
 
-def acquire_run_lock(value: TaskDirLike) -> RunLock:
-    """Atomically acquire ``.run.lock``, safely competing for stale takeover."""
+def task_run_lock_dir(value: TaskDirLike) -> Path:
+    task_dir = _task_dir(value)
+    return task_dir.parent / ".run-locks" / task_dir.name
 
-    task_dir = _require_task_dir(value)
-    lock_dir = task_dir / RUN_LOCK_DIR
+
+def acquire_run_lock(value: TaskDirLike) -> RunLock:
+    """Acquire the shared control lock and honor any existing legacy lock.
+
+    The lock must also work before a new DB task has been registered, so its
+    logical task path need not exist. All backends use the same mutex.
+    """
+
+    task_dir = _task_dir(value)
+    if not _database_is_authoritative(task_dir):
+        task_dir = _require_task_dir(value)
+    elif task_dir.exists() and not task_dir.is_dir():
+        raise RunLockError(f"task path is not a directory: {task_dir}")
+    lock_dir = task_run_lock_dir(task_dir)
+    lock_dir.parent.mkdir(parents=True, exist_ok=True)
+    lock = _acquire_run_lock_at(task_dir, lock_dir)
+    legacy_dir = task_dir / RUN_LOCK_DIR
+    if legacy_dir.exists():
+        try:
+            legacy = _acquire_run_lock_at(task_dir, legacy_dir)
+        except Exception:
+            release_run_lock(lock)
+            raise
+        return RunLock(task_dir, lock_dir, lock.owner_token, lock.owner, legacy)
+    return lock
+
+
+def _acquire_run_lock_at(task_dir: Path, lock_dir: Path) -> RunLock:
     local_host = socket.gethostname()
     owner_token = uuid.uuid4().hex
     owner: JsonDict = {
@@ -661,7 +924,7 @@ def acquire_run_lock(value: TaskDirLike) -> RunLock:
     # owner publication is one rename; a crash before it leaves an empty lock
     # that the aged-ownerless recovery path can remove. No internal temp file
     # can make that crash window permanently non-empty.
-    prepared_owner = task_dir / f".run-lock-owner.{owner_token}.tmp"
+    prepared_owner = lock_dir.parent / f".run-lock-owner.{owner_token}.tmp"
     _atomic_write_json(prepared_owner, owner)
     try:
         while True:
@@ -735,6 +998,9 @@ def acquire_run_lock(value: TaskDirLike) -> RunLock:
 def release_run_lock(lock: RunLock) -> bool:
     """Release only when the on-disk owner token is still ours."""
 
+    legacy_released = True
+    if lock.legacy_lock is not None:
+        legacy_released = release_run_lock(lock.legacy_lock)
     try:
         owner = _read_lock_owner(lock.lock_dir)
     except RunLockError:
@@ -746,4 +1012,4 @@ def release_run_lock(lock: RunLock) -> bool:
         lock.lock_dir.rmdir()
     except OSError:
         return False
-    return True
+    return legacy_released

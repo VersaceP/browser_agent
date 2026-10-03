@@ -1262,56 +1262,17 @@ async def _spawn_accepted_browser_agent(ctx: ToolContext) -> JsonDict:
         base_context = f"{base_context}\n\n{auth_gate_guidance}".strip()
     if collection_guidance:
         base_context = f"{base_context}\n\n{collection_guidance}".strip()
-    # Skill selection is a LeadAgent decision gate. Soft recall returns candidate
-    # SKILL.md content first; the LeadAgent must retry with explicit skill_id or
-    # an explicit decline. The worker fast path then takes the explicit path.
-    try:
-        spawner = getattr(agent, "spawner", None)
-        runtime = getattr(spawner, "runtime", None)
-        harness_cfg = getattr(runtime, "harness", None)
-        registry = spawner._get_skill_registry() if spawner is not None and hasattr(spawner, "_get_skill_registry") else None
-        if registry is not None and getattr(harness_cfg, "skill_fast_path_enabled", True):
-            from harness.skill.contract import (
-                apply_forced_skill,
-                build_skill_selection_request,
-                enrich_worker_contract_with_skill,
-            )
-            from harness.skill.guidance import default_guidance_health
-            from harness.skill.health import default_health
-            # Operator override wins first: a configured forced_skill_id stamps
-            # skill_id (clearing any Lead decline), so selection is skipped and the
-            # worker runs that skill wherever its variables are derivable.
-            selection_mode = str(getattr(harness_cfg, "skill_selection_mode", "manual") or "manual")
-            forced = apply_forced_skill(
-                worker_contract,
-                registry=registry,
-                forced_skill_id=str(getattr(harness_cfg, "forced_skill_id", "") or ""),
-                phase=phase,
-                logger=agent.logger,
-                workflow_health=default_health(),
-                guidance_health=default_guidance_health(),
-            )
-            if not forced:
-                # manual mode: the Lead is never interrupted with a selection
-                # request — only the user's /skill choice engages a skill.
-                selection_request = build_skill_selection_request(
-                    worker_contract,
-                    registry=registry,
-                    phase=phase,
-                    task=base_task,
-                    context=base_context,
-                    logger=agent.logger,
-                    mode=selection_mode,
-                )
-                if selection_request is not None:
-                    return selection_request
-            enrich_worker_contract_with_skill(
-                worker_contract, registry=registry, phase=phase,
-                task=base_task, context=base_context, logger=agent.logger,
-                mode=selection_mode,
-            )
-    except Exception:  # never break spawning
-        pass
+    # Only the user's task-level selection authorizes a Skill. A model-supplied
+    # skill_id in worker_contract cannot select or change the pinned version.
+    spawner = getattr(agent, "spawner", None)
+    harness_cfg = getattr(getattr(spawner, "runtime", None), "harness", None)
+    selected_skill = str(getattr(harness_cfg, "forced_skill_id", "") or "")
+    selected_hash = str(getattr(harness_cfg, "forced_skill_hash", "") or "")
+    worker_contract.pop("skill_id", None)
+    worker_contract.pop("skill_hash", None)
+    if selected_skill and selected_hash:
+        worker_contract["skill_id"] = selected_skill
+        worker_contract["skill_hash"] = selected_hash
     checkpoint_rejection = replan_checkpoint_spawn_rejection(
         agent.logger,
         phase=phase,
@@ -1545,61 +1506,9 @@ def _wait_candidate_worker_ids(
     return candidates, True
 
 
-async def _recover_transport_before_lead_decision(
-    ctx: ToolContext,
-    completed: Any,
-) -> Optional[JsonDict]:
-    """Probe once for a new fatal transport batch before Lead sees the wait.
-
-    This is deliberately limited to the control-plane probe implemented by the
-    spawner.  It never retries the failed browser Action, starts a worker, or
-    creates a Fleet.  The durable fingerprint prevents repeated waits from
-    issuing the same probe again; a new fatal worker result creates a new batch.
-    """
-    results = completed if isinstance(completed, list) else []
-    required = note_transport_recovery_required(ctx.agent.logger, results)
-    if not isinstance(required, dict):
-        return None
-    if str(required.get("status") or "") == "ready":
-        return dict(required)
-    probe = getattr(ctx.agent.spawner, "refresh_browser_connection", None)
-    if not callable(probe):
-        recovery = {
-            "status": "blocked",
-            "reason": "transport recovery probe is unavailable",
-            "businessActionsReplayed": 0,
-        }
-    else:
-        try:
-            recovery = await probe(
-                str(getattr(ctx.agent, "task_fleet_reference", "") or "")
-            )
-        except Exception as exc:
-            # A probe failure is a control-plane blocker, not a reason to let
-            # the Lead retry business work or lose the durable fatal receipt.
-            recovery = {
-                "status": "blocked",
-                "reason": type(exc).__name__,
-                "businessActionsReplayed": 0,
-            }
-    recorded = record_transport_recovery_probe(
-        ctx.agent.logger, recovery,
-    )
-    receipt = dict(recovery) if isinstance(recovery, dict) else {
-        "status": "blocked",
-        "reason": "invalid recovery probe receipt",
-    }
-    receipt["requiredFingerprint"] = required.get("fingerprint")
-    try:
-        receipt["businessActionsReplayed"] = max(
-            0, int(receipt.get("businessActionsReplayed") or 0)
-        )
-    except (TypeError, ValueError):
-        receipt["businessActionsReplayed"] = 0
-    if isinstance(recorded, dict):
-        receipt["controlState"] = recorded.get("status")
-        receipt["probeAttempts"] = recorded.get("probeAttempts")
-    return receipt
+async def _recover_transport_before_lead_decision(ctx: ToolContext, completed: Any) -> Optional[JsonDict]:
+    from harness.runtime.worker_recovery import recover_worker_transport
+    return await recover_worker_transport(ctx.agent, completed)
 
 
 @LEAD_TOOLS.register(

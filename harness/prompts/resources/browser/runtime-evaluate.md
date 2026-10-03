@@ -1,8 +1,8 @@
 ---
 id: browser.runtime-evaluate
 audience: browser
-version: "2026-09-08"
-description: Runtime.evaluate world selection, audit receipts, and legacy JSON extraction compatibility.
+version: "2026-10-02"
+description: Runtime.evaluate world selection, audit receipts, and direct JSON extraction recording.
 sources:
   - harness/tools/runtime_evaluation.py
   - harness/tools/browser_tools/runtime_eval.py
@@ -68,6 +68,24 @@ execution world, then invalidates stale page targeting state after every model
 Runtime.evaluate call. Re-observe any page state that a subsequent action
 depends on.
 
-`runtime_policy` is optional legacy metadata and is not authorization data. Its
-`result_mode="json"` and `record_name` fields retain the existing JSON extraction
-envelope for older callers; new calls can omit it.
+## Recording structured captures
+
+For data intended as an extraction artifact, set
+`browser_call.runtime_policy={"record_name":"<dataset name>"}` in the capture
+call. The expression returns a row-object array or `{rows:[...]}` directly,
+without `JSON.stringify`. The Harness enables JSON decoding and passes the
+returned rows unchanged through `record_extraction`; nested arrays, objects,
+nulls and source text are preserved. Decide selectors and field mapping in the
+expression rather than copying the resulting dataset into another model call.
+
+Inspect `recordExtraction.status`, validation feedback and `savedPath`. Reuse
+that path for inspection and delivery. Large recorded results
+also expose the complete source receipt through `_truncation.savedPath`; read
+it when source details are needed. Recording confirms persistence, not source
+coverage, field meaning or task completion. A failed record is reported explicitly;
+its returned data remains available for diagnosis.
+
+Omit `record_name` for diagnostic calls. `result_mode="json"` alone requests JSON
+decoding without persistence; existing calls using both options remain supported.
+These options stay inside the Harness and do not grant JavaScript permissions
+or choose the execution world.

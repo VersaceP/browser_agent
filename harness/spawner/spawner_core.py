@@ -759,7 +759,7 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
         preferred_slot_id: Optional[str],
         reuse_from_worker_id: Optional[str],
     ) -> Optional[ResumeBrowserHint]:
-        """Return the weak resume candidate only for an unconstrained worker."""
+        """Return a task-owned candidate only when routing permits its Fleet."""
 
         hint = self.resume_browser_hint
         if hint is None:
@@ -771,8 +771,10 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
             reason = "different_phase"
         elif str(session_key or "").strip():
             reason = "session_key"
-        elif str(fleet_reference or "").strip():
-            reason = "explicit_fleet"
+        elif (str(fleet_reference or "").strip()
+              and not hint.fleet_id.lower().startswith(
+                  str(fleet_reference).strip().lower())):
+            reason = "different_explicit_fleet"
         elif worker_contract.get("needs_isolated_session") is True:
             reason = "needs_isolated_session"
         elif str(preferred_slot_id or "").strip():
@@ -814,17 +816,6 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
     ) -> bool:
         """Persist only the FleetAssignment that this task actually received."""
 
-        state_path = self.logger.task_dir / "task_state.json"
-        if not state_path.exists():
-            self.logger.write(
-                "spawner.browser_context.persist_skipped",
-                {
-                    "reason": "task_state_missing",
-                    "workerId": assignment.worker_id,
-                    "fleetId": assignment.fleet_id,
-                },
-            )
-            return False
         state = load_task_state(self.logger)
         if not state:
             self.logger.write(
@@ -1677,6 +1668,12 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                                 },
                             )
                             resume_page_inventory_refreshed = True
+                            if (effective_fleet_reference
+                                    and resume_hint_may_select_page):
+                                # The explicit Fleet remains authoritative;
+                                # this verified historical Page is only a
+                                # task-owned candidate inside that Fleet.
+                                expose_reusable_pages = True
                         except Exception as exc:
                             self.logger.write(
                                 "spawner.resume_browser_hint.page_probe_failed",
@@ -1860,8 +1857,8 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                             if (
                                 resume_hint is not None
                                 and expose_reusable_pages
-                                and assignment.assignment_reason
-                                == "resume_browser_hint"
+                                and assignment.fleet_id == resume_hint.fleet_id
+                                and resume_page_inventory_refreshed
                             )
                             else self.pinned_browser_context.page_id
                             if (
@@ -2071,7 +2068,10 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                 name=agent_name,
                 task=task,
                 context=context,
-                max_steps=self.runtime.harness.worker_max_steps,
+                max_steps=(
+                    0 if self.runtime.harness.agent_mode == "browser"
+                    else self.runtime.harness.worker_max_steps
+                ),
                 result_contract=result_contract,
                 phase_id=phase_id,
                 worker_contract=effective_contract,

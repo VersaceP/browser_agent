@@ -7,10 +7,12 @@ prompts talk about ``run.jsonl`` and ``traces/*.jsonl``. Changing that contract
 would mean rewriting prompts, so instead the database is presented through the
 same names it replaced.
 
-Two event tables back two path families:
+The existing storage tables back the same logical paths:
 
     run.jsonl                 -> run_events
     traces/<worker>.jsonl     -> worker_trace_events
+    task_state.json           -> task_snapshots.task_state
+    task_plan.json            -> task_snapshots.current_task_plan
     everything else           -> task_resources, keyed by logical_path
 
 Rendering reproduces the exact line a file backend would have written, so a
@@ -23,12 +25,19 @@ import fnmatch
 import json
 from typing import Any, Iterator, List, Optional, Tuple
 
-from harness.storage.base import glob_matches as _glob_matches
+from harness.storage.base import (
+    SNAPSHOT_KEY_CURRENT_PLAN, SNAPSHOT_KEY_TASK_STATE,
+    glob_matches as _glob_matches,
+)
 from harness.storage.resource_codec import logical_text_from_row, normalize_text_file
 from harness.utils import JsonDict
 
 
 RUN_EVENTS_PATH = "run.jsonl"
+_SNAPSHOT_PATHS = {
+    "task_state.json": SNAPSHOT_KEY_TASK_STATE,
+    "task_plan.json": SNAPSHOT_KEY_CURRENT_PLAN,
+}
 
 # Mirrors FileStore._ENVELOPE_KEYS. Written here rather than imported to keep
 # this module free of a dependency on the file backend, and pinned by the
@@ -107,6 +116,17 @@ class VirtualTaskFs:
             return []
         files: List[Tuple[str, int, bool]] = []
         connection = self._connection
+        snapshot_files = set()
+        for row in connection.execute(
+            "SELECT snapshot_key, LENGTH(CAST(value_json AS BLOB))"
+            " FROM task_snapshots WHERE task_id = ? AND revision > 0"
+            " AND snapshot_key IN (?, ?)",
+            (self.task_id, SNAPSHOT_KEY_TASK_STATE, SNAPSHOT_KEY_CURRENT_PLAN),
+        ).fetchall():
+            for path, key in _SNAPSHOT_PATHS.items():
+                if row[0] == key:
+                    files.append((path, int(row[1]), True))
+                    snapshot_files.add(path)
 
         row = connection.execute(
             "SELECT COUNT(*), COALESCE(SUM(payload_byte_size), 0)"
@@ -142,6 +162,8 @@ class VirtualTaskFs:
             " ORDER BY r.logical_path",
             (self.task_id,),
         ).fetchall():
+            if resource_row[0] in snapshot_files:
+                continue
             files.append((str(resource_row[0]), int(resource_row[1]), False))
         return files
 
@@ -185,6 +207,14 @@ class VirtualTaskFs:
         if not self.available:
             return None
         path = str(logical_path or "").strip()
+        if path in _SNAPSHOT_PATHS:
+            value, revision = self.storage.load_snapshot(
+                task_id=self.task_id, snapshot_key=_SNAPSHOT_PATHS[path],
+            )
+            if not revision:
+                return None
+            return iter((json.dumps(value, ensure_ascii=False, indent=2, default=str)
+                         + "\n").splitlines(keepends=True))
         if path == RUN_EVENTS_PATH:
             return self._iter_run_events()
         if path.startswith(TRACES_PREFIX) and path.endswith(".jsonl"):

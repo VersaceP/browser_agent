@@ -484,6 +484,15 @@ async def _navigate_verified_impl(
                 "axtreeRefreshAttempts": len(tree_attempts),
                 "axtreeRefreshResults": tree_attempts,
             }
+        # A settled ready/failed response is an outcome, not evidence that
+        # another redirect will happen. Preserve an event already received;
+        # otherwise return the observed mismatch/failure without spending the
+        # rest of the caller's deadline waiting for a hypothetical redirect.
+        if (not state_read_failed and not title_is_lingering
+                and (status == "ready" or status in _NAVIGATION_FAILED_STATUSES)
+                and (redirect_waiter is None or not redirect_waiter.done())):
+            await _cancel_waiter(redirect_waiter)
+            break
         settlement_event = (
             await redirect_waiter if redirect_waiter is not None else None
         )
@@ -1087,7 +1096,7 @@ def _content_completeness_upstream_blocker(
     ):
         return "challenge:detected"
 
-    overlay = detect_overlay_from_result(result)
+    overlay = detect_overlay_from_result(result, logger=getattr(agent, "logger", None))
     subtype = str((overlay or {}).get("subtype") or "")
     if subtype in {"auth_prompt", "paywall"}:
         return f"overlay:{subtype}"

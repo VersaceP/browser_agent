@@ -54,10 +54,9 @@ from harness.utils import trim_large_strings
 from harness.results.worker_result import build_worker_handoff_projection
 from harness.results.worker_result import build_worker_result_levels
 from harness.results.recovery import worker_recovery_facts
-from harness.workflow.workflow_runtime import workflow_execution_enabled
 from llm import LLMFactory
 from .spawner_classification import _allowance_from_validators, _clone_capability_bundle, _cohort_identity_fields, _safe_str_list, _validated_rows_for_ledger, _worker_feedback_classification  # noqa: F401
-from .spawner_helpers import BrowserAgentHandle, BrowserAgentSlot, TaskSessionBinding, _TaskContextTrackingBrowserClient, _effective_worker_status, _finalize_skill_execution_metadata, _fresh_click_settlement_class, _prompt_worker_contract, _skill_execution_metadata, _unresolved_repair_visual_evidence, _verified_workflow_hitl_settlement  # noqa: F401
+from .spawner_helpers import BrowserAgentHandle, BrowserAgentSlot, TaskSessionBinding, _TaskContextTrackingBrowserClient, _fresh_click_settlement_class, _prompt_worker_contract, _verified_workflow_hitl_settlement  # noqa: F401
 
 _TASK_MEMORY_TERMINAL_WRITE_TIMEOUT_SECONDS = 5.0
 _WORKER_FAILURE_CLEANUP_TIMEOUT_SECONDS = 5.0
@@ -154,62 +153,6 @@ def _transport_failure_fields(exc: ABCPTransportError) -> JsonDict:
 
 class SpawnerWorkerMixin:
 
-    def _get_skill_registry(self):
-        """Lazy-load the skill registry once per spawner."""
-        registry = getattr(self, "_skill_registry", None)
-        if registry is None:
-            try:
-                from harness.skill.registry import SkillRegistry
-                registry = SkillRegistry.load()
-            except Exception as exc:  # registry load must never break spawning
-                self.logger.write("skill.registry.load_failed", {"error": str(exc)})
-                registry = False  # sentinel: tried and failed
-            self._skill_registry = registry
-        return registry or None
-
-    async def _try_skill_fast_path(
-        self,
-        harness: Any,
-        *,
-        worker_contract: JsonDict,
-        phase: JsonDict,
-        task: str,
-        context: str,
-        fleet_ids: List[str],
-    ) -> Optional[JsonDict]:
-        """Attempt a matching skill's fast path. Returns the dispatch outcome:
-        {"handled": True, "answer": ...} when the skill completed the task,
-        {"handled": False, "handoff_note": ...} when a batch run stopped mid-way
-        (completed rows persisted; the note tells the slow path what remains),
-        or None (caller runs the normal LLM loop with the original task).
-        Any error falls back to the LLM loop — must never break the worker."""
-        if not workflow_execution_enabled(self.runtime):
-            return None
-        if not getattr(self.runtime.harness, "skill_fast_path_enabled", True):
-            return None
-        registry = self._get_skill_registry()
-        if registry is None or not registry.all():
-            return None
-        try:
-            from harness.skill.dispatch import maybe_run_skill_fast_path
-            from harness.skill.health import default_health
-            from harness.tools.browser_tools import _record_extraction
-            outcome = await maybe_run_skill_fast_path(
-                harness,
-                registry=registry,
-                worker_contract=worker_contract,
-                phase=phase,
-                task=task,
-                context=context,
-                fleet_ids=fleet_ids,
-                record_extraction=_record_extraction,
-                health=default_health(),
-            )
-        except Exception as exc:  # any failure → normal loop
-            self.logger.write("skill.fast_path.error", {"error": str(exc)})
-            return None
-        return outcome
-
     def _record_row_ledger(
         self,
         harness: Any,
@@ -282,96 +225,6 @@ class SpawnerWorkerMixin:
                 "rows": ledger,
             })
         return ledger
-
-    async def _maybe_autoheal_skill(
-        self,
-        harness: Any,
-        *,
-        fast_path_handled: bool,
-        slow_path_succeeded: bool,
-        worker_contract: JsonDict,
-        phase: JsonDict,
-        task: str,
-        context: str,
-        fleet_ids: List[str],
-    ) -> None:
-        """Close the self-heal loop: if the fast path fell back but the slow path
-        succeeded for a degraded skill, distill the trace → candidate → canary →
-        promote. Best-effort; any error is swallowed (never affects the worker)."""
-        if fast_path_handled or not slow_path_succeeded:
-            return
-        if not workflow_execution_enabled(self.runtime):
-            return
-        if not getattr(self.runtime.harness, "skill_auto_heal_enabled", True):
-            return
-        try:
-            # 07-07: a directly forced skill takes health OUT of the loop —
-            # dispatch stopped recording, and health-driven autoheal must not
-            # fire either. A suite route is different: its four-dimensional
-            # phase match is exact, so it remains eligible for health/autoheal.
-            from harness.skill.contract import is_suite_routed
-            from harness.skill.dispatch import _is_explicit_selection
-            suite_routed = is_suite_routed(worker_contract or {})
-            # An exact suite route is health-managed and may autoheal after a
-            # degraded workflow falls back successfully. A direct force remains
-            # outside both health accounting and health-driven autoheal.
-            if not suite_routed and _is_explicit_selection(worker_contract or {}):
-                return
-        except Exception:  # pragma: no cover - guard must never break the worker
-            return
-        registry = self._get_skill_registry()
-        if registry is None or not registry.all():
-            return
-        try:
-            from harness.skill.autoheal import maybe_autoheal_from_trace
-            from harness.skill.dispatch import resolve_skill_and_variables
-            from harness.skill.health import default_health
-
-            skill, canary_variables = resolve_skill_and_variables(
-                registry, worker_contract, phase=phase, task=task, context=context,
-                mode=str(getattr(self.runtime.harness, "skill_selection_mode", "manual") or "manual"),
-            )
-            if skill is None:
-                return
-            await maybe_autoheal_from_trace(
-                harness,
-                skill=skill,
-                health=default_health(),
-                trace=getattr(harness, "trace", []) or [],
-                canary_variables=canary_variables,
-                fleet_id=next(iter(fleet_ids), "") if fleet_ids else "",
-            )
-        except Exception as exc:  # self-heal must never break the worker
-            self.logger.write("skill.autoheal.error", {"error": str(exc)})
-
-    def _record_guidance_signal(
-        self,
-        *,
-        worker_contract: JsonDict,
-        fast_path_handled: bool,
-        validated_ok: bool,
-        steps: int,
-        answer: str,
-    ) -> None:
-        """Guidance（hints）层的防腐弱信号：结局 + 步数 + answer 里的
-        guidance_stale 上报 → skills/.guidance_health.json（独立软通道，只标
-        needs_review 供人工复审，永不禁用）。record_guidance_outcome 只接受
-        suite_routed；直接强制单个 guidance 不记。Best-effort，绝不影响结果。"""
-        if not getattr(self.runtime.harness, "skill_guidance_signal_enabled", True):
-            return
-        try:
-            from harness.skill.guidance import record_guidance_outcome
-            record_guidance_outcome(
-                self._get_skill_registry(),
-                worker_contract,
-                validated_ok=validated_ok,
-                fast_path_handled=fast_path_handled,
-                steps=steps,
-                answer=answer,
-                logger=self.logger,
-            )
-        except Exception as exc:  # weak signal must never break the worker
-            self.logger.write("skill.guidance.signal_error", {"error": str(exc)})
 
     async def _checkpoint_terminal_task_memory(
         self,
@@ -491,9 +344,12 @@ class SpawnerWorkerMixin:
             agent_id=slot.agent_id,
             harness=replace(
                 self.runtime.harness,
-                # All entry points, including legacy callers, use the operator's
-                # configured budget. Model-authored plans cannot override it.
-                max_steps=self.runtime.harness.worker_max_steps,
+                # Standalone /browser uses explicit terminal signals; Lead's
+                # delegated workers keep the configured step budget.
+                max_steps=(
+                    0 if self.runtime.harness.agent_mode == "browser"
+                    else self.runtime.harness.worker_max_steps
+                ),
             ),
         )
         provider = LLMFactory.create_provider(
@@ -532,16 +388,8 @@ class SpawnerWorkerMixin:
             effective_context = context or "(none)"
             if slot_context:
                 effective_context = f"{effective_context}\n\n{slot_context}".strip()
-            try:
-                from harness.skill.contract import selected_skill_context
-                skill_context = selected_skill_context(
-                    self._get_skill_registry(),
-                    worker_contract or {},
-                    workflow_enabled=workflow_execution_enabled(worker_runtime),
-                )
-            except Exception as exc:
-                self.logger.write("skill.context.error", {"error": str(exc)})
-                skill_context = ""
+            from harness.skill_builder.selection import selected_skill_context
+            skill_context = selected_skill_context(worker_runtime)
             if skill_context:
                 effective_context = f"{effective_context}\n\n{skill_context}".strip()
             prompt_worker_contract = _prompt_worker_contract(worker_contract)
@@ -654,6 +502,11 @@ class SpawnerWorkerMixin:
                     )
                 )
             harness.worker_contract = worker_contract or {}
+            harness.authoritative_user_context = source_context
+            harness.standalone_resuming = bool(
+                self.runtime.harness.agent_mode == "browser"
+                and getattr(self, "standalone_resuming", False)
+            )
             harness.task_memory_root_task = str(
                 self.root_task or task or ""
             ).strip()
@@ -791,44 +644,8 @@ class SpawnerWorkerMixin:
                 if assignment is not None and assignment.session_key
                 else None
             )
-            skill_outcome = await self._try_skill_fast_path(
-                harness,
-                worker_contract=worker_contract or {},
-                phase=phase or {},
-                task=task,
-                context=effective_context,
-                fleet_ids=([assignment.fleet_id] if assignment else sorted(slot.fleet_ids)),
-            )
-            skill_answer = (
-                skill_outcome.get("answer")
-                if skill_outcome and skill_outcome.get("handled")
-                else None
-            )
-            execution_metadata = _skill_execution_metadata(skill_outcome)
-            if skill_answer is not None:
-                answer = skill_answer
-                harness.final_status = _effective_worker_status(
-                    harness.final_status, skill_answer,
-                )
-            else:
-                # A batch fast path that stopped mid-way hands its progress to the
-                # slow path: completed rows are already persisted, the note says
-                # which rows remain and how to merge into ONE final artifact.
-                handoff_note = str((skill_outcome or {}).get("handoff_note") or "")
-                if handoff_note:
-                    repair_manifest = (skill_outcome or {}).get("repair_manifest")
-                    if isinstance(repair_manifest, dict):
-                        harness.worker_contract = {
-                            **(harness.worker_contract or {}),
-                            "_repair_manifest": dict(repair_manifest),
-                        }
-                    worker_task = (
-                        f"{worker_task}\n\nSKILL FAST-PATH BATCH HANDOFF:\n{handoff_note}"
-                    )
-                answer = await harness.run(worker_task)
-            execution_metadata = _finalize_skill_execution_metadata(
-                execution_metadata, harness,
-            )
+            answer = await harness.run(worker_task)
+            execution_metadata: JsonDict = {}
             trace_path = self._write_worker_trace(worker_id, harness.trace)
             trace_summary = self._summarize_worker_trace(harness.trace)
             challenge_tracker = getattr(harness, "challenge_tracker", None)
@@ -940,26 +757,6 @@ class SpawnerWorkerMixin:
                 validation=artifact_validation,
                 worker_id=worker_id,
                 phase_id=phase_id,
-            )
-            # Self-heal loop: the fast path fell back (skill_answer is None) but the
-            # slow path produced a validated result — distill its trace into a
-            # candidate workflow and canary-promote it for the degraded skill.
-            await self._maybe_autoheal_skill(
-                harness,
-                fast_path_handled=skill_answer is not None,
-                slow_path_succeeded=validated_status == "validated_done",
-                worker_contract=worker_contract or {},
-                phase=phase or {},
-                task=task,
-                context=effective_context,
-                fleet_ids=([assignment.fleet_id] if assignment else sorted(slot.fleet_ids)),
-            )
-            self._record_guidance_signal(
-                worker_contract=worker_contract or {},
-                fast_path_handled=skill_answer is not None,
-                validated_ok=validated_status == "validated_done",
-                steps=int(trace_summary.get("toolCalls") or 0),
-                answer=str(answer or ""),
             )
             diagnostics = getattr(harness, "diagnostics", None)
             captcha_receipts = list(

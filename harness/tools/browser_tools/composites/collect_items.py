@@ -166,7 +166,8 @@ def _validated_base_row(agent: Any, base_row_ref: Any) -> tuple[Optional[JsonDic
             "error": "baseRowRef.savedPath is not in the task's validated artifact ledger",
         }
     try:
-        payload = json.loads(candidate.read_text(encoding="utf-8"))
+        from harness.utils import read_task_file_text
+        payload = json.loads(read_task_file_text(agent.logger, str(candidate)) or "")
     except (OSError, json.JSONDecodeError) as exc:
         return None, {"status": "rejected", "error": f"baseRowRef could not be read: {exc}"}
     rows = payload.get("rows") if isinstance(payload, dict) else None
@@ -739,7 +740,7 @@ async def _collect_overlay_recovery(
             count_progress=False,
         )
         if _invoke_result_failed(inspect) or not isinstance(
-            detect_overlay_from_result(inspect), dict
+            detect_overlay_from_result(inspect, logger=getattr(agent, "logger", None)), dict
         ):
             return {"handled": False}
     dismissed = await _dismiss_overlay(

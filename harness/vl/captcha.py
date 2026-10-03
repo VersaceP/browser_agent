@@ -6,8 +6,7 @@ times before a human is asked":
   * the worker hot path (``harness.tools.browser_tools.captcha_autosolve``),
     which drives the page over the agent's own primary connection before any
     ``Hitl.requestPause`` is issued;
-  * the skill workflow control channel (``harness.skill.control``), which drives
-    a page that is already HITL-paused over a second connection.
+  * callers with an explicitly scoped alternate connection, when present.
 
 The engine owns only the ORDER of operations and the budget; every I/O leg is
 injected as a zero/low-arg awaitable so both callers keep their own transport,

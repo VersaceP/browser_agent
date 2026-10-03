@@ -68,9 +68,14 @@ def purge_task(
     ).fetchone()
     if running and int(running[0]):
         raise PurgeRefused(f"task {task_id} still has a running run")
-    lock_dir = store.task_dir(task_id) / ".run.lock"
-    if lock_dir.is_dir():
-        raise PurgeRefused(f"task {task_id} still holds a run lock at {lock_dir}")
+    from harness.runtime.resume_state import task_run_lock_dir
+
+    for lock_dir in (
+        task_run_lock_dir(store.task_dir(task_id)),
+        store.task_dir(task_id) / ".run.lock",
+    ):
+        if lock_dir.is_dir():
+            raise PurgeRefused(f"task {task_id} still holds a run lock at {lock_dir}")
 
     _set_purge_status(connection, task_id, "purging")
     removed, skipped, failed = (

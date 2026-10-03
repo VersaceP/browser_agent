@@ -4,10 +4,12 @@ harness.tools.browser_tools.dispatch - Tool registry, dispatcher and model-facin
 
 import asyncio
 import copy
+import hashlib
 import json
 import re
 import uuid
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 from typing import Awaitable
 from typing import Callable
@@ -138,12 +140,19 @@ async def _page_lifecycle_guard_before(
 ) -> Optional[JsonDict]:
     """Event-driven pre-call gate.
 
-    DOM probes wait for settlement.  A missed event triggers exactly one
-    Page.getState call.  Re-perception obligations are then exposed as explicit
-    guards so the model cannot continue with stale DOM handles.
+    DOM probes wait for known loading to settle. An ambiguous navigation commit
+    or missed settlement event triggers one Page.getState call. Re-perception
+    obligations still prevent use of stale DOM handles.
     """
     tracker = getattr(agent, "page_lifecycle", None)
     if not isinstance(tracker, PageLifecycleTracker):
+        return None
+    if method == "Workflow.execute":
+        # WebCross owns the sequential action execution, including waitEvent
+        # and Page.getState recovery inside the document. An outer one-action
+        # resync obligation must not prevent those recovery steps from running.
+        # Capability/schema, task binding, Fleet ownership and HITL admission
+        # still run independently in the capability dispatcher.
         return None
     page_id = _lifecycle_page_id(agent, params)
     state = tracker.state(page_id)
@@ -151,6 +160,7 @@ async def _page_lifecycle_guard_before(
         return None
 
     is_dom_probe = method.startswith("DOM.")
+    settled = None
     if is_dom_probe and state.status == "loading":
         raw_timeout = getattr(
             agent.runtime.harness, "page_settlement_timeout_seconds", 15.0
@@ -165,38 +175,45 @@ async def _page_lifecycle_guard_before(
             "timeoutSeconds": timeout,
             "outcome": settled,
         })
-        if settled == "timeout":
-            runner = getattr(agent, "browser_call_runner", None)
-            if runner is None:
-                runner = build_browser_call_runner(
-                    browser=agent.browser,
-                    logger=agent.logger,
-                    capability_methods=agent.capability_methods,
-                )
-                agent.browser_call_runner = runner
-            try:
-                response = await runner.call("Page.getState", {
-                    "pageId": page_id,
-                    "purpose": "One-shot resynchronization after settlement event timeout",
-                })
+    navigation_unknown = (is_dom_probe and state.status == "unknown"
+                          and state.requires_state_resync and state.requires_ax_refresh)
+    if settled == "timeout" or navigation_unknown:
+        runner = getattr(agent, "browser_call_runner", None)
+        if runner is None:
+            runner = build_browser_call_runner(
+                browser=agent.browser,
+                logger=agent.logger,
+                capability_methods=agent.capability_methods,
+            )
+            agent.browser_call_runner = runner
+        observed_state = (state.generation, state.status)
+        try:
+            response = await runner.call("Page.getState", {
+                "pageId": page_id,
+                "purpose": ("Confirm current state after a navigation commit"
+                            if navigation_unknown else
+                            "One-shot resynchronization after settlement event timeout"),
+            })
+            current = tracker.state(page_id)
+            response_applied = (current.generation, current.status) == observed_state
+            if response_applied:
                 tracker.observe_state_response(page_id, response)
-                agent.logger.write("page.lifecycle.timeout_resync", {
-                    **tracker.receipt(page_id),
-                    "performed": True,
-                })
-            except Exception as exc:  # the original DOM call remains blocked
-                return {
-                    "status": "page_settlement_unknown",
-                    "tool_was_executed": False,
-                    "pageLifecycle": tracker.receipt(page_id),
-                    "error": str(exc),
-                    "next_instruction": (
-                        "The Page.loaded settlement event timed out and the one-shot"
-                        " Page.getState resynchronization failed. Do not poll; inspect"
-                        " the failure or recover the page."
-                    ),
-                }
-            state = tracker.state(page_id)
+            agent.logger.write("page.lifecycle.navigation_resync" if navigation_unknown
+                               else "page.lifecycle.timeout_resync", {
+                **tracker.receipt(page_id), "performed": True,
+                "responseApplied": response_applied,
+            })
+        except Exception as exc:  # the original DOM call remains blocked
+            return {
+                "status": "page_settlement_unknown",
+                "tool_was_executed": False,
+                "pageLifecycle": tracker.receipt(page_id),
+                "error": str(exc),
+                "next_instruction": (
+                    "The one-shot Page.getState resynchronization failed."
+                    " Do not poll; inspect the failure or recover the page."
+                ),
+            }
 
     state = tracker.state(page_id)
     if state is None:
@@ -831,6 +848,8 @@ async def _execute_browser_tool_impl(
         " Derive params from live feedback: previous response.data handles, current"
         " DOM.getAXTree node ids and query records, worker_contract,"
         " or cited record_extraction artifacts."
+        " For Runtime.evaluate data capture, runtime_policy.record_name persists"
+        " returned rows directly and returns recordExtraction.savedPath."
     ),
     input_schema=_browser_schema_for("browser_call"),
     strict=False,
@@ -843,240 +862,6 @@ async def _browser_call(ctx: ToolContext) -> JsonDict:
         ctx.tool_input,
         ctx.step,
     )
-    return result
-
-@BROWSER_TOOLS.register(
-    name="execute_selected_skill",
-    description=(
-        "Execute the currently selected workflow skill's frozen recipe without"
-        " copying, reading, or reconstructing workflow.json steps. Accepts one"
-        " variables object or multiple rows; batch rows run strictly serially"
-        " on the supplied warm page. This tool only runs the selected recipe and"
-        " returns structured rows; persist accepted data with record_extraction."
-    ),
-    input_schema=_browser_schema_for("execute_selected_skill"),
-    contract_check=True,
-)
-async def _browser_execute_selected_skill(ctx: ToolContext) -> JsonDict:
-    if not workflow_execution_enabled(ctx.agent):
-        return workflow_execution_disabled_result(source="execute_selected_skill")
-    from harness.skill.contract import skill_selection_declined
-    from harness.skill.dispatch import (
-        _align_row_fields_to_expected,
-        auth_fence_outcome,
-        _expected_fields_of,
-        _provenance_evidence_requirements,
-        _run_with_transient_retry,
-        build_extraction_row,
-        page_binding_mismatch,
-        required_filled,
-    )
-    from harness.skill.pause import classify_run_for_hitl
-    from harness.skill.registry import SkillRegistry
-    from harness.skill.workflow import check_success_contract
-
-    agent = ctx.agent
-    contract = getattr(agent, "worker_contract", None)
-    contract = contract if isinstance(contract, dict) else {}
-    repair_manifest = contract.get("_repair_manifest")
-    if (
-        isinstance(repair_manifest, dict)
-        and not str(repair_manifest.get("disabledReason") or "").strip()
-    ):
-        return {
-            "status": "rejected",
-            "error": (
-                "A field-level repair manifest is active. Preserve its trusted"
-                " baseline and patch only the listed fields; do not re-run the"
-                " full selected workflow."
-            ),
-            "tool_was_executed": False,
-        }
-    if bool(getattr(agent, "_selected_skill_workflow_attempted", False)):
-        return {
-            "status": "rejected",
-            "error": (
-                "The selected frozen workflow already ran in this worker."
-                " Follow the existing failure/partial handoff and re-observe"
-                " only the unresolved target instead of replaying the recipe."
-            ),
-            "tool_was_executed": False,
-        }
-    if skill_selection_declined(contract):
-        return {
-            "status": "rejected",
-            "error": "The worker contract explicitly declined skill execution.",
-            "tool_was_executed": False,
-        }
-    skill_id = str(contract.get("skill_id") or "").strip()
-    if not skill_id:
-        selection = contract.get("skill_selection")
-        if isinstance(selection, dict) and selection.get("use_skill") is not False:
-            skill_id = str(selection.get("skill_id") or "").strip()
-    registry = SkillRegistry.load()
-    skill = registry.get(skill_id) if skill_id else None
-    if skill is None or not skill.has_workflow:
-        return {
-            "status": "rejected",
-            "error": "No selected workflow skill is available for this worker.",
-            "tool_was_executed": False,
-        }
-
-    single = ctx.tool_input.get("variables")
-    single = single if isinstance(single, dict) else {}
-    batch = ctx.tool_input.get("rows")
-    batch = [row for row in batch if isinstance(row, dict)] if isinstance(batch, list) else []
-    if single and batch:
-        return {
-            "status": "invalid_input",
-            "error": "Provide variables or rows, not both.",
-            "tool_was_executed": False,
-        }
-    page_id = str(ctx.tool_input.get("pageId") or "").strip()
-    fleet_id = str(ctx.tool_input.get("fleetId") or "").strip()
-    if not page_id:
-        return {
-            "status": "invalid_input",
-            "error": "pageId must be a live page handle from Page.getState/Page.list.",
-            "tool_was_executed": False,
-        }
-
-    evidence_fields = set(
-        _provenance_evidence_requirements(contract.get("validators")).values()
-    )
-    passthrough = {
-        str(value)
-        for value in (skill.row_contract.get("passthrough_variables") or [])
-        if str(value).strip()
-    }
-    allowed = set(skill.variable_template) | passthrough | evidence_fields
-    base_input = contract.get("skill_variables")
-    base_input = base_input if isinstance(base_input, dict) else {}
-    inputs = batch if batch else [single]
-    effective_inputs: List[JsonDict] = []
-    for row in inputs:
-        effective = dict(base_input)
-        effective.update(row)
-        unknown = sorted(str(key) for key in effective if str(key) not in allowed)
-        if unknown:
-            return {
-                "status": "invalid_input",
-                "error": "Input contains fields outside the selected skill row contract.",
-                "unknownFields": unknown,
-                "allowedFields": sorted(allowed),
-                "tool_was_executed": False,
-            }
-        effective_inputs.append(effective)
-
-    output_rows: List[JsonDict] = []
-    runs: List[JsonDict] = []
-    for index, row_input in enumerate(effective_inputs):
-        variables = {
-            key: row_input.get(key, default)
-            for key, default in skill.variable_template.items()
-        }
-        if not required_filled(skill, variables):
-            result = {
-                "status": "partial" if output_rows else "invalid_input",
-                "skill": skill.skill_id,
-                "completedRows": len(output_rows),
-                "failedRow": index,
-                "error": "A workflow-referenced variable is empty.",
-                "rows": output_rows,
-                "tool_was_executed": bool(output_rows),
-            }
-            return result
-        run_id = f"skill-tool-{skill.skill_id}-{uuid.uuid4().hex[:8]}"
-        run_result, observed_signal = await _run_with_transient_retry(
-            agent,
-            skill,
-            run_id=run_id,
-            page_id=page_id,
-            fleet_id=fleet_id,
-            variables=variables,
-            event_prefix="skill.selected_workflow",
-        )
-        auth_fence = auth_fence_outcome(run_result)
-        if auth_fence is not None:
-            result = {
-                "status": "partial" if output_rows else "workflow_auth_fenced",
-                "skill": skill.skill_id,
-                "completedRows": len(output_rows),
-                "failedRow": index,
-                "rows": output_rows,
-                "runs": runs,
-                "authFence": auth_fence,
-                "next_instruction": (
-                    "The shared authentication generation changed or its"
-                    " barrier closed. Preserve completed rows, re-perceive the"
-                    " current page, and retry only the failed row."
-                ),
-            }
-            _record_selected_skill_tool_trace(agent, result)
-            return result
-        hitl = classify_run_for_hitl(run_result, observed_signal)
-        verdict = check_success_contract(skill, run_result)
-        mismatch = page_binding_mismatch(skill, run_result, variables)
-        run_summary: JsonDict = {
-            "index": index,
-            "runId": run_id,
-            "succeeded": bool(run_result.get("succeeded")),
-            "failedChecks": verdict.get("failed_checks") or [],
-        }
-        if hitl is not None:
-            run_summary["hitl"] = hitl
-        if mismatch is not None:
-            run_summary["pageBinding"] = mismatch
-        runs.append(run_summary)
-        if (
-            not run_result.get("succeeded")
-            or not verdict.get("ok")
-            or hitl is not None
-            or mismatch is not None
-        ):
-            result = {
-                "status": "partial" if output_rows else "workflow_failed",
-                "skill": skill.skill_id,
-                "completedRows": len(output_rows),
-                "failedRow": index,
-                "rows": output_rows,
-                "runs": runs,
-                "next_instruction": (
-                    "Use the returned completed rows as observed data. Re-observe"
-                    " only the failed row/fields, then persist one final artifact."
-                ),
-            }
-            _record_selected_skill_tool_trace(agent, result)
-            return result
-        built = build_extraction_row(
-            skill,
-            run_result,
-            input_variables=dict(row_input),
-        )
-        output_rows.append(_align_row_fields_to_expected(
-            built, _expected_fields_of(contract),
-        ))
-        await wait_between_rows(
-            agent,
-            contract,
-            completed_index=index,
-            total_rows=len(effective_inputs),
-            source="execute_selected_skill",
-        )
-
-    result = {
-        "status": "done",
-        "skill": skill.skill_id,
-        "completedRows": len(output_rows),
-        "rows": output_rows,
-        "runs": runs,
-        "next_instruction": (
-            "Review the structured rows against the worker contract, add any"
-            " evidence the frozen workflow cannot produce, then call"
-            " record_extraction. Do not re-run the same workflow manually."
-        ),
-    }
-    _record_selected_skill_tool_trace(agent, result)
     return result
 
 def _workflow_definition_outcome(ctx: ToolContext, receipt: JsonDict, result: JsonDict) -> None:
@@ -1142,6 +927,116 @@ def _record_workflow_definition_before_dispatch(ctx: ToolContext, receipt: JsonD
         trace = []
         ctx.agent.trace = trace
     trace.append(record)
+
+
+@BROWSER_TOOLS.register(
+    name="execute_published_skill_workflow",
+    description=(
+        "Execute one immutable Workflow JSON file from the exact Skill version"
+        " explicitly selected by the user for this task. The live page and"
+        " variables are supplied separately; the file is never reconstructed"
+        " from model text. Returns actual WebCross and Harness receipts."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Relative Workflow JSON path inside selected Skill."},
+            "pageId": {"type": "string"},
+            "fleetId": {"type": "string"},
+            "variables": {"type": "object", "additionalProperties": True},
+        },
+        "required": ["path", "pageId", "fleetId", "variables"],
+        "additionalProperties": False,
+    },
+    contract_check=True,
+    trace_type="skill_workflow_invocation",
+)
+async def _browser_execute_published_skill_workflow(ctx: ToolContext) -> JsonDict:
+    if not workflow_execution_enabled(ctx.agent):
+        return workflow_execution_disabled_result(source="execute_published_skill_workflow")
+    config = getattr(getattr(ctx.agent, "runtime", None), "harness", None)
+    skill_id = str(getattr(config, "forced_skill_id", "") or "").strip()
+    skill_hash = str(getattr(config, "forced_skill_hash", "") or "").strip()
+    if not skill_id or not skill_hash:
+        return {"status": "permission_denied", "tool_was_executed": False,
+                "error": "此任务没有用户明确选择且绑定版本的 Skill"}
+    from harness.skill_builder.catalog import SkillCatalog
+    from harness.storage.factory import resolve_sqlite_path
+    from harness.workflow.workflow_projection import workflow_execution_facts
+
+    worktree = str(getattr(config, "worktree_dir", "worktree"))
+    catalog = SkillCatalog(
+        Path(__file__).resolve().parents[3] / "skills",
+        resolve_sqlite_path(getattr(config, "storage_sqlite_path", "harness.db"), worktree),
+    )
+    invocation = None
+    invocation_open = False
+    try:
+        snapshot = catalog.version_path(skill_id, skill_hash)
+        if snapshot is None:
+            return {"status": "skill_version_unavailable", "tool_was_executed": False,
+                    "skill": skill_id, "hash": skill_hash}
+        relative = Path(str(ctx.tool_input.get("path") or ""))
+        if (relative.is_absolute() or not relative.parts or ".." in relative.parts
+                or any(part.startswith(".") for part in relative.parts)
+                or relative.suffix != ".json"):
+            return {"status": "invalid_skill_path", "tool_was_executed": False}
+        path = snapshot / relative
+        if not path.is_file() or path.is_symlink() or not path.resolve().is_relative_to(snapshot.resolve()):
+            return {"status": "skill_workflow_missing", "tool_was_executed": False,
+                    "path": relative.as_posix()}
+        workflow = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(workflow, dict):
+            return {"status": "invalid_skill_workflow", "tool_was_executed": False}
+        variables = ctx.tool_input.get("variables")
+        if not isinstance(variables, dict):
+            return {"status": "invalid_variables", "tool_was_executed": False}
+        workflow = dict(workflow)
+        workflow["initialVariables"] = {**(workflow.get("initialVariables") or {}), **variables}
+        page_id = str(ctx.tool_input.get("pageId") or "")
+        fleet_id = str(ctx.tool_input.get("fleetId") or "")
+        input_hash = hashlib.sha256(json.dumps(
+            {"workflow": relative.as_posix(), "variables": variables,
+             "pageId": page_id, "fleetId": fleet_id},
+            sort_keys=True, default=str,
+        ).encode()).hexdigest()
+        invocation = catalog.begin_invocation(
+            task_id=ctx.agent.logger.task_id, run_id=ctx.agent.logger.run_id,
+            skill_id=skill_id, content_hash=skill_hash, input_hash=input_hash,
+        )
+        invocation_open = True
+        ctx.agent.logger.write("skill.invocation.started", {
+            **invocation, "workflowPath": relative.as_posix(), "pageId": page_id,
+            "fleetId": fleet_id, "inputHash": input_hash,
+        })
+        result, _should_stop = await _bt()._execute_browser_capability_tool(
+            ctx.agent, "browser_call", {
+                "method": "Workflow.execute",
+                "params": {"workflow": workflow,
+                           "binding": {"pageId": page_id, "fleetId": fleet_id}},
+                "reason": f"Execute selected Skill {skill_id} Workflow {relative.as_posix()}",
+            }, ctx.step, published_skill_workflow=True,
+        )
+        facts = workflow_execution_facts(result)
+        status = str(facts.get("status") or "unknown")
+        ctx.agent.logger.write("skill.invocation.result", {
+            "invocationId": invocation["invocationId"], "facts": facts,
+        })
+        catalog.finish_invocation(invocation["invocationId"], status=status,
+                                  result_ref="skill.invocation.result")
+        invocation_open = False
+        result["skillInvocation"] = {**invocation, "workflowPath": relative.as_posix(),
+                                     "status": status}
+        return result
+    except BaseException:
+        if invocation is not None and invocation_open:
+            try:
+                catalog.finish_invocation(invocation["invocationId"], status="unknown")
+            except Exception:
+                pass  # Preserve the original execution or persistence failure.
+        raise
+    finally:
+        catalog.close()
 
 
 @BROWSER_TOOLS.register(
@@ -1370,25 +1265,6 @@ async def _browser_execute_saved_browser_workflow(ctx: ToolContext) -> JsonDict:
         })
     return result
 
-def _record_selected_skill_tool_trace(agent: Any, result: JsonDict) -> None:
-    summary = {
-        "skill": result.get("skill"),
-        "status": result.get("status"),
-        "completedRows": result.get("completedRows"),
-        "failedRow": result.get("failedRow"),
-        "runIds": [
-            run.get("runId")
-            for run in (result.get("runs") or [])
-            if isinstance(run, dict)
-        ],
-    }
-    logger = getattr(agent, "logger", None)
-    if logger is not None and hasattr(logger, "write"):
-        logger.write("skill.selected_workflow.executed", summary)
-    trace = getattr(agent, "trace", None)
-    if isinstance(trace, list):
-        trace.append({"type": "execute_selected_skill", "result": summary})
-
 @BROWSER_TOOLS.register(
     name="navigate_verified",
     description=(
@@ -1539,8 +1415,29 @@ async def _browser_visual_verify(ctx: ToolContext) -> JsonDict:
 )
 async def _browser_final_answer(ctx: ToolContext) -> JsonDict:
     answer = str(ctx.tool_input.get("answer", "")).strip()
+    status = str(ctx.tool_input.get("status") or "done")
+    if (
+        bool(getattr(ctx.agent, "standalone_browser_mode", False))
+        and status == "partial"
+    ):
+        checkpoint = {
+            "status": "continuing", "answer": answer,
+            "continuation": ctx.tool_input.get("continuation"),
+        }
+        ctx.agent.logger.write("browser.task_checkpoint", checkpoint)
+        ctx.agent.trace.append({"type": "browser_task_checkpoint", "result": checkpoint})
+        return {
+            **checkpoint, "tool_was_executed": False,
+            "next_instruction": (
+                "Progress was saved. This standalone Browser task is still"
+                " active. Re-observe the current page as needed and continue"
+                " the original user goal. Use final_answer(status='done')"
+                " only after verifying completion, or status='incomplete'"
+                " with a concrete blocker when no useful action remains."
+            ),
+        }
     result = {
-        "status": ctx.tool_input.get("status", "done"),
+        "status": status,
         "answer": answer,
         "artifacts": ctx.agent.artifacts,
     }
@@ -1646,6 +1543,8 @@ async def _browser_request_step_extension(ctx: ToolContext) -> JsonDict:
         " `name` identifies the dataset; `rows` must be a list[dict] backed by actual observations"
         " and should preserve provenance for critical fields. Inspect the returned"
         " validation status; savedPath alone is not proof the contract passed."
+        " When capturing structured rows with Runtime.evaluate, set browser_call's"
+        " runtime_policy.record_name instead of regenerating those rows here."
     ),
     input_schema=_browser_schema_for("record_extraction"),
     strict=False,
@@ -1771,6 +1670,54 @@ async def _browser_local_fs_read(ctx: ToolContext) -> JsonDict:
 
 
 @BROWSER_TOOLS.register(
+    name="update_task_todo",
+    description=(
+        "Write the standalone Browser task's full Markdown checklist to its"
+        " task scratchpad. Replace the whole checklist when progress changes;"
+        " this note is not a user deliverable."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "content": {"type": "string", "minLength": 1},
+            "ready_for_final_review": {"type": "boolean", "default": False,
+                "description": "Set true when the next step is final_answer. Saves this update for that final review; it does not approve completion."},
+        },
+        "required": ["content"], "additionalProperties": False,
+    },
+    trace_type="browser_todo_update",
+)
+async def _browser_update_task_todo(ctx: ToolContext) -> JsonDict:
+    from harness.agents.browser.review.task import write_todo
+    result = write_todo(ctx.agent, ctx.tool_input.get("content"))
+    if result.get("status") == "done":
+        result["readyForFinalReview"] = ctx.tool_input.get("ready_for_final_review") is True
+    return result
+
+
+@BROWSER_TOOLS.register(
+    name="request_goal_review",
+    description=(
+        "Ask the independent reviewer to inspect a concrete concern about the"
+        " standalone Browser task. This does not modify the page or the goal."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {"question": {"type": "string", "minLength": 1}},
+        "required": ["question"], "additionalProperties": False,
+    },
+    loop_guard=False,
+    trace_type="goal_review_request",
+)
+async def _browser_request_goal_review(ctx: ToolContext) -> JsonDict:
+    if not getattr(ctx.agent, "standalone_browser_mode", False):
+        return {"status": "rejected", "reason": "standalone_browser_only",
+                "tool_was_executed": False}
+    return {"status": "requested", "question": ctx.tool_input["question"][:2000],
+            "tool_was_executed": True}
+
+
+@BROWSER_TOOLS.register(
     name="local_fs_batch",
     description=(
         "Batch bounded local file operations: list, create directories, write UTF-8 text/JSON,"
@@ -1830,8 +1777,10 @@ def build_browser_agent_tool_specs(
     capability_methods: Set[str],
     *,
     workflow_enabled: bool = False,
+    selected_skill_available: bool = False,
     step_extension_enabled: bool = False,
     multimodal_enabled: bool = False,
+    standalone_review_enabled: bool = False,
 ) -> List[JsonDict]:
     # A live capability does not authorize Harness execution by itself. Both
     # the control-plane master switch and the ABCP capability must be present.
@@ -1845,14 +1794,18 @@ def build_browser_agent_tool_specs(
             step_extension_enabled
             or spec.get("name") != "request_step_extension"
         )
+        and (standalone_review_enabled or spec.get("name") not in {
+            "request_goal_review", "update_task_todo",
+        })
         and (
             workflow_visible
             or spec.get("name") not in {
-                "execute_selected_skill",
+                "execute_published_skill_workflow",
                 "execute_browser_workflow",
                 "execute_saved_browser_workflow",
             }
         )
+        and (selected_skill_available or spec.get("name") != "execute_published_skill_workflow")
         # A multimodal BrowserAgent receives a bounded Page.screenshot image
         # attachment in the very next model request. Do not offer the old
         # second-model visual tool alongside it: that adds a network/model

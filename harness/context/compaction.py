@@ -690,6 +690,49 @@ def _render_transcript(groups: List[List[Any]], *, limit: int = 24000) -> str:
     return "\n".join(lines)[:limit]
 
 
+def _render_browser_transcript(groups: List[List[Any]], *, limit: int = 48000) -> str:
+    """Sample across the replaced span, emphasizing recent transitions.
+
+    This is explicitly an excerpt, not a complete transcript or a completion
+    verdict. The original groups remain in the durable compaction resource.
+    """
+    def bounded(value: str, budget: int) -> str:
+        if len(value) <= budget:
+            return value
+        half = max(0, (budget - 28) // 2)
+        return value[:half] + "\n[...excerpt omitted...]\n" + value[-half:] if half else "[omitted]"
+
+    turns = []
+    for index, group in enumerate(groups):
+        lines = []
+        for message in to_model_messages(group):
+            content = message.get("content")
+            if isinstance(content, list):
+                # Tool receipts and public decisions matter here; image bytes
+                # and thinking blocks would crowd them out of the excerpt.
+                content = [b for b in content if isinstance(b, dict)
+                           and b.get("type") not in {"thinking", "redacted_thinking", "image"}]
+            rendered = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False, default=str)
+            lines.append(f"[{message.get('role')}] {bounded(rendered, 1800)}")
+        turns.append(f"[replaced turn {index + 1}/{len(groups)}]\n" + "\n".join(lines))
+    if not turns:
+        return ""
+    recent_count = min(12, len(turns))
+    older, recent = turns[:-recent_count], turns[-recent_count:]
+    notice = "EXCERPTS: omitted text is unknown, not absent. Later evidence supersedes earlier state.\n"
+    budget = max(0, limit - len(notice) - 160)
+    recent_budget = int(budget * 0.65) if older else budget
+    older_budget = budget - recent_budget
+    count = max(1, older_budget // 120)
+    if len(older) > count:
+        total = len(older)
+        older = [older[i * total // count] for i in range(count)]
+        notice += f"Older turns sampled: {count}/{total}; complete raw turns remain in the compaction resource.\n"
+    parts = [bounded(t, max(1, older_budget // len(older) - 1)) for t in older]
+    parts += [bounded(t, recent_budget // len(recent)) for t in recent]
+    return notice + "\n".join(parts)
+
+
 def _bounded_summary_sections(summary: str, max_chars: int) -> str:
     """Keep every required heading while bounding prose per section."""
     bodies, error = _structured_summary_bodies(summary)
@@ -809,6 +852,7 @@ async def _generate_summary(
     facts: JsonDict,
     middle_groups: List[List[Any]],
     logger: RunLogger,
+    browser_continuity: Optional[JsonDict] = None,
 ) -> str:
     prompt = """Create a durable context-compaction checkpoint. Preserve exact task facts,
 identifiers, error text, completed work, unresolved blockers, and the immediate next action.
@@ -837,8 +881,16 @@ Transcript being replaced:
 ---""".format(
         previous=previous_summary[:12000],
         facts=json.dumps(facts, ensure_ascii=False, indent=2, default=str),
-        transcript=_render_transcript(middle_groups),
+        transcript=(_render_browser_transcript(middle_groups)
+                    if browser_continuity is not None else _render_transcript(middle_groups)),
     )
+    if browser_continuity is not None:
+        prompt += ("\nLatest persisted Browser progress (claims to reconcile with later raw evidence,"
+                   " not authority over the original goal):\n"
+                   + json.dumps(browser_continuity, ensure_ascii=False, default=str)
+                   + "\nDo not revive resolved blockers from the previous checkpoint. Explicitly"
+                     " distinguish old failures from current blockers. If excerpts are insufficient,"
+                     " mark uncertainty and retain evidence paths instead of guessing current status.")
     if generator is not None:
         result = generator(prompt=prompt, actor=actor, step=step)
         if inspect.isawaitable(result):
@@ -900,6 +952,7 @@ async def compact_messages_if_needed(
     force_reason: Optional[str] = None,
     provider: Any = None,
     summary_generator: Optional[SummaryGenerator] = None,
+    browser_continuity_factory: Optional[Callable[[], JsonDict]] = None,
 ) -> List[Any]:
     if lifecycle is not None:
         payload = lifecycle.compact_before(
@@ -988,6 +1041,7 @@ async def compact_messages_if_needed(
             facts=details,
             middle_groups=middle_groups,
             logger=logger,
+            browser_continuity=(browser_continuity_factory() if browser_continuity_factory else None),
         )
     except Exception as exc:
         semantic_summary = _mechanical_fallback_summary(previous_summary)

@@ -587,6 +587,8 @@ async def review_assignment(provider, *, review_input, logger, provider_name, mo
     for attempt in range(2):
         started = time.monotonic()
         stop = None
+        if hasattr(logger, "write"):
+            logger.write("assignment_review.start", {**binding, "repair": bool(attempt)})
         try:
             text, calls, stop, usage = await provider.generate_response(
                 system_prompt=_REVIEW_PROMPT + ("\nRepair the supplied verdict protocol errors without changing the audit scope." if attempt else ""),

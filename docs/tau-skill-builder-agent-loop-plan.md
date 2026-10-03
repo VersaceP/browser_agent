@@ -1,10 +1,18 @@
 # 基于 Tau 的 Skill Builder、Coding Agent 与共享执行能力实施计划
 
-- 更新日期：2026-09-29；根据本轮九项评审修订。
-- 状态：设计文档；运行时代码删除、数据库迁移与功能实现待本版方案确认后执行。
+- 更新日期：2026-09-29；第一阶段实现与无业务副作用试运行已落地。
+- 状态：第一阶段已实现核心闭环；真实模型驱动的业务 Skill 构建及长流程效果仍需用实际任务验收。第二至四阶段尚未实施。
 - 顺序：第一阶段 Skill Builder；第二阶段共享 Python/Shell 沙箱、grep 与公共网络；第三阶段 Coding / Browser 编排；第四阶段恢复与性能完善。
 - 选型：固定 Tau Agent 核心并做必要补丁，应用会话复用当前 Harness；不整体继承 Tau CodingSession。
 - 本版调整：面向更长的可复用 Workflow；DSL 编译由 WebCross 负责；明确根目录 skills 与任务 worktree 的 SQLite 索引；取消 CandidateStore、独立生成/验证报告、Skill/Workflow health 与自动晋升；用户选择发布、编辑、删除；Skill 继续显式使用。
+
+### 2026-09-29 第一阶段实施记录
+
+- `harness/_vendor/tau_agent/` 固定上游核心与补丁；`harness/skill_builder/` 实现 Provider 桥接、来源任务只读访问、工作文件、隔离浏览器试运行、目录索引与发布操作。Builder 需要 Python 3.12+；普通 Browser/Lead 保持原项目要求。
+- `/skill-create @task_id ...` 与 `/<确切Skill名> @task_id ...` 已接入 CLI；同一来源任务多次调用该 Skill 时要求明确 `--invocation <id>`。`/skill-edit`、`/skill-publish`、`/skill-delete` 管理工作文件和正式版本；发布与删除有文件/SQLite 恢复日志。
+- 正式任务只通过 `/skill <name>` 或 `--skill <name>` 显式选择，任务 manifest 保存内容哈希；Worker 读取相同快照，`execute_published_skill_workflow` 记录每次实际调用。旧 Skill 自动匹配、快路径、health、autoheal、报告与蒸馏模块已从运行代码删除。
+- 新的发布 Skill 路径保留 WebCross 原始 Workflow 定义，不经过旧的 100 步/导航顺序 DSL 检查；Harness 只检查嵌套 Action 的权限、实时能力与页面归属。旧 BrowserAgent 模型即时编写的 `execute_browser_workflow` 仍走旧 policy，后续单独评估，不将其结果冒充 Builder 路径。
+- 本地端到端测试覆盖 Builder 工作文件、SQLite 版本、历史引用、CLI 创建/发布、版本冲突、删除恢复与正式调用记账。实际安装 WebCross 上的隔离 `about:blank` 单步 `Page.getState` Workflow 返回 `status=succeeded` 和 workflowId，测试 Fleet 已关闭。真实 Provider 驱动的长业务流程、失败修复与多页面 Workflow 尚无端到端数据，因此不能声称这些效果已验收。
 
 ## 1. 目标与第一阶段交付
 
@@ -13,7 +21,8 @@ Skill Builder 根据用户目标与历史执行资料，把已经理解的浏览
 第一阶段交付：
 
 ```text
-/skill-create <任务目录或 task_id> [要求]
+/skill-create @<task_id> 用户需求/用户建议
+/<确切 Skill 名> @<task_id> 用户需求/用户建议
   → 读取原始目标、轨迹、文件和平台合同
   → 在当前构建任务 worktree 中编写 Skill
   → 发送给 WebCross：平台编译 → 实际执行
@@ -33,7 +42,7 @@ Skill Builder 根据用户目标与历史执行资料，把已经理解的浏览
 
 ### 2.1 2026-09-29 工作区核对
 
-工作区 HEAD 仍为 `0b0617727573e7fe3a26dd4cd419811eeaafe289`，存在未提交修改。下表描述本次读取的代码，不能据此认定正在运行的程序已经更新。
+下表是实施前代码调查记录；本轮实施起点为 `83dfcfb`。工作区源码与正在运行的安装版本仍须分别核对，不能据此认定部署已更新。
 
 | 代码 | 已核实事实 | 设计结论 |
 | --- | --- | --- |
@@ -44,7 +53,7 @@ Skill Builder 根据用户目标与历史执行资料，把已经理解的浏览
 | [workflow_policy.py](../harness/workflow/workflow_policy.py) | 目前混合权限、资源、DSL 结构、固定导航顺序及旧拼写转换；默认有 100 静态步骤、50 循环次数和 600000ms 相关限制 | 拆清职责，删重复 DSL/旧格式修复；资源限制独立配置，不用它定义 Skill 的业务边界 |
 | [dismiss_overlay.py](../harness/tools/browser_tools/composites/dismiss_overlay.py) | 同时包含原生操作和 VL 定位/验证分支 | 能确定表达的分支可重构进 Workflow；不能声称所有 composite 都只是原生 RPC 的薄封装 |
 | [collect_items.py](../harness/tools/browser_tools/composites/collect_items.py) | 含浏览器采集及 Harness `record_extraction` 落盘 | 浏览器段可展开；任务数据落盘职责仍在 Harness |
-| [registry.py](../harness/skill/registry.py) | 默认目录为项目根 `skills/`；当前还有 match、suite、draft/tested 与 `.create_report.json` 逻辑 | 新实现只保留元数据读取、索引、确切名称选择和显式执行职责 |
+| 旧 `harness/skill/registry.py`（实施前） | 默认目录为项目根 `skills/`；原有 match、suite、draft/tested 与 `.create_report.json` 逻辑 | 已由 `harness/skill_builder/catalog.py` 的确切名称选择和索引替换 |
 | [schema.sql](../harness/storage/schema.sql) | `task_resources` 有 task/run、external_path、hash、版本；没有全局 Skill 表 | 任务产物复用资源表；新增独立 Skill 索引，避免任务删除级联删除已发布 Skill |
 | [base.py](../harness/storage/base.py) | 外部资源类型已含 `coding_agent_output` | 可复用资源合同；类型存在不表示 Coding Agent 已实现 |
 | [main.py](../main.py) 的 `_run_browser_mode` | 使用 LeadAgent 对象承载部分基础设施，但没有 Lead 模型轮次 | `/browser` 后续由 Browser 模型发起 Coding 委派，不能让纯调度代码代替语义判断 |
@@ -174,7 +183,7 @@ Builder / Coding → 固定 Tau 核心 + 项目 provider / 消息 adapter
 
 ### 5.1 与现有 segment guide 的关系
 
-[segment guide](../harness/prompts/resources/browser/workflow-segments.md)主要指导在线 Browser 如何把当前已知操作组成一段 Workflow。Builder 有完整历史资料，能够消除当时的信息缺口，因此**复用其协议知识，重新判断切分位置**。
+[segment guide](../harness/prompts/resources/browser/workflow-segments.md)主要指导在线 Browser 如何把当前已知操作组成一段 Workflow。Builder 按授权读取可得的历史资料；资料可能不完整，因此**复用其协议知识，并依据实际证据重新判断切分位置**。
 
 保留：live Action/DSL 格式、原始回执与 Harness hydration 差异、引用/变量/store 语义、事件窗口、页面身份更新、错误与不确定副作用处理。重新评估：因当时需要截图、某个 composite、一次诊断或模型解读而产生的 segment 边界。
 
@@ -188,7 +197,7 @@ Builder / Coding → 固定 Tau 核心 + 项目 provider / 消息 adapter
 2. 沿数据依赖与决策依赖整理流程，不按 trace 的工具调用边界原样复制。
 3. 找出历史中的样本值、当次 page/Fleet/node ID、临时路径、凭据和需抽取的参数；保留原数据字段含义。新执行重新观察和绑定目标。
 4. 判断哪些在线模型决策现在能用明确输入、页面事实、条件和循环表达；可表达的连续部分合并。
-5. 检查 composite 实际职责，把有证据支持且原生 DSL 可表达的部分改写为原生步骤；保留必须依赖模型或 Harness 的部分。
+5. 依据公开工具合同、已记录的内部调用与实际试验分析 composite；把有证据支持且原生 DSL 可表达的部分重新实现为原生步骤，保留必须依赖模型或 Harness 的部分。
 6. 明确各 Workflow 输入/输出、结束条件、外部动作与中断后可恢复信息；通过 WebCross 实跑验证重构。
 7. 将确实需要模型的选择和恢复说明写进 SKILL.md；有多个 Workflow 时列明入口文件、数据交接和调用条件。
 
@@ -196,7 +205,7 @@ Builder / Coding → 固定 Tau 核心 + 项目 provider / 消息 adapter
 
 ### 5.3 composite 是否构成边界
 
-**composite 名称本身不构成边界；真正边界是下一步依赖的能力与决策。** 不能在未分析实现时声称“大部分可以替代”或“一律不可替代”。
+**composite 名称本身不构成边界；真正边界是下一步依赖的能力与决策。** Builder/Coding 默认读不到 Harness 源码，也不能仅凭一次调用摘要声称已复刻其全部分支。任务目标、工具合同、可归属的子调用与真实试运行构成重构依据；证据缺失时明确说明，继续探索或保留 Agent 边界。
 
 | composite 中的职责 | 可能处理 |
 | --- | --- |
@@ -206,7 +215,7 @@ Builder / Coding → 固定 Tau 核心 + 项目 provider / 消息 adapter
 | `record_extraction`、SQLite 索引、沙箱进程 | 浏览器执行结束后调用 Harness 工具；不能假装是平台 Action |
 | 权限、身份验证或敏感信息处理 | 在所属执行层继续落实，不能因展开 composite 而丢失 |
 
-现有 `dismiss_overlay` 含 VL 分支，`collect_items` 含数据落盘。Builder 可以提取其中确定性的浏览器流程，但不会把这些职责一起复制成一段伪原生脚本。
+现有 `dismiss_overlay` 含 VL 分支，`collect_items` 含数据落盘。这是本方案阅读源码得到的设计证据，不表示 Builder 执行时可读取源码。第一阶段应给 Builder 提供当前部署版本的工具描述、输入/输出及副作用合同，并在可记录处按父工具调用关联子调用的脱敏参数、回执和文件引用。旧 trace 未记录的内部细节标为未知；一次观察路径不能证明其他分支等价。Builder 可以围绕用户目标用原生工具重新实现确定性流程，实际试运行验证结果。
 
 ### 5.4 应交还 Agent 的情形
 
@@ -220,7 +229,9 @@ Builder / Coding → 固定 Tau 核心 + 项目 provider / 消息 adapter
 
 ### 6.1 入口与编辑
 
-`/skill-create <源任务目录或 task_id> [创建要求]` 创建一个新的构建任务，拥有自己的 task_id/run_id；源任务仅作为资料引用。中间文件写入该构建任务的 worktree。源任务失败或不完整也可作为参考，不设置“必须原任务成功”的机械门槛。
+`/skill-create @<task_id> 用户需求/用户建议` 创建新的构建任务；`/<确切 Skill 名> @<task_id> 用户需求/用户建议` 在同一 Builder 模式下修复用户指定的 Skill。两者均有自己的 task_id/run_id，源任务通过明确授权的只读资料接口引用，中间文件写入新任务 worktree。`@task_id` 可以指向失败或不完整的任务；不能要求源任务成功。裸命令与未知 Skill 名返回具体用法，不以模糊匹配猜测对象。
+
+修复时先定位源任务中该 Skill 的具体调用及 attempt，读取当次使用的文件版本/hash/快照、输入、原始回执、已完成动作和后续人工操作。若同一任务有多个匹配调用，先呈现候选供用户选择；若快照缺失，标记历史内容不可恢复，不能以当前最新版冒充。Builder 根据用户新增要求生成独立工作副本，核对失败责任层和可能的已有副作用后再试运行。进入修复模式不自动重放源任务、回滚副作用或发布；用户仍自行选择发布、编辑、删除。
 
 Builder 在阅读、写文件、调用 WebCross、理解错误和编辑之间持续循环；结束/退出后返回主入口。恢复时重新核对文件 hash、权限、页面绑定和未决执行。只清理自身持有的订阅/作业，不关闭用户页面。
 
@@ -228,7 +239,8 @@ Builder 在阅读、写文件、调用 WebCross、理解错误和编辑之间持
 
 | 工具/接口 | 阶段 | 用途 |
 | --- | --- | --- |
-| read/search_task_resources | 一 | 通过 Storage 读原需求、轨迹、回执与文件，兼容文件/DB 来源 |
+| read/search_task_resources | 一 | 按显式 @task_id 只读授权，通过 Storage 读原需求、轨迹、回执与文件，兼容文件/DB 来源 |
+| describe_harness_tool / 读取调用链 | 一 | 当前部署版本的工具合同、脱敏子调用与副作用引用；缺失信息标未知 |
 | workspace_read/write/edit/list/search | 一 | 受限工作目录读写，支持 expected_hash；写入同步 SQLite 资源索引 |
 | describe_abcp_action / 获取 Workflow guide | 一 | 查询部署合同与版本 |
 | browser_call | 一 | 原生探索、页面恢复及有权限的 readApi |
@@ -415,7 +427,7 @@ Builder 是新任务，`source_task_id` 只引用历史任务，不把新产物�
 | Coding/Builder 任务文件 | 复用 `task_resources` 外部文件资源 | task_id/run_id/worker 或 session、logical_path/external_path、hash/size/media_type/resource_version |
 | 当前正式 Skill | 新增全局 `skill_index`（表名拟定） | skill_id、根目录相对路径、当前 version/hash、原 metadata JSON、删除标记/时间 |
 | Skill 版本记录 | 新增 `skill_versions`（表名拟定） | skill_id/version/hash、文件清单、来源 task/resource、创建/发布时间、该版本内容是否仍可得 |
-| trial/正式调用 | 复用 run_events/task_resources 的执行记录 | invocation/attempt、skill/version/hash、输入/输出引用、实际状态 |
+| trial/正式调用 | 复用 run_events/task_resources 的执行记录 | invocation/attempt、skill/version/hash、不可变文件快照、输入/输出引用、实际状态、来源 task_id |
 
 全局 Skill 索引不设置会随源任务删除而级联删除的强关联。`task_resources` 受 task/run 外键约束，不能直接用它充当全局 Skill 注册表。
 
@@ -544,13 +556,13 @@ Builder 自己编写文件并直接调用浏览器执行模块验证，不为每
 | 步骤 | 交付 | 验收 |
 | --- | --- | --- |
 | 1A 核心接入 | 固定 Tau 核心、provider/消息/事件 adapter、ToolRunner、finish/length/进度补丁 | 真实 provider 工具往返、消息保真、取消；不重复计费/记录 |
-| 1B 资料与工作区 | 独立构建任务、Storage 读取、worktree 文件工具、SQLite task_resources 索引、会话恢复 | 文件和 DB 来源均可读；中间文件属于构建任务；源任务不变 |
-| 1C 长 Workflow 构建 | Builder guide、composite 展开指导、元数据保留、轻量准入、平台执行回执 | 不按旧 segment 分割；不新增 Harness DSL 编译器；真实平台错误可供模型修复 |
+| 1B 资料与工作区 | 独立构建任务、显式 @task_id 只读引用、执行版本快照、worktree 文件工具、SQLite task_resources 索引、会话恢复 | 文件和 DB 来源均可读；可定位源调用/attempt 和当次文件；源任务不变 |
+| 1C 长 Workflow 构建 | Builder guide、无源码 composite 重构证据接口、元数据保留、轻量准入、平台执行回执 | 不按旧 segment 分割；缺失内部信息不假装等价；真实平台错误可供模型修复 |
 | 1D 浏览器闭环 | 原生探索、Workflow 实跑、失败数据、通知归属、页面恢复与新 attempt | 原始回执可追溯；编译拒绝/执行失败/未知分别正确；更长流程可实际运行 |
 | 1E 用户操作与全局索引 | 发布/编辑/删除；根 skills 目录；全局 SQLite Skill/版本索引 | 文件与索引一致；保留原元数据；删除源任务不级联删除 Skill；用户手改可重新索引 |
 | 1F 显式使用与整体替换 | browser/lead 显式加载新 Skill，删除旧创建/匹配/health/报告/autoheal 全链路 | 没有运行调用点和失效 import；旧健康状态不影响选择；用户文件完成迁移 |
 
-阶段一不依赖通用 Shell 或 Coding 委派，但必须有真实 WebCross 试运行。验收案例包括：合并历史短 segment；展开可替换 composite；保留确实需要模型的混合路径；平台返回错误后模型修复；发布/编辑/删除与 SQLite 一致性；显式使用。
+阶段一不依赖通用 Shell 或 Coding 委派，但必须有真实 WebCross 试运行。验收案例包括：合并历史短 segment；无源码情况下依据合同与真实回执重新实现可替换职责；证据不足时保留边界；平台返回错误后模型修复；`/<Skill 名> @task_id` 定位失败调用并保留副作用事实；发布/编辑/删除与 SQLite 一致性；显式使用。
 
 这些是工程验收案例，不是每个 Skill 的业务门禁。环境阻断单列，不以 mock 冒充真实闭环。试运行摘要从日志直接呈现，不创建 report/health 系统。
 

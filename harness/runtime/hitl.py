@@ -684,6 +684,8 @@ async def wait_for_hitl_resume(
                            elapsedMs=int((time.monotonic() - started) * 1000))
             if diagnostics is not None and outcome.get("status") == "resumed":
                 diagnostics.mark_hitl_resumed()
+            if logger is not None:
+                logger.write("hitl.wait." + str(outcome["status"]), outcome)
         # Feedback may arrive while the event path confirms page settlement.
         if not feedback and input_task.done() and not input_task.cancelled():
             try:

@@ -581,6 +581,12 @@ def read_task_file_text(logger: Any, raw_path: Any) -> Optional[str]:
             lines = view.iter_lines(relative)
             if lines is not None:
                 return "".join(lines)
+        if _registered_external_task_file(logger, resolved, relative):
+            try:
+                return resolved.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                return None
+        return None
     if resolved.is_file():
         try:
             return resolved.read_text(encoding="utf-8")
@@ -618,6 +624,8 @@ def task_file_exists(logger: Any, raw_path: Any) -> bool:
         view = virtual_fs_for(logger)
         if view is not None and view.exists(relative):
             return True
+        return _registered_external_task_file(logger, resolved, relative,
+                                              verify_content=False)
     if resolved.is_file():
         return True
     view = virtual_fs_for(logger)
@@ -628,6 +636,45 @@ def task_file_exists(logger: Any, raw_path: Any) -> bool:
     except (OSError, ValueError):
         return False
     return view.exists(relative)
+
+
+def _registered_external_task_file(logger: Any, path: Path, relative: str,
+                                   *, verify_content: bool = True) -> bool:
+    """A physical task output is readable only when SQLite records its identity."""
+    from harness.storage.virtual_fs import db_authoritative_for
+
+    if not db_authoritative_for(logger) or not path.is_file():
+        return False
+    storage, task_id = storage_for_logger(logger)
+    rows = storage.search_resources(task_id=task_id, path_glob=relative,
+                                    max_results=20)
+    for row in rows:
+        if row.get("logical_path") != relative:
+            continue
+        record = storage.read_resource(
+            current_task_id=task_id, resource_uri=str(row.get("saved_path") or ""))
+        if not isinstance(record, dict) or not record.get("external_path"):
+            continue
+        external = Path(record["external_path"])
+        if not external.is_absolute():
+            external = Path(logger.task_dir) / external
+        if external.resolve(strict=False) != path:
+            continue
+        try:
+            if record.get("byte_size") is not None and path.stat().st_size != record["byte_size"]:
+                return False
+            expected = record.get("sha256")
+            if verify_content and isinstance(expected, str) and expected:
+                digest = hashlib.sha256()
+                with path.open("rb") as source:
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                if digest.hexdigest() != expected:
+                    return False
+        except OSError:
+            return False
+        return True
+    return False
 
 
 def load_task_json(logger: Any, raw_path: Any) -> Optional[Any]:
@@ -676,8 +723,14 @@ class RunLogger:
         self.worktree_dir = str(worktree_dir)
         self.task_dir = Path(worktree_dir) / self.task_id
         self.artifacts_dir = self.task_dir / "artifacts"
-        self.task_dir.mkdir(parents=True, exist_ok=True)
-        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        self._storage = storage
+        # DB resource paths are logical addresses. Only file-backed loggers
+        # need the historical directory layout at construction time.
+        from harness.storage.virtual_fs import db_authoritative_for
+
+        if storage is None or not db_authoritative_for(self):
+            self.task_dir.mkdir(parents=True, exist_ok=True)
+            self.artifacts_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.task_dir / "run.jsonl"
         self.usage_aggregator = UsageAggregator()
         self._usage_summary_written = False
@@ -686,7 +739,6 @@ class RunLogger:
         # which launch or resume produced an event and is a foreign key in the
         # database backend. bind_context must never be used to carry it.
         self.run_id = str(run_id or "")
-        self._storage = storage
         # Every event this run produces draws from one sequence, so lead and
         # worker events interleave into a single totally ordered stream.
         self._sequencer = RunEventSequencer()
@@ -1034,7 +1086,10 @@ def safe_path_component(value: Any, fallback: str = "item") -> str:
 
 def task_subdir(logger: RunLogger, name: str) -> Path:
     path = logger.task_dir / name
-    path.mkdir(parents=True, exist_ok=True)
+    from harness.storage.virtual_fs import db_authoritative_for
+
+    if not db_authoritative_for(logger):
+        path.mkdir(parents=True, exist_ok=True)
     return path
 
 
@@ -1073,10 +1128,19 @@ def write_context_snapshot(
         "messages": to_model_messages(messages),
         "tools": tools,
     }
-    path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
-    )
+    from harness.storage.virtual_fs import db_authoritative_for
+    if db_authoritative_for(logger):
+        logger.storage.save_resource(
+            task_id=logger.task_id, run_id=str(logger.run_id or ""),
+            resource_type="context_snapshot",
+            logical_path=str(path.relative_to(logger.task_dir)),
+            media_type="application/json", content=payload,
+        )
+    else:
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
     event = {
         "actor": actor,
         "name": name,

@@ -105,8 +105,8 @@ DIALOG_ROLE_MARKERS = (
 )
 
 
-def detect_overlay_from_result(result: Any) -> Optional[JsonDict]:
-    text = _collect_page_text(result)
+def detect_overlay_from_result(result: Any, *, logger: Any = None) -> Optional[JsonDict]:
+    text = _collect_page_text(result, logger=logger)
     detected = detect_overlay_from_text(text)
     if detected is not None:
         return detected
@@ -230,7 +230,7 @@ def _has_strong_overlay_evidence(
     return len(primary_hits) >= 2 or any(hit in strong for hit in primary_hits)
 
 
-def _collect_page_text(value: Any, *, limit: int = 120_000) -> str:
+def _collect_page_text(value: Any, *, limit: int = 120_000, logger: Any = None) -> str:
     chunks: List[str] = []
 
     def add(text: str) -> None:
@@ -248,7 +248,11 @@ def _collect_page_text(value: Any, *, limit: int = 120_000) -> str:
             path = item.get("savedPath")
             if isinstance(path, str) and item.get("format") == "text_lines":
                 try:
-                    add(Path(path).read_text(encoding="utf-8", errors="replace"))
+                    if logger is not None:
+                        from harness.utils import read_task_file_text
+                        add(read_task_file_text(logger, path) or "")
+                    else:
+                        add(Path(path).read_text(encoding="utf-8", errors="replace"))
                 except OSError:
                     pass
             for nested in item.values():

@@ -130,7 +130,9 @@ def _resource_json(record: Any) -> Optional[JsonDict]:
     value = record.get("content_json")
     if isinstance(value, dict):
         return value
-    text = record.get("content_text")
+    # SQLite restores JSON as serialized text; the file backend returns the
+    # decoded object. Both represent the same resource envelope.
+    text = value if isinstance(value, str) else record.get("content_text")
     if isinstance(text, str):
         try:
             loaded = json.loads(text)

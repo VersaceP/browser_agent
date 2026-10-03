@@ -108,6 +108,7 @@ def execute(line: str, *, config_path: str = "config.json",
             print(json.dumps({"builderTaskId": result["builderTaskId"],
                               "workDir": result["workDir"],
                               "files": result["files"],
+                              "skill": result["skill"],
                               "next": [f"/skill-edit @{result['builderTaskId']} <建议>",
                                        f"/skill-publish @{result['builderTaskId']}"],
                               "summary": result["summary"]}, ensure_ascii=False, indent=2))

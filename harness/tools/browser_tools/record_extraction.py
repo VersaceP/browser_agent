@@ -256,7 +256,8 @@ def _merge_repair_patch_rows(
             "repair baseline must be an extraction artifact in this task",
         )
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        from harness.utils import read_task_file_text
+        payload = json.loads(read_task_file_text(agent.logger, str(path)) or "")
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         return fallback(
             "baseline_unreadable",

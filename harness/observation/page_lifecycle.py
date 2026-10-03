@@ -205,7 +205,12 @@ class PageLifecycleTracker:
             self._set_settled_event(state)
         elif name in {"Page.navigate", "Page.recovered"}:
             state.generation += 1
-            state.status = "loading" if name == "Page.navigate" else "unknown"
+            # A navigation commit may be an in-document URL change. Older
+            # platforms omit inPage entirely; neither case establishes loading.
+            # Only an explicit main-document commit preserves a known load.
+            state.status = ("loading" if name == "Page.navigate"
+                            and payload.get("inPage") is False
+                            and state.status == "loading" else "unknown")
             self._record_failure(state, None)
             state.requires_state_resync = True
             state.requires_ax_refresh = True
@@ -254,6 +259,10 @@ class PageLifecycleTracker:
             self._record_failure(
                 state, failure or {"kind": "renderer-lost", "message": ""}
             )
+            self._set_settled_event(state)
+        elif status == "closed":
+            state.status = "closed"
+            state.requires_ax_refresh = True
             self._set_settled_event(state)
         else:
             # `ready` is the settled state; anything else here is a status this
