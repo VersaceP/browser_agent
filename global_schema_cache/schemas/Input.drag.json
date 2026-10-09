@@ -2,7 +2,7 @@
   "method": "Input.drag",
   "description": "Drags from one resolved source to a resolved target, coordinate, or bounded offset within the same document.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:ceccd4cf3cd46954290b4ff6547bffaaa32f0836d6047d3f30ae72b459f15d73",
+  "catalogRevision": "sha256:4353ee6b25dd1c25bb33c594c8231a1d46faab7783a010b1092fd1c91582bd64",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -14,12 +14,12 @@
         "description": "Page ID containing the drag source and destination."
       },
       "selector": {
-        "description": "Fallback CSS selector for the drag source.",
+        "description": "Fallback CSS selector for the drag source in the main document.",
         "type": "string",
         "minLength": 1
       },
       "id": {
-        "description": "Current source node ID from the latest page observation.",
+        "description": "Current source node ID from the latest page observation. Use node IDs for endpoints inside an iframe.",
         "type": "string",
         "pattern": "^n_[0-9a-f]{16}$"
       },
@@ -32,12 +32,12 @@
         "type": "number"
       },
       "destinationSelector": {
-        "description": "CSS selector for the destination. Without destinationOffset, the drop point defaults to the destination center.",
+        "description": "CSS selector for the destination in the main document. Without destinationOffset, the drop point defaults to the destination center.",
         "type": "string",
         "minLength": 1
       },
       "destinationId": {
-        "description": "Current destination node ID from the latest page observation. Without destinationOffset, the drop point defaults to the destination center.",
+        "description": "Current destination node ID from the latest page observation. Use node IDs for endpoints inside an iframe, keeping both endpoints in one document. Without destinationOffset, the drop point defaults to the destination center.",
         "type": "string",
         "pattern": "^n_[0-9a-f]{16}$"
       },
@@ -97,32 +97,84 @@
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "properties": {
-      "source": {
-        "description": "Resolved drag source identity or point."
-      },
-      "destination": {
-        "description": "Resolved drag destination identity or point."
+      "success": {
+        "type": "boolean",
+        "const": true,
+        "description": "The drag input completed. Verify the resulting page state before the next action."
       },
       "resolvedBy": {
         "description": "Resolution mode used for the drag endpoints.",
         "type": "string"
       },
-      "distance": {
-        "description": "Drag path distance in CSS pixels.",
-        "type": "number"
+      "dispatchMode": {
+        "description": "Whether interactive hit testing or visible geometry was used.",
+        "type": "string",
+        "enum": [
+          "interactive",
+          "geometry-fallback"
+        ]
       },
-      "completed": {
-        "description": "Whether the native drag and drop operation completed.",
+      "geometryFallbackEndpoints": {
+        "description": "Endpoints that required visible geometry fallback.",
+        "type": "array",
+        "items": {
+          "type": "string",
+          "enum": [
+            "source",
+            "destination"
+          ]
+        }
+      },
+      "clamped": {
+        "description": "Whether the relative offset was shortened at the source document edge.",
         "type": "boolean"
       },
-      "resolutionSource": {
-        "description": "Target resolution route used by the action.",
-        "type": "string"
+      "requested": {
+        "description": "The requested relative offset; it does not represent a business value change.",
+        "type": "object",
+        "properties": {
+          "dx": {
+            "type": "number",
+            "description": "Requested horizontal offset in the source document."
+          },
+          "dy": {
+            "type": "number",
+            "description": "Requested vertical offset in the source document."
+          }
+        },
+        "required": [
+          "dx",
+          "dy"
+        ],
+        "additionalProperties": false
+      },
+      "actual": {
+        "description": "The relative offset dispatched after clamping; verify the resulting control state separately.",
+        "type": "object",
+        "properties": {
+          "dx": {
+            "type": "number",
+            "description": "Actual horizontal offset after edge clamping."
+          },
+          "dy": {
+            "type": "number",
+            "description": "Actual vertical offset after edge clamping."
+          }
+        },
+        "required": [
+          "dx",
+          "dy"
+        ],
+        "additionalProperties": false
       }
     },
-    "additionalProperties": {}
+    "required": [
+      "success"
+    ],
+    "additionalProperties": false
   },
   "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "properties": {
       "observation": {
@@ -134,34 +186,84 @@
         "description": "Guidance to re-observe current state and choose the next operation."
       },
       "data": {
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Validated business result returned by the Action.",
         "type": "object",
         "properties": {
-          "source": {
-            "description": "Resolved drag source identity or point."
-          },
-          "destination": {
-            "description": "Resolved drag destination identity or point."
+          "success": {
+            "type": "boolean",
+            "const": true,
+            "description": "The drag input completed. Verify the resulting page state before the next action."
           },
           "resolvedBy": {
             "description": "Resolution mode used for the drag endpoints.",
             "type": "string"
           },
-          "distance": {
-            "description": "Drag path distance in CSS pixels.",
-            "type": "number"
+          "dispatchMode": {
+            "description": "Whether interactive hit testing or visible geometry was used.",
+            "type": "string",
+            "enum": [
+              "interactive",
+              "geometry-fallback"
+            ]
           },
-          "completed": {
-            "description": "Whether the native drag and drop operation completed.",
+          "geometryFallbackEndpoints": {
+            "description": "Endpoints that required visible geometry fallback.",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "source",
+                "destination"
+              ]
+            }
+          },
+          "clamped": {
+            "description": "Whether the relative offset was shortened at the source document edge.",
             "type": "boolean"
           },
-          "resolutionSource": {
-            "description": "Target resolution route used by the action.",
-            "type": "string"
+          "requested": {
+            "description": "The requested relative offset; it does not represent a business value change.",
+            "type": "object",
+            "properties": {
+              "dx": {
+                "type": "number",
+                "description": "Requested horizontal offset in the source document."
+              },
+              "dy": {
+                "type": "number",
+                "description": "Requested vertical offset in the source document."
+              }
+            },
+            "required": [
+              "dx",
+              "dy"
+            ],
+            "additionalProperties": false
+          },
+          "actual": {
+            "description": "The relative offset dispatched after clamping; verify the resulting control state separately.",
+            "type": "object",
+            "properties": {
+              "dx": {
+                "type": "number",
+                "description": "Actual horizontal offset after edge clamping."
+              },
+              "dy": {
+                "type": "number",
+                "description": "Actual vertical offset after edge clamping."
+              }
+            },
+            "required": [
+              "dx",
+              "dy"
+            ],
+            "additionalProperties": false
           }
         },
-        "additionalProperties": {},
-        "description": "Validated business result returned by the Action."
+        "required": [
+          "success"
+        ],
+        "additionalProperties": false
       }
     },
     "required": [

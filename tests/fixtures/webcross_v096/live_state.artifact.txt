@@ -1,0 +1,3 @@
+# meta schema=abcp.page-observation schemaVersion=3 fileKind=artifact mode=detail pageId=f170fa51-d368-40f3-9402-6b05e5015686 documentEpoch=d_bb1f817b1cdd098239879a442fcbab11 capturedAt="2026-10-06T06:42:45.788Z" checkedAt="2026-10-06T06:42:45.788Z" pendingChanges=false completeness=complete version=v_bb1f817b1cdd0982_1 filteredCounts={"emptyText":0,"internalLeaf":0,"nonContent":0,"source":0} source=live
+detail index=0 ok=true target={"requestedSelector":"#field","resolvedBy":"selector","resolvedId":"n_a949c5fa219a96af"} view=state value={"attributes":{"aria-label":"Search","value":"initial"},"state":{"focused":false,"value":"initial"},"text":""}
+# end frames=0 nodes=0 components=0 details=1 contentSha256=45296db7e1d6850b40727bc9ffa466e1e5ea9562988f048393aba858fdd84e63

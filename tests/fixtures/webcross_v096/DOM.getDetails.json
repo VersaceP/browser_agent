@@ -1,0 +1,804 @@
+{
+  "method": "DOM.getDetails",
+  "description": "Reads complete saved node details with version and nodeIds, or bounded live facts with query. The two forms are mutually exclusive. Read the returned artifact.path.",
+  "requiresPurpose": true,
+  "catalogRevision": "sha256:f3668c2329565bf4c2d36f63e0002429722d5e7f39b6f442b9a22120c866c78b",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "anyOf": [
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "The page that owns the saved observation."
+          },
+          "version": {
+            "type": "string",
+            "pattern": "^v_[0-9a-f]{16}_[0-9a-z]+$",
+            "description": "The saved observation version to read; this does not refresh live state."
+          },
+          "nodeIds": {
+            "minItems": 1,
+            "maxItems": 64,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^n_[0-9a-f]{16}$",
+              "description": "An opaque node ID from the current observation. Do not parse it."
+            },
+            "description": "Nodes whose complete saved details are needed, in result order."
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "State which saved values or current target facts are needed."
+          }
+        },
+        "required": [
+          "pageId",
+          "version",
+          "nodeIds",
+          "purpose"
+        ],
+        "additionalProperties": true
+      },
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "The page to query."
+          },
+          "query": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "view": {
+                    "type": "string",
+                    "const": "dom",
+                    "description": "Read DOM structure."
+                  },
+                  "targets": {
+                    "minItems": 1,
+                    "maxItems": 64,
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "pattern": "^n_[0-9a-f]{16}$",
+                          "description": "An opaque node ID from the current observation. Do not parse it."
+                        },
+                        "selector": {
+                          "description": "A selector fallback, accepted only when it uniquely matches in the current document.",
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "additionalProperties": true
+                    },
+                    "description": "Exact query targets in input order. Component members are not substituted."
+                  },
+                  "maxDepth": {
+                    "default": 12,
+                    "description": "Maximum DOM subtree depth.",
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 64
+                  },
+                  "includeShadowDom": {
+                    "default": true,
+                    "description": "Include observable Shadow DOM subtrees.",
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "view",
+                  "maxDepth",
+                  "includeShadowDom"
+                ],
+                "additionalProperties": true
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "view": {
+                    "type": "string",
+                    "const": "text",
+                    "description": "Read page text."
+                  },
+                  "targets": {
+                    "minItems": 1,
+                    "maxItems": 64,
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "pattern": "^n_[0-9a-f]{16}$",
+                          "description": "An opaque node ID from the current observation. Do not parse it."
+                        },
+                        "selector": {
+                          "description": "A selector fallback, accepted only when it uniquely matches in the current document.",
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "additionalProperties": true
+                    },
+                    "description": "Exact query targets in input order. Component members are not substituted."
+                  },
+                  "textMode": {
+                    "default": "rendered",
+                    "description": "Rendered text or DOM textContent.",
+                    "type": "string",
+                    "enum": [
+                      "rendered",
+                      "textContent"
+                    ]
+                  }
+                },
+                "required": [
+                  "view",
+                  "textMode"
+                ],
+                "additionalProperties": true
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "view": {
+                    "type": "string",
+                    "const": "attributes",
+                    "description": "Read HTML or ARIA attributes."
+                  },
+                  "targets": {
+                    "minItems": 1,
+                    "maxItems": 64,
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "pattern": "^n_[0-9a-f]{16}$",
+                          "description": "An opaque node ID from the current observation. Do not parse it."
+                        },
+                        "selector": {
+                          "description": "A selector fallback, accepted only when it uniquely matches in the current document.",
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "additionalProperties": true
+                    },
+                    "description": "Exact query targets in input order. Component members are not substituted."
+                  },
+                  "attributes": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "const": "*"
+                      },
+                      {
+                        "minItems": 1,
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      }
+                    ],
+                    "description": "Requested attributes, or * for every available attribute."
+                  }
+                },
+                "required": [
+                  "view",
+                  "targets",
+                  "attributes"
+                ],
+                "additionalProperties": true
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "view": {
+                    "type": "string",
+                    "const": "state",
+                    "description": "Read static value attributes and live control state."
+                  },
+                  "targets": {
+                    "minItems": 1,
+                    "maxItems": 64,
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "pattern": "^n_[0-9a-f]{16}$",
+                          "description": "An opaque node ID from the current observation. Do not parse it."
+                        },
+                        "selector": {
+                          "description": "A selector fallback, accepted only when it uniquely matches in the current document.",
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "additionalProperties": true
+                    },
+                    "description": "Exact query targets in input order. Component members are not substituted."
+                  }
+                },
+                "required": [
+                  "view",
+                  "targets"
+                ],
+                "additionalProperties": true
+              }
+            ],
+            "description": "A bounded live query for known targets."
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "State which saved values or current target facts are needed."
+          }
+        },
+        "required": [
+          "pageId",
+          "query",
+          "purpose"
+        ],
+        "additionalProperties": true
+      }
+    ]
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "oneOf": [
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "The page that owns this observation."
+          },
+          "mode": {
+            "type": "string",
+            "const": "detail",
+            "description": "A bounded target detail; it does not replace the current page view."
+          },
+          "artifact": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "detail",
+                "description": "A bounded target detail artifact."
+              },
+              "path": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Read the observation artifact at this path."
+              },
+              "format": {
+                "type": "string",
+                "const": "text",
+                "description": "The observation text format."
+              },
+              "bytes": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Artifact size in bytes."
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Artifact content hash."
+              },
+              "expiresAt": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+                "description": "The time until the artifact is available."
+              }
+            },
+            "required": [
+              "kind",
+              "path",
+              "format",
+              "bytes",
+              "sha256",
+              "expiresAt"
+            ],
+            "additionalProperties": false,
+            "description": "A bounded target detail artifact."
+          },
+          "checkedAt": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+            "description": "When these details were collected."
+          },
+          "summary": {
+            "type": "object",
+            "properties": {
+              "total": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "The number of requested targets."
+              },
+              "succeeded": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "The number of successful targets."
+              },
+              "failed": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "The number of failed targets."
+              }
+            },
+            "required": [
+              "total",
+              "succeeded",
+              "failed"
+            ],
+            "additionalProperties": false,
+            "description": "Detail query totals."
+          },
+          "source": {
+            "type": "string",
+            "const": "snapshot",
+            "description": "Complete saved details from one observation version, not current live state."
+          },
+          "version": {
+            "type": "string",
+            "pattern": "^v_[0-9a-f]{16}_[0-9a-z]+$",
+            "description": "The saved observation version."
+          }
+        },
+        "required": [
+          "pageId",
+          "mode",
+          "artifact",
+          "checkedAt",
+          "summary",
+          "source",
+          "version"
+        ],
+        "additionalProperties": false
+      },
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "The page that owns this observation."
+          },
+          "mode": {
+            "type": "string",
+            "const": "detail",
+            "description": "A bounded target detail; it does not replace the current page view."
+          },
+          "artifact": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "detail",
+                "description": "A bounded target detail artifact."
+              },
+              "path": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Read the observation artifact at this path."
+              },
+              "format": {
+                "type": "string",
+                "const": "text",
+                "description": "The observation text format."
+              },
+              "bytes": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Artifact size in bytes."
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Artifact content hash."
+              },
+              "expiresAt": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+                "description": "The time until the artifact is available."
+              }
+            },
+            "required": [
+              "kind",
+              "path",
+              "format",
+              "bytes",
+              "sha256",
+              "expiresAt"
+            ],
+            "additionalProperties": false,
+            "description": "A bounded target detail artifact."
+          },
+          "checkedAt": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+            "description": "When these details were collected."
+          },
+          "summary": {
+            "type": "object",
+            "properties": {
+              "total": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "The number of requested targets."
+              },
+              "succeeded": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "The number of successful targets."
+              },
+              "failed": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "The number of failed targets."
+              }
+            },
+            "required": [
+              "total",
+              "succeeded",
+              "failed"
+            ],
+            "additionalProperties": false,
+            "description": "Detail query totals."
+          },
+          "source": {
+            "type": "string",
+            "const": "live",
+            "description": "Target facts collected by this live query."
+          }
+        },
+        "required": [
+          "pageId",
+          "mode",
+          "artifact",
+          "checkedAt",
+          "summary",
+          "source"
+        ],
+        "additionalProperties": false
+      }
+    ]
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Facts directly observed by the Action or returned by its declared result schema."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "pageId": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                "description": "The page that owns this observation."
+              },
+              "mode": {
+                "type": "string",
+                "const": "detail",
+                "description": "A bounded target detail; it does not replace the current page view."
+              },
+              "artifact": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "detail",
+                    "description": "A bounded target detail artifact."
+                  },
+                  "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Read the observation artifact at this path."
+                  },
+                  "format": {
+                    "type": "string",
+                    "const": "text",
+                    "description": "The observation text format."
+                  },
+                  "bytes": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991,
+                    "description": "Artifact size in bytes."
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$",
+                    "description": "Artifact content hash."
+                  },
+                  "expiresAt": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+                    "description": "The time until the artifact is available."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "path",
+                  "format",
+                  "bytes",
+                  "sha256",
+                  "expiresAt"
+                ],
+                "additionalProperties": false,
+                "description": "A bounded target detail artifact."
+              },
+              "checkedAt": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+                "description": "When these details were collected."
+              },
+              "summary": {
+                "type": "object",
+                "properties": {
+                  "total": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991,
+                    "description": "The number of requested targets."
+                  },
+                  "succeeded": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991,
+                    "description": "The number of successful targets."
+                  },
+                  "failed": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991,
+                    "description": "The number of failed targets."
+                  }
+                },
+                "required": [
+                  "total",
+                  "succeeded",
+                  "failed"
+                ],
+                "additionalProperties": false,
+                "description": "Detail query totals."
+              },
+              "source": {
+                "type": "string",
+                "const": "snapshot",
+                "description": "Complete saved details from one observation version, not current live state."
+              },
+              "version": {
+                "type": "string",
+                "pattern": "^v_[0-9a-f]{16}_[0-9a-z]+$",
+                "description": "The saved observation version."
+              }
+            },
+            "required": [
+              "pageId",
+              "mode",
+              "artifact",
+              "checkedAt",
+              "summary",
+              "source",
+              "version"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "pageId": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                "description": "The page that owns this observation."
+              },
+              "mode": {
+                "type": "string",
+                "const": "detail",
+                "description": "A bounded target detail; it does not replace the current page view."
+              },
+              "artifact": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "const": "detail",
+                    "description": "A bounded target detail artifact."
+                  },
+                  "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Read the observation artifact at this path."
+                  },
+                  "format": {
+                    "type": "string",
+                    "const": "text",
+                    "description": "The observation text format."
+                  },
+                  "bytes": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991,
+                    "description": "Artifact size in bytes."
+                  },
+                  "sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$",
+                    "description": "Artifact content hash."
+                  },
+                  "expiresAt": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+                    "description": "The time until the artifact is available."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "path",
+                  "format",
+                  "bytes",
+                  "sha256",
+                  "expiresAt"
+                ],
+                "additionalProperties": false,
+                "description": "A bounded target detail artifact."
+              },
+              "checkedAt": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+                "description": "When these details were collected."
+              },
+              "summary": {
+                "type": "object",
+                "properties": {
+                  "total": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991,
+                    "description": "The number of requested targets."
+                  },
+                  "succeeded": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991,
+                    "description": "The number of successful targets."
+                  },
+                  "failed": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991,
+                    "description": "The number of failed targets."
+                  }
+                },
+                "required": [
+                  "total",
+                  "succeeded",
+                  "failed"
+                ],
+                "additionalProperties": false,
+                "description": "Detail query totals."
+              },
+              "source": {
+                "type": "string",
+                "const": "live",
+                "description": "Target facts collected by this live query."
+              }
+            },
+            "required": [
+              "pageId",
+              "mode",
+              "artifact",
+              "checkedAt",
+              "summary",
+              "source"
+            ],
+            "additionalProperties": false
+          }
+        ],
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
+  "purposeHint": "State which saved values or current target facts are needed."
+}

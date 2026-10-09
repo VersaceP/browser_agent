@@ -598,7 +598,7 @@ def _collect_contract_warning(
 
 
 def _wheel_axis_and_sign(direction: str) -> tuple:
-    """Map a compass direction onto the Page.wheel delta field and its sign.
+    """Map a composite direction onto the Input.scroll delta field and its sign.
 
     Positive `deltaX` scrolls right and positive `deltaY` scrolls down, per
     the live Action schema, so up/left are the negative directions.
@@ -660,34 +660,20 @@ async def _collect_items_materialize(
                     "replayForbidden": replay_forbidden(result)}
         return {"ok": True, "exhausted": False, "detail": "clicked load-more"}
 
-    # default: scroll. A stale container id must still go through the seen-id
-    # rematch guard (Phase 2), not bypass it -> allow_rematch=True.
-    #
-    # Input.scroll now REQUIRES a locator on every branch (target reveal,
-    # container distance, container edge). Its root-viewport mode is gone, so
-    # the no-container case must go to Page.wheel instead — the old locator-less
-    # shape matches no branch and the platform rejects the whole call, which
-    # made page-level collection unable to scroll at all.
+    # A container bounds the scroll surface; omission selects the page viewport.
+    # Explicit composite direction/amount inputs translate to signed CSS deltas.
     container: JsonDict = {}
     if container_id:
         container["id"] = container_id
     if container_selector:
         container["selector"] = container_selector
-
+    method = "Input.scroll"
+    axis, sign = _wheel_axis_and_sign(direction or "down")
+    params = {"pageId": page_id, "deltaX": 0, "deltaY": 0,
+              "purpose": "collect_items: scroll"}
+    params[axis] = sign * float(amount)
     if container:
-        method = "Input.scroll"
-        params = {"pageId": page_id, "direction": direction or "down",
-                  "distance": amount, "container": container,
-                  "purpose": "collect_items: scroll"}
-    else:
-        # Page.wheel is a real wheel gesture at a point, so it needs one inside
-        # the viewport and it moves whichever surface hit-testing picks — native
-        # propagation carries it to the nearest scrollable ancestor.
-        method = "Page.wheel"
-        axis, sign = _wheel_axis_and_sign(direction or "down")
-        params = {"pageId": page_id, "x": 0, "y": 0, "deltaX": 0, "deltaY": 0,
-                  "purpose": "collect_items: scroll"}
-        params[axis] = sign * float(amount)
+        params["container"] = container
     result = await _invoke_browser_method(
         agent, method, params, step, count_progress=False,
         allow_rematch=bool(container_id),
@@ -702,24 +688,16 @@ async def _collect_items_materialize(
         "detail": "scrolled",
         "replayForbidden": failed and replay_forbidden(result),
     }
-    # Where the gesture landed, reported as an observation and used for
-    # NOTHING here. A point-aimed wheel can land on a sidebar or a nested list
-    # instead of the document, and that is worth surfacing - but it must not
-    # become a progress rule:
-    #   * the receipt reports each layer's final position and no per-layer
-    #     delta, so a layer appearing here is not proof that it moved;
-    #   * scrolling an element is not "no progress" - a virtual list lives
-    #     inside one, and this composite already decides progress by counting
-    #     deduplicated new rows, which is the fact that actually matters;
-    #   * a mis-hit container must not be adopted as the next target on its
-    #     own, or the collection would just scroll the wrong surface more
-    #     reliably.
-    # So it travels outward for the model to weigh against its collection
-    # goal; the inner loop has no model in it and makes no such judgment.
-    if method == "Page.wheel" and not failed:
-        surface = scroll_dispatch_target(_response_data(result) or {})
+    # Report physical surface and independent execution facts to the model.
+    # Collection progress still comes from observed, deduplicated new rows.
+    if not failed:
+        data = _response_data(result) or {}
+        surface = scroll_dispatch_target(data)
         if surface:
             outcome["scrollSurface"] = surface
+        outcome["scrollReceipt"] = {key: data[key] for key in
+            ("input", "observation", "goal", "completedReason", "observedDelta", "totalDelta")
+            if key in data}
     return outcome
 
 

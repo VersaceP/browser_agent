@@ -1,0 +1,1496 @@
+[
+  {
+    "case": "typescript",
+    "request": {
+      "schemaVersion": 1,
+      "name": "typescript",
+      "entry": "main.ts",
+      "files": {
+        "main.ts": "import {twice} from './helper.js'; type Input={values:number[]}; export default async function main({actions},input:Input) {const page=await actions.Page.getState({purpose:'验证 TS 模块'});return {title:page.title,values:input.values.map(twice)};}",
+        "helper.ts": "export function twice(value:number):number {return value*2;}"
+      },
+      "timeoutMs": 30000
+    },
+    "receipt": {
+      "workflowHash": "7f11c40f2d92531ade49bea5fe26fbd6ce057ee499929efd225717c653facfe0",
+      "result": {
+        "observation": "Workflow a9bb92a8-0a03-4771-8558-0f7d5420b29b succeeded; 1 platform call(s).",
+        "suggested_prompt": "Read status first, then output on success or error and results on failure. Inspect effects before a manual retry.",
+        "data": {
+          "workflowId": "a9bb92a8-0a03-4771-8558-0f7d5420b29b",
+          "taskId": "537d1978-d232-42cc-8d45-81ef5b09bb83",
+          "status": "succeeded",
+          "output": {
+            "title": "Harness v0.9.7 isolated trial",
+            "values": [
+              4,
+              10
+            ]
+          },
+          "results": [
+            {
+              "callId": 1,
+              "kind": "action",
+              "action": "Page.getState",
+              "source": {
+                "file": "harness-capabilities.js",
+                "line": 37,
+                "column": 40
+              },
+              "status": "succeeded",
+              "createdAt": 1791370833996,
+              "startedAt": 1791370833999,
+              "finishedAt": 1791370834004,
+              "durationMs": 5,
+              "value": {
+                "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+                "status": "ready",
+                "url": "data:text/html,%3Ctitle%3EHarness%20v0.9.7%20isolated%20trial%3C/title%3E%3Clabel%3EName%3Cinput%20id%3D%22name%22%3E%3C/label%3E%3Cinput%20id%3D%22upload%22%20type%3D%22file%22%3E%3Cp%20id%3D%22note%22%3ECanary%20only%3C/p%3E",
+                "title": "Harness v0.9.7 isolated trial",
+                "zoomLevel": 0,
+                "isPinned": false,
+                "isAudible": false,
+                "isMuted": false,
+                "isBlocked": false,
+                "hitl": {
+                  "isPaused": false
+                },
+                "blockingInteractions": {
+                  "hasPendingDialog": false
+                }
+              }
+            }
+          ],
+          "timing": {
+            "createdAt": 1791370833662,
+            "startedAt": 1791370833703,
+            "finishedAt": 1791370834068,
+            "durationMs": 365
+          }
+        }
+      }
+    }
+  },
+  {
+    "case": "variables_a",
+    "input": {
+      "name": "Alpha",
+      "values": [
+        1
+      ]
+    },
+    "request": {
+      "schemaVersion": 1,
+      "name": "variables-template",
+      "entry": "main.js",
+      "files": {
+        "main.js": "import {normalized} from './helper.js';\nexport default async function main({actions,readText},input) {\n const tree = await actions.DOM.getAXTree({purpose:'读取测试页面'});\n const text = await readText(tree.artifact);\n await actions.Input.type({selector:'#name',text:normalized(input.name),clear:true,delayMs:0,purpose:'填入本轮测试变量'});\n const facts=await actions.DOM.getDetails({query:{view:'state',targets:[{selector:'#name'}]},purpose:'校验测试字段'});\n return {name:input.name,values:input.values.map(x=>x*2),treeChars:text.length,details:facts.details};\n}",
+        "helper.js": "export const normalized=x=>x.trim();"
+      },
+      "timeoutMs": 30000
+    },
+    "binding": {
+      "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+      "fleetId": "39bdd73b-8618-4cd9-8dea-612f97959b31"
+    },
+    "receipt": {
+      "workflowHash": "ba7099613ebb4422ac80d48cd658bb31fc7c0a0d61e56a08f95c2d5c9a668918",
+      "result": {
+        "observation": "Workflow 40e71176-8c2f-498b-a834-20af8e308ad7 succeeded; 4 platform call(s).",
+        "suggested_prompt": "Read status first, then output on success or error and results on failure. Inspect effects before a manual retry.",
+        "data": {
+          "workflowId": "40e71176-8c2f-498b-a834-20af8e308ad7",
+          "taskId": "c7868774-aa39-40be-82fe-19ab952130d4",
+          "status": "succeeded",
+          "output": {
+            "name": "Alpha",
+            "values": [
+              2
+            ],
+            "treeChars": 1935,
+            "details": [
+              {
+                "index": 0,
+                "view": "state",
+                "target": {
+                  "requestedSelector": "#name",
+                  "resolvedId": "n_5f09d8555f6ca86a",
+                  "resolvedBy": "selector"
+                },
+                "ok": true,
+                "value": {
+                  "text": "",
+                  "state": {
+                    "value": "Alpha",
+                    "focused": true
+                  }
+                }
+              }
+            ]
+          },
+          "results": [
+            {
+              "callId": 1,
+              "kind": "action",
+              "action": "DOM.getAXTree",
+              "source": {
+                "file": "harness-capabilities.js",
+                "line": 37,
+                "column": 40
+              },
+              "status": "succeeded",
+              "createdAt": 1791370834164,
+              "startedAt": 1791370834167,
+              "finishedAt": 1791370834196,
+              "durationMs": 29,
+              "value": {
+                "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+                "checkedAt": "2026-10-07T11:00:34.176Z",
+                "freshness": "current",
+                "pendingChanges": false,
+                "completeness": "complete",
+                "mode": "full",
+                "version": "v_1f35c9924c58ae02_1",
+                "artifact": {
+                  "kind": "full",
+                  "path": "/Users/versace/Library/Application Support/webcross/observations/39bdd73b-8618-4cd9-8dea-612f97959b31/978c3007-1157-43e4-bea1-1df805a4c35c/epochs/d_1f35c9924c58ae026e1cfcee9799779a/full/v_1f35c9924c58ae02_1",
+                  "format": "text",
+                  "bytes": 1937,
+                  "sha256": "8f6356849963557a1832287bbb750f30126235965d3d05ff0665a19afe8ee3fd",
+                  "expiresAt": "2026-10-07T11:10:34.191Z"
+                }
+              }
+            },
+            {
+              "callId": 2,
+              "kind": "readText",
+              "source": {
+                "file": "harness-capabilities.js",
+                "line": 44,
+                "column": 31
+              },
+              "status": "succeeded",
+              "createdAt": 1791370834199,
+              "startedAt": 1791370834201,
+              "finishedAt": 1791370834204,
+              "durationMs": 3,
+              "value": {
+                "artifact": {
+                  "path": "/Users/versace/Library/Application Support/webcross/observations/39bdd73b-8618-4cd9-8dea-612f97959b31/978c3007-1157-43e4-bea1-1df805a4c35c/epochs/d_1f35c9924c58ae026e1cfcee9799779a/full/v_1f35c9924c58ae02_1",
+                  "sha256": "8f6356849963557a1832287bbb750f30126235965d3d05ff0665a19afe8ee3fd"
+                },
+                "bytes": 1937
+              }
+            },
+            {
+              "callId": 3,
+              "kind": "action",
+              "action": "Input.type",
+              "source": {
+                "file": "harness-capabilities.js",
+                "line": 37,
+                "column": 40
+              },
+              "status": "succeeded",
+              "createdAt": 1791370834207,
+              "startedAt": 1791370834208,
+              "finishedAt": 1791370834315,
+              "durationMs": 107,
+              "value": {
+                "resolvedBy": "selector",
+                "typed": "Alpha",
+                "length": 5
+              }
+            },
+            {
+              "callId": 4,
+              "kind": "action",
+              "action": "DOM.getDetails",
+              "source": {
+                "file": "harness-capabilities.js",
+                "line": 37,
+                "column": 40
+              },
+              "status": "succeeded",
+              "createdAt": 1791370834317,
+              "startedAt": 1791370834318,
+              "finishedAt": 1791370834368,
+              "durationMs": 50,
+              "value": {
+                "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+                "mode": "detail",
+                "documentEpoch": "d_1f35c9924c58ae026e1cfcee9799779a",
+                "capturedAt": "2026-10-07T11:00:34.367Z",
+                "checkedAt": "2026-10-07T11:00:34.367Z",
+                "summary": {
+                  "total": 1,
+                  "succeeded": 1,
+                  "failed": 0
+                },
+                "source": "live",
+                "completeness": "complete",
+                "pendingChanges": false,
+                "details": [
+                  {
+                    "index": 0,
+                    "view": "state",
+                    "target": {
+                      "requestedSelector": "#name",
+                      "resolvedId": "n_5f09d8555f6ca86a",
+                      "resolvedBy": "selector"
+                    },
+                    "ok": true,
+                    "value": {
+                      "text": "",
+                      "state": {
+                        "value": "Alpha",
+                        "focused": true
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "timing": {
+            "createdAt": 1791370834079,
+            "startedAt": 1791370834086,
+            "finishedAt": 1791370834371,
+            "durationMs": 285
+          }
+        }
+      }
+    },
+    "wallMs": 302
+  },
+  {
+    "case": "variables_b",
+    "input": {
+      "name": "测试 Beta",
+      "values": [
+        2,
+        3,
+        4
+      ]
+    },
+    "request": {
+      "schemaVersion": 1,
+      "name": "variables-template",
+      "entry": "main.js",
+      "files": {
+        "main.js": "import {normalized} from './helper.js';\nexport default async function main({actions,readText},input) {\n const tree = await actions.DOM.getAXTree({purpose:'读取测试页面'});\n const text = await readText(tree.artifact);\n await actions.Input.type({selector:'#name',text:normalized(input.name),clear:true,delayMs:0,purpose:'填入本轮测试变量'});\n const facts=await actions.DOM.getDetails({query:{view:'state',targets:[{selector:'#name'}]},purpose:'校验测试字段'});\n return {name:input.name,values:input.values.map(x=>x*2),treeChars:text.length,details:facts.details};\n}",
+        "helper.js": "export const normalized=x=>x.trim();"
+      },
+      "timeoutMs": 30000
+    },
+    "binding": {
+      "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+      "fleetId": "39bdd73b-8618-4cd9-8dea-612f97959b31"
+    },
+    "receipt": {
+      "workflowHash": "ba7099613ebb4422ac80d48cd658bb31fc7c0a0d61e56a08f95c2d5c9a668918",
+      "result": {
+        "observation": "Workflow a12355c0-dca4-4718-8a19-e0cc0b9a4380 succeeded; 4 platform call(s).",
+        "suggested_prompt": "Read status first, then output on success or error and results on failure. Inspect effects before a manual retry.",
+        "data": {
+          "workflowId": "a12355c0-dca4-4718-8a19-e0cc0b9a4380",
+          "taskId": "1430fde7-1477-413f-b657-4fa3382efe60",
+          "status": "succeeded",
+          "output": {
+            "name": "测试 Beta",
+            "values": [
+              4,
+              6,
+              8
+            ],
+            "treeChars": 2106,
+            "details": [
+              {
+                "index": 0,
+                "view": "state",
+                "target": {
+                  "requestedSelector": "#name",
+                  "resolvedId": "n_5f09d8555f6ca86a",
+                  "resolvedBy": "selector"
+                },
+                "ok": true,
+                "value": {
+                  "text": "",
+                  "state": {
+                    "value": "测试 Beta",
+                    "focused": true
+                  }
+                }
+              }
+            ]
+          },
+          "results": [
+            {
+              "callId": 1,
+              "kind": "action",
+              "action": "DOM.getAXTree",
+              "source": {
+                "file": "harness-capabilities.js",
+                "line": 37,
+                "column": 40
+              },
+              "status": "succeeded",
+              "createdAt": 1791370834462,
+              "startedAt": 1791370834464,
+              "finishedAt": 1791370834485,
+              "durationMs": 21,
+              "value": {
+                "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+                "checkedAt": "2026-10-07T11:00:34.467Z",
+                "freshness": "current",
+                "pendingChanges": false,
+                "completeness": "complete",
+                "mode": "full",
+                "version": "v_1f35c9924c58ae02_2",
+                "artifact": {
+                  "kind": "full",
+                  "path": "/Users/versace/Library/Application Support/webcross/observations/39bdd73b-8618-4cd9-8dea-612f97959b31/978c3007-1157-43e4-bea1-1df805a4c35c/epochs/d_1f35c9924c58ae026e1cfcee9799779a/full/v_1f35c9924c58ae02_2",
+                  "format": "text",
+                  "bytes": 2108,
+                  "sha256": "51a69e3aed38442b6816ba439bb02418265bba58ab2a7baef84a5b435f7fbed1",
+                  "expiresAt": "2026-10-07T11:10:34.481Z"
+                }
+              }
+            },
+            {
+              "callId": 2,
+              "kind": "readText",
+              "source": {
+                "file": "harness-capabilities.js",
+                "line": 44,
+                "column": 31
+              },
+              "status": "succeeded",
+              "createdAt": 1791370834487,
+              "startedAt": 1791370834525,
+              "finishedAt": 1791370834526,
+              "durationMs": 1,
+              "value": {
+                "artifact": {
+                  "path": "/Users/versace/Library/Application Support/webcross/observations/39bdd73b-8618-4cd9-8dea-612f97959b31/978c3007-1157-43e4-bea1-1df805a4c35c/epochs/d_1f35c9924c58ae026e1cfcee9799779a/full/v_1f35c9924c58ae02_2",
+                  "sha256": "51a69e3aed38442b6816ba439bb02418265bba58ab2a7baef84a5b435f7fbed1"
+                },
+                "bytes": 2108
+              }
+            },
+            {
+              "callId": 3,
+              "kind": "action",
+              "action": "Input.type",
+              "source": {
+                "file": "harness-capabilities.js",
+                "line": 37,
+                "column": 40
+              },
+              "status": "succeeded",
+              "createdAt": 1791370834529,
+              "startedAt": 1791370834530,
+              "finishedAt": 1791370836359,
+              "durationMs": 1829,
+              "value": {
+                "resolvedBy": "selector",
+                "typed": "测试 Beta",
+                "length": 7
+              }
+            },
+            {
+              "callId": 4,
+              "kind": "action",
+              "action": "DOM.getDetails",
+              "source": {
+                "file": "harness-capabilities.js",
+                "line": 37,
+                "column": 40
+              },
+              "status": "succeeded",
+              "createdAt": 1791370836361,
+              "startedAt": 1791370836363,
+              "finishedAt": 1791370836414,
+              "durationMs": 51,
+              "value": {
+                "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+                "mode": "detail",
+                "documentEpoch": "d_1f35c9924c58ae026e1cfcee9799779a",
+                "capturedAt": "2026-10-07T11:00:36.412Z",
+                "checkedAt": "2026-10-07T11:00:36.412Z",
+                "summary": {
+                  "total": 1,
+                  "succeeded": 1,
+                  "failed": 0
+                },
+                "source": "live",
+                "completeness": "complete",
+                "pendingChanges": false,
+                "details": [
+                  {
+                    "index": 0,
+                    "view": "state",
+                    "target": {
+                      "requestedSelector": "#name",
+                      "resolvedId": "n_5f09d8555f6ca86a",
+                      "resolvedBy": "selector"
+                    },
+                    "ok": true,
+                    "value": {
+                      "text": "",
+                      "state": {
+                        "value": "测试 Beta",
+                        "focused": true
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "timing": {
+            "createdAt": 1791370834381,
+            "startedAt": 1791370834386,
+            "finishedAt": 1791370836417,
+            "durationMs": 2031
+          }
+        }
+      }
+    },
+    "wallMs": 2046
+  },
+  {
+    "case": "consumer_0",
+    "receipt": {
+      "method": "Workflow.execute",
+      "params": {
+        "workflow": {
+          "name": "variables-template",
+          "entry": "main.js",
+          "sourceFiles": [
+            "helper.js",
+            "main.js"
+          ],
+          "sourceHash": "973fe51d00616a66b2fe797bd5fbb7dc0b810f68ed61952a66573ff1c7f9b186",
+          "executionPackageHash": "bac9241102f2b9bfc6e789f721ad364cc513001422cbb1fe8127df6cbd8fe81c"
+        },
+        "input": {
+          "name": "consumer-0",
+          "values": [
+            10
+          ]
+        },
+        "binding": {
+          "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+          "fleetId": "39bdd73b-8618-4cd9-8dea-612f97959b31"
+        },
+        "timeoutMs": 30000,
+        "sourceRecordedIn": "/private/tmp/webcross-v097-sync-GV4LTB/consumer-bdfc260279ab4d3e8cb4682f24bd5927/worktree/isolated-consumer/tool_results/abcp-agent-step2-Workflow-execute-complete-7eb99ae9.json"
+      },
+      "response": {
+        "observation": "Workflow 3a64fbf9-a989-43a7-a8ba-bb2ea2a21a39 succeeded; 4 platform call(s).",
+        "suggested_prompt": "Read status first, then output on success or error and results on failure. Inspect effects before a manual retry.",
+        "data": {
+          "workflowId": "3a64fbf9-a989-43a7-a8ba-bb2ea2a21a39",
+          "taskId": "411c4168-76f4-4943-9210-f04df10f8f81",
+          "status": "succeeded",
+          "output": {
+            "name": "consumer-0",
+            "values": [
+              20
+            ],
+            "treeChars": 2111,
+            "details": [
+              {
+                "index": 0,
+                "view": "state",
+                "target": {
+                  "requestedSelector": "#name",
+                  "resolvedId": "n_5f09d8555f6ca86a",
+                  "resolvedBy": "selector"
+                },
+                "ok": true,
+                "value": {
+                  "text": "",
+                  "state": {
+                    "value": "consumer-0",
+                    "focused": true
+                  }
+                }
+              }
+            ]
+          },
+          "results": [
+            {
+              "callId": 1,
+              "kind": "action",
+              "action": "DOM.getAXTree",
+              "source": {
+                "file": "harness-capabilities.js",
+                "line": 37,
+                "column": 40
+              },
+              "status": "succeeded",
+              "createdAt": 1791370836734,
+              "startedAt": 1791370836738,
+              "finishedAt": 1791370836783,
+              "durationMs": 45,
+              "value": {
+                "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+                "checkedAt": "2026-10-07T11:00:36.743Z",
+                "freshness": "current",
+                "pendingChanges": false,
+                "completeness": "complete",
+                "mode": "full",
+                "version": "v_1f35c9924c58ae02_3",
+                "artifact": {
+                  "kind": "full",
+                  "path": "/Users/versace/Library/Application Support/webcross/observations/39bdd73b-8618-4cd9-8dea-612f97959b31/978c3007-1157-43e4-bea1-1df805a4c35c/epochs/d_1f35c9924c58ae026e1cfcee9799779a/full/v_1f35c9924c58ae02_3",
+                  "format": "text",
+                  "bytes": 2125,
+                  "sha256": "ff68a4f8edf3aa26f5e8e1d9d106d04ce67d48def8292d77357e6b0a675d4ea9",
+                  "expiresAt": "2026-10-07T11:10:36.775Z"
+                }
+              }
+            },
+            {
+              "callId": 2,
+              "kind": "readText",
+              "source": {
+                "file": "harness-capabilities.js",
+                "line": 44,
+                "column": 31
+              },
+              "status": "succeeded",
+              "createdAt": 1791370836788,
+              "startedAt": 1791370836791,
+              "finishedAt": 1791370836795,
+              "durationMs": 4,
+              "value": {
+                "artifact": {
+                  "path": "/Users/versace/Library/Application Support/webcross/observations/39bdd73b-8618-4cd9-8dea-612f97959b31/978c3007-1157-43e4-bea1-1df805a4c35c/epochs/d_1f35c9924c58ae026e1cfcee9799779a/full/v_1f35c9924c58ae02_3",
+                  "sha256": "ff68a4f8edf3aa26f5e8e1d9d106d04ce67d48def8292d77357e6b0a675d4ea9"
+                },
+                "bytes": 2125
+              }
+            },
+            {
+              "callId": 3,
+              "kind": "action",
+              "action": "Input.type",
+              "source": {
+                "file": "harness-capabilities.js",
+                "line": 37,
+                "column": 40
+              },
+              "status": "succeeded",
+              "createdAt": 1791370836799,
+              "startedAt": 1791370836800,
+              "finishedAt": 1791370837529,
+              "durationMs": 729,
+              "value": {
+                "resolvedBy": "selector",
+                "typed": "consumer-0",
+                "length": 10
+              }
+            },
+            {
+              "callId": 4,
+              "kind": "action",
+              "action": "DOM.getDetails",
+              "source": {
+                "file": "harness-capabilities.js",
+                "line": 37,
+                "column": 40
+              },
+              "status": "succeeded",
+              "createdAt": 1791370837534,
+              "startedAt": 1791370837576,
+              "finishedAt": 1791370837584,
+              "durationMs": 8,
+              "value": {
+                "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+                "mode": "detail",
+                "documentEpoch": "d_1f35c9924c58ae026e1cfcee9799779a",
+                "capturedAt": "2026-10-07T11:00:37.581Z",
+                "checkedAt": "2026-10-07T11:00:37.581Z",
+                "summary": {
+                  "total": 1,
+                  "succeeded": 1,
+                  "failed": 0
+                },
+                "source": "live",
+                "completeness": "complete",
+                "pendingChanges": false,
+                "details": [
+                  {
+                    "index": 0,
+                    "view": "state",
+                    "target": {
+                      "requestedSelector": "#name",
+                      "resolvedId": "n_5f09d8555f6ca86a",
+                      "resolvedBy": "selector"
+                    },
+                    "ok": true,
+                    "value": {
+                      "text": "",
+                      "state": {
+                        "value": "consumer-0",
+                        "focused": true
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "timing": {
+            "createdAt": 1791370836626,
+            "startedAt": 1791370836633,
+            "finishedAt": 1791370837588,
+            "durationMs": 955
+          }
+        }
+      },
+      "executionTrace": {
+        "workflowId": "3a64fbf9-a989-43a7-a8ba-bb2ea2a21a39",
+        "phase": "succeeded",
+        "stepsObserved": 0,
+        "stepsSucceeded": 0,
+        "completedCalls": 4,
+        "activeCalls": [],
+        "eventCursorRange": [
+          79929,
+          79975
+        ]
+      },
+      "workflowExecution": {
+        "status": "succeeded",
+        "workflowId": "3a64fbf9-a989-43a7-a8ba-bb2ea2a21a39",
+        "tool_was_executed": true,
+        "source": null,
+        "failedActionCode": null,
+        "failedAction": null,
+        "failedErrorCode": null,
+        "completedCalls": 4
+      },
+      "status": "succeeded",
+      "_truncation": {
+        "sourceComplete": true,
+        "projectionTruncated": true,
+        "savedPath": "/private/tmp/webcross-v097-sync-GV4LTB/consumer-bdfc260279ab4d3e8cb4682f24bd5927/worktree/isolated-consumer/tool_results/abcp-agent-step2-Workflow-execute-complete-7eb99ae9.json",
+        "persistedPayloadSha256": "c499d4081ce58e933819041ea072531f562d2441b3c48959319ffe689383f4b3",
+        "contentAddress": "c499d4081ce58e93",
+        "lineCount": 227,
+        "originalBytes": 8619,
+        "projectionLimitChars": 24000,
+        "reason": "workflow_source_echo_omitted"
+      },
+      "skillInvocation": {
+        "invocationId": "9ef5014fd0454614891243d4ac36116f",
+        "skillId": "native-reuse",
+        "hash": "6bef378b2c10480d038d69755bf313a80629ee8ec18ad2507df067df67765a46",
+        "version": "unversioned",
+        "workflowPath": "workflow.json",
+        "status": "succeeded"
+      }
+    },
+    "skillHash": "6bef378b2c10480d038d69755bf313a80629ee8ec18ad2507df067df67765a46"
+  },
+  {
+    "case": "consumer_1",
+    "receipt": {
+      "method": "Workflow.execute",
+      "params": {
+        "workflow": {
+          "name": "variables-template",
+          "entry": "main.js",
+          "sourceFiles": [
+            "helper.js",
+            "main.js"
+          ],
+          "sourceHash": "973fe51d00616a66b2fe797bd5fbb7dc0b810f68ed61952a66573ff1c7f9b186",
+          "executionPackageHash": "bac9241102f2b9bfc6e789f721ad364cc513001422cbb1fe8127df6cbd8fe81c"
+        },
+        "input": {
+          "name": "consumer-1",
+          "values": [
+            20,
+            30,
+            40
+          ]
+        },
+        "binding": {
+          "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+          "fleetId": "39bdd73b-8618-4cd9-8dea-612f97959b31"
+        },
+        "timeoutMs": 30000,
+        "sourceRecordedIn": "/private/tmp/webcross-v097-sync-GV4LTB/consumer-bdfc260279ab4d3e8cb4682f24bd5927/worktree/isolated-consumer/tool_results/abcp-agent-step3-Workflow-execute-complete-eff873b4.json"
+      },
+      "response": {
+        "observation": "Workflow e9c7ccd6-4712-4489-8202-9a70d2ae8c71 succeeded; 4 platform call(s).",
+        "suggested_prompt": "Read status first, then output on success or error and results on failure. Inspect effects before a manual retry.",
+        "data": {
+          "workflowId": "e9c7ccd6-4712-4489-8202-9a70d2ae8c71",
+          "taskId": "0818f411-1466-4cf9-8db8-e6a8341fd7f5",
+          "status": "succeeded",
+          "output": {
+            "name": "consumer-1",
+            "values": [
+              40,
+              60,
+              80
+            ],
+            "treeChars": 2121,
+            "details": [
+              {
+                "index": 0,
+                "view": "state",
+                "target": {
+                  "requestedSelector": "#name",
+                  "resolvedId": "n_5f09d8555f6ca86a",
+                  "resolvedBy": "selector"
+                },
+                "ok": true,
+                "value": {
+                  "text": "",
+                  "state": {
+                    "value": "consumer-1",
+                    "focused": true
+                  }
+                }
+              }
+            ]
+          },
+          "results": [
+            {
+              "callId": 1,
+              "kind": "action",
+              "action": "DOM.getAXTree",
+              "source": {
+                "file": "harness-capabilities.js",
+                "line": 37,
+                "column": 40
+              },
+              "status": "succeeded",
+              "createdAt": 1791370837710,
+              "startedAt": 1791370837713,
+              "finishedAt": 1791370837742,
+              "durationMs": 29,
+              "value": {
+                "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+                "checkedAt": "2026-10-07T11:00:37.718Z",
+                "freshness": "current",
+                "pendingChanges": false,
+                "completeness": "complete",
+                "mode": "full",
+                "version": "v_1f35c9924c58ae02_4",
+                "artifact": {
+                  "kind": "full",
+                  "path": "/Users/versace/Library/Application Support/webcross/observations/39bdd73b-8618-4cd9-8dea-612f97959b31/978c3007-1157-43e4-bea1-1df805a4c35c/epochs/d_1f35c9924c58ae026e1cfcee9799779a/full/v_1f35c9924c58ae02_4",
+                  "format": "text",
+                  "bytes": 2123,
+                  "sha256": "d0f57307c625527f1c32a081f5e378392c71912f4ea1830c30f5c92afcc5a31a",
+                  "expiresAt": "2026-10-07T11:10:37.735Z"
+                }
+              }
+            },
+            {
+              "callId": 2,
+              "kind": "readText",
+              "source": {
+                "file": "harness-capabilities.js",
+                "line": 44,
+                "column": 31
+              },
+              "status": "succeeded",
+              "createdAt": 1791370837745,
+              "startedAt": 1791370837747,
+              "finishedAt": 1791370837751,
+              "durationMs": 4,
+              "value": {
+                "artifact": {
+                  "path": "/Users/versace/Library/Application Support/webcross/observations/39bdd73b-8618-4cd9-8dea-612f97959b31/978c3007-1157-43e4-bea1-1df805a4c35c/epochs/d_1f35c9924c58ae026e1cfcee9799779a/full/v_1f35c9924c58ae02_4",
+                  "sha256": "d0f57307c625527f1c32a081f5e378392c71912f4ea1830c30f5c92afcc5a31a"
+                },
+                "bytes": 2123
+              }
+            },
+            {
+              "callId": 3,
+              "kind": "action",
+              "action": "Input.type",
+              "source": {
+                "file": "harness-capabilities.js",
+                "line": 37,
+                "column": 40
+              },
+              "status": "succeeded",
+              "createdAt": 1791370837753,
+              "startedAt": 1791370837755,
+              "finishedAt": 1791370839546,
+              "durationMs": 1791,
+              "value": {
+                "resolvedBy": "selector",
+                "typed": "consumer-1",
+                "length": 10
+              }
+            },
+            {
+              "callId": 4,
+              "kind": "action",
+              "action": "DOM.getDetails",
+              "source": {
+                "file": "harness-capabilities.js",
+                "line": 37,
+                "column": 40
+              },
+              "status": "succeeded",
+              "createdAt": 1791370839551,
+              "startedAt": 1791370839554,
+              "finishedAt": 1791370839598,
+              "durationMs": 44,
+              "value": {
+                "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+                "mode": "detail",
+                "documentEpoch": "d_1f35c9924c58ae026e1cfcee9799779a",
+                "capturedAt": "2026-10-07T11:00:39.595Z",
+                "checkedAt": "2026-10-07T11:00:39.595Z",
+                "summary": {
+                  "total": 1,
+                  "succeeded": 1,
+                  "failed": 0
+                },
+                "source": "live",
+                "completeness": "complete",
+                "pendingChanges": false,
+                "details": [
+                  {
+                    "index": 0,
+                    "view": "state",
+                    "target": {
+                      "requestedSelector": "#name",
+                      "resolvedId": "n_5f09d8555f6ca86a",
+                      "resolvedBy": "selector"
+                    },
+                    "ok": true,
+                    "value": {
+                      "text": "",
+                      "state": {
+                        "value": "consumer-1",
+                        "focused": true
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "timing": {
+            "createdAt": 1791370837615,
+            "startedAt": 1791370837625,
+            "finishedAt": 1791370839603,
+            "durationMs": 1978
+          }
+        }
+      },
+      "executionTrace": {
+        "workflowId": "e9c7ccd6-4712-4489-8202-9a70d2ae8c71",
+        "phase": "succeeded",
+        "stepsObserved": 0,
+        "stepsSucceeded": 0,
+        "completedCalls": 4,
+        "activeCalls": [],
+        "eventCursorRange": [
+          79978,
+          80024
+        ]
+      },
+      "workflowExecution": {
+        "status": "succeeded",
+        "workflowId": "e9c7ccd6-4712-4489-8202-9a70d2ae8c71",
+        "tool_was_executed": true,
+        "source": null,
+        "failedActionCode": null,
+        "failedAction": null,
+        "failedErrorCode": null,
+        "completedCalls": 4
+      },
+      "status": "succeeded",
+      "_truncation": {
+        "sourceComplete": true,
+        "projectionTruncated": true,
+        "savedPath": "/private/tmp/webcross-v097-sync-GV4LTB/consumer-bdfc260279ab4d3e8cb4682f24bd5927/worktree/isolated-consumer/tool_results/abcp-agent-step3-Workflow-execute-complete-eff873b4.json",
+        "persistedPayloadSha256": "e37ed6463a1383a57aa3d558bfc06d9979f3a09413826e7ed5662f843975eff0",
+        "contentAddress": "e37ed6463a1383a5",
+        "lineCount": 231,
+        "originalBytes": 8638,
+        "projectionLimitChars": 24000,
+        "reason": "workflow_source_echo_omitted"
+      },
+      "skillInvocation": {
+        "invocationId": "713a85894e724af9bffb6b787c743cf9",
+        "skillId": "native-reuse",
+        "hash": "6bef378b2c10480d038d69755bf313a80629ee8ec18ad2507df067df67765a46",
+        "version": "unversioned",
+        "workflowPath": "workflow.json",
+        "status": "succeeded"
+      }
+    },
+    "skillHash": "6bef378b2c10480d038d69755bf313a80629ee8ec18ad2507df067df67765a46"
+  },
+  {
+    "case": "upload",
+    "input": {
+      "files": [
+        "/Users/versace/Desktop/abcp browser system/worktree/v097-canary-613f9259df29493b80150532878815ea/upload.txt"
+      ]
+    },
+    "request": {
+      "schemaVersion": 1,
+      "name": "upload",
+      "entry": "main.js",
+      "files": {
+        "main.js": "export default async function main({actions},input) {\n const assigned=await actions.File.handleChooser({selector:'#upload',files:input.files,purpose:'验证隔离页面文件指派'});\n const state=await actions.DOM.getDetails({query:{view:'state',targets:[{selector:'#upload'}]},purpose:'查看文件控件接受结果'});\n return {assigned,details:state.details};\n}"
+      },
+      "timeoutMs": 30000
+    },
+    "binding": {
+      "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+      "fleetId": "39bdd73b-8618-4cd9-8dea-612f97959b31"
+    },
+    "receipt": {
+      "workflowHash": "c038eaacdf235a7f6d98b45e195b33fb4f10eecdb2d0fae5578e5ced7743e381",
+      "result": {
+        "observation": "Workflow e90cca20-1a93-4f75-b1a0-c92f98c3f898 succeeded; 2 platform call(s).",
+        "suggested_prompt": "Read status first, then output on success or error and results on failure. Inspect effects before a manual retry.",
+        "data": {
+          "workflowId": "e90cca20-1a93-4f75-b1a0-c92f98c3f898",
+          "taskId": "d5a8da84-c4db-4164-999b-8b22d8342b03",
+          "status": "succeeded",
+          "output": {
+            "assigned": {
+              "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+              "handled": true,
+              "selectedFileCount": 1,
+              "resolvedBy": "agent",
+              "targetResolvedBy": "selector"
+            },
+            "details": [
+              {
+                "index": 0,
+                "view": "state",
+                "target": {
+                  "requestedSelector": "#upload",
+                  "resolvedId": "n_3c4c192dc3b4fa54",
+                  "resolvedBy": "selector"
+                },
+                "ok": true,
+                "value": {
+                  "text": "",
+                  "state": {
+                    "value": "C:\\fakepath\\upload.txt",
+                    "focused": false
+                  }
+                }
+              }
+            ]
+          },
+          "results": [
+            {
+              "callId": 1,
+              "kind": "action",
+              "action": "File.handleChooser",
+              "source": {
+                "file": "harness-capabilities.js",
+                "line": 37,
+                "column": 40
+              },
+              "status": "succeeded",
+              "createdAt": 1791370839719,
+              "startedAt": 1791370839722,
+              "finishedAt": 1791370839796,
+              "durationMs": 74,
+              "value": {
+                "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+                "handled": true,
+                "selectedFileCount": 1,
+                "resolvedBy": "agent",
+                "targetResolvedBy": "selector"
+              }
+            },
+            {
+              "callId": 2,
+              "kind": "action",
+              "action": "DOM.getDetails",
+              "source": {
+                "file": "harness-capabilities.js",
+                "line": 37,
+                "column": 40
+              },
+              "status": "succeeded",
+              "createdAt": 1791370839798,
+              "startedAt": 1791370839799,
+              "finishedAt": 1791370839806,
+              "durationMs": 7,
+              "value": {
+                "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+                "mode": "detail",
+                "documentEpoch": "d_1f35c9924c58ae026e1cfcee9799779a",
+                "capturedAt": "2026-10-07T11:00:39.804Z",
+                "checkedAt": "2026-10-07T11:00:39.805Z",
+                "summary": {
+                  "total": 1,
+                  "succeeded": 1,
+                  "failed": 0
+                },
+                "source": "live",
+                "completeness": "complete",
+                "pendingChanges": false,
+                "details": [
+                  {
+                    "index": 0,
+                    "view": "state",
+                    "target": {
+                      "requestedSelector": "#upload",
+                      "resolvedId": "n_3c4c192dc3b4fa54",
+                      "resolvedBy": "selector"
+                    },
+                    "ok": true,
+                    "value": {
+                      "text": "",
+                      "state": {
+                        "value": "C:\\fakepath\\upload.txt",
+                        "focused": false
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "timing": {
+            "createdAt": 1791370839628,
+            "startedAt": 1791370839634,
+            "finishedAt": 1791370839809,
+            "durationMs": 175
+          }
+        }
+      }
+    },
+    "wallMs": 189
+  },
+  {
+    "case": "events",
+    "input": {
+      "url": "data:text/html,%3Ctitle%3EHarness%20v0.9.7%20isolated%20trial%3C/title%3E%3Clabel%3EName%3Cinput%20id%3D%22name%22%3E%3C/label%3E%3Cinput%20id%3D%22upload%22%20type%3D%22file%22%3E%3Cp%20id%3D%22note%22%3ECanary%20only%3C/p%3E%3Cp%3Enext%3C/p%3E"
+    },
+    "request": {
+      "schemaVersion": 1,
+      "name": "events",
+      "entry": "main.js",
+      "files": {
+        "main.js": "export default async function main({actions,context,waitFor},input) {\n const waited=await waitFor({events:['Page.loaded','Page.loadFailed'],pageId:context.pageId,timeoutMs:10000},()=>actions.Page.navigate({url:input.url,purpose:'验证订阅先于导航'}));\n const state=await actions.Page.getState({purpose:'同步导航结果'}); return {event:waited.event.event,title:state.title};\n}"
+      },
+      "timeoutMs": 30000
+    },
+    "binding": {
+      "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+      "fleetId": "39bdd73b-8618-4cd9-8dea-612f97959b31"
+    },
+    "receipt": {
+      "workflowHash": "ba93e730ce938394e581cf23ac1dc2304a0f531d010913b0ee0854562791a6e0",
+      "result": {
+        "observation": "Workflow dd892d9f-f414-4882-8ebb-7dc5c7a07fa2 succeeded; 3 platform call(s).",
+        "suggested_prompt": "Read status first, then output on success or error and results on failure. Inspect effects before a manual retry.",
+        "data": {
+          "workflowId": "dd892d9f-f414-4882-8ebb-7dc5c7a07fa2",
+          "taskId": "46bb8248-4c74-4099-95c9-0355ae0285b5",
+          "status": "succeeded",
+          "output": {
+            "event": "Page.loaded",
+            "title": "Harness v0.9.7 isolated trial"
+          },
+          "results": [
+            {
+              "callId": 1,
+              "kind": "waitFor",
+              "source": {
+                "file": "harness-capabilities.js",
+                "line": 45,
+                "column": 53
+              },
+              "status": "succeeded",
+              "createdAt": 1791370839910,
+              "startedAt": 1791370839915,
+              "finishedAt": 1791370840182,
+              "durationMs": 267,
+              "value": {
+                "event": {
+                  "eventId": "1bc26726-9be8-4100-b976-99776ae07ed5",
+                  "cursor": 80077,
+                  "revision": 80077,
+                  "event": "Page.loaded",
+                  "category": "navigation",
+                  "severity": "info",
+                  "persistence": "windowed",
+                  "source": "browser-client",
+                  "fleetId": "39bdd73b-8618-4cd9-8dea-612f97959b31",
+                  "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+                  "taskId": "46bb8248-4c74-4099-95c9-0355ae0285b5",
+                  "occurredAt": 1791370840181,
+                  "payload": {
+                    "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+                    "fleetId": "39bdd73b-8618-4cd9-8dea-612f97959b31",
+                    "url": "data:text/html,%3Ctitle%3EHarness%20v0.9.7%20isolated%20trial%3C/title%3E%3Clabel%3EName%3Cinput%20id%3D%22name%22%3E%3C/label%3E%3Cinput%20id%3D%22upload%22%20type%3D%22file%22%3E%3Cp%20id%3D%22note%22%3ECanary%20only%3C/p%3E%3Cp%3Enext%3C/p%3E",
+                    "title": "Harness v0.9.7 isolated trial"
+                  }
+                }
+              }
+            },
+            {
+              "callId": 2,
+              "kind": "action",
+              "action": "Page.navigate",
+              "source": {
+                "file": "harness-capabilities.js",
+                "line": 37,
+                "column": 40
+              },
+              "status": "succeeded",
+              "createdAt": 1791370839918,
+              "startedAt": 1791370839920,
+              "finishedAt": 1791370839939,
+              "durationMs": 19,
+              "value": {
+                "url": "data:text/html,%3Ctitle%3EHarness%20v0.9.7%20isolated%20trial%3C/title%3E%3Clabel%3EName%3Cinput%20id%3D%22name%22%3E%3C/label%3E%3Cinput%20id%3D%22upload%22%20type%3D%22file%22%3E%3Cp%20id%3D%22note%22%3ECanary%20only%3C/p%3E%3Cp%3Enext%3C/p%3E",
+                "title": "",
+                "status": "loading",
+                "accepted": true
+              }
+            },
+            {
+              "callId": 3,
+              "kind": "action",
+              "action": "Page.getState",
+              "source": {
+                "file": "harness-capabilities.js",
+                "line": 37,
+                "column": 40
+              },
+              "status": "succeeded",
+              "createdAt": 1791370840183,
+              "startedAt": 1791370840185,
+              "finishedAt": 1791370840188,
+              "durationMs": 3,
+              "value": {
+                "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+                "status": "ready",
+                "url": "data:text/html,%3Ctitle%3EHarness%20v0.9.7%20isolated%20trial%3C/title%3E%3Clabel%3EName%3Cinput%20id%3D%22name%22%3E%3C/label%3E%3Cinput%20id%3D%22upload%22%20type%3D%22file%22%3E%3Cp%20id%3D%22note%22%3ECanary%20only%3C/p%3E%3Cp%3Enext%3C/p%3E",
+                "title": "Harness v0.9.7 isolated trial",
+                "zoomLevel": 0,
+                "isPinned": false,
+                "isAudible": false,
+                "isMuted": false,
+                "isBlocked": false,
+                "hitl": {
+                  "isPaused": false
+                },
+                "blockingInteractions": {
+                  "hasPendingDialog": false
+                }
+              }
+            }
+          ],
+          "timing": {
+            "createdAt": 1791370839817,
+            "startedAt": 1791370839822,
+            "finishedAt": 1791370840192,
+            "durationMs": 370
+          }
+        }
+      }
+    },
+    "wallMs": 382
+  },
+  {
+    "case": "blocked",
+    "input": {
+      "domain": "Page",
+      "method": "getState",
+      "pageId": "00000000-0000-0000-0000-000000000000"
+    },
+    "request": {
+      "schemaVersion": 1,
+      "name": "blocked",
+      "entry": "main.js",
+      "files": {
+        "main.js": "export default async function main({actions},input) {return actions[input.domain][input.method]({pageId:input.pageId,purpose:'验证绑定边界'});}"
+      },
+      "timeoutMs": 30000
+    },
+    "binding": {
+      "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+      "fleetId": "39bdd73b-8618-4cd9-8dea-612f97959b31"
+    },
+    "receipt": {
+      "workflowHash": "d701efede1b1960666b41abcf826084ac12c74cf38ec08c48a30baf6d23f18dd",
+      "result": {
+        "observation": "Workflow 12cdc639-0d97-4064-bafe-e2d87e4207d2 failed; 0 platform call(s).",
+        "suggested_prompt": "Read status first, then output on success or error and results on failure. Inspect effects before a manual retry.",
+        "data": {
+          "workflowId": "12cdc639-0d97-4064-bafe-e2d87e4207d2",
+          "taskId": "43d1e86b-b974-459c-93b8-afcc9259f2e3",
+          "status": "failed",
+          "output": null,
+          "results": [],
+          "error": {
+            "code": "harness-scope-denied",
+            "message": "Page is outside the task binding",
+            "source": {
+              "file": "harness-capabilities.js",
+              "line": 18,
+              "column": 45
+            }
+          },
+          "timing": {
+            "createdAt": 1791370840200,
+            "startedAt": 1791370840205,
+            "finishedAt": 1791370840362,
+            "durationMs": 157
+          }
+        }
+      }
+    },
+    "wallMs": 169
+  },
+  {
+    "case": "partial_failure",
+    "input": null,
+    "request": {
+      "schemaVersion": 1,
+      "name": "partial_failure",
+      "entry": "main.js",
+      "files": {
+        "main.js": "export default async function main({actions}) {await actions.Input.type({selector:'#name',text:'effect-before-error',clear:true,delayMs:0,purpose:'验证失败前已完成调用记录'}); throw new Error('intentional canary failure');}"
+      },
+      "timeoutMs": 30000
+    },
+    "binding": {
+      "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+      "fleetId": "39bdd73b-8618-4cd9-8dea-612f97959b31"
+    },
+    "receipt": {
+      "workflowHash": "e82fc3b55ae0fe5cec7fae81d64c289412f19fa84639773014a4e3ebd978a99b",
+      "result": {
+        "observation": "Workflow ced92a87-17e3-442f-b0a6-ab255c7cb3b1 failed; 1 platform call(s).",
+        "suggested_prompt": "Read status first, then output on success or error and results on failure. Inspect effects before a manual retry.",
+        "data": {
+          "workflowId": "ced92a87-17e3-442f-b0a6-ab255c7cb3b1",
+          "taskId": "dfa93f36-2176-4b2b-9a55-0f7df8c456e8",
+          "status": "failed",
+          "output": null,
+          "results": [
+            {
+              "callId": 1,
+              "kind": "action",
+              "action": "Input.type",
+              "source": {
+                "file": "harness-capabilities.js",
+                "line": 37,
+                "column": 40
+              },
+              "status": "succeeded",
+              "createdAt": 1791370840452,
+              "startedAt": 1791370840456,
+              "finishedAt": 1791370840717,
+              "durationMs": 261,
+              "value": {
+                "resolvedBy": "selector",
+                "typed": "effect-before-error",
+                "length": 19
+              }
+            }
+          ],
+          "error": {
+            "code": "workflow-script-failed",
+            "message": "intentional canary failure",
+            "source": {
+              "file": "main.js",
+              "line": 1,
+              "column": 175
+            }
+          },
+          "timing": {
+            "createdAt": 1791370840370,
+            "startedAt": 1791370840374,
+            "finishedAt": 1791370840727,
+            "durationMs": 353
+          }
+        }
+      }
+    },
+    "wallMs": 366
+  },
+  {
+    "case": "compile_failure",
+    "input": null,
+    "request": {
+      "schemaVersion": 1,
+      "name": "compile_failure",
+      "entry": "main.js",
+      "files": {
+        "main.js": "export default async function main( { syntax broken"
+      },
+      "timeoutMs": 30000
+    },
+    "binding": {
+      "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+      "fleetId": "39bdd73b-8618-4cd9-8dea-612f97959b31"
+    },
+    "receipt": {
+      "workflowHash": "adecc32e2b6651dd95d553f6eb0f14d86d4e07e7763bbd63d3f973c40385f343",
+      "result": {
+        "status": "platform_error",
+        "transportCode": "ABCP_RPC_ERROR",
+        "rpcCode": -32005,
+        "rpcMethod": "Workflow.execute",
+        "requestSent": true,
+        "requestId": "84a62198-f0b2-4c30-b244-bcd3c2630c73",
+        "details": {
+          "details": {
+            "code": "workflow-compile-failed",
+            "message": "Expected \"}\" but found \"broken\"",
+            "source": {
+              "file": "main.js",
+              "line": 1,
+              "column": 46
+            }
+          },
+          "observation": "Workflow.execute failed: Workflow source could not be compiled.",
+          "suggested_prompt": "Inspect the source or execution status before submitting again.",
+          "error": {
+            "code": "workflow-compile-failed",
+            "message": "Workflow source could not be compiled.",
+            "details": {
+              "code": "workflow-compile-failed",
+              "message": "Expected \"}\" but found \"broken\"",
+              "source": {
+                "file": "main.js",
+                "line": 1,
+                "column": 46
+              }
+            }
+          }
+        },
+        "message": "ABCP Browser call Workflow.execute failed: -32005 Workflow source could not be compiled."
+      }
+    },
+    "wallMs": 17
+  },
+  {
+    "case": "cancel",
+    "statusBefore": {
+      "observation": "Workflow cfaf3e59-0b32-4384-857c-5b6071ac1c61: running.",
+      "suggested_prompt": "Inspect lifecycle and active calls before further control.",
+      "data": {
+        "workflowId": "cfaf3e59-0b32-4384-857c-5b6071ac1c61",
+        "taskId": "c90eda96-13d2-415e-ac25-ba48995b3694",
+        "status": "running",
+        "completedCalls": 0,
+        "activeCalls": [
+          {
+            "callId": 1,
+            "kind": "sleep",
+            "source": {
+              "file": "harness-capabilities.js",
+              "line": 44,
+              "column": 68
+            },
+            "status": "running",
+            "createdAt": 1791370840843,
+            "startedAt": 1791370840846
+          }
+        ],
+        "timing": {
+          "createdAt": 1791370840755,
+          "startedAt": 1791370840761,
+          "durationMs": 95
+        }
+      }
+    },
+    "cancel": {
+      "observation": "Workflow cfaf3e59-0b32-4384-857c-5b6071ac1c61: cancelling.",
+      "suggested_prompt": "Inspect lifecycle and active calls before further control.",
+      "data": {
+        "workflowId": "cfaf3e59-0b32-4384-857c-5b6071ac1c61",
+        "taskId": "c90eda96-13d2-415e-ac25-ba48995b3694",
+        "status": "cancelling",
+        "completedCalls": 0,
+        "activeCalls": [
+          {
+            "callId": 1,
+            "kind": "sleep",
+            "source": {
+              "file": "harness-capabilities.js",
+              "line": 44,
+              "column": 68
+            },
+            "status": "running",
+            "createdAt": 1791370840843,
+            "startedAt": 1791370840846
+          }
+        ],
+        "timing": {
+          "createdAt": 1791370840755,
+          "startedAt": 1791370840761,
+          "durationMs": 100
+        }
+      }
+    },
+    "receipt": {
+      "workflowHash": "f4dbb4bd3e8efcf3f24a60f9ffb991be33bff3431083fe42e81ac5f9f5d6d83f",
+      "result": {
+        "observation": "Workflow cfaf3e59-0b32-4384-857c-5b6071ac1c61 cancelled; 1 platform call(s).",
+        "suggested_prompt": "Read status first, then output on success or error and results on failure. Inspect effects before a manual retry.",
+        "data": {
+          "workflowId": "cfaf3e59-0b32-4384-857c-5b6071ac1c61",
+          "taskId": "c90eda96-13d2-415e-ac25-ba48995b3694",
+          "status": "cancelled",
+          "output": null,
+          "results": [
+            {
+              "callId": 1,
+              "kind": "sleep",
+              "source": {
+                "file": "harness-capabilities.js",
+                "line": 44,
+                "column": 68
+              },
+              "status": "cancelled",
+              "createdAt": 1791370840843,
+              "startedAt": 1791370840846,
+              "finishedAt": 1791370840861,
+              "durationMs": 15,
+              "error": {
+                "code": "workflow-cancelled",
+                "message": "Timer was cancelled.",
+                "source": {
+                  "file": "harness-capabilities.js",
+                  "line": 44,
+                  "column": 68
+                }
+              }
+            }
+          ],
+          "timing": {
+            "createdAt": 1791370840755,
+            "startedAt": 1791370840761,
+            "finishedAt": 1791370840862,
+            "durationMs": 101
+          }
+        }
+      }
+    }
+  }
+]

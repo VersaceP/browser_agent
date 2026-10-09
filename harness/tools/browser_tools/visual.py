@@ -1524,29 +1524,17 @@ def _stash_reality_check(agent: Any, task: Any) -> None:
 async def _read_page_scroll(
     agent: Any, page_id: str, step: int
 ) -> Optional[Dict[str, float]]:
-    """The document scroll offset, or None when it cannot be read.
+    """Read the main-document offset with Input.scroll's viewport state read.
 
-    `Page.wheel` with a zero delta is the platform's own root-viewport state
-    read: measured to answer `completedReason: "state-read"` with
-    `observedDelta: {x: 0, y: 0}` and the current `position`, leaving the page
-    untouched. Using a scroll action to read the scroll is only defensible
-    because of that receipt, so this refuses any answer that does not carry it —
-    a read that moved the page is the one thing the surrounding bracket exists
-    to detect, and it would be detecting its own instrument.
-
-    This used to send `Input.scroll` in viewport mode. That mode no longer
-    exists: the Action now requires `target` or `container` on every branch, so
-    the call failed `invalid-params` and this returned None for every capture,
-    silently disabling cssPoint promotion. `Page.wheel` is where root-viewport
-    scrolling went, and `x`/`y` must be inside the viewport, so the capture's
-    own origin is used rather than a fixed guess.
+    Only stable observations with completed input and proven zero measured
+    movement can certify the geometry bracket. Missing evidence stays unknown.
     """
     from harness.vl.locate import _scroll_position_from_state_read
 
     try:
         resp = await _bt()._invoke_browser_method(
-            agent, "Page.wheel",
-            {"pageId": page_id, "x": 0, "y": 0, "deltaX": 0, "deltaY": 0,
+            agent, "Input.scroll",
+            {"pageId": page_id, "deltaX": 0, "deltaY": 0,
              "purpose": "read the scroll offset for VL coordinate mapping"},
             step,
             internal=True,
@@ -1843,7 +1831,7 @@ async def _promote_visual_locate(
             out["resolvedLabel"] = promo.get("label")
             out["next_instruction"] = (
                 f"Located and promoted to durable id {promo.get('id')!r}. Act on"
-                f" that id (Input.click, or a bounded DOM.getAXTree query) — it survives a"
+                f" that id (Input.click, or a bounded DOM.getDetails query) — it survives a"
                 f" relayout that a coordinate does not. No coordinate is needed"
                 f" or offered here."
             )

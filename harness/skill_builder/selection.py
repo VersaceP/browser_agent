@@ -24,12 +24,17 @@ def selected_skill_context(runtime: Any) -> str:
         if snapshot is None:
             raise RuntimeError(f"选定 Skill 版本不可用: {skill_id}@{content_hash}")
         guide = (snapshot / "SKILL.md").read_text(encoding="utf-8")
-        workflows = sorted(p.relative_to(snapshot).as_posix()
-                           for p in snapshot.rglob("*.json") if p.is_file())
+        from harness.skill_builder.resources import workflow_entries
+        import json
+        workflows = workflow_entries(snapshot)
+        resources = sorted(p.relative_to(snapshot).as_posix() for p in snapshot.rglob("*")
+                           if p.is_file() and p.relative_to(snapshot).parts[0] not in {"trials", "workflows"})
         execution_note = (
             "When useful and authorized, call execute_published_skill_workflow "
             "with a listed relative path, the assigned pageId/fleetId, and "
-            "explicit variables. Interpret the receipt against the user's task; "
+            "explicit business variables (sent as input on JS/TS deployments). Read "
+            "the source package and input instructions; legacy steps require rebuilding. "
+            "Interpret the receipt against the user's task; "
             "a failed call may have side effects."
             if bool(getattr(config, "workflow_execution_enabled", False))
             else "Workflow execution is disabled for this run. Use this Skill's "
@@ -38,7 +43,8 @@ def selected_skill_context(runtime: Any) -> str:
         return (
             f"<selected_skill name={skill_id!r} hash={content_hash!r}>\n"
             f"{guide}\n"
-            f"Workflow JSON files: {workflows}. {execution_note}\n"
+            f"Formal Workflow entries: {json.dumps(workflows, ensure_ascii=False)}\n"
+            f"Supporting text/parameter resources: {resources}. Development probes are not execution entries. {execution_note}\n"
             "</selected_skill>"
         )
     finally:

@@ -1,0 +1,231 @@
+{
+  "method": "Workflow.execute",
+  "params": {
+    "description": "variables-template",
+    "timeout": 30000,
+    "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+    "fleetId": "39bdd73b-8618-4cd9-8dea-612f97959b31",
+    "_platformWorkflow": {
+      "schemaVersion": 1,
+      "name": "variables-template",
+      "entry": "harness-scope.js",
+      "files": {
+        "main.js": "import {normalized} from './helper.js';\nexport default async function main({actions,readText},input) {\n const tree = await actions.DOM.getAXTree({purpose:'读取测试页面'});\n const text = await readText(tree.artifact);\n await actions.Input.type({selector:'#name',text:normalized(input.name),clear:true,delayMs:0,purpose:'填入本轮测试变量'});\n const facts=await actions.DOM.getDetails({query:{view:'state',targets:[{selector:'#name'}]},purpose:'校验测试字段'});\n return {name:input.name,values:input.values.map(x=>x*2),treeChars:text.length,details:facts.details};\n}",
+        "helper.js": "export const normalized=x=>x.trim();",
+        "harness-capabilities.js": "\n// Reserve SDK intrinsics before loading untrusted modules. Prototypes or\n// globals must not be replaced to alter the SDK's JSON encoding or our checks.\nfor (const name of [\"Object\", \"Array\", \"JSON\", \"Set\", \"Map\", \"Error\", \"Number\", \"String\", \"Promise\", \"RegExp\", \"Symbol\", \"Reflect\"]) {\n  const intrinsic = globalThis[name];\n  if (intrinsic.prototype) Object.freeze(intrinsic.prototype);\n  Object.freeze(intrinsic);\n  Object.defineProperty(globalThis, name, {value: intrinsic, writable: false, configurable: false});\n}\nconst scope = {\"pageId\": \"978c3007-1157-43e4-bea1-1df805a4c35c\", \"fleetId\": \"39bdd73b-8618-4cd9-8dea-612f97959b31\", \"methods\": [\"DOM.getAXTree\", \"DOM.getDetails\", \"DOM.inspectSelect\", \"File.handleChooser\", \"Input.click\", \"Input.drag\", \"Input.press\", \"Input.scroll\", \"Input.select\", \"Input.type\", \"Page.click\", \"Page.getState\", \"Page.go\", \"Page.handleDialog\", \"Page.navigate\", \"Page.reload\"], \"files\": []};\nconst permittedHas = Set.prototype.has.bind(new Set(scope.methods));\nconst filesHas = Set.prototype.has.bind(new Set(scope.files));\nconst parse = JSON.parse, stringify = JSON.stringify;\nconst create = Object.create, keys = Object.keys, freeze = Object.freeze;\nconst isArray = Array.isArray;\nconst some = Function.prototype.call.bind(Array.prototype.some);\nconst NativeError = Error;\nconst deny = message => { const error = new NativeError(message); error.code = \"harness-scope-denied\"; throw error; };\nexport function scopedApi(raw) {\n  const bind = params => {\n    if (params.pageId !== undefined && params.pageId !== scope.pageId) deny(\"Page is outside the task binding\");\n    if (params.fleetId !== undefined && params.fleetId !== scope.fleetId) deny(\"Fleet is outside the task binding\");\n  };\n  const actions = create(null);\n  for (const domain of keys(raw.actions)) {\n    const group = create(null);\n    for (const name of keys(raw.actions[domain])) {\n      const method = domain + \".\" + name;\n      group[name] = async value => {\n        if (!permittedHas(method)) deny(\"Action requires an independently authorized tool: \" + method);\n        const params = parse(stringify(value === undefined ? {} : value));\n        if (params === null || typeof params !== \"object\" || isArray(params)) deny(\"Action params must be an object\");\n        bind(params);\n        if (method === \"File.handleChooser\" && (!isArray(params.files) || some(params.files, file => !filesHas(file)))) {\n          deny(\"File is outside the authorized input file manifest; read or authorize the files and supply canonical paths in input\");\n        }\n        return raw.actions[domain][name](params);\n      };\n    }\n    actions[domain] = freeze(group);\n  }\n  return freeze({\n    actions: freeze(actions), context: freeze({...raw.context}),\n    readText: artifact => raw.readText(artifact), sleep: ms => raw.sleep(ms),\n    waitFor: (options, trigger) => { bind(options); return raw.waitFor({...options, pageId: scope.pageId || options.pageId, fleetId: scope.fleetId || options.fleetId}, trigger); }\n  });\n}\n",
+        "harness-scope.js": "import {scopedApi} from \"./harness-capabilities.js\";\nimport main from \"./main.js\";\nexport default async function guarded(raw, input) { return main(scopedApi(raw), input); }\n"
+      },
+      "timeoutMs": 30000
+    },
+    "_platformInput": {
+      "name": "consumer-1",
+      "values": [
+        20,
+        30,
+        40
+      ]
+    }
+  },
+  "response": {
+    "observation": "Workflow e9c7ccd6-4712-4489-8202-9a70d2ae8c71 succeeded; 4 platform call(s).",
+    "suggested_prompt": "Read status first, then output on success or error and results on failure. Inspect effects before a manual retry.",
+    "data": {
+      "workflowId": "e9c7ccd6-4712-4489-8202-9a70d2ae8c71",
+      "taskId": "0818f411-1466-4cf9-8db8-e6a8341fd7f5",
+      "status": "succeeded",
+      "output": {
+        "name": "consumer-1",
+        "values": [
+          40,
+          60,
+          80
+        ],
+        "treeChars": 2121,
+        "details": [
+          {
+            "index": 0,
+            "view": "state",
+            "target": {
+              "requestedSelector": "#name",
+              "resolvedId": "n_5f09d8555f6ca86a",
+              "resolvedBy": "selector"
+            },
+            "ok": true,
+            "value": {
+              "text": "",
+              "state": {
+                "value": "consumer-1",
+                "focused": true
+              }
+            }
+          }
+        ]
+      },
+      "results": [
+        {
+          "callId": 1,
+          "kind": "action",
+          "action": "DOM.getAXTree",
+          "source": {
+            "file": "harness-capabilities.js",
+            "line": 37,
+            "column": 40
+          },
+          "status": "succeeded",
+          "createdAt": 1791370837710,
+          "startedAt": 1791370837713,
+          "finishedAt": 1791370837742,
+          "durationMs": 29,
+          "value": {
+            "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+            "checkedAt": "2026-10-07T11:00:37.718Z",
+            "freshness": "current",
+            "pendingChanges": false,
+            "completeness": "complete",
+            "mode": "full",
+            "version": "v_1f35c9924c58ae02_4",
+            "artifact": {
+              "kind": "full",
+              "path": "/Users/versace/Library/Application Support/webcross/observations/39bdd73b-8618-4cd9-8dea-612f97959b31/978c3007-1157-43e4-bea1-1df805a4c35c/epochs/d_1f35c9924c58ae026e1cfcee9799779a/full/v_1f35c9924c58ae02_4",
+              "format": "text",
+              "bytes": 2123,
+              "sha256": "d0f57307c625527f1c32a081f5e378392c71912f4ea1830c30f5c92afcc5a31a",
+              "expiresAt": "2026-10-07T11:10:37.735Z"
+            }
+          }
+        },
+        {
+          "callId": 2,
+          "kind": "readText",
+          "source": {
+            "file": "harness-capabilities.js",
+            "line": 44,
+            "column": 31
+          },
+          "status": "succeeded",
+          "createdAt": 1791370837745,
+          "startedAt": 1791370837747,
+          "finishedAt": 1791370837751,
+          "durationMs": 4,
+          "value": {
+            "artifact": {
+              "path": "/Users/versace/Library/Application Support/webcross/observations/39bdd73b-8618-4cd9-8dea-612f97959b31/978c3007-1157-43e4-bea1-1df805a4c35c/epochs/d_1f35c9924c58ae026e1cfcee9799779a/full/v_1f35c9924c58ae02_4",
+              "sha256": "d0f57307c625527f1c32a081f5e378392c71912f4ea1830c30f5c92afcc5a31a"
+            },
+            "bytes": 2123
+          }
+        },
+        {
+          "callId": 3,
+          "kind": "action",
+          "action": "Input.type",
+          "source": {
+            "file": "harness-capabilities.js",
+            "line": 37,
+            "column": 40
+          },
+          "status": "succeeded",
+          "createdAt": 1791370837753,
+          "startedAt": 1791370837755,
+          "finishedAt": 1791370839546,
+          "durationMs": 1791,
+          "value": {
+            "resolvedBy": "selector",
+            "typed": "consumer-1",
+            "length": 10
+          }
+        },
+        {
+          "callId": 4,
+          "kind": "action",
+          "action": "DOM.getDetails",
+          "source": {
+            "file": "harness-capabilities.js",
+            "line": 37,
+            "column": 40
+          },
+          "status": "succeeded",
+          "createdAt": 1791370839551,
+          "startedAt": 1791370839554,
+          "finishedAt": 1791370839598,
+          "durationMs": 44,
+          "value": {
+            "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+            "mode": "detail",
+            "documentEpoch": "d_1f35c9924c58ae026e1cfcee9799779a",
+            "capturedAt": "2026-10-07T11:00:39.595Z",
+            "checkedAt": "2026-10-07T11:00:39.595Z",
+            "summary": {
+              "total": 1,
+              "succeeded": 1,
+              "failed": 0
+            },
+            "source": "live",
+            "completeness": "complete",
+            "pendingChanges": false,
+            "details": [
+              {
+                "index": 0,
+                "view": "state",
+                "target": {
+                  "requestedSelector": "#name",
+                  "resolvedId": "n_5f09d8555f6ca86a",
+                  "resolvedBy": "selector"
+                },
+                "ok": true,
+                "value": {
+                  "text": "",
+                  "state": {
+                    "value": "consumer-1",
+                    "focused": true
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "timing": {
+        "createdAt": 1791370837615,
+        "startedAt": 1791370837625,
+        "finishedAt": 1791370839603,
+        "durationMs": 1978
+      }
+    }
+  },
+  "executionTrace": {
+    "workflowId": "e9c7ccd6-4712-4489-8202-9a70d2ae8c71",
+    "phase": "succeeded",
+    "stepsObserved": 0,
+    "stepsSucceeded": 0,
+    "completedCalls": 4,
+    "activeCalls": [],
+    "eventCursorRange": [
+      79978,
+      80024
+    ]
+  },
+  "workflowExecution": {
+    "status": "succeeded",
+    "workflowId": "e9c7ccd6-4712-4489-8202-9a70d2ae8c71",
+    "tool_was_executed": true,
+    "source": null,
+    "failedActionCode": null,
+    "failedAction": null,
+    "failedErrorCode": null,
+    "completedCalls": 4
+  },
+  "status": "succeeded",
+  "suspected_challenge": {
+    "pageId": "978c3007-1157-43e4-bea1-1df805a4c35c",
+    "suspicionScore": 0,
+    "highConfidenceHit": false,
+    "structuralChallenge": false,
+    "structuralEvidence": null,
+    "lastVlVerdict": null,
+    "lastVlStep": null,
+    "vlAttempts": 0,
+    "signals": [],
+    "adjudication": "not_ready"
+  }
+}

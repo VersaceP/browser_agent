@@ -42,7 +42,8 @@ def _stored_definition(
     *,
     required_variable_names: Optional[List[str]] = None,
 ) -> Tuple[JsonDict, bool]:
-    payload = {
+    script = isinstance(definition.get("workflow"), dict)
+    payload = copy.deepcopy(definition) if script else {
         "description": str(definition.get("description") or ""),
         "variables": copy.deepcopy(definition.get("variables") or {}),
         "steps": copy.deepcopy(definition.get("steps") or []),
@@ -51,25 +52,31 @@ def _stored_definition(
         payload, set(SENSITIVE_URL_QUERY_KEYS),
     )
     scrubbed = redact_values(payload, replacements) if replacements else payload
+    variable_key = "input" if script else "variables"
+    variables = payload.get(variable_key) or {}
+    scrubbed_variables = scrubbed.get(variable_key) or {}
+    if not isinstance(variables, dict):
+        variables = {}
+        scrubbed_variables = {}
     sensitive_variable_names = sorted({
         *(
-            str(name) for name, value in payload["variables"].items()
-            if scrubbed["variables"].get(name) != value
+            str(name) for name, value in variables.items()
+            if scrubbed_variables.get(name) != value
         ),
         *(
             str(name) for name in (required_variable_names or [])
             if str(name).strip()
         ),
     })
-    sensitive_outside_variables = bool(
-        scrubbed["description"] != payload["description"]
-        or scrubbed["steps"] != payload["steps"]
-    )
+    sensitive_outside_variables = any(scrubbed.get(key) != value
+        for key, value in payload.items() if key != variable_key)
+    if not isinstance(payload.get(variable_key), dict):
+        sensitive_outside_variables |= scrubbed.get(variable_key) != payload.get(variable_key)
     if sensitive_variable_names and not sensitive_outside_variables:
         # Keep only the variable names in the reusable definition. The actual
         # values must be supplied again through the normal authorized tool call.
         for name in sensitive_variable_names:
-            scrubbed["variables"].pop(name, None)
+            scrubbed[variable_key].pop(name, None)
     sensitive = sensitive_outside_variables
     envelope = {
         "protocol": WORKFLOW_DEFINITION_PROTOCOL,
@@ -206,8 +213,8 @@ def _pointer_parts(path: Any) -> Tuple[Optional[List[str]], Optional[str]]:
             decoded += "~" if encoded[index + 1] == "0" else "/"
             index += 2
         parts.append(decoded)
-    if not parts or parts[0] not in {"description", "variables", "steps"}:
-        return None, "patch may change only description, variables, or steps"
+    if not parts or parts[0] not in {"description", "variables", "steps", "workflow", "input"}:
+        return None, "patch may change only the source definition or business input"
     return parts, None
 
 

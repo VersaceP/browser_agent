@@ -134,14 +134,17 @@ _EXTENSION_HANDOFF_HINT = (
 )
 
 
-def _webcross_behavioral_guide(guide: str) -> str:
+def _webcross_behavioral_guide(
+    guide: str, *, workflow_artifact_reader: str = "",
+) -> str:
     """Return the browser-behavior sections of the live WebCross guide.
 
     The platform guide also documents CLI/MCP/WebSocket connection setup and
     durable event-cursor ownership.  Those are process concerns that this
     harness implements before the worker starts, so exposing them as worker
     instructions would advertise operations the worker cannot perform.  The
-    numbered sections hold the shared browser protocol rules instead.
+    numbered sections hold the shared browser protocol rules instead. Adapt
+    artifact delivery to the caller's exposed Harness and Workflow surfaces.
     """
     text = str(guide or "").strip()
     start_marker = "## 1. Action Feedback"
@@ -153,6 +156,27 @@ def _webcross_behavioral_guide(guide: str) -> str:
     appendix = re.search(r"^## (?!\d+\.\s)", text[start:], re.MULTILINE)
     end = start + appendix.start() if appendix else len(text)
     behavioral = text[start:end].strip()
+
+    # Standalone browser_call hydrates and verifies the full artifact before
+    # returning it. The platform's direct-client file instruction would
+    # conflict with L2 and invite a second read of an unavailable host path.
+    # Workflows still consume raw artifacts through their advertised reader.
+    artifact_rule = (
+        "For `DOM.getAXTree`, read the returned `artifact.path` before using"
+        " its facts or IDs."
+    )
+    harness_artifact_rule = (
+        "For `DOM.getAXTree` through `browser_call`, the Harness reads and"
+        " verifies the artifact. Read its returned `lines` or use the"
+        " advertised Harness tools for offloaded content before using facts"
+        " or IDs; do not open the platform's host `artifact.path`."
+    )
+    if workflow_artifact_reader:
+        harness_artifact_rule += (
+            " Inside a Workflow, read the raw observation artifact with "
+            + workflow_artifact_reader + " before using its facts or IDs."
+        )
+    behavioral = behavioral.replace(artifact_rule, harness_artifact_rule)
 
     # Section 3 begins with transport-specific event delivery and durable
     # cursor instructions.  The worker has no events.read/checkpoint surface;

@@ -1,0 +1,63 @@
+{
+  "ts": "2026-10-07T10:41:11.010098+00:00",
+  "taskId": "isolated",
+  "type": "skill_builder.trial.result",
+  "payload": {
+    "workflowHash": "c038eaacdf235a7f6d98b45e195b33fb4f10eecdb2d0fae5578e5ced7743e381",
+    "result": {
+      "observation": "Workflow 2597274e-8558-4576-92bb-2d900effaa8f failed; 1 platform call(s).",
+      "suggested_prompt": "Read status first, then output on success or error and results on failure. Inspect effects before a manual retry.",
+      "data": {
+        "workflowId": "2597274e-8558-4576-92bb-2d900effaa8f",
+        "taskId": "dd30e585-5696-43f9-a84e-4ff4cf5d45cd",
+        "status": "failed",
+        "output": null,
+        "results": [
+          {
+            "callId": 1,
+            "kind": "action",
+            "action": "File.handleChooser",
+            "source": {
+              "file": "harness-capabilities.js",
+              "line": 37,
+              "column": 40
+            },
+            "status": "failed",
+            "createdAt": 1791369670988,
+            "startedAt": 1791369670990,
+            "finishedAt": 1791369671004,
+            "durationMs": 14,
+            "error": {
+              "code": "workflow-action-failed",
+              "message": "The upload path is outside the allowed workspace.",
+              "source": {
+                "file": "harness-capabilities.js",
+                "line": 37,
+                "column": 40
+              },
+              "action": "File.handleChooser",
+              "actionCode": "file-path-not-allowed"
+            }
+          }
+        ],
+        "error": {
+          "code": "workflow-action-failed",
+          "message": "The upload path is outside the allowed workspace.",
+          "action": "File.handleChooser",
+          "actionCode": "file-path-not-allowed"
+        },
+        "timing": {
+          "createdAt": 1791369670894,
+          "startedAt": 1791369670904,
+          "finishedAt": 1791369671008,
+          "durationMs": 104
+        }
+      }
+    }
+  },
+  "eventUid": "dd3acae5-160d-448b-88bb-572f270f202a",
+  "schemaVersion": 1,
+  "sequenceNo": 110,
+  "category": "legacy",
+  "actorType": "system"
+}

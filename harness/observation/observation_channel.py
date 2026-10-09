@@ -1,30 +1,10 @@
-"""Per-page observation chains, model-facing change views, and node watches.
+"""Process-local page snapshots and bounded live node watches.
 
-Every hydrated DOM.getAXTree full view - from any client, model-initiated or
-harness-internal - is recorded here, keyed by page. Three things follow.
-
-1. Version chain. WebCross computes each diff against the page's previously
-   issued view, whoever asked for it, and never names that base. The platform
-   numbers versions per document with a sequence that grows by exactly one for
-   every new content version, and creates versions only when a view is read.
-   So a computed diff whose sequence is exactly one past the previous recorded
-   view is provably relative to it; anything else is a gap, and a gap is never
-   papered over.
-
-2. Model view. A worker that already holds a complete view of the page gets
-   the chained change records since the version it last received instead of
-   the whole page again, rendered compactly. Any gap, reset, document change or
-   oversized change list falls back to the full view.
-
-3. Watches. A worker may watch specific nodes. Full AX views compare semantic
-   state, while exact detail queries compare values only with earlier queries
-   on the same surface. A first detail query without a comparable prior value
-   reports the current sample without claiming a change. Geometry, scrolling
-   and focus are ignored. A background poller probes the nodes while watches
-   are active; `wait` blocks on their event channel.
-
-Everything here is process-local and in memory. It never talks to the browser
-itself: the poller calls a read function supplied by the tool layer.
+Complete verified AX views retain page/document identity. Repeated delivery of
+the same immutable version can be abbreviated; changed versions deliver full
+views. There is no platform diff or version-sequence inference. Full views
+compare semantic node state; live detail queries compare only the same query
+surface. Saved snapshot details never enter a live watch baseline.
 """
 
 from __future__ import annotations
@@ -38,43 +18,22 @@ import uuid
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Deque, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Deque, Dict, List, Optional, Set, Tuple
 
 from harness.observation.axtree_format import AXTREE_LINE_RE, parse_axtree_line
-from harness.observation.page_observation import parse_change_line
 from harness.utils import JsonDict
 
 
-MAX_TRANSITIONS_PER_PAGE = 64
 MAX_WATCHES_PER_CONSUMER = 8
 MAX_NODES_PER_WATCH = 16
 MAX_EVENTS_PER_WATCH = 64
 DEFAULT_WATCH_TTL_SECONDS = 120
 POLL_FAILURE_LIMIT = 3
-# A change view larger than this share of the full view saves little and is
-# harder to read than the view itself.
-MAX_CHANGE_VIEW_RATIO = 0.5
-
 # Flags that describe where a node sits, or where focus happens to be, rather
 # than what it is. Watches ignore them: a scroll would otherwise fire every
 # watch on the page, and every click elsewhere moves focus.
 _TRANSIENT_FLAGS = frozenset({"off", "scroll", "focused"})
-_FOCUS_ONLY_VALUES = frozenset({"absent", '{"focused":true}', '{"focused":false}'})
 
-
-def version_sequence(version: Any) -> Optional[int]:
-    """The base36 content sequence at the end of a `v_<epoch>_<seq>` version."""
-    if not isinstance(version, str) or not version.startswith("v_"):
-        return None
-    try:
-        return int(version.rsplit("_", 1)[-1], 36)
-    except ValueError:
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Change rendering
-# ---------------------------------------------------------------------------
 
 def _label(role: Any, name: Any) -> str:
     role_text = str(role or "?")
@@ -83,223 +42,6 @@ def _label(role: Any, name: Any) -> str:
         name_text = name_text[:57] + "…"
     return f'{role_text} {json.dumps(name_text, ensure_ascii=False)}' if name_text else role_text
 
-
-def _json_node_line(value: Any) -> str:
-    """A compact node line from a diff record's JSON node value."""
-    if not isinstance(value, dict):
-        return json.dumps(value, ensure_ascii=False)[:200]
-    parts = [_label(value.get("role") or value.get("tag") or value.get("kind"), value.get("name"))]
-    flags: List[str] = []
-    if value.get("targetable"):
-        flags.append("targetable")
-    if value.get("interaction") in {"actionable", "candidate"}:
-        flags.append(str(value["interaction"]))
-    state = value.get("state") if isinstance(value.get("state"), dict) else {}
-    for key in ("checked", "selected", "expanded", "disabled", "focused", "required", "invalid"):
-        item = state.get(key)
-        if item is True:
-            flags.append(key)
-        elif key in {"checked", "selected", "expanded"} and item in (False, "mixed"):
-            flags.append(f"{key}={str(item).lower()}")
-    if flags:
-        parts.append(f"[{','.join(flags)}]")
-    bounds = value.get("bounds")
-    if isinstance(bounds, dict):
-        parts.append("@{x},{y},{width},{height}".format(**{
-            key: bounds.get(key, 0) for key in ("x", "y", "width", "height")
-        }))
-    text = value.get("text")
-    if isinstance(text, str) and text and text != value.get("name"):
-        parts.append(f"text={json.dumps(text[:80], ensure_ascii=False)}")
-    if value.get("visibility") in {"↓", "∅"}:
-        parts.append(f"vis={value['visibility']}")
-    if "value" in state:
-        parts.append(f"value={json.dumps(state['value'], ensure_ascii=False)[:80]}")
-    if value.get("parent"):
-        parts.append(f"parent={value['parent']}")
-    return " ".join(parts)
-
-
-def _record_value(line: str) -> Any:
-    marker = " value="
-    index = line.find(marker)
-    if index < 0:
-        return None
-    try:
-        return json.loads(line[index + len(marker):])
-    except json.JSONDecodeError:
-        return None
-
-
-def _labels_for(ids: Set[str], lines: Iterable[str]) -> Dict[str, str]:
-    labels: Dict[str, str] = {}
-    if not ids:
-        return labels
-    for line in lines:
-        head = AXTREE_LINE_RE.match(line)
-        if head is None or head.group("id") not in ids:
-            continue
-        name = head.group("name")
-        labels[head.group("id")] = _label(head.group("role"), json.loads(name) if name else "")
-        if len(labels) == len(ids):
-            break
-    return labels
-
-
-def _is_focus_only(record: str, path: str) -> bool:
-    if path == "/state/focused":
-        return True
-    if path != "/state":
-        return False
-    values = record.split(" set /state ", 1)[-1].split(" -> ")
-    return len(values) == 2 and all(value.strip() in _FOCUS_ONLY_VALUES for value in values)
-
-
-def render_changes(records: List[str], current_lines: List[str]) -> JsonDict:
-    """Compact, model-facing NET change view of chained diff records.
-
-    Returns ``{"changes": [...], "folded": {...}, "reset": bool}``. Records
-    from several consecutive diffs are reduced to their net effect: a node
-    added and removed again within the chain disappears, a field set several
-    times shows only its first value and its last, splices on one list are
-    summed, and a context anchor appears once. Additions become node lines,
-    removals and anchors become labels, and the updates of one node collapse
-    into one line prefixed with that node's current label. Pure geometry -
-    visibility flips from layout or scrolling, bounds, focus moves, surface
-    bookkeeping - is folded into counts.
-    """
-    folded = {"cameIntoView": 0, "leftView": 0, "geometry": 0, "focus": 0, "surfaces": 0}
-    reset = False
-    order: List[Tuple[str, str]] = []  # (kind, key) in first-seen order
-    seen: Set[Tuple[str, str]] = set()
-    added: Dict[str, str] = {}
-    removed: Dict[str, str] = {}
-    context: Dict[str, str] = {}
-    sets: Dict[str, Dict[str, List[str]]] = {}
-    splices: Dict[str, Dict[str, List[List[str]]]] = {}
-    changed: Dict[str, List[str]] = {}
-
-    def note(kind: str, key: str) -> None:
-        if (kind, key) not in seen:
-            seen.add((kind, key))
-            order.append((kind, key))
-
-    for record in records:
-        if record.startswith("! reset"):
-            reset = True
-            continue
-        parsed = parse_change_line(record)
-        if parsed is None:
-            continue
-        op, entity, node_id = parsed["op"], parsed["entity"], parsed["id"]
-        if entity == "surface":
-            folded["surfaces"] += 1
-            continue
-        verb, path = parsed.get("verb"), parsed.get("path", "")
-        if op == "~" and verb == "set" and path == "/visibility":
-            if record.rstrip().endswith("-> absent"):
-                folded["cameIntoView"] += 1
-            else:
-                folded["leftView"] += 1
-            continue
-        if op == "~" and verb == "set" and (path.startswith("/bounds") or path.startswith("/scroll")):
-            folded["geometry"] += 1
-            continue
-        if op == "~" and verb == "set" and _is_focus_only(record, path):
-            folded["focus"] += 1
-            continue
-        key = f"{entity}:{node_id}"
-        if op == "+":
-            if key in removed:
-                # Removed earlier in the chain and back again: keep both facts.
-                note("removed", key)
-            added[key] = f"+ {entity} [{node_id}] {_json_node_line(_record_value(record))}"
-            note("added", key)
-        elif op == "-":
-            value = _record_value(record)
-            label = _label(value.get("role"), value.get("name")) if isinstance(value, dict) else ""
-            if key in added:
-                # Appeared and vanished within the chain: no net change.
-                del added[key]
-                sets.pop(key, None)
-                splices.pop(key, None)
-                changed.pop(key, None)
-                continue
-            removed[key] = f"- {entity} [{node_id}] {label}".rstrip()
-            note("removed", key)
-        elif op == "=":
-            value = _record_value(record)
-            label = _label(value.get("role"), value.get("name")) if isinstance(value, dict) else ""
-            context.setdefault(key, f"= {entity} [{node_id}] {label} (context)".rstrip())
-            note("context", key)
-        else:
-            detail = record.split(f"[{node_id}] ", 1)[-1]
-            note("update", key)
-            if verb == "set":
-                values = detail[len("set ") + len(path):].strip().split(" -> ", 1)
-                before, after = (values + [""])[:2] if len(values) == 2 else ("?", values[0])
-                entry = sets.setdefault(key, {}).setdefault(path, [before, after])
-                entry[1] = after
-            elif verb == "splice":
-                try:
-                    removed_items = json.loads(detail.split(" removed=", 1)[1].split(" inserted=", 1)[0])
-                    inserted_items = json.loads(detail.split(" inserted=", 1)[1])
-                except (IndexError, json.JSONDecodeError):
-                    changed.setdefault(key, []).append(path)
-                else:
-                    # Net by member: an item inserted and removed again within
-                    # the chain (or the reverse) cancels out.
-                    net_removed, net_inserted = splices.setdefault(key, {}).setdefault(path, [[], []])
-                    for item in map(str, removed_items):
-                        if item in net_inserted:
-                            net_inserted.remove(item)
-                        else:
-                            net_removed.append(item)
-                    for item in map(str, inserted_items):
-                        if item in net_removed:
-                            net_removed.remove(item)
-                        else:
-                            net_inserted.append(item)
-            else:
-                paths = changed.setdefault(key, [])
-                if path not in paths:
-                    paths.append(path)
-
-    update_ids = {key.split(":", 1)[1] for kind, key in order if kind == "update" and key.startswith("node:")}
-    labels = _labels_for(update_ids, current_lines)
-    lines_out: List[str] = []
-    for kind, key in order:
-        if kind == "added" and key in added:
-            lines_out.append(added[key])
-        elif kind == "removed" and key in removed:
-            lines_out.append(removed[key])
-        elif kind == "context" and key in context:
-            if any(key in store for store in (sets, splices, changed, added, removed)):
-                continue  # the node's own change already anchors it
-            lines_out.append(context.pop(key))
-        elif kind == "update":
-            parts = [
-                f"{path} {before} -> {after}"
-                for path, (before, after) in sets.get(key, {}).items() if before != after
-            ]
-            parts += [
-                f"{path} -{len(net_removed)} +{len(net_inserted)}"
-                for path, (net_removed, net_inserted) in splices.get(key, {}).items()
-                if net_removed or net_inserted
-            ]
-            parts += [f"changed {path}" for path in changed.get(key, [])]
-            if not parts:
-                continue
-            entity, node_id = key.split(":", 1)
-            label = labels.get(node_id, "")
-            prefix = f"~ {entity} [{node_id}]" + (f" {label}" if label else "")
-            lines_out.append(f"{prefix}: " + "; ".join(parts))
-    return {"changes": lines_out, "folded": {k: v for k, v in folded.items() if v}, "reset": reset}
-
-
-# ---------------------------------------------------------------------------
-# Watch comparison
-# ---------------------------------------------------------------------------
 
 def _semantic_signature(node: JsonDict) -> JsonDict:
     return {
@@ -415,21 +157,10 @@ def _compare_entry(before: Optional[JsonDict], after: Optional[JsonDict]) -> Opt
 # ---------------------------------------------------------------------------
 
 @dataclass
-class _Transition:
-    base: str
-    target: str
-    records: Optional[List[str]]
-
-
-@dataclass
 class _PageState:
     epoch: str
     version: str
-    sequence: Optional[int]
     lines: List[str]
-    transitions: Deque[_Transition] = field(
-        default_factory=lambda: deque(maxlen=MAX_TRANSITIONS_PER_PAGE)
-    )
 
 
 ReadFn = Callable[[], Awaitable[Any]]
@@ -501,27 +232,15 @@ class ObservationChannel:
         epoch = str(observation.get("documentEpoch") or "")
         if not version or not epoch:
             return
-        sequence = version_sequence(version)
         state = self._pages.get(page_id)
         if state is None or state.epoch != epoch:
             if state is not None:
                 self._close_page_watches(page_id, "document_changed")
             self._details.pop(page_id, None)
-            self._pages[page_id] = _PageState(epoch, version, sequence, lines)
+            self._pages[page_id] = _PageState(epoch, version, lines)
             self._evaluate_watches(page_id)
             return
-        if version != state.version:
-            diff = data.get("diff") if isinstance(data.get("diff"), dict) else {}
-            records = diff.get("records") if diff.get("status") == "computed" else None
-            continuous = (
-                sequence is not None and state.sequence is not None
-                and sequence == state.sequence + 1
-            )
-            state.transitions.append(_Transition(
-                state.version, version,
-                list(records) if continuous and isinstance(records, list) else None,
-            ))
-            state.version, state.sequence = version, sequence
+        state.version = version
         state.lines = lines
         self._evaluate_watches(page_id)
 
@@ -532,32 +251,8 @@ class ObservationChannel:
             del self._cursors[key]
         self._close_page_watches(page_id, reason)
 
-    def _chain_records(self, page_id: str, base: str) -> Optional[List[str]]:
-        state = self._pages.get(page_id)
-        if state is None:
-            return None
-        if base == state.version:
-            return []
-        collected: List[List[str]] = []
-        expected_target = state.version
-        for transition in reversed(state.transitions):
-            if transition.target != expected_target or transition.records is None:
-                return None
-            collected.append(transition.records)
-            if transition.base == base:
-                return [record for records in reversed(collected) for record in records]
-            expected_target = transition.base
-        return None
-
-    # -- model view --------------------------------------------------------
-
     def model_view(self, consumer: str, page_id: str, data: JsonDict) -> JsonDict:
-        """Decide what a worker sees for a full view it just received.
-
-        Returns ``{"delivery": "full"}``, ``{"delivery": "unchanged", ...}`` or
-        ``{"delivery": "changes", "since": v, "changes": [...], ...}`` and
-        advances the worker's cursor to the delivered version.
-        """
+        """Abbreviate only a verified immutable version already delivered."""
         observation = data.get("observation") if isinstance(data, dict) else None
         state = self._pages.get(page_id)
         if not consumer or not isinstance(observation, dict) or state is None:
@@ -568,30 +263,14 @@ class ObservationChannel:
         if version and epoch:
             self._cursors[(consumer, page_id)] = (epoch, version)
         if version != state.version or epoch != state.epoch:
-            # A later read (a watch poll) already moved the chain on; this
-            # response is not the head, so it cannot anchor a change view.
+            # A later read (a watch poll) already updated the current view; this
+            # response is not the head, so it cannot abbreviate the current view.
             return {"delivery": "full", "reason": "superseded_by_newer_read"}
         if cursor is None or cursor[0] != epoch:
             return {"delivery": "full"}
         if cursor[1] == version:
             return {"delivery": "unchanged", "version": version}
-        records = self._chain_records(page_id, cursor[1])
-        if records is None:
-            return {"delivery": "full", "reason": "version_chain_gap"}
-        rendered = render_changes(records, data.get("lines") or [])
-        if rendered["reset"]:
-            return {"delivery": "full", "reason": "platform_reset"}
-        size = sum(len(line) for line in rendered["changes"])
-        full_size = sum(len(line) for line in data.get("lines") or []) or 1
-        if size > full_size * MAX_CHANGE_VIEW_RATIO:
-            return {"delivery": "full", "reason": "change_view_too_large"}
-        return {
-            "delivery": "changes",
-            "since": cursor[1],
-            "version": version,
-            "changes": rendered["changes"],
-            **({"folded": rendered["folded"]} if rendered["folded"] else {}),
-        }
+        return {"delivery": "full"}
 
     def reset_consumer_view(self, consumer: str, page_id: str) -> None:
         """Forget what a worker holds, so its next read is shown in full."""
@@ -902,20 +581,26 @@ def observation_channel() -> ObservationChannel:
 
 
 def record_hydrated_response(params: Any, response: Any) -> None:
-    """Record a hydrated DOM.getAXTree response on the process channel."""
+    """Record a verified full view or a live DOM.getDetails query."""
     if not isinstance(response, dict):
         return
     data = response.get("data")
-    if not isinstance(data, dict):
+    if not isinstance(data, dict) or data.get("observationError"):
         return
     page_id = str((params or {}).get("pageId") or data.get("pageId") or "") if isinstance(params, dict) else str(data.get("pageId") or "")
     if data.get("mode") == "full" and "lines" in data:
         _CHANNEL.record_full(page_id, data)
-    elif data.get("mode") == "detail" and isinstance(data.get("records"), list):
+    elif (data.get("mode") == "detail" and data.get("source") == "live"
+          and isinstance(data.get("records"), list)):
+        epoch = str((data.get("observation") or {}).get("documentEpoch") or "")
+        current = _CHANNEL._pages.get(page_id)
+        if epoch and current is not None and current.epoch != epoch:
+            _CHANNEL.forget_page(page_id, "document_changed")
+            return
         query = params.get("query") if isinstance(params, dict) and isinstance(params.get("query"), dict) else {}
         view = str(query.get("view") or "")
         surface = (
-            f"text:{query.get('textMode') or 'semantic'}" if view == "text" else
+            f"text:{query.get('textMode') or 'rendered'}" if view == "text" else
             f"dom:{query.get('maxDepth', 0)}" if view == "dom" else view
         )
         _CHANNEL.record_detail(page_id, surface, data["records"])

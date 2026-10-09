@@ -161,8 +161,10 @@ def normalize_action_params(label: str, params: Any) -> Any:
 
         return {
             "pageId": params.get("pageId"),
-            "direction": params.get("direction"),
-            "distance": params.get("distance"),
+            "deltaX": params.get("deltaX"),
+            "deltaY": params.get("deltaY"),
+            "x": params.get("x"),
+            "y": params.get("y"),
             "edge": params.get("edge"),
             "axis": params.get("axis"),
             "containerId": (
@@ -230,9 +232,10 @@ def normalize_action_params(label: str, params: Any) -> Any:
             "edge": params.get("edge"),
             "axis": params.get("axis"),
         }
-    if label == "DOM.getAXTree":
+    if label in {"DOM.getAXTree", "DOM.getDetails"}:
         # Bounded queries for different targets are different reads.
-        return {"pageId": params.get("pageId"), "query": params.get("query")}
+        return {"pageId": params.get("pageId"), "query": params.get("query"),
+                "version": params.get("version"), "nodeIds": params.get("nodeIds")}
     if label == "Page.getState":
         return {"pageId": params.get("pageId")}
     if label.startswith("local_fs_"):
@@ -252,7 +255,7 @@ def nudge_threshold_for_action(label: str) -> Optional[int]:
         return None
     if label in {"Input.scroll", "Page.wheel"}:
         return 8
-    if label in {"DOM.getAXTree", "Page.getState"}:
+    if label in {"DOM.getAXTree", "DOM.getDetails", "Page.getState"}:
         return 5
     if label in {"Input.click", "Page.click", "Input.select", "Input.type", "Input.press"}:
         return 4

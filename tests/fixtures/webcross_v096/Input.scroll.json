@@ -1,0 +1,1204 @@
+{
+  "method": "Input.scroll",
+  "description": "Reveals a target, moves a scroll surface by a total displacement, reaches a boundary, or reads its state. Reports input completion, observation, and goal attainment separately.",
+  "requiresPurpose": true,
+  "catalogRevision": "sha256:f3668c2329565bf4c2d36f63e0002429722d5e7f39b6f442b9a22120c866c78b",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "anyOf": [
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Page containing the requested scroll surface."
+          },
+          "target": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "description": "Current node ID from the latest page observation.",
+                "type": "string",
+                "pattern": "^n_[0-9a-f]{16}$"
+              },
+              "selector": {
+                "description": "Unique fallback CSS selector.",
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": true,
+            "description": "Mounted element to reveal."
+          },
+          "container": {
+            "description": "Upper boundary of the allowed target scroll chain.",
+            "type": "object",
+            "properties": {
+              "id": {
+                "description": "Current node ID from the latest page observation.",
+                "type": "string",
+                "pattern": "^n_[0-9a-f]{16}$"
+              },
+              "selector": {
+                "description": "Unique fallback CSS selector.",
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": true
+          },
+          "x": {
+            "description": "Not accepted in this scroll form.",
+            "not": {}
+          },
+          "y": {
+            "description": "Not accepted in this scroll form.",
+            "not": {}
+          },
+          "deltaX": {
+            "description": "Not accepted in this scroll form.",
+            "not": {}
+          },
+          "deltaY": {
+            "description": "Not accepted in this scroll form.",
+            "not": {}
+          },
+          "axis": {
+            "description": "Not accepted in this scroll form.",
+            "not": {}
+          },
+          "edge": {
+            "description": "Not accepted in this scroll form.",
+            "not": {}
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "State which content needs to be revealed or which scroll surface needs to move."
+          }
+        },
+        "required": [
+          "pageId",
+          "target",
+          "purpose"
+        ],
+        "additionalProperties": true
+      },
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Page containing the requested scroll surface."
+          },
+          "container": {
+            "description": "Container to scroll. Mutually exclusive with x/y.",
+            "type": "object",
+            "properties": {
+              "id": {
+                "description": "Current node ID from the latest page observation.",
+                "type": "string",
+                "pattern": "^n_[0-9a-f]{16}$"
+              },
+              "selector": {
+                "description": "Unique fallback CSS selector.",
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": true
+          },
+          "x": {
+            "description": "Main viewport CSS x coordinate; requires y.",
+            "type": "number",
+            "minimum": 0
+          },
+          "y": {
+            "description": "Main viewport CSS y coordinate; requires x.",
+            "type": "number",
+            "minimum": 0
+          },
+          "edge": {
+            "type": "string",
+            "enum": [
+              "start",
+              "end"
+            ],
+            "description": "Boundary to reach on the selected axis."
+          },
+          "axis": {
+            "default": "vertical",
+            "description": "Boundary axis; defaults to vertical.",
+            "type": "string",
+            "enum": [
+              "vertical",
+              "horizontal"
+            ]
+          },
+          "target": {
+            "description": "Not accepted in this scroll form.",
+            "not": {}
+          },
+          "deltaX": {
+            "description": "Not accepted in this scroll form.",
+            "not": {}
+          },
+          "deltaY": {
+            "description": "Not accepted in this scroll form.",
+            "not": {}
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "State which content needs to be revealed or which scroll surface needs to move."
+          }
+        },
+        "required": [
+          "pageId",
+          "edge",
+          "axis",
+          "purpose"
+        ],
+        "additionalProperties": true
+      },
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Page containing the requested scroll surface."
+          },
+          "container": {
+            "description": "Container to scroll. Mutually exclusive with x/y.",
+            "type": "object",
+            "properties": {
+              "id": {
+                "description": "Current node ID from the latest page observation.",
+                "type": "string",
+                "pattern": "^n_[0-9a-f]{16}$"
+              },
+              "selector": {
+                "description": "Unique fallback CSS selector.",
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": true
+          },
+          "x": {
+            "description": "Main viewport CSS x coordinate; requires y.",
+            "type": "number",
+            "minimum": 0
+          },
+          "y": {
+            "description": "Main viewport CSS y coordinate; requires x.",
+            "type": "number",
+            "minimum": 0
+          },
+          "deltaX": {
+            "description": "Total signed horizontal displacement in CSS pixels; defaults to zero.",
+            "type": "number"
+          },
+          "deltaY": {
+            "description": "Total signed vertical displacement in CSS pixels; defaults to zero.",
+            "type": "number"
+          },
+          "target": {
+            "description": "Not accepted in this scroll form.",
+            "not": {}
+          },
+          "axis": {
+            "description": "Not accepted in this scroll form.",
+            "not": {}
+          },
+          "edge": {
+            "description": "Not accepted in this scroll form.",
+            "not": {}
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "State which content needs to be revealed or which scroll surface needs to move."
+          }
+        },
+        "required": [
+          "pageId",
+          "purpose"
+        ],
+        "additionalProperties": true
+      }
+    ]
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "mode": {
+        "type": "string",
+        "enum": [
+          "target",
+          "delta",
+          "edge"
+        ],
+        "description": "Requested goal form."
+      },
+      "input": {
+        "type": "object",
+        "properties": {
+          "completed": {
+            "type": "boolean",
+            "description": "Whether all submitted input has been confirmed."
+          },
+          "sentDelta": {
+            "description": "Total submitted displacement; does not prove movement.",
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "number",
+                "description": "Horizontal CSS pixel value."
+              },
+              "y": {
+                "type": "number",
+                "description": "Vertical CSS pixel value."
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "completed"
+        ],
+        "additionalProperties": false,
+        "description": "Confirmed input completion and submitted displacement, when available."
+      },
+      "observation": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "stable",
+              "moving",
+              "unavailable"
+            ],
+            "description": "Availability and stability of the observation."
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "additionalProperties": false,
+        "description": "Status of the final observation."
+      },
+      "goal": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "not-requested",
+              "reached",
+              "not-reached",
+              "unknown"
+            ],
+            "description": "Goal outcome established by current evidence."
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "additionalProperties": false,
+        "description": "Whether the requested goal was proved."
+      },
+      "completedReason": {
+        "type": "string",
+        "enum": [
+          "already-visible",
+          "target-visible",
+          "maximally-exposed",
+          "state-read",
+          "distance-reached",
+          "boundary-reached",
+          "partial-progress",
+          "observation-unavailable",
+          "observation-budget-exhausted",
+          "no-progress",
+          "correction-oscillation",
+          "attempt-limit",
+          "forward-budget-exhausted",
+          "reverse-budget-exhausted",
+          "total-budget-exhausted"
+        ],
+        "description": "Reason execution stopped."
+      },
+      "requestedDelta": {
+        "description": "Requested total displacement.",
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "number",
+            "description": "Horizontal CSS pixel value."
+          },
+          "y": {
+            "type": "number",
+            "description": "Vertical CSS pixel value."
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "additionalProperties": false
+      },
+      "observedDelta": {
+        "description": "Displacement from the latest reliable sample; never inferred from submitted input.",
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "number",
+            "description": "Horizontal CSS pixel value."
+          },
+          "y": {
+            "type": "number",
+            "description": "Vertical CSS pixel value."
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "additionalProperties": false
+      },
+      "totalDelta": {
+        "description": "Measured physical displacement across the observed scroll chain.",
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "number",
+            "description": "Horizontal CSS pixel value."
+          },
+          "y": {
+            "type": "number",
+            "description": "Vertical CSS pixel value."
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "additionalProperties": false
+      },
+      "point": {
+        "description": "Requested main viewport CSS coordinate.",
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "number",
+            "description": "Horizontal CSS pixel value."
+          },
+          "y": {
+            "type": "number",
+            "description": "Vertical CSS pixel value."
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "additionalProperties": false
+      },
+      "position": {
+        "description": "Physical scroll position, when available.",
+        "type": "object",
+        "properties": {
+          "x": {
+            "type": "number",
+            "description": "Horizontal CSS pixel value."
+          },
+          "y": {
+            "type": "number",
+            "description": "Vertical CSS pixel value."
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "additionalProperties": false
+      },
+      "extent": {
+        "description": "Physical scroll extent, when available.",
+        "type": "object",
+        "properties": {
+          "width": {
+            "type": "number",
+            "description": "Physical content width in CSS pixels."
+          },
+          "height": {
+            "type": "number",
+            "description": "Physical content height in CSS pixels."
+          }
+        },
+        "required": [
+          "width",
+          "height"
+        ],
+        "additionalProperties": false
+      },
+      "frameDepth": {
+        "description": "Depth of the bound frame.",
+        "type": "number"
+      },
+      "targetVisible": {
+        "description": "Whether current target exposure was proved.",
+        "type": "boolean",
+        "const": true
+      },
+      "visibilityProof": {
+        "description": "Current target exposure proof.",
+        "type": "object",
+        "properties": {
+          "visibleBounds": {
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "number",
+                "description": "Left CSS coordinate."
+              },
+              "y": {
+                "type": "number",
+                "description": "Top CSS coordinate."
+              },
+              "width": {
+                "type": "number",
+                "description": "CSS width."
+              },
+              "height": {
+                "type": "number",
+                "description": "CSS height."
+              }
+            },
+            "required": [
+              "x",
+              "y",
+              "width",
+              "height"
+            ],
+            "additionalProperties": false,
+            "description": "Currently exposed target bounds."
+          },
+          "maximumReachableBounds": {
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "number",
+                "description": "Left CSS coordinate."
+              },
+              "y": {
+                "type": "number",
+                "description": "Top CSS coordinate."
+              },
+              "width": {
+                "type": "number",
+                "description": "CSS width."
+              },
+              "height": {
+                "type": "number",
+                "description": "CSS height."
+              }
+            },
+            "required": [
+              "x",
+              "y",
+              "width",
+              "height"
+            ],
+            "additionalProperties": false,
+            "description": "Maximum target bounds reachable in the allowed chain."
+          },
+          "fullyExposed": {
+            "type": "boolean",
+            "description": "Whether the entire target is exposed."
+          },
+          "maximallyExposed": {
+            "type": "boolean",
+            "description": "Whether maximum reachable exposure was proved."
+          }
+        },
+        "required": [
+          "visibleBounds",
+          "maximumReachableBounds",
+          "fullyExposed",
+          "maximallyExposed"
+        ],
+        "additionalProperties": false
+      },
+      "layers": {
+        "description": "Measured physical scroll surfaces.",
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "element",
+                "frame-viewport",
+                "viewport"
+              ],
+              "description": "Physical scroll surface kind."
+            },
+            "id": {
+              "description": "Public identity of the bound physical surface.",
+              "type": "string"
+            },
+            "position": {
+              "type": "object",
+              "properties": {
+                "x": {
+                  "type": "number",
+                  "description": "Horizontal CSS pixel value."
+                },
+                "y": {
+                  "type": "number",
+                  "description": "Vertical CSS pixel value."
+                }
+              },
+              "required": [
+                "x",
+                "y"
+              ],
+              "additionalProperties": false,
+              "description": "Current physical offset."
+            },
+            "extent": {
+              "type": "object",
+              "properties": {
+                "width": {
+                  "type": "number",
+                  "description": "Physical content width in CSS pixels."
+                },
+                "height": {
+                  "type": "number",
+                  "description": "Physical content height in CSS pixels."
+                }
+              },
+              "required": [
+                "width",
+                "height"
+              ],
+              "additionalProperties": false,
+              "description": "Current physical content extent."
+            },
+            "delta": {
+              "type": "object",
+              "properties": {
+                "x": {
+                  "type": "number",
+                  "description": "Horizontal CSS pixel value."
+                },
+                "y": {
+                  "type": "number",
+                  "description": "Vertical CSS pixel value."
+                }
+              },
+              "required": [
+                "x",
+                "y"
+              ],
+              "additionalProperties": false,
+              "description": "Measured physical displacement."
+            }
+          },
+          "required": [
+            "kind",
+            "position",
+            "extent",
+            "delta"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "resolution": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "description": "Target endpoint resolution.",
+            "type": "object",
+            "properties": {
+              "source": {
+                "type": "string",
+                "enum": [
+                  "id",
+                  "selector",
+                  "selector-fallback"
+                ],
+                "description": "Source used to resolve the bound endpoint."
+              }
+            },
+            "required": [
+              "source"
+            ],
+            "additionalProperties": false
+          },
+          "container": {
+            "description": "Container endpoint resolution.",
+            "type": "object",
+            "properties": {
+              "source": {
+                "type": "string",
+                "enum": [
+                  "id",
+                  "selector",
+                  "selector-fallback"
+                ],
+                "description": "Source used to resolve the bound endpoint."
+              }
+            },
+            "required": [
+              "source"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false,
+        "description": "Bound endpoint resolution sources."
+      }
+    },
+    "required": [
+      "mode",
+      "input",
+      "observation",
+      "goal",
+      "completedReason",
+      "resolution"
+    ],
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Facts directly observed by the Action or returned by its declared result schema."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "target",
+              "delta",
+              "edge"
+            ],
+            "description": "Requested goal form."
+          },
+          "input": {
+            "type": "object",
+            "properties": {
+              "completed": {
+                "type": "boolean",
+                "description": "Whether all submitted input has been confirmed."
+              },
+              "sentDelta": {
+                "description": "Total submitted displacement; does not prove movement.",
+                "type": "object",
+                "properties": {
+                  "x": {
+                    "type": "number",
+                    "description": "Horizontal CSS pixel value."
+                  },
+                  "y": {
+                    "type": "number",
+                    "description": "Vertical CSS pixel value."
+                  }
+                },
+                "required": [
+                  "x",
+                  "y"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "completed"
+            ],
+            "additionalProperties": false,
+            "description": "Confirmed input completion and submitted displacement, when available."
+          },
+          "observation": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "stable",
+                  "moving",
+                  "unavailable"
+                ],
+                "description": "Availability and stability of the observation."
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "additionalProperties": false,
+            "description": "Status of the final observation."
+          },
+          "goal": {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "not-requested",
+                  "reached",
+                  "not-reached",
+                  "unknown"
+                ],
+                "description": "Goal outcome established by current evidence."
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "additionalProperties": false,
+            "description": "Whether the requested goal was proved."
+          },
+          "completedReason": {
+            "type": "string",
+            "enum": [
+              "already-visible",
+              "target-visible",
+              "maximally-exposed",
+              "state-read",
+              "distance-reached",
+              "boundary-reached",
+              "partial-progress",
+              "observation-unavailable",
+              "observation-budget-exhausted",
+              "no-progress",
+              "correction-oscillation",
+              "attempt-limit",
+              "forward-budget-exhausted",
+              "reverse-budget-exhausted",
+              "total-budget-exhausted"
+            ],
+            "description": "Reason execution stopped."
+          },
+          "requestedDelta": {
+            "description": "Requested total displacement.",
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "number",
+                "description": "Horizontal CSS pixel value."
+              },
+              "y": {
+                "type": "number",
+                "description": "Vertical CSS pixel value."
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "additionalProperties": false
+          },
+          "observedDelta": {
+            "description": "Displacement from the latest reliable sample; never inferred from submitted input.",
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "number",
+                "description": "Horizontal CSS pixel value."
+              },
+              "y": {
+                "type": "number",
+                "description": "Vertical CSS pixel value."
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "additionalProperties": false
+          },
+          "totalDelta": {
+            "description": "Measured physical displacement across the observed scroll chain.",
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "number",
+                "description": "Horizontal CSS pixel value."
+              },
+              "y": {
+                "type": "number",
+                "description": "Vertical CSS pixel value."
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "additionalProperties": false
+          },
+          "point": {
+            "description": "Requested main viewport CSS coordinate.",
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "number",
+                "description": "Horizontal CSS pixel value."
+              },
+              "y": {
+                "type": "number",
+                "description": "Vertical CSS pixel value."
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "additionalProperties": false
+          },
+          "position": {
+            "description": "Physical scroll position, when available.",
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "number",
+                "description": "Horizontal CSS pixel value."
+              },
+              "y": {
+                "type": "number",
+                "description": "Vertical CSS pixel value."
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "additionalProperties": false
+          },
+          "extent": {
+            "description": "Physical scroll extent, when available.",
+            "type": "object",
+            "properties": {
+              "width": {
+                "type": "number",
+                "description": "Physical content width in CSS pixels."
+              },
+              "height": {
+                "type": "number",
+                "description": "Physical content height in CSS pixels."
+              }
+            },
+            "required": [
+              "width",
+              "height"
+            ],
+            "additionalProperties": false
+          },
+          "frameDepth": {
+            "description": "Depth of the bound frame.",
+            "type": "number"
+          },
+          "targetVisible": {
+            "description": "Whether current target exposure was proved.",
+            "type": "boolean",
+            "const": true
+          },
+          "visibilityProof": {
+            "description": "Current target exposure proof.",
+            "type": "object",
+            "properties": {
+              "visibleBounds": {
+                "type": "object",
+                "properties": {
+                  "x": {
+                    "type": "number",
+                    "description": "Left CSS coordinate."
+                  },
+                  "y": {
+                    "type": "number",
+                    "description": "Top CSS coordinate."
+                  },
+                  "width": {
+                    "type": "number",
+                    "description": "CSS width."
+                  },
+                  "height": {
+                    "type": "number",
+                    "description": "CSS height."
+                  }
+                },
+                "required": [
+                  "x",
+                  "y",
+                  "width",
+                  "height"
+                ],
+                "additionalProperties": false,
+                "description": "Currently exposed target bounds."
+              },
+              "maximumReachableBounds": {
+                "type": "object",
+                "properties": {
+                  "x": {
+                    "type": "number",
+                    "description": "Left CSS coordinate."
+                  },
+                  "y": {
+                    "type": "number",
+                    "description": "Top CSS coordinate."
+                  },
+                  "width": {
+                    "type": "number",
+                    "description": "CSS width."
+                  },
+                  "height": {
+                    "type": "number",
+                    "description": "CSS height."
+                  }
+                },
+                "required": [
+                  "x",
+                  "y",
+                  "width",
+                  "height"
+                ],
+                "additionalProperties": false,
+                "description": "Maximum target bounds reachable in the allowed chain."
+              },
+              "fullyExposed": {
+                "type": "boolean",
+                "description": "Whether the entire target is exposed."
+              },
+              "maximallyExposed": {
+                "type": "boolean",
+                "description": "Whether maximum reachable exposure was proved."
+              }
+            },
+            "required": [
+              "visibleBounds",
+              "maximumReachableBounds",
+              "fullyExposed",
+              "maximallyExposed"
+            ],
+            "additionalProperties": false
+          },
+          "layers": {
+            "description": "Measured physical scroll surfaces.",
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "element",
+                    "frame-viewport",
+                    "viewport"
+                  ],
+                  "description": "Physical scroll surface kind."
+                },
+                "id": {
+                  "description": "Public identity of the bound physical surface.",
+                  "type": "string"
+                },
+                "position": {
+                  "type": "object",
+                  "properties": {
+                    "x": {
+                      "type": "number",
+                      "description": "Horizontal CSS pixel value."
+                    },
+                    "y": {
+                      "type": "number",
+                      "description": "Vertical CSS pixel value."
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y"
+                  ],
+                  "additionalProperties": false,
+                  "description": "Current physical offset."
+                },
+                "extent": {
+                  "type": "object",
+                  "properties": {
+                    "width": {
+                      "type": "number",
+                      "description": "Physical content width in CSS pixels."
+                    },
+                    "height": {
+                      "type": "number",
+                      "description": "Physical content height in CSS pixels."
+                    }
+                  },
+                  "required": [
+                    "width",
+                    "height"
+                  ],
+                  "additionalProperties": false,
+                  "description": "Current physical content extent."
+                },
+                "delta": {
+                  "type": "object",
+                  "properties": {
+                    "x": {
+                      "type": "number",
+                      "description": "Horizontal CSS pixel value."
+                    },
+                    "y": {
+                      "type": "number",
+                      "description": "Vertical CSS pixel value."
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y"
+                  ],
+                  "additionalProperties": false,
+                  "description": "Measured physical displacement."
+                }
+              },
+              "required": [
+                "kind",
+                "position",
+                "extent",
+                "delta"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "resolution": {
+            "type": "object",
+            "properties": {
+              "target": {
+                "description": "Target endpoint resolution.",
+                "type": "object",
+                "properties": {
+                  "source": {
+                    "type": "string",
+                    "enum": [
+                      "id",
+                      "selector",
+                      "selector-fallback"
+                    ],
+                    "description": "Source used to resolve the bound endpoint."
+                  }
+                },
+                "required": [
+                  "source"
+                ],
+                "additionalProperties": false
+              },
+              "container": {
+                "description": "Container endpoint resolution.",
+                "type": "object",
+                "properties": {
+                  "source": {
+                    "type": "string",
+                    "enum": [
+                      "id",
+                      "selector",
+                      "selector-fallback"
+                    ],
+                    "description": "Source used to resolve the bound endpoint."
+                  }
+                },
+                "required": [
+                  "source"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "additionalProperties": false,
+            "description": "Bound endpoint resolution sources."
+          }
+        },
+        "required": [
+          "mode",
+          "input",
+          "observation",
+          "goal",
+          "completedReason",
+          "resolution"
+        ],
+        "additionalProperties": false,
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
+  "purposeHint": "State which content needs to be revealed or which scroll surface needs to move."
+}

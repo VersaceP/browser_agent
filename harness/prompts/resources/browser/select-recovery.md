@@ -160,7 +160,7 @@ level: open it with `Input.click`, re-observe to enumerate the options that are
 now rendered, then choose with `Input.click`, `Input.type` when the control is
 observably editable, or `Input.press`. A custom menu is often portal-rendered
 OUTSIDE the control's own subtree, so look for the options across the whole
-fresh page view (its change list shows what appeared after the click), and
+fresh page view to inspect what appeared after the click, and
 follow the control's `rel{aria-controls|aria-owns|aria-activedescendant}` or its
 `component=` members, before concluding they are absent. Verify the control's value afterwards - nothing in this path reports the
 selection for you.
@@ -207,7 +207,7 @@ there.
 
 `select-final-state-unproven` means the keyboard operation recorded the choice
 but the final control state could not be proven. Read the control's own value
-first - inspect it, or a `DOM.getAXTree` `state` query on it - BEFORE issuing
+first - inspect it, or a `DOM.getDetails` `state` query on it - BEFORE issuing
 any correction. A
 corrective selection against an unknown state can undo a selection that in
 fact succeeded.

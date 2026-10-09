@@ -1,0 +1,3 @@
+# meta schema=abcp.page-observation schemaVersion=3 fileKind=artifact mode=detail pageId=f170fa51-d368-40f3-9402-6b05e5015686 documentEpoch=d_bb1f817b1cdd098239879a442fcbab11 capturedAt="2026-10-06T06:42:45.938Z" checkedAt="2026-10-06T06:42:45.938Z" pendingChanges=false completeness=complete version=v_bb1f817b1cdd0982_1 filteredCounts={"emptyText":0,"internalLeaf":0,"nonContent":0,"source":0} source=live
+detail index=0 ok=true target={"requestedSelector":"#field","resolvedBy":"selector","resolvedId":"n_a949c5fa219a96af"} view=text value=""
+# end frames=0 nodes=0 components=0 details=1 contentSha256=7de594b7172272a88db53911afdc99efa84526d8de053c13d7aaa77436dd5697

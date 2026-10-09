@@ -61,7 +61,15 @@ def to_platform_execute_params(params: Any) -> Any:
             key: params[key] for key in ("pageId", "fleetId")
             if isinstance(params.get(key), str) and params[key].strip()
         }
-        return {"workflow": copy.deepcopy(preserved), "binding": binding}
+        # A host-scoped JS package explicitly pins each page Action. Keeping
+        # only its Fleet here lets waitFor observe newly opened pages; installed
+        # WebCross otherwise inherits the old page even for an explicit Fleet.
+        if isinstance(params.get("_platformBinding"), dict):
+            binding = copy.deepcopy(params["_platformBinding"])
+        wire = {"workflow": copy.deepcopy(preserved), "binding": binding}
+        if "files" in preserved:
+            wire["input"] = copy.deepcopy(params.get("_platformInput", {}))
+        return wire
     description = str(params.get("description") or "").strip()
     workflow: JsonDict = {
         "schemaVersion": WORKFLOW_SCHEMA_VERSION,

@@ -434,7 +434,7 @@ SELECT_FAILURE_POLICY = {
         guidance=(
             "The selection was recorded during the keyboard operation but the"
             " final control state could not be proven. Read the control's own"
-            " value (inspect it, or a `state` DOM.getAXTree query) BEFORE issuing any"
+            " value (inspect it, or a `state` DOM.getDetails query) BEFORE issuing any"
             " correction - a corrective selection against an unknown state can"
             " undo a selection that in fact succeeded."
         ),

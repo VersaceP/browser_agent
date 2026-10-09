@@ -2,7 +2,7 @@
   "method": "Page.list",
   "description": "Lists pages owned by a Fleet with their lifecycle and queue-activity states.",
   "requiresPurpose": false,
-  "catalogRevision": "sha256:ceccd4cf3cd46954290b4ff6547bffaaa32f0836d6047d3f30ae72b459f15d73",
+  "catalogRevision": "sha256:4353ee6b25dd1c25bb33c594c8231a1d46faab7783a010b1092fd1c91582bd64",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -59,6 +59,7 @@
     }
   },
   "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "properties": {
       "observation": {
@@ -70,7 +71,7 @@
         "description": "Guidance to re-observe current state and choose the next operation."
       },
       "data": {
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Validated business result returned by the Action.",
         "type": "array",
         "items": {
           "type": "object",
@@ -106,8 +107,7 @@
           },
           "additionalProperties": {},
           "description": "One page summary."
-        },
-        "description": "Validated business result returned by the Action."
+        }
       }
     },
     "required": [

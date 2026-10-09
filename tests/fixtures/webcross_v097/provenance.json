@@ -1,0 +1,7 @@
+{
+  "capturedOn": "2026-10-07",
+  "installedVersion": "0.9.7-beta",
+  "catalogRevision": "sha256:4353ee6b25dd1c25bb33c594c8231a1d46faab7783a010b1092fd1c91582bd64",
+  "platformWorkspaceCommit": "6b9647d00409c1f261e9edecfe2d6678d9cf452d",
+  "source": "live System.describeAction / Workflow.getGuide; workspace uses older engine"
+}

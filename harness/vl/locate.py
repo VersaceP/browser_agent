@@ -897,30 +897,14 @@ def scroll_bracket(
 
 
 async def read_scroll(browser: Any, page_id: str) -> Optional[Dict[str, float]]:
-    """Read the document scroll offset, the one piece of geometry no capture
-    receipt reliably carries.
+    """Read the main-document offset with Input.scroll's viewport state read.
 
-    Uses `Page.wheel` with a zero delta, which the platform documents and was
-    measured to treat as a state read: it answers `completedReason:
-    "state-read"` with `observedDelta: {x: 0, y: 0}` and the current
-    `position`, leaving the page untouched. That receipt is why a scroll ACTION
-    is acceptable as a read here — it states that it did not scroll, so a read
-    that silently moved the page cannot be mistaken for one that did not, and
-    this refuses anything that does not say so.
-
-    This used to send `Input.scroll` in viewport mode. That mode was removed:
-    every branch of the Action now requires `target` or `container`, so the
-    call came back `invalid-params` and this returned None for every capture.
-    Root-viewport scrolling moved to `Page.wheel`, whose `x`/`y` must be inside
-    the viewport.
-
-    `Page.getState` carries no scroll field on this build.
+    Only stable observations with completed input and proven zero measured
+    movement can certify the geometry bracket. Missing evidence stays unknown.
     """
     try:
-        resp = await browser.call("Page.wheel", {
+        resp = await browser.call("Input.scroll", {
             "pageId": page_id,
-            "x": 0,
-            "y": 0,
             "deltaX": 0,
             "deltaY": 0,
             "purpose": "read the scroll offset for VL coordinate mapping",

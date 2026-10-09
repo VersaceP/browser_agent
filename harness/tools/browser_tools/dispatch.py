@@ -846,7 +846,7 @@ async def _execute_browser_tool_impl(
     description=(
         "Invoke a single ABCP Browser atomic capability and return the browser observation/data."
         " Derive params from live feedback: previous response.data handles, current"
-        " DOM.getAXTree node ids and query records, worker_contract,"
+        " DOM.getAXTree node ids and DOM.getDetails query records, worker_contract,"
         " or cited record_extraction artifacts."
         " For Runtime.evaluate data capture, runtime_policy.record_name persists"
         " returned rows directly and returns recordExtraction.savedPath."
@@ -930,6 +930,20 @@ def _record_workflow_definition_before_dispatch(ctx: ToolContext, receipt: JsonD
 
 
 @BROWSER_TOOLS.register(
+    name="read_selected_skill_resource",
+    description="Read a bounded text file from the exact Skill version selected for this Browser task. Read formal source packages and input definitions before binding this run's values. This does not grant project-source access.",
+    input_schema={"type": "object", "properties": {"path": {"type": "string"},
+        "offset": {"type": "integer", "minimum": 0}, "max_chars": {"type": "integer", "minimum": 1, "maximum": 50000}},
+        "required": ["path"], "additionalProperties": False},
+    trace_type="skill_resource_read",
+)
+async def _browser_read_selected_skill_resource(ctx: ToolContext) -> JsonDict:
+    from harness.skill_builder.resources import read_selected_resource
+    return read_selected_resource(ctx.agent.runtime, str(ctx.tool_input.get("path") or ""),
+        offset=ctx.tool_input.get("offset", 0), max_chars=ctx.tool_input.get("max_chars", 16000))
+
+
+@BROWSER_TOOLS.register(
     name="execute_published_skill_workflow",
     description=(
         "Execute one immutable Workflow JSON file from the exact Skill version"
@@ -991,8 +1005,18 @@ async def _browser_execute_published_skill_workflow(ctx: ToolContext) -> JsonDic
         variables = ctx.tool_input.get("variables")
         if not isinstance(variables, dict):
             return {"status": "invalid_variables", "tool_was_executed": False}
+        from harness.skill_builder.resources import workflow_entries
+        if relative.as_posix() not in {e["path"] for e in workflow_entries(snapshot)}:
+            return {"status": "not_skill_execution_entry", "tool_was_executed": False,
+                    "error": "Parameters and development probes are not formal Workflow entries"}
+        from harness.workflow.script_runtime import is_script_package, script_contract_available, workflow_payload
+        script = is_script_package(workflow)
+        if script_contract_available() and not script:
+            return {"status": "legacy_workflow_requires_rebuild", "tool_was_executed": False,
+                    "path": relative.as_posix(), "error": "Rebuild this selected version as a JS/TS source package; changing variables cannot migrate steps DSL."}
         workflow = dict(workflow)
-        workflow["initialVariables"] = {**(workflow.get("initialVariables") or {}), **variables}
+        if not script:
+            workflow["initialVariables"] = {**(workflow.get("initialVariables") or {}), **variables}
         page_id = str(ctx.tool_input.get("pageId") or "")
         fleet_id = str(ctx.tool_input.get("fleetId") or "")
         input_hash = hashlib.sha256(json.dumps(
@@ -1012,8 +1036,8 @@ async def _browser_execute_published_skill_workflow(ctx: ToolContext) -> JsonDic
         result, _should_stop = await _bt()._execute_browser_capability_tool(
             ctx.agent, "browser_call", {
                 "method": "Workflow.execute",
-                "params": {"workflow": workflow,
-                           "binding": {"pageId": page_id, "fleetId": fleet_id}},
+                "params": workflow_payload(workflow, variables, page_id, fleet_id) if script else {
+                    "workflow": workflow, "binding": {"pageId": page_id, "fleetId": fleet_id}},
                 "reason": f"Execute selected Skill {skill_id} Workflow {relative.as_posix()}",
             }, ctx.step, published_skill_workflow=True,
         )
@@ -1042,19 +1066,17 @@ async def _browser_execute_published_skill_workflow(ctx: ToolContext) -> JsonDic
 @BROWSER_TOOLS.register(
     name="execute_browser_workflow",
     description=(
-        "Execute a browser-only ABCP workflow after recursive harness validation."
+        "Execute a browser-only WebCross JS/TS source package with separate input and page/Fleet binding."
         " A complete definition is saved before dispatch and its receipt returns"
         " definitionRef/definitionHash; later calls may reuse that pair with"
-        " optional local operations instead of copying the full steps. Use it"
+        " optional input overrides instead of copying source. Use it"
         " when the upcoming actions and target-selection rules are decided;"
-        " target ids may be discovered inside the segment. A Workflow"
-        " segment can read a leased page observation: after DOM.getAXTree, use"
-        " the complete `$cache.observation` or `$last` reference with transform"
-        " to search artifact text and extract a current id."
-        " `$cache.observation.artifact.path` is metadata only. It cannot call"
-        " Harness-local tools or Runtime.evaluate. After navigation, read"
-        " terminal load events, wait only if needed, handle failure/timeout,"
-        " and synchronize Page.getState before DOM/Input. End the segment at the"
+        " target ids may be discovered inside the script. Read DOM.getAXTree"
+        " artifact text through api.readText, and DOM.getDetails details directly."
+        " Use native JS processing and api.waitFor(options, trigger) to subscribe"
+        " before the action. The scoped API checks every call's permission and"
+        " binding. It cannot call Harness-local tools or Runtime.evaluate."
+        " Read status/output/error/results and source locations. End at the"
         " next point that needs model judgment, a screenshot, a Harness-only"
         " tool, an expired artifact, or recovery from a failed workflow."
     ),
@@ -1066,6 +1088,21 @@ async def _browser_execute_browser_workflow(ctx: ToolContext) -> JsonDict:
     if not workflow_execution_enabled(ctx.agent):
         return workflow_execution_disabled_result(source="execute_browser_workflow")
     from harness.workflow.workflow_definitions import save_workflow_definition
+    if isinstance(ctx.tool_input.get("workflow"), dict):
+        definition = {"workflow": ctx.tool_input["workflow"], "input": ctx.tool_input.get("input", {})}
+        receipt = save_workflow_definition(ctx.agent.logger, definition)
+        receipt.update(reused=False, patchBytes=0)
+        _record_workflow_definition_before_dispatch(ctx, receipt)
+        from harness.workflow.script_runtime import workflow_payload
+        result, _ = await _bt()._execute_browser_capability_tool(ctx.agent, "browser_call", {
+            "method": "Workflow.execute", "params": workflow_payload(
+                definition["workflow"], definition["input"],
+                str(ctx.tool_input.get("pageId") or ""), str(ctx.tool_input.get("fleetId") or "")),
+            "reason": definition["workflow"].get("name", "Execute browser source package")}, ctx.step)
+        _workflow_definition_outcome(ctx, receipt, result)
+        result["workflowDefinition"] = receipt
+        ctx.agent.logger.write("workflow.definition.used", {**receipt, "workflowStatus": receipt["lastAttempt"]["status"]})
+        return result
 
     workflow_definition = {
         "description": str(
@@ -1231,6 +1268,26 @@ async def _browser_execute_saved_browser_workflow(ctx: ToolContext) -> JsonDict:
             operations, ensure_ascii=False, default=str,
         ).encode("utf-8")),
     })
+    if isinstance(workflow_definition.get("workflow"), dict):
+        from harness.workflow.script_runtime import workflow_payload
+        business_input = workflow_definition.get("input", {})
+        if isinstance(business_input, dict):
+            business_input = {**business_input, **overrides}
+        elif overrides:
+            return {"status": "invalid_input_override", "tool_was_executed": False,
+                    "error": "Named variable overrides require an object input"}
+        package = dict(workflow_definition["workflow"])
+        if "timeout" in ctx.tool_input:
+            package["timeoutMs"] = ctx.tool_input["timeout"]
+        _record_workflow_definition_before_dispatch(ctx, definition_receipt)
+        result, _ = await _bt()._execute_browser_capability_tool(ctx.agent, "browser_call", {
+            "method": "Workflow.execute", "params": workflow_payload(package, business_input,
+                str(ctx.tool_input.get("pageId") or ""), str(ctx.tool_input.get("fleetId") or "")),
+            "reason": package.get("name", "Reuse browser source package")}, ctx.step)
+        _workflow_definition_outcome(ctx, definition_receipt, result)
+        result["workflowDefinition"] = definition_receipt
+        ctx.agent.logger.write("workflow.definition.used", {**definition_receipt, "workflowStatus": definition_receipt["lastAttempt"]["status"]})
+        return result
     variables = dict(workflow_definition.get("variables") or {})
     variables.update(overrides)
     params = {
@@ -1355,7 +1412,7 @@ async def _browser_dismiss_overlay(ctx: ToolContext) -> JsonDict:
         " control; do not guess them."
         " Use this only when the collection cannot be read from one DOM snapshot;"
         " otherwise enumerate node ids and read them with one batched"
-        " DOM.getAXTree `text`/`attributes` query."
+        " DOM.getDetails `text`/`attributes` query."
         " Persists through record_extraction"
         " only after target_reached or mechanically evidenced exhaustion; stalled"
         " or blocked partial rows are not persisted. When content completeness is"
@@ -1562,7 +1619,7 @@ async def _browser_record_extraction(ctx: ToolContext) -> JsonDict:
         "Search the current DOM.getAXTree snapshot by role/name/text and return"
         " node ids (n_…) with line context. Use this instead of grepping"
         " offloaded page text when locating an element in a large page view;"
-        " it also covers the full view saved behind a change list. Matches"
+        " axTreeCache.status reports whether that local full view is current. Matches"
         " include the line's `flags` and its `rect` viewport box (CSS pixels)"
         " when present. `flags` carries target evidence (targetable,"
         " actionable, candidate, ignored), explicit state"
@@ -1806,6 +1863,8 @@ def build_browser_agent_tool_specs(
             }
         )
         and (selected_skill_available or spec.get("name") != "execute_published_skill_workflow")
+        and (selected_skill_available and standalone_review_enabled
+             or spec.get("name") != "read_selected_skill_resource")
         # A multimodal BrowserAgent receives a bounded Page.screenshot image
         # attachment in the very next model request. Do not offer the old
         # second-model visual tool alongside it: that adds a network/model

@@ -14,6 +14,7 @@ from harness.context.offload import model_visible_screenshot_attachment
 from harness.observation.page_fingerprint import render_page_stats_for_prompt, render_snapshot_diff_for_prompt
 from harness.observation.browser_call import build_browser_call_runner
 from harness.tools.browser_tools import _close_agent_watches, build_browser_agent_tool_specs, build_browser_tool_dispatcher
+from harness.tools.browser_tools.observation_view import _prepare_browser_result_for_model
 from harness.workflow.workflow_runtime import workflow_execution_enabled
 from harness.utils import JsonDict, exception_payload, write_context_snapshot
 from llm import LLMConnectionError, LLMEmptyResponseError, LLMProviderProtocolError, LLMRateLimitError, LLMRequestTimeoutError, input_moderation_rejection, retry_usage_from_attempts
@@ -37,6 +38,22 @@ from harness.runtime.model_support import (
     log_model_visible_tool_result,
     offload_tool_result_for_model,
 )
+
+
+def _offload_browser_result_for_model(
+    agent: Any, tool_call: JsonDict, result: Any, step: int,
+) -> Any:
+    projected = _prepare_browser_result_for_model(agent, tool_call, result)
+    model_result = offload_tool_result_for_model(
+        logger=agent.logger, runtime=agent.runtime,
+        tool_call=tool_call, result=projected, step=step,
+    )
+    # Keep this small local fact visible even when the receipt moves to disk.
+    cache = projected.get("axTreeCache") if isinstance(projected, dict) else None
+    if isinstance(cache, dict) and isinstance(model_result, dict):
+        model_result = {**model_result, "axTreeCache": cache}
+    return model_result
+
 
 async def run_browser_agent(self, task: str) -> str:
     control = self.task_control
@@ -768,13 +785,7 @@ async def run_browser_agent(self, task: str) -> str:
                         "step": step,
                         "result": nudge,
                     })
-                model_result = offload_tool_result_for_model(
-                    logger=self.logger,
-                    runtime=self.runtime,
-                    tool_call=tool_call,
-                    result=result,
-                    step=step,
-                )
+                model_result = _offload_browser_result_for_model(self, tool_call, result, step)
                 _tool_input = (
                     tool_call.get("input")
                     if isinstance(tool_call.get("input"), dict) else {}

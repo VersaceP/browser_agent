@@ -102,7 +102,7 @@ proof that the business content is absent.
 
 The harness raises route_recovery_required from heuristic absence only after
 the missing regions survive a full DOM.getAXTree view read after an
-Input.scroll, Page.wheel or click on that page, with the page at its bottom,
+Input.scroll or click on that page, with the page at its bottom,
 or after a collect_items run; until then `decision` stays `inconclusive`. At
 the bottom means the main-document root line has no `down` in
 `scroll{can=...}`; a root without `scroll{}` fits in view. Content that loads

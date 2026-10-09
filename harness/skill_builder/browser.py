@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import json
 import uuid
 from pathlib import Path
@@ -15,7 +16,8 @@ from harness.tools.tool_policy import (
 )
 
 
-_READ_METHODS = {"System.getCapabilities", "System.describeAction", "Workflow.getStatus"}
+_READ_METHODS = {"System.getCapabilities", "System.describeAction", "Workflow.getGuide",
+                 "Workflow.getStatus", "Workflow.pause", "Workflow.resume", "Workflow.cancel"}
 _PAGE_PREFIXES = ("Page.", "DOM.", "Input.")
 
 
@@ -30,9 +32,14 @@ def _platform_error(exc: ABCPTransportError) -> dict[str, Any]:
 
 
 class BuilderBrowser:
-    def __init__(self, config: Any, logger: Any):
+    def __init__(self, config: Any, logger: Any, runtime: Any = None):
         def record_transport(kind: str, payload: Any) -> None:
             data = payload if isinstance(payload, dict) else {}
+            event = (data.get("params") or {}).get("data") or {}
+            progress = event.get("payload") or {}
+            if (kind == "notify" and getattr(self, "active_trial", False)
+                    and event.get("event") == "Workflow.progress" and progress.get("workflowId")):
+                self.workflow_ids.add(str(progress["workflowId"]))
             # The transport hook runs before Network.readApi response scrubbing
             # and may also see typed input. Keep protocol identity only.
             logger.write("skill_builder.transport", {
@@ -41,14 +48,24 @@ class BuilderBrowser:
             })
         self.client = ABCPClient(config, on_event=record_transport)
         self.logger = logger
+        self.runtime = runtime
         self.fleet_id: str | None = None
         self.pages: set[str] = set()
+        self.page_fleets: dict[str, str] = {}
+        self.capability_methods: set[str] = set()
         self.workflow_ids: set[str] = set()
         self.connected = False
+        self.active_trial = False
 
     async def close(self) -> None:
         if self.connected:
             try:
+                if self.active_trial:
+                    for workflow_id in self.workflow_ids:
+                        try:
+                            await self.client.call("Workflow.cancel", {"workflowId": workflow_id})
+                        except ABCPTransportError:
+                            pass
                 if self.fleet_id:
                     try:
                         receipt = await self.client.call("Fleet.close", {"fleetId": self.fleet_id})
@@ -78,6 +95,49 @@ class BuilderBrowser:
                 capabilities = _platform_error(exc)
             self.logger.write("skill_builder.platform.capabilities",
                               sanitize_transport_payload(capabilities))
+            self.capability_methods = {a["method"] for a in (capabilities.get("data") or {}).get("actions", [])}
+
+    async def describe_action(self, method: str) -> dict[str, Any]:
+        await self._connect()
+        result = await self.client.call("System.describeAction", {"action": method})
+        schema = result.get("data") or {}
+        if schema.get("method") == method:
+            path = Path(__file__).resolve().parents[2] / "global_schema_cache" / "schemas" / (method + ".json")
+            path.write_text(json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
+        return result
+
+    async def guide(self) -> dict[str, Any]:
+        await self._connect()
+        result = await self.client.call("Workflow.getGuide", {})
+        data = result.get("data") or {}
+        return {"content": (data.get("skillsGuide") or {}).get("value", ""),
+                "guideRevision": data.get("guideRevision"), "source": "live Workflow.getGuide"}
+
+    async def authorize_files(self, paths: list[str]) -> dict[str, Any]:
+        from harness.tools.path_authorization import authorize_path, canonical
+        granted = []
+        for path in paths:
+            rejected = await authorize_path(self, path, "read")
+            if rejected:
+                return rejected
+            granted.append(str(canonical(self, path)))
+        return {"status": "authorized", "paths": granted}
+
+    async def attach_page(self, page_id: str, fleet_id: str) -> dict[str, Any]:
+        from harness.runtime.hitl_input import read_terminal_input
+        decision = await read_terminal_input(
+            f"[Skill Builder] Request to use test page {page_id} (Fleet {fleet_id}). Scripts may modify this page. Enter yes to authorize this trial.")
+        approved = str(decision or "").strip().lower() in {"yes", "y"}
+        self.logger.write("skill_builder.page.authorization", {"pageId": page_id, "fleetId": fleet_id, "approved": approved})
+        if not approved:
+            return {"status": "permission_denied", "reason": "Test page was not authorized by the user"}
+        await self._connect()
+        inventory = await self.client.call("Page.list", {"fleetId": fleet_id})
+        if page_id not in {p.get("pageId") for p in (inventory.get("data") or {}).get("pages", [])}:
+            return {"status": "unknown_page_binding", "reason": "Page was not found in the authorized Fleet"}
+        await self.client.call("Page.switchTo", {"pageId": page_id})
+        self.pages.add(page_id); self.page_fleets[page_id] = fleet_id
+        return {"status": "authorized", "pageId": page_id, "fleetId": fleet_id}
 
     async def _own_fleet(self) -> str:
         await self._connect()
@@ -88,7 +148,7 @@ class BuilderBrowser:
                                                           "scope": "skill-builder"})
         observed = str((result.get("data") or {}).get("fleetId") or "")
         if observed != proposed:
-            raise RuntimeError("WebCross 未确认 Builder Fleet 身份")
+            raise RuntimeError("WebCross did not confirm the Builder Fleet identity")
         self.fleet_id = proposed
         return proposed
 
@@ -96,7 +156,7 @@ class BuilderBrowser:
         try:
             fleet_id = await self._own_fleet()
             result = await self.client.call("Page.create", {"fleetId": fleet_id,
-                                                            "url": url})
+                                                            "url": url, "purpose": "Create an isolated Skill Builder test page"})
         except ABCPTransportError as exc:
             return _platform_error(exc)
         data = result.get("data") or {}
@@ -104,6 +164,7 @@ class BuilderBrowser:
         if not page_id or data.get("fleetId") != fleet_id:
             return {"status": "unknown_page_binding", "response": result}
         self.pages.add(page_id)
+        self.page_fleets[page_id] = fleet_id
         self.logger.write("skill_builder.page.created", {"pageId": page_id,
                                                           "fleetId": fleet_id})
         return result
@@ -114,16 +175,20 @@ class BuilderBrowser:
             return {"status": "permission_denied", "reason": disabled_reason_for_method(method)}
         if method == "Page.create":
             return await self.create_page(str(params.get("url") or "about:blank"))
-        if method not in _READ_METHODS and method != "Network.readApi" and not method.startswith(_PAGE_PREFIXES):
-            return {"status": "permission_denied", "reason": "Builder 工具未开放该方法"}
-        if method == "Workflow.getStatus":
+        if method not in _READ_METHODS and method not in {"Network.readApi", "File.handleChooser"} and not method.startswith(_PAGE_PREFIXES):
+            return {"status": "permission_denied", "reason": "This method is not available to Builder tools"}
+        if method in {"Workflow.getStatus", "Workflow.pause", "Workflow.resume", "Workflow.cancel"}:
             if str(params.get("workflowId") or "") not in self.workflow_ids:
-                return {"status": "permission_denied", "reason": "Workflow 不属于此 Builder 会话"}
+                return {"status": "permission_denied", "reason": "Workflow does not belong to this Builder session"}
         elif method not in _READ_METHODS:
             if str(params.get("pageId") or "") not in self.pages:
-                return {"status": "permission_denied", "reason": "pageId 不属于 Builder 创建的页面"}
-            if params.get("fleetId") not in (None, self.fleet_id):
-                return {"status": "permission_denied", "reason": "fleetId 与 Builder Fleet 不一致"}
+                return {"status": "permission_denied", "reason": "pageId is not an authorized test page for this Builder"}
+            if params.get("fleetId") not in (None, self.page_fleets.get(str(params.get("pageId")), self.fleet_id)):
+                return {"status": "permission_denied", "reason": "fleetId does not match the Builder Fleet"}
+        if method == "File.handleChooser":
+            rejected = await self.authorize_files(params.get("files") or [])
+            if rejected.get("status") != "authorized":
+                return rejected
         try:
             await self._connect()
             result = await self.client.call(method, params)
@@ -170,6 +235,8 @@ class BuilderBrowser:
 
     async def trial(self, workflow_path: Path, page_id: str,
                     variables: dict[str, Any] | None = None) -> dict[str, Any]:
+        if self.active_trial:
+            return {"status": "trial_busy", "reason": "A trial is already active in this session"}
         if page_id not in self.pages:
             return {"status": "permission_denied", "reason": "trial page is not Builder-owned"}
         raw = workflow_path.read_bytes()
@@ -180,29 +247,63 @@ class BuilderBrowser:
             return {"status": "invalid_json", "error": str(exc)}
         if not isinstance(workflow, dict):
             return {"status": "invalid_document", "error": "Workflow file must hold an object"}
+        from harness.workflow.script_runtime import is_script_package, scope_package, input_files
+        execution_package = workflow
+        scope = None
+        fleet_id = self.page_fleets.get(page_id, self.fleet_id)
         try:
-            self._authorize_steps(workflow.get("steps"), page_id)
-        except PermissionError as exc:
-            return {"status": "permission_denied", "reason": str(exc)}
-        if variables:
+            await self._connect()
+            if is_script_package(workflow):
+                execution_package, scope = scope_package(workflow, page_id=page_id,
+                    fleet_id=str(fleet_id or ""), methods=self.capability_methods,
+                    files=input_files(self, variables or {}))
+            else:
+                self._authorize_steps(workflow.get("steps"), page_id)
+        except (PermissionError, ValueError) as exc:
+            return {"status": "permission_denied" if isinstance(exc, PermissionError) else "invalid_document", "reason": str(exc)}
+        if variables and not scope:
             workflow = dict(workflow)
             workflow["initialVariables"] = {**(workflow.get("initialVariables") or {}), **variables}
         self.logger.write("skill_builder.trial.start", {
             "workflowPath": str(workflow_path), "workflowHash": expected_hash,
-            "pageId": page_id, "fleetId": self.fleet_id,
+            "pageId": page_id, "fleetId": fleet_id, "scope": scope,
         })
         try:
+            self.active_trial = True
             await self._connect()
             result = await self.client.call("Workflow.execute", {
-                "workflow": workflow,
-                "binding": {"pageId": page_id, "fleetId": self.fleet_id},
+                "workflow": execution_package if scope else workflow,
+                **({"input": variables or {}} if scope else {}),
+                "binding": scope["platformBinding"] if scope else {"pageId": page_id, "fleetId": fleet_id},
             })
         except ABCPTransportError as exc:
             result = _platform_error(exc)
+        except asyncio.CancelledError:
+            for workflow_id in self.workflow_ids:
+                try:
+                    await self.client.call("Workflow.cancel", {"workflowId": workflow_id})
+                except ABCPTransportError:
+                    pass
+            raise
+        finally:
+            self.active_trial = False
         data = result.get("data") or {}
         workflow_id = str(data.get("workflowId") or "")
         if workflow_id:
             self.workflow_ids.add(workflow_id)
-        receipt = {"workflowHash": expected_hash, "result": sanitize_transport_payload(result)}
+        records = data.get("results")
+        known_records = isinstance(records, list) and all(isinstance(r, dict) for r in records)
+        receipt = {"workflowHash": expected_hash, "result": sanitize_transport_payload(result),
+                   "executionFacts": {
+                       "workflowStatus": data.get("status"),
+                       "callRecordCount": len(records) if known_records else None,
+                       "succeededCallRecordCount": sum(r.get("status") == "succeeded" for r in records)
+                           if known_records else None,
+                       "failedCallRecordCount": sum(r.get("status") == "failed" for r in records)
+                           if known_records else None,
+                       "outputAvailable": data.get("output") is not None if "output" in data else None,
+                       "recordedActions": sorted({r["action"] for r in records if isinstance(r.get("action"), str)})
+                           if known_records else None,
+                   }}
         self.logger.write("skill_builder.trial.result", receipt)
         return receipt

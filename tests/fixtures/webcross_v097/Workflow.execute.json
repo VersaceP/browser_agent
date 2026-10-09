@@ -1,0 +1,870 @@
+{
+  "method": "Workflow.execute",
+  "description": "Compiles and runs a JavaScript or TypeScript source package in an isolated workflow.",
+  "requiresPurpose": false,
+  "catalogRevision": "sha256:4353ee6b25dd1c25bb33c594c8231a1d46faab7783a010b1092fd1c91582bd64",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "workflow": {
+        "type": "object",
+        "properties": {
+          "schemaVersion": {
+            "type": "number",
+            "const": 1,
+            "description": "Workflow document schema version."
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "Human-readable script name."
+          },
+          "description": {
+            "description": "Optional script description.",
+            "type": "string",
+            "maxLength": 2000
+          },
+          "timeoutMs": {
+            "description": "Total deadline in milliseconds, including pauses.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 3600000
+          },
+          "entry": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "Module exporting the entry function."
+          },
+          "files": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Package sources indexed by normalized path."
+          }
+        },
+        "required": [
+          "schemaVersion",
+          "name",
+          "entry",
+          "files"
+        ],
+        "additionalProperties": true,
+        "description": "Source package compiled in memory."
+      },
+      "input": {
+        "description": "JSON business input; defaults to an empty object.",
+        "allOf": [
+          {
+            "$ref": "#/$defs/__schema0"
+          },
+          {}
+        ]
+      },
+      "binding": {
+        "description": "Execution-specific resource binding.",
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "description": "Page bound to this execution.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "fleetId": {
+            "description": "Fleet bound to this execution.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "workflow"
+    ],
+    "additionalProperties": true,
+    "$defs": {
+      "__schema0": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "number"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/__schema0"
+            }
+          },
+          {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {
+              "$ref": "#/$defs/__schema0"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "workflowId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Identifier of this execution."
+      },
+      "taskId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "Task created for this execution."
+      },
+      "status": {
+        "type": "string",
+        "enum": [
+          "succeeded",
+          "failed",
+          "cancelled"
+        ],
+        "description": "Final business execution state."
+      },
+      "output": {
+        "allOf": [
+          {
+            "$ref": "#/$defs/__schema0"
+          },
+          {}
+        ],
+        "description": "JSON entry return, or null on failure or no return."
+      },
+      "results": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "callId": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991,
+              "description": "Execution-local call sequence."
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "action",
+                "waitFor",
+                "readText",
+                "sleep"
+              ],
+              "description": "Platform operation category."
+            },
+            "action": {
+              "description": "Canonical Action name.",
+              "type": "string"
+            },
+            "source": {
+              "description": "Original script source position.",
+              "type": "object",
+              "properties": {
+                "file": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Original package source file."
+                },
+                "line": {
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991,
+                  "description": "One-based source line."
+                },
+                "column": {
+                  "description": "One-based source column when available.",
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                }
+              },
+              "required": [
+                "file",
+                "line"
+              ],
+              "additionalProperties": false
+            },
+            "status": {
+              "type": "string",
+              "enum": [
+                "queued",
+                "running",
+                "succeeded",
+                "failed",
+                "cancelled",
+                "unknown"
+              ],
+              "description": "Call lifecycle; unknown means dispatched effects could not be confirmed."
+            },
+            "createdAt": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991,
+              "description": "Call creation time in Unix milliseconds."
+            },
+            "startedAt": {
+              "description": "Dispatch time in Unix milliseconds.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "finishedAt": {
+              "description": "Settlement time in Unix milliseconds.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "durationMs": {
+              "description": "Elapsed call time in milliseconds.",
+              "type": "number",
+              "minimum": 0
+            },
+            "error": {
+              "description": "Safe call failure details.",
+              "type": "object",
+              "properties": {
+                "code": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Stable public failure code."
+                },
+                "message": {
+                  "type": "string",
+                  "description": "Safe failure summary."
+                },
+                "source": {
+                  "description": "Original script source position.",
+                  "type": "object",
+                  "properties": {
+                    "file": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Original package source file."
+                    },
+                    "line": {
+                      "type": "integer",
+                      "exclusiveMinimum": 0,
+                      "maximum": 9007199254740991,
+                      "description": "One-based source line."
+                    },
+                    "column": {
+                      "description": "One-based source column when available.",
+                      "type": "integer",
+                      "exclusiveMinimum": 0,
+                      "maximum": 9007199254740991
+                    }
+                  },
+                  "required": [
+                    "file",
+                    "line"
+                  ],
+                  "additionalProperties": false
+                },
+                "action": {
+                  "description": "Canonical Action name.",
+                  "type": "string"
+                },
+                "actionCode": {
+                  "description": "Public error code reported by the Action.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "code",
+                "message"
+              ],
+              "additionalProperties": false
+            },
+            "value": {
+              "description": "Retained business value.",
+              "allOf": [
+                {
+                  "$ref": "#/$defs/__schema0"
+                },
+                {}
+              ]
+            },
+            "valueOmittedReason": {
+              "description": "Why a business value was omitted from the trace.",
+              "type": "string",
+              "const": "result-size-limit"
+            }
+          },
+          "required": [
+            "callId",
+            "kind",
+            "status",
+            "createdAt"
+          ],
+          "additionalProperties": false
+        },
+        "description": "Platform call records in invocation order."
+      },
+      "error": {
+        "description": "Safe execution failure details.",
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Safe failure summary."
+          },
+          "source": {
+            "description": "Original script source position.",
+            "type": "object",
+            "properties": {
+              "file": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Original package source file."
+              },
+              "line": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991,
+                "description": "One-based source line."
+              },
+              "column": {
+                "description": "One-based source column when available.",
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": [
+              "file",
+              "line"
+            ],
+            "additionalProperties": false
+          },
+          "action": {
+            "description": "Canonical Action name.",
+            "type": "string"
+          },
+          "actionCode": {
+            "description": "Public error code reported by the Action.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "timing": {
+        "type": "object",
+        "properties": {
+          "createdAt": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Admission time in Unix milliseconds."
+          },
+          "startedAt": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Worker execution start in Unix milliseconds."
+          },
+          "finishedAt": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Cleanup completion in Unix milliseconds."
+          },
+          "durationMs": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Elapsed execution time in milliseconds."
+          }
+        },
+        "required": [
+          "createdAt",
+          "startedAt",
+          "finishedAt",
+          "durationMs"
+        ],
+        "additionalProperties": false,
+        "description": "Execution admission, start, completion, and elapsed time."
+      }
+    },
+    "required": [
+      "workflowId",
+      "taskId",
+      "status",
+      "output",
+      "results",
+      "timing"
+    ],
+    "additionalProperties": false,
+    "$defs": {
+      "__schema0": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "number"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/__schema0"
+            }
+          },
+          {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {
+              "$ref": "#/$defs/__schema0"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Facts directly observed by the Action or returned by its declared result schema."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "data": {
+        "description": "Validated business result returned by the Action.",
+        "type": "object",
+        "properties": {
+          "workflowId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Identifier of this execution."
+          },
+          "taskId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Task created for this execution."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "succeeded",
+              "failed",
+              "cancelled"
+            ],
+            "description": "Final business execution state."
+          },
+          "output": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/__schema0"
+              },
+              {}
+            ],
+            "description": "JSON entry return, or null on failure or no return."
+          },
+          "results": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "callId": {
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991,
+                  "description": "Execution-local call sequence."
+                },
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "action",
+                    "waitFor",
+                    "readText",
+                    "sleep"
+                  ],
+                  "description": "Platform operation category."
+                },
+                "action": {
+                  "description": "Canonical Action name.",
+                  "type": "string"
+                },
+                "source": {
+                  "description": "Original script source position.",
+                  "type": "object",
+                  "properties": {
+                    "file": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Original package source file."
+                    },
+                    "line": {
+                      "type": "integer",
+                      "exclusiveMinimum": 0,
+                      "maximum": 9007199254740991,
+                      "description": "One-based source line."
+                    },
+                    "column": {
+                      "description": "One-based source column when available.",
+                      "type": "integer",
+                      "exclusiveMinimum": 0,
+                      "maximum": 9007199254740991
+                    }
+                  },
+                  "required": [
+                    "file",
+                    "line"
+                  ],
+                  "additionalProperties": false
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "queued",
+                    "running",
+                    "succeeded",
+                    "failed",
+                    "cancelled",
+                    "unknown"
+                  ],
+                  "description": "Call lifecycle; unknown means dispatched effects could not be confirmed."
+                },
+                "createdAt": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991,
+                  "description": "Call creation time in Unix milliseconds."
+                },
+                "startedAt": {
+                  "description": "Dispatch time in Unix milliseconds.",
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "finishedAt": {
+                  "description": "Settlement time in Unix milliseconds.",
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "durationMs": {
+                  "description": "Elapsed call time in milliseconds.",
+                  "type": "number",
+                  "minimum": 0
+                },
+                "error": {
+                  "description": "Safe call failure details.",
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Stable public failure code."
+                    },
+                    "message": {
+                      "type": "string",
+                      "description": "Safe failure summary."
+                    },
+                    "source": {
+                      "description": "Original script source position.",
+                      "type": "object",
+                      "properties": {
+                        "file": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Original package source file."
+                        },
+                        "line": {
+                          "type": "integer",
+                          "exclusiveMinimum": 0,
+                          "maximum": 9007199254740991,
+                          "description": "One-based source line."
+                        },
+                        "column": {
+                          "description": "One-based source column when available.",
+                          "type": "integer",
+                          "exclusiveMinimum": 0,
+                          "maximum": 9007199254740991
+                        }
+                      },
+                      "required": [
+                        "file",
+                        "line"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "action": {
+                      "description": "Canonical Action name.",
+                      "type": "string"
+                    },
+                    "actionCode": {
+                      "description": "Public error code reported by the Action.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message"
+                  ],
+                  "additionalProperties": false
+                },
+                "value": {
+                  "description": "Retained business value.",
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/__schema0"
+                    },
+                    {}
+                  ]
+                },
+                "valueOmittedReason": {
+                  "description": "Why a business value was omitted from the trace.",
+                  "type": "string",
+                  "const": "result-size-limit"
+                }
+              },
+              "required": [
+                "callId",
+                "kind",
+                "status",
+                "createdAt"
+              ],
+              "additionalProperties": false
+            },
+            "description": "Platform call records in invocation order."
+          },
+          "error": {
+            "description": "Safe execution failure details.",
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Stable public failure code."
+              },
+              "message": {
+                "type": "string",
+                "description": "Safe failure summary."
+              },
+              "source": {
+                "description": "Original script source position.",
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Original package source file."
+                  },
+                  "line": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991,
+                    "description": "One-based source line."
+                  },
+                  "column": {
+                    "description": "One-based source column when available.",
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991
+                  }
+                },
+                "required": [
+                  "file",
+                  "line"
+                ],
+                "additionalProperties": false
+              },
+              "action": {
+                "description": "Canonical Action name.",
+                "type": "string"
+              },
+              "actionCode": {
+                "description": "Public error code reported by the Action.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ],
+            "additionalProperties": false
+          },
+          "timing": {
+            "type": "object",
+            "properties": {
+              "createdAt": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Admission time in Unix milliseconds."
+              },
+              "startedAt": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Worker execution start in Unix milliseconds."
+              },
+              "finishedAt": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Cleanup completion in Unix milliseconds."
+              },
+              "durationMs": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Elapsed execution time in milliseconds."
+              }
+            },
+            "required": [
+              "createdAt",
+              "startedAt",
+              "finishedAt",
+              "durationMs"
+            ],
+            "additionalProperties": false,
+            "description": "Execution admission, start, completion, and elapsed time."
+          }
+        },
+        "required": [
+          "workflowId",
+          "taskId",
+          "status",
+          "output",
+          "results",
+          "timing"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false,
+    "$defs": {
+      "__schema0": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "number"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/__schema0"
+            }
+          },
+          {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {
+              "$ref": "#/$defs/__schema0"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  }
+}

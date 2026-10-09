@@ -1,0 +1,180 @@
+{
+  "seconds": 12.266,
+  "checks": {
+    "full": {
+      "nodeCount": 15,
+      "documentEpoch": "d_b5856ac7b7d425d4c0738f88f3d51c29"
+    },
+    "savedDetails": "passed",
+    "liveState": "passed",
+    "workflow": {
+      "workflowId": "ce71c8a0-3924-435b-b29f-9f092e9b9183",
+      "taskId": "1e4616fe-0d51-40a2-8e44-d262a3c0d58f",
+      "status": "succeeded",
+      "results": [
+        {
+          "stepPath": "steps[0]",
+          "stepRunId": 1,
+          "stepType": "action",
+          "action": "DOM.getDetails",
+          "status": "success",
+          "result": {
+            "pageId": "f7f07a56-7f55-4ae3-a9b4-324149e4fa7a",
+            "mode": "detail",
+            "artifact": {
+              "kind": "detail",
+              "path": "/Users/versace/Library/Application Support/webcross/observations/3539d0fd-219d-4bf5-94fd-bc7171de456b/f7f07a56-7f55-4ae3-a9b4-324149e4fa7a/epochs/d_b5856ac7b7d425d4c0738f88f3d51c29/query/542dc869-791a-47d7-ae6e-fd8830f03b86",
+              "format": "text",
+              "bytes": 779,
+              "sha256": "d416fd7f8ba157682297c57a0a69f06fa8430d6a0b235fc216160c0aee1714a0",
+              "expiresAt": "2026-10-06T07:10:55.264Z"
+            },
+            "checkedAt": "2026-10-06T07:00:55.236Z",
+            "summary": {
+              "total": 1,
+              "succeeded": 1,
+              "failed": 0
+            },
+            "source": "live"
+          },
+          "duration": 50
+        },
+        {
+          "stepPath": "steps[1]",
+          "stepRunId": 2,
+          "stepType": "transform",
+          "status": "success",
+          "result": {
+            "output": [
+              "detail index=0 ok=true target={\"requestedSelector\":\"#field\",\"resolvedBy\":\"selector\",\"resolvedId\":\"n_c84617c33e7c33e3\"} view=state value={\"attributes\":{\"aria-label\":\"Search\",\"value\":\"initial\"},\"state\":{\"focused\":true,\"value\":\"updated\"},\"text\":\"\"}"
+            ]
+          },
+          "duration": 210
+        }
+      ],
+      "variables": {
+        "pageId": "f7f07a56-7f55-4ae3-a9b4-324149e4fa7a",
+        "succeeded": 1,
+        "detailSource": "live",
+        "detailLines": [
+          "detail index=0 ok=true target={\"requestedSelector\":\"#field\",\"resolvedBy\":\"selector\",\"resolvedId\":\"n_c84617c33e7c33e3\"} view=state value={\"attributes\":{\"aria-label\":\"Search\",\"value\":\"initial\"},\"state\":{\"focused\":true,\"value\":\"updated\"},\"text\":\"\"}"
+        ]
+      },
+      "store": {},
+      "storeRevision": 0,
+      "timing": {
+        "createdAt": 1791270055221,
+        "startedAt": 1791270055225,
+        "finishedAt": 1791270055552,
+        "durationMs": 327
+      }
+    },
+    "watch": {
+      "status": "changed",
+      "events": [
+        {
+          "watchId": "w_a585ce0adc95",
+          "nodeId": "n_0d4007126e2e7c89",
+          "change": "detail_changed",
+          "surface": "state",
+          "before": {
+            "ok": true,
+            "value": "{\"state\": {\"focused\": false}, \"text\": \"idle\"}",
+            "valueTruncated": false,
+            "valueSha256": "f2d986f0864e5cd8d52c08100963fddbbcb5198cf5fb145dc9fb83289b19ae58"
+          },
+          "after": {
+            "ok": true,
+            "value": "{\"state\": {\"focused\": false}, \"text\": \"finished\"}",
+            "valueTruncated": false,
+            "valueSha256": "32a29dea0604d9152306b24784c861b7aa792306945541a34c259cafe01051c5"
+          },
+          "sampledAt": "2026-10-06T07:00:58.108801+00:00"
+        }
+      ],
+      "observationEvidence": {
+        "sampleCount": 1,
+        "firstSampleAt": "2026-10-06T07:00:58.108801+00:00",
+        "lastSampleAt": "2026-10-06T07:00:58.108801+00:00",
+        "lastSamples": {
+          "state:n_0d4007126e2e7c89": {
+            "ok": true,
+            "value": "{\"state\": {\"focused\": false}, \"text\": \"finished\"}",
+            "valueTruncated": false,
+            "valueSha256": "32a29dea0604d9152306b24784c861b7aa792306945541a34c259cafe01051c5"
+          }
+        },
+        "probeErrorCount": 0
+      },
+      "watchId": "w_a585ce0adc95",
+      "watchedIds": [
+        "n_0d4007126e2e7c89"
+      ],
+      "resolvedFrom": "ids",
+      "closed": true
+    },
+    "scrollState": {
+      "mode": "delta",
+      "input": {
+        "completed": true
+      },
+      "observation": {
+        "status": "stable"
+      },
+      "goal": {
+        "status": "not-requested"
+      },
+      "completedReason": "state-read",
+      "requestedDelta": {
+        "x": 0,
+        "y": 0
+      },
+      "observedDelta": {
+        "x": 0,
+        "y": 0
+      },
+      "totalDelta": {
+        "x": 0,
+        "y": 0
+      },
+      "position": {
+        "x": 0,
+        "y": 0
+      },
+      "extent": {
+        "width": 1209,
+        "height": 1739
+      },
+      "frameDepth": 0,
+      "layers": [
+        {
+          "kind": "viewport",
+          "position": {
+            "x": 0,
+            "y": 0
+          },
+          "extent": {
+            "width": 1209,
+            "height": 1739
+          },
+          "delta": {
+            "x": 0,
+            "y": 0
+          }
+        }
+      ],
+      "resolution": {}
+    },
+    "screenshot": {
+      "pageId": "f7f07a56-7f55-4ae3-a9b4-324149e4fa7a",
+      "path": "/tmp/screenshot_1791270061268_29e43c55.png",
+      "mimeType": "image/png",
+      "width": 1224,
+      "height": 725,
+      "scaleFactor": 2,
+      "target": {},
+      "mode": "viewport"
+    },
+    "screenshotCoordinateBracket": "passed"
+  }
+}

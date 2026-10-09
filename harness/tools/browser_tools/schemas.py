@@ -5,6 +5,7 @@ from typing import Dict, Tuple
 from harness.utils import JsonDict
 from harness.workflow.workflow_policy import listenable_events
 from harness.workflow.workflow_schema_source import platform_constraints, workflow_contract
+from harness.workflow.script_runtime import script_tool_schema
 
 
 def _workflow_condition_schema() -> JsonDict:
@@ -116,7 +117,7 @@ def _workflow_step_definitions() -> JsonDict:
         "description": (
             "Map workflow variable names to dot paths in the Action's data"
             " (`url`, not `data.url`) or the event result. Inside Workflow.execute,"
-            " DOM.getAXTree returns the platform's raw artifact reference: a"
+            " DOM.getAXTree and DOM.getDetails return raw artifact references: a"
             " detail query has summary and artifact but no records array."
             " Standalone browser_call may show data.records after Harness"
             " hydration; do not use `records` as a workflow extract path."
@@ -472,7 +473,7 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
             "required": ["method", "params", "reason"],
             "additionalProperties": False,
         },
-        "execute_browser_workflow": {
+        "execute_browser_workflow": script_tool_schema() if "workflow" in workflow_contract().execute_properties else {
             "type": "object",
             "$defs": _workflow_step_definitions(),
             "properties": {

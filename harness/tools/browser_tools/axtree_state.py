@@ -326,7 +326,7 @@ def _check_stale_axtree_target(
     *,
     allow_rematch: bool = False,
 ) -> Optional[JsonDict]:
-    if method == "DOM.getAXTree" or not isinstance(params, dict):
+    if method in {"DOM.getAXTree", "DOM.getDetails"} or not isinstance(params, dict):
         return None
     target_ids = _axtree_ids_from_params(params)
     if not target_ids:
@@ -586,14 +586,16 @@ def _observe_axtree_state_after(
     page_before: Optional[str] = None,
 ) -> None:
     _observe_page_url(agent, params, result)
-    if method == "DOM.getAXTree" and _response_data(result).get("mode") == "detail":
+    if method == "DOM.getDetails":
         data = _response_data(result)
         page_id = str(params.get("pageId") or "")
         observation = data.get("observation") or {}
         document_epoch = str(observation.get("documentEpoch") or "")
         serial = int(getattr(agent, "axtree_event_serial", 0) or 0)
         if (not page_id or str(data.get("pageId") or page_id) != page_id
+                or data.get("source") != "live"
                 or not document_epoch or data.get("observationError")
+                or observation.get("pendingChanges") is True
                 or observation.get("freshness") not in {None, "current"}
                 or (event_serial_before is not None and serial != event_serial_before)):
             return
@@ -602,6 +604,10 @@ def _observe_axtree_state_after(
         for record in data.get("records") or []:
             if isinstance(record, dict) and record.get("ok") is True:
                 ids.update(_axtree_ids_from_value(record.get("value")))
+                target = record.get("target") or {}
+                resolved = str(target.get("resolvedId") or "")
+                if AXTREE_ID_RE.fullmatch(resolved):
+                    ids.add(resolved)
         if ids:
             details = getattr(agent, "axtree_detail_targets", None)
             if not isinstance(details, dict):
@@ -610,7 +616,10 @@ def _observe_axtree_state_after(
             if old_epoch and old_epoch != document_epoch:
                 _invalidate_axtree_snapshot(agent, "Page.recovered", {"pageId": page_id})
                 agent.axtree_ids = set()
-            _record_axtree_history(agent, page_id, [], ids, document_epoch=document_epoch)
+            _record_axtree_history(
+                agent, page_id, [], ids,
+                document_epoch=document_epoch, partial=True,
+            )
             details[page_id] = {
                 "ids": ids, "documentEpoch": document_epoch,
                 "eventSerial": serial,
@@ -750,6 +759,7 @@ def _record_axtree_history(
     ids: Set[str],
     *,
     document_epoch: str = "",
+    partial: bool = False,
 ) -> None:
     """Keep a bounded per-page history of recent snapshot ids with their
     role/name signatures, for the CURRENT document only.
@@ -759,7 +769,8 @@ def _record_axtree_history(
     stale guard uses it to tell "id this document has shown" (the platform
     resolves it, or reports it removed) from "id we never saw" (always
     blocked), and rematch validation uses the signatures even after the live
-    snapshot has been invalidated."""
+    snapshot has been invalidated. Partial live queries enrich the latest
+    entry instead of consuming full-snapshot slots and evicting its ids."""
     if not page_id:
         return
     epochs_by_page = getattr(agent, "axtree_document_epochs", None)
@@ -786,6 +797,11 @@ def _record_axtree_history(
         history = {}
         agent.axtree_seen_history = history
     epochs = history.setdefault(page_id, [])
+    if partial and epochs:
+        for node_id, signature in signatures.items():
+            if signature or node_id not in epochs[-1]:
+                epochs[-1][node_id] = signature
+        return
     epochs.append(signatures)
     if len(epochs) > AXTREE_SEEN_EPOCH_LIMIT:
         del epochs[: len(epochs) - AXTREE_SEEN_EPOCH_LIMIT]

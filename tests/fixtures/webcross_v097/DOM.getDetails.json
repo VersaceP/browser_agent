@@ -1,0 +1,2284 @@
+{
+  "method": "DOM.getDetails",
+  "description": "Reads complete saved node details with version and nodeIds, or bounded live facts with query. The two forms are mutually exclusive. Read the returned details array directly.",
+  "requiresPurpose": true,
+  "catalogRevision": "sha256:4353ee6b25dd1c25bb33c594c8231a1d46faab7783a010b1092fd1c91582bd64",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "anyOf": [
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "The page that owns the saved observation."
+          },
+          "version": {
+            "type": "string",
+            "pattern": "^v_[0-9a-f]{16}_[0-9a-z]+$",
+            "description": "The saved observation version to read; this does not refresh live state."
+          },
+          "nodeIds": {
+            "minItems": 1,
+            "maxItems": 64,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^n_[0-9a-f]{16}$",
+              "description": "An opaque node ID from the current observation. Do not parse it."
+            },
+            "description": "Nodes whose complete saved details are needed, in result order."
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "State which saved values or current target facts are needed."
+          }
+        },
+        "required": [
+          "pageId",
+          "version",
+          "nodeIds",
+          "purpose"
+        ],
+        "additionalProperties": true
+      },
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "The page to query."
+          },
+          "query": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "view": {
+                    "type": "string",
+                    "const": "dom",
+                    "description": "Read DOM structure."
+                  },
+                  "targets": {
+                    "minItems": 1,
+                    "maxItems": 64,
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "pattern": "^n_[0-9a-f]{16}$",
+                          "description": "An opaque node ID from the current observation. Do not parse it."
+                        },
+                        "selector": {
+                          "description": "A selector fallback, accepted only when it uniquely matches in the current document.",
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "additionalProperties": true
+                    },
+                    "description": "Exact query targets in input order. Component members are not substituted."
+                  },
+                  "maxDepth": {
+                    "default": 12,
+                    "description": "Maximum DOM subtree depth.",
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 64
+                  },
+                  "includeShadowDom": {
+                    "default": true,
+                    "description": "Include observable Shadow DOM subtrees.",
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "view",
+                  "maxDepth",
+                  "includeShadowDom"
+                ],
+                "additionalProperties": true
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "view": {
+                    "type": "string",
+                    "const": "text",
+                    "description": "Read page text."
+                  },
+                  "targets": {
+                    "minItems": 1,
+                    "maxItems": 64,
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "pattern": "^n_[0-9a-f]{16}$",
+                          "description": "An opaque node ID from the current observation. Do not parse it."
+                        },
+                        "selector": {
+                          "description": "A selector fallback, accepted only when it uniquely matches in the current document.",
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "additionalProperties": true
+                    },
+                    "description": "Exact query targets in input order. Component members are not substituted."
+                  },
+                  "textMode": {
+                    "default": "rendered",
+                    "description": "Rendered text or DOM textContent.",
+                    "type": "string",
+                    "enum": [
+                      "rendered",
+                      "textContent"
+                    ]
+                  }
+                },
+                "required": [
+                  "view",
+                  "textMode"
+                ],
+                "additionalProperties": true
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "view": {
+                    "type": "string",
+                    "const": "attributes",
+                    "description": "Read HTML or ARIA attributes."
+                  },
+                  "targets": {
+                    "minItems": 1,
+                    "maxItems": 64,
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "pattern": "^n_[0-9a-f]{16}$",
+                          "description": "An opaque node ID from the current observation. Do not parse it."
+                        },
+                        "selector": {
+                          "description": "A selector fallback, accepted only when it uniquely matches in the current document.",
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "additionalProperties": true
+                    },
+                    "description": "Exact query targets in input order. Component members are not substituted."
+                  },
+                  "attributes": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "const": "*"
+                      },
+                      {
+                        "minItems": 1,
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      }
+                    ],
+                    "description": "Requested attributes, or * for every available attribute."
+                  }
+                },
+                "required": [
+                  "view",
+                  "targets",
+                  "attributes"
+                ],
+                "additionalProperties": true
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "view": {
+                    "type": "string",
+                    "const": "state",
+                    "description": "Read static value attributes and live control state."
+                  },
+                  "targets": {
+                    "minItems": 1,
+                    "maxItems": 64,
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "pattern": "^n_[0-9a-f]{16}$",
+                          "description": "An opaque node ID from the current observation. Do not parse it."
+                        },
+                        "selector": {
+                          "description": "A selector fallback, accepted only when it uniquely matches in the current document.",
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "additionalProperties": true
+                    },
+                    "description": "Exact query targets in input order. Component members are not substituted."
+                  }
+                },
+                "required": [
+                  "view",
+                  "targets"
+                ],
+                "additionalProperties": true
+              }
+            ],
+            "description": "A bounded live query for known targets."
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "State which saved values or current target facts are needed."
+          }
+        },
+        "required": [
+          "pageId",
+          "query",
+          "purpose"
+        ],
+        "additionalProperties": true
+      }
+    ]
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "oneOf": [
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "The page that owns this observation."
+          },
+          "mode": {
+            "type": "string",
+            "const": "detail",
+            "description": "A bounded target detail; it does not replace the current page view."
+          },
+          "documentEpoch": {
+            "type": "string",
+            "pattern": "^d_[0-9a-f]{32}$",
+            "description": "The document epoch that owns these details."
+          },
+          "capturedAt": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+            "description": "When the source values were captured."
+          },
+          "checkedAt": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+            "description": "When these details were collected."
+          },
+          "summary": {
+            "type": "object",
+            "properties": {
+              "total": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "The number of requested targets."
+              },
+              "succeeded": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "The number of successful targets."
+              },
+              "failed": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "The number of failed targets."
+              }
+            },
+            "required": [
+              "total",
+              "succeeded",
+              "failed"
+            ],
+            "additionalProperties": false,
+            "description": "Detail query totals."
+          },
+          "source": {
+            "type": "string",
+            "const": "snapshot",
+            "description": "Complete saved details from one observation version, not current live state."
+          },
+          "version": {
+            "type": "string",
+            "pattern": "^v_[0-9a-f]{16}_[0-9a-z]+$",
+            "description": "The saved observation version."
+          },
+          "details": {
+            "maxItems": 64,
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "index": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991,
+                      "description": "The node position in the requested order."
+                    },
+                    "view": {
+                      "type": "string",
+                      "const": "dom",
+                      "description": "The complete saved node view."
+                    },
+                    "target": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "pattern": "^n_[0-9a-f]{16}$",
+                          "description": "The requested saved node ID."
+                        }
+                      },
+                      "required": [
+                        "id"
+                      ],
+                      "additionalProperties": false,
+                      "description": "The requested saved node."
+                    },
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "Complete saved values are available for this node."
+                    },
+                    "nodeId": {
+                      "type": "string",
+                      "pattern": "^n_[0-9a-f]{16}$",
+                      "description": "The saved node identity."
+                    },
+                    "fields": {
+                      "minItems": 1,
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "pattern": "^\\/.*"
+                      },
+                      "description": "Field paths truncated in the complete page view."
+                    },
+                    "node": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "pattern": "^n_[0-9a-f]{16}$",
+                          "description": "An opaque node ID from the current observation. Do not parse it."
+                        },
+                        "frameId": {
+                          "type": "string",
+                          "pattern": "^f_[0-9a-f]{32}$",
+                          "description": "An opaque frame ID from the current observation. Do not pass it as an Action locator."
+                        },
+                        "kind": {
+                          "type": "string",
+                          "enum": [
+                            "element",
+                            "text",
+                            "ax-virtual",
+                            "shadow-root"
+                          ],
+                          "description": "The observed node kind."
+                        },
+                        "parent": {
+                          "anyOf": [
+                            {
+                              "type": "string",
+                              "pattern": "^n_[0-9a-f]{16}$",
+                              "description": "An opaque node ID from the current observation. Do not parse it."
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ],
+                          "description": "The DOM parent ID, or null for a root."
+                        },
+                        "children": {
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "pattern": "^n_[0-9a-f]{16}$",
+                            "description": "An opaque node ID from the current observation. Do not parse it."
+                          },
+                          "description": "DOM child IDs in document order."
+                        },
+                        "tag": {
+                          "description": "The HTML tag name.",
+                          "type": "string"
+                        },
+                        "role": {
+                          "description": "The accessibility role.",
+                          "type": "string"
+                        },
+                        "name": {
+                          "description": "The accessible name.",
+                          "type": "string"
+                        },
+                        "text": {
+                          "description": "The observed text content.",
+                          "type": "string"
+                        },
+                        "directText": {
+                          "description": "Text belonging directly to this element.",
+                          "type": "string"
+                        },
+                        "textValueControl": {
+                          "description": "Whether the node is a text value control.",
+                          "type": "boolean"
+                        },
+                        "generatedBefore": {
+                          "description": "Text generated before the element.",
+                          "type": "string"
+                        },
+                        "generatedAfter": {
+                          "description": "Text generated after the element.",
+                          "type": "string"
+                        },
+                        "generatedTextPosition": {
+                          "description": "The position of generated text relative to the element.",
+                          "type": "string",
+                          "enum": [
+                            "before",
+                            "after"
+                          ]
+                        },
+                        "description": {
+                          "description": "The accessible description.",
+                          "type": "string"
+                        },
+                        "ariaValueText": {
+                          "description": "The human-readable ARIA value.",
+                          "type": "string"
+                        },
+                        "backingNodeId": {
+                          "type": "string",
+                          "pattern": "^n_[0-9a-f]{16}$",
+                          "description": "An opaque node ID from the current observation. Do not parse it."
+                        },
+                        "ignored": {
+                          "description": "Whether accessibility observation ignores the node.",
+                          "type": "boolean"
+                        },
+                        "targetable": {
+                          "type": "boolean",
+                          "description": "Whether the node can be located in this observation."
+                        },
+                        "interaction": {
+                          "type": "string",
+                          "enum": [
+                            "actionable",
+                            "candidate",
+                            "none"
+                          ],
+                          "description": "The observed interaction capability; current action checks still apply."
+                        },
+                        "interactionSources": {
+                          "description": "Observed evidence of interaction capability.",
+                          "maxItems": 32,
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "minLength": 1
+                          }
+                        },
+                        "visibility": {
+                          "description": "The observed rendering and viewport visibility.",
+                          "type": "string",
+                          "enum": [
+                            "visible",
+                            "out-of-view",
+                            "not-rendered"
+                          ]
+                        },
+                        "bounds": {
+                          "description": "The observed element bounds.",
+                          "type": "object",
+                          "properties": {
+                            "x": {
+                              "type": "number",
+                              "description": "The left coordinate in CSS pixels."
+                            },
+                            "y": {
+                              "type": "number",
+                              "description": "The top coordinate in CSS pixels."
+                            },
+                            "width": {
+                              "type": "number",
+                              "minimum": 0,
+                              "description": "The width in CSS pixels."
+                            },
+                            "height": {
+                              "type": "number",
+                              "minimum": 0,
+                              "description": "The height in CSS pixels."
+                            }
+                          },
+                          "required": [
+                            "x",
+                            "y",
+                            "width",
+                            "height"
+                          ],
+                          "additionalProperties": false
+                        },
+                        "componentId": {
+                          "type": "string",
+                          "pattern": "^c_[0-9a-f]{16}$",
+                          "description": "A component display ID. It cannot target an Input action."
+                        },
+                        "presentation": {
+                          "type": "string",
+                          "enum": [
+                            "standalone",
+                            "component-primary",
+                            "component-member"
+                          ],
+                          "description": "The node role in the observed component structure."
+                        },
+                        "attributes": {
+                          "description": "Observed HTML and ARIA attribute values.",
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          }
+                        },
+                        "state": {
+                          "description": "Observed control state at capture time.",
+                          "type": "object",
+                          "properties": {
+                            "value": {
+                              "description": "The non-sensitive live control value at capture time.",
+                              "type": "string"
+                            },
+                            "valueRedacted": {
+                              "description": "Whether a sensitive value was hidden.",
+                              "type": "boolean"
+                            },
+                            "checked": {
+                              "description": "The observed checked state.",
+                              "anyOf": [
+                                {
+                                  "type": "boolean"
+                                },
+                                {
+                                  "type": "string",
+                                  "const": "mixed"
+                                }
+                              ]
+                            },
+                            "selected": {
+                              "description": "Whether the node was selected.",
+                              "type": "boolean"
+                            },
+                            "expanded": {
+                              "description": "Whether the controlled content was expanded.",
+                              "type": "boolean"
+                            },
+                            "disabled": {
+                              "description": "Whether the control was disabled.",
+                              "type": "boolean"
+                            },
+                            "readOnly": {
+                              "description": "Whether the control was read-only.",
+                              "type": "boolean"
+                            },
+                            "required": {
+                              "description": "Whether the control required a value.",
+                              "type": "boolean"
+                            },
+                            "focused": {
+                              "description": "Whether the node had focus.",
+                              "type": "boolean"
+                            },
+                            "invalid": {
+                              "description": "Whether the control value was invalid.",
+                              "type": "boolean"
+                            },
+                            "validationMessage": {
+                              "description": "The observed control validation message.",
+                              "type": "string"
+                            }
+                          },
+                          "additionalProperties": false
+                        },
+                        "relations": {
+                          "description": "Observed relationships to other nodes.",
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {
+                            "maxItems": 64,
+                            "type": "array",
+                            "items": {
+                              "anyOf": [
+                                {
+                                  "type": "object",
+                                  "properties": {
+                                    "id": {
+                                      "type": "string",
+                                      "pattern": "^n_[0-9a-f]{16}$",
+                                      "description": "An opaque node ID from the current observation. Do not parse it."
+                                    },
+                                    "inView": {
+                                      "type": "boolean",
+                                      "description": "Whether the related node is in the observation view."
+                                    }
+                                  },
+                                  "required": [
+                                    "id",
+                                    "inView"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            }
+                          }
+                        },
+                        "componentEvidence": {
+                          "description": "Observed evidence for component relationships.",
+                          "maxItems": 64,
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "relation": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "The relationship supporting component membership."
+                              },
+                              "targetId": {
+                                "type": "string",
+                                "pattern": "^n_[0-9a-f]{16}$",
+                                "description": "An opaque node ID from the current observation. Do not parse it."
+                              },
+                              "confidence": {
+                                "type": "number",
+                                "minimum": 0,
+                                "maximum": 1,
+                                "description": "The confidence of this component relationship."
+                              }
+                            },
+                            "required": [
+                              "relation",
+                              "targetId",
+                              "confidence"
+                            ],
+                            "additionalProperties": false
+                          }
+                        },
+                        "scroll": {
+                          "description": "Observed scrolling dimensions and offsets.",
+                          "type": "object",
+                          "properties": {
+                            "left": {
+                              "type": "number",
+                              "description": "The horizontal scroll offset in CSS pixels."
+                            },
+                            "top": {
+                              "type": "number",
+                              "description": "The vertical scroll offset in CSS pixels."
+                            },
+                            "width": {
+                              "type": "number",
+                              "minimum": 0,
+                              "description": "The scrollable content width in CSS pixels."
+                            },
+                            "height": {
+                              "type": "number",
+                              "minimum": 0,
+                              "description": "The scrollable content height in CSS pixels."
+                            },
+                            "clientWidth": {
+                              "type": "number",
+                              "minimum": 0,
+                              "description": "The visible scroll area width in CSS pixels."
+                            },
+                            "clientHeight": {
+                              "type": "number",
+                              "minimum": 0,
+                              "description": "The visible scroll area height in CSS pixels."
+                            }
+                          },
+                          "required": [
+                            "left",
+                            "top",
+                            "width",
+                            "height",
+                            "clientWidth",
+                            "clientHeight"
+                          ],
+                          "additionalProperties": false
+                        },
+                        "truncatedFields": {
+                          "description": "Field paths whose values were truncated in the observed view.",
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "frameId",
+                        "kind",
+                        "parent",
+                        "children",
+                        "targetable",
+                        "interaction",
+                        "presentation"
+                      ],
+                      "additionalProperties": false,
+                      "description": "The complete public-safe saved node."
+                    }
+                  },
+                  "required": [
+                    "index",
+                    "view",
+                    "target",
+                    "ok",
+                    "nodeId",
+                    "fields",
+                    "node"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "index": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991,
+                      "description": "The node position in the requested order."
+                    },
+                    "view": {
+                      "type": "string",
+                      "const": "dom",
+                      "description": "The complete saved node view."
+                    },
+                    "target": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "pattern": "^n_[0-9a-f]{16}$",
+                          "description": "The requested saved node ID."
+                        }
+                      },
+                      "required": [
+                        "id"
+                      ],
+                      "additionalProperties": false,
+                      "description": "The requested saved node."
+                    },
+                    "ok": {
+                      "type": "boolean",
+                      "const": false,
+                      "description": "No complete saved detail is available for this node."
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "The target detail failure code."
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Why this target detail is unavailable."
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message"
+                      ],
+                      "additionalProperties": {
+                        "$ref": "#/$defs/__schema0"
+                      },
+                      "description": "A failure for one requested target."
+                    }
+                  },
+                  "required": [
+                    "index",
+                    "view",
+                    "target",
+                    "ok",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "description": "Saved details in the requested order, including duplicates and failures."
+          }
+        },
+        "required": [
+          "pageId",
+          "mode",
+          "documentEpoch",
+          "capturedAt",
+          "checkedAt",
+          "summary",
+          "source",
+          "version",
+          "details"
+        ],
+        "additionalProperties": false
+      },
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "The page that owns this observation."
+          },
+          "mode": {
+            "type": "string",
+            "const": "detail",
+            "description": "A bounded target detail; it does not replace the current page view."
+          },
+          "documentEpoch": {
+            "type": "string",
+            "pattern": "^d_[0-9a-f]{32}$",
+            "description": "The document epoch that owns these details."
+          },
+          "capturedAt": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+            "description": "When the source values were captured."
+          },
+          "checkedAt": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+            "description": "When these details were collected."
+          },
+          "summary": {
+            "type": "object",
+            "properties": {
+              "total": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "The number of requested targets."
+              },
+              "succeeded": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "The number of successful targets."
+              },
+              "failed": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "The number of failed targets."
+              }
+            },
+            "required": [
+              "total",
+              "succeeded",
+              "failed"
+            ],
+            "additionalProperties": false,
+            "description": "Detail query totals."
+          },
+          "source": {
+            "type": "string",
+            "const": "live",
+            "description": "Target facts collected by this live query."
+          },
+          "completeness": {
+            "type": "string",
+            "enum": [
+              "complete",
+              "partial"
+            ],
+            "description": "Whether every accessible frame was observed."
+          },
+          "pendingChanges": {
+            "type": "boolean",
+            "description": "Whether more page changes remain pending."
+          },
+          "details": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "index": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991,
+                      "description": "The target position in the requested order."
+                    },
+                    "view": {
+                      "type": "string",
+                      "enum": [
+                        "dom",
+                        "text",
+                        "attributes",
+                        "state"
+                      ],
+                      "description": "The requested detail view."
+                    },
+                    "target": {
+                      "description": "The requested target and its live resolution.",
+                      "type": "object",
+                      "properties": {
+                        "requestedId": {
+                          "description": "The requested public node ID.",
+                          "type": "string",
+                          "pattern": "^n_[0-9a-f]{16}$"
+                        },
+                        "requestedSelector": {
+                          "description": "The requested selector.",
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "resolvedId": {
+                          "description": "The public node ID resolved by this query.",
+                          "type": "string",
+                          "pattern": "^n_[0-9a-f]{16}$"
+                        },
+                        "resolvedBy": {
+                          "description": "How this live target was resolved.",
+                          "type": "string",
+                          "enum": [
+                            "id",
+                            "selector",
+                            "selector-fallback"
+                          ]
+                        }
+                      },
+                      "additionalProperties": false
+                    },
+                    "ok": {
+                      "type": "boolean",
+                      "const": true,
+                      "description": "This target was queried successfully."
+                    },
+                    "value": {
+                      "description": "The normalized DOM, text, attributes, or state value.",
+                      "$ref": "#/$defs/__schema1"
+                    },
+                    "relations": {
+                      "description": "The target relationships reported by the query.",
+                      "type": "object",
+                      "propertyNames": {
+                        "type": "string"
+                      },
+                      "additionalProperties": {
+                        "maxItems": 64,
+                        "type": "array",
+                        "items": {
+                          "anyOf": [
+                            {
+                              "type": "object",
+                              "properties": {
+                                "id": {
+                                  "type": "string",
+                                  "pattern": "^n_[0-9a-f]{16}$",
+                                  "description": "The related public node ID."
+                                },
+                                "inView": {
+                                  "type": "boolean",
+                                  "description": "Whether the related node is in the query view."
+                                }
+                              },
+                              "required": [
+                                "id",
+                                "inView"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    "truncatedFields": {
+                      "description": "Field paths already truncated by the native query.",
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "pattern": "^\\/.*"
+                      }
+                    }
+                  },
+                  "required": [
+                    "index",
+                    "view",
+                    "ok"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "index": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991,
+                      "description": "The target position in the requested order."
+                    },
+                    "view": {
+                      "type": "string",
+                      "enum": [
+                        "dom",
+                        "text",
+                        "attributes",
+                        "state"
+                      ],
+                      "description": "The requested detail view."
+                    },
+                    "target": {
+                      "description": "The requested target and its live resolution.",
+                      "type": "object",
+                      "properties": {
+                        "requestedId": {
+                          "description": "The requested public node ID.",
+                          "type": "string",
+                          "pattern": "^n_[0-9a-f]{16}$"
+                        },
+                        "requestedSelector": {
+                          "description": "The requested selector.",
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "resolvedId": {
+                          "description": "The public node ID resolved by this query.",
+                          "type": "string",
+                          "pattern": "^n_[0-9a-f]{16}$"
+                        },
+                        "resolvedBy": {
+                          "description": "How this live target was resolved.",
+                          "type": "string",
+                          "enum": [
+                            "id",
+                            "selector",
+                            "selector-fallback"
+                          ]
+                        }
+                      },
+                      "additionalProperties": false
+                    },
+                    "ok": {
+                      "type": "boolean",
+                      "const": false,
+                      "description": "This target detail is unavailable."
+                    },
+                    "error": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "The target detail failure code."
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Why this target detail is unavailable."
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message"
+                      ],
+                      "additionalProperties": {
+                        "$ref": "#/$defs/__schema0"
+                      },
+                      "description": "A failure for one requested target."
+                    }
+                  },
+                  "required": [
+                    "index",
+                    "view",
+                    "ok",
+                    "error"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "description": "Normalized live facts in target order, including individual failures."
+          }
+        },
+        "required": [
+          "pageId",
+          "mode",
+          "documentEpoch",
+          "capturedAt",
+          "checkedAt",
+          "summary",
+          "source",
+          "completeness",
+          "pendingChanges",
+          "details"
+        ],
+        "additionalProperties": false
+      }
+    ],
+    "$defs": {
+      "__schema0": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "number"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/__schema0"
+            }
+          },
+          {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {
+              "$ref": "#/$defs/__schema0"
+            }
+          }
+        ]
+      },
+      "__schema1": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "number"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/__schema1"
+            }
+          },
+          {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {
+              "$ref": "#/$defs/__schema1"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Facts directly observed by the Action or returned by its declared result schema."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "data": {
+        "description": "Validated business result returned by the Action.",
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "pageId": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                "description": "The page that owns this observation."
+              },
+              "mode": {
+                "type": "string",
+                "const": "detail",
+                "description": "A bounded target detail; it does not replace the current page view."
+              },
+              "documentEpoch": {
+                "type": "string",
+                "pattern": "^d_[0-9a-f]{32}$",
+                "description": "The document epoch that owns these details."
+              },
+              "capturedAt": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+                "description": "When the source values were captured."
+              },
+              "checkedAt": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+                "description": "When these details were collected."
+              },
+              "summary": {
+                "type": "object",
+                "properties": {
+                  "total": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991,
+                    "description": "The number of requested targets."
+                  },
+                  "succeeded": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991,
+                    "description": "The number of successful targets."
+                  },
+                  "failed": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991,
+                    "description": "The number of failed targets."
+                  }
+                },
+                "required": [
+                  "total",
+                  "succeeded",
+                  "failed"
+                ],
+                "additionalProperties": false,
+                "description": "Detail query totals."
+              },
+              "source": {
+                "type": "string",
+                "const": "snapshot",
+                "description": "Complete saved details from one observation version, not current live state."
+              },
+              "version": {
+                "type": "string",
+                "pattern": "^v_[0-9a-f]{16}_[0-9a-z]+$",
+                "description": "The saved observation version."
+              },
+              "details": {
+                "maxItems": 64,
+                "type": "array",
+                "items": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "index": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991,
+                          "description": "The node position in the requested order."
+                        },
+                        "view": {
+                          "type": "string",
+                          "const": "dom",
+                          "description": "The complete saved node view."
+                        },
+                        "target": {
+                          "type": "object",
+                          "properties": {
+                            "id": {
+                              "type": "string",
+                              "pattern": "^n_[0-9a-f]{16}$",
+                              "description": "The requested saved node ID."
+                            }
+                          },
+                          "required": [
+                            "id"
+                          ],
+                          "additionalProperties": false,
+                          "description": "The requested saved node."
+                        },
+                        "ok": {
+                          "type": "boolean",
+                          "const": true,
+                          "description": "Complete saved values are available for this node."
+                        },
+                        "nodeId": {
+                          "type": "string",
+                          "pattern": "^n_[0-9a-f]{16}$",
+                          "description": "The saved node identity."
+                        },
+                        "fields": {
+                          "minItems": 1,
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "pattern": "^\\/.*"
+                          },
+                          "description": "Field paths truncated in the complete page view."
+                        },
+                        "node": {
+                          "type": "object",
+                          "properties": {
+                            "id": {
+                              "type": "string",
+                              "pattern": "^n_[0-9a-f]{16}$",
+                              "description": "An opaque node ID from the current observation. Do not parse it."
+                            },
+                            "frameId": {
+                              "type": "string",
+                              "pattern": "^f_[0-9a-f]{32}$",
+                              "description": "An opaque frame ID from the current observation. Do not pass it as an Action locator."
+                            },
+                            "kind": {
+                              "type": "string",
+                              "enum": [
+                                "element",
+                                "text",
+                                "ax-virtual",
+                                "shadow-root"
+                              ],
+                              "description": "The observed node kind."
+                            },
+                            "parent": {
+                              "anyOf": [
+                                {
+                                  "type": "string",
+                                  "pattern": "^n_[0-9a-f]{16}$",
+                                  "description": "An opaque node ID from the current observation. Do not parse it."
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ],
+                              "description": "The DOM parent ID, or null for a root."
+                            },
+                            "children": {
+                              "type": "array",
+                              "items": {
+                                "type": "string",
+                                "pattern": "^n_[0-9a-f]{16}$",
+                                "description": "An opaque node ID from the current observation. Do not parse it."
+                              },
+                              "description": "DOM child IDs in document order."
+                            },
+                            "tag": {
+                              "description": "The HTML tag name.",
+                              "type": "string"
+                            },
+                            "role": {
+                              "description": "The accessibility role.",
+                              "type": "string"
+                            },
+                            "name": {
+                              "description": "The accessible name.",
+                              "type": "string"
+                            },
+                            "text": {
+                              "description": "The observed text content.",
+                              "type": "string"
+                            },
+                            "directText": {
+                              "description": "Text belonging directly to this element.",
+                              "type": "string"
+                            },
+                            "textValueControl": {
+                              "description": "Whether the node is a text value control.",
+                              "type": "boolean"
+                            },
+                            "generatedBefore": {
+                              "description": "Text generated before the element.",
+                              "type": "string"
+                            },
+                            "generatedAfter": {
+                              "description": "Text generated after the element.",
+                              "type": "string"
+                            },
+                            "generatedTextPosition": {
+                              "description": "The position of generated text relative to the element.",
+                              "type": "string",
+                              "enum": [
+                                "before",
+                                "after"
+                              ]
+                            },
+                            "description": {
+                              "description": "The accessible description.",
+                              "type": "string"
+                            },
+                            "ariaValueText": {
+                              "description": "The human-readable ARIA value.",
+                              "type": "string"
+                            },
+                            "backingNodeId": {
+                              "type": "string",
+                              "pattern": "^n_[0-9a-f]{16}$",
+                              "description": "An opaque node ID from the current observation. Do not parse it."
+                            },
+                            "ignored": {
+                              "description": "Whether accessibility observation ignores the node.",
+                              "type": "boolean"
+                            },
+                            "targetable": {
+                              "type": "boolean",
+                              "description": "Whether the node can be located in this observation."
+                            },
+                            "interaction": {
+                              "type": "string",
+                              "enum": [
+                                "actionable",
+                                "candidate",
+                                "none"
+                              ],
+                              "description": "The observed interaction capability; current action checks still apply."
+                            },
+                            "interactionSources": {
+                              "description": "Observed evidence of interaction capability.",
+                              "maxItems": 32,
+                              "type": "array",
+                              "items": {
+                                "type": "string",
+                                "minLength": 1
+                              }
+                            },
+                            "visibility": {
+                              "description": "The observed rendering and viewport visibility.",
+                              "type": "string",
+                              "enum": [
+                                "visible",
+                                "out-of-view",
+                                "not-rendered"
+                              ]
+                            },
+                            "bounds": {
+                              "description": "The observed element bounds.",
+                              "type": "object",
+                              "properties": {
+                                "x": {
+                                  "type": "number",
+                                  "description": "The left coordinate in CSS pixels."
+                                },
+                                "y": {
+                                  "type": "number",
+                                  "description": "The top coordinate in CSS pixels."
+                                },
+                                "width": {
+                                  "type": "number",
+                                  "minimum": 0,
+                                  "description": "The width in CSS pixels."
+                                },
+                                "height": {
+                                  "type": "number",
+                                  "minimum": 0,
+                                  "description": "The height in CSS pixels."
+                                }
+                              },
+                              "required": [
+                                "x",
+                                "y",
+                                "width",
+                                "height"
+                              ],
+                              "additionalProperties": false
+                            },
+                            "componentId": {
+                              "type": "string",
+                              "pattern": "^c_[0-9a-f]{16}$",
+                              "description": "A component display ID. It cannot target an Input action."
+                            },
+                            "presentation": {
+                              "type": "string",
+                              "enum": [
+                                "standalone",
+                                "component-primary",
+                                "component-member"
+                              ],
+                              "description": "The node role in the observed component structure."
+                            },
+                            "attributes": {
+                              "description": "Observed HTML and ARIA attribute values.",
+                              "type": "object",
+                              "propertyNames": {
+                                "type": "string"
+                              },
+                              "additionalProperties": {
+                                "anyOf": [
+                                  {
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              }
+                            },
+                            "state": {
+                              "description": "Observed control state at capture time.",
+                              "type": "object",
+                              "properties": {
+                                "value": {
+                                  "description": "The non-sensitive live control value at capture time.",
+                                  "type": "string"
+                                },
+                                "valueRedacted": {
+                                  "description": "Whether a sensitive value was hidden.",
+                                  "type": "boolean"
+                                },
+                                "checked": {
+                                  "description": "The observed checked state.",
+                                  "anyOf": [
+                                    {
+                                      "type": "boolean"
+                                    },
+                                    {
+                                      "type": "string",
+                                      "const": "mixed"
+                                    }
+                                  ]
+                                },
+                                "selected": {
+                                  "description": "Whether the node was selected.",
+                                  "type": "boolean"
+                                },
+                                "expanded": {
+                                  "description": "Whether the controlled content was expanded.",
+                                  "type": "boolean"
+                                },
+                                "disabled": {
+                                  "description": "Whether the control was disabled.",
+                                  "type": "boolean"
+                                },
+                                "readOnly": {
+                                  "description": "Whether the control was read-only.",
+                                  "type": "boolean"
+                                },
+                                "required": {
+                                  "description": "Whether the control required a value.",
+                                  "type": "boolean"
+                                },
+                                "focused": {
+                                  "description": "Whether the node had focus.",
+                                  "type": "boolean"
+                                },
+                                "invalid": {
+                                  "description": "Whether the control value was invalid.",
+                                  "type": "boolean"
+                                },
+                                "validationMessage": {
+                                  "description": "The observed control validation message.",
+                                  "type": "string"
+                                }
+                              },
+                              "additionalProperties": false
+                            },
+                            "relations": {
+                              "description": "Observed relationships to other nodes.",
+                              "type": "object",
+                              "propertyNames": {
+                                "type": "string"
+                              },
+                              "additionalProperties": {
+                                "maxItems": 64,
+                                "type": "array",
+                                "items": {
+                                  "anyOf": [
+                                    {
+                                      "type": "object",
+                                      "properties": {
+                                        "id": {
+                                          "type": "string",
+                                          "pattern": "^n_[0-9a-f]{16}$",
+                                          "description": "An opaque node ID from the current observation. Do not parse it."
+                                        },
+                                        "inView": {
+                                          "type": "boolean",
+                                          "description": "Whether the related node is in the observation view."
+                                        }
+                                      },
+                                      "required": [
+                                        "id",
+                                        "inView"
+                                      ],
+                                      "additionalProperties": false
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                }
+                              }
+                            },
+                            "componentEvidence": {
+                              "description": "Observed evidence for component relationships.",
+                              "maxItems": 64,
+                              "type": "array",
+                              "items": {
+                                "type": "object",
+                                "properties": {
+                                  "relation": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "description": "The relationship supporting component membership."
+                                  },
+                                  "targetId": {
+                                    "type": "string",
+                                    "pattern": "^n_[0-9a-f]{16}$",
+                                    "description": "An opaque node ID from the current observation. Do not parse it."
+                                  },
+                                  "confidence": {
+                                    "type": "number",
+                                    "minimum": 0,
+                                    "maximum": 1,
+                                    "description": "The confidence of this component relationship."
+                                  }
+                                },
+                                "required": [
+                                  "relation",
+                                  "targetId",
+                                  "confidence"
+                                ],
+                                "additionalProperties": false
+                              }
+                            },
+                            "scroll": {
+                              "description": "Observed scrolling dimensions and offsets.",
+                              "type": "object",
+                              "properties": {
+                                "left": {
+                                  "type": "number",
+                                  "description": "The horizontal scroll offset in CSS pixels."
+                                },
+                                "top": {
+                                  "type": "number",
+                                  "description": "The vertical scroll offset in CSS pixels."
+                                },
+                                "width": {
+                                  "type": "number",
+                                  "minimum": 0,
+                                  "description": "The scrollable content width in CSS pixels."
+                                },
+                                "height": {
+                                  "type": "number",
+                                  "minimum": 0,
+                                  "description": "The scrollable content height in CSS pixels."
+                                },
+                                "clientWidth": {
+                                  "type": "number",
+                                  "minimum": 0,
+                                  "description": "The visible scroll area width in CSS pixels."
+                                },
+                                "clientHeight": {
+                                  "type": "number",
+                                  "minimum": 0,
+                                  "description": "The visible scroll area height in CSS pixels."
+                                }
+                              },
+                              "required": [
+                                "left",
+                                "top",
+                                "width",
+                                "height",
+                                "clientWidth",
+                                "clientHeight"
+                              ],
+                              "additionalProperties": false
+                            },
+                            "truncatedFields": {
+                              "description": "Field paths whose values were truncated in the observed view.",
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            }
+                          },
+                          "required": [
+                            "id",
+                            "frameId",
+                            "kind",
+                            "parent",
+                            "children",
+                            "targetable",
+                            "interaction",
+                            "presentation"
+                          ],
+                          "additionalProperties": false,
+                          "description": "The complete public-safe saved node."
+                        }
+                      },
+                      "required": [
+                        "index",
+                        "view",
+                        "target",
+                        "ok",
+                        "nodeId",
+                        "fields",
+                        "node"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "index": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991,
+                          "description": "The node position in the requested order."
+                        },
+                        "view": {
+                          "type": "string",
+                          "const": "dom",
+                          "description": "The complete saved node view."
+                        },
+                        "target": {
+                          "type": "object",
+                          "properties": {
+                            "id": {
+                              "type": "string",
+                              "pattern": "^n_[0-9a-f]{16}$",
+                              "description": "The requested saved node ID."
+                            }
+                          },
+                          "required": [
+                            "id"
+                          ],
+                          "additionalProperties": false,
+                          "description": "The requested saved node."
+                        },
+                        "ok": {
+                          "type": "boolean",
+                          "const": false,
+                          "description": "No complete saved detail is available for this node."
+                        },
+                        "error": {
+                          "type": "object",
+                          "properties": {
+                            "code": {
+                              "type": "string",
+                              "minLength": 1,
+                              "description": "The target detail failure code."
+                            },
+                            "message": {
+                              "type": "string",
+                              "minLength": 1,
+                              "description": "Why this target detail is unavailable."
+                            }
+                          },
+                          "required": [
+                            "code",
+                            "message"
+                          ],
+                          "additionalProperties": {
+                            "$ref": "#/$defs/__schema0"
+                          },
+                          "description": "A failure for one requested target."
+                        }
+                      },
+                      "required": [
+                        "index",
+                        "view",
+                        "target",
+                        "ok",
+                        "error"
+                      ],
+                      "additionalProperties": false
+                    }
+                  ]
+                },
+                "description": "Saved details in the requested order, including duplicates and failures."
+              }
+            },
+            "required": [
+              "pageId",
+              "mode",
+              "documentEpoch",
+              "capturedAt",
+              "checkedAt",
+              "summary",
+              "source",
+              "version",
+              "details"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "pageId": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                "description": "The page that owns this observation."
+              },
+              "mode": {
+                "type": "string",
+                "const": "detail",
+                "description": "A bounded target detail; it does not replace the current page view."
+              },
+              "documentEpoch": {
+                "type": "string",
+                "pattern": "^d_[0-9a-f]{32}$",
+                "description": "The document epoch that owns these details."
+              },
+              "capturedAt": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+                "description": "When the source values were captured."
+              },
+              "checkedAt": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+                "description": "When these details were collected."
+              },
+              "summary": {
+                "type": "object",
+                "properties": {
+                  "total": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991,
+                    "description": "The number of requested targets."
+                  },
+                  "succeeded": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991,
+                    "description": "The number of successful targets."
+                  },
+                  "failed": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991,
+                    "description": "The number of failed targets."
+                  }
+                },
+                "required": [
+                  "total",
+                  "succeeded",
+                  "failed"
+                ],
+                "additionalProperties": false,
+                "description": "Detail query totals."
+              },
+              "source": {
+                "type": "string",
+                "const": "live",
+                "description": "Target facts collected by this live query."
+              },
+              "completeness": {
+                "type": "string",
+                "enum": [
+                  "complete",
+                  "partial"
+                ],
+                "description": "Whether every accessible frame was observed."
+              },
+              "pendingChanges": {
+                "type": "boolean",
+                "description": "Whether more page changes remain pending."
+              },
+              "details": {
+                "type": "array",
+                "items": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "index": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991,
+                          "description": "The target position in the requested order."
+                        },
+                        "view": {
+                          "type": "string",
+                          "enum": [
+                            "dom",
+                            "text",
+                            "attributes",
+                            "state"
+                          ],
+                          "description": "The requested detail view."
+                        },
+                        "target": {
+                          "description": "The requested target and its live resolution.",
+                          "type": "object",
+                          "properties": {
+                            "requestedId": {
+                              "description": "The requested public node ID.",
+                              "type": "string",
+                              "pattern": "^n_[0-9a-f]{16}$"
+                            },
+                            "requestedSelector": {
+                              "description": "The requested selector.",
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            "resolvedId": {
+                              "description": "The public node ID resolved by this query.",
+                              "type": "string",
+                              "pattern": "^n_[0-9a-f]{16}$"
+                            },
+                            "resolvedBy": {
+                              "description": "How this live target was resolved.",
+                              "type": "string",
+                              "enum": [
+                                "id",
+                                "selector",
+                                "selector-fallback"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false
+                        },
+                        "ok": {
+                          "type": "boolean",
+                          "const": true,
+                          "description": "This target was queried successfully."
+                        },
+                        "value": {
+                          "description": "The normalized DOM, text, attributes, or state value.",
+                          "$ref": "#/$defs/__schema1"
+                        },
+                        "relations": {
+                          "description": "The target relationships reported by the query.",
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {
+                            "maxItems": 64,
+                            "type": "array",
+                            "items": {
+                              "anyOf": [
+                                {
+                                  "type": "object",
+                                  "properties": {
+                                    "id": {
+                                      "type": "string",
+                                      "pattern": "^n_[0-9a-f]{16}$",
+                                      "description": "The related public node ID."
+                                    },
+                                    "inView": {
+                                      "type": "boolean",
+                                      "description": "Whether the related node is in the query view."
+                                    }
+                                  },
+                                  "required": [
+                                    "id",
+                                    "inView"
+                                  ],
+                                  "additionalProperties": false
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            }
+                          }
+                        },
+                        "truncatedFields": {
+                          "description": "Field paths already truncated by the native query.",
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "pattern": "^\\/.*"
+                          }
+                        }
+                      },
+                      "required": [
+                        "index",
+                        "view",
+                        "ok"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "index": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991,
+                          "description": "The target position in the requested order."
+                        },
+                        "view": {
+                          "type": "string",
+                          "enum": [
+                            "dom",
+                            "text",
+                            "attributes",
+                            "state"
+                          ],
+                          "description": "The requested detail view."
+                        },
+                        "target": {
+                          "description": "The requested target and its live resolution.",
+                          "type": "object",
+                          "properties": {
+                            "requestedId": {
+                              "description": "The requested public node ID.",
+                              "type": "string",
+                              "pattern": "^n_[0-9a-f]{16}$"
+                            },
+                            "requestedSelector": {
+                              "description": "The requested selector.",
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            "resolvedId": {
+                              "description": "The public node ID resolved by this query.",
+                              "type": "string",
+                              "pattern": "^n_[0-9a-f]{16}$"
+                            },
+                            "resolvedBy": {
+                              "description": "How this live target was resolved.",
+                              "type": "string",
+                              "enum": [
+                                "id",
+                                "selector",
+                                "selector-fallback"
+                              ]
+                            }
+                          },
+                          "additionalProperties": false
+                        },
+                        "ok": {
+                          "type": "boolean",
+                          "const": false,
+                          "description": "This target detail is unavailable."
+                        },
+                        "error": {
+                          "type": "object",
+                          "properties": {
+                            "code": {
+                              "type": "string",
+                              "minLength": 1,
+                              "description": "The target detail failure code."
+                            },
+                            "message": {
+                              "type": "string",
+                              "minLength": 1,
+                              "description": "Why this target detail is unavailable."
+                            }
+                          },
+                          "required": [
+                            "code",
+                            "message"
+                          ],
+                          "additionalProperties": {
+                            "$ref": "#/$defs/__schema0"
+                          },
+                          "description": "A failure for one requested target."
+                        }
+                      },
+                      "required": [
+                        "index",
+                        "view",
+                        "ok",
+                        "error"
+                      ],
+                      "additionalProperties": false
+                    }
+                  ]
+                },
+                "description": "Normalized live facts in target order, including individual failures."
+              }
+            },
+            "required": [
+              "pageId",
+              "mode",
+              "documentEpoch",
+              "capturedAt",
+              "checkedAt",
+              "summary",
+              "source",
+              "completeness",
+              "pendingChanges",
+              "details"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false,
+    "$defs": {
+      "__schema0": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "number"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/__schema0"
+            }
+          },
+          {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {
+              "$ref": "#/$defs/__schema0"
+            }
+          }
+        ]
+      },
+      "__schema1": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "number"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/__schema1"
+            }
+          },
+          {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {
+              "$ref": "#/$defs/__schema1"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
+  "purposeHint": "State which saved values or current target facts are needed."
+}

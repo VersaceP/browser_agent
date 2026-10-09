@@ -1,0 +1,25 @@
+# meta schema=abcp.page-observation schemaVersion=3 fileKind=artifact mode=full pageId=f170fa51-d368-40f3-9402-6b05e5015686 documentEpoch=d_bb1f817b1cdd098239879a442fcbab11 capturedAt="2026-10-06T06:43:03.938Z" checkedAt="2026-10-06T06:43:03.939Z" freshness=current pendingChanges=false completeness=complete version=v_bb1f817b1cdd0982_4 contentHash=10b54facd56c5fa0382ba288872a7ef65f4231dc4f50bae24bbadca1f3508c6f filteredCounts={"emptyText":0,"internalLeaf":0,"nonContent":0,"source":0}
+frame [f_b64c6c5cb386ad760075a04ffd742296] root=[n_63cacfaa5289c27c] url="http://127.0.0.1:62757/" status=complete
+0 [n_63cacfaa5289c27c] rootWebArea "Harness v096 contract" [targetable,ev{focus}] @0,0,1224,725 scroll{can="down"}
+1 [n_d87f225ed92d6802] generic "Harness v096 contract" vis=∅
+1 [n_539c307db48f3a2e] heading "Contract probe" [targetable] @8,21,1193,38
+2 [n_80447e116dfdddcf] staticText "Contract probe"
+1 [n_a949c5fa219a96af] textField "Search" [targetable,actionable,ev{ax|focus|native|role},focused] @8,79,147,23 state{value="updated"} attrs{aria-label="Search",id="field",value="initial"}
+2 [n_0bc336d514443406] staticText "updated" [ev{native},focused] @8,79,147,23
+2 [n_ae48d89e7962a7fc] generic "updated" [targetable] @12,82,139,17
+1 [n_d1440d8f4d54a789] button "Change status" [targetable,actionable,ev{listener|ax|focus|native|role}] @155,79,102,23 attrs{id="change"}
+2 [n_5b9f5c8b21aca68d] staticText "Change status" [ev{listener|native}] @155,79,102,23
+1 [n_492103f2633391cf] status "idle" [targetable] @8,101,1193,19 attrs{id="status"}
+2 [n_3d22bc66d391a9c6] staticText "idle"
+1 [n_955d432934b515d9] genericContainer [targetable,candidate,ev{focus}] @8,119,1193,103 scroll{can="down"} attrs{id="nested"}
+2 [n_d95d85dd7d540ee8] genericContainer "Nested content" [targetable] @9,120,1176,601
+3 [n_73e8d6feb7f921c3] staticText "Nested content"
+2 [n_663fc11bacad2d60] button "Nested bottom" [targetable,actionable,ev{ax|focus|native|role}] @9,720,103,23 vis=↓
+3 [n_a7955da950c81c15] staticText "Nested bottom" [ev{native}] @9,720,103,23 vis=↓
+1 [n_9d9f34ef1f76e156] paragraph "long-value-long-value-long-value-long-value-long-v" [targetable] @8,237,1193,131 attrs{id="long"} truncated{"/name","/text"}
+2 [n_d55b57063e639809] staticText "long-value-long-value-long-value-long-value-long-v" truncated{"/name"}
+1 [n_a48fc12e193787fb] genericContainer "Page content" [targetable] @8,383,1193,1801
+2 [n_f89590c6352c5ec5] staticText "Page content"
+1 [n_855bf62e44cbbd4e] button "Bottom target" [targetable,actionable,ev{ax|focus|native|role}] @8,2183,97,22 vis=↓ attrs{id="bottom"}
+2 [n_2d25374659b402ef] staticText "Bottom target" [ev{native}] @8,2183,97,22 vis=↓
+# end frames=1 nodes=22 components=0 details=0 contentSha256=c4fda2c43b095a14d0c84e3fb14b495b8abd42d9f4b45b2083ee0ca66c3f87b0

@@ -1,0 +1,354 @@
+{
+  "method": "DOM.getAXTree",
+  "description": "Reads the current page view with full structure and targets. Results include a versioned full artifact and observation status.",
+  "requiresPurpose": true,
+  "catalogRevision": "sha256:f3668c2329565bf4c2d36f63e0002429722d5e7f39b6f442b9a22120c866c78b",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "pageId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "The page to observe."
+      },
+      "purpose": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "minLength": 1,
+        "description": "State why the full page structure or targets are needed."
+      }
+    },
+    "required": [
+      "pageId",
+      "purpose"
+    ],
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "pageId": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+        "description": "The page that owns this observation."
+      },
+      "checkedAt": {
+        "type": "string",
+        "format": "date-time",
+        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+        "description": "When the page state was checked."
+      },
+      "freshness": {
+        "type": "string",
+        "enum": [
+          "current",
+          "pending"
+        ],
+        "description": "Whether the page stayed stable during capture."
+      },
+      "pendingChanges": {
+        "type": "boolean",
+        "description": "Whether more page changes remain pending."
+      },
+      "completeness": {
+        "type": "string",
+        "enum": [
+          "complete",
+          "partial"
+        ],
+        "description": "Whether every accessible frame was observed."
+      },
+      "mode": {
+        "type": "string",
+        "const": "full",
+        "description": "The current page view artifact."
+      },
+      "version": {
+        "type": "string",
+        "pattern": "^v_[0-9a-f]{16}_[0-9a-z]+$",
+        "description": "The current page view identifier."
+      },
+      "artifact": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "const": "full",
+            "description": "The current page view artifact."
+          },
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Read the observation artifact at this path."
+          },
+          "format": {
+            "type": "string",
+            "const": "text",
+            "description": "The observation text format."
+          },
+          "bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Artifact size in bytes."
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Artifact content hash."
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+            "description": "The time until the artifact is available."
+          }
+        },
+        "required": [
+          "kind",
+          "path",
+          "format",
+          "bytes",
+          "sha256",
+          "expiresAt"
+        ],
+        "additionalProperties": false,
+        "description": "The current page view artifact reference."
+      },
+      "limitations": {
+        "description": "Reasons the page view is partial. Omitted for a complete observation.",
+        "maxItems": 129,
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "frameId": {
+              "description": "The affected frame, when its current identity is available.",
+              "type": "string",
+              "pattern": "^f_[0-9a-f]{32}$"
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Capture reason, or partial-observation when no specific reason is available."
+            }
+          },
+          "required": [
+            "reason"
+          ],
+          "additionalProperties": false,
+          "description": "A limitation of the captured page view."
+        }
+      }
+    },
+    "required": [
+      "pageId",
+      "checkedAt",
+      "freshness",
+      "pendingChanges",
+      "completeness",
+      "mode",
+      "version",
+      "artifact"
+    ],
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Facts directly observed by the Action or returned by its declared result schema."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "data": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "The page that owns this observation."
+          },
+          "checkedAt": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+            "description": "When the page state was checked."
+          },
+          "freshness": {
+            "type": "string",
+            "enum": [
+              "current",
+              "pending"
+            ],
+            "description": "Whether the page stayed stable during capture."
+          },
+          "pendingChanges": {
+            "type": "boolean",
+            "description": "Whether more page changes remain pending."
+          },
+          "completeness": {
+            "type": "string",
+            "enum": [
+              "complete",
+              "partial"
+            ],
+            "description": "Whether every accessible frame was observed."
+          },
+          "mode": {
+            "type": "string",
+            "const": "full",
+            "description": "The current page view artifact."
+          },
+          "version": {
+            "type": "string",
+            "pattern": "^v_[0-9a-f]{16}_[0-9a-z]+$",
+            "description": "The current page view identifier."
+          },
+          "artifact": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "full",
+                "description": "The current page view artifact."
+              },
+              "path": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Read the observation artifact at this path."
+              },
+              "format": {
+                "type": "string",
+                "const": "text",
+                "description": "The observation text format."
+              },
+              "bytes": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991,
+                "description": "Artifact size in bytes."
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Artifact content hash."
+              },
+              "expiresAt": {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z))$",
+                "description": "The time until the artifact is available."
+              }
+            },
+            "required": [
+              "kind",
+              "path",
+              "format",
+              "bytes",
+              "sha256",
+              "expiresAt"
+            ],
+            "additionalProperties": false,
+            "description": "The current page view artifact reference."
+          },
+          "limitations": {
+            "description": "Reasons the page view is partial. Omitted for a complete observation.",
+            "maxItems": 129,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "frameId": {
+                  "description": "The affected frame, when its current identity is available.",
+                  "type": "string",
+                  "pattern": "^f_[0-9a-f]{32}$"
+                },
+                "reason": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Capture reason, or partial-observation when no specific reason is available."
+                }
+              },
+              "required": [
+                "reason"
+              ],
+              "additionalProperties": false,
+              "description": "A limitation of the captured page view."
+            }
+          }
+        },
+        "required": [
+          "pageId",
+          "checkedAt",
+          "freshness",
+          "pendingChanges",
+          "completeness",
+          "mode",
+          "version",
+          "artifact"
+        ],
+        "additionalProperties": false,
+        "description": "Validated business result returned by the Action."
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable public failure code."
+          },
+          "message": {
+            "type": "string",
+            "description": "Concise public explanation for the failure code."
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "additionalProperties": false
+      },
+      "observation": {
+        "type": "string",
+        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "details": {
+        "type": "object",
+        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "error",
+      "observation",
+      "suggested_prompt"
+    ],
+    "additionalProperties": false
+  },
+  "purposeHint": "State why the full page structure or targets are needed."
+}

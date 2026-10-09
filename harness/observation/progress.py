@@ -19,6 +19,7 @@ NO_ARTIFACT_DIAGNOSTIC_TOOLS = frozenset({
     "search_harness_guides",
     "visual_verify",
     "DOM.getAXTree",
+    "DOM.getDetails",
     "Input.scroll",
     "Page.wheel",
     "Input.press",
@@ -49,6 +50,7 @@ ARTIFACT_PROGRESS_TOOLS = {
     "Memory.save",
     "Runtime.evaluate",
     "DOM.getAXTree",
+    "DOM.getDetails",
     # DOM.getImg is an output-producing primitive.  One call can export an
     # arbitrary batch of declared targets, so a small call-count diagnostic
     # budget would reject legitimate image-heavy pages.  Keep it behind the
@@ -66,6 +68,7 @@ ARTIFACT_PROGRESS_TOOLS = {
 
 PRODUCTIVE_PRIMITIVE_TOOLS = {
     "DOM.getAXTree",
+    "DOM.getDetails",
     "Input.click",
     "Page.click",
     "Input.type",

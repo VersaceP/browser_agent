@@ -64,10 +64,22 @@ def workflow_execution_facts(result: Any) -> JsonDict:
     response = response if isinstance(response, dict) else {}
     data = response.get("data")
     data = data if isinstance(data, dict) else {}
+    if "output" in data:
+        from harness.workflow.script_runtime import script_result_facts
+        return script_result_facts(result)
     rpc_data = result.get("rpcData")
     rpc_data = rpc_data if isinstance(rpc_data, dict) else {}
     details = rpc_data.get("details")
     details = details if isinstance(details, dict) else rpc_data
+    if str(details.get("code") or "").startswith("workflow-") or "source" in details:
+        return {"status": "failed", "workflowId": details.get("workflowId"),
+                "tool_was_executed": bool(details.get("taskId")),
+                "failedErrorCode": details.get("code"), "source": details.get("source")}
+    if str(result.get("transportCode") or "").startswith("ABCP_TRANSPORT_"):
+        trace = result.get("executionTrace") or {}
+        return {"status": "unknown", "workflowId": trace.get("workflowId"),
+                "tool_was_executed": result.get("requestSent"),
+                "failedErrorCode": result.get("transportCode"), "deliveryConfirmed": False}
     workflow_id = data.get("workflowId") or details.get("workflowId")
     executed = result.get("tool_was_executed")
     if executed is None:
@@ -108,6 +120,28 @@ def project_workflow_receipt(
     steps = data.get("results")
     if not isinstance(steps, list) or not steps:
         return None
+    if "output" in data:
+        candidates = {i for i, call in enumerate(steps)
+                      if isinstance(call, dict) and "value" in call
+                      and json_size_bytes(call["value"]) > inline_result_bytes}
+        if not candidates and len(steps) <= 64:
+            return None
+        saved = _persist_full_payload(logger, data, step, prefix)
+        if not saved.get("savedPath"):
+            return {"projected": False, "projectionSkipped": "full-payload-not-persisted"}
+        projected = copy.deepcopy(steps)
+        for i in candidates:
+            projected[i].pop("value", None)
+            projected[i]["valueReference"] = {"resource": saved["savedPath"], "index": i, "field": "value"}
+        if len(projected) > 64:
+            indices = sorted({*range(8), *range(len(projected) - 32, len(projected)),
+                              *[i for i, c in enumerate(projected) if c.get("status") in {"failed", "unknown", "cancelled"}][:24]})
+            projected = [projected[i] for i in indices]
+        data["results"] = projected
+        data["callRecordsReference"] = {"resource": saved["savedPath"], "total": len(steps),
+                                         "omitted": len(steps) - len(projected)}
+        return {"projected": True, "stepsTotal": len(steps), "stepResultsProjected": len(candidates),
+                **saved}
 
     # Two phases, and the order matters. Scanning first means a segment with
     # nothing to project leaves no trace at all: the receipt is returned

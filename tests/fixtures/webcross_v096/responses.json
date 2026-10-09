@@ -1,0 +1,691 @@
+{
+  "runtimeVersion": "0.9.6-beta",
+  "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+  "responses": {
+    "full1": {
+      "observation": "The current page view is available at /Users/versace/Library/Application Support/webcross/observations/eb5a6e0a-70c9-485a-9a23-4f56b68b6b9c/f170fa51-d368-40f3-9402-6b05e5015686/epochs/d_bb1f817b1cdd098239879a442fcbab11/full/v_bb1f817b1cdd0982_1.",
+      "suggested_prompt": "Read artifact.path first. Re-observe only if the evidence needed for the next decision is missing or outdated.",
+      "data": {
+        "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+        "checkedAt": "2026-10-06T06:42:45.451Z",
+        "freshness": "current",
+        "pendingChanges": false,
+        "completeness": "complete",
+        "mode": "full",
+        "version": "v_bb1f817b1cdd0982_1",
+        "artifact": {
+          "kind": "full",
+          "path": "full1.artifact.txt",
+          "format": "text",
+          "bytes": 2789,
+          "sha256": "5276415d96954b7e5e931f8d277fb410c55bae21e530df0a628e4f03d9a1005b",
+          "expiresAt": "2026-10-06T06:52:45.495Z"
+        }
+      }
+    },
+    "full_repeat": {
+      "observation": "The current page view is available at /Users/versace/Library/Application Support/webcross/observations/eb5a6e0a-70c9-485a-9a23-4f56b68b6b9c/f170fa51-d368-40f3-9402-6b05e5015686/epochs/d_bb1f817b1cdd098239879a442fcbab11/full/v_bb1f817b1cdd0982_1.",
+      "suggested_prompt": "Read artifact.path first. Re-observe only if the evidence needed for the next decision is missing or outdated.",
+      "data": {
+        "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+        "checkedAt": "2026-10-06T06:42:45.628Z",
+        "freshness": "current",
+        "pendingChanges": false,
+        "completeness": "complete",
+        "mode": "full",
+        "version": "v_bb1f817b1cdd0982_1",
+        "artifact": {
+          "kind": "full",
+          "path": "full_repeat.artifact.txt",
+          "format": "text",
+          "bytes": 2789,
+          "sha256": "5276415d96954b7e5e931f8d277fb410c55bae21e530df0a628e4f03d9a1005b",
+          "expiresAt": "2026-10-06T06:52:45.661Z"
+        }
+      }
+    },
+    "live_state": {
+      "observation": "Page details are available at /Users/versace/Library/Application Support/webcross/observations/eb5a6e0a-70c9-485a-9a23-4f56b68b6b9c/f170fa51-d368-40f3-9402-6b05e5015686/epochs/d_bb1f817b1cdd098239879a442fcbab11/query/da33f165-8c7a-434d-944b-4ef720862593 (1/1 targets succeeded; source=live).",
+      "suggested_prompt": "Read artifact.path first. Re-observe only if the evidence needed for the next decision is missing or outdated.",
+      "data": {
+        "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+        "mode": "detail",
+        "artifact": {
+          "kind": "detail",
+          "path": "live_state.artifact.txt",
+          "format": "text",
+          "bytes": 780,
+          "sha256": "447812dfd2f2e67ada20ec5bd5d4a3057460fbe18f77565f390942ce0b3b7cda",
+          "expiresAt": "2026-10-06T06:52:45.818Z"
+        },
+        "checkedAt": "2026-10-06T06:42:45.788Z",
+        "summary": {
+          "total": 1,
+          "succeeded": 1,
+          "failed": 0
+        },
+        "source": "live"
+      }
+    },
+    "live_text": {
+      "observation": "Page details are available at /Users/versace/Library/Application Support/webcross/observations/eb5a6e0a-70c9-485a-9a23-4f56b68b6b9c/f170fa51-d368-40f3-9402-6b05e5015686/epochs/d_bb1f817b1cdd098239879a442fcbab11/query/bbece013-ead9-49e6-8007-ca96cf771140 (1/1 targets succeeded; source=live).",
+      "suggested_prompt": "Read artifact.path first. Re-observe only if the evidence needed for the next decision is missing or outdated.",
+      "data": {
+        "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+        "mode": "detail",
+        "artifact": {
+          "kind": "detail",
+          "path": "live_text.artifact.txt",
+          "format": "text",
+          "bytes": 671,
+          "sha256": "5404cf0b2609ce9b4b91505f73839c676d164bcf44f0a7e3173b6121503c3866",
+          "expiresAt": "2026-10-06T06:52:45.964Z"
+        },
+        "checkedAt": "2026-10-06T06:42:45.938Z",
+        "summary": {
+          "total": 1,
+          "succeeded": 1,
+          "failed": 0
+        },
+        "source": "live"
+      }
+    },
+    "live_attributes": {
+      "observation": "Page details are available at /Users/versace/Library/Application Support/webcross/observations/eb5a6e0a-70c9-485a-9a23-4f56b68b6b9c/f170fa51-d368-40f3-9402-6b05e5015686/epochs/d_bb1f817b1cdd098239879a442fcbab11/query/23a3a32d-637a-4d12-bf3b-fa261ab0a551 (1/1 targets succeeded; source=live).",
+      "suggested_prompt": "Read artifact.path first. Re-observe only if the evidence needed for the next decision is missing or outdated.",
+      "data": {
+        "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+        "mode": "detail",
+        "artifact": {
+          "kind": "detail",
+          "path": "live_attributes.artifact.txt",
+          "format": "text",
+          "bytes": 698,
+          "sha256": "7c3d236405772668f29b9537afb328118a5d973819b7e46ead283f526e02a456",
+          "expiresAt": "2026-10-06T06:52:46.137Z"
+        },
+        "checkedAt": "2026-10-06T06:42:46.109Z",
+        "summary": {
+          "total": 1,
+          "succeeded": 1,
+          "failed": 0
+        },
+        "source": "live"
+      }
+    },
+    "live_dom": {
+      "observation": "Page details are available at /Users/versace/Library/Application Support/webcross/observations/eb5a6e0a-70c9-485a-9a23-4f56b68b6b9c/f170fa51-d368-40f3-9402-6b05e5015686/epochs/d_bb1f817b1cdd098239879a442fcbab11/query/9b5f20db-5775-48bc-8711-75a6c95d7d05 (1/1 targets succeeded; source=live).",
+      "suggested_prompt": "Read artifact.path first. Re-observe only if the evidence needed for the next decision is missing or outdated.",
+      "data": {
+        "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+        "mode": "detail",
+        "artifact": {
+          "kind": "detail",
+          "path": "live_dom.artifact.txt",
+          "format": "text",
+          "bytes": 1486,
+          "sha256": "61bedc0529af5a12f81336e4e542cf4ec4c520a2d28057ada49a50d67681e67a",
+          "expiresAt": "2026-10-06T06:52:46.334Z"
+        },
+        "checkedAt": "2026-10-06T06:42:46.302Z",
+        "summary": {
+          "total": 1,
+          "succeeded": 1,
+          "failed": 0
+        },
+        "source": "live"
+      }
+    },
+    "snapshot": {
+      "observation": "Page details are available at /Users/versace/Library/Application Support/webcross/observations/eb5a6e0a-70c9-485a-9a23-4f56b68b6b9c/f170fa51-d368-40f3-9402-6b05e5015686/epochs/d_bb1f817b1cdd098239879a442fcbab11/query/8514c76f-5ba3-4329-8b6b-189d6d5290b9 (1/2 targets succeeded; source=snapshot). Saved values do not confirm current page state.",
+      "suggested_prompt": "Read artifact.path first. Re-observe only if the evidence needed for the next decision is missing or outdated.",
+      "data": {
+        "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+        "mode": "detail",
+        "artifact": {
+          "kind": "detail",
+          "path": "snapshot.artifact.txt",
+          "format": "text",
+          "bytes": 3369,
+          "sha256": "4a1add03a0c87fceab8575ff041a803be1061952a862fd808988ff7d36182c5d",
+          "expiresAt": "2026-10-06T06:52:46.478Z"
+        },
+        "checkedAt": "2026-10-06T06:42:45.451Z",
+        "summary": {
+          "total": 2,
+          "succeeded": 1,
+          "failed": 1
+        },
+        "source": "snapshot",
+        "version": "v_bb1f817b1cdd0982_1"
+      }
+    },
+    "live_changed": {
+      "observation": "Page details are available at /Users/versace/Library/Application Support/webcross/observations/eb5a6e0a-70c9-485a-9a23-4f56b68b6b9c/f170fa51-d368-40f3-9402-6b05e5015686/epochs/d_bb1f817b1cdd098239879a442fcbab11/query/c6ab74ca-0574-4def-8cea-54a0897e89dd (1/1 targets succeeded; source=live).",
+      "suggested_prompt": "Read artifact.path first. Re-observe only if the evidence needed for the next decision is missing or outdated.",
+      "data": {
+        "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+        "mode": "detail",
+        "artifact": {
+          "kind": "detail",
+          "path": "live_changed.artifact.txt",
+          "format": "text",
+          "bytes": 779,
+          "sha256": "21c3795828da3e213117c33341dc63c48d49660119e76cc2d5fbfbee4cc91f0b",
+          "expiresAt": "2026-10-06T06:52:48.522Z"
+        },
+        "checkedAt": "2026-10-06T06:42:48.478Z",
+        "summary": {
+          "total": 1,
+          "succeeded": 1,
+          "failed": 0
+        },
+        "source": "live"
+      }
+    },
+    "full_changed": {
+      "observation": "The current page view is available at /Users/versace/Library/Application Support/webcross/observations/eb5a6e0a-70c9-485a-9a23-4f56b68b6b9c/f170fa51-d368-40f3-9402-6b05e5015686/epochs/d_bb1f817b1cdd098239879a442fcbab11/full/v_bb1f817b1cdd0982_2.",
+      "suggested_prompt": "Read artifact.path first. Re-observe only if the evidence needed for the next decision is missing or outdated.",
+      "data": {
+        "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+        "checkedAt": "2026-10-06T06:42:48.640Z",
+        "freshness": "current",
+        "pendingChanges": false,
+        "completeness": "complete",
+        "mode": "full",
+        "version": "v_bb1f817b1cdd0982_2",
+        "artifact": {
+          "kind": "full",
+          "path": "full_changed.artifact.txt",
+          "format": "text",
+          "bytes": 2805,
+          "sha256": "61476378bd7dad021e24e3e060a24b03b52b4993d1df802b6cca4f35df6699c8",
+          "expiresAt": "2026-10-06T06:52:48.693Z"
+        }
+      }
+    },
+    "scroll_state": {
+      "observation": "Input.scroll input completed=true, observation=stable, goal=not-requested, reason=state-read, observed movement=(0, 0).",
+      "suggested_prompt": "Re-observe the requested scroll surface before deciding the next action. Use only returned geometry and current visible content.",
+      "data": {
+        "mode": "delta",
+        "input": {
+          "completed": true
+        },
+        "observation": {
+          "status": "stable"
+        },
+        "goal": {
+          "status": "not-requested"
+        },
+        "completedReason": "state-read",
+        "requestedDelta": {
+          "x": 0,
+          "y": 0
+        },
+        "observedDelta": {
+          "x": 0,
+          "y": 0
+        },
+        "totalDelta": {
+          "x": 0,
+          "y": 0
+        },
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "extent": {
+          "width": 1209,
+          "height": 2213
+        },
+        "frameDepth": 0,
+        "layers": [
+          {
+            "kind": "viewport",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "extent": {
+              "width": 1209,
+              "height": 2213
+            },
+            "delta": {
+              "x": 0,
+              "y": 0
+            }
+          }
+        ],
+        "resolution": {}
+      }
+    },
+    "scroll_state_view": {
+      "observation": "The current page view is available at /Users/versace/Library/Application Support/webcross/observations/eb5a6e0a-70c9-485a-9a23-4f56b68b6b9c/f170fa51-d368-40f3-9402-6b05e5015686/epochs/d_bb1f817b1cdd098239879a442fcbab11/full/v_bb1f817b1cdd0982_2.",
+      "suggested_prompt": "Read artifact.path first. Re-observe only if the evidence needed for the next decision is missing or outdated.",
+      "data": {
+        "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+        "checkedAt": "2026-10-06T06:42:50.903Z",
+        "freshness": "current",
+        "pendingChanges": false,
+        "completeness": "complete",
+        "mode": "full",
+        "version": "v_bb1f817b1cdd0982_2",
+        "artifact": {
+          "kind": "full",
+          "path": "scroll_state_view.artifact.txt",
+          "format": "text",
+          "bytes": 2805,
+          "sha256": "61476378bd7dad021e24e3e060a24b03b52b4993d1df802b6cca4f35df6699c8",
+          "expiresAt": "2026-10-06T06:52:50.953Z"
+        }
+      }
+    },
+    "scroll_delta": {
+      "observation": "Input.scroll input completed=true, observation=stable, goal=not-reached, reason=no-progress, observed movement=(0, 0).",
+      "suggested_prompt": "Re-observe the requested scroll surface before deciding the next action. Use only returned geometry and current visible content.",
+      "data": {
+        "mode": "delta",
+        "input": {
+          "completed": true,
+          "sentDelta": {
+            "x": 0,
+            "y": 300
+          }
+        },
+        "observation": {
+          "status": "stable"
+        },
+        "goal": {
+          "status": "not-reached"
+        },
+        "completedReason": "no-progress",
+        "requestedDelta": {
+          "x": 0,
+          "y": 300
+        },
+        "observedDelta": {
+          "x": 0,
+          "y": 0
+        },
+        "totalDelta": {
+          "x": 0,
+          "y": 0
+        },
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "extent": {
+          "width": 1209,
+          "height": 2213
+        },
+        "frameDepth": 0,
+        "layers": [
+          {
+            "kind": "viewport",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "extent": {
+              "width": 1209,
+              "height": 2213
+            },
+            "delta": {
+              "x": 0,
+              "y": 0
+            }
+          }
+        ],
+        "resolution": {}
+      }
+    },
+    "scroll_delta_view": {
+      "observation": "The current page view is available at /Users/versace/Library/Application Support/webcross/observations/eb5a6e0a-70c9-485a-9a23-4f56b68b6b9c/f170fa51-d368-40f3-9402-6b05e5015686/epochs/d_bb1f817b1cdd098239879a442fcbab11/full/v_bb1f817b1cdd0982_2.",
+      "suggested_prompt": "Read artifact.path first. Re-observe only if the evidence needed for the next decision is missing or outdated.",
+      "data": {
+        "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+        "checkedAt": "2026-10-06T06:42:53.857Z",
+        "freshness": "current",
+        "pendingChanges": false,
+        "completeness": "complete",
+        "mode": "full",
+        "version": "v_bb1f817b1cdd0982_2",
+        "artifact": {
+          "kind": "full",
+          "path": "scroll_delta_view.artifact.txt",
+          "format": "text",
+          "bytes": 2805,
+          "sha256": "61476378bd7dad021e24e3e060a24b03b52b4993d1df802b6cca4f35df6699c8",
+          "expiresAt": "2026-10-06T06:52:53.903Z"
+        }
+      }
+    },
+    "scroll_nested": {
+      "code": "scroll-target-not-visible",
+      "message": "The Action failed with public error code \"scroll-target-not-visible\".",
+      "observation": "Action failed: The Action failed with public error code \"scroll-target-not-visible\".",
+      "suggested_prompt": "Re-observe the current target and confirm visibility before scrolling again."
+    },
+    "scroll_nested_view": {
+      "observation": "The current page view is available at /Users/versace/Library/Application Support/webcross/observations/eb5a6e0a-70c9-485a-9a23-4f56b68b6b9c/f170fa51-d368-40f3-9402-6b05e5015686/epochs/d_bb1f817b1cdd098239879a442fcbab11/full/v_bb1f817b1cdd0982_3.",
+      "suggested_prompt": "Read artifact.path first. Re-observe only if the evidence needed for the next decision is missing or outdated.",
+      "data": {
+        "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+        "checkedAt": "2026-10-06T06:42:54.371Z",
+        "freshness": "current",
+        "pendingChanges": false,
+        "completeness": "complete",
+        "mode": "full",
+        "version": "v_bb1f817b1cdd0982_3",
+        "artifact": {
+          "kind": "full",
+          "path": "scroll_nested_view.artifact.txt",
+          "format": "text",
+          "bytes": 2926,
+          "sha256": "4719a2826987f5c3bd33d1737ca972007ba61dab7405598674f6393ae3888613",
+          "expiresAt": "2026-10-06T06:52:54.418Z"
+        }
+      }
+    },
+    "scroll_edge": {
+      "observation": "Input.scroll input completed=true, observation=stable, goal=not-reached, reason=no-progress, observed movement=(0, 0).",
+      "suggested_prompt": "Re-observe the requested scroll surface before deciding the next action. Use only returned geometry and current visible content.",
+      "data": {
+        "mode": "edge",
+        "input": {
+          "completed": true,
+          "sentDelta": {
+            "x": 0,
+            "y": 1188
+          }
+        },
+        "observation": {
+          "status": "stable"
+        },
+        "goal": {
+          "status": "not-reached"
+        },
+        "completedReason": "no-progress",
+        "requestedDelta": {
+          "x": 0,
+          "y": 1188
+        },
+        "observedDelta": {
+          "x": 0,
+          "y": 0
+        },
+        "totalDelta": {
+          "x": 0,
+          "y": 0
+        },
+        "position": {
+          "x": 0,
+          "y": 300
+        },
+        "extent": {
+          "width": 1209,
+          "height": 2213
+        },
+        "frameDepth": 0,
+        "layers": [
+          {
+            "kind": "viewport",
+            "position": {
+              "x": 0,
+              "y": 300
+            },
+            "extent": {
+              "width": 1209,
+              "height": 2213
+            },
+            "delta": {
+              "x": 0,
+              "y": 0
+            }
+          }
+        ],
+        "resolution": {}
+      }
+    },
+    "scroll_edge_view": {
+      "observation": "The current page view is available at /Users/versace/Library/Application Support/webcross/observations/eb5a6e0a-70c9-485a-9a23-4f56b68b6b9c/f170fa51-d368-40f3-9402-6b05e5015686/epochs/d_bb1f817b1cdd098239879a442fcbab11/full/v_bb1f817b1cdd0982_3.",
+      "suggested_prompt": "Read artifact.path first. Re-observe only if the evidence needed for the next decision is missing or outdated.",
+      "data": {
+        "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+        "checkedAt": "2026-10-06T06:42:58.063Z",
+        "freshness": "current",
+        "pendingChanges": false,
+        "completeness": "complete",
+        "mode": "full",
+        "version": "v_bb1f817b1cdd0982_3",
+        "artifact": {
+          "kind": "full",
+          "path": "scroll_edge_view.artifact.txt",
+          "format": "text",
+          "bytes": 2926,
+          "sha256": "4719a2826987f5c3bd33d1737ca972007ba61dab7405598674f6393ae3888613",
+          "expiresAt": "2026-10-06T06:52:58.127Z"
+        }
+      }
+    },
+    "scroll_target": {
+      "observation": "Input.scroll input completed=true, observation=stable, goal=reached, reason=maximally-exposed.",
+      "suggested_prompt": "The target has a current exposure proof. Continue with the intended interaction and its own visibility checks.",
+      "data": {
+        "mode": "target",
+        "input": {
+          "completed": true
+        },
+        "observation": {
+          "status": "stable"
+        },
+        "goal": {
+          "status": "reached"
+        },
+        "completedReason": "maximally-exposed",
+        "totalDelta": {
+          "x": 0,
+          "y": -1488
+        },
+        "targetVisible": true,
+        "visibilityProof": {
+          "visibleBounds": {
+            "x": 12,
+            "y": 82.875,
+            "width": 139,
+            "height": 15.5
+          },
+          "maximumReachableBounds": {
+            "x": 12,
+            "y": 82.875,
+            "width": 139,
+            "height": 15.5
+          },
+          "fullyExposed": false,
+          "maximallyExposed": true
+        },
+        "layers": [
+          {
+            "kind": "viewport",
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "extent": {
+              "width": 0,
+              "height": 1488
+            },
+            "delta": {
+              "x": 0,
+              "y": -1488
+            }
+          }
+        ],
+        "resolution": {
+          "target": {
+            "source": "selector"
+          }
+        }
+      }
+    },
+    "scroll_target_view": {
+      "observation": "The current page view is available at /Users/versace/Library/Application Support/webcross/observations/eb5a6e0a-70c9-485a-9a23-4f56b68b6b9c/f170fa51-d368-40f3-9402-6b05e5015686/epochs/d_bb1f817b1cdd098239879a442fcbab11/full/v_bb1f817b1cdd0982_4.",
+      "suggested_prompt": "Read artifact.path first. Re-observe only if the evidence needed for the next decision is missing or outdated.",
+      "data": {
+        "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+        "checkedAt": "2026-10-06T06:43:03.939Z",
+        "freshness": "current",
+        "pendingChanges": false,
+        "completeness": "complete",
+        "mode": "full",
+        "version": "v_bb1f817b1cdd0982_4",
+        "artifact": {
+          "kind": "full",
+          "path": "scroll_target_view.artifact.txt",
+          "format": "text",
+          "bytes": 2805,
+          "sha256": "6294b0a910a1cb9e19ed860d15c11bfa8171eacb2f2df6b938db03e912369b88",
+          "expiresAt": "2026-10-06T06:53:03.986Z"
+        }
+      }
+    }
+  },
+  "params": {
+    "full1": {
+      "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+      "purpose": "capture v096 observation contract"
+    },
+    "full_repeat": {
+      "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+      "purpose": "capture v096 observation contract"
+    },
+    "live_state": {
+      "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+      "query": {
+        "view": "state",
+        "targets": [
+          {
+            "selector": "#field"
+          }
+        ]
+      },
+      "purpose": "capture v096 observation contract"
+    },
+    "live_text": {
+      "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+      "query": {
+        "view": "text",
+        "targets": [
+          {
+            "selector": "#field"
+          }
+        ],
+        "textMode": "rendered"
+      },
+      "purpose": "capture v096 observation contract"
+    },
+    "live_attributes": {
+      "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+      "query": {
+        "view": "attributes",
+        "targets": [
+          {
+            "selector": "#field"
+          }
+        ],
+        "attributes": "*"
+      },
+      "purpose": "capture v096 observation contract"
+    },
+    "live_dom": {
+      "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+      "query": {
+        "view": "dom",
+        "targets": [
+          {
+            "selector": "#field"
+          }
+        ],
+        "maxDepth": 1,
+        "includeShadowDom": true
+      },
+      "purpose": "capture v096 observation contract"
+    },
+    "snapshot": {
+      "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+      "version": "v_bb1f817b1cdd0982_1",
+      "nodeIds": [
+        "n_a949c5fa219a96af",
+        "n_9d9f34ef1f76e156"
+      ],
+      "purpose": "capture v096 observation contract"
+    },
+    "live_changed": {
+      "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+      "query": {
+        "view": "state",
+        "targets": [
+          {
+            "selector": "#field"
+          }
+        ]
+      },
+      "purpose": "capture v096 observation contract"
+    },
+    "full_changed": {
+      "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+      "purpose": "capture v096 observation contract"
+    },
+    "scroll_state": {
+      "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+      "purpose": "capture v096 observation contract"
+    },
+    "scroll_state_view": {
+      "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+      "purpose": "capture v096 observation contract"
+    },
+    "scroll_delta": {
+      "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+      "deltaY": 300,
+      "purpose": "capture v096 observation contract"
+    },
+    "scroll_delta_view": {
+      "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+      "purpose": "capture v096 observation contract"
+    },
+    "scroll_nested": {
+      "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+      "container": {
+        "selector": "#nested"
+      },
+      "deltaY": 100
+    },
+    "scroll_nested_view": {
+      "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+      "purpose": "capture v096 observation contract"
+    },
+    "scroll_edge": {
+      "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+      "edge": "end",
+      "axis": "vertical",
+      "purpose": "capture v096 observation contract"
+    },
+    "scroll_edge_view": {
+      "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+      "purpose": "capture v096 observation contract"
+    },
+    "scroll_target": {
+      "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+      "target": {
+        "selector": "#field"
+      },
+      "purpose": "capture v096 observation contract"
+    },
+    "scroll_target_view": {
+      "pageId": "f170fa51-d368-40f3-9402-6b05e5015686",
+      "purpose": "capture v096 observation contract"
+    }
+  }
+}

@@ -352,13 +352,16 @@ class BuilderSession:
             elif name == "describe_harness_tool":
                 value = self._describe_tool(str(args["name"]))
             elif name == "describe_abcp_action":
-                value = self._describe_action(str(args["method"]))
+                method = str(args["method"])
+                if not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*\.[A-Za-z][A-Za-z0-9]*", method):
+                    raise ValueError("Invalid ABCP method name")
+                value = await self.browser.describe_action(method)
             elif name == "read_workflow_guide":
-                guide = (Path(__file__).resolve().parents[1] / "prompts" / "resources"
-                         / "browser" / "workflow-segments.md")
-                value = {"content": guide.read_text(encoding="utf-8")[:50000],
-                         "source": str(guide),
-                         "scope": "protocol guidance; Builder chooses longer boundaries from evidence"}
+                value = await self.browser.guide()
+            elif name == "authorize_trial_files":
+                value = await self.browser.authorize_files(list(args["paths"]))
+            elif name == "attach_trial_page":
+                value = await self.browser.attach_page(str(args["page_id"]), str(args["fleet_id"]))
             elif name == "browser_call":
                 value = await self.browser.call(str(args["method"]), dict(args.get("params") or {}))
             elif name == "run_workflow_trial":
@@ -384,8 +387,10 @@ class BuilderSession:
             ("read_work_file", "Read a bounded page of a Builder work file.", _schema({"path": _STRING, "offset": {"type": "integer"}, "max_chars": {"type": "integer"}}, ("path",))),
             ("write_work_file", "Write one Builder file with compare-and-swap hash; null expected_hash creates it.", _schema({"path": _STRING, "content": _STRING, "expected_hash": {"type": ["string", "null"]}}, ("path", "content"))),
             ("describe_harness_tool", "Read the public contract of a Harness composite/tool, without source access.", _schema({"name": _STRING}, ("name",))),
-            ("describe_abcp_action", "Read cached platform action schema and catalog revision.", _schema({"method": _STRING}, ("method",))),
-            ("read_workflow_guide", "Read the protocol guide for Workflow steps and event windows; online segment boundaries are not Builder boundaries.", _schema({})),
+            ("describe_abcp_action", "Read the live platform action input/result/failure contract.", _schema({"method": _STRING}, ("method",))),
+            ("read_workflow_guide", "Read the live JS/TS Workflow SDK and source-package contract.", _schema({})),
+            ("authorize_trial_files", "Request read permission for files used by a trial.", _schema({"paths": {"type": "array", "items": _STRING}}, ("paths",))),
+            ("attach_trial_page", "Ask the user to authorize a real test page; it is not closed during Builder cleanup.", _schema({"page_id": _STRING, "fleet_id": _STRING}, ("page_id", "fleet_id"))),
             ("browser_call", "Call an authorized ABCP action on a Builder-owned page; Page.create creates one.", _schema({"method": _STRING, "params": _OBJECT}, ("method",))),
             ("run_workflow_trial", "Execute a Workflow JSON file on a Builder-owned page through WebCross.", _schema({"path": _STRING, "page_id": _STRING, "variables": _OBJECT}, ("path", "page_id"))),
             ("finish_skill_create", "Finish the current Builder turn and present files and actual trial facts.", _schema({"summary": _STRING}, ("summary",))),

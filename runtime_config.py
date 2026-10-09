@@ -1136,11 +1136,9 @@ class HarnessConfig:
     #                       seen stale ids through to the browser rematch
     #   "on"             -> model-initiated calls may pass them through too
     browser_side_rematch: str = "composite_only"
-    # Page observation delivery. After a worker has received one complete
-    # DOM.getAXTree view of a page, later reads show only the platform's
-    # change records when the version chain is provably continuous (the full
-    # view still goes to disk and to find_in_axtree). False shows every read
-    # in full, the pre-diff behaviour.
+    # Legacy setting name: since WebCross 0.9.6 this controls only abbreviation
+    # of an immutable full version already held by the worker. Changed versions
+    # deliver the full view; platform diff delivery has been retired.
     observation_diff_view: bool = True
     # watch_nodes: how often the harness re-reads a watched page while any
     # watch on it is active, and the longest lifetime a watch may request.

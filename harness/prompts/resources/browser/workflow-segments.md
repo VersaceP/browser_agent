@@ -1,202 +1,300 @@
 ---
 id: browser.workflow-segments
 audience: browser
-version: "2026-09-27"
-description: Author bounded Workflow segments with observation references, deterministic transforms, event synchronization and failure recovery.
+version: "2026-10-07"
+description: Run reusable WebCross JS/TS packages with independent input, scoped capabilities and source/call recovery.
 sources:
-  - abcp-platform/resources/skills/webcross-browser/references/workflow-orchestration.md
-  - harness/tools/browser_tools/schemas.py
-  - harness/workflow/workflow_policy.py
+  - global_schema_cache/workflow_guide.md
+  - harness/workflow/script_runtime.py
 related_tools:
+  - execute_published_skill_workflow
+  - read_selected_skill_resource
   - execute_browser_workflow
   - execute_saved_browser_workflow
-  - browser_call
 related_methods:
   - Workflow.execute
   - Workflow.getStatus
+  - Workflow.pause
+  - Workflow.resume
+  - Workflow.cancel
 ---
 
-# Segments
+# Workflow authoring guide
 
-Use Workflow only when its execution tool is exposed and enabled for this worker.
-Choose a bounded sequence whose actions, conditions and stopping rules are known.
-A segment may observe the page and mechanically select a target. End it when the
-next decision needs model judgment, a screenshot, a Harness-only tool, artifact
-expiry recovery or failure diagnosis. Runtime.evaluate and record_extraction are
-not available inside a Harness Workflow segment.
+## Harness execution receipts
 
-## References and transforms
+Dispatch is not outcome proof. A `succeeded` receipt means the script returned;
+interpret its output and observed page results against the user's goal.
+`execute_browser_workflow` also saves a versioned definition. Reuse its exact
+`definitionRef/definitionHash` with `execute_saved_browser_workflow`, changing
+`input` rather than source for ordinary parameter changes. For a selected Skill,
+prefer `execute_published_skill_workflow` on the pinned formal entry.
 
-After DOM.getAXTree, the complete `$cache.observation` or `$last` reference reads
-leased artifact text. `$cache.observation.diff` reads a computed diff; a diff that
-was not computed remains status metadata. `$cache.observation.detail[nodeId]`
-reads an available leased detail artifact for that literal node id. The path
-`$cache.observation.artifact.path` is metadata, not content. A lease does not make
-old node ids current: after navigation, settle and read a fresh observation.
+## When to use Workflow
 
-Keep the two DOM.getAXTree return shapes separate. A standalone browser_call is
-hydrated by the Harness: a bounded query can appear as `response.data.records`
-after the Harness reads and parses its artifact. Inside Workflow.execute, the
-Action returns the platform's raw data: a bounded query has `mode: "detail"`,
-`artifact`, `checkedAt` and `summary`, but no `records` array. Do not write
-`extract: {"name": "records"}` or `$last.records` after a workflow DOM.getAXTree
-step. Action `extract` reads fields of that raw data (for example
-`summary.succeeded` or `artifact.path`). To inspect detail values in the same
-segment, pass the complete `$cache.observation` or `$last` to transform: the
-Workflow host reads the leased text artifact. Match only lines whose target,
-index and `ok` status establish the intended result; check failed or missing
-targets before acting. If model judgment is needed, return the Action result
-and interpret it after the segment.
+Use Workflow when the flow, conditions, and stopping rules are already clear, such as batch page reads, observation processing, or fixed operations.
 
-References occupy the complete string value; embedded references are not string
-interpolation. Use template for string construction. The roots are `$context`,
-`$vars.NAME`, `$last`, `$cache`, and `$store`; there is no `$steps[N]`.
-`$context` holds read-only execution data. `$vars` supports nested object fields
-and numeric array indices, with literal variable keys taking precedence.
-`$last` is the latest successful Action, readEvents or waitEvent result;
-transform writes its output variable without replacing `$last` or `$store`.
-`extract` paths address Action data directly: `url`, not `data.url`.
-Missing references fail unless checked with exists/notExists.
+When new page content requires a decision, let the Agent read the result and decide the next step.
 
-## Read a known target inside a workflow
+## Write and run immediately
 
-This bounded query illustrates the raw result boundary. Replace the placeholder
-with an id from the current page observation. `summary.succeeded` is a raw
-Action result field; the detail line comes from the leased artifact text.
-The resulting line is evidence to inspect, not proof that a requested value
-has the expected meaning.
+Provide source directly in a `Workflow.execute` request. The platform validates, compiles in memory, and runs the script.
 
-```json
-[
-  {"type":"action","action":"DOM.getAXTree","purpose":"Read the current state of a known control","params":{"query":{"view":"state","targets":[{"id":"«current-node-id»"}]}},"extract":{"succeeded":"summary.succeeded"}},
-  {"type":"transform","input":"$cache.observation","ops":[{"op":"find","pattern":"detail index=0 ok=true","mode":"contains"}],"output":"successfulDetailLines"}
-]
+This example constructs a request to read the selected page. Set `pageId` to the page chosen for this execution.
+
+```js
+const source = `
+export default async function main({ actions }) {
+  const page = await actions.Page.getState({
+    purpose: "读取当前页面信息"
+  });
+
+  return {
+    title: page.title,
+    url: page.url
+  };
+}
+`;
+
+const params = {
+  workflow: {
+    schemaVersion: 1,
+    name: "读取当前页面",
+    entry: "main.js",
+    files: {
+      "main.js": source,
+    },
+  },
+  binding: {
+    pageId,
+  },
+};
 ```
 
-`find` returns every matching line/item as an array, or [] on a miss. Check
-`$vars.matches.length` equals 1 before selecting jsonpath index `0` to extract an
-id. regex and template preserve array shape. A regex miss returns an empty
-string, so exists alone is not a valid id guard. jsonpath uses dot paths and
-numeric indices, not full JSONPath. reg parses the first matching observation
-record and does not prove uniqueness. querySelector operates on a supplied
-simplified tree, not the live DOM or raw artifact text. Use only operations
-exposed by the current schema; some versions also expose join and decode.
+Pass `params` to `Workflow.execute`.
 
-## Step types
+| Parameter  | Meaning                                              |
+| ---------- | ---------------------------------------------------- |
+| `workflow` | Name, entry module, and source files                 |
+| `input`    | Business input passed to the entry; defaults to `{}` |
+| `binding`  | Page or Fleet used for this execution                |
 
-Write explicit type for every step and purpose for every Action. The Harness
-also accepts action shorthand where its schema permits it.
+Compilation errors include available source locations. Correct the source and submit again.
 
-| type | purpose |
-| --- | --- |
-| action | Run an Action with params, purpose, extract and onError |
-| readEvents | Read replayable events from the latest Action window |
-| waitEvent | Wait for events after that window, with bounded timeout |
-| transform | Apply deterministic operations and write an output variable |
-| store | set, merge, append or delete a path relative to the execution's store |
-| if | Evaluate condition and run then or else |
-| loop | Repeat body subject to condition, maxIterations and total deadline |
+## Entry and business logic
 
-Keep onError at stop. There is no retry step setting. Continue only when an
-explicit recovery branch handles the failure under the applicable policy.
-Variables and store hold JSON-compatible values. Store is execution-scoped;
-return accepted rows to the Agent for record_extraction. Every loop must make
-observable progress and recheck its continuation condition.
+Default-export the entry function. Its first argument provides platform capabilities; its second argument receives business input.
 
-Step shapes use exact field names, not a family of synonyms: a loop step is
-`{"type":"loop","maxIterations":N,"condition":{...},"body":[...]}` — never
-`steps` or `stopWhen`. A conditional step is
-`{"type":"if","condition":{...},"then":[...],"else":[...]}` — the type is
-`"if"`, never `"condition"`. A transform step is
-`{"type":"transform","input":"$reference","ops":[...],"output":"name"}`
-— never `expression`, `inputs` or `outputs`. `extract` is a field on an action
-step, not a step type.
+| Capability | Use                                                 |
+| ---------- | --------------------------------------------------- |
+| `actions`  | Call platform Actions and receive business data     |
+| `context`  | Read the immutable execution-start snapshot         |
+| `waitFor`  | Wait for events, optionally with a trigger function |
+| `readText` | Read observation artifact text                      |
+| `sleep`    | Wait for a duration in milliseconds                 |
 
-## Runtime binding
+`context` contains `workflowId`, `taskId`, and available page, Fleet, URL, and hostname information. Call `Page.getState` for current page state.
 
-Do not write `pageId` or `fleetId` in action params. The runtime binding
-supplies the target; a placeholder string ("$pageId", "{{pageId}}") is sent
-as a literal value and fails, and a guessed UUID passes validation but fails
-at runtime. Omit the field entirely. Object arguments keep their object shape:
-Input.scroll's `target` and `container` are `{"id":"n_..."}` objects, never
-a bare node-id string.
+Use native JavaScript or TypeScript variables, conditions, loops, functions, classes, exceptions, and data transformations. Pass required capabilities to helper modules.
 
-## Observe, select one target, act
+Provide `purpose` for proxied Actions. Explicit page and Fleet arguments take precedence over execution bindings.
 
-This example assumes a settled page and a previously chosen target label. The
-pattern must match the observed role/name and artifact format for the task.
-Zero or multiple matches return evidence without clicking. Even a succeeded
-Workflow can take this no-action branch; inspect its store before claiming success.
+## Modules, events, and observations
 
-```json
-[
-  {"type":"action","action":"DOM.getAXTree","purpose":"Read current controls"},
-  {"type":"transform","input":"$cache.observation","ops":[{"op":"find","pattern":"button \"Continue\"","mode":"contains"}],"output":"matches"},
-  {"type":"if","condition":{"path":"$vars.matches.length","operator":"equals","value":1},
-   "then":[
-     {"type":"transform","input":"$vars.matches","ops":[{"op":"jsonpath","path":"0"},{"op":"regex","pattern":"\\[(n_[A-Za-z0-9_-]+)\\]","group":1}],"output":"targetId"},
-     {"type":"if","condition":{"path":"$vars.targetId","operator":"matches","value":"^n_[A-Za-z0-9_-]+$"},
-      "then":[{"type":"action","action":"Input.click","params":{"id":"$vars.targetId"},"purpose":"Activate the uniquely matched control"}],
-      "else":[{"type":"store","op":"set","path":"selection.status","value":"invalid-id"}]}
-   ],
-   "else":[{"type":"store","op":"set","path":"selection.matches","value":"$vars.matches"}]}
-]
+Import package modules through relative paths. Reference TypeScript modules with the corresponding `.js` suffix.
+
+`main.ts`:
+
+```ts
+import { summarizeText } from "./helpers.js";
+
+interface Input {
+  url: string;
+}
+
+export default async function main(
+  { actions, context, waitFor, readText }: WorkflowApi,
+  input: Input,
+) {
+  const pageId = context.pageId;
+
+  if (!pageId) {
+    throw new Error("需要绑定页面");
+  }
+
+  if (typeof input?.url !== "string") {
+    throw new Error("需要提供目标地址");
+  }
+
+  const url = input.url;
+  const { event } = await waitFor(
+    {
+      events: ["Page.loaded", "Page.loadFailed"],
+      pageId,
+      timeoutMs: 30_000,
+      match(event) {
+        if (event.event === "Page.loadFailed") {
+          return true;
+        }
+
+        return event.payload.url === url;
+      },
+    },
+    () =>
+      actions.Page.navigate({
+        pageId,
+        url,
+        purpose: "打开目标页面",
+      }),
+  );
+
+  if (event.event === "Page.loadFailed") {
+    throw new Error("页面加载失败");
+  }
+
+  const observation = await actions.DOM.getAXTree({
+    pageId,
+    purpose: "读取页面结构",
+  });
+  const text = await readText(observation.artifact);
+
+  return {
+    pageId,
+    url,
+    version: observation.version,
+    freshness: observation.freshness,
+    completeness: observation.completeness,
+    ...summarizeText(text),
+  };
+}
 ```
 
-## Event synchronization
+`helpers.ts`:
 
-A terminal event can arrive during or after an Action. First readEvents for its
-Action window. Only waitEvent when no terminal event was found. Handle success,
-failure and timeout explicitly. A timeout is normal data with events: [] and
-timedOut: true; it does not prove readiness. Use the current schema's focus names;
-schema support does not guarantee an event will occur for this operation.
-Page.go can report navigationStarted=false with no load event. Follow the live
-Harness lifecycle policy, synchronize Page.getState and refresh AXTree before
-using new document ids. If the policy rejects an authored synchronization shape,
-inspect its receipt and return to Agent settlement rather than bypassing the gate.
+```ts
+export function summarizeText(text: string) {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
 
-The following steps illustrate event-window handling after an Action. They are
-not a standalone navigation or readiness assertion:
-
-```json
-[
-  {"type":"readEvents","focus":["Page.loaded","Page.loadFailed"],"extract":{"navigationEvents":"events"}},
-  {"type":"if","condition":{"path":"$vars.navigationEvents.0.event","operator":"notExists"},
-   "then":[{"type":"waitEvent","focus":["Page.loaded","Page.loadFailed"],"timeout":15000,"extract":{"navigationEvents":"events","navigationTimedOut":"timedOut"}}]},
-  {"type":"store","op":"set","path":"navigation.events","value":"$vars.navigationEvents"}
-]
+  return {
+    lineCount: lines.length,
+    preview: lines.slice(0, 5).join("\n"),
+  };
+}
 ```
 
-## Failure and continuation
+Provide this `input` through `Workflow.execute`:
 
-Inspect failedStepPath, failedErrorCode, completedSteps, variablesAtFailure,
-storeAtFailure and executionTrace.pageEvents in the Harness failure receipt.
-Keep collected rows and resume only the remaining work. Do not mechanically
-slice at failedStepPath: branches and loops carry state. stepPath identifies a
-static DSL location; stepRunId distinguishes executions such as loop iterations.
+```json
+{
+  "url": "https://example.com/"
+}
+```
 
-Dispatch is not outcome proof. An Action may have taken effect even if a later
-step failed or a receipt is missing. Verify the affected resource before retrying
-and obey replayForbidden and task permissions. A failed segment does not undo
-prior actions. Choose a new bounded segment or single calls for diagnosis.
+`waitFor(options, trigger)` subscribes before invoking the trigger and can receive an event that arrives before the Action returns. Filter by page scope and business conditions; keep related operations on one page sequential.
 
-Consume final execution results for full values. Workflow.progress and
-Workflow.getStatus expose summaries such as variableKeys and resultCount, not
-full variable values. Store is not shared between executions; carry required
-state explicitly into a continuation.
+Use `freshness` and `completeness` to assess whether the observation meets the next operation's needs. `DOM.getDetails` accepts `version` and `nodeIds` for saved-version reads or `query` for live reads. Read its returned `details` directly.
 
-## Reuse
+## Concurrency and return values
 
-Reuse returned workflowDefinition.definitionRef and definitionHash through
-execute_saved_browser_workflow, patching only the intended changes. Read the
-receipt's lastAttempt status, issues and errors before reuse: a definition is
-saved before execution and may never have passed validation or reached the
-platform. Correct invalid parameter paths; do not replay an unchanged invalid
-definition. A page_state_resync_required receipt requires Page.getState, not a
-new template. Carry lastAttempt with ref/hash when handing a definition to
-another worker. Definition identity does not authorize replay of already
-dispatched side effects.
-The Harness execution tool accepts its own wrapper; direct platform
-Workflow.execute uses workflow plus binding. Workshop export is a separate
-format with hostname availability; exclude execution ids, credentials, cookies
-and machine-specific paths from reusable Workshop documents.
+Use `Promise.all` for independent pages. Organize larger batches with at most 8 platform requests per batch. Same-page Actions follow platform scheduling.
+
+Await every platform operation before returning. Handle allowed individual failures with `try/catch` and return them as business data.
+
+Return JSON data, preferably an object organized by business meaning. No return value produces `output: null`. Convert dates, collections, and other objects to strings, arrays, or plain objects first.
+
+Output is limited to 4 MiB. Save larger reports through file Actions and return a summary with file information. Workshop file exports use `output.file` for the file Action's result.
+
+## Results and controls
+
+Read the execution result's `status` first:
+
+- `succeeded`: read `output`.
+- `failed`: read `error` and the call records.
+- `cancelled`: inspect call records to determine effects already produced.
+
+`results` contains platform call status, timing, and available source locations. Values omitted for size include `valueOmittedReason`.
+
+Use `Workflow.getStatus` to inspect an execution and `Workflow.pause`, `Workflow.resume`, or `Workflow.cancel` to control it. Pause takes effect at an asynchronous job boundary; resume continues the live environment. Manual retry starts a new execution from the entry.
+
+## Save and import into Workshop
+
+A local project contains `workflow.json`, the editor type file, and scripts under `src`.
+
+`workflow.json`:
+
+```json
+{
+  "schemaVersion": 1,
+  "name": "读取当前页面",
+  "entry": "src/main.js",
+  "timeoutMs": 60000,
+  "availability": {
+    "mode": "hosts",
+    "hostnamePatterns": ["(^|\\.)example\\.com$"]
+  }
+}
+```
+
+Export editor types and package the source:
+
+```sh
+webcross workflow types --out ./my-workflow/webcross.d.ts
+webcross workflow pack ./my-workflow --out ./read-page.workshop.json
+```
+
+The type file supplies editor completion and type checking. Packaging collects source and metadata into a `webcross-workshop` document.
+
+Availability patterns match normalized hostnames. Use `mode: "all-hosts"` for all HTTP and HTTPS hosts.
+
+Workshop passes `{}` to the entry. For workflows requiring business input, use `Workflow.execute` with `input`.
+
+## Harness execution scope and selected Skill
+
+In standalone /browser, the explicitly selected Skill supplies the starting
+orchestration. Read its formal Workflow packages and input definitions through
+read_selected_skill_resource. Bind actual task values, then prefer applicable
+execute_published_skill_workflow entries. Its variables argument is passed as
+execution input, separately from the immutable source and page/Fleet binding.
+Normal supported value changes reuse source. Model judgment decides applicability,
+missing data and recovery; record evidence when a template gap requires deviation.
+Parameter examples support input binding. Development probes are not business execution entries.
+
+The current source language replaces steps/transform/store and implicit $vars,
+$last, $cache references. Rebuild legacy files against the actual task and current
+SDK; changing variables cannot translate their language. A fresh read or page
+re-render does not automatically require another model turn: native JS can read,
+locate and act when the choice is already determined. End a segment at a new
+semantic decision, permission handoff, unavailable capability or uncertain effect.
+Evaluate boundaries by model round trips and recovery cost, not a fixed step count.
+
+The Harness passes a scoped API to unmodified business source. Every call checks
+allowed methods and bound page/Fleet, including aliases and computed calls.
+Ownership discovery/changes, Network.readApi, Runtime.evaluate and local output
+remain independent tools. For File.handleChooser, canonical already-authorized
+file paths must appear in execution input or individual file grants. A source
+string cannot grant access. Read or authorize missing files before retrying.
+This Harness currently scopes each execution to one page/Fleet, even though the
+native platform can schedule several pages. Keep same-page operations sequential.
+
+Read full observation text with readText; DOM.getDetails returns details directly.
+waitFor subscribes before trigger and timeout throws; neither an event nor file
+assignment alone proves a website accepted the upload. Await every platform call
+and return compact JSON evidence, coverage and remaining work. The JS environment
+does not supply Node, Shell, Python or browser Runtime.evaluate.
+
+The client waits for the source package's declared deadline plus bounded cleanup.
+If transport delivery fails, inspect identity and actual effects. getStatus reports
+completedCalls/activeCalls. cancelled and unknown are not success. Retry starts
+from the entry: never mechanically slice at an error source line or replay uncertain
+writes. Large intermediate call values are preserved with task-resource references;
+read them only when needed to diagnose or verify.
+
+The trusted capability module initializes before business modules. SDK globals
+and their prototypes are reserved: scripts use their own helpers instead of
+replacing built-ins. This protects permission and JSON encoding invariants.
+Compiler errors and business exceptions map to original source; a proxied Action
+call's native source location may name the trusted capability module. Keep that
+location and the action/code/ledger; do not relabel it as a business source line.

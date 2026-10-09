@@ -1,30 +1,13 @@
-"""Read WebCross page-observation artifacts back into the DOM.getAXTree response.
+"""Read and verify WebCross page-observation artifacts.
 
-Since the unified page observation (WebCross 0.9.3), `DOM.getAXTree` no longer
-carries the tree inline. A successful read returns references to immutable
-text artifacts on the host's disk:
+WebCross 0.9.6 returns a full artifact from DOM.getAXTree and a detail artifact
+from DOM.getDetails. Detail source=live is a current bounded query;
+source=snapshot reads saved values and never refreshes live state. Host paths
+are consumed at receipt time and removed from model-visible references.
 
-* ``mode="full"``: ``artifact`` is ALWAYS the complete current page view, and
-  ``diff`` says how it relates to the page's previous issued view -
-  ``initial`` / ``unchanged`` / ``computed`` (with its own diff artifact) /
-  ``unavailable`` (a reason; the platform declines a diff larger than a third
-  of the full view).
-* ``mode="detail"``: one bounded query artifact for the requested targets.
-
-The files live outside the task worktree, and the platform deletes them once
-their lease ends (a closed page retires its artifacts), so they must be read
-when the response arrives. `hydrate_axtree_response` does that for every
-client: it verifies each file against the reference the platform returned
-and folds the content back into the response - node lines under
-``data.lines``, frame and component records beside them, diff and detail
-records as parsed lists - and removes the host paths. Every existing reader of
-``data.lines`` keeps working, and nothing points the model at a host file it
-is not authorised to open.
-
-Nothing here trusts the path merely because the platform named it: the file
-must sit under a directory named for the requested page, match the byte size
-and sha256 in the reference, carry this page's id in its meta line and end
-with the platform's own content hash.
+References, page identity and the artifact's own end hash are verified before
+any facts are exposed. A missing or malformed artifact is unavailable evidence,
+never an empty page. Versions are opaque identifiers, not ordering evidence.
 """
 
 from __future__ import annotations
@@ -57,10 +40,7 @@ _FRAME_REF_RE = re.compile(
     rf"\b(?P<key>parent|owner|root)=\[(?P<id>{AX_FRAME_ID_PATTERN}|{AX_NODE_ID_PATTERN})\]"
 )
 _COMPONENT_LINE_RE = re.compile(r"^component \[(?P<id>c_[0-9a-f]+)\](?P<rest>.*)$")
-_CHANGE_LINE_RE = re.compile(
-    r"^(?P<op>[~+\-=]) (?P<entity>node|frame|component|surface) \[(?P<id>[^\]]+)\]"
-    r"(?: (?P<verb>set|splice|changed) (?P<path>\S+))?"
-)
+
 
 
 class ObservationArtifactError(ValueError):
@@ -339,14 +319,6 @@ def node_frame_map(lines: List[str], frames: List[JsonDict]) -> Dict[str, Option
     return result
 
 
-def parse_change_line(line: str) -> Optional[JsonDict]:
-    """The addressing part of one diff record: op, entity, id, verb, path."""
-    match = _CHANGE_LINE_RE.match(line)
-    if match is None:
-        return None
-    return {key: value for key, value in match.groupdict().items() if value is not None}
-
-
 def parse_detail_line(line: str) -> Optional[JsonDict]:
     if not line.startswith("detail "):
         return None
@@ -366,87 +338,102 @@ def _public_reference(reference: Any) -> Any:
     return {key: value for key, value in reference.items() if key != "path"}
 
 
-def hydrate_axtree_response(params: Any, response: Any) -> Any:
-    """Fold a DOM.getAXTree response's artifacts back into the response.
-
-    Returns a new response; the input is not modified. A response that is not
-    an artifact-bearing observation is returned unchanged. A read failure is
-    reported as ``data.observationError`` (the caller fails closed on it) and
-    never as an empty page.
-    """
+def hydrate_page_observation_response(params: Any, response: Any, *, method: Optional[str] = None) -> Any:
+    """Hydrate one full or detail receipt without modifying its input."""
     if not isinstance(response, dict):
         return response
     data = response.get("data")
     if not isinstance(data, dict) or data.get("mode") not in {"full", "detail"}:
         return response
+    if data.get("mode") == "detail" and isinstance(data.get("details"), list):
+        hydrated = copy.deepcopy(response)
+        out = hydrated["data"]
+        params = params if isinstance(params, dict) else {}
+        records = out["details"]
+        summary = out.get("summary") or {}
+        source = "snapshot" if "nodeIds" in params else "live"
+        try:
+            if out.get("pageId") != params.get("pageId") or out.get("source") != source:
+                raise ObservationArtifactError("detail-identity-mismatch", "Details do not match page/source binding")
+            if source == "snapshot" and out.get("version") != params.get("version"):
+                raise ObservationArtifactError("detail-version-mismatch", "Saved details belong to a different observation")
+            succeeded = sum(r.get("ok") is True for r in records if isinstance(r, dict))
+            failed = sum(r.get("ok") is False for r in records if isinstance(r, dict))
+            if (summary.get("total") != len(records) or summary.get("succeeded") != succeeded
+                    or summary.get("failed") != failed or succeeded + failed != len(records)
+                    or [r.get("index") for r in records] != list(range(len(records)))):
+                raise ObservationArtifactError("detail-count-mismatch", "Details contradict their ordered summary")
+            if source == "snapshot" and [r.get("target", {}).get("id") for r in records] != params.get("nodeIds"):
+                raise ObservationArtifactError("detail-target-mismatch", "Saved details belong to different requested nodes")
+            out["observation"] = {k: out[k] for k in ("pageId", "documentEpoch", "capturedAt", "checkedAt", "version", "source", "completeness", "pendingChanges") if k in out}
+            out["records"] = [{**r, **({"value": {"nodes": [r["node"]]}} if r.get("ok") and "node" in r else {})} for r in records]
+        except ObservationArtifactError as exc:
+            out["observationError"] = {"code": exc.code, "message": str(exc)}
+        return hydrated
     if not isinstance(data.get("artifact"), dict):
         return response
-    page_id = ""
-    if isinstance(params, dict):
-        page_id = str(params.get("pageId") or "")
+    page_id = str(params.get("pageId") or "") if isinstance(params, dict) else ""
     page_id = page_id or str(data.get("pageId") or "")
     hydrated = copy.deepcopy(response)
     out = hydrated["data"]
+    # Retired platform fields must not leak host paths or imply a change chain.
+    out.pop("diff", None)
+    out.pop("details", None)
     try:
+        expected_mode = {"DOM.getAXTree": "full", "DOM.getDetails": "detail"}.get(method)
+        if expected_mode and out["mode"] != expected_mode:
+            raise ObservationArtifactError("artifact-mode-mismatch", "observation mode contradicts the called Action")
+        if data.get("pageId") and data["pageId"] != page_id:
+            raise ObservationArtifactError("artifact-page-mismatch", "response names another page")
+        meta, body, end = read_artifact(out["artifact"], kind=out["mode"], page_id=page_id)
+        if out.get("version") and out["version"] != meta.get("version"):
+            raise ObservationArtifactError("artifact-version-mismatch", "artifact names another observation version")
+        fields = ("version", "documentEpoch", "capturedAt", "checkedAt", "freshness",
+                  "pendingChanges", "completeness", "filteredCounts")
+        out["observation"] = {key: meta[key] for key in fields if key in meta}
+        for key in ("checkedAt", "freshness", "pendingChanges", "completeness"):
+            if key in out:
+                out["observation"][key] = out[key]
         if out["mode"] == "detail":
-            meta, body, end = read_artifact(out["artifact"], kind="detail", page_id=page_id)
-            out["records"] = [record for record in map(parse_detail_line, body) if record is not None]
-            out["observation"] = {
-                key: meta.get(key) for key in (
-                    "documentEpoch", "version", "capturedAt", "freshness",
-                )
-            }
-            out["artifact"] = _public_reference(out["artifact"])
-            return hydrated
-        meta, body, end = read_artifact(out["artifact"], kind="full", page_id=page_id)
-        lines, frames, components = split_full_records(body)
-        out["lines"] = order_frame_blocks(lines, frames)
-        out["frames"] = frames
-        out["components"] = components
-        out["nodeCount"] = int(end.get("nodes") or len(lines))
-        out["observation"] = {
-            "version": meta.get("version"),
-            "documentEpoch": meta.get("documentEpoch"),
-            "freshness": meta.get("freshness"),
-            "pendingChanges": meta.get("pendingChanges"),
-            "completeness": meta.get("completeness"),
-            "capturedAt": meta.get("capturedAt"),
-            "filteredCounts": meta.get("filteredCounts"),
-        }
+            source = out.get("source")
+            if source not in {"live", "snapshot"} or meta.get("source") != source:
+                raise ObservationArtifactError("artifact-source-mismatch", "detail source is missing or inconsistent")
+            requested_source = "live" if isinstance(params, dict) and "query" in params else "snapshot"
+            if source != requested_source:
+                raise ObservationArtifactError("artifact-source-mismatch", "detail source contradicts the requested form")
+            out["observation"]["source"] = source
+            if source == "snapshot":
+                requested_version = params.get("version") if isinstance(params, dict) else None
+                if requested_version != meta.get("version"):
+                    raise ObservationArtifactError("artifact-version-mismatch", "saved details do not match the requested version")
+            records = [parse_detail_line(line) for line in body]
+            summary = out.get("summary") or {}
+            if (any(record is None for record in records)
+                    or len(records) != end.get("details")
+                    or len(records) != summary.get("total")
+                    or any(type(record.get("ok")) is not bool for record in records)
+                    or sum(record["ok"] is True for record in records) != summary.get("succeeded")
+                    or sum(record["ok"] is False for record in records) != summary.get("failed")):
+                raise ObservationArtifactError("artifact-record-count-mismatch", "detail records contradict their summary")
+            out["records"] = records
+        else:
+            lines, frames, components = split_full_records(body)
+            out["lines"] = order_frame_blocks(lines, frames)
+            out["frames"] = frames
+            out["components"] = components
+            out["nodeCount"] = int(end.get("nodes") or len(lines))
         out["artifact"] = _public_reference(out["artifact"])
-        diff = out.get("diff")
-        if isinstance(diff, dict) and diff.get("status") == "computed":
-            # The full view stands on its own; a diff that cannot be trusted
-            # degrades to "unavailable" instead of taking the view with it.
-            try:
-                diff_meta, diff_body, _diff_end = read_artifact(
-                    diff.get("artifact"), kind="diff", page_id=page_id,
-                )
-                if diff_meta.get("version") != meta.get("version"):
-                    raise ObservationArtifactError(
-                        "diff-version-mismatch", "diff artifact does not end at the full view's version",
-                    )
-                out["diff"] = {"status": "computed", "records": diff_body}
-            except ObservationArtifactError as exc:
-                out["diff"] = {"status": "unavailable", "reason": f"harness-{exc.code}"}
-        details = out.get("details")
-        if isinstance(details, list):
-            # Complete values of truncated fields. Their artifacts are other
-            # host files; the model reaches the same values with a bounded
-            # DOM.getAXTree query instead.
-            out["details"] = [
-                {"nodeId": item.get("nodeId"), "fields": item.get("fields")}
-                for item in details if isinstance(item, dict)
-            ]
-    except ObservationArtifactError as exc:
+    except (ObservationArtifactError, UnicodeError, json.JSONDecodeError) as exc:
         out.pop("lines", None)
-        out["observationError"] = {"code": exc.code, "message": str(exc)}
-        if isinstance(out.get("artifact"), dict):
-            out["artifact"] = _public_reference(out["artifact"])
-        diff = out.get("diff")
-        if isinstance(diff, dict) and isinstance(diff.get("artifact"), dict):
-            diff["artifact"] = _public_reference(diff["artifact"])
+        out.pop("records", None)
+        out.pop("observation", None)
+        out["observationError"] = {"code": getattr(exc, "code", "artifact-format-invalid"), "message": str(exc)}
+        out["artifact"] = _public_reference(out["artifact"])
     return hydrated
+
+
+# Kept for callers importing the pre-split hydration helper.
+hydrate_axtree_response = hydrate_page_observation_response
 
 
 def main_document_can_scroll_down(lines: Any) -> Optional[bool]:

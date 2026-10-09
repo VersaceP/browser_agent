@@ -610,12 +610,19 @@ class ABCPClient:
                     request_sent=None,
                 ) from exc
             try:
-                raw_response = await asyncio.wait_for(
-                    future, timeout=self.config.call_timeout_seconds
-                )
+                call_timeout = self.config.call_timeout_seconds
+                package = params.get("workflow") if isinstance(params, dict) else None
+                if method == "Workflow.execute" and isinstance(package, dict) and "files" in package:
+                    # The source-package deadline includes pauses; the platform
+                    # also has a bounded cleanup phase. This is a single call,
+                    # not a retry or permission to replay dispatched effects.
+                    deadline_ms = package.get("timeoutMs", 600000)
+                    if isinstance(deadline_ms, int) and not isinstance(deadline_ms, bool) and 0 < deadline_ms <= 3600000:
+                        call_timeout = max(call_timeout, deadline_ms / 1000 + 10)
+                raw_response = await asyncio.wait_for(future, timeout=call_timeout)
             except asyncio.TimeoutError as exc:
                 raise ABCPTransportError(
-                    f"Call to {method} timed out ({self.config.call_timeout_seconds}s)",
+                    f"Call to {method} timed out ({call_timeout}s)",
                     rpc_method=method,
                     transport_code=ABCP_TRANSPORT_CALL_TIMEOUT,
                     request_sent=True,
@@ -669,13 +676,13 @@ class ABCPClient:
             "response", response, secrets,
             already_redacted=method == "Network.readApi",
         )
-        if method == "DOM.getAXTree":
+        if method in {"DOM.getAXTree", "DOM.getDetails"}:
             # The page view arrives as host artifact files that the platform
             # retires on its own schedule; read them now, for every caller,
             # after the transport log has kept the original references.
             from harness.observation.observation_channel import record_hydrated_response
-            from harness.observation.page_observation import hydrate_axtree_response
-            response = hydrate_axtree_response(params, response)
+            from harness.observation.page_observation import hydrate_page_observation_response
+            response = hydrate_page_observation_response(params, response, method=method)
             record_hydrated_response(params, response)
         if (method == "System.register" and isinstance(self._ws, LocalControlSocket)
                 and not self._ws.watching):

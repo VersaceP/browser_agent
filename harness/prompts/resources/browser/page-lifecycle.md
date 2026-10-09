@@ -90,7 +90,7 @@ Dialogs are stateful. When the Input action that opened the dialog returns
 `dialog.id`, copy that id directly into `Page.handleDialog`. If it did not,
 `Page.getState` carries harness-tracked `pendingDialogs`; select the intended id
 from that current list when more than one is pending. Refresh state after
-handling one. Never retain `Page.handleDialog.userInput` in reasoning,
+handling one. Never retain `Page.handleDialog.promptText (legacy userInput)` in reasoning,
 artifacts, or output.
 
 ## Human decisions when the task no longer determines the next action
@@ -156,14 +156,15 @@ that terminal state first.
 
 After navigation or recovery, first settle loading and synchronize Page.getState.
 Refresh DOM.getAXTree when deriving node ids or querying find_in_axtree.
-Selector-targeted actions and `DOM.getAXTree` queries by selector can run on a
+Selector-targeted actions and `DOM.getDetails` live queries by selector can run on a
 settled page without a preceding full read. They do not make old ids current. Target identity, ownership and actual readiness checks still apply.
 
 Workflow has the same distinction: navigation settlement followed by
 Page.getState is sufficient for a selector-targeted step or to end the segment.
 Workflow action execution and live handle resolution remain WebCross's responsibility.
-A workflow can read leased observation content with `$cache.observation` or `$last`
-and use `transform`; the artifact path field itself is metadata only.
+A JS/TS workflow reads fresh full observation content with `api.readText` on the
+artifact issued by DOM.getAXTree, and processes it with native JS. DOM.getDetails
+returns `details` directly. The artifact path field itself is metadata only.
 
 ## No dispatch, load failure and snapshot freshness
 

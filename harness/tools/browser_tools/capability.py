@@ -59,7 +59,7 @@ def _mark_axtree_parse_inconsistency(
     The original browser response stays attached for platform diagnosis.
     """
 
-    if method != "DOM.getAXTree" or not isinstance(snapshot, dict):
+    if method not in {"DOM.getAXTree", "DOM.getDetails"}:
         return False
     response = result.get("response")
     data = response.get("data") if isinstance(response, dict) else None
@@ -71,21 +71,23 @@ def _mark_axtree_parse_inconsistency(
         result.update({
             "status": "failed",
             "error": (
-                "DOM.getAXTree artifact could not be read: "
+                f"{method} artifact could not be read: "
                 f"{observation_error.get('code')}"
             ),
-            "axtreeDataError": {
-                "code": "axtree_artifact_unreadable",
+            ("axtreeDataError" if method == "DOM.getAXTree" else "observationDataError"): {
+                "code": "axtree_artifact_unreadable" if method == "DOM.getAXTree" else "observation_artifact_unreadable",
                 "artifactError": observation_error.get("code"),
                 "parsedNodeCount": 0,
             },
             "next_instruction": (
-                "The page view could not be read back from its artifact. Call"
-                " DOM.getAXTree again; do not use a prior AXTree id or infer"
-                " absence from this read."
+                "The observation artifact could not be verified. Inspect the"
+                f" reported error before another {method} read; this result"
+                " cannot establish absence or current target identity."
             ),
         })
         return True
+    if method != "DOM.getAXTree" or not isinstance(snapshot, dict):
+        return False
     nodes = snapshot.get("nodes")
     if isinstance(nodes, list) and nodes:
         return False
@@ -146,7 +148,7 @@ async def _execute_browser_capability_tool(
                 "tool": method,
                 "params": agent._trim_for_log(redact_params_for_display(
                     params,
-                    {"userInput"} if method == "Page.handleDialog" else None,
+                    sensitive_browser_method_params(method),
                 )),
             },
         )
@@ -305,6 +307,26 @@ async def _execute_browser_capability_tool(
             params["returnByValue"] = True
 
     if method == "Workflow.execute":
+        from harness.workflow.script_runtime import (is_script_package,
+            script_contract_available, scope_package, input_files)
+        script_request = isinstance(params.get("workflow"), dict) and is_script_package(params["workflow"])
+        if script_request:
+            if not workflow_execution_enabled(agent):
+                return workflow_execution_disabled_result(source="browser_call.Workflow.execute"), False
+            wire_issues = validate_schema(params, method_input_schema)
+            if wire_issues:
+                return capability_argument_error(tool_name, method, wire_issues), False
+            document = params["workflow"]
+            binding = params.get("binding") or {}
+            business_input = params.get("input", {})
+            params = {"description": document.get("description") or document.get("name"),
+                      "timeout": document.get("timeoutMs", 600000), **binding,
+                      "_platformWorkflow": document, "_platformInput": business_input}
+        elif script_contract_available():
+            return {"status": "workflow_source_required", "tool_was_executed": False,
+                    "error": "This deployment requires a JS/TS source package (entry/files) and separate input; rebuild legacy steps Workflow.",
+                    "next_instruction": "Read the current Workflow guide; do not silently translate or replay legacy steps."}, False
+    if method == "Workflow.execute" and not script_request:
         if "workflow" in params:
             wire_issues = validate_schema(params, method_input_schema)
             if wire_issues:
@@ -543,6 +565,24 @@ async def _execute_browser_capability_tool(
         )
         agent.trace.append({"type": "browser_call_schema_rejected", "result": result})
         return result, False
+
+    if method == "Workflow.execute" and script_request:
+        # Scope the actual identities after ordinary Fleet injection, ownership
+        # admission and wire validation. Early wrapping would capture a missing
+        # Fleet instead of the one the Harness authoritatively bound.
+        methods = {m for m in set(getattr(agent, "capability_methods", set()))
+                   if _bt()._check_worker_contract(agent, m) is None}
+        try:
+            guarded, scope = scope_package(params["_platformWorkflow"],
+                page_id=str(params.get("pageId") or ""),
+                fleet_id=str(params.get("fleetId") or ""), methods=methods,
+                files=input_files(agent, params.get("_platformInput", {})))
+        except ValueError as exc:
+            return {"status": "invalid_workflow_package", "tool_was_executed": False,
+                    "error": str(exc)}, False
+        agent.logger.write("workflow.script.scope", scope)
+        params["_platformWorkflow"] = guarded
+        params["_platformBinding"] = scope["platformBinding"]
 
     _bt()._observe_progress_before(agent, method, params, step)
 
@@ -1098,7 +1138,7 @@ async def _execute_browser_capability_tool(
         prefix=agent.runtime.agent_id,
         # Read defensively, like the rest of this module reads harness config:
         # a preservation step must never be the reason a browser call raises.
-        projection_limit=int(
+        projection_limit=1 if method == "Workflow.execute" and script_request else int(
             getattr(
                 getattr(agent.runtime, "harness", None),
                 "max_observation_chars",
@@ -1111,6 +1151,11 @@ async def _execute_browser_capability_tool(
     agent.logger.write("browser.call.result", agent._trim_for_log(result))
     workflow_facts = workflow_execution_facts(result) if method == "Workflow.execute" else None
     model_source = result
+    if method == "Workflow.execute" and script_request and complete_payload and complete_payload.get("savedPath"):
+        from harness.workflow.script_runtime import script_params_for_model
+        complete_payload["reason"] = "workflow_source_echo_omitted"
+        complete_payload["projectionLimitChars"] = agent.runtime.harness.max_observation_chars
+        model_source = {**result, "params": script_params_for_model(shown_params(), scope, complete_payload["savedPath"])}
     if (
         method == "Runtime.evaluate"
         and complete_payload
@@ -1297,6 +1342,38 @@ def _attach_exec_trace(
         return
     receipt = trace.to_receipt()
     result["executionTrace"] = receipt
+    data = (result.get("response") or {}).get("data")
+    if isinstance(data, dict) and "output" in data:
+        from harness.workflow.script_runtime import script_result_facts
+        facts = script_result_facts(result)
+        result["workflowExecution"] = facts
+        result["status"] = facts["status"]
+        if facts["status"] in {"failed", "cancelled"}:
+            result["isError"] = True
+        calls = data.get("results") or []
+        logger = getattr(agent, "logger", None)
+        if logger:
+            logger.write("exec.segment.result", {
+                "step": step, "workflowId": data.get("workflowId"),
+                "phase": "completed" if facts["status"] == "succeeded" else facts["status"],
+                "format": "js-ts-source-package", "executedStepCount": len(calls),
+                "actionsObserved": sum(c.get("kind") == "action" for c in calls),
+                "actionsSucceeded": sum(c.get("kind") == "action" and c.get("status") == "succeeded" for c in calls),
+                "completedCalls": len(calls), "source": (data.get("error") or {}).get("source"),
+                "failedErrorCode": (data.get("error") or {}).get("code"),
+                "durationMs": (data.get("timing") or {}).get("durationMs"),
+            })
+        return
+    from harness.workflow.script_runtime import is_script_package
+    if is_script_package((workflow_params or {}).get("_platformWorkflow")):
+        if isinstance(failure_details, dict):
+            # Compile errors carry an original nested source location. Retain
+            # the public fields without the legacy scalar-only projection.
+            result.setdefault("rpcData", {})["details"] = {
+                k: failure_details[k] for k in ("code", "source", "workflowId", "taskId") if k in failure_details}
+        result["workflowExecution"] = workflow_execution_facts(result)
+        result["isError"] = True
+        return
     if agent is not None and isinstance(workflow_params, dict):
         from harness.tools.browser_tools.downloads import remember_workflow_download_progress
         remember_workflow_download_progress(agent, workflow_params, receipt)
@@ -1839,7 +1916,7 @@ def _find_in_axtree(agent: Any, tool_input: JsonDict) -> JsonDict:
         "count": len(matches),
         "matches": matches,
         "next_instruction": (
-            "Use a returned full id with Input.* or a bounded DOM.getAXTree query."
+            "Use a returned full id with Input.* or a bounded DOM.getDetails query."
             if matches
             else "No matching node exists in the current AXTree snapshot; refresh or change query."
         ),

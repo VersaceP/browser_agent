@@ -1,0 +1,14 @@
+[
+  {
+    "case": "consumer_0",
+    "originalReference": "/private/tmp/webcross-v097-sync-GV4LTB/consumer-bdfc260279ab4d3e8cb4682f24bd5927/worktree/isolated-consumer/tool_results/abcp-agent-step2-Workflow-execute-complete-7eb99ae9.json",
+    "fixture": "complete-requests/abcp-agent-step2-Workflow-execute-complete-7eb99ae9.json",
+    "sha256": "c499d4081ce58e933819041ea072531f562d2441b3c48959319ffe689383f4b3"
+  },
+  {
+    "case": "consumer_1",
+    "originalReference": "/private/tmp/webcross-v097-sync-GV4LTB/consumer-bdfc260279ab4d3e8cb4682f24bd5927/worktree/isolated-consumer/tool_results/abcp-agent-step3-Workflow-execute-complete-eff873b4.json",
+    "fixture": "complete-requests/abcp-agent-step3-Workflow-execute-complete-eff873b4.json",
+    "sha256": "e37ed6463a1383a57aa3d558bfc06d9979f3a09413826e7ed5662f843975eff0"
+  }
+]

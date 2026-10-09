@@ -188,119 +188,54 @@ def _check_id_param_format(
 DOM_GET_IMG_MAX_TARGETS = 32
 
 _SCROLL_MODE_INSTRUCTION = (
-    "Input.scroll has three schema branches and no top-level locator. Target mode:"
-    " target={id?,selector?} (plus optional container) with NO distance or"
-    " direction — the browser derives the movement and success means"
-    " targetVisible=true. Container-distance mode: container={id?,selector?}"
-    " with direction and distance. Container-edge mode: container={id?,selector?}"
-    " with edge=start|end and axis=vertical|horizontal (vertical by default)."
-    " Root-viewport scrolling is Page.wheel with current in-viewport x/y and"
-    " explicit deltaX/deltaY (positive = right/down) or edge/axis. Page.wheel"
-    " reports movement as observedDelta against requestedDelta — NOT as"
-    " totalDelta, which is Input.scroll's name for it. Read that field plus"
-    " completedReason before deciding whether another wheel action is needed."
+    "Input.scroll supports target reveal (optional container), signed deltaX/deltaY,"
+    " edge=start|end with axis, or a state read with neither displacement nor edge."
+    " Delta/edge/state reads use an optional container or paired viewport CSS x/y;"
+    " omit both for the page viewport. Target excludes coordinates, deltas and edge."
+    " container and x/y are mutually exclusive. Inspect input.completed,"
+    " observation.status and goal.status separately; submitted input is not movement."
 )
 
-def _check_scroll_param_requirements(
-    method: str,
-    params: JsonDict,
-) -> Optional[JsonDict]:
-    """Reject Input.scroll shapes that do not express one supported mode.
+def _check_scroll_param_requirements(method: str, params: JsonDict) -> Optional[JsonDict]:
+    """Check protocol exclusions omitted from the platform's JSON Schema.
 
-    Check locator presence and mutually exclusive modes before dispatch.
-    Container distance uses the public ``distance`` field; ``amount`` belongs
-    to the native bridge and is not a public Action parameter.
+    These are site-independent action shapes. A rejection performs no input;
+    callers can correct the fields using the live contract. No scroll-progress
+    or business retry decision is made here.
     """
     if method != "Input.scroll":
         return None
 
-    def invalid(detail: str, invalid_param: str) -> JsonDict:
-        return {
-            "method": method,
-            "params": params,
-            "status": "invalid_params",
-            "error": detail,
-            "invalidParam": invalid_param,
-            "tool_was_executed": False,
-            "next_instruction": _SCROLL_MODE_INSTRUCTION,
-        }
+    def invalid(detail: str, key: str) -> JsonDict:
+        return {"method": method, "params": params, "status": "invalid_params",
+                "error": detail, "invalidParam": key, "tool_was_executed": False,
+                "next_instruction": _SCROLL_MODE_INSTRUCTION}
 
-    if "viewport" in params:
-        return invalid(
-            "Input.scroll does not support root viewport mode; use Page.wheel"
-            " with current in-viewport coordinates instead.",
-            "viewport",
-        )
-
-    for key in ("id", "selector", "nodeId", "targetId"):
-        if _non_empty_param(params, key):
-            return invalid(
-                f"Input.scroll does not accept a top-level {key}; put the"
-                " locator in target={id?,selector?} or container={id?,selector?}.",
-                key,
-            )
-
-    target = params.get("target")
-    container = params.get("container")
-    edge = params.get("edge")
-    for key, locator in (("target", target), ("container", container)):
-        if locator is None:
+    for key in ("direction", "distance", "amount", "viewport", "id", "selector", "nodeId", "targetId"):
+        if key in params:
+            return invalid(f"Input.scroll does not accept params.{key}; use the current scroll contract.", key)
+    target, container = params.get("target"), params.get("container")
+    for key in ("target", "container"):
+        if key not in params:
             continue
-        if not isinstance(locator, dict):
-            return invalid(f"Input.scroll params.{key} must be an object.", key)
-        if not (_non_empty_param(locator, "id") or _non_empty_param(locator, "selector")):
-            return invalid(
-                f"Input.scroll params.{key} requires id or selector.", key
-            )
-
-    distance = params.get("distance")
-    numeric_distance = (
-        float(distance)
-        if isinstance(distance, (int, float)) and not isinstance(distance, bool)
-        else None
-    )
-    if numeric_distance is not None and numeric_distance < 0:
-        return invalid("Input.scroll distance must not be negative.", "distance")
-    if target is None and container is None:
-        return invalid(
-            "Input.scroll requires target reveal or an explicit container; use"
-            " Page.wheel for root viewport scrolling.",
-            "container",
-        )
+        locator = params[key]
+        if not isinstance(locator, dict) or not (_non_empty_param(locator, "id") or _non_empty_param(locator, "selector")):
+            return invalid(f"Input.scroll params.{key} requires a locator with id or selector.", key)
+    has_point = "x" in params or "y" in params
+    if has_point and not ("x" in params and "y" in params):
+        return invalid("Viewport coordinates require both x and y.", "x" if "x" not in params else "y")
+    if container is not None and has_point:
+        return invalid("container and viewport coordinates are mutually exclusive.", "container")
     if target is not None:
-        if edge is not None or _non_empty_param(params, "axis"):
-            return invalid(
-                "Input.scroll target mode does not accept edge or axis.",
-                "edge" if edge is not None else "axis",
-            )
-        if _non_empty_param(params, "direction"):
-            return invalid(
-                "Input.scroll target mode derives its own direction; drop"
-                " params.direction or switch to container mode.",
-                "direction",
-            )
-        if distance is not None:
-            return invalid(
-                "Input.scroll target mode derives its own movement; drop"
-                " params.distance or switch to container-distance mode.",
-                "distance",
-            )
-    if edge is not None:
-        if container is None:
-            return invalid(
-                "Input.scroll edge mode requires a container locator.",
-                "container",
-            )
-        if _non_empty_param(params, "direction") or distance is not None:
-            return invalid(
-                "Input.scroll container-edge mode does not accept direction or distance.",
-                "direction" if _non_empty_param(params, "direction") else "distance",
-            )
-    elif _non_empty_param(params, "axis"):
-        return invalid(
-            "Input.scroll axis is accepted only with container-edge mode.",
-            "axis",
-        )
+        for key in ("x", "y", "deltaX", "deltaY", "edge", "axis"):
+            if key in params:
+                return invalid(f"Target reveal does not accept {key}.", key)
+    elif "edge" in params:
+        for key in ("deltaX", "deltaY"):
+            if key in params:
+                return invalid(f"Edge scrolling does not accept {key}.", key)
+    elif "axis" in params:
+        return invalid("axis belongs only to edge scrolling.", "axis")
     return None
 
 def _check_target_param_requirements(

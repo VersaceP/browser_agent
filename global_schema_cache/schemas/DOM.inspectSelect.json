@@ -2,13 +2,13 @@
   "method": "DOM.inspectSelect",
   "description": "Reads the type and current options or value constraints of a native select, date, datetime-local, time, month, week, or color control without changing it.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:ceccd4cf3cd46954290b4ff6547bffaaa32f0836d6047d3f30ae72b459f15d73",
+  "catalogRevision": "sha256:4353ee6b25dd1c25bb33c594c8231a1d46faab7783a010b1092fd1c91582bd64",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "properties": {
       "id": {
-        "description": "Opaque select control ID from the latest DOM.getAXTree observation.",
+        "description": "Opaque select control ID from the current page observation.",
         "type": "string",
         "pattern": "^n_[0-9a-f]{16}$"
       },
@@ -170,6 +170,7 @@
     ]
   },
   "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "properties": {
       "observation": {
@@ -181,7 +182,7 @@
         "description": "Guidance to re-observe current state and choose the next operation."
       },
       "data": {
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Validated business result returned by the Action.",
         "oneOf": [
           {
             "type": "object",
@@ -311,8 +312,7 @@
             ],
             "additionalProperties": false
           }
-        ],
-        "description": "Validated business result returned by the Action."
+        ]
       }
     },
     "required": [

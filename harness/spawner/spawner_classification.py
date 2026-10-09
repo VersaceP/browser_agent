@@ -403,7 +403,8 @@ def _page_traversal_evidence(trace: Optional[List[JsonDict]]) -> JsonDict:
                 # their weaker historical reading. Page.wheel's current schema
                 # REQUIRES its delta field, so a wheel receipt without one is
                 # malformed and cannot prove that the page moved.
-                if method == "Input.scroll":
+                data = _scroll_receipt_data(result) or {}
+                if method == "Input.scroll" and not any(key in data for key in ("input", "observation", "goal")):
                     scrolls += 1
                 continue
             scroll_effect_evidence = "receipt"

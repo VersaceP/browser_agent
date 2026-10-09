@@ -37,7 +37,7 @@ from harness.agents.browser.review.issues import issue_state, active_issues, app
 
 
 READ_BROWSER_METHODS = frozenset({
-    "DOM.getAXTree", "Page.getState", "Network.readApi",
+    "DOM.getAXTree", "DOM.getDetails", "Page.getState", "Network.readApi",
 })
 
 _TOOLS = [
@@ -73,7 +73,7 @@ _TOOLS = [
     {"name": "review_view_image", "description": "View an authorized local image using the existing bounded model image attachment.",
      "input_schema": {"type": "object", "properties": {
          "path": {"type": "string"}}, "required": ["path"]}},
-    {"name": "review_browser_read", "description": "Read a task-bound live page without invoking BrowserAgent post-call actions. Methods: DOM.getAXTree, Page.getState, Network.readApi.",
+    {"name": "review_browser_read", "description": "Read a task-bound live page without invoking BrowserAgent post-call actions. Methods: DOM.getAXTree, DOM.getDetails, Page.getState, Network.readApi.",
      "input_schema": {"type": "object", "properties": {
          "method": {"type": "string", "enum": sorted(READ_BROWSER_METHODS)},
          "params": {"type": "object"}}, "required": ["method", "params"]}},
@@ -662,6 +662,11 @@ async def _browser_read(agent: Any, raw: dict, review_id: str) -> dict[str, Any]
     schema = capability_input_schema(getattr(agent, "method_schemas", {}), method)
     if not isinstance(schema, dict):
         return {"status": "unavailable", "reason": "live_method_schema_missing"}
+    from harness.tools.capability_repairs import prepare_capability_arguments
+    params, _repairs, issues = prepare_capability_arguments(method, params, schema)
+    if issues:
+        return {"status": "rejected", "reason": "method_schema_invalid",
+                "issues": [issue.as_dict() for issue in issues]}
     params, _defaults = apply_required_schema_defaults(params, schema)
     issues = validate_schema(params, schema)
     if issues:
@@ -684,7 +689,7 @@ async def _browser_read(agent: Any, raw: dict, review_id: str) -> dict[str, Any]
         return {"status": "unavailable", "reason": "browser_read_failed",
                 "detail": outcome.error[:500]}
     data = response.get("data") if isinstance(response, dict) else None
-    if method == "DOM.getAXTree":
+    if method in {"DOM.getAXTree", "DOM.getDetails"}:
         # ABCPClient.call already hydrates and verifies artifacts for ALL
         # callers. Hydrating twice reads a deliberately removed host path.
         if isinstance(data, dict) and data.get("observationError"):
@@ -712,7 +717,7 @@ async def _browser_read(agent: Any, raw: dict, review_id: str) -> dict[str, Any]
         resource_uri, content_hash]))[:24]
     preview = serialized
     notice = "Use review_query_observation with this evidenceId for the complete stored response."
-    if method == "DOM.getAXTree" and isinstance(data, dict):
+    if method in {"DOM.getAXTree", "DOM.getDetails"} and isinstance(data, dict):
         lines = data.get("lines")
         if isinstance(lines, list) or isinstance(data.get("records"), list):
             # The raw receipt is saved above. Its host-file directions no

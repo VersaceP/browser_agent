@@ -1,21 +1,8 @@
-"""Scroll receipt shapes: `Input.scroll` and `Page.wheel` do not match.
+"""Read measured scroll facts without conflating input and goal completion.
 
-Both Actions report movement, and they report it with different field names.
-Measured against a live 1.1.9-era build:
-
-    Input.scroll  -> totalDelta {x,y}, actualDistance, requestedDistance,
-                     layers[].delta, position, extent, completedReason
-    Page.wheel    -> observedDelta {x,y}, requestedDelta {x,y},
-                     position, extent, completedReason, layers[]  (NO delta)
-
-`Page.wheel` carries neither `totalDelta` nor `layers[].delta`, so a reader
-written against the `Input.scroll` shape gets None for every wheel call. That is
-not a loud failure: it reads as "this build ships no movement receipt", which is
-the same answer a genuinely old build gives, so a wheel that moved 400px and a
-wheel that moved nothing become indistinguishable.
-
-Keeping both shapes here means a reader states WHICH question it is asking, not
-which field name it happens to remember.
+WebCross 0.9.6 reports input.completed, observation.status and goal.status
+separately. submitted sentDelta is never movement evidence. Legacy measured
+fields remain readable for stored task receipts; new calls use Input.scroll.
 """
 
 from __future__ import annotations
@@ -212,6 +199,10 @@ def scroll_state_read_position(data: Any) -> Optional[Dict[str, float]]:
         return None
     if str(data.get("completedReason") or "") not in STATE_READ_REASONS:
         return None
+    if ("input" in data or "observation" in data):
+        if ((data.get("input") or {}).get("completed") is not True
+                or (data.get("observation") or {}).get("status") != "stable"):
+            return None
     if not _proves_zero_movement(data):
         return None
     return root_viewport_position(data)

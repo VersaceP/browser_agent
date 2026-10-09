@@ -17,7 +17,7 @@ from typing import Any, Dict, FrozenSet, Iterable, Optional, Set
 # value; these are masked at every harness log/trace/result boundary, and the
 # dispatcher fallback withholds an unknown exception's text for such a call.
 SENSITIVE_BROWSER_METHOD_PARAMS: Dict[str, FrozenSet[str]] = {
-    "Page.handleDialog": frozenset({"userInput"}),
+    "Page.handleDialog": frozenset({"userInput", "promptText"}),
 }
 
 def sensitive_browser_method_params(method: Any) -> Set[str]:

@@ -1,8 +1,8 @@
 ---
 id: browser.observation-evidence
 audience: browser
-version: "2026-09-27"
-description: Read the unified page view, its change lists and bounded queries; interpret node flags and ids without redundant full-page reads.
+version: "2026-10-08"
+description: Read full page views, bounded live queries and saved details; interpret node flags and ids without redundant full-page reads.
 sources:
   - harness/observation/axtree_format.py
   - harness/observation/page_observation.py
@@ -15,10 +15,10 @@ related_tools:
   - await_node_change
 related_methods:
   - DOM.getAXTree
+  - DOM.getDetails
 topics:
   - AXTree flags
   - page view
-  - change list
   - bounded query
   - node id
   - observation freshness
@@ -27,56 +27,51 @@ aliases:
   - AX 节点标记
   - 观察时效
   - 重复读取
-  - 增量
   - 节点监控
 ---
 # Observation and evidence
 
-## One read, three shapes
+## Full views and details
 
-`DOM.getAXTree` publishes immutable artifact files on the browser host. For a
-standalone `browser_call`, the Harness reads and verifies them and puts the
-content in the receipt. Inside `Workflow.execute`, the Action returns the raw
-artifact reference and summary; a complete `$cache.observation` or `$last`
-reference lets the Workflow host read its leased text for `transform`. There
-is no inline `records` field to extract inside the workflow. Never open a host
-`artifact.path` yourself.
+DOM.getAXTree returns a complete page-view artifact. DOM.getDetails has two
+mutually exclusive forms: query for bounded live facts, or version + nodeIds
+for complete saved values from that observation. source=snapshot is historical
+and does not refresh the page, validate current targets, or feed live watches.
+A saved node without complete detail returns an individual detail-not-found;
+that does not mean the node or business value is absent from the page.
 
-- **Full view** — `lines`: the first read of a page, or whenever continuity is
-  lost (navigation, a gap in the version chain, a view the change list cannot
-  describe compactly). Large views are offloaded to a file and indexed for
-  find_in_axtree.
-- **Change list** — `changes` (with `changesSince`): a later read of a page you
-  already hold. Only the difference since your version is shown; the complete
-  view still goes to disk and to find_in_axtree. A change list is not an
-  inventory: unlisted nodes are unchanged, and `= … (context)` lines are
-  anchors, not a list of what is visible. A `-` removal means the node left the
-  observation, not that business data was deleted. `changesFolded` counts pure
-  geometry (nodes scrolled into or out of view, bounds, focus moves).
-- **Unchanged** — `lines.delivery: "unchanged"`: nothing changed since your
-  version. It does not show that an earlier action succeeded; query the
-  specific unresolved values instead of rereading the full view.
+For standalone browser_call, the Harness verifies full artifacts and exposes
+inline DOM.getDetails as response.data.details once; older artifact receipts
+use records. Check each ok/error independently.
+Inside a JS/TS Workflow, read a full artifact with api.readText and inspect
+DOM.getDetails.details directly. A saved-version read never refreshes live state.
+Never open a host artifact.path through generic file tools.
 
-Choose the observation by the next decision, not a fixed full-read cycle:
+Changed full versions deliver complete views, with large views offloaded and
+indexed for find_in_axtree. There are no platform diff/change-chain records.
+An immutable version already delivered to the worker may be abbreviated as
+lines.delivery=unchanged; this does not confirm an action's outcome.
 
-- Discover targets or restore context after navigation or lost continuity: a
-  full read.
-- Known targets: a bounded query, `query: {view, targets, …}` — `state` for
-  current values and control state, `text` for displayed text and selections,
-  `attributes` for attributes (`"*"` or a list), `dom` for local structure with
-  an appropriate `maxDepth`. Up to 64 targets per query, answered in target
-  order as Harness-hydrated `records` for standalone calls. `mode: "detail"`
-  is the RESULT mode, not an input. Query
-  results do not replace the page view or fill gaps in its change chain.
-- A label or id in the view you hold: find_in_axtree.
-- Something that changes only after you act: `await_node_change` (below).
+Choose the read by the unresolved fact:
 
-Version changes require fresh evidence for the next decision, not necessarily
-a full read; targeted queries give current data independently of full-view
-changes. Do not infer ordering from version strings. `freshness: pending`,
-`pendingChanges: true` or `completeness: partial` means the view may lag or
-miss a frame: it never proves absence. Resolve only the relevant uncertainty
-and stop once the outcome is established.
+- Discover targets or restore context after navigation: DOM.getAXTree.
+- Known targets: DOM.getDetails query.view=state for current values, text for
+  rendered text, attributes for requested attributes, or dom for bounded
+  structure. Use the live schema's declared defaults and limits.
+- Complete truncated values from a saved view: DOM.getDetails with its version
+  and nodeIds. Do not combine this with query or call it current live evidence.
+- A label or id in the current cached full view: find_in_axtree.
+- A delayed result after acting: await_node_change, which uses live queries.
+
+Versions are opaque. pendingChanges=true, freshness=pending or
+completeness=partial means evidence may lag or miss a frame; it cannot prove
+absence. Resolve the relevant uncertainty and stop once the outcome is known.
+
+Harness axTreeCache reports the local full view's search status: current,
+invalidated or unavailable. find_in_axtree only searches that cache. A bounded
+live query does not refresh it; invalidation does not retire known document ids
+or invalidate current live-query facts. Choose a live query for known targets
+or a full read for discovery according to the unresolved question.
 
 ## Node lines
 
@@ -111,8 +106,8 @@ this view's tree; each embedded frame is its own document rooted at a
   and `children` the structure. `component=` groups the parts of a composite
   control; flags never substitute for `DOM.inspectSelect`.
 - Page-view text is capped at 50 characters. `truncated{…}` names the fields cut
-  short and the receipt's `details` lists nodes whose complete values exist;
-  query that node with `text` or `attributes` when you need the full value.
+  short; use DOM.getDetails with version + nodeIds for needed saved values,
+  or a live query for their current values.
   `valueRedacted` means the complete value is unavailable.
 
 ## Node ids

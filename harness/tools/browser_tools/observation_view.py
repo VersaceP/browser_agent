@@ -1,19 +1,8 @@
-"""Model-facing page-observation views and the node-watch tools.
+"""Model-facing full observations and live DOM.getDetails node watches.
 
-Two worker-facing behaviours sit on the process observation channel
-(harness.observation.observation_channel):
-
-* After a worker has received one complete DOM.getAXTree view of a page, a
-  later read shows only the changes since the version that worker holds. The
-  full view still goes to disk and to find_in_axtree; only what enters the
-  model context shrinks. Any break in the version chain shows the full view.
-
-* await_node_change: one call registers a watch on named nodes, blocks until
-  they change, and closes itself. A poller probes those nodes while the watch
-  is active and reads the whole page only when the probe moves. In background
-  mode the call returns at once and changes ride the worker's later tool
-  results as `watchEvents`; the harness also closes watches on navigation,
-  page loss, expiry, and when the worker finishes.
+Changed observations remain complete. Only a repeated immutable full version
+already held by the consumer is abbreviated. Bounded live queries feed watches;
+historical snapshot details never establish current state.
 """
 
 from __future__ import annotations
@@ -22,18 +11,67 @@ import hashlib
 import json
 from typing import Any, Dict, List, Optional
 
-from harness.context.offload import page_view_blob_path, write_offloaded_blob
 from harness.observation.axtree_format import AX_NODE_ID_RE
 from harness.observation.observation_channel import (
     DEFAULT_WATCH_TTL_SECONDS,
     MAX_NODES_PER_WATCH,
     observation_channel,
 )
-from harness.utils import JsonDict, task_subdir
+from harness.utils import JsonDict
 
 
 WAIT_DEFAULT_SECONDS = 15.0
 WAIT_MAX_SECONDS = 120.0
+
+
+def _prepare_browser_result_for_model(
+    agent: Any, tool_call: JsonDict, result: Any,
+) -> Any:
+    """Project executor receipts without changing stored or internal evidence.
+
+    Inline details have an identical compatibility alias after hydration.
+    Keep one copy for the model, preserving divergent representations. Cache
+    status describes local full-view bookkeeping, not live page freshness or
+    the validity of a known target id.
+    """
+    if not isinstance(result, dict):
+        return result
+    tool_input = tool_call.get("input")
+    tool_input = tool_input if isinstance(tool_input, dict) else {}
+    response = result.get("response")
+    data = response.get("data") if isinstance(response, dict) else None
+    data = data if isinstance(data, dict) else {}
+    model_result = result
+    if (tool_call.get("name") == "browser_call"
+            and tool_input.get("method") == "DOM.getDetails"
+            and isinstance(data.get("details"), list)
+            and isinstance(data.get("records"), list)
+            and data["details"] == data["records"]):
+        projected_data = {key: value for key, value in data.items() if key != "records"}
+        model_result = {**result, "response": {**response, "data": projected_data}}
+
+    if tool_call.get("name") == "browser_call":
+        params = result.get("params") or tool_input.get("params") or {}
+        params = params if isinstance(params, dict) else {}
+        page_id = str(params.get("pageId") or data.get("pageId") or "")
+    elif tool_call.get("name") == "find_in_axtree":
+        page_id = str(tool_input.get("pageId") or getattr(agent, "axtree_page_id", "") or "")
+    else:
+        page_id = ""
+    if page_id:
+        held_page = str(getattr(agent, "axtree_page_id", "") or "")
+        if page_id != held_page:
+            status = "unavailable"
+        elif bool(getattr(agent, "axtree_invalidated", True)):
+            status = "invalidated"
+        elif (getattr(agent, "axtree_nodes", None)
+              or getattr(agent, "axtree_lines", None)
+              or getattr(agent, "axtree_saved_path", "")):
+            status = "current"
+        else:
+            status = "unavailable"
+        model_result = {**model_result, "axTreeCache": {"pageId": page_id, "status": status}}
+    return model_result
 
 
 def _consumer_id(agent: Any) -> str:
@@ -46,27 +84,8 @@ def _harness_config(agent: Any) -> Any:
     return getattr(getattr(agent, "runtime", None), "harness", None)
 
 
-def _diff_view_enabled(agent: Any) -> bool:
+def _unchanged_view_enabled(agent: Any) -> bool:
     return bool(getattr(_harness_config(agent), "observation_diff_view", True))
-
-
-def _store_full_view_quietly(agent: Any, params: JsonDict, lines: List[str], step: int) -> JsonDict:
-    """Persist the complete view without putting any of it in the model context."""
-    logger = getattr(agent, "logger", None)
-    if logger is None:
-        return {"lineCount": len(lines)}
-    path = page_view_blob_path(
-        task_subdir(logger, "observations"),
-        _consumer_id(agent),
-        str(params.get("pageId") or "no-page"),
-    )
-    _format, query_with, _outline, facts = write_offloaded_blob(logger, path, "lines", lines)
-    return {
-        "_offloaded": True,
-        "format": "text_lines",
-        "query_with": query_with,
-        **{key: facts[key] for key in ("savedPath", "lineCount", "sameContentAs") if key in facts},
-    }
 
 
 def _full_view_evidence(method: str, response: Any) -> Optional[JsonDict]:
@@ -86,38 +105,19 @@ def _project_observation_for_model(
     response: Any,
     step: int,
 ) -> Any:
-    """Show a worker the changes since its last view instead of the page again."""
+    """Show full views, abbreviating a repeated version already held."""
     if method != "DOM.getAXTree" or not isinstance(response, dict):
         return response
     data = response.get("data")
     if not isinstance(data, dict) or data.get("mode") != "full" or not isinstance(data.get("lines"), list):
         return response
-    diff = data.get("diff")
-    if isinstance(diff, dict):
-        # Raw platform records are for the harness; the model gets the
-        # rendered view below, or the full view.
-        diff.pop("records", None)
-    if not _diff_view_enabled(agent):
+    if not _unchanged_view_enabled(agent):
         return response
     page_id = str(params.get("pageId") or data.get("pageId") or "")
     view = observation_channel().model_view(_consumer_id(agent), page_id, data)
     delivery = view.get("delivery")
     version = (data.get("observation") or {}).get("version")
-    if delivery == "changes":
-        data["lines"] = {
-            **_store_full_view_quietly(agent, params, data["lines"], step),
-            "delivery": "changes",
-            "note": (
-                "Only the changes since the version you already hold are shown"
-                " in `changes`; the complete current view is on disk and in"
-                " find_in_axtree."
-            ),
-        }
-        data["changes"] = view["changes"]
-        data["changesSince"] = view["since"]
-        if view.get("folded"):
-            data["changesFolded"] = view["folded"]
-    elif delivery == "unchanged":
+    if delivery == "unchanged":
         data["lines"] = {
             "delivery": "unchanged",
             "version": version,
@@ -162,7 +162,7 @@ def _make_reader(agent: Any, page_id: str, node_ids: List[str], scope: str):
     30-second wait cost twenty full captures. The watch names at most sixteen
     nodes, which a bounded query answers. Query values themselves generate
     comparable watch events; a continuing probe change also refreshes the
-    full AX view for the model's page-version chain.
+    complete AX view for the model's current page context.
     """
     # Rendered text can change without a corresponding full AX label change.
     # Alternate it with the original structural/state probe so existing watch
@@ -206,11 +206,11 @@ def _make_reader(agent: Any, page_id: str, node_ids: List[str], scope: str):
             "targets": [{"id": node_id} for node_id in node_ids],
             "view": "text" if text_probe else "dom" if scope == "subtree" else "state",
             **({"textMode": "rendered"} if text_probe else {}),
-            **({"maxDepth": 1} if not text_probe and scope == "subtree" else {}),
+            **({"maxDepth": 1, "includeShadowDom": True} if not text_probe and scope == "subtree" else {}),
         }
 
         try:
-            probe = await browser.call("DOM.getAXTree", {
+            probe = await browser.call("DOM.getDetails", {
                 "pageId": page_id,
                 "purpose": "watch: probe the watched nodes for a change",
                 "query": probe_query,
@@ -255,13 +255,14 @@ async def _resolve_watch_targets(agent: Any, page_id: str, selector: str) -> Jso
     if browser is None:
         return {"ids": [], "reason": "no_browser"}
     try:
-        response = await browser.call("DOM.getAXTree", {
+        response = await browser.call("DOM.getDetails", {
             "pageId": page_id,
             "purpose": "await_node_change: resolve the watched selector",
             "query": {
                 "targets": [{"selector": selector}],
                 "view": "dom",
                 "maxDepth": 0,
+                "includeShadowDom": True,
             },
         })
     except Exception:  # noqa: BLE001 - an unresolvable selector is a tool answer

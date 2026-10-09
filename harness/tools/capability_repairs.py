@@ -19,9 +19,26 @@ def prepare_capability_arguments(method, params, schema):
     if not isinstance(prepared, dict):
         return params, [], [SchemaIssue((), 'type', 'Action params must be an object')]
     properties = schema.get('properties') if isinstance(schema, dict) else None
+    if method == 'DOM.getDetails' and isinstance(schema, dict):
+        branches = schema.get('anyOf') or schema.get('oneOf') or []
+        # Select an explicitly supplied form, never invent a query or version.
+        selected = [b.get('properties', {}) for b in branches if isinstance(b, dict)
+                    and ('query' in b.get('properties', {})) == ('query' in prepared)]
+        if len(selected) == 1:
+            properties = {**(properties if isinstance(properties, dict) else {}), **selected[0]}
+        if 'query' in prepared and any(k in prepared for k in ('version', 'nodeIds')):
+            issues.append(SchemaIssue(('query',), 'conflict',
+                'DOM.getDetails live query and saved version/nodeIds are mutually exclusive'))
     if not isinstance(properties, dict):
         # No authoritative shape: do not invent aliases or schema semantics.
         return prepared, [], []
+
+    if method == 'DOM.getAXTree' and 'query' not in properties:
+        for key in ('query', 'targets', 'version', 'nodeIds', 'mode'):
+            if key in prepared:
+                issues.append(SchemaIssue((key,), 'misplaced',
+                    'DOM.getAXTree reads the full page. Use DOM.getDetails with query '
+                    'for live facts or version/nodeIds for saved details; no method was rewritten'))
 
     def move(source, destination, old, new, key):
         if key in new and new[key] != old[source]:
@@ -32,13 +49,13 @@ def prepare_capability_arguments(method, params, schema):
         repairs.append({'from': source, 'to': destination, 'operation': 'relocate'})
 
     query = prepared.get('query')
-    misplaced_targets = (method == 'DOM.getAXTree' and 'targets' in prepared
+    misplaced_targets = (method in {'DOM.getAXTree', 'DOM.getDetails'} and 'targets' in prepared
                          and 'targets' not in properties)
     if misplaced_targets and not isinstance(query, dict):
         issues.append(SchemaIssue(('query',), 'required',
             'targets requires an explicit query.view and query.targets; '
             'cannot infer the intended view or fall back to a full-page read'))
-    if method == 'DOM.getAXTree' and isinstance(query, dict):
+    if method in {'DOM.getAXTree', 'DOM.getDetails'} and isinstance(query, dict):
         query_schema = properties.get('query')
         branches = query_schema.get('oneOf', []) if isinstance(query_schema, dict) else []
         if not isinstance(branches, list):
@@ -121,10 +138,15 @@ def prepare_workflow_literal_arguments(params, method_schemas):
             method = step.get('action')
             args = step.get('params')
             if (step.get('type', 'action') == 'action'
-                    and method in {'Input.type', 'DOM.getAXTree'}
+                    and method in {'Input.type', 'DOM.getAXTree', 'DOM.getDetails', 'Input.scroll'}
                     and isinstance(args, dict)):
                 schema = capability_input_schema(method_schemas, method)
                 fixed, changes, errors = prepare_capability_arguments(method, args, schema)
+                if method == 'Input.scroll':
+                    from harness.tools.browser_tools.validation import _check_scroll_param_requirements
+                    rejected = _check_scroll_param_requirements(method, args)
+                    if rejected:
+                        errors.append(SchemaIssue((rejected['invalidParam'],), 'conflict', rejected['error']))
                 if dynamic(args) and changes:
                     # Resolved values are not available in the Harness. Never
                     # let a known misplaced target silently become a full read.
@@ -133,14 +155,19 @@ def prepare_workflow_literal_arguments(params, method_schemas):
                         'Use the canonical field paths before execution, or resolve '
                         'the values and issue a direct action; no automatic repair was applied.'))
                 elif changes:
-                    fixed, _ = apply_required_schema_defaults(fixed, schema)
                     # Binding and purpose are supplied by the engine; preserve
                     # all other schema constraints, including local references.
                     action_schema = copy.deepcopy(schema or {})
-                    action_schema['required'] = [
-                        key for key in action_schema.get('required', [])
-                        if key not in {'pageId', 'fleetId', 'purpose'}
-                    ]
+                    def unrequire_binding(shape):
+                        if not isinstance(shape, dict):
+                            return
+                        shape['required'] = [key for key in shape.get('required', [])
+                            if key not in {'pageId', 'fleetId', 'purpose'}]
+                        for union in ('anyOf', 'oneOf', 'allOf'):
+                            for branch in shape.get(union, []):
+                                unrequire_binding(branch)
+                    unrequire_binding(action_schema)
+                    fixed, _ = apply_required_schema_defaults(fixed, action_schema)
                     errors += validate_schema(fixed, action_schema)
                 issues.extend(SchemaIssue(prefix + ('params',) + e.path, e.keyword, e.message)
                               for e in errors)

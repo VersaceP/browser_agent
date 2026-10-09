@@ -1,4 +1,10 @@
-"""harness.observation.exec_observer — execution trace for a blocked Workflow.execute.
+"""Live Workflow control identity and progress, with legacy trace support.
+
+WebCross 0.9.7 emits status/completedCalls/activeCalls. The final execute receipt
+is authoritative for business output and the detailed call ledger. Older
+deployments use the step events documented below.
+
+Historical behavior before the script engine:
 
 A `Workflow.execute` answers only once, at the end, and its failure envelope
 carries almost nothing. The per-step record exists solely in the
@@ -71,6 +77,8 @@ class ExecTrace:
         # Segment telemetry reads these, never len(self.steps).
         self.total_steps = 0
         self.total_succeeded = 0
+        self.completed_calls: Optional[int] = None
+        self.active_calls: List[JsonDict] = []
         # Wall time from observer start to stop. The lifecycle tool events
         # measure the whole tool call; this isolates the Workflow.execute
         # itself, which is the unit segment telemetry is compared against
@@ -91,6 +99,9 @@ class ExecTrace:
         }
         if self.steps:
             receipt["steps"] = self.steps
+        if self.completed_calls is not None:
+            receipt["completedCalls"] = self.completed_calls
+            receipt["activeCalls"] = self.active_calls
         if self.dropped_steps:
             receipt["stepsOmitted"] = self.dropped_steps
         if self.variables:
@@ -202,6 +213,14 @@ class ExecObserver:
             and self.trace.workflow_id
             and str(workflow_id) != self.trace.workflow_id
         ):
+            return
+
+        if "completedCalls" in payload and "status" in payload:
+            self.trace.phase = str(payload["status"])
+            self.trace.completed_calls = payload["completedCalls"]
+            self.trace.active_calls = payload.get("activeCalls") or []
+            if payload.get("error"):
+                self.trace.failure = dict(payload["error"])
             return
 
         phase = str(payload.get("phase") or "")
