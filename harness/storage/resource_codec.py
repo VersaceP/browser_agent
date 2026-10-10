@@ -431,9 +431,9 @@ def restore_row_content(row: Mapping[str, Any]) -> dict:
     deployment and wrong in the other. Parsing hides the difference, which is
     the reason it would stay hidden until something stopped parsing.
 
-    ``content_blob`` is removed - the physical bytes are the codec's business,
-    and a caller reaching for them by accident is exactly the two-answers
-    problem this module exists to prevent. ``content_encoding`` stays for
+    Compressed textual ``content_blob`` is removed - those physical bytes are
+    the codec's business. Native identity blobs retain their original bytes,
+    since they have no textual form. ``content_encoding`` stays for
     provenance: it says how the row was *stored*, never what was returned.
     """
 
@@ -455,5 +455,6 @@ def restore_row_content(row: Mapping[str, Any]) -> dict:
     if key:
         record[key] = text
         record["content_text" if key == "content_json" else "content_json"] = None
-    record.pop("content_blob", None)
+    if key or encoding != ENCODING_IDENTITY:
+        record.pop("content_blob", None)
     return record

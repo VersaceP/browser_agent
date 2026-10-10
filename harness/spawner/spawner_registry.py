@@ -372,6 +372,14 @@ class SpawnerRegistryMixin:
                     " its pageId on first use; the harness atomically claims it."
                 ),
             ])
+        payload["reuseRules"].append(
+            "After verifying a reused page, continue from its current surface"
+            " when it supports the requested work. Treat a supplied site URL"
+            " as an entry point unless the request requires visiting that exact"
+            " location; it does not by itself require resetting an already"
+            " relevant page. Use observed page state and the task goal to decide"
+            " whether navigation is needed."
+        )
         return (
             "<slot_context>\n"
             f"{json.dumps(payload, ensure_ascii=False, indent=2, default=str)}\n"

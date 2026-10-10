@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 from typing import Any
 
 
@@ -165,6 +166,86 @@ class ReceiptIndex:
                 "content": raw[offset:offset + 16000], "offset": offset,
                 "nextOffset": offset + 16000 if offset + 16000 < len(raw) else None,
                 "totalChars": len(raw), "historicalObservation": True}
+
+    def query_source(self, ref: str) -> dict | None:
+        """Resolve a task-bound receipt without paging it through model context.
+
+        A complete-payload reference is followed only when its task-local bytes
+        match the hash in this receipt. It does not grant access to host files.
+        """
+        record = self.records.get(ref)
+        if record is None:
+            return None
+        source = record["source"]
+        content = record["content"]
+        fingerprint = hashlib.sha256(content.encode()).hexdigest()
+        if (self.task_id != self.agent.logger.task_id
+                or source.get("taskId") != self.task_id
+                or fingerprint != record["receiptSha256"]
+                or ref != "receipt:" + digest([source, fingerprint])[:32]):
+            return None
+        try:
+            item = json.loads(content)
+        except ValueError:
+            return None
+        resources = []
+        incomplete = False
+        result = item.get("result")
+        truncation = result.get("_truncation") if isinstance(result, dict) else None
+        if isinstance(truncation, dict):
+            incomplete = (truncation.get("projectionTruncated") is True
+                          or truncation.get("sourceComplete") is False)
+            reference, expected = truncation.get("savedPath"), truncation.get("persistedPayloadSha256")
+            if (truncation.get("sourceComplete") is True and isinstance(reference, str)
+                    and isinstance(expected, str) and len(expected) == 64):
+                from harness.utils import read_task_file_text
+                root = Path(self.agent.logger.task_dir).resolve()
+                path = Path(reference)
+                try:
+                    inside = path.is_absolute() and path.resolve().is_relative_to(root)
+                    text = read_task_file_text(self.agent.logger, str(path)) if inside else None
+                except (OSError, ValueError, RuntimeError):
+                    text = None
+                if text is not None and hashlib.sha256(text.encode()).hexdigest() == expected:
+                    try:
+                        complete = json.loads(text)
+                    except ValueError:
+                        complete = None
+                    if isinstance(complete, dict):
+                        item = {**item, "result": complete}
+                        resources.append({"path": reference, "sourceSha256": expected})
+                        incomplete = False
+        # A projected Workflow may omit call values or whole call records. A
+        # query over that projection must not imply those facts were absent.
+        def projected(value: Any) -> bool:
+            stack = [value]
+            seen = 0
+            while stack and seen < 100_000:
+                current = stack.pop()
+                seen += 1
+                if isinstance(current, dict):
+                    if (current.get("_projected") is True or "valueReference" in current
+                            or "callRecordsReference" in current):
+                        return True
+                    stack.extend(current.values())
+                elif isinstance(current, list):
+                    stack.extend(current)
+            return bool(stack)
+        view = canonical(receipt_view(item))
+        return {"content": view, "source": source,
+                "sourceSha256": hashlib.sha256(view.encode()).hexdigest(),
+                "receiptSha256": fingerprint, "resolvedResources": resources,
+                "coverageTruncated": incomplete or projected(item)}
+
+    def validates(self, ref: str, fact: dict) -> bool:
+        current = self.fact(ref)
+        if current is None or any(fact.get(key) != value for key, value in current.items()):
+            return False
+        if "querySourceSha256" in fact:
+            source = self.query_source(ref)
+            return (source is not None and source["sourceSha256"] == fact["querySourceSha256"]
+                    and source["resolvedResources"] == fact.get("queryResources", []))
+        return True
 
     def search(self, term: str, cursor: str = "") -> dict:
         snapshot = digest([term, sorted(self.records)])[:20]

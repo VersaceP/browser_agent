@@ -78,6 +78,11 @@ when claimable=true, busy=false and quarantined=false. Claim with Page.switchTo,
 then verify Page.getState and fresh DOM evidence; a matching URL does not prove
 login or task state. Create a page if no suitable candidate exists. Do not
 navigate an unrelated existing page or inherit another worker's observations.
+After verification, continue from the current surface when it supports the
+requested work. A supplied site URL is an entry point unless the request
+requires visiting that exact location; it does not by itself require resetting
+an already relevant page. Decide whether to navigate from the observed page
+state and the task goal.
 
 During execution, call Page.list once when a receipt says pageInventoryChanged
 or a navigation-like click did not visibly move the source page. Never re-click
