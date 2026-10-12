@@ -580,7 +580,7 @@ class FleetCoordinator:
 
         Released fleets remain quarantined from generic reuse. The next use of
         the same key receives a new generation and must bootstrap a fresh fleet.
-        This method is intentionally not exposed as a model/Lead tool.
+        This method is intentionally not exposed as a model/task owner tool.
         """
 
         key = str(session_key or "").strip()

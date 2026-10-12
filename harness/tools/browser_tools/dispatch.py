@@ -541,7 +541,7 @@ def build_browser_tool_dispatcher(agent: Any) -> BrowserToolDispatcher:
             if authorization_error is not None:
                 if authorization_error.get("status") == "needs_human":
                     agent.diagnostics.local_path_authorization_pending = dict(authorization_error)
-                    # Finish this attempt so the spawner wakes the Lead rather
+                    # Finish this attempt so the spawner wakes the task owner rather
                     # than letting the model retry an unanswered consent prompt.
                     return {
                         **authorization_error,
@@ -1460,7 +1460,7 @@ async def _browser_visual_verify(ctx: ToolContext) -> JsonDict:
 @BROWSER_TOOLS.register(
     name="final_answer",
     description=(
-        "Terminate orchestration and return the structured result to LeadAgent."
+        "Terminate orchestration and return the structured result to task owner."
         " The `status` field is restricted to the whitelist below; other terminal states"
         " (hitl_*, page_crashed, browser_api_contract_error, context_limit_exceeded,"
         " step_budget_exhausted) are detected and set by the harness — do not self-report them."
@@ -1594,7 +1594,7 @@ async def _browser_request_step_extension(ctx: ToolContext) -> JsonDict:
     name="record_extraction",
     description=(
         "Persist and validate structured data already observed in the browser (product URLs/titles, form fields,"
-        " list rows, etc.) to an artifact that LeadAgent can reuse."
+        " list rows, etc.) to an artifact that task owner can reuse."
         " Fields that never went through record_extraction must not appear"
         " in the final_answer's `data`."
         " `name` identifies the dataset; `rows` must be a list[dict] backed by actual observations"

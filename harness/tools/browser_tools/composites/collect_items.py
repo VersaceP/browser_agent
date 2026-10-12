@@ -436,7 +436,7 @@ def _collect_contract_preflight(
             # A bare/unknown field is not proof of a nested collection.  Fail
             # closed before replacing a scalar business field with list rows,
             # but distinguish missing type information from an explicit scalar
-            # declaration so the Lead can repair the contract accurately.
+            # declaration so the task owner can repair the contract accurately.
             reasons.append({
                 "code": "collection_field_array_contract_required",
                 "field": collection_field,
@@ -506,7 +506,7 @@ def _collect_contract_preflight(
             " array contract, so this worker cannot repair it. Stop retrying"
             " and final_answer with status=incomplete and classification="
             f"{COLLECTION_CONTRACT_REPLAN_REQUIRED}; include field and"
-            " expectedShape so LeadAgent can replan."
+            " expectedShape so task owner can replan."
         )
     result: JsonDict = {
         "status": "rejected",
@@ -528,7 +528,7 @@ def _collect_contract_preflight(
             "field": array_contract_reason.get("field"),
             "expectedShape": array_contract_reason.get("expectedShape"),
             "hint": (
-                "LeadAgent must replan expected_artifact.fields with the"
+                "task owner must replan expected_artifact.fields with the"
                 " declared nested array shape before collect_items can persist"
                 " this collection."
             ),

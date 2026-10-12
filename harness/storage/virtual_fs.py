@@ -2,7 +2,7 @@
 harness.storage.virtual_fs - Database rows rendered as the files agents expect.
 
 ``local_fs_read`` and ``local_fs_search`` are model-facing tools whose contract
-is paths and globs: offloaded results hand the Lead a ``savedPath``, skills and
+is paths and globs: offloaded results hand the task owner a ``savedPath``, skills and
 prompts talk about ``run.jsonl`` and ``traces/*.jsonl``. Changing that contract
 would mean rewriting prompts, so instead the database is presented through the
 same names it replaced.

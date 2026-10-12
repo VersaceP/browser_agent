@@ -51,7 +51,7 @@ async def _maybe_auto_hitl_for_challenge(
         enriched["next_instruction"] = (
             "This is an existing HITL paused-state error, not a newly detected"
             " page challenge. Do not call Hitl.requestPause again for this"
-            " page. Wait for an explicit HITL resume event, or let LeadAgent"
+            " page. Wait for an explicit HITL resume event, or let task owner"
             " restart with a fresh page if the pause is stale."
         )
         return enriched
@@ -91,7 +91,7 @@ async def _maybe_auto_hitl_for_challenge(
             "This page resumed from HITL recently. Do not request another"
             " automatic pause for the same page yet; first re-check Page.getState,"
             " refresh DOM.getAXTree, and verify the active page contains target"
-            " content. If it is still blocked, report the blocker to LeadAgent."
+            " content. If it is still blocked, report the blocker to task owner."
         )
         return enriched
     if not tracker.should_adjudicate(page_id, step):
@@ -1090,12 +1090,12 @@ async def _adjudicate_and_maybe_hitl(
         elif verdict == "unrelated_block":
             enriched["next_instruction"] = (
                 "Visual adjudicator found an unrelated block. Record the blocker or"
-                " let LeadAgent pivot strategy."
+                " let task owner pivot strategy."
             )
         else:
             enriched["next_instruction"] = (
                 "Challenge suspicion remains uncertain after visual adjudication."
-                " Observe once more or hand the blocker to LeadAgent."
+                " Observe once more or hand the blocker to task owner."
             )
         return enriched
 
@@ -1122,7 +1122,7 @@ async def _adjudicate_and_maybe_hitl(
         "This page is suspected to be blocked by a challenge, but visual"
         " adjudication is unavailable and no high-confidence CAPTCHA keyword"
         " was found. Do not poll indefinitely; report the blocker or let"
-        " LeadAgent decide."
+        " task owner decide."
     )
     return enriched
 
@@ -1943,7 +1943,7 @@ async def _enrich_pause_with_wait(
             enriched["suggested_prompt"] = (
                 "HITL pause is deadlocked: Hitl.resolvePause is blocked by"
                 " ERR_PAGE_PAUSED. Do NOT call Hitl.requestPause again for this"
-                " page; report status=stale_pause_deadlock and let LeadAgent"
+                " page; report status=stale_pause_deadlock and let task owner"
                 " continue from a fresh page/fleet."
             )
         else:
@@ -1962,7 +1962,7 @@ async def _enrich_pause_with_wait(
                     "Post-HITL recovery did not confirm a usable page. Do NOT call"
                     " more browser tools or Hitl.* methods in this worker; call"
                     " final_answer(status=\"incomplete\") and report hitl_wait.status,"
-                    " postHitlRecovery evidence, screenshotPath, and pageId to LeadAgent."
+                    " postHitlRecovery evidence, screenshotPath, and pageId to task owner."
                 )
     elif wait_result.get("status") == "page_settled_after_hitl":
         enriched["suggested_prompt"] = (

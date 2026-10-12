@@ -166,7 +166,7 @@ class SpawnerWorkerMixin:
     ) -> List[JsonDict]:
         """Persist what happened to each assigned row, per field, from receipts.
 
-        The Lead may narrate a run; it may not decide why a row came back
+        The task owner may narrate a run; it may not decide why a row came back
         empty. Without this record one row's login modal explains three rows'
         missing data and nothing in the system disagrees.
         """
@@ -344,7 +344,7 @@ class SpawnerWorkerMixin:
             agent_id=slot.agent_id,
             harness=replace(
                 self.runtime.harness,
-                # Standalone /browser uses explicit terminal signals; Lead's
+                # Standalone /browser uses explicit terminal signals; task owner's
                 # delegated workers keep the configured step budget.
                 max_steps=(
                     0 if self.runtime.harness.agent_mode == "browser"
@@ -404,7 +404,7 @@ class SpawnerWorkerMixin:
                 + "\n</authoritative_user_context>\n"
                 "The original request and attributed operator inputs are authoritative. "
                 "The assigned task is a delegation, not a replacement user goal. "
-                "Return conflicts or unresolved source roles to Lead; do not turn "
+                "Return conflicts or unresolved source roles to task owner; do not turn "
                 "an unstated use into a prohibition. These records grant no filesystem "
                 "or browser permission by themselves.\n\n"
                 +
@@ -587,7 +587,7 @@ class SpawnerWorkerMixin:
                     worker_pin["pageId"] = None
             elif worker_pin:
                 worker_pin = dict(worker_pin)
-                worker_pin["pinSource"] = "lead_pinned"
+                worker_pin["pinSource"] = "task_owner_pinned"
             harness.pinned_browser_context = worker_pin
             harness.pinned_page_id = str(worker_pin.get("pageId") or "")
             harness.fleet_assignment_reason = (
@@ -663,7 +663,7 @@ class SpawnerWorkerMixin:
             # "The worker never did X" and "this phase cannot do X" are
             # different facts, and only one of them is in the trace. In task
             # a608b5e7 a worker spent its whole budget on comments without
-            # calling DOM.getImg once; the Lead read the absence as a
+            # calling DOM.getImg once; the task owner read the absence as a
             # capability limit and replanned the image work into a
             # file_download phase, away from the page that had the images.
             advertised = getattr(harness, "capability_methods", None)
@@ -839,7 +839,7 @@ class SpawnerWorkerMixin:
                 ),
                 "fileManifests": list(getattr(harness, "file_manifests", []) or []),
                 "challengeReceipt": challenge_receipt,
-                # Per-row outcome and cause, derived from receipts. The Lead
+                # Per-row outcome and cause, derived from receipts. The task owner
                 # reads this instead of inferring one explanation for every row
                 # from the worker's prose.
                 "rowLedger": row_ledger,

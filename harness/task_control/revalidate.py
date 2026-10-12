@@ -114,7 +114,7 @@ def revalidate_phase_artifacts(agent, *, phase_id, plan_version, decision="inspe
                "evidenceContractHash": tc.evidence_contract_fingerprint(phase),
                "artifactDigests": artifact_digests,
                "validationStatus": "done", "validation": validation, "reviewedAt": tc.utc_now_iso(),
-               "priorFailure": current.get("last_failure"), "authority": "lead_semantic_judgment"}
+               "priorFailure": current.get("last_failure"), "authority": "task_owner_semantic_judgment"}
     current["artifactRevalidation"] = receipt
     current["status"] = "validated_done"
     current["validated_artifacts"] = validated_paths
@@ -127,4 +127,4 @@ def revalidate_phase_artifacts(agent, *, phase_id, plan_version, decision="inspe
     state["current_phase"] = tc._first_active_phase_id(agent.task_plan, state["phases"])
     tc.write_task_state(logger, state)
     logger.write("task_phase.artifacts_revalidated", {"phaseId": phase_id, **receipt})
-    return {**result, "status": "done", "decision": "accept", "next_instruction": "Existing artifacts were accepted after revalidation and Lead review. Continue the accepted plan; prior worker history and budgets are unchanged."}
+    return {**result, "status": "done", "decision": "accept", "next_instruction": "Existing artifacts were accepted after revalidation and task owner review. Continue the accepted plan; prior worker history and budgets are unchanged."}

@@ -49,7 +49,7 @@ def worker_recovery_facts(result: dict) -> dict:
             "absenceOfReceiptsProvesNoEffects": False,
         },
         "tracePath": result.get("tracePath") or None,
-        "decisionOwner": "lead",
+        "decisionOwner": "task_owner",
         "next_instruction": (
             "Use these recorded facts first. A ready connection probe is not proof of page recovery "
             "or permission to replay. Inspect unresolved effects with available read-only receipts/state; "

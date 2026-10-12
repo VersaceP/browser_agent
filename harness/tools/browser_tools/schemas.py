@@ -861,9 +861,9 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                     "description": (
                         "Optional BrowserAgent decision for this SAME phase. Use"
                         " continue_current_phase only when the unfinished objective"
-                        " remains inside the accepted contract; use needs_lead_review"
+                        " remains inside the accepted contract; use needs_owner_review"
                         " when strategy, scope, authorization, or task routing needs"
-                        " Lead judgement. Omit for status=done."
+                        " task-owner judgment. Omit for status=done."
                     ),
                     "properties": {
                         "protocol": {
@@ -874,7 +874,7 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                             "type": "string",
                             "enum": [
                                 "continue_current_phase",
-                                "needs_lead_review",
+                                "needs_owner_review",
                             ],
                         },
                         "reason": {"type": "string", "minLength": 1, "maxLength": 500},

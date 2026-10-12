@@ -1,7 +1,7 @@
 ---
 id: browser.collection-materialization
 audience: browser
-version: "2026-09-22"
+version: "2026-10-12"
 description: Collect repeated page records with bounded evidence cycles and distinguish an incomplete surface from a confirmed absence.
 sources:
   - harness/observation/content_completeness.py
@@ -60,7 +60,7 @@ calibration is required. Preserve conflicting observations and report blockers.
 contentCompleteness is attributed observation, not a terminal verdict. Compare
 its markers, counts, exhaustion receipts and attempted actions with other live
 evidence, then choose a falsifiable next experiment. Persist the relevant
-observation through record_extraction before handing it to Lead.
+observation through record_extraction before returning it to the task owner.
 
 When the output needs `href`, `src`, `id`, `aria-*`, `data-*`, or `value`, read
 the attribute from the same observed item or control as its visible label.
@@ -86,7 +86,7 @@ allow_empty_with_outcome permits confirmed_absent, record the judgment directly:
 This is a worker semantic judgment, not a mechanical proof. No eight-flag
 checklist, positive epoch or required visual tool call applies. Optional
 `evidenceRefs` must name existing evidence files; the harness checks those
-references, while you and Lead judge whether they support the claim. A bare
+references, while you and the task owner judge whether they support the claim. A bare
 empty value or a blocked/unreadable region does not declare confirmed_absent.
 A displayed value such as "N/A" is page data when supported by provenance;
 your own "could not retrieve" narrative is not a field value.

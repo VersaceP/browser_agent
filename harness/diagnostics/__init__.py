@@ -3,7 +3,7 @@ harness.diagnostics - Worker status taxonomy and terminal-status classifier.
 
 The classifier consumes WorkerDiagnostics that BrowserAgent fills in during a
 run, plus the model's self-reported status, and produces a final status that
-LeadAgent can route on.
+task owner can route on.
 
 Priority of hard signals (see WORKER_STATUS_HARD_PRIORITY in constants.py):
     context_limit_exceeded
@@ -368,7 +368,7 @@ def _classify_hitl(diag: WorkerDiagnostics) -> Optional[str]:
           (a) harness never entered wait (PR #4 not yet wired, or regressed)
           (b) wait was entered but neither resumed nor timed out (agent was
               cancelled / crashed / classifier ran mid-wait)
-        Both subcases warrant the same LeadAgent reaction: don't auto-retry,
+        Both subcases warrant the same task owner reaction: don't auto-retry,
         surface infrastructure-gap or in-progress state to the user. The
         hitl_wait_entered flag remains in diagnostics for forensics.
       - page_settled_after_hitl: lifecycle notifications show the page got

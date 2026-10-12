@@ -305,7 +305,7 @@ def observe_placeholder_text_rows(
 ) -> List[JsonDict]:
     """Values that READ like site empty-state copy. Advisory, never a verdict.
 
-    Reported so the Lead can look, not so the harness can decide. The reader
+    Reported so the task owner can look, not so the harness can decide. The reader
     has the page evidence and the user's request; this function has a word
     list.
     """

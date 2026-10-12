@@ -2,7 +2,7 @@
 
 The failure this closes: a final answer reported "CodeDesign 18 条" while the
 artifact it shipped held 3. Both numbers were real — 18 came from a worker
-artifact the Lead had cited and then dropped rows from — so nothing in the
+artifact the task owner had cited and then dropped rows from — so nothing in the
 prose looked false, and no reader could catch it without opening the files.
 
 Two halves, split along what is decidable:
@@ -12,7 +12,7 @@ Two halves, split along what is decidable:
     are all lookups; no judgment is involved and none is invited.
   * Binding a number in free prose to (subject, field, metric) is a MODEL
     call. "18 条" is only a review count because of the sentence around it,
-    and there is no exhaustive rule for the sentences a Lead may write.
+    and there is no exhaustive rule for the sentences a task owner may write.
 
 The extractor proposes bindings; it never decides whether a claim holds. A
 claim whose quoted text is not present verbatim in the answer is rejected

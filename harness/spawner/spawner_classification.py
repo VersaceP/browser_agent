@@ -170,7 +170,7 @@ def _classification_from_collection_contract_preflight(
         recovered = dict(classification)
         recovered.setdefault(
             "hint",
-            "LeadAgent must replan expected_artifact with a nested array field.",
+            "task owner must replan expected_artifact with a nested array field.",
         )
         recovered["source"] = "collect_items.contractPreflight"
         return recovered
@@ -633,7 +633,7 @@ def _classification_from_final_answer(
                 if isinstance(traversal, dict):
                     classification["pageTraversal"] = dict(traversal)
                 # The claim stays the worker's own. Our receipts are appended
-                # beside it so the Lead reads both and decides; rewriting the
+                # beside it so the task owner reads both and decides; rewriting the
                 # category here would be this harness judging a page's
                 # behaviour, which is the model's call to make.
                 classification["counterevidence"] = counterevidence
@@ -648,10 +648,10 @@ def _classification_from_final_answer(
                 return classification
         # The worker's own words are its claim and travel verbatim. Where it
         # gave none, this used to substitute a per-category directive
-        # ("LeadAgent should stop retrying…", "…should replan…"); that is the
+        # ("task owner should stop retrying…", "…should replan…"); that is the
         # harness picking the next move from a category name, with none of the
         # run's evidence in front of it. The category and the receipts beside
-        # it are the record; reading them is the Lead's job.
+        # it are the record; reading them is the task owner's job.
         hint = (
             blocker.get("hint")
             or blocker.get("message")

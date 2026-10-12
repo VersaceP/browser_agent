@@ -4,7 +4,7 @@ The failure this closes: task 5324506f reported "评论需要登录" for three
 products. One had shown a login modal after a "View more" click; the other two
 had simply run out of worker steps before their reviews were read. The run held
 both facts — a step-budget receipt for the latter two, an overlay receipt for
-the first — but nowhere did it hold them PER ROW, so the Lead's single narrative
+the first — but nowhere did it hold them PER ROW, so the task owner's single narrative
 covered all three and no check could contradict it.
 
 Two things live here, and they are deliberately different in kind:
@@ -16,7 +16,7 @@ Two things live here, and they are deliberately different in kind:
     selector, which epoch — so nothing here knows anything about any site.
   * `derive_row_ledger` reads the receipts and says, per row and field, which
     outcome occurred and which mechanical cause explains it. Causes come from
-    receipts only. A Lead may describe a row, but it may not rename what the
+    receipts only. A task owner may describe a row, but it may not rename what the
     ledger recorded about it.
 """
 
@@ -96,7 +96,7 @@ def field_absence_accepted(
 
     Acceptance is structural; it does not certify the truth of the judgment.
     A bare empty value, or an explicit blocked/unresolved outcome, cannot use
-    confirmed_absent's licence. Legacy evidence remains visible to the Lead.
+    confirmed_absent's licence. Legacy evidence remains visible to the task owner.
     """
     allowed = allowed_outcomes if isinstance(allowed_outcomes, list) else []
     if OUTCOME_CONFIRMED_ABSENT not in allowed:
@@ -276,7 +276,7 @@ def mechanical_causes(trace_facts: Any) -> Dict[str, Any]:
 def _cause_for_unresolved(facts: Dict[str, Any]) -> str:
     # Order matters: the most specific receipt wins, and a plain step-budget
     # miss must never be reported as an access problem. That substitution is
-    # the exact error the Lead made for Syndie.io and Face Privacy.
+    # the exact error the task owner made for Syndie.io and Face Privacy.
     if facts["overlayOutcome"] == "blocked_after_ladder":
         return CAUSE_BLOCKED_AFTER_LADDER
     if facts["overlayOutcome"] == "auth_prompt_observed":

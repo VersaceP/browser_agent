@@ -195,8 +195,8 @@ def assess_batch_source_binding(
     by the downstream artifact.  Equal row counts, plan order, and matching
     field names never prove a cohort relationship. Every failed proof is an
     optional optimization miss, not a new execution gate: the ordinary
-    Lead/worker path remains available. Checkpoint/replan, joins/aggregates,
-    and form interaction phases remain explicit Lead responsibilities.
+    task owner/worker path remains available. Checkpoint/replan, joins/aggregates,
+    and form interaction phases remain explicit task owner responsibilities.
     """
 
     if not isinstance(worker_contract, dict) or any(
@@ -251,7 +251,7 @@ def assess_batch_source_binding(
     ):
         return {"status": "not_applicable", "reason": "input_artifact_plan_mismatch"}
     # The accepted phase is the output-contract authority.  The effective
-    # worker contract can include a spawn-time Lead override; it must never
+    # worker contract can include a spawn-time task owner override; it must never
     # alter the row-count or identity proof for automatic binding.
     if phase.get("validators_normalized") is not True:
         return {"status": "not_applicable", "reason": "phase_not_normalized"}
@@ -260,7 +260,7 @@ def assess_batch_source_binding(
     reviewed_validators = phase.get("validators")
     target_count = _auto_bind_exact_row_count(expected, reviewed_validators)
     # A one-row downstream result can be a summary, join, or other semantic
-    # reduction.  Leave that shape to the Lead rather than guessing it is a
+    # reduction.  Leave that shape to the task owner rather than guessing it is a
     # detail phase.
     if target_count is None or target_count <= 1:
         return {"status": "not_applicable"}
@@ -354,7 +354,7 @@ def materialize_batch_rows_from_source(
 ) -> Optional[JsonDict]:
     """Bind batch_rows to a validated extraction artifact before spawning.
 
-    The Lead declares selection intent; it never copies potentially large row
+    The task owner declares selection intent; it never copies potentially large row
     payloads through model context.  Only paths already present in the task's
     validated artifact ledger are eligible.
     """

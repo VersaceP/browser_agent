@@ -739,7 +739,7 @@ class RunLogger:
         # which launch or resume produced an event and is a foreign key in the
         # database backend. bind_context must never be used to carry it.
         self.run_id = str(run_id or "")
-        # Every event this run produces draws from one sequence, so lead and
+        # Every event this run produces draws from one sequence, so task owner and
         # worker events interleave into a single totally ordered stream.
         self._sequencer = RunEventSequencer()
         self._emitter: Optional[Any] = None

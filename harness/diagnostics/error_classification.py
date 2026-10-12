@@ -863,7 +863,7 @@ def classify_browser_error(
         }
     return {
         "type": "unknown",
-        "suggested_action": "report_to_lead_with_context",
+        "suggested_action": "report_to_owner_with_context",
         "method": method_name,
     }
 
@@ -887,7 +887,7 @@ def attach_error_classification(result: JsonDict, *, method: str = "") -> JsonDi
     if transport_code and transport_code != "ABCP_RPC_ERROR":
         error_type, suggested_action = _TRANSPORT_ERROR_TYPES.get(
             transport_code,
-            ("transport_error", "report_transport_diagnostics_to_lead"),
+            ("transport_error", "report_transport_diagnostics_to_owner"),
         )
         classification: JsonDict = {
             "type": error_type,

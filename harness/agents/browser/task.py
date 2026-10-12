@@ -1,7 +1,7 @@
 """Standalone Browser task entry, continuation and worker collection.
 
-No Lead planner, delegation review or Lead tool adapter is involved. The
-persisted phase ledger remains compatible with existing SQLite tasks.
+BrowserTaskRunner uses the shared spawner and persisted phase ledger directly.
+Existing SQLite Browser tasks keep their saved execution contracts.
 """
 from __future__ import annotations
 
@@ -138,7 +138,7 @@ async def _run_browser_mode(
     original_task: str,
     resume_context: Optional[ResumeContext],
 ) -> JsonDict:
-    """Run the explicit browser entry without a Lead model turn.
+    """Run the explicit browser entry without a task owner model turn.
 
     BrowserTaskRunner owns dispatch, lifecycle and persistence. The single
     phase records the user request without a model-authored delegation.
@@ -297,7 +297,7 @@ async def _wait_for_browser_mode_result(
 ) -> JsonDict:
     """Collect exactly the dispatched worker, preserving its evidence and status.
 
-    The spawn tool stays asynchronous for Lead orchestration. Waiting here has
+    The spawn tool stays asynchronous for task owner orchestration. Waiting here has
     no polling or replay policy; cancellation is handled by the CLI owner while
     storage is still open.
     """

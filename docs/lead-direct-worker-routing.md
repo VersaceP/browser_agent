@@ -1,5 +1,7 @@
 # Lead route: direct worker and orchestration
 
+> Historical record, archived 2026-10-12. Lead mode and its planning tools have been removed. The implementation described below belongs to the former runtime; see the [current request flow](end-to-end-request-flow.md) for Browser, Skill and Workflow.
+
 The Lead still decides the route after reading the user task. It has two
 planning tools:
 

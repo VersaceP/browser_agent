@@ -34,7 +34,7 @@ def _normalized_source_urls(*texts: Any) -> List[str]:
 
     Caveat (by design): URLs are regex-extracted from natural-language
     worker_task/objective text, so this dimension is only as stable as the
-    Lead's phrasing — it is an AUXILIARY discriminator (so "same range,
+    task owner's phrasing — it is an AUXILIARY discriminator (so "same range,
     different source" unlocks the budget). The primary objective key remains
     the numeric validators + artifact name."""
     urls: Set[str] = set()
@@ -251,7 +251,7 @@ def objective_fingerprint(
     (different source, different range, different artifact), which is
     exactly when the accumulated budget should reset.
 
-    When the Lead spawns with a worker_contract override, THAT is what the
+    When the task owner spawns with a worker_contract override, THAT is what the
     worker actually runs — its expected_artifact/validators/texts take
     precedence over the raw phase (same merge semantics as phase_contract),
     so the gate and the execution stay in sync.

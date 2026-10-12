@@ -36,6 +36,7 @@ _MODEL_CONFIG = ConfigDict(
     frozen=True,
 )
 
+# "lead" is a persisted historical label; no Lead runtime emits new events.
 ActorType = Literal["lead", "browser", "system", "browser_platform"]
 Severity = Literal["debug", "info", "warning", "error"]
 Category = Literal[

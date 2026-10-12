@@ -3,9 +3,8 @@ runtime_config.py - 全项目统一配置表（single source of truth）。
 
 config.json 的配置表全部定义在这一个文件里：
 
-    "lead"/"worker"         -> ModelConfig         （各自完整的 LLM 连接：provider=供应商、api=协议、
+    "worker"/"skill_orchestrator"         -> ModelConfig         （各自完整的 LLM 连接：provider=供应商、api=协议、
                                                     model_id/api_key/超时重试/extra_params；互不继承）
-    "plan_validator": {...} -> PlanValidatorConfig （独立计划审计模型，必须配置且开启）
     "vl": {...}             -> VLConfig            （视觉模型连接 + 各 VL 角色开关）
     "browser": {...}        -> ABCPClientConfig    （ABCP WebSocket 连接）
     "harness": {...}        -> HarnessConfig       （编排/步数预算/offload/HITL/skill 等运行时行为）
@@ -199,9 +198,9 @@ def _validated_browser_agent_max_multimodal_image_bytes(value: Any) -> int:
 
 
 def _validated_agent_mode(value: Any) -> str:
-    mode = str(value or "lead").strip().lower()
-    if mode not in {"lead", "browser"}:
-        raise ValueError("harness.agent_mode must be 'lead' or 'browser'")
+    mode = str(value or "browser").strip().lower()
+    if mode != "browser":
+        raise ValueError("harness.agent_mode must be 'browser'")
     return mode
 
 
@@ -231,7 +230,7 @@ def _normalize_hitl_attendance(value: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 模型连接：ModelConfig（lead / worker / plan_validator 各自一段，互不继承）
+# 模型连接：ModelConfig（worker / skill_orchestrator 各自一段，互不继承）
 # ---------------------------------------------------------------------------
 
 # 这两个供应商名是兼容写法：表示官方服务，并隐含同名协议。
@@ -239,11 +238,11 @@ _PROTOCOL_IMPLIED_PROVIDERS = frozenset({"anthropic", "openai"})
 
 
 def require_model_connection(data: Any, *, section: str) -> None:
-    """lead / worker / plan_validator 必须各自写全连接，缺哪项点名哪项。"""
+    """worker / skill_orchestrator 必须各自写全连接，缺哪项点名哪项。"""
     if not isinstance(data, dict) or not data:
         raise ValueError(
-            f"config.json 缺少 {section} 段：lead、worker、plan_validator 必须各自"
-            "完整配置（provider、model_id、api_key 或 api_key_env；命名供应商还要写 api）"
+            f"config.json is missing the {section} section; each model role requires "
+            "a complete connection (provider, model_id, api_key or api_key_env, and api for named providers)"
         )
     problems: List[str] = []
     provider = data.get("provider")
@@ -344,205 +343,13 @@ class ModelConfig:
 
 
 # ---------------------------------------------------------------------------
-# "plan_validator" 段：独立计划审计模型
-# ---------------------------------------------------------------------------
-
-@dataclass
-class PlanValidatorConfig:
-    enabled: bool = False
-    provider: str = "openai"
-    api: Optional[str] = None
-    model_id: str = ""
-    api_key: Optional[str] = None
-    api_key_env: Optional[str] = None
-    base_url: Optional[str] = None
-    base_url_env: Optional[str] = None
-    max_tokens: int = 8000
-    llm_api_timeout_seconds: float = DEFAULT_LLM_API_TIMEOUT_SECONDS
-    llm_timeout_max_retries: int = DEFAULT_LLM_TIMEOUT_MAX_RETRIES
-    llm_timeout_backoff_seconds: float = DEFAULT_LLM_TIMEOUT_BACKOFF_SECONDS
-    llm_timeout_retry_interval_seconds: Optional[float] = None
-    # One malformed/transport-failed verdict must not force the Lead to alter
-    # an otherwise identical candidate just to obtain another independent
-    # review. This is an attempt budget, not a semantic override: a retry can
-    # only produce approved/rejected/error and all outcomes stay audited.
-    review_error_retry_attempts: int = 1
-    extra_params: Dict[str, Any] = field(default_factory=dict)
-
-    @classmethod
-    def from_dict(cls, data: JsonDict) -> "PlanValidatorConfig":
-        if not isinstance(data, dict):
-            return cls()
-        api_key_env = str(data.get("api_key_env") or "").strip() or None
-        base_url_env = str(data.get("base_url_env") or "").strip() or None
-        return cls(
-            enabled=bool(data.get("enabled", cls.enabled)),
-            provider=str(data.get("provider", cls.provider) or cls.provider),
-            api=data.get("api"),
-            model_id=str(data.get("model_id", cls.model_id) or "").strip(),
-            api_key=(
-                data.get("api_key")
-                or (os.environ.get(api_key_env) if api_key_env else None)
-            ),
-            api_key_env=api_key_env,
-            base_url=(
-                data.get("base_url")
-                or (os.environ.get(base_url_env) if base_url_env else None)
-            ),
-            base_url_env=base_url_env,
-            max_tokens=_int_config(
-                data.get("max_tokens", cls.max_tokens),
-                cls.max_tokens,
-                minimum=256,
-                maximum=65536,
-            ),
-            llm_api_timeout_seconds=_float_config(
-                data.get(
-                    "llm_api_timeout_seconds",
-                    cls.llm_api_timeout_seconds,
-                ),
-                cls.llm_api_timeout_seconds,
-                minimum=1.0,
-            ),
-            llm_timeout_max_retries=_int_config(
-                data.get(
-                    "llm_timeout_max_retries",
-                    cls.llm_timeout_max_retries,
-                ),
-                cls.llm_timeout_max_retries,
-                minimum=0,
-                maximum=10,
-            ),
-            llm_timeout_backoff_seconds=_float_config(
-                data.get(
-                    "llm_timeout_backoff_seconds",
-                    cls.llm_timeout_backoff_seconds,
-                ),
-                cls.llm_timeout_backoff_seconds,
-                minimum=0.0,
-            ),
-            llm_timeout_retry_interval_seconds=_optional_float_config(
-                data.get("llm_timeout_retry_interval_seconds"),
-                minimum=0.0,
-            ),
-            review_error_retry_attempts=_int_config(
-                data.get(
-                    "review_error_retry_attempts",
-                    cls.review_error_retry_attempts,
-                ),
-                cls.review_error_retry_attempts,
-                minimum=0,
-                maximum=3,
-            ),
-            extra_params=(
-                dict(data.get("extra_params"))
-                if isinstance(data.get("extra_params"), dict)
-                else {}
-            ),
-        )
-
-    def model_config(self) -> ModelConfig:
-        extra_params = dict(self.extra_params)
-        extra_params["max_tokens"] = int(self.max_tokens)
-        extra_params["tool_choice"] = "required"
-        # No forced temperature: several current models reject any explicit
-        # value (GPT-5 answers 400 "Unsupported parameter: 'temperature'").
-        # Sampling is opt-in through this section's own extra_params.
-        return ModelConfig(
-            provider=self.provider,
-            api=self.api,
-            model_id=self.model_id,
-            api_key=self.api_key,
-            base_url=self.base_url,
-            extra_params=extra_params,
-            llm_api_timeout_seconds=self.llm_api_timeout_seconds,
-            llm_timeout_max_retries=self.llm_timeout_max_retries,
-            llm_timeout_backoff_seconds=self.llm_timeout_backoff_seconds,
-            llm_timeout_retry_interval_seconds=(
-                self.llm_timeout_retry_interval_seconds
-            ),
-        )
-
-
-# ---------------------------------------------------------------------------
-# "claim_extractor" 段：独立观测模型（把散文里的数量绑定到可重算的指标）
+# Model connections are defined by ModelConfig above.
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class ClaimExtractorConfig(PlanValidatorConfig):
-    """Independent model that binds quantities in prose to checkable metrics.
-
-    Same shape as the plan validator on purpose: both are read-only auditors
-    that must not be the Lead model. Deciding whether a bound number is right
-    is code's job (harness.results.numeric_facts); this model only says which metric a
-    sentence is talking about. When this section is absent the LeadAgent falls
-    back to the plan_validator provider rather than adding a second key.
-    """
-
-    # One short entry per enumerated span. 51 spans on a dense report needs
-    # roughly 3k; the headroom is for reports with many more. Kept explicit
-    # because inheriting the plan validator's budget once let a truncated
-    # response return no tool call at all, which reads as "extractor
-    # unavailable" and silently fails the gate open (task 857616aa).
-    max_tokens: int = 16000
-
-    def model_config(self) -> ModelConfig:
-        # Transport selection is permissive; numeric_facts still requires
-        # exactly one valid claim tool response and checks span coverage.
-        model = super().model_config()
-        model.extra_params["tool_choice"] = "auto"
-        return model
-
-    @classmethod
-    def derived_from(
-        cls, validator: "PlanValidatorConfig",
-    ) -> "ClaimExtractorConfig":
-        """Reuse the auditor's model and credentials, not its thinking budget.
-
-        Binding a number in prose to a metric is a lookup; judging whether a
-        plan quietly dropped an objective is not. Inheriting the validator's
-        provider object gave the extractor `effort=high` and a shared 12k
-        output budget, and in task 5b91bd44 the extractor spent all of it
-        thinking and returned no tool call at all — which reads as "extractor
-        unavailable" and costs three minutes for nothing.
-        """
-        extra = {
-            key: value
-            for key, value in (validator.extra_params or {}).items()
-            if key not in _REASONING_PARAM_KEYS
-        }
-        return cls(
-            enabled=True,
-            provider=validator.provider,
-            api=validator.api,
-            model_id=validator.model_id,
-            api_key=validator.api_key,
-            base_url=validator.base_url,
-            llm_api_timeout_seconds=validator.llm_api_timeout_seconds,
-            llm_timeout_max_retries=validator.llm_timeout_max_retries,
-            llm_timeout_backoff_seconds=validator.llm_timeout_backoff_seconds,
-            llm_timeout_retry_interval_seconds=(
-                validator.llm_timeout_retry_interval_seconds
-            ),
-            extra_params=extra,
-        )
-
-
-# Spellings different providers use for the same "spend tokens deliberating"
-# switch. Stripped when a read-only lookup inherits an auditor's connection.
-_REASONING_PARAM_KEYS = frozenset({
-    "thinking",
-    "reasoning",
-    "reasoning_effort",
-    "effort",
-    # Output-limit spellings travel with a role's protocol. A read-only lookup
-    # keeps the role's own connection, so leaving these in makes the inherited
-    # block contradict the protocol it is about to be encoded for.
-    "max_output_tokens",
-    "max_tokens",
-    "max_completion_tokens",
-})
+# ---------------------------------------------------------------------------
+# Browser transport configuration
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -852,9 +659,8 @@ class VLConfig:
 
 @dataclass
 class HarnessConfig:
-    agent_mode: str = "lead"
+    agent_mode: str = "browser"
     max_steps: int = 40
-    lead_max_steps: int = 40
     worker_max_steps: int = 40
     # Experimental BrowserAgent continuation.  The current worker may ask for
     # one bounded extension near its step cap; harness guards remain
@@ -1036,7 +842,7 @@ class HarnessConfig:
     # ever filled. Off is the escape hatch, not the resting state.
     events_lifecycle_enabled: bool = True
     # Whether message_end carries the assistant text. Off while the legacy
-    # agent.model / lead.model events still carry it: two copies of the same
+    # agent.model events still carry it: two copies of the same
     # text is the double-write this refactor exists to remove.
     events_persist_message_content: bool = False
     offload_threshold_bytes: int = DEFAULT_OFFLOAD_THRESHOLD_BYTES
@@ -1076,7 +882,6 @@ class HarnessConfig:
     cache_pressure_uncached_input_threshold: int = 40000
     cache_pressure_consecutive_steps: int = 3
     cache_pressure_min_remaining_steps: int = 2
-    lead_model_timeout_step_retries: int = 1
     log_browser_payloads: bool = True
     # Master control-plane gate for every Harness-owned Workflow.execute path.
     #
@@ -1198,7 +1003,6 @@ class HarnessConfig:
                 data.get("agent_mode", cls.agent_mode)
             ),
             max_steps=int(data.get("max_steps", cls.max_steps)),
-            lead_max_steps=int(data.get("lead_max_steps", cls.lead_max_steps)),
             worker_max_steps=int(data.get("worker_max_steps", cls.worker_max_steps)),
             browser_agent_step_extension_enabled=(
                 _validated_browser_agent_step_extension_enabled(
@@ -1515,12 +1319,6 @@ class HarnessConfig:
                     cls.cache_pressure_min_remaining_steps,
                 )
             ),
-            lead_model_timeout_step_retries=int(
-                data.get(
-                    "lead_model_timeout_step_retries",
-                    cls.lead_model_timeout_step_retries,
-                )
-            ),
             context_compaction_keep_head_pairs=int(
                 data.get(
                     "context_compaction_keep_head_pairs",
@@ -1685,27 +1483,18 @@ class RuntimeConfig:
     agent_id: str
     browser: ABCPClientConfig
     harness: HarnessConfig
-    lead: ModelConfig
     worker: ModelConfig
-    plan_validator: PlanValidatorConfig = field(
-        default_factory=PlanValidatorConfig
-    )
-    claim_extractor: ClaimExtractorConfig = field(
-        default_factory=ClaimExtractorConfig
-    )
+    skill_orchestrator: Optional[ModelConfig] = None
 
 
 # ---------------------------------------------------------------------------
 # 未知字段审计 + 装载入口
 # ---------------------------------------------------------------------------
 
-# 顶层只放各段和 agent_id 兜底；模型连接一律写在 lead / worker / plan_validator 段里。
+# 顶层只放各段和 agent_id 兜底；模型连接一律写在 worker / skill_orchestrator 段里。
 _TOP_LEVEL_KEYS = {
     "agent_id",
     "vl",
-    "plan_validator",
-    "claim_extractor",
-    "lead",
     "worker",
     "browser",
     "harness",
@@ -1725,7 +1514,7 @@ _REMOVED_TOP_LEVEL_MODEL_KEYS = (
     "llm_timeout_backoff_seconds",
     "llm_timeout_retry_interval_seconds",
 )
-# lead / worker 段认识的键：ModelConfig 字段 + 两个环境变量间接键。
+# worker / skill_orchestrator 段认识的键：ModelConfig 字段 + 两个环境变量间接键。
 _MODEL_SECTION_KEYS = {"api_key_env", "base_url_env"}
 # browser 段里 agent_id 由 load_runtime_config 直接读取（不属于 ABCPClientConfig）。
 _BROWSER_EXTRA_KEYS = {"agent_id"}
@@ -1759,23 +1548,15 @@ def audit_config_keys(raw: JsonDict) -> List[str]:
         _field_names(ABCPClientConfig) | _BROWSER_EXTRA_KEYS,
     )
     # runtime-only 字段不算“不认识”，下面单独给更准确的专属提示。
-    check("harness", raw.get("harness"), _field_names(HarnessConfig))
+    check("harness", raw.get("harness"), _field_names(HarnessConfig) | {"max_steps"})
     check("vl", raw.get("vl"), _field_names(VLConfig) | _VL_ALIAS_KEYS)
-    check(
-        "plan_validator",
-        raw.get("plan_validator"),
-        _field_names(PlanValidatorConfig),
-    )
-    check(
-        "claim_extractor",
-        raw.get("claim_extractor"),
-        _field_names(ClaimExtractorConfig),
-    )
-    for _role in ("lead", "worker"):
+    for _role in ("worker", "skill_orchestrator"):
         check(_role, raw.get(_role), _field_names(ModelConfig) | _MODEL_SECTION_KEYS)
 
     harness_raw = raw.get("harness")
     if isinstance(harness_raw, dict):
+        if "max_steps" in harness_raw:
+            warnings.append("harness.max_steps is deprecated and ignored; Workflow, Skill and Builder have no fixed model-turn cap")
         if "forced_skill_id" in harness_raw:
             warnings.append(
                 "harness.forced_skill_id 只在运行时通过 --skill / /skill 设置，"
@@ -1790,27 +1571,18 @@ def _reject_top_level_model_keys(raw: JsonDict) -> None:
     stale = [key for key in _REMOVED_TOP_LEVEL_MODEL_KEYS if key in raw]
     if stale:
         raise ValueError(
-            "config.json 顶层不再配置模型：请把 " + "、".join(stale)
-            + " 写进 lead、worker 各自的段里（plan_validator 同样单独配置），"
-            "三段互不继承"
+            "Top-level model configuration is no longer supported; move " + ", ".join(stale)
+            + " into the worker or skill_orchestrator section; "
+            "these sections do not inherit from each other"
         )
-
-
-def _load_plan_validator(data: Any) -> PlanValidatorConfig:
-    require_model_connection(data, section="plan_validator")
-    if data.get("enabled", True) is not True:
-        raise ValueError(
-            "plan_validator 必须开启：删掉 enabled 或写成 true，计划审计不能关闭"
-        )
-    return replace(PlanValidatorConfig.from_dict(data), enabled=True)
 
 
 def load_runtime_config(config_path: str, *, warn: bool = True) -> RuntimeConfig:
     path = Path(config_path)
     if not path.exists():
         raise ValueError(
-            f"找不到配置文件 {path}：lead、worker、plan_validator 必须在配置文件里"
-            "各自完整配置"
+            f"Configuration file not found: {path}; worker and any explicit skill_orchestrator section must each "
+            "have a complete connection configuration"
         )
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
@@ -1821,9 +1593,7 @@ def load_runtime_config(config_path: str, *, warn: bool = True) -> RuntimeConfig
         for line in audit_config_keys(raw):
             print(f"[config] {path.name} {line}", file=sys.stderr)
 
-    lead = ModelConfig.from_section(raw.get("lead"), section="lead")
     worker = ModelConfig.from_section(raw.get("worker"), section="worker")
-    plan_validator = _load_plan_validator(raw.get("plan_validator"))
     browser_raw = raw.get("browser", {})
     harness_raw = raw.get("harness", {})
 
@@ -1836,12 +1606,9 @@ def load_runtime_config(config_path: str, *, warn: bool = True) -> RuntimeConfig
         agent_id=browser_raw.get("agent_id") or raw.get("agent_id", "abcp-agent"),
         browser=ABCPClientConfig.from_dict(browser_raw),
         harness=harness,
-        lead=lead,
         worker=worker,
-        plan_validator=plan_validator,
-        claim_extractor=ClaimExtractorConfig.from_dict(
-            raw.get("claim_extractor", {})
-        ),
+        skill_orchestrator=(ModelConfig.from_section(raw["skill_orchestrator"], section="skill_orchestrator")
+                            if "skill_orchestrator" in raw else None),
     )
 
 

@@ -267,7 +267,7 @@ async def bootstrap_schema_cache(self) -> None:
                 "requestId": getattr(exc, "request_id", "") or None,
                 "requestSent": getattr(exc, "request_sent", None),
                 "fallback": (
-                    "stop before Lead model calls; preserve task for resume"
+                    "stop before task owner model calls; preserve task for resume"
                     if self._browser_connection_failure else
                     "validate_task_plan will skip unknown-method check"
                 ),

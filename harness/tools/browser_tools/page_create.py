@@ -458,7 +458,7 @@ async def _recover_page_create_32005(
         "classification": classification,
         "errorClassification": {
             "type": classification["type"],
-            "suggested_action": "lead_review_page_and_transport_evidence",
+            "suggested_action": "owner_review_page_and_transport_evidence",
             "method": "Page.create",
         },
         "pageCreateRecovery": probe,
@@ -467,7 +467,7 @@ async def _recover_page_create_32005(
             probe=probe,
         ),
         "next_instruction": (
-            "Return the recorded page-create and probe facts to Lead. Do not infer"
+            "Return the recorded page-create and probe facts to task owner. Do not infer"
             " global unavailability or replay the creation; the page may already exist."
         ),
     }

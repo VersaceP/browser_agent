@@ -1,7 +1,7 @@
 ---
 id: browser.file-upload
 audience: browser
-version: "2026-09-26"
+version: "2026-10-12"
 description: Assign files to a current upload input, then verify page acceptance and diagnose an unconfirmed result.
 sources:
   - abcp-platform/resources/skills/webcross-browser/SKILL.md
@@ -67,4 +67,4 @@ Network request bodies and credential fields in JSON response bodies are
 redacted by the harness; unstructured text bodies may be withheld. Use the
 remaining metadata and page state for the decision. If the accepted result
 cannot be established, keep the upload objective open and report the evidence
-and blocker to Lead. Directory uploads require HITL.
+and blocker to the task owner. Directory uploads require HITL.

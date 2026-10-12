@@ -3,7 +3,7 @@
 An identical request is an arithmetic fact.  It is not proof of an identical
 world state: waits, page reads and searches can legitimately return new data,
 and production runs showed that blocking a repeated ``wait_browser_agents``
-sent the Lead into several steps of irrelevant file archaeology.  Global run
+sent the task owner into several steps of irrelevant file archaeology.  Global run
 budgets bound ordinary repetition; irreversible side effects retain their own
 idempotency, confirmation and uncertain-side-effect protections.
 

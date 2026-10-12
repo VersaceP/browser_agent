@@ -1,11 +1,11 @@
 # Harness 高级配置 / Advanced configuration
 
 首次使用只需配置模型连接和浏览器连接。内部阈值、复用与恢复参数由
-[`HarnessConfig`](../runtime_config.py) 提供默认值，Browser 与 Lead 共用。
+[`HarnessConfig`](../runtime_config.py) 提供默认值，Browser、Skill 与 Workflow 共用。
 需要部署调优时，仍可在 `config.json` 的 `harness` 段显式覆写；旧配置继续生效。
 
 For initial setup, configure the models and browser connection. Internal tuning
-uses `HarnessConfig` defaults for both Browser and Lead. Explicit `harness`
+uses `HarnessConfig` defaults for Browser, Skill and Workflow. Explicit `harness`
 overrides remain supported, including existing configurations.
 
 ## 内置默认值 / Internal defaults
@@ -38,7 +38,6 @@ or its compaction ratio.
 ```json
 {
   "harness": {
-    "lead_max_steps": 20,
     "worker_max_steps": 30,
     "max_browser_agent_instances": 3,
     "max_browser_agents": 3,
@@ -67,8 +66,7 @@ or its compaction ratio.
 }
 ```
 
-- `lead_max_steps`: LeadAgent 最大决策轮数。
-- `worker_max_steps`: Lead 委派的 BrowserAgent 最大执行轮数；独立 `/browser` 任务不受此轮数限制，以显式完成或实际阻塞为终态。
+- `worker_max_steps`: 委派 BrowserAgent 最大执行轮数；独立 `/browser` 任务不受此轮数限制，以显式完成或实际阻塞为终态。
 - 独立 `/browser` 的清单使用任务逻辑路径 `scratchpad/todo.md`，默认存于 SQLite。清单变化、主动调用 `request_goal_review`、以及 `final_answer(done)` 会触发独立证据复核。完成声明只有通过最终复核才会结束任务。复核器可读取授权文件和任务页面观察结果，但不能修改页面。
 - `max_browser_agent_instances`: 可复用池长期保留的 BrowserAgent slot 目标数。idle slot 会保留 ABCP 连接和页面 registry；有效池容量至少等于 `max_browser_agents`。普通新 worker 只复用连接并从新页面开始；显式 continuation 才会复用旧页面候选。
 - `max_browser_agents`: 同时运行的 browser worker 权威上限。
@@ -97,7 +95,6 @@ Optional advanced configuration example:
 ```json
 {
   "harness": {
-    "lead_max_steps": 20,
     "worker_max_steps": 30,
     "max_browser_agent_instances": 3,
     "max_browser_agents": 3,
@@ -126,8 +123,7 @@ Optional advanced configuration example:
 }
 ```
 
-- `lead_max_steps`: maximum LeadAgent decision rounds.
-- `worker_max_steps`: maximum rounds for a BrowserAgent delegated by Lead. A standalone `/browser` task has no step limit and ends on an explicit completion or real blocker.
+- `worker_max_steps`: maximum rounds for a BrowserAgent delegated by a task owner. A standalone `/browser` task has no step limit and ends on an explicit completion or real blocker.
 - Standalone `/browser` maintains its checklist at the logical task path `scratchpad/todo.md`, stored in SQLite by default. Checklist changes, an explicit `request_goal_review`, and `final_answer(done)` trigger independent evidence review. A done answer ends the task only after the final review verifies it. The reviewer can read authorized files and task-bound page observations but cannot change the page.
 - `max_browser_agent_instances`: target number of live BrowserAgent slots kept in the reusable pool. Idle slots keep their ABCP connection and page registry. The effective pool is raised to at least `max_browser_agents`.
 - `max_browser_agents`: authoritative maximum number of concurrently running browser workers.
@@ -136,7 +132,7 @@ Optional advanced configuration example:
 - `similar_task_reuse_threshold`: deterministic normalized text/character-ngram ranking threshold in `[0, 1]`, default `0.78`. It cannot grant reuse by itself: normalized tasks must first be equal or a high-overlap contiguous extension, explicit URL origins must not conflict, and numeric tokens must agree when both tasks contain them. Reuse transfers browser context only—prior pages and results are never accepted as current evidence.
 - `similar_task_running_stale_seconds`: lease TTL for a `running` Fleet-memory record, default `86400` (24 hours). A worker entering through similar-task reuse must save its initial lease before browser work starts. Eligible live workers then refresh the lease in the background and stop heartbeating before terminal state is written; cancellation and failure paths also attempt a bounded terminal checkpoint. Positive configured values are clamped to at least `60` seconds to avoid expiring inside one write and to bound write amplification. Set it to `0` to disable expiry and retain indefinite fail-closed blocking.
 - `same_fleet_multiworker_enabled`: opt-in canary for sharing one task/session fleet across parallel slots while keeping separate pages. It defaults to `false`; when enabled, the owner socket remains authoritative, notifications are relayed to delegates, and equal-page calls are serialized.
-- `max_task_fleets`: ceiling on how many distinct fleets (browser instances) one task may occupy; `0` disables it. The harness never closes a fleet, so one it opens holds its budget slot until the platform stops reporting it — a fleet that disappears from the owner inventory releases its slot again. Counted over fleets bound to this task's workers, never over the Agent-global `Fleet.list`. A Fleet named by task-level `@<id>`, a bound `session_key`, or `reuse_from_worker_id` consumes the budget and is honored if current authoritative inventory confirms it. At the ceiling a fleetless worker reuses one of the task's existing fleets, preferring one no running worker holds, and deployment-default `worker_session_isolation_enabled` yields to the cap. Two cases cannot be served that way and get a `task_fleet_limit_reached` receipt instead: a spawn demanding a separate identity (a phase-declared `needs_isolated_session`, or a new `session_key`), and a ceiling where every task fleet is bound to a named session, since a logged-in cookie jar is never lent to a generic worker. Waiting does not clear either one — the harness closes no fleets and a session binding outlives its worker — so the receipt tells the Lead to continue on an existing fleet, release a session binding through auth recovery, or raise the ceiling. Before refusing, the cap re-reads the authoritative `Fleet.list` once. The dispatcher answers that from the whole fleets table with no per-connection scoping, so one successful read both finds a fleet another slot created seconds ago and retires any fleet the platform has dropped — whichever slot owned it — handing its budget back. A failed read is never treated as proof of disappearance.
+- `max_task_fleets`: ceiling on how many distinct fleets (browser instances) one task may occupy; `0` disables it. The harness never closes a fleet, so one it opens holds its budget slot until the platform stops reporting it — a fleet that disappears from the owner inventory releases its slot again. Counted over fleets bound to this task's workers, never over the Agent-global `Fleet.list`. A Fleet named by task-level `@<id>`, a bound `session_key`, or `reuse_from_worker_id` consumes the budget and is honored if current authoritative inventory confirms it. At the ceiling a fleetless worker reuses one of the task's existing fleets, preferring one no running worker holds, and deployment-default `worker_session_isolation_enabled` yields to the cap. Two cases cannot be served that way and get a `task_fleet_limit_reached` receipt instead: a spawn demanding a separate identity (a phase-declared `needs_isolated_session`, or a new `session_key`), and a ceiling where every task fleet is bound to a named session, since a logged-in cookie jar is never lent to a generic worker. Waiting does not clear either one — the harness closes no fleets and a session binding outlives its worker — so the receipt tells the task owner to continue on an existing fleet, release a session binding through auth recovery, or raise the ceiling. Before refusing, the cap re-reads the authoritative `Fleet.list` once. The dispatcher answers that from the whole fleets table with no per-connection scoping, so one successful read both finds a fleet another slot created seconds ago and retires any fleet the platform has dropped — whichever slot owned it — handing its budget back. A failed read is never treated as proof of disappearance.
 - `fleet_auth_barrier_enabled`: make login/CAPTCHA resolution fleet-wide and fail closed for non-resolver workers. `fleet_auth_barrier_wait_seconds` controls the bounded wait.
 - `auth_fleet_ledger_path`: persistent, non-secret verified session index, relative to `worktree_dir` unless absolute. Reclaimed fleets are quarantined until ledger reconciliation restores their restrictions.
 - `fleet_slot_reconnect_attempts`: bounded reconnect attempts per recovery cycle. Each reconnect must retain the server-assigned protocol identity before an authenticated fleet binding is reused; transport loss never proves that the fleet is lost.

@@ -22,7 +22,7 @@ from harness.utils import JsonDict, optional_int
 
 
 _GUIDE_ID_RE = re.compile(r"^[a-z][a-z0-9]*(?:[.-][a-z0-9]+)*$")
-_GUIDE_AUDIENCES = frozenset({"browser", "lead"})
+_GUIDE_AUDIENCES = frozenset({"browser"})
 _MAX_LINE_LIMIT = 500
 
 # Search is lexical and deterministic on purpose. The queries that actually

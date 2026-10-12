@@ -83,7 +83,7 @@ def capability_hash(
     # blocked-methods set) into the digest so that un-banning/re-banning a method
     # changes the cache key even though the raw System.getCapabilities response is
     # unchanged. Without it, a cache built while a method was blocked would never
-    # describe that method after it is un-banned -> Lead plan validation reports
+    # describe that method after it is un-banned -> task owner plan validation reports
     # "unknown method". Omitted (None) keeps the legacy capability-only hash.
     # `generation` additionally folds a known schema-contract generation in:
     # describeAction-level schema changes that leave capability entries

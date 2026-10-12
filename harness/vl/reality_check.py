@@ -465,7 +465,7 @@ def build_reality_check_row(
     gate's B3 check when cited in evidenceArtifacts).
 
     The row states its own standing. `originClass` and `evidenceGrade` travel
-    with the observation so anything that later reads this artifact — the Lead,
+    with the observation so anything that later reads this artifact — the task owner,
     the auditor, a repair pass — sees a model assertion labelled as one, rather
     than a harness-persisted file that looks like a measurement because of
     where it lives.

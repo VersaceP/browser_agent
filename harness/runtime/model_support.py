@@ -302,10 +302,6 @@ def _deferred_tool_result(
     }
 
 
-
-
-
-
 def _expire_multimodal_image_blocks(messages: List[JsonDict]) -> int:
     """Remove screenshot pixels after one successful model observation.
 
@@ -462,8 +458,6 @@ async def _compact_before_multimodal_request(
         messages=prefix, tools=tools, force_reason=compact_reason,
     )
     return compacted_prefix + protected
-
-
 
 
 def _is_context_limit_exception(exc: BaseException) -> bool:
@@ -771,8 +765,6 @@ def log_model_visible_tool_result(
     logger.write("tool_result.model_visible", payload)
 
 
-
-
 @dataclass(frozen=True)
 class CachePressureState:
     """What the usage receipts have said so far about prompt-prefix reuse.
@@ -878,7 +870,7 @@ async def compact_and_track_prefix_rebuild(
 
     Every skip path in `compact_messages_if_needed` returns the same list
     object it was handed, so identity is what separates a real rebuild from a
-    no-op. Both agents go through here rather than calling the compactor
+    no-op. Model-call paths go through here rather than calling the compactor
     directly: the error-recovery paths rebuild the prefix exactly like the
     main loop does, and a detector that only knows about some of the rebuilds
     goes back to counting its own splash on the others.
@@ -959,12 +951,6 @@ def _store_received_model_output(**kwargs: Any) -> Optional[JsonDict]:
     return store_received_model_output(**kwargs)
 
 
-def _assistant_message_to_wire(message: Any) -> JsonDict:
-    from harness.messages.convert import assistant_message_to_wire
-
-    return assistant_message_to_wire(message)
-
-
 def _assistant_message_from_parts(**kwargs: Any) -> Any:
     from harness.events.recorder import assistant_message_from_parts
 
@@ -978,7 +964,7 @@ def _lifecycle_recorder_for(
 
     The identity comes from two places and needs both: the logger carries the
     worker/slot/phase the spawner bound, and the caller carries which KIND of
-    agent this is. Leaving the second to a default is how every event - lead,
+    agent this is. Leaving the second to a default is how every event - task owner,
     worker and browser transition alike - came out labelled "system", filling
     the formerly-NULL actor_type column with a uniformly wrong value.
     """

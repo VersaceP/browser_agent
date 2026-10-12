@@ -1224,7 +1224,7 @@ def phase_start_rejection(
         # Two very different situations share this branch: a dependency that
         # FAILED terminally (replan territory) vs one that simply has not
         # finished yet (wait territory). Now that the rejection payload
-        # reaches the Lead verbatim, the wrong instruction would upgrade a
+        # reaches the task owner verbatim, the wrong instruction would upgrade a
         # blind retry into a wrong replan — say the right thing per case.
         if blocker.get("blocking"):
             next_instruction = (
@@ -1236,7 +1236,7 @@ def phase_start_rejection(
               and blocker.get("dependencyLastAttemptStatus")):
             next_instruction = (
                 "The dependency worker already returned. Inspect its artifacts and validation"
-                " findings; use revalidate_phase_artifacts with the current plan version if"
+                " findings; ask the task runtime to revalidate the current plan's artifacts if"
                 " the existing evidence satisfies its contract, or continue/revise that"
                 " assignment. Waiting alone cannot validate a returned partial result."
             )
@@ -1244,7 +1244,7 @@ def phase_start_rejection(
             next_instruction = (
                 f"Dependency phase {blocker.get('dependencyPhaseId')} is"
                 f" {blocker.get('dependencyStatus') or 'pending'}, not failed."
-                " Run the accepted dependency if pending, or wait_browser_agents if running."
+                " Let the task runtime dispatch the accepted dependency if pending, or collect its result if running."
                 " Resume this assignment once the dependency is validated_done."
             )
         return {
@@ -1383,15 +1383,15 @@ def next_pending_phase(plan: Optional[JsonDict], logger: RunLogger) -> Optional[
 def schedule_snapshot(
     plan: Optional[JsonDict], logger: RunLogger,
 ) -> JsonDict:
-    """Classify every phase for the Lead, without touching task state.
+    """Classify every phase for the task owner, without touching task state.
 
     `next_pending_phase` answers a different question and answers it by
     writing: it stamps blocked_by_dependency and current_phase as it walks.
     A snapshot is read into an error payload, so it must be able to run when
-    the Lead is being told why its spawn failed without itself changing what
+    the task owner is being told why its spawn failed without itself changing what
     happens next.
 
-    The distinction the Lead could not make from the old generic
+    The distinction the task owner could not make from the old generic
     "no pending phase" is between "wait", "spawn something else", "replan" and
     "report": task eb939033 read it as "phase not found" and re-spawned the
     same blocked phase twice.
@@ -1461,7 +1461,7 @@ def schedule_snapshot(
         # Same attempt budget the spawn path enforces, computed without
         # writing. The ordinary spawn runs an exhaustion normalizer first and
         # would correct a wrong answer here, but the repeated-invalid-replan
-        # path reads this snapshot directly — it would have told the Lead to
+        # path reads this snapshot directly — it would have told the task owner to
         # spawn a phase the very next call rejects as exhausted.
         attempts = phase_state.get("attempts")
         max_attempts = (
@@ -1496,7 +1496,7 @@ def schedule_snapshot(
         )
     if running:
         actions.append(
-            "Wait for " + ", ".join(running) + " with wait_browser_agents."
+            "Let the task runtime collect results from " + ", ".join(running) + "."
         )
     if blocked:
         blocked_ids = [

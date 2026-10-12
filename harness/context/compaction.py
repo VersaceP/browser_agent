@@ -401,7 +401,7 @@ def summarize_messages_for_compaction(
                     response = parsed.get("response")
                     if isinstance(response, dict) and response.get("error"):
                         errors.append(str(response.get("error"))[:500])
-    scope = "lead" if "lead" in str(actor).lower() else "browser"
+    scope = "browser"
     facts: JsonDict = {
         "schemaVersion": "context_compaction.v3",
         "actor": actor,

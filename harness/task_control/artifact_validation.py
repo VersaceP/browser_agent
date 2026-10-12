@@ -366,7 +366,7 @@ def validate_worker_artifacts(
                 }
     failures.extend(selected_failures)
     warnings = _empty_array_observations(rows, expected)
-    # Word-list placeholder readings inform the Lead; they do not fail the
+    # Word-list placeholder readings inform the task owner; they do not fail the
     # phase. The reader has the page evidence and the user's request, which
     # is what deciding this actually takes.
     warnings.extend(

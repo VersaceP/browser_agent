@@ -214,7 +214,7 @@ async def run_browser_agent(self, task: str) -> str:
                 )
                 text, tool_calls, stop_reason, usage = model_result.legacy_fields()
             except LLMEmptyResponseError as exc:
-                # Mirror the lead: a degenerate response that survived the
+                # A degenerate response that survived the
                 # provider's own retries surfaces as an empty turn for the
                 # streak guard below — crashing the worker here would burn
                 # the whole phase attempt on a gateway hiccup.
@@ -489,9 +489,7 @@ async def run_browser_agent(self, task: str) -> str:
                             # request never reached the model, and coaching
                             # it about an "empty response" it never made
                             # would be a lie it then has to reason around.
-                            # Unlike the lead — whose retry loop sits
-                            # inside a step and so must force compaction —
-                            # this continue re-enters the step loop, where
+                            # This continue re-enters the step loop, where
                             # the normal size check compacts if the context
                             # really is what upstream choked on.
                             continue
@@ -1059,7 +1057,7 @@ async def run_browser_agent(self, task: str) -> str:
             exception_payload(exc, last_step=step, artifacts=self.artifacts),
         )
         if _is_context_limit_exception(exc):
-            # Promote to a hard worker status so LeadAgent can react
+            # Promote to a hard worker status so task owner can react
             # (otherwise spawner wraps as generic "failed").
             final_status, override_reason = classify_terminal_status(
                 diagnostics=self.diagnostics,

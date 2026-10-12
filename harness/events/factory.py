@@ -8,7 +8,7 @@ process, and cancellation - which is how the harness actually stops a worker -
 runs finalisers like any other exception.
 
 Sequence numbers come from a run-scoped allocator shared by every actor, so
-lead and workers interleave into one totally ordered stream. Scope stacks do
+task owners and workers interleave into one totally ordered stream. Scope stacks do
 NOT: each agent gets its own factory, which is why two workers can never
 appear inside one another's turn.
 """

@@ -164,9 +164,9 @@ class TraceProjectionSink:
             return False
         if self._worker_id is not None:
             return context.worker_id == self._worker_id
-        # A lead shares its agent_id with the workers it spawned, so matching
-        # on agent_id alone would pull every worker's turn into the lead's
-        # trace. Only an event with no worker at all belongs to the lead.
+        # A task owner shares its agent_id with the workers it spawned, so matching
+        # on agent_id alone would pull every worker's turn into the task owner's
+        # trace. Only an event with no worker at all belongs to the task owner.
         if context.worker_id is not None:
             return False
         if self._agent_id is not None:

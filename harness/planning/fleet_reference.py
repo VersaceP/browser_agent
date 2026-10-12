@@ -26,6 +26,11 @@ def extract_fleet_reference(task: str) -> Tuple[Optional[str], Optional[str]]:
     if len(unique) > 1:
         return None, "任务里出现了多个不同的 Fleet 引用，无法判断该用哪一个。"
     for match in _FLEET_SIGIL_RE.finditer(text):
+        # Workflow advice can cite a generated Harness task (32 hex chars)
+        # alongside an explicit Fleet UUID/prefix. It is not a second Fleet.
+        # Without a valid Fleet reference, preserve the existing syntax error.
+        if unique and re.fullmatch(r"@[0-9a-f]{32}", match.group(0), re.IGNORECASE):
+            continue
         if not _FLEET_REF_RE.fullmatch(match.group(0)):
             return None, (
                 f"{match.group(0)} 不是合法的 Fleet id（要 8 位十六进制前缀或完整"

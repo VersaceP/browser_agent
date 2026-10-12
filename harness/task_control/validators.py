@@ -55,7 +55,7 @@ def run_row_validator(validator: JsonDict, rows: List[JsonDict]) -> List[JsonDic
 def _invalid_value_summary(value: Any) -> JsonDict:
     """Return bounded structural context for a malformed validator value.
 
-    Validation receipts are surfaced to the Lead and persisted in task state.
+    Validation receipts are surfaced to the task owner and persisted in task state.
     They must explain the wrong *shape* without echoing a large extraction
     field (or potentially sensitive text) back into either channel.
     """

@@ -18,9 +18,7 @@ try:
 except ImportError:
     pass
 
-from harness.agents.lead.agent import LeadAgent
 from harness.runtime.resume_context import ResumeContext
-from harness.runtime.model_config import lead_agent_model_config
 from harness.runtime.model_support import llm_rate_limit_terminal_result
 from harness.utils import exception_payload
 from harness.agents.browser.task import (
@@ -82,11 +80,9 @@ CLI_CANCELLED_EXIT_CODE = 130
 
 _INTERACTIVE_AGENT_MODES = {
     "/browser": "browser",
-    "/lead": "lead",
 }
 _AGENT_MODE_LABELS = {
     "browser": "直达单个 BrowserAgent",
-    "lead": "计划、并发与汇总",
 }
 
 
@@ -317,18 +313,7 @@ class ConsoleProgressReporter:
                     f"{self._short_text(payload.get('reason'), 240)}")
         if event_type == "browser.task_review.skipped":
             return f"[BrowserReview] 未启动：{payload.get('reason')}"
-        if event_type == "assignment_review.start":
-            return f"[PlanValidator] 开始{'协议修正' if payload.get('repair') else '复核'} {payload.get('assignmentId')}"
-        if event_type == "assignment_review.call":
-            return f"[PlanValidator] 模型调用结束，耗时 {payload.get('durationMs')}ms"
-        if event_type == "assignment_review.result":
-            return (f"[PlanValidator] {payload.get('status')}，记录：{payload.get('auditPath')}"
-                    f" {self._short_text(payload.get('errors') or '', 240)}").rstrip()
-        if event_type in {"assignment_review.cache_hit", "assignment_review.service_unavailable"}:
-            return f"[PlanValidator] {event_type.rsplit('.', 1)[-1]}: {payload.get('assignmentId') or payload.get('candidateHash')}"
-        if event_type == "llm.usage" and payload.get("source") in {
-            "browser_task_reviewer", "plan_validator", "plan_validator_repair",
-        }:
+        if event_type == "llm.usage" and payload.get("source") == "browser_task_reviewer":
             return (f"[LLM {payload.get('source')}] cache_read={payload.get('cache_read', 0)} "
                     f"cache_creation={payload.get('cache_creation', 0)} "
                     f"uncached_input={payload.get('uncached_input', 0)} output={payload.get('output', 0)}")
@@ -352,14 +337,12 @@ class ConsoleProgressReporter:
                     f"checkpoint={payload.get('checkpointRef') or '-'}{fallback}"
                 )
             return f"[Compaction] {status}: {self._short_text(payload.get('error'), 160)}"
-        if event_type == "lead.step.start":
-            return f"[LeadAgent] 第 {payload.get('step')} 步：请求模型..."
         if event_type == "agent.step.start":
             return (
                 f"[{self._browser_actor_label(payload)}] "
                 f"第 {payload.get('step')} 步：请求模型..."
             )
-        if event_type in {"lead.model", "agent.model"}:
+        if event_type in {"agent.model"}:
             return self._format_model_event(event_type, payload)
         if event_type == "agent.truncated_response" and payload.get("kind") == "truncated":
             streak = payload.get("streak")
@@ -370,8 +353,6 @@ class ConsoleProgressReporter:
                 f"[{self._browser_actor_label(payload)}] 连续异常 {streak}/{limit}（本次：输出截断）；"
                 f"{action}"
             )
-        if event_type == "lead.tool.result":
-            return self._format_lead_tool_result(payload)
         if event_type == "tool_result.offloaded":
             return self._format_offloaded_tool_result(payload)
         if event_type == "spawner.browser.spawn":
@@ -413,11 +394,6 @@ class ConsoleProgressReporter:
             return (
                 f"[Progress] 观察 {payload.get('tool') or '?'}: "
                 f"{payload.get('reasonObserved') or 'no progress'}"
-            )
-        if event_type == "lead.step_cap.reminder":
-            return (
-                f"[LeadAgent] 接近步数上限: step={payload.get('step')} "
-                f"remaining={payload.get('remaining')}"
             )
         if event_type == "agent.step_cap.reminder":
             return (
@@ -483,7 +459,7 @@ class ConsoleProgressReporter:
             if payload.get("error"):
                 return f"[{actor}] 浏览器响应: error ({self._format_error(payload)})"
             return f"[{actor}] 浏览器响应: ok"
-        if event_type in {"lead.model_timeout", "agent.model_timeout"}:
+        if event_type in {"agent.model_timeout"}:
             attempts = len(
                 payload.get("attempts") or payload.get("timeoutAttempts") or []
             )
@@ -498,7 +474,7 @@ class ConsoleProgressReporter:
                 f"[LLM] 模型服务无响应（连续 {seconds}s 未收到新数据，触发空闲超时），"
                 f"连初次请求共尝试 {attempts} 次仍失败；{tail}"
             )
-        if event_type in {"lead.model_connection_error", "agent.model_connection_error"}:
+        if event_type in {"agent.model_connection_error"}:
             # The provider already retried silently; by the time this fires the
             # connection is repeatedly dropping, which the user should see
             # rather than discover as a traceback.
@@ -513,10 +489,10 @@ class ConsoleProgressReporter:
                 f"[LLM] 与模型服务的连接中断（{payload.get('reason') or 'connection error'}），"
                 f"连初次请求共尝试 {attempts} 次仍失败；{tail}"
             )
-        if event_type in {"run.error", "lead.error", "agent.error"}:
+        if event_type in {"run.error", "agent.error"}:
             error = payload.get("error") or payload.get("errorType") or "unknown error"
             return f"[错误] {error}"
-        if event_type in {"lead.final", "agent.final"}:
+        if event_type in {"agent.final"}:
             return "[完成] Agent 已生成最终结果。"
         return None
 
@@ -525,11 +501,7 @@ class ConsoleProgressReporter:
         event_type: str,
         payload: Dict[str, Any],
     ) -> str:
-        role = (
-            "LeadAgent"
-            if event_type == "lead.model"
-            else self._browser_actor_label(payload)
-        )
+        role = self._browser_actor_label(payload)
         tool_calls = payload.get("tool_calls") or []
         tool_summaries = [
             self._format_tool_call(item)
@@ -618,28 +590,6 @@ class ConsoleProgressReporter:
             return (
                 f"{name} (glob={self._short_path(raw_input.get('glob') or '**/*')}; "
                 f"pattern={self._short_text(raw_input.get('pattern'), 70) or '-'})"
-            )
-        if name == "spawn_browser_agent":
-            details = [
-                f"name={raw_input.get('name') or 'unnamed'}",
-                f"phase={raw_input.get('phase_id') or '-'}",
-            ]
-            if raw_input.get("max_steps") is not None:
-                details.append(f"max_steps={raw_input.get('max_steps')}")
-            if raw_input.get("reuse_from_worker_id"):
-                details.append(f"reuse={raw_input.get('reuse_from_worker_id')}")
-            return f"{name} ({'; '.join(details)})"
-        if name == "wait_browser_agents":
-            worker_ids = raw_input.get("worker_ids")
-            if isinstance(worker_ids, list):
-                workers = ",".join(str(item) for item in worker_ids[:4])
-                if len(worker_ids) > 4:
-                    workers += f",+{len(worker_ids) - 4}"
-            else:
-                workers = "all"
-            return (
-                f"{name} (workers={workers}; mode={raw_input.get('mode') or 'all'}; "
-                f"timeout={raw_input.get('timeout_seconds') or '-'})"
             )
         if name == "record_extraction":
             rows = raw_input.get("rows")
@@ -764,51 +714,6 @@ class ConsoleProgressReporter:
         suffix = f", warnings={warning_count}" if warning_count else ""
         return f"[Artifact] {name} 写入 {row_count if row_count is not None else '?'} 行: {path}{suffix}"
 
-    def _format_lead_tool_result(self, payload: Dict[str, Any]) -> str:
-        tool = payload.get("tool") or "unknown"
-        parts = []
-        for key in ("status", "count", "truncated"):
-            if key in payload:
-                parts.append(f"{key}={payload.get(key)}")
-        if payload.get("expr"):
-            parts.append(f"expr={self._short_text(payload.get('expr'), 70)}")
-        path = payload.get("relativePath") or payload.get("savedPath") or payload.get("path")
-        if path:
-            parts.append(f"file={self._short_path(path)}")
-        if payload.get("completedCount") is not None:
-            parts.append(f"completed={payload.get('completedCount')}")
-        if payload.get("pendingCount") is not None:
-            parts.append(f"pending={payload.get('pendingCount')}")
-        worker_statuses = payload.get("workerStatuses")
-        if isinstance(worker_statuses, list) and worker_statuses:
-            rendered = []
-            for item in worker_statuses[:4]:
-                if not isinstance(item, dict):
-                    continue
-                rendered.append(
-                    f"{item.get('workerId') or '?'}:{item.get('status') or '?'}"
-                    f"/{item.get('validatedStatus') or '-'}"
-                )
-            if len(worker_statuses) > 4:
-                rendered.append(f"+{len(worker_statuses) - 4}")
-            if rendered:
-                parts.append("workers=" + ",".join(rendered))
-        if payload.get("error"):
-            parts.append(f"error={self._short_text(payload.get('error'), 120)}")
-        issues = payload.get("issues")
-        if isinstance(issues, list):
-            issues = [item for item in issues if isinstance(item, dict)]
-            rendered = [
-                f"{self._short_text(item.get('path') or 'input', 140)}: "
-                f"{self._short_text(item.get('message') or item.get('keyword'), 120)}"
-                for item in issues[:3]
-            ]
-            remaining = int(payload.get("issueCount") or len(issues)) - len(rendered)
-            if remaining > 0:
-                rendered.append(f"另有 {remaining} 项（见日志 issues）")
-            if rendered:
-                parts.append("issues=" + "; ".join(rendered))
-        return f"[LeadAgent] 工具结果 {tool}: {', '.join(parts) if parts else 'ok'}"
 
     def _format_offloaded_tool_result(self, payload: Dict[str, Any]) -> str:
         tool = payload.get("tool") or "tool"
@@ -989,11 +894,11 @@ def _handle_agent_mode_command(line: str, args: argparse.Namespace) -> bool:
         tokens = shlex.split(line)
     except ValueError as exc:
         print(f"模式命令参数错误: {exc}")
-        return line.lstrip().startswith(("/browser", "/lead"))
+        return line.lstrip().startswith(("/browser"))
     if not tokens or tokens[0].lower() not in _INTERACTIVE_AGENT_MODES:
         return False
     if len(tokens) != 1:
-        print("用法: /browser 或 /lead；模式命令不能携带任务文本。")
+        print("用法: /browser；模式命令不能携带任务文本。")
         return True
     agent_mode = _INTERACTIVE_AGENT_MODES[tokens[0].lower()]
     args.agent_mode = agent_mode
@@ -1014,15 +919,14 @@ def read_task(args: argparse.Namespace) -> str:
     if not sys.stdin.isatty():
         return sys.stdin.read().strip()
     configured_mode = str(
-        getattr(args, "configured_agent_mode", "lead") or "lead"
+        getattr(args, "configured_agent_mode", "browser") or "browser"
     ).strip().lower()
     selected_mode = str(getattr(args, "agent_mode", "") or "").strip().lower()
     if selected_mode not in _AGENT_MODE_LABELS:
         selected_mode = ""
     if not selected_mode:
         print(
-            "请选择编排模式：/browser（直达单个 BrowserAgent）或 "
-            "/lead（计划、并发与汇总）。"
+            "请选择模式：/browser（直达单个 BrowserAgent）。"
         )
         print(f"当前配置默认：{configured_mode}；请选择后再输入任务。")
     while True:
@@ -1042,7 +946,7 @@ def read_task(args: argparse.Namespace) -> str:
             selected_mode = str(getattr(args, "agent_mode", "") or "").strip().lower()
             continue
         if not selected_mode:
-            print("请先输入 /browser 或 /lead 选择本次编排模式。")
+            print("请先输入 /browser 选择本次编排模式。")
             continue
         if line.startswith("/skill"):
             inline_task = _handle_skill_command(line, args)
@@ -1055,113 +959,6 @@ def read_task(args: argparse.Namespace) -> str:
                 return resumed
             continue
         return line
-
-
-def _print_task_plan_review(plan: Dict[str, Any], candidate_hash: str) -> None:
-    from harness.planning.context import approval_view
-    view = approval_view(plan)
-    print("\n[Assignment] 委派等待确认", flush=True)
-    print(f"候选版本: {candidate_hash[:12]}", flush=True)
-    print(json.dumps(view, ensure_ascii=False, indent=2), flush=True)
-    print("确认/确定执行；修改意见交给 Lead；详情查看完整记录；取消停止。", flush=True)
-
-
-async def _terminal_plan_approval(
-    plan: Dict[str, Any], candidate_hash: str,
-    *, runtime: Optional[RuntimeConfig] = None, logger: Any = None,
-) -> Dict[str, Any]:
-    _print_task_plan_review(plan, candidate_hash)
-    input_records: List[Dict[str, Any]] = []
-
-    def record_input(answer: str, decision: str, error: str = "") -> Dict[str, Any]:
-        record = {
-            "inputId": uuid.uuid4().hex,
-            "candidateHash": candidate_hash,
-            "text": answer,
-            "decision": decision,
-            "error": error,
-            "receivedAt": datetime.now(timezone.utc).isoformat(),
-        }
-        input_records.append(record)
-        if logger is not None:
-            logger.write("task_plan.approval_input_received", record)
-        return record
-
-    def unresolved_feedback() -> str:
-        return "\n".join(
-            item["text"] for item in input_records
-            if item["decision"] in {"clarify", "revision"}
-        )
-
-    def unresolved_records() -> List[Dict[str, Any]]:
-        return [item for item in input_records
-                if item["decision"] in {"clarify", "revision"}]
-
-    def has_unclassified_feedback() -> bool:
-        return any(item.get("error") or item.get("errorCode")
-                   for item in unresolved_records())
-
-    while True:
-        answer = (await asyncio.to_thread(input, "计划审阅> ")).strip()
-        normalized = answer.lower()
-        # ``确定`` is the normal affirmative answer in the terminal UI.  It
-        # must have exactly the same meaning as ``确认``; treating it as free
-        # form feedback makes a user-approved candidate go back through the
-        # Lead and be submitted a second time.
-        if normalized in {"确认", "确定", "同意", "执行", "y", "yes"}:
-            record_input(answer, "approved")
-            feedback = unresolved_feedback()
-            if feedback and has_unclassified_feedback():
-                # An unclassified response may change the candidate. A
-                # classifier error cannot authorize discarding that input.
-                return {"decision": "revision", "feedback": feedback,
-                        "inputRecords": input_records}
-            return ({"decision": "approved", "inputRecords": input_records}
-                    if feedback else {"decision": "approved"})
-        if normalized in {"取消", "停止", "n", "no", "cancel"}:
-            record_input(answer, "cancelled")
-            return {"decision": "cancelled"}
-        if normalized in {"详情", "detail", "details", "json"}:
-            record_input(answer, "details")
-            print(json.dumps(plan, ensure_ascii=False, indent=2), flush=True)
-            continue
-        if answer:
-            prior_unresolved = bool(unresolved_records())
-            record = record_input(answer, "received")
-            if runtime is None:
-                record["decision"] = "clarify"
-                record["error"] = "classifier_unavailable"
-                if logger is not None:
-                    logger.write("task_plan.approval_input_classified", record)
-                print("无法进行语义确认，请输入明确的确认、取消或详情命令。", flush=True)
-                continue
-            from harness.planning.approval_intent import classify_approval_intent
-            outcome = await classify_approval_intent(
-                answer, plan, candidate_hash, runtime, logger, prior_inputs=input_records[:-1],
-            )
-            record["decision"] = str(outcome.get("decision") or "clarify")
-            record["error"] = str(outcome.get("error") or "")
-            record["errorCode"] = str(outcome.get("errorCode") or "")
-            if logger is not None:
-                logger.write("task_plan.approval_input_classified", record)
-            if outcome["decision"] == "details":
-                print(json.dumps(plan, ensure_ascii=False, indent=2), flush=True)
-                continue
-            if outcome["decision"] == "clarify":
-                return {"decision": "revision", "feedback": unresolved_feedback(),
-                        "inputRecords": input_records}
-            if outcome["decision"] == "revision":
-                outcome["feedback"] = unresolved_feedback()
-                outcome["inputRecords"] = input_records
-            elif (outcome["decision"] == "approved" and unresolved_feedback()
-                  and has_unclassified_feedback()):
-                return {"decision": "revision",
-                        "feedback": unresolved_feedback(),
-                        "inputRecords": input_records}
-            elif outcome["decision"] == "approved" and prior_unresolved:
-                outcome["inputRecords"] = input_records
-            return outcome
-        print("空输入不会确认计划。请输入“确认”、修改意见、“详情”或“取消”。", flush=True)
 
 
 def _handle_resume_command(
@@ -1189,8 +986,25 @@ def _validate_resume_mode(manifest: Optional[JsonDict], plan: JsonDict, selected
     startup = (manifest or {}).get("startup_args") or {}
     recorded = startup.get("agent_mode") if isinstance(startup, dict) else None
     original = str(recorded or "").strip().lower()
-    if original not in {"browser", "lead"}:
-        original = "browser" if plan.get("execution_mode") == "direct_worker" else "lead"
+    execution_mode = str(plan.get("execution_mode") or "").strip()
+    if original and original not in _AGENT_MODE_LABELS:
+        raise ResumeStateError(
+            f"Saved task mode '{original}' is no longer supported; this task cannot be resumed. "
+            "Its saved records remain available. Start a new task in a supported mode."
+        )
+    if execution_mode and execution_mode not in {"direct_worker", "delegated"}:
+        raise ResumeStateError(
+            f"Saved plan execution mode '{execution_mode}' is no longer supported; "
+            "this task cannot be resumed. Its saved records remain available."
+        )
+    if not original:
+        if plan.get("execution_mode") == "direct_worker":
+            original = "browser"
+        else:
+            raise ResumeStateError(
+                "This legacy task has no recorded execution mode; it cannot be "
+                "safely identified as a Browser task. Its saved records remain available."
+            )
     if selected != original:
         raise ResumeStateError(
             f"该任务使用 /{original} 模式；请切换到 /{original} 后恢复，不能在 /{selected} 中恢复。"
@@ -1411,7 +1225,7 @@ def _close_task_storage(
 
 
 def _artifact_row_count(path: Path) -> Optional[int]:
-    """Small, bounded summary for the Lead resume bootstrap."""
+    """Small, bounded summary for the Browser resume bootstrap."""
 
     try:
         suffix = path.suffix.lower()
@@ -1675,7 +1489,7 @@ def _resume_projection(
     """Build a read-only recovery map from durable state and artifacts.
 
     It intentionally does not change phase status, copy filled values into
-    task state, or convert partial work into completion.  The Lead gets stable
+    task state, or convert partial work into completion.  The runtime gets stable
     control identities and artifact pointers; a continuation must re-perceive
     the live page and re-read any value it needs from the cited artifact.
     """
@@ -1835,7 +1649,7 @@ def _operator_input_receipts(
     """Project durable human text into resume context without inferring consent.
 
     The full ordered record remains in the run log. The bounded prompt copy
-    lets Lead see recent answers, their request identity and classification;
+    lets the runtime see recent answers, their request identity and classification;
     older inputs remain available at the source path for a concrete question.
     """
     result: Dict[str, Any] = {
@@ -2128,9 +1942,9 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
     _CANCELLED_LOGGED = False
     _LAST_LOGGER = None
     runtime = load_runtime_config(args.config)
-    configured_mode = str(getattr(runtime.harness, "agent_mode", "lead") or "lead").strip().lower()
+    configured_mode = str(getattr(runtime.harness, "agent_mode", "browser") or "browser").strip().lower()
     if configured_mode not in _AGENT_MODE_LABELS:
-        print("config.json 中 harness.agent_mode 必须是 lead 或 browser。")
+        print("config.json 中 harness.agent_mode 必须是 browser。")
         return CLI_INPUT_ERROR_EXIT_CODE
     args.configured_agent_mode = configured_mode
     # Resume helpers run before a logger exists; hand them the configuration
@@ -2149,10 +1963,10 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
     requested_mode = str(getattr(args, "agent_mode", "") or "").strip().lower()
     if requested_mode:
         if requested_mode not in _AGENT_MODE_LABELS:
-            print("交互模式必须是 /lead 或 /browser。")
+            print("交互模式必须是 /browser。")
             return CLI_INPUT_ERROR_EXIT_CODE
         runtime.harness.agent_mode = requested_mode
-    agent_mode = str(getattr(runtime.harness, "agent_mode", "lead") or "lead").strip().lower()
+    agent_mode = str(getattr(runtime.harness, "agent_mode", "browser") or "browser").strip().lower()
     resume_requested = bool(str(getattr(args, "resume", "") or "").strip())
     if not task and not resume_requested:
         print("没有收到任务。")
@@ -2172,8 +1986,15 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
         runtime.harness.forced_skill_hash = forced_hash
         print(f"已选 Skill: {forced_skill}@{forced_hash[:12]}", flush=True)
 
+    if resume_requested:
+        resume_manifest = load_task_manifest(_resolve_resume_directory(args.resume))
+        recorded_mode = str(((resume_manifest or {}).get("startup_args") or {}).get("agent_mode") or "").strip().lower()
+        if recorded_mode and recorded_mode not in _AGENT_MODE_LABELS:
+            print(f"Saved task mode '{recorded_mode}' is no longer supported; this task cannot be resumed. Its saved records remain available.")
+            return CLI_INPUT_ERROR_EXIT_CODE
+
     logger: Optional[RunLogger] = None
-    harness: Optional[LeadAgent] = None
+    harness: Optional[BrowserTaskRunner] = None
     run_lock: Optional[RunLock] = None
     resume_context: Optional[ResumeContext] = None
     task_for_agent = task
@@ -2561,149 +2382,80 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
         if resume_context is not None:
             label = "带补充指令继续" if resume_context.instruction else "按原计划恢复"
             print(f"{label}：先检查浏览器连接；连接不可用时停止，不调用模型或派发 worker。", flush=True)
-        elif agent_mode == "browser":
-            print("Browser 模式：直接启动 BrowserAgent，执行中维护任务清单。", flush=True)
-        elif sys.stdin.isatty():
-            print("开始生成执行计划；确认前不会启动 BrowserAgent。", flush=True)
-        else:
-            print("开始执行，关键进度会在这里显示。", flush=True)
+        print("Browser 模式：直接启动 BrowserAgent，执行中维护任务清单。", flush=True)
 
-        if agent_mode == "browser":
-            harness = BrowserTaskRunner(
-                runtime, logger, resume=resume_context,
-                task_fleet_reference=task_fleet_reference or "",
-            )
+        harness = BrowserTaskRunner(
+            runtime, logger, resume=resume_context,
+            task_fleet_reference=task_fleet_reference or "",
+        )
+        browser_result = await _run_browser_mode(
+            harness,
+            task=task_for_agent,
+            original_task=task,
+            resume_context=resume_context,
+        )
+        # Browser receipts still use savedPath for extraction evidence.
+        # In DB mode those paths are virtual during execution; export only
+        # the final receipt's extraction artifacts so a user can open the
+        # paths it presents without mirroring task logs to the worktree.
+        from harness.evidence.extraction_artifacts import (
+            export_extraction_artifacts_for_delivery,
+        )
+        try:
+            delivered = export_extraction_artifacts_for_delivery(
+                logger, browser_result.get("artifacts") or [])
+        except Exception as exc:
+            detail = f"{type(exc).__name__}: {exc}"
+            browser_result["artifactDelivery"] = {
+                "status": "failed", "error": detail,
+            }
+            logger.write("artifact.delivery_failed", {"error": detail})
         else:
-            harness = LeadAgent(
-                LLMFactory.create_provider(lead_agent_model_config(runtime)),
-                runtime, logger, resume=resume_context,
-                task_fleet_reference=task_fleet_reference or "",
-                plan_approval_handler=(
-                    (lambda plan, candidate_hash: _terminal_plan_approval(
-                        plan, candidate_hash, runtime=runtime, logger=logger
-                    )) if sys.stdin.isatty() else None
-                ),
-            )
-        if agent_mode == "browser":
-            browser_result = await _run_browser_mode(
-                harness,
-                task=task_for_agent,
-                original_task=task,
-                resume_context=resume_context,
-            )
-            # Browser receipts still use savedPath for extraction evidence.
-            # In DB mode those paths are virtual during execution; export only
-            # the final receipt's extraction artifacts so a user can open the
-            # paths it presents without mirroring task logs to the worktree.
-            from harness.evidence.extraction_artifacts import (
-                export_extraction_artifacts_for_delivery,
-            )
-            try:
-                delivered = export_extraction_artifacts_for_delivery(
-                    logger, browser_result.get("artifacts") or [])
-            except Exception as exc:
-                detail = f"{type(exc).__name__}: {exc}"
+            if delivered:
                 browser_result["artifactDelivery"] = {
-                    "status": "failed", "error": detail,
+                    "status": "done", "paths": delivered,
                 }
-                logger.write("artifact.delivery_failed", {"error": detail})
-            else:
-                if delivered:
-                    browser_result["artifactDelivery"] = {
-                        "status": "done", "paths": delivered,
-                    }
-                    logger.write("artifact.delivery_exported", {
-                        "count": len(delivered), "paths": delivered,
-                    })
-            result_resource = logger.storage.save_resource(
-                task_id=logger.task_id, run_id=str(logger.run_id or ""),
-                resource_type="browser_task_result", logical_path="artifacts/browser-result.json",
-                media_type="application/json", content=json.dumps(browser_result, ensure_ascii=False, default=str),
+                logger.write("artifact.delivery_exported", {
+                    "count": len(delivered), "paths": delivered,
+                })
+        result_resource = logger.storage.save_resource(
+            task_id=logger.task_id, run_id=str(logger.run_id or ""),
+            resource_type="browser_task_result", logical_path="artifacts/browser-result.json",
+            media_type="application/json", content=json.dumps(browser_result, ensure_ascii=False, default=str),
+        )
+        output_mode = getattr(args, "output", "auto")
+        human_output = output_mode == "text" or output_mode == "auto" and sys.stdout.isatty()
+        if human_output or output_mode == "auto":
+            _print_browser_mode_summary(
+                {**browser_result, "receiptPath": result_resource.get("saved_path") or
+                    f"数据库任务 {logger.task_id} / artifacts/browser-result.json"},
+                str(logger.task_dir or ""),
+                logger=logger,
             )
-            output_mode = getattr(args, "output", "auto")
-            human_output = output_mode == "text" or output_mode == "auto" and sys.stdout.isatty()
-            if human_output or output_mode == "auto":
-                _print_browser_mode_summary(
-                    {**browser_result, "receiptPath": result_resource.get("saved_path") or
-                        f"数据库任务 {logger.task_id} / artifacts/browser-result.json"},
-                    str(logger.task_dir or ""),
-                    logger=logger,
-                )
-            if human_output:
-                answer = ""
-            else:
-                answer = json.dumps(browser_result, ensure_ascii=False, default=str)
-            result_status = str(browser_result.get("status") or "failed").lower()
-            run_error = _browser_mode_terminal_error(browser_result)
-            run_status = (
-                "completed"
-                if result_status in {"done", "completed", "validated_done"}
-                else "cancelled" if result_status == "cancelled"
-                else "failed"
-            )
-            if run_status == "cancelled":
-                exit_code = CLI_CANCELLED_EXIT_CODE
-            elif run_status != "completed":
-                exit_code = CLI_ERROR_EXIT_CODE
-            logger.write("direct_mode.final", {
-                "status": result_status,
-                "workerId": browser_result.get("workerId"),
-                "phaseId": browser_result.get("phaseId"),
-                "directExecution": browser_result.get("directExecution"),
-                "validatedStatus": browser_result.get("validatedStatus"),
-                "error": run_error,
-            })
+        if human_output:
+            answer = ""
         else:
-            answer = await harness.run(task_for_agent)
-        terminal_error = getattr(harness, "terminal_error", None)
-        if agent_mode == "browser":
-            # The browser entry owns the worker receipt and status;
-            # LeadAgent.final_status is intentionally untouched because no
-            # LeadAgent.run() turn was made.
-            pass
-        elif isinstance(terminal_error, dict):
-            run_error = terminal_error
-            run_status = "failed"
-            exit_code = LLM_TEMPORARY_FAILURE_EXIT_CODE
-            _safe_logger_write(logger, "run.rate_limited", terminal_error)
-        else:
-            lead_status = str(
-                getattr(harness, "final_status", "") or ""
-            ).strip().lower()
-            if lead_status and lead_status not in {"done", "completed"}:
-                run_status = "failed"
-                exit_code = CLI_ERROR_EXIT_CODE
-                lead_trigger = str(
-                    getattr(harness, "final_trigger", "") or "unknown"
-                )
-                failure = _cli_failure_result(
-                    code="task_not_completed",
-                    message=(
-                        f"LeadAgent ended with status={lead_status} "
-                        f"(trigger={lead_trigger})."
-                    ),
-                    error_type="LeadTerminalOutcome",
-                    retryable=lead_status in {"blocked", "incomplete"},
-                    status=(
-                        lead_status
-                        if lead_status in {"blocked", "failed", "incomplete"}
-                        else "failed"
-                    ),
-                    details={"trigger": lead_trigger},
-                )
-                failure["answer"] = answer
-                run_error = failure["error"]
-                answer = json.dumps(failure, ensure_ascii=False)
-                _safe_logger_write(
-                    logger,
-                    "run.incomplete",
-                    {
-                        "status": lead_status,
-                        "trigger": lead_trigger,
-                    },
-                )
-            else:
-                run_status = "completed"
+            answer = json.dumps(browser_result, ensure_ascii=False, default=str)
+        result_status = str(browser_result.get("status") or "failed").lower()
+        run_error = _browser_mode_terminal_error(browser_result)
+        run_status = (
+            "completed"
+            if result_status in {"done", "completed", "validated_done"}
+            else "cancelled" if result_status == "cancelled"
+            else "failed"
+        )
+        if run_status == "cancelled":
+            exit_code = CLI_CANCELLED_EXIT_CODE
+        elif run_status != "completed":
+            exit_code = CLI_ERROR_EXIT_CODE
+        logger.write("direct_mode.final", {
+            "status": result_status,
+            "workerId": browser_result.get("workerId"),
+            "phaseId": browser_result.get("phaseId"),
+            "directExecution": browser_result.get("directExecution"),
+            "validatedStatus": browser_result.get("validatedStatus"),
+            "error": run_error,
+        })
     except asyncio.CancelledError as exc:
         run_status = "cancelled"
         exit_code = CLI_CANCELLED_EXIT_CODE
@@ -2737,8 +2489,7 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
             },
         )
     finally:
-        # LeadAgent.run owns its spawner cleanup. Browser mode skips that method,
-        # so the CLI must explicitly join workers before closing the audit store.
+        # Join all workers before closing the audit store.
         if agent_mode == "browser" and harness is not None:
             try:
                 cancelled = await _shutdown_browser_mode(harness)
@@ -2831,7 +2582,7 @@ async def run_cli(args: argparse.Namespace) -> int:
             _LAST_LOGGER,
             "run.startup_failed",
             {
-                **exception_payload(exc, mode="lead"),
+                **exception_payload(exc, mode=str(getattr(args, "agent_mode", "") or "browser")),
                 "terminal": failure.get("error"),
             },
         )
@@ -2932,7 +2683,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _LAST_LOGGER,
             "run.fatal",
             {
-                **exception_payload(exc, mode="lead"),
+                **exception_payload(exc, mode="cli"),
                 "terminal": failure.get("error"),
             },
         )

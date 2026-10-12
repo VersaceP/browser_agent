@@ -1,7 +1,7 @@
 ---
 id: browser.page-lifecycle
 audience: browser
-version: "2026-09-15"
+version: "2026-10-12"
 description: Reconcile navigation, page lifecycle, dialog, page inventory and stale-handle receipts before another browser action.
 sources:
   - abcp-platform/resources/skills/webcross-browser/SKILL.md
@@ -135,7 +135,7 @@ that the task and prior authorization do not resolve:
 
 Use the existing HITL mechanism; keep the affected branch paused until an explicit
 resolution arrives. Record a skip as user-directed, not successful extraction or
-confirmed_absent. New requirements must be handed to the Lead to update the plan
+confirmed_absent. New requirements must be handed to the task owner to update the plan
 and contract before resuming. Existing task authorization resolves choices already
 made by the user; do not ask again. Stale DOM, schema errors, page-state sync and
 bounded recoverable navigation failures are technical recovery, not user decisions.

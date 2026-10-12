@@ -28,7 +28,7 @@ def _pin_source(agent: Any) -> str:
             if str(raw.get("bindingScope") or "page") == "page"
             else "task_auth"
         )
-    return "lead_pinned" if raw else "unknown"
+    return "task_owner_pinned" if raw else "unknown"
 
 def _apply_fleet_binding(
     agent: Any,
@@ -81,7 +81,7 @@ def _apply_fleet_binding(
             "tool_was_executed": False,
             "next_instruction": (
                 "Use the pinned pageId from slot_context. If that page is no"
-                " longer usable, report pinned_page_unavailable to LeadAgent;"
+                " longer usable, report pinned_page_unavailable to task owner;"
                 " do not create a substitute page."
             ),
         }, receipt
@@ -702,7 +702,7 @@ async def _fleet_auth_barrier_before_call(
                 " claimable pages, or explicitly create an authorized page if needed."
                 " Existing ownership/permission checks still apply. Read Page.getState"
                 " and DOM.getAXTree on the same owned page. If no page is available,"
-                " report its owners and the unresolved recovery to Lead; do not repeat blocked business calls."
+                " report its owners and the unresolved recovery to task owner; do not repeat blocked business calls."
             ),
         }
     return None

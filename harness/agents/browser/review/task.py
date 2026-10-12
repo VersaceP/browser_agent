@@ -162,7 +162,7 @@ price/stock does not make requested source options/variants optional; file count
 do not prove image-to-variant correspondence. For unresolved material scope or
 authority, use needs_user with competing interpretations/evidence and a concise
 question. The executor can request HITL information; you cannot decide for the
-user, create a Lead handoff or treat timeout as consent. A paused page requires
+user, create a task owner handoff or treat timeout as consent. A paused page requires
 actual resume; hasPendingDialog=false is not resume evidence. Issues are unresolved
 work/uncertainty/authority; disclosures are verified nonblocking limitations and
 cannot replace required work.

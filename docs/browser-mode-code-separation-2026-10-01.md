@@ -1,5 +1,11 @@
 # Browser 模式拆分与 beb662 修复
 
+2026-10-12 更新：Lead 模式及项目根目录的 `agent_harness.py` 兼容壳已删除。
+当前 BrowserTaskRunner 与 SkillSession 仍共用 `harness.spawner.BrowserAgentSpawner`；
+BrowserAgent 直接导入 `harness.agents.browser.agent`，共享模型辅助直接导入
+`harness.runtime.model_support`。旧 Lead 查询入口和失效工具指引已清理，
+共享连接恢复、槽位、Fleet、租约、HITL 和存储能力保留。下文为 2026-10-01 的拆分记录。
+
 本轮按已确认的两批计划实施：先修复已核实的问题，再拆分模式代码。没有新增站点、字段或业务完成条件的机械门禁，没有更改任务预算或压缩阈值。
 
 ## 入口和依赖

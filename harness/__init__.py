@@ -5,7 +5,7 @@ harness - Focused building blocks for the ABCP agent harness.
 from harness.context.compaction import compact_messages_if_needed, validate_tool_pairing
 from runtime_config import HarnessConfig, RuntimeConfig, VLConfig
 from harness.tools.local_fs import local_fs_read, local_fs_search
-from harness.runtime.model_config import browser_agent_model_config, lead_agent_model_config
+from harness.runtime.model_config import browser_agent_model_config, skill_orchestrator_model_config
 from harness.context.offload import offload_large_response_fields, offload_large_tool_result
 from harness.observation.browser_call import (
     build_browser_call_runner,
@@ -32,7 +32,7 @@ __all__ = [
     "call_browser_redacted",
     "compact_messages_if_needed",
     "exception_payload",
-    "lead_agent_model_config",
+    "skill_orchestrator_model_config",
     "load_capability_bundle",
     "local_fs_read",
     "local_fs_search",

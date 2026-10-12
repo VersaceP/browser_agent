@@ -1035,7 +1035,7 @@ def _validate_execution_role_dependencies(
             # the role itself is legitimate, so a missing checkpoint used to
             # report four consequences at once: no row input, no
             # row_independent, no max_rows_per_phase, plus the checkpoint.  In
-            # task eb939033 that taught the Lead to repair the consequences and
+            # task eb939033 that taught the task owner to repair the consequences and
             # resend the same role, and the same four came back.  An ordinary
             # downstream batch has no checkpoint because it needs none: the way
             # out is to drop the role, not to satisfy its ladder.
@@ -1557,7 +1557,7 @@ def _compile_phase_plan_shorthand(
     repair_issues: Optional[List[JsonDict]] = None,
     warnings: Optional[List[JsonDict]] = None,
 ) -> JsonDict:
-    """Expand the concise Lead-facing plan syntax before normal validation."""
+    """Expand the concise task owner-facing plan syntax before normal validation."""
     phase = copy.deepcopy(raw_phase)
     task = str(phase.get("task") or "").strip()
     if task:
@@ -1722,7 +1722,7 @@ def validate_task_plan(
     the phase implicitly depends on all prior phases in plan order (strict
     serial, the conservative default); `depends_on=[]` ⇒ explicitly
     independent; `depends_on=[ids]` ⇒ exactly those. Phases whose dependencies
-    are all validated_done can be spawned concurrently by the Lead. A phase
+    are all validated_done can be spawned concurrently by the task owner. A phase
     whose dependency ended in a blocking terminal status is marked
     blocked_by_dependency instead of being spawned. `fanout_from` remains
     forward-compat only.
@@ -2269,9 +2269,9 @@ def validate_task_plan(
     # single-worker path after the same approval gate.  Ordinary plans omit it.
     execution_mode = str(raw_plan.get("execution_mode") or "").strip()
     if execution_mode:
-        if execution_mode not in {"direct_worker", "lead_orchestration", "delegated"}:
+        if execution_mode not in {"direct_worker", "delegated"}:
             errors.append(
-                "execution_mode must be direct_worker, lead_orchestration or delegated"
+                "execution_mode must be direct_worker or delegated"
             )
         else:
             normalized["execution_mode"] = execution_mode
@@ -2457,12 +2457,12 @@ def phase_contract(
             else phase.get("pacing")
         ),
     }
-    # Pass through skill-selection fields the LeadAgent set on the worker_contract.
+    # Pass through skill-selection fields the task owner set on the worker_contract.
     # phase_contract otherwise rebuilds a fixed-field payload, which silently
     # dropped these — so an explicit skill_id/skill_variables (select) or
     # skill_selection={"use_skill": false} (decline) never reached the dispatch
     # gate and spawn_browser_agent kept re-returning skill_selection_required
-    # (an unbreakable loop for the Lead). Preserve them verbatim when present.
+    # (an unbreakable loop for the task owner). Preserve them verbatim when present.
     for skill_key in (
         "skill_id", "skill_variables", "skill_rows", "batch_rows",
         # Must travel WITH batch_rows: the spawn gate rejects rows that arrive
@@ -2539,7 +2539,7 @@ def accept_task_plan(
                 user_approval=user_approval, source_plan=source_plan,
                 preserve_execution=True, _locked=True,
             )
-    from harness.planning.validator import build_plan_version_record
+    from harness.planning.ledger import build_plan_version_record
 
     record = build_plan_version_record(
         plan=plan,
@@ -2722,7 +2722,7 @@ def initialize_task_state(
             (preserve_from or {}).get("transport_recovery") or {}
         ),
         # Task-local Stage 6B-A evidence.  Candidates remain non-executable;
-        # preserving them across replans lets the Lead acknowledge the exact
+        # preserving them across replans lets the task owner acknowledge the exact
         # checkpoint instead of recreating guidance from prose.
         "batch_progress": dict(
             (preserve_from or {}).get("batch_progress") or {}

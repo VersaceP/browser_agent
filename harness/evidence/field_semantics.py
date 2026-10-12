@@ -11,9 +11,8 @@ was present, so no mechanical validator could see anything wrong. The evidence
 text itself said what it really was ("店铺评分"), and nobody compared it with
 the request.
 
-The plan-side rubric added to the PlanValidator catches a plan that DEFINES the
-field wrongly. It cannot catch this: the plan said "review score" and the worker
-retargeted at extraction time.
+A plan can define the field correctly while the worker retargets it at
+extraction time. The delivered evidence therefore needs its own review.
 
 Division of labour here follows the usual rule — the mechanical layer decides
 what is decidable (which fields carry evidence, which entries are duplicates,
@@ -183,7 +182,7 @@ def array_fields_without_semantic_evidence(
 
     This is a coverage fact, not a failure: an array length cannot establish
     whether its elements answer the user's request. Keeping it visible lets a
-    Lead disclose the limit without inventing a site-specific rule that every
+    task owner disclose the limit without inventing a site-specific rule that every
     array must have an evidence string.
     """
     artifacts = (index or {}).get("activeArtifacts") if isinstance(index, dict) else None

@@ -412,7 +412,7 @@ class SpawnerSlotsMixin:
 
         A caller may provide redundant selectors for a continuation, but they
         must resolve to the same current slot/fleet. Silent precedence would
-        make the lead believe an explicit handoff occurred when it did not.
+        make the task owner believe an explicit handoff occurred when it did not.
         """
 
         source_worker = str(reuse_from_worker_id or "").strip()
@@ -479,8 +479,8 @@ class SpawnerSlotsMixin:
                 },
                 "slots": [self._slot_summary(slot) for slot in self._slots.values()],
                 "next_instruction": (
-                    "Do not create another worker now. Call wait_browser_agents"
-                    " for one running worker to finish, then reuse an idle slot."
+                    "Do not create another worker now. The task runtime must collect"
+                    " a running worker's result before reusing its idle slot."
                 ),
             }
 
@@ -492,7 +492,7 @@ class SpawnerSlotsMixin:
                 # another worker start now?". An earlier revision sent only
                 # `max_slots - live_slots`, which is capacity NEVER CREATED: in
                 # the ordinary mid-run state of six live slots with five idle
-                # it reads zero and tells the Lead to wait while five slots sit
+                # it reads zero and tells the task owner to wait while five slots sit
                 # free. Reusing an idle slot and creating a new one are both
                 # routes to parallelism, and max_browser_agents caps both.
                 "idleSlots": sum(
@@ -732,9 +732,8 @@ class SpawnerSlotsMixin:
                     },
                     "slots": [self._slot_summary(item) for item in self._slots.values()],
                     "next_instruction": (
-                        "The slot pool is full. Call wait_browser_agents, then"
-                        " spawn the continuation with reuse_from_worker_id or"
-                        " preferred_slot_id for the related idle slot."
+                        "The slot pool is full. The task runtime must collect a running"
+                        " worker's result, then bind the continuation to the related idle slot."
                     ),
                 }
             slot = self._reserve_new_slot()
@@ -766,7 +765,7 @@ class SpawnerSlotsMixin:
                     "error": f"preferred_slot_id is not idle: {preferred}",
                     "slot": self._slot_summary(slot),
                     "next_instruction": (
-                        "Call wait_browser_agents for the slot's running worker,"
+                        "The task runtime must collect the slot's running worker,"
                         " then retry with the same preferred_slot_id."
                     ),
                 }
@@ -790,10 +789,10 @@ class SpawnerSlotsMixin:
             if slot.status != "idle":
                 # Two different situations wear this same error, and telling
                 # the caller to wait is right for only one of them. In task
-                # fae5a7b6 the Lead sent two spawns in one turn -- the correct
+                # fae5a7b6 the task owner sent two spawns in one turn -- the correct
                 # fan-out shape -- and the second was a SIBLING that merely
                 # carried reuse_from_worker_id out of habit. It was refused
-                # with "wait", the Lead obeyed, and the remaining six phases
+                # with "wait", the task owner obeyed, and the remaining six phases
                 # ran strictly one at a time through a single slot while five
                 # slots in the pool were never created at all.
                 facts = capacity if isinstance(capacity, dict) else {}
@@ -2614,7 +2613,7 @@ class SpawnerSlotsMixin:
     ) -> JsonDict:
         """Host/operator-only CAS reset for an unrecoverable named session.
 
-        This is intentionally not registered as a LeadAgent or BrowserAgent
+        This is intentionally not registered as a task owner or BrowserAgent
         tool. Transport failure alone never calls it automatically: an operator
         must explicitly accept losing the old cookie jar and provide the fleet
         and generation shown in ``session_manual_reset_required``.

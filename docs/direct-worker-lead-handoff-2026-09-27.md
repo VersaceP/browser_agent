@@ -1,5 +1,7 @@
 # Direct Worker 完成后的 Lead 交接修复
 
+> 历史记录（2026-10-12 归档标记）：Lead 模式及其规划工具已删除。下文保留原审计、实施或测量证据，描述的是当时的实现；当前 Browser／Skill／Workflow 入口见[现行请求流程](end-to-end-request-flow.md)。
+
 事故任务：`3be9419ec5e8496f96114b792eb63def`。
 
 ## 证据与原因

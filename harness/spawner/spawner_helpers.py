@@ -174,7 +174,7 @@ class BrowserAgentSlot:
 
 @dataclass(frozen=True)
 class PinnedBrowserContext:
-    """Trusted task-level routing target supplied outside the Lead plan."""
+    """Trusted task-level routing target supplied outside the task owner plan."""
 
     fleet_id: str
     page_id: str = ""
@@ -236,7 +236,7 @@ class TaskSessionBinding:
     # exact bound Fleet/Page can continue"), and one that omits it reaches the
     # coordinator as an unnamed request for a named fleet and is refused again
     # ("fleet ... is already bound to another session_key"). Task 69cab1c4 rode
-    # that loop for 38 Lead steps and ended blocked with the page still open.
+    # that loop for 38 task owner steps and ended blocked with the page still open.
     session_key: str = ""
     session_generation: int = 0
     source: str = "hitl_resume"

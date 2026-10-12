@@ -34,7 +34,7 @@ def _record_extraction_persist(
     agent: Any,
     tool_input: JsonDict,
 ) -> JsonDict:
-    """Persist a structured extraction artifact for LeadAgent consumption.
+    """Persist a structured extraction artifact for task owner consumption.
 
     Returns a stub describing the saved file.
 
@@ -469,7 +469,7 @@ def _merge_repair_patch_rows(
                     "next_instruction": (
                         "This is a deterministic contract conflict, not an"
                         " extraction retry. Do not submit the same empty patch"
-                        " again; report the blocker so LeadAgent can revise the"
+                        " again; report the blocker so task owner can revise the"
                         " contract or accept a partial result."
                     ),
                 }

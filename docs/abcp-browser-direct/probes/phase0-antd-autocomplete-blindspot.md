@@ -13,7 +13,7 @@
 > 取代它的是通用路径：`visual_verify` 的 `mode=visual_locate`（VL 定位 → 几何证明 →
 > canonical id 或 viewport CSS 坐标），由 BrowserAgent 在确定性恢复失败后**自主调用**，
 > 失败回执上的 `visualRecoveryHint` 负责告诉它这条路存在。详见
-> `docs/end-to-end-request-flow.md` Q20。
+> [归档全链路说明](../../end-to-end-request-flow-legacy-lead.md) Q20。
 >
 > **本文保留的价值**：下面测到的盲区形态——SemanticTree 不投影弹层、AXTree 里同时
 > 存在无面积的隐藏 mirror 与真正渲染的行——不是 AntD 独有的，通用方案照样会撞上。

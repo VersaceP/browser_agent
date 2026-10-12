@@ -16,7 +16,7 @@ def phase_outcome_facts(state: Any) -> List[JsonDict]:
     """Preserve phase history without deciding the user's current goal.
 
     A later user instruction or page observation can make the task complete
-    even when an earlier worker returned partial. The Lead must see that
+    even when an earlier worker returned partial. The task owner must see that
     history, but a raw worker status cannot veto its semantic conclusion.
     """
     phases = state.get("phases") if isinstance(state, dict) else None
@@ -101,7 +101,7 @@ def artifact_generation_view(
     what "active" means differently. Apply valid merge edges to the current
     active artifact generation.
 
-    A Lead `reference_merge` that copies every row of its sources verbatim is
+    A task owner `reference_merge` that copies every row of its sources verbatim is
     a new generation of the same data, not an addition to it. Until this ran,
     the merged artifact was in no ledger at all: the completion receipt could
     not count it and the numeric gate resolved claims about it against the
@@ -611,7 +611,7 @@ def persist_completion_receipt(
     state["completion_receipts"] = receipts
 
     # Import lazily: task_control already depends on the shared utility types,
-    # while completion receipts are also used from Lead tools during teardown.
+    # while completion receipts are also used from task owner tools during teardown.
     from harness.task_control import write_task_state
 
     path = write_task_state(logger, state)

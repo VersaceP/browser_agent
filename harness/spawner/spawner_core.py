@@ -226,7 +226,7 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
         # Record only pages this task actually addressed; sharing a Fleet does
         # not make every tab returned by Page.list part of this task.
         self._task_browser_page_ids: Dict[str, Set[str]] = {}
-        # LeadAgent sets this to the original user objective before the first
+        # task owner sets this to the original user objective before the first
         # spawn. Direct spawner tests/callers fall back to the worker task.
         self.root_task = ""
 
@@ -494,7 +494,7 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
     ) -> JsonDict:
         """Host/operator-only CAS reset after authoritative continuity loss.
 
-        This is intentionally not a Lead/Browser tool. A model cannot discard
+        This is intentionally not a task owner/Browser tool. A model cannot discard
         an active authenticated context to escape a busy or temporarily broken
         page. The host may reset only a binding already marked stale and must
         echo the identity from the failure receipt.
@@ -1137,7 +1137,7 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
         task_fleet_reference: Optional[str] = None,
         session_key: Optional[str] = None,
         page_policy: Optional[str] = None,
-        dispatch_origin: str = "lead_model",
+        dispatch_origin: str = "task_owner",
         dispatch_identity: Optional[JsonDict] = None,
     ) -> JsonDict:
         effective_contract = worker_contract or {}
@@ -1349,7 +1349,7 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
             # instruction above ("omit session_key") sends the spawn straight
             # into the coordinator's `fleet_session_conflict`, because an
             # unnamed request cannot attach to a fleet reserved for a named
-            # session. Every escape the Lead tried in task 69cab1c4 -- naming
+            # session. Every escape the task owner tried in task 69cab1c4 -- naming
             # the key, omitting it, reusing the worker -- landed on one of the
             # three refusals in that cycle.
             if not effective_session_key and task_session_binding.session_key:
@@ -1487,8 +1487,8 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                     "Do not change, replace, or replan the task identity: the "
                     "original task's @Fleet binding is authoritative. This is "
                     "a bounded startup infrastructure failure. Report the "
-                    "WebSocket/Fleet availability blocker. After external recovery, use "
-                    "list_browser_agents(refresh_connection=true) to verify it before retrying."
+                    "WebSocket/Fleet availability blocker. After external recovery, "
+                    "the task runtime must verify the same connection and Fleet before retrying."
                 )
             self.logger.write(
                 "spawner.slot.acquire_exhausted", acquisition_rejection
@@ -2031,8 +2031,8 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                         "Do not change, replace, or replan the task identity: "
                         "the original task's @Fleet binding is authoritative. "
                         "Report the WebSocket/Fleet availability blocker and "
-                        "use list_browser_agents(refresh_connection=true) after that endpoint "
-                        "is restored, then retry only if its probe succeeds. The business objective attempt budget was "
+                        "let the task runtime probe the same endpoint and Fleet after recovery, "
+                        "then retry only if its probe succeeds. The business objective attempt budget was "
                         "not consumed."
                     )
             self.logger.write("spawner.slot.acquire_failed", result)
@@ -2274,54 +2274,6 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
             pending = self._connection_recovery_task = asyncio.create_task(probe())
         return await asyncio.shield(pending)
 
-    def list_browser_agents(self) -> JsonDict:
-        from harness.task_control import load_task_state
-        state = load_task_state(self.logger)
-        phase_states = state.get("phases") or {}
-        self._cleanup_retired_slots()
-        agents = []
-        for handle in self._handles.values():
-            if handle.async_task.cancelled():
-                status = "cancelled"
-            elif handle.async_task.done():
-                result = self._task_result(handle)
-                status = result.get("status", "done")
-            else:
-                status = "running"
-            agent_summary = {
-                "workerId": handle.worker_id,
-                "agentId": handle.agent_id,
-                "slotId": handle.slot_id,
-                "name": handle.name,
-                "phaseId": handle.phase_id,
-                "status": status,
-                "task": handle.task,
-            }
-            if handle.async_task.done() and not handle.async_task.cancelled():
-                from harness.results.recovery import worker_recovery_facts
-                if status not in {"done", "validated_done"}:
-                    facts = dict(result.get("recoveryFacts") or worker_recovery_facts(result))
-                    phase_state = phase_states.get(handle.phase_id) or {}
-                    facts["currentPhase"] = {
-                        "status": phase_state.get("status"),
-                        "recordedAttemptCount": len(phase_state.get("attempts") or []),
-                        "planVersion": state.get("plan_version"),
-                    }
-                    agent_summary["recoveryFacts"] = facts
-            assignment = self.fleet_coordinator.assignment_for_worker(
-                handle.worker_id
-            )
-            if assignment is not None:
-                agent_summary["fleetAssignment"] = assignment.to_dict()
-            agents.append(agent_summary)
-        return {
-            "status": "done",
-            "agents": agents,
-            "slots": [
-                self._slot_summary(slot)
-                for slot in self._slots.values()
-            ],
-        }
 
     async def shutdown(self) -> None:
         pending = [

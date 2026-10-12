@@ -31,7 +31,7 @@ class StandaloneTaskControl:
         system_prompt += (
             "\n\nStandalone /browser task: the original user request"
             " and attributed later user instructions define the goal."
-            " There is no Lead agent to receive a handoff."
+            " You own this whole task and its completion."
             " Do not end the task for a turn count, context compaction,"
             " or a saved partial checkpoint. Recheck the original"
             " request against observed results as you work; correct"
@@ -282,7 +282,7 @@ class StandaloneTaskControl:
     async def review(
         self, *, phase: str, final_answer: str = "", question: str = "",
     ) -> JsonDict:
-        """Continue the task's independent Browser review without Lead planning."""
+        """Continue the task's independent Browser review without task owner planning."""
         agent = self.agent
         from harness.agents.browser.review.task import (
             persist_review_state, review_browser_task, review_for_executor,

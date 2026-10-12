@@ -66,14 +66,14 @@ def build_worker_result_levels(
     workflow_definitions: Optional[List[JsonDict]] = None,
     file_manifests: Optional[List[JsonDict]] = None,
 ) -> JsonDict:
-    """Return the stable worker handoff shape consumed by LeadAgent.
+    """Return the stable worker handoff shape consumed by task owner.
 
     L1 is for routing, L2 is the default semantic payload, and L3 is a set of
     references for on-demand recall. Top-level legacy fields remain available
     on the spawner result for compatibility.
     """
     answer_payload = parse_worker_answer(answer)
-    # The summary the Lead reads must agree with the artifact gate. Built from
+    # The summary the task owner reads must agree with the artifact gate. Built from
     # a task_dir alone it cannot see the database, and every db-mode artifact
     # comes back "missing" with rowCount 0 while the gate passes the same file.
     extraction_artifacts = summarize_extraction_artifacts(
@@ -281,9 +281,9 @@ def build_worker_handoff_projection(
                     "observations": unresolved_pages,
                 },
             ]
-    # Lexical artifact advisories reach the Lead here or nowhere. Everything
-    # else in `artifactValidation` is a verdict the Lead can act on from the
-    # status alone; an advisory only means something if the Lead can read WHICH
+    # Lexical artifact advisories reach the task owner here or nowhere. Everything
+    # else in `artifactValidation` is a verdict the task owner can act on from the
+    # status alone; an advisory only means something if the task owner can read WHICH
     # rows and fields were flagged, and a large worker result is offloaded to
     # disk with only this projection surviving in context.
     artifact_advisories = _artifact_advisories(levels)
@@ -502,7 +502,7 @@ def _shed_observations_to_fit(projection: JsonDict) -> JsonDict:
             return True
         return False
 
-    # Advisories shed first: they are a word-list reading, and the Lead can
+    # Advisories shed first: they are a word-list reading, and the task owner can
     # still see the flagged rows in the artifact itself.
     steps = (
         lambda: _cap("artifactAdvisories", 2),
@@ -577,7 +577,7 @@ def _minimal_handoff(projection: JsonDict) -> JsonDict:
         # Keep one bounded worker-authored route hint. This is advisory rather
         # than a mechanical decision, but it is the useful part of a sibling
         # handoff (for example, a canonical URL or shadow-root route) and avoids
-        # forcing Lead to reread the full result merely to restate it.
+        # forcing task owner to reread the full result merely to restate it.
         "suggestedNextExperiment": trim_large_strings(
             (projection.get("suggestedNextExperiment") or [])[:1]
             if isinstance(projection.get("suggestedNextExperiment"), list)
@@ -605,7 +605,7 @@ def _minimal_handoff(projection: JsonDict) -> JsonDict:
         return minimal
     # Nothing above depends on a value the caller supplied, so this always
     # fits. Reached only if a producer breaks the scalar contract in a way the
-    # bounds above did not anticipate - the Lead gets a truthful "unreadable"
+    # bounds above did not anticipate - the task owner gets a truthful "unreadable"
     # rather than a handoff that blows its own budget.
     return {
         "workerId": _bounded_scalar(minimal.get("workerId")),
@@ -735,7 +735,7 @@ def _summarize_extraction_artifact(
             })
             return summary
 
-    # The summary the Lead reads must agree with the artifact gate: both go
+    # The summary the task owner reads must agree with the artifact gate: both go
     # through the same reader so a db-mode artifact is never reported missing.
     reader = logger if logger is not None else (
         _ArtifactReaderLogger(task_dir) if task_dir else None
@@ -859,7 +859,7 @@ def _artifact_advisories(levels: JsonDict) -> List[JsonDict]:
 
     Only entries that mark themselves ``severity: advisory`` travel. A warning
     without that mark is either already reflected in the artifact status or is
-    a verdict in its own right, and neither needs re-stating to the Lead as
+    a verdict in its own right, and neither needs re-stating to the task owner as
     something to judge.
     """
 
@@ -885,7 +885,7 @@ def _artifact_advisories(levels: JsonDict) -> List[JsonDict]:
             if not isinstance(spec, dict):
                 continue
             # The matched regex is the observer's own internals: it is bulky,
-            # it is not something the Lead can act on, and printing a pattern
+            # it is not something the task owner can act on, and printing a pattern
             # invites reading the word list as the rule.
             fields.append({
                 "field": spec.get("field"),

@@ -6,7 +6,7 @@ ABCP Agent Harness connects LLM tool calling to ABCP Browser's WebSocket capabil
 
 ## Requirements
 
-- Python 3.9 or newer for Browser/Lead; Skill Builder requires Python 3.12 or newer.
+- Python 3.9 or newer for Browser; Skill Builder requires Python 3.12 or newer.
 - An ABCP Browser service reachable over WebSocket.
 - An OpenAI-compatible or Anthropic API key.
 
@@ -25,15 +25,14 @@ ws://127.0.0.1:61168/ws
 ```
 
 For a new setup, copy [`config example.json`](config%20example.json) to `config.json`.
-Existing configurations remain supported. Fill in the model connections for
-`lead`, `worker` and `plan_validator`, then check that `browser.ws_url` points
+Configure `worker` and optionally `skill_orchestrator`, then check that `browser.ws_url` points
 to the running browser. See the [model configuration guide](docs/provider-model-configuration.md).
 
 When using `api_key_env`, set the named variable in the launch terminal. For example,
-the template's validator credentials use:
+set your worker credentials, for example:
 
 ```bash
-export PLAN_VALIDATOR_API_KEY="your-validator-key"
+export WORKER_API_KEY="your-worker-key"
 ```
 
 Run a task:
@@ -65,9 +64,9 @@ Use the [provider and model configuration guide](docs/provider-model-configurati
 for all supported services, protocol endpoints, credentials, per-role connections,
 thinking, output budgets, caching, examples and connection checks.
 
-`lead`, `worker` and `plan_validator` are each configured in full and inherit
-nothing; the top level holds no model fields (loading fails if it does), and the
-plan validator must stay enabled. `provider` names the service and `api` the
+`worker` and any explicit `skill_orchestrator` connection are configured in full.
+Without `skill_orchestrator`, Skill and Workflow owners reuse `worker`.
+The top level holds no model fields (loading fails if it does). `provider` names the service and `api` the
 request protocol; named services require an explicit `api`. Auxiliary models
 have separate configuration rules. Keep configuration instructions in that guide
 so examples do not drift.
@@ -110,7 +109,6 @@ Add these common options only when needed:
 ```json
 {
   "harness": {
-    "lead_max_steps": 20,
     "worker_max_steps": 30,
     "max_browser_agents": 3,
     "max_task_fleets": 3,
@@ -120,7 +118,7 @@ Add these common options only when needed:
 }
 ```
 
-- `lead_max_steps` / `worker_max_steps`: decision rounds for Lead and its delegated workers. Standalone `/browser` has neither of these step limits.
+- `worker_max_steps`: decision rounds for a delegated Browser worker. Standalone `/browser` has no step limit.
 - `max_browser_agents` / `max_task_fleets`: concurrent workers and browser instances per task.
 - `hitl_wait_timeout_seconds`: maximum wait for human assistance.
 - `worktree_dir`: root directory for the SQLite database and deliverable files.
@@ -133,7 +131,7 @@ for deployment policies, project instructions and detailed options.
 
 ## Running Tasks
 
-Run a task through the LeadAgent orchestrator:
+Run a standalone Browser task (the default mode):
 
 ```bash
 python main.py --task "Open https://example.com and summarize the page."
@@ -148,12 +146,11 @@ echo "Open https://example.com and summarize the page." | python main.py
 Override agent id or step count:
 
 ```bash
-python main.py --agent-id demo-agent --max-steps 20 --task "Check the current fleet list."
+python main.py --agent-id demo-agent --task "Check the current fleet list."
 ```
 
 For an interactive run, choose the orchestration entry before entering the
-task: type `/browser` for one direct BrowserAgent, or `/lead` for planning,
-parallel work, and aggregation. The prompt confirms the choice for this run;
+task: type `/browser` for one direct BrowserAgent. The prompt confirms the choice for this run;
 it does not modify `config.json`.
 
 Resume a task at phase granularity, optionally adding a user instruction under
@@ -170,8 +167,7 @@ is recorded as attributed user input. Browser mode continues an open phase or
 creates a new continuation after a terminal phase without replaying its old
 side effects. An amendment saved before a startup failure remains available to
 the next plain resume. An existing task cannot be rebound to a different
-explicit `@Fleet` reference through an amendment. Lead mode evaluates the new instruction and routes new or revised
-assignments through review and any required approval. Validated phases and
+explicit `@Fleet` reference through an amendment. Validated phases and
 their active artifacts are preserved; an unfinished phase requires fresh
 verification before repeating its actions. A phase that was live
 when the process stopped requires confirmation before it is replayed. For
@@ -200,7 +196,7 @@ skipped, and subtest counts.
 
 ## Logs and Artifacts
 
-Both Browser and Lead store task records in SQLite. DB mode creates no task
+Browser, Skill and Workflow store task records in SQLite. DB mode creates no task
 or log subdirectories in advance. Locks live in a shared control directory;
 task directories are created only for actual downloads, screenshots, local
 intermediate files, or deliverables:
@@ -214,11 +210,11 @@ worktree/<task_id>/...                  # Actual files, created as needed
 The task's events are SQLite rows, available through the virtual `run.jsonl`
 view for task-scoped readers. Important event types include:
 
-- `lead.model` / `agent.model`: model text and tool calls.
+- `agent.model`: model text and tool calls.
 - `browser.call.result`: ABCP method call result.
 - `llm.usage`: per-call token and prompt-cache metrics.
 - `llm.usage_summary`: task-level token and prompt-cache summary.
-- `lead.final` / `agent.final`: final answer.
+- `agent.final`: final answer.
 
 Screenshot-like responses are saved to `artifacts/`; large base64 payloads are omitted from model context.
 
@@ -241,18 +237,9 @@ The harness records per-call cache metrics returned by the provider:
 
 The static prompt-context fields are disabled by default. Their rendered XML is hashed as part of the full prompt fingerprint recorded in usage diagnostics; the guide manifest is included in that fingerprint too. Keep these fields stable within a task to preserve prefix-cache reuse. Do not place current date, cwd, or task-specific observations here.
 
-## Lead Agent Tools
+## Browser Tools
 
-`LeadAgent` does not operate the browser directly. It plans, dispatches, and summarizes work through these tools:
-
-- `spawn_browser_agent`: start an isolated BrowserAgent.
-- `wait_browser_agents`: wait for one or more browser workers.
-- `list_browser_agents`: inspect active workers.
-- `lead_save_artifact`: persist LeadAgent-reshaped rows from trusted extraction evidence.
-- `read_harness_guide`: load a paged, versioned operating guide from the prompt's compact guide index when a detailed receipt/recovery rule is relevant.
-- `final_answer`: finish the LeadAgent run.
-
-LeadAgent should use BrowserAgent phases. BrowserAgent's `browser_call` uses:
+BrowserAgent uses `browser_call` to invoke the declared platform capabilities:
 
 ```json
 {
@@ -265,14 +252,14 @@ LeadAgent should use BrowserAgent phases. BrowserAgent's `browser_call` uses:
 }
 ```
 
-## Typical Orchestration Flow
+## Runtime Entries
 
-```text
-LeadAgent receives task
-  -> spawn_browser_agent: submit one reviewed assignment
-  -> wait_browser_agents: return worker evidence and remaining work
-  -> validate extraction artifacts and resultLevels
-  -> lead_save_artifact: reshape trusted rows only when validation is schema_mismatch
-  -> revise the assignment or continue its phase when evidence is missing/wrong
-  -> final_answer: summarize successes, failures, and blocked items
-```
+`/browser` starts BrowserTaskRunner and its BrowserAgent. `/skill` starts the
+independent Skill Orchestrator; `/workflow` starts Workflow development. They
+share browser tools, leases, permissions, storage, evidence and recovery.
+
+Lead mode has been removed. Move a former `lead` model connection to
+`skill_orchestrator` to preserve the Skill/Workflow model choice, remove
+`plan_validator`, `claim_extractor` and Lead-only harness settings, and choose
+`browser`, `skill` or `workflow`. Historical Lead records remain readable, but
+those tasks cannot resume through a removed runtime.

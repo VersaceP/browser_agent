@@ -1291,9 +1291,9 @@ class BrowserAgent:
         """State this worker reached, for whoever picks the phase up next.
 
         A worker cut off at the step cap never writes a final answer, so the
-        handoff used to be a hint plus a log path. The Lead then reconstructed
+        handoff used to be a hint plus a log path. The task owner then reconstructed
         the story from the raw worker trace instead: in a608 that was five reads
-        of a 230KB trace file, 29% of the Lead's entire context. Everything
+        of a 230KB trace file, 29% of the task owner's entire context. Everything
         below is already in hand here and costs no extra call.
         """
         lines: List[str] = []
@@ -1340,7 +1340,7 @@ class BrowserAgent:
             # action errors land in response.data.error (top-level error is only
             # set on transport failures), and stale_element_reference /
             # tool_was_executed=False carry no error object at all. Those would
-            # be listed to the Lead as actions that succeeded.
+            # be listed to the task owner as actions that succeeded.
             result = item.get("result")
             failed = _invoke_result_failed(result)
             params = item.get("params") if isinstance(item.get("params"), dict) else {}

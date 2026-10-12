@@ -53,36 +53,6 @@ OFFLOAD_FIELDS_AS_JSON = {
 OFFLOAD_FIELDS = OFFLOAD_FIELDS_AS_TEXT | OFFLOAD_FIELDS_AS_JSON
 SCREENSHOT_METHODS = {"Page.screenshot"}
 
-# Fleet-routing outcomes that can reach LeadAgent. Keep the guidance text and
-# this catalog together so tests can mechanically reject undocumented additions.
-LEAD_FLEET_ROUTING_DECISION_CODES = (
-    "session_fleet_lost",
-    "page_continuation_lost",
-    "fleet_assignment_lost",
-    "fleet_auth_gated",
-    "fleet_auth_resolver_required",
-    "fleet_reperception_required",
-    "session_transport_unavailable",
-    "session_manual_reset_required",
-    "session_slot_busy",
-    "fleet_owner_unavailable",
-    "fleet_reference_invalid",
-    "fleet_reference_not_found",
-    "fleet_inventory_temporarily_unavailable",
-    "ambiguous_fleet_reference",
-    "reuse_fleet_lost",
-    "reuse_session_conflict",
-    "session_isolation_conflict",
-    "fleet_routing_conflict",
-    "session_binding_conflict",
-    "fleet_session_conflict",
-    "released_fleet_conflict",
-    "task_fleet_limit_reached",
-)
-
-LEAD_FLEET_ROUTING_DECISION_GUIDANCE = """- Fleet/session routing outcomes reach the Lead on a worker result or a spawn rejection, Use their structured status, offending reference, execution facts and retry constraints, with next_instruction when present. Missing guidance does not authorize replay or identity replacement. When a rejection needs more than its instruction, read_harness_guide("lead.fleet-session-continuity") carries the background, and search_harness_guides resolves any of these codes to it - notably session_fleet_lost and page_continuation_lost, which are terminal for the affected session or page state, fleet_auth_gated whose fleet_auth_resolver_required variant requires you to ASSIGN a resolver rather than wait, and task_fleet_limit_reached, which waiting never clears because the harness never closes a fleet.
-- Never answer a routing rejection by creating a replacement fleet, releasing a named session binding, or rebinding a session_key that the receipt did not release."""
-
 GENERIC_TOOL_RESULT_KEEP_KEYS = (
     "method",
     "status",
@@ -115,11 +85,11 @@ GENERIC_TOOL_RESULT_KEEP_KEYS = (
     "visualRecoveryHint",
     "taskId",
     # A wait result may be offloaded because completed worker payloads are
-    # large. Keep the reviewed scheduler facts inline so Lead does not need a
+    # large. Keep the reviewed scheduler facts inline so task owner does not need a
     # separate list/read round merely to learn which phase is ready next.
     "scheduleSnapshot",
     # Compact receipt emitted by the direct-worker controller. Keep it when a
-    # large worker result is offloaded so Lead can distinguish an automatic
+    # large worker result is offloaded so task owner can distinguish an automatic
     # continuation from a normal orchestration tool response.
     "directExecution",
 )
@@ -159,7 +129,7 @@ PAGE_DEAD_OBSERVATION_MARKERS = (
 )
 
 # Recoverable routing classification: the worker's immutable artifact contract
-# lacks the nested-array shape required by collect_items, so only Lead can fix
+# lacks the nested-array shape required by collect_items, so only task owner can fix
 # it by replanning. This is deliberately not a worker/phase terminal status.
 COLLECTION_CONTRACT_REPLAN_REQUIRED = "collection_contract_replan_required"
 
@@ -204,7 +174,7 @@ WORKER_STATUS_HARD_PRIORITY = (
     WORKER_STATUS_STEP_BUDGET,
 )
 
-# Categories that LeadAgent uses to pick a default reaction.
+# Categories that task owner uses to pick a default reaction.
 WORKER_STATUS_CATEGORY_DONE = "done"
 WORKER_STATUS_CATEGORY_RECOVERABLE = "recoverable"
 WORKER_STATUS_CATEGORY_NEEDS_HUMAN = "needs_human"

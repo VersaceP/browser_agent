@@ -225,9 +225,9 @@ def transport_recovery_spawn_rejection(
         },
         "next_instruction": (
             "A fatal browser transport failure requires a bounded connection "
-            "probe before dispatch. Use list_browser_agents("
-            "refresh_connection=true); it only registers, refreshes "
-            "capabilities and lists Fleets. Do not replay browser actions "
+            "probe before dispatch. The task runtime must verify the same "
+            "endpoint's connection, capabilities and Fleet inventory. "
+            "Do not replay browser actions "
             "or create a replacement Fleet. Retry the original phase only "
             "after a ready probe receipt."
         ),

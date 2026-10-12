@@ -1617,7 +1617,7 @@ def _navigate_challenge_blocked_result(
             "Navigation appears blocked by an anti-bot or challenge page after"
             " bounded verification. Do not keep polling Page.getState; call"
             " final_answer with status=\"blocked_by_challenge\", request HITL"
-            " if the workflow supports it, or let LeadAgent pivot strategy."
+            " if the workflow supports it, or let task owner pivot strategy."
         ),
     }
 
@@ -1692,12 +1692,12 @@ def _loop_interrupt_summary(
             "A human verification (e.g. Cloudflare/CAPTCHA) blocked this page and"
             " the loop paused for HITL. Do NOT resume the loop or retry browser"
             " actions; wait for the human resume event or report the blocker to"
-            " LeadAgent."
+            " task owner."
         ),
         "timeout": (
             "Human intervention was requested for a challenge but did not complete"
             " in time. Do NOT resume the loop or retry; report the blocker or hand"
-            " off to LeadAgent."
+            " off to task owner."
         ),
         "page_settled_after_hitl": (
             "The page looks past the challenge but ABCP still reports it paused."
