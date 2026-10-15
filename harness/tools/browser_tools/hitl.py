@@ -469,7 +469,7 @@ async def _repause_for_structural_challenge(
     return await _bt().wait_for_hitl_resume(
         browser=agent.browser,
         page_id=str(page_id),
-        timeout_seconds=getattr(harness_cfg, "hitl_wait_timeout_seconds", 900.0),
+        timeout_seconds=None,
         poll_interval_seconds=getattr(harness_cfg, "hitl_poll_interval_seconds", 2.0),
         diagnostics=getattr(agent, "diagnostics", None),
         logger=agent.logger,
@@ -658,7 +658,7 @@ async def _refresh_and_wait_for_post_hitl_retry(
     wait_result = await _bt().wait_for_hitl_resume(
         browser=agent.browser,
         page_id=str(page_id),
-        timeout_seconds=getattr(harness_cfg, "hitl_wait_timeout_seconds", 900.0),
+        timeout_seconds=None,
         poll_interval_seconds=getattr(harness_cfg, "hitl_poll_interval_seconds", 2.0),
         diagnostics=getattr(agent, "diagnostics", None),
         logger=agent.logger,
@@ -1127,7 +1127,7 @@ async def _adjudicate_and_maybe_hitl(
     return enriched
 
 def _hitl_pause_rounds(agent: Any) -> Dict[str, int]:
-    """Pause rounds spent, keyed by pageId; the "" key is the worker total."""
+    """Observed pause counts by pageId; the empty key is the worker total."""
     rounds = getattr(agent, "hitl_pause_rounds", None)
     if not isinstance(rounds, dict):
         rounds = {}
@@ -1135,12 +1135,12 @@ def _hitl_pause_rounds(agent: Any) -> Dict[str, int]:
     return rounds
 
 def _count_hitl_pause_round(agent: Any, page_id: str) -> Dict[str, int]:
-    """Charge one pause round. Called from exactly one place.
+    """Record one dispatched pause, without a quota. Called from one place.
 
     `_claim_fleet_auth_barrier_for_hitl` is the single choke point every
     dispatched Hitl.requestPause crosses, so counting there — and only there —
     keeps the auto path (which claims the barrier itself first, then dispatches
-    through the same guard) from being charged twice for one pause.
+    through the same guard) from being counted twice for one pause.
     """
     rounds = _hitl_pause_rounds(agent)
     key = str(page_id or "")
@@ -1173,12 +1173,7 @@ async def _refuse_hitl(
     return admission
 
 def _hitl_admission(agent: Any, page_id: str) -> Optional[JsonDict]:
-    """Decide whether asking a human is still worth doing.
-
-    Returns None to proceed, or a terminal receipt to hand back instead. Both
-    refusals are returned BEFORE the fleet auth barrier is claimed: a pause
-    nobody will answer must not also shut the gate on every sibling worker.
-    """
+    """Honor explicitly unattended deployments; counts do not decide intent."""
     harness_cfg = getattr(getattr(agent, "runtime", None), "harness", None)
     attendance = str(
         getattr(harness_cfg, "hitl_attendance", "attended") or "attended"
@@ -1196,33 +1191,7 @@ def _hitl_admission(agent: Any, page_id: str) -> Optional[JsonDict]:
                 " navigate around it: report it as a blocker and finish."
             ),
         }
-    rounds = _hitl_pause_rounds(agent)
-    per_page = max(0, int(getattr(harness_cfg, "hitl_max_pause_rounds_per_page", 3) or 0))
-    per_worker = max(0, int(getattr(harness_cfg, "hitl_max_pause_rounds_per_worker", 3) or 0))
-    page_used = int(rounds.get(str(page_id), 0))
-    worker_used = int(rounds.get("", 0))
-    if per_page and page_used >= per_page:
-        scope, used, budget = "page", page_used, per_page
-    elif per_worker and worker_used >= per_worker:
-        scope, used, budget = "worker", worker_used, per_worker
-    else:
-        return None
-    return {
-        "status": "hitl_budget_exhausted",
-        "reasonKind": "hitl_budget_exhausted",
-        "tool_was_executed": False,
-        "retryable": False,
-        "pageId": page_id,
-        "budgetScope": scope,
-        "pauseRoundsUsed": used,
-        "pauseRoundsBudget": budget,
-        "next_instruction": (
-            f"The cumulative HITL budget for this {scope} is spent"
-            f" ({used}/{budget} pauses). A human did not resolve the challenge"
-            " in the earlier rounds and re-pausing holds the fleet gate shut"
-            " for every sibling worker. Report this as a blocker and finish."
-        ),
-    }
+    return None
 
 async def _release_fleet_auth_after_hitl_refusal(agent: Any, reason: str) -> JsonDict:
     """Hand the gate back when this worker will not be asking a human."""
@@ -1859,7 +1828,7 @@ async def _enrich_pause_with_wait(
     wait_result = await _bt().wait_for_hitl_resume(
         browser=agent.browser,
         page_id=str(page_id),
-        timeout_seconds=getattr(harness_cfg, "hitl_wait_timeout_seconds", 900.0),
+        timeout_seconds=None,
         poll_interval_seconds=getattr(harness_cfg, "hitl_poll_interval_seconds", 2.0),
         diagnostics=diagnostics,
         logger=agent.logger,
@@ -1869,7 +1838,7 @@ async def _enrich_pause_with_wait(
             if browser_assistance else None
         ),
         pause_snapshot=_hitl_pause_snapshot(agent, str(page_id)),
-        pause_reason=str(params.get("reason") or params.get("purpose") or "等待确认"),
+        pause_reason=str(params.get("reason") or params.get("purpose") or "Awaiting confirmation"),
         input_handler=getattr(agent, "hitl_input_handler", None),
     )
     feedback = wait_result.get("userFeedback")
@@ -1922,7 +1891,7 @@ async def _enrich_pause_with_wait(
     }
     enriched["hitl_wait"] = wait_result
     if getattr(agent, "standalone_browser_mode", False):
-        if wait_result.get("status") == "timeout":
+        if wait_result.get("status") in {"timeout", "waiting"}:
             agent.standalone_hitl_timeout = {
                 "pageId": str(page_id), "pauseId": pause_id,
                 "assistanceKind": assistance_kind,
@@ -1974,7 +1943,8 @@ async def _enrich_pause_with_wait(
         )
     else:
         enriched["suggested_prompt"] = (
-            "HITL wait timed out — page is still paused. Do NOT call other"
+            "HITL wait ended without a reply or a confirmed resume; inspect"
+            " hitl_wait.status and reason. The page is still paused. Do NOT call other"
             " Hitl.* methods; report status=incomplete via final_answer."
         )
     return enriched

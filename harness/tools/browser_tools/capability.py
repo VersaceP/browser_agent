@@ -36,6 +36,7 @@ from .axtree_state import _browser_side_rematch_mode
 from .axtree_state import _check_stale_axtree_target
 from .axtree_state import _observe_axtree_state_after
 from .axtree_state import _precompute_axtree_snapshot
+from .workflow_observation import prepare_workflow_observations, apply_workflow_observations
 from harness.workflow.workflow_policy import validate_workflow_params
 from harness.observation.exec_observer import ExecObserver
 from harness.workflow.workflow_projection import project_workflow_receipt, workflow_execution_facts
@@ -129,6 +130,8 @@ async def _execute_browser_capability_tool(
     *,
     published_skill_workflow: bool = False,
 ) -> Tuple[JsonDict, bool]:
+    from harness.runtime.steering import current_steering, dispatch_boundary
+    steering_revision = current_steering().revision if current_steering() else 0
     direct_method = str(tool_name or "").strip()
     if tool_name == "browser_call":
         method = str(tool_input.get("method", "")).strip()
@@ -687,7 +690,14 @@ async def _execute_browser_capability_tool(
                     {"redact_params": sensitive_params}
                     if sensitive_params else {}
                 )
-                response = await runner.call(method, params, **runner_kwargs)
+                pending = dispatch_boundary(agent, steering_revision, method)
+                if pending:
+                    response = pending
+                elif method == "Workflow.execute":
+                    from harness.runtime.workflow_steering import controlled_call
+                    response = await controlled_call(agent, runner, params, exec_observer, **runner_kwargs)
+                else:
+                    response = await runner.call(method, params, **runner_kwargs)
             except ABCPTransportError as exc:
                 # JSON-RPC action timeouts may happen after Electron has begun
                 # a download.  Contain this one method locally so reconciliation
@@ -844,6 +854,10 @@ async def _execute_browser_capability_tool(
                     dict(row) for row in shown_sidecar if isinstance(row, dict)
                 ]
         axtree_snapshot = _precompute_axtree_snapshot(method, params, response)
+        workflow_observations = (
+            prepare_workflow_observations(params, response)
+            if method == "Workflow.execute" and script_request else None
+        )
         full_view_response = _bt()._full_view_evidence(method, response)
         response = _bt()._project_observation_for_model(agent, method, params, response, step)
         response = agent._offload_response(method, params, response, step)
@@ -915,6 +929,8 @@ async def _execute_browser_capability_tool(
         # connection state into a model-facing tool error: the spawner owns
         # slot teardown/reconnect and must receive the typed exception.
         if bool(getattr(exc, "connection_fatal", False)):
+            if exec_observer is not None:
+                exc.execution_trace = exec_observer.trace.to_receipt()
             agent.logger.write(
                 "browser.transport.fatal",
                 {
@@ -955,6 +971,8 @@ async def _execute_browser_capability_tool(
             workflow_params=params if method == "Workflow.execute" else None,
             failure_details=workflow_failure_details,
         )
+        from harness.runtime.workflow_recovery import reconcile_interrupted_workflow
+        await reconcile_interrupted_workflow(agent, result)
         _project_workflow_result(result, agent, step)
 
     if image_output_receipt is not None:
@@ -1109,6 +1127,13 @@ async def _execute_browser_capability_tool(
         event_serial_before=event_serial_before if "event_serial_before" in locals() else None,
         page_before=page_before if "page_before" in locals() else None,
     )
+    if method == "Workflow.execute" and locals().get("workflow_observations") is not None:
+        apply_workflow_observations(
+            agent,
+            workflow_observations,
+            result,
+            event_serial_before=event_serial_before,
+        )
     # Phase 7.2: optionally auto-run the dismiss_overlay micro-loop (gated by
     # config auto_intercept). dismiss_overlay uses _invoke_browser_method (not
     # this model path), so there is no recursion; its internal clicks/re-inspects
@@ -1125,6 +1150,9 @@ async def _execute_browser_capability_tool(
     # decided FOR the model behind gates so narrow they almost never fired.
     if not page_create_should_stop:
         result = _bt()._attach_visual_recovery_hint(agent, method, params, result, step)
+    if method == "Workflow.execute":
+        from harness.workflow.workflow_projection import capture_workflow_result
+        capture_workflow_result(agent.logger, result)
     # Complete payload first, then the log copy, then the model copy. Both of
     # the copies below cut strings - the log at 8000 chars, the model at
     # max_observation_chars - and until this call nothing held the whole
@@ -1190,6 +1218,8 @@ async def _execute_browser_capability_tool(
     )
     if workflow_facts is not None and isinstance(model_result, dict):
         model_result["workflowExecution"] = workflow_facts
+        if result.get("workflowResultRef"):
+            model_result["workflowResultRef"] = result["workflowResultRef"]
     model_result = _attach_complete_payload(model_result, complete_payload)
     _bt()._observe_progress_after(agent, method, model_result)
     agent.trace.append({
@@ -1445,6 +1475,8 @@ async def _invoke_browser_method(
     lifecycle_cleanup_bypass: bool = False,
     _trusted_collection_runtime_token: Any = None,
 ) -> JsonDict:
+    from harness.runtime.steering import current_steering, dispatch_boundary
+    steering_revision = current_steering().revision if current_steering() else 0
     # internal=True marks a harness plumbing call: it must not enter the observation chain —
     # no challenge adjudication, diagnostics, progress, or model-facing trace —
     # only a compact audit log. Such calls also never count as progress.
@@ -1578,7 +1610,14 @@ async def _invoke_browser_method(
                 step,
             )
         _bt()._page_lifecycle_before_action(agent, method, params)
-        response = await runner.call(method, params, **runner_kwargs)
+        pending = dispatch_boundary(agent, steering_revision, method)
+        if pending:
+            response = pending
+        elif method == "Workflow.execute":
+            from harness.runtime.workflow_steering import controlled_call
+            response = await controlled_call(agent, runner, params, exec_observer, **runner_kwargs)
+        else:
+            response = await runner.call(method, params, **runner_kwargs)
         _bt()._page_lifecycle_after_action(agent, method, params, response)
         response = agent._capture_artifacts(method, response)
         structural_challenge = detect_structural_challenge(method, response)
@@ -1704,6 +1743,9 @@ async def _invoke_browser_method(
         event_serial_before=event_serial_before if "event_serial_before" in locals() else None,
         page_before=page_before if "page_before" in locals() else None,
     )
+    if method == "Workflow.execute":
+        from harness.workflow.workflow_projection import capture_workflow_result
+        capture_workflow_result(agent.logger, result)
     if internal:
         agent.logger.write("browser.call.internal", {"method": method})
         if (

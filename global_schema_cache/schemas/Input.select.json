@@ -1,8 +1,8 @@
 {
   "method": "Input.select",
-  "description": "Sets a supported native choice control and confirms the result. Use selections for select, or value for date, datetime-local, time, month, week, and color; never both.",
+  "description": "Sets a supported native choice control and confirms the result. Provide id or selector. Provide exactly one of selections or value: selections for select, or value for date, datetime-local, time, month, week, and color.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:4353ee6b25dd1c25bb33c594c8231a1d46faab7783a010b1092fd1c91582bd64",
+  "catalogRevision": "sha256:f14f45a51d9e8c2fec30ee6e50e9cd2003d0d7eb9b217ea8922884f5fa221f76",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -11,20 +11,20 @@
         "type": "string",
         "format": "uuid",
         "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-        "description": "Page ID containing the select control."
+        "description": "Page ID containing the native choice control."
       },
       "id": {
-        "description": "Current node ID from the latest page observation for the native choice control.",
+        "description": "Control ID obtained from the current page observation for the native choice control.",
         "type": "string",
         "pattern": "^n_[0-9a-f]{16}$"
       },
       "selector": {
-        "description": "Unique CSS selector for one select control.",
+        "description": "Unique CSS selector for one native choice control.",
         "type": "string",
         "minLength": 1
       },
       "selections": {
-        "description": "Exact option values for a native select; mutually exclusive with value.",
+        "description": "Non-empty array for a native select; each item accepts only value. Mutually exclusive with value.",
         "minItems": 1,
         "type": "array",
         "items": {

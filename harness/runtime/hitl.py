@@ -28,6 +28,7 @@ analysis).
 """
 
 import asyncio
+import sys
 import time
 import uuid
 from datetime import datetime, timezone
@@ -616,7 +617,7 @@ async def wait_for_hitl_resume(
     *,
     browser: ABCPClient,
     page_id: str,
-    timeout_seconds: float,
+    timeout_seconds: Optional[float] = None,
     poll_interval_seconds: float,
     diagnostics: Optional[WorkerDiagnostics],
     logger: Optional[RunLogger],
@@ -629,6 +630,9 @@ async def wait_for_hitl_resume(
     from harness.runtime.hitl_input import read_hitl_input
 
     handler = input_handler or read_hitl_input
+    terminal_available = input_handler is not None or (
+        sys.stdin is not None and sys.stdin.isatty()
+    )
     event_task = asyncio.create_task(_wait_for_hitl_events(
         browser=browser, page_id=page_id, timeout_seconds=timeout_seconds,
         poll_interval_seconds=poll_interval_seconds, diagnostics=diagnostics,
@@ -667,6 +671,17 @@ async def wait_for_hitl_resume(
             else:
                 feedback = None
         retain_feedback(feedback)
+        if (event_task not in done and not feedback and terminal_available
+                and timeout_seconds is None):
+            # A reachable input channel ended without an answer (e.g. EOF).
+            # Preserve the pause; never turn closed input into a human decision
+            # or leave an unbounded event wait running after the terminal ends.
+            outcome = {"status": "waiting", "pageId": page_id,
+                       "reason": "terminal_input_ended",
+                       "elapsedMs": int((time.monotonic() - started) * 1000)}
+            if logger is not None:
+                logger.write("hitl.wait.interrupted", outcome)
+            return outcome
         if event_task in done or not feedback:
             outcome = await event_task
         else:
@@ -709,7 +724,7 @@ async def _wait_for_hitl_events(
     *,
     browser: ABCPClient,
     page_id: str,
-    timeout_seconds: float,
+    timeout_seconds: Optional[float] = None,
     poll_interval_seconds: float,
     diagnostics: Optional[WorkerDiagnostics],
     logger: Optional[RunLogger],
@@ -718,7 +733,7 @@ async def _wait_for_hitl_events(
     ] = None,
     pause_snapshot: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Block until the paused page resumes or `timeout_seconds` elapses.
+    """Wait for resume, with no human deadline when timeout_seconds is None.
 
     Resume can be established by an explicit Agent-visible HITL notification or
     by a verifier-backed lifecycle notification followed by Hitl.resolvePause.
@@ -743,8 +758,9 @@ async def _wait_for_hitl_events(
             },
         )
 
-    deadline = time.monotonic() + max(0.0, timeout_seconds)
-    started = deadline - max(0.0, timeout_seconds)
+    started = time.monotonic()
+    deadline = (started + max(0.0, timeout_seconds)
+                if timeout_seconds is not None else None)
     strict_predicate = _make_resume_predicate_strict(page_id)
 
     def settlement_predicate(msg: Dict[str, Any]) -> bool:
@@ -759,8 +775,8 @@ async def _wait_for_hitl_events(
     )
 
     async def via_notification() -> Optional[Dict[str, Any]]:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        remaining = deadline - time.monotonic() if deadline is not None else None
+        if remaining is not None and remaining <= 0:
             return None
         msg = await browser.wait_for_notification(
             live_predicate,
@@ -812,14 +828,18 @@ async def _wait_for_hitl_events(
             value = None
 
         if not isinstance(value, dict):
-            if diagnostics is not None:
+            if diagnostics is not None and timeout_seconds is not None:
                 diagnostics.mark_hitl_wait_timed_out()
             outcome = {
-                "status": "timeout",
+                "status": "timeout" if timeout_seconds is not None else "waiting",
                 "pageId": page_id,
                 "elapsedMs": elapsed_ms_now(),
                 "timeoutSeconds": timeout_seconds,
             }
+            if timeout_seconds is None:
+                outcome["reason"] = (
+                    "notification_channel_failed" if task_errors else "notification_channel_ended"
+                )
             if task_errors:
                 # A sub-millisecond "timeout" usually means a branch errored out
                 # before doing real work. Surface it so callers know to look.
@@ -827,7 +847,7 @@ async def _wait_for_hitl_events(
             if settlement_rejections:
                 outcome["settlementRejections"] = settlement_rejections[-3:]
             if logger is not None:
-                logger.write("hitl.wait.timeout", outcome)
+                logger.write("hitl.wait." + outcome["status"], outcome)
             return outcome
 
         via = "notification"
@@ -839,7 +859,7 @@ async def _wait_for_hitl_events(
             confirmation = await _confirm_unpaused_after_settlement(
                 browser=browser,
                 page_id=page_id,
-                deadline=deadline,
+                deadline=deadline if deadline is not None else time.monotonic() + 10.0,
                 poll_interval_seconds=poll_interval_seconds,
             )
             if confirmation.get("status") != "resumed":
@@ -1031,7 +1051,7 @@ async def _wait_for_hitl_events(
         resolution = await _resolve_after_verified_settlement(
             browser=browser,
             page_id=page_id,
-            deadline=deadline,
+            deadline=deadline if deadline is not None else time.monotonic() + 10.0,
             poll_interval_seconds=poll_interval_seconds,
         )
         if resolution.get("status") == STALE_PAUSE_DEADLOCK:

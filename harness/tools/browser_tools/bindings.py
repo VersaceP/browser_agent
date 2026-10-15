@@ -197,7 +197,7 @@ def _check_page_binding(
 ) -> Optional[JsonDict]:
     """Reject model-visible page handles outside the worker delegation."""
 
-    if not _fleet_reuse_enabled(agent) or not isinstance(params, dict):
+    if not isinstance(params, dict):
         return None
     # Page.list stays readable for every assignment: a worker that cannot see
     # the Fleet cannot tell "my action did nothing" from "my result opened in a
@@ -206,6 +206,15 @@ def _check_page_binding(
     # operated, and _filter_page_list_response marks which rows are delegated.
     page_id = str(params.get("pageId") or "").strip()
     if not page_id:
+        return None
+    operation = (getattr(agent, "worker_contract", {}) or {}).get("_skill_operation") or {}
+    if (page_id in operation.get("excludedPages", []) or
+            ("executionPages" in operation and page_id not in operation["executionPages"])):
+        return {"status": "delegated_page_scope_violation", "pageId": page_id,
+                "tool_was_executed": False,
+                "error": "Page is outside this role's delegated execution scope",
+                "next_instruction": "Use the assigned page or return the binding mismatch to the task owner"}
+    if not _fleet_reuse_enabled(agent):
         return None
     pinned_page_id = str(getattr(agent, "pinned_page_id", "") or "").strip()
     if pinned_page_id and page_id != pinned_page_id:
@@ -815,11 +824,9 @@ async def _claim_fleet_auth_barrier_for_hitl(
     """Admit, then atomically select the one worker allowed to enter HITL.
 
     Every `Hitl.requestPause` — the model's own call and the harness's
-    auto-adjudicated one — passes through here, so this is where attendance and
-    the cumulative pause budget are ENFORCED and ACCOUNTED. Putting them only in
-    the auto path left the manual call as a hole wide enough to drive the whole
-    mechanism through: a model handed an `hitl_unattended` verdict could reach
-    the same 900-second wait by calling the tool itself.
+    auto-adjudicated one — passes through here. Enforce declared attendance and
+    the Fleet's resolver identity. Pause counts are telemetry only and never
+    refuse a human question.
     """
 
     if method != "Hitl.requestPause":

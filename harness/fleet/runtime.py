@@ -2,9 +2,9 @@
 
 The Dispatcher routes browser actions by ``pageId``.  The harness therefore
 gives each live worker persistent ownership of the pages it uses while allowing
-different pages in one fleet to make progress concurrently. Opaque Workflow is
-Fleet-exclusive because nested steps may switch to a newly opened page without
-re-entering the Harness. Authentication/challenge state is also fleet-wide, so
+different pages in one fleet to make progress concurrently. A host capability
+package enforcing one page holds only that page during Workflow execution.
+Opaque Workflows retain Fleet exclusion. Authentication/challenge state is Fleet-wide, so
 ``FleetAuthBarrier`` gates the whole fleet until one resolver has completed
 verified HITL recovery.
 """
@@ -36,15 +36,17 @@ class PageLeaseManager:
     alternating DOM reads and actions on one page while still allowing
     different pages in the same Fleet to make progress concurrently.
 
-    ``Workflow.execute`` is opaque to the Harness and may open and continue on
-    a new page between nested steps.  It therefore holds a short-lived Fleet
-    interaction lease for the duration of the whole call.  Ordinary page calls
-    wait outside that Fleet while the Workflow is active.
+    Host-wrapped single-page Workflows exclude interactions on their page.
+    Unwrapped Workflows retain Fleet exclusion. Page creation and authentication
+    still coordinate at Fleet scope.
     """
 
     def __init__(self, *, wait_timeout_seconds: float = 30.0) -> None:
         self._page_owners: Dict[str, str] = {}
         self._page_fleets: Dict[str, str] = {}
+        self._page_workflow_owner: Dict[str, tuple[str, asyncio.Task[Any]]] = {}
+        self._page_workflow_depth: Dict[str, int] = {}
+        self._page_active_calls: Dict[str, Dict[asyncio.Task[Any], int]] = {}
         self._quarantined_pages: set[str] = set()
         self._worker_pages: Dict[str, set[str]] = {}
         self._fleet_active_calls: Dict[
@@ -169,6 +171,19 @@ class PageLeaseManager:
                 self._page_owners.pop(page_id, None)
                 changed = True
         fleets_changed: set[str] = set()
+        for page, owner in list(self._page_workflow_owner.items()):
+            if owner[0] == worker:
+                self._page_workflow_owner.pop(page, None)
+                self._page_workflow_depth.pop(page, None)
+                fleets_changed.add(self._page_fleets.get(page, ""))
+                changed = True
+        tasks = {task for calls in self._fleet_active_calls.values()
+                 for task, (owner, _count) in calls.items() if owner == worker}
+        for page, calls in list(self._page_active_calls.items()):
+            for task in tasks:
+                calls.pop(task, None)
+            if not calls:
+                self._page_active_calls.pop(page, None)
         for fleet_id, owner in list(self._fleet_workflow_owner.items()):
             if owner[0] == worker:
                 self._fleet_workflow_owner.pop(fleet_id, None)
@@ -325,6 +340,7 @@ class PageLeaseManager:
         worker_id: str,
         workflow: bool = False,
         fleet_scoped: bool = False,
+        page_exclusive: bool = False,
     ) -> AsyncIterator[None]:
         """Atomically claim pages and enter one page/Fleet interaction."""
 
@@ -433,7 +449,14 @@ class PageLeaseManager:
             owner_is_current_task = workflow_owner == (worker, task)
             creation_is_current_task = creation_owner == (worker, task)
             creation_available = creation_owner is None or creation_is_current_task
-            if creation_available and (owner_is_current_task or (
+            if fleet_scoped:
+                creation_available &= not any(t is not task for t in self._fleet_active_calls.get(fleet, {}))
+            page_available = all(self._page_workflow_owner.get(page) in {None, (worker, task)}
+                                 for page in pages)
+            if page_exclusive:
+                page_available &= all(not any(t is not task for t in self._page_active_calls.get(page, {}))
+                                      for page in pages)
+            if creation_available and page_available and (owner_is_current_task or (
                 workflow_owner is None and not workflow_waiting
             )):
                 if fleet_scoped and creation_owner is None:
@@ -444,6 +467,12 @@ class PageLeaseManager:
                 active = self._fleet_active_calls.setdefault(fleet, {})
                 active_worker, count = active.get(task, (worker, 0))
                 active[task] = (active_worker, count + 1)
+                for page in pages:
+                    calls = self._page_active_calls.setdefault(page, {})
+                    calls[task] = calls.get(task, 0) + 1
+                    if page_exclusive:
+                        self._page_workflow_owner[page] = (worker, task)
+                        self._page_workflow_depth[page] = self._page_workflow_depth.get(page, 0) + 1
                 break
             try:
                 await self._wait_for_change(fleet, deadline)
@@ -456,6 +485,21 @@ class PageLeaseManager:
         try:
             yield
         finally:
+            for page in pages:
+                calls = self._page_active_calls.get(page, {})
+                if task in calls:
+                    calls[task] -= 1
+                    if not calls[task]:
+                        calls.pop(task)
+                    if not calls:
+                        self._page_active_calls.pop(page, None)
+                if page_exclusive and self._page_workflow_owner.get(page) == (worker, task):
+                    depth = self._page_workflow_depth[page] - 1
+                    if depth:
+                        self._page_workflow_depth[page] = depth
+                    else:
+                        self._page_workflow_depth.pop(page, None)
+                        self._page_workflow_owner.pop(page, None)
             active = self._fleet_active_calls.get(fleet)
             if active is not None and task in active:
                 active_worker, count = active[task]
@@ -1624,7 +1668,9 @@ class PageLeasedBrowserClient:
             or self._assigned_fleet_id
             or ""
         ).strip()
-        page_ids = self._literal_page_ids(method, payload)
+        from harness.workflow.script_runtime import page_scoped_workflow
+        scoped_workflow = method == "Workflow.execute" and page_scoped_workflow(payload)
+        page_ids = {payload["pageId"]} if scoped_workflow else self._literal_page_ids(method, payload)
         workflow = method == "Workflow.execute"
         page_create = method == "Page.create"
         if workflow and self._worker_id:
@@ -1647,8 +1693,9 @@ class PageLeasedBrowserClient:
                 page_ids=page_ids,
                 fleet_id=fleet_id,
                 worker_id=self._worker_id,
-                workflow=workflow,
+                workflow=workflow and not scoped_workflow,
                 fleet_scoped=page_create,
+                page_exclusive=scoped_workflow,
             ):
                 result = await self._call_under_interaction(method, params)
                 if page_create:

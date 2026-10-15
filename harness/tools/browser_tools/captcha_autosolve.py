@@ -156,9 +156,10 @@ def skill_forbids_autosolve(agent: Any) -> Optional[JsonDict]:
         catalog = SkillCatalog(
             Path(__file__).resolve().parents[3] / "skills",
             resolve_sqlite_path(config.storage_sqlite_path, config.worktree_dir),
+            worktree_dir=Path(config.worktree_dir),
         )
         try:
-            snapshot = catalog.version_path(skill_id, skill_hash)
+            snapshot = catalog.pin_source(skill_id, skill_hash, task_id=agent.logger.task_id)
             frontmatter = inspect_skill(snapshot)["metadata"] if snapshot else {}
         finally:
             catalog.close()

@@ -72,9 +72,12 @@ On success and failure, read the Action result, `observation`, and `suggested_pr
 - Use live schemas for names, arguments, defaults, results, and failures. `System.getCapabilities` provides summaries; describe an unfamiliar Action or event before using it.
 - When required, provide a non-empty `purpose` explaining how the call advances the user's goal, and follow `purposeHint`.
 
-### Network request interception
+### Large observations and uncertain delivery
 
-`Network.setInterception` replaces `rules`; pass `[]` to clear them. In `urlPattern`, use an exact URL or `*` wildcards; matching covers the full URL, is case-sensitive, and does not support regular expressions.
+- Read only the evidence needed for the current decision. Use the available pagination or chunking support when observations are large; discover parameters and limits from live contracts.
+- Process each batch incrementally and return a compact summary. Avoid combining a large observation into one final result.
+- Check completeness and availability before relying on captured content. Explain missing evidence and reacquire it when the task requires it.
+- Separate an operation's outcome from observation or result delivery failures. Inspect the current state before repeating any operation with side effects.
 
 ## 3. Events and Page Lifecycle
 
@@ -89,13 +92,13 @@ Manage event cursors as follows:
 
 Event names are notifications, not Actions. Do not try to call names such as `Page.loaded` or `Hitl.resumed`.
 
-`Page.open` means that a page is registered and visible to the Agent; it starts in `lifecycle="loading"`. Do not run DOM or Input Actions yet. Wait for `Page.loaded`, or poll `Page.getState` until `status="ready"`.
+`Page.open` registers a page in `lifecycle="loading"`. During loading, observe or attempt the required Action and use its result to decide whether to wait.
 
-`Page.loaded` means the page exposes a usable main-frame accessibility structure and is ready for DOM/Input actions. Observe the page when current evidence is needed; loading does not provide that evidence automatically. `Page.startedLoading` invalidates current DOM/Input targets. `Page.loadFailed` and `Page.crashed` require inspection with `Page.getState` before recovery.
+`Page.loaded` means the main document finished loading; it does not guarantee AXTree or target availability. `Page.startedLoading` invalidates previous-document evidence. Obtain current evidence before continuing. Use `Page.loadFailed` and `Page.crashed` details to decide how to recover.
 
 `Hitl.paused` is page-scoped. Keep the current connection open, stop ordinary automation for that page, and wait for the matching `Hitl.resumed` through the active transport's event listener or cursor-based reads. If delivery is uncertain, replay from the saved cursor without disconnecting. Follow the Human intervention rule before resuming.
 
-`Page.go` reports that history navigation was started; it does not mean the destination document has loaded. Wait for `Page.loaded` or `Page.loadFailed` before querying the page or reusing targets.
+`Page.go` reports that history navigation was started; it does not mean the destination document has loaded. Obtain current-document evidence and decide the next step from observation and Action results.
 
 `Download.remove` does not cancel active downloads automatically; confirm that the record is terminal before removing it.
 
@@ -107,7 +110,7 @@ Call `Hitl.requestPause` when a CAPTCHA blocks progress or sign-in, verification
 
 Give a concise `reason` describing the required human action, without credentials or verification codes. After a confirmed pause, follow the HITL waiting rule. Check the current HITL state before retrying an uncertain request; if handoff is unavailable, report the blocker. Do not call `Hitl.resolvePause` merely to bypass waiting or repeat a request the user declined.
 
-`Hitl.resumed` means the pause ended, not that the task succeeded; system lifecycle changes can also end it. Check `Page.getState`, wait for readiness, and verify the required outcome with fresh evidence. Stop waiting if the page closes.
+`Hitl.resumed` means the pause ended, not that the task succeeded; system lifecycle changes can also end it. Check `Page.getState` and verify the required outcome with fresh evidence. Stop waiting if the page closes.
 
 ## 4. Observation and Interaction
 
@@ -128,13 +131,25 @@ Before acting, identify the outcome required by the user's goal and where eviden
 - Query: use `DOM.getDetails` with bounded queries for known targets: `state`, `text`, `attributes`, or `dom`.
 - Saved details: use `DOM.getDetails` with `version` and `nodeIds` to read complete values from that observation. This does not refresh live state; do not combine it with `query`.
 
-For `DOM.getAXTree`, read the returned `artifact.path` before using its facts or IDs. For `DOM.getDetails`, read the returned `details` array directly: live values are in `value`, and saved complete nodes are in `node`. Choose only the evidence needed for the next decision; do not reread full by default. Partial or pending results do not prove absence, and unavailable values remain unconfirmed. When feedback says to observe or re-observe, apply these rules.
+For `DOM.getAXTree`, inspect `freshness` first. An `unavailable` result has no artifact or version; use `reason` to decide the next step. A `pending` view may be outdated. Read a returned `artifact.path` before using its facts or IDs. For `DOM.getDetails`, read the returned `details` array directly: live values are in `value`, and saved complete nodes are in `node`. Choose only the evidence needed for the next decision; do not reread full by default. Partial or pending results do not prove absence, and unavailable values remain unconfirmed. When feedback says to observe or re-observe, apply these rules.
 
 ### Targets and interaction
 
 Use a current `id`, otherwise a unique current `selector`, and coordinates only when a locator cannot reliably address the target. If both `id` and `selector` are supplied, `id` takes precedence.
 
-Node IDs and `targetable` identify locatable nodes; they do not guarantee suitability for an operation. Use current state, interaction evidence, and geometry to choose a target. Hidden semantic nodes can provide state but are not pointer targets. `vis=↓` can indicate an offscreen or clipped node, not necessarily a target that scrolling can reveal. For a pointer failure with public code `target-has-no-interaction-area`, re-observe the page and choose the visible rendered node representing the intended control or drag endpoint; do not retry the same target ID unchanged. `target-not-visible` indicates a visibility, scrolling, reveal, or frame-exposure problem and should be handled through the current viewport and page state. Follow Recovery before retrying a failed Action.
+Node IDs and `targetable` identify locatable nodes; they do not guarantee suitability for an operation.
+Use current state, interaction evidence, and geometry to choose a target.
+Semantic and interaction nodes may differ. Use current structure, relationships,
+and interaction evidence to choose an operation target; role or name alone does not establish usability.
+Hidden semantic nodes can provide state but are not pointer targets.
+`vis=↓` can indicate an offscreen or clipped node.
+Being outside the viewport does not by itself establish that a target is hidden, disabled,
+or has no interaction area.
+For a pointer failure with public code `target-has-no-interaction-area`, re-observe the page
+and choose the visible rendered node representing the intended control or drag endpoint;
+do not retry the same target ID unchanged.
+For `target-not-visible`, inspect the current target and page state before choosing a recovery action.
+Do not assume that another scroll will reveal the target. Follow Recovery before retrying a failed Action.
 
 A `pageId` remains the page identity across navigation. After navigation or document replacement, discard old element IDs and geometry. After recovery or other structure changes, reuse targets only when current evidence establishes their identity and usability.
 
@@ -142,15 +157,24 @@ Use real Input Actions. Do not bypass focus, visibility, or coverage checks thro
 
 ### Expandable controls
 
-After opening or updating associated content, use fresh evidence to identify its region, exposed expansion state, and usable targets. Follow explicit relationships and current structure; the region may be outside the control's subtree. Use a bounded `query.view="dom"` for a known region when needed, or full to discover unknown targets. Do not add a query when current evidence is sufficient. If content is not ready, use bounded re-observation rather than fixed delays.
+After opening or updating associated content, use fresh evidence to identify its region, exposed expansion state, and usable targets.
+Follow explicit relationships and current structure; the region may be outside the control's subtree.
+Use a bounded `query.view="dom"` for a known region when needed, or full to discover unknown targets.
+Do not add a query when current evidence is sufficient.
+
+If content is still appearing or transitioning, use bounded re-observation rather than fixed delays.
+Wait briefly between checks, increasing intervals until the intended target is usable.
+Limit check count and total elapsed time, including waits and observation calls.
+Continue as soon as the target is usable; on timeout, follow Recovery.
+Do not repeat the opening click while expansion is pending.
 
 ### Scrolling
 
-For a known interaction target, call its locator-based Action directly. Scroll explicitly to discover content, trigger lazy loading, handle nested scrolling, satisfy the user's request, or prepare coordinate interaction.
-
-- Use `Input.scroll` with `target` when revealing a mounted element is the goal. Add `container` to bound its scroll chain.
-- Use `deltaX/deltaY` for a total displacement, `edge` for a boundary, or omit both for a state read. Choose `container`, paired viewport CSS `x/y` coordinates, or omit these fields for the page viewport. Read the current Schema before calling the Action.
-- After scrolling, re-observe newly visible content and use current targets for subsequent interactions.
+For a known interaction target, call its locator-based Action directly.
+Let the Action handle any required target reveal. Do not scroll first solely because
+the target is outside the viewport or inside a nested scroll area.
+Use explicit scrolling to discover or load content, or to fulfill a requested scrolling or viewing task.
+Read the live Action description for usage and follow the shared observation and recovery rules.
 
 ### Select-like controls
 
@@ -189,7 +213,7 @@ For `Input.drag`, source and destination must be in the same document. Within an
 
 After failure, timeout, partial completion, or an uncertain result, establish what already happened before deciding what remains.
 
-Use `Page.getState` when readiness, loading, renderer availability, dialogs, or HITL state is unclear. Once page interaction is permitted, inspect the smallest relevant state needed to resolve the uncertainty. After navigation or document replacement, wait for readiness and restore full context.
+Use `Page.getState` when readiness, loading, renderer availability, dialogs, or HITL state is unclear. Once page interaction is permitted, inspect the smallest relevant state needed to resolve the uncertainty. After navigation or document replacement, restore the current evidence needed for the next decision.
 
 Follow the Human intervention rule when recovery makes no progress. Do not retry blindly. Repeat an action only when evidence establishes that its intended effect did not occur, repetition is safe, and the current contract permits it. If the effect may already have occurred, inspect the outcome or report uncertainty instead of duplicating it.
 

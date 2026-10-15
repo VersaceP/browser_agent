@@ -1,8 +1,8 @@
 {
   "method": "Page.click",
-  "description": "Dispatches one or more physical clicks at a page-viewport CSS coordinate. Coordinates do not scroll, resolve semantic targets, or recover stale targets; two clicks use the native double-click gesture and larger counts run bounded sequential clicks.",
+  "description": "Dispatches one or more physical clicks at a page-viewport CSS coordinate. For a target id from page observation or a unique selector, use Input.click. Coordinates do not scroll, resolve semantic targets, or recover stale targets; two clicks use the native double-click gesture and larger counts run bounded sequential clicks.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:4353ee6b25dd1c25bb33c594c8231a1d46faab7783a010b1092fd1c91582bd64",
+  "catalogRevision": "sha256:f14f45a51d9e8c2fec30ee6e50e9cd2003d0d7eb9b217ea8922884f5fa221f76",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",

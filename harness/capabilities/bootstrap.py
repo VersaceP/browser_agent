@@ -50,7 +50,10 @@ async def bootstrap_schema_cache(self) -> None:
             prefix="schema-bootstrap.transport",
         )
         connect_started = time.monotonic()
-        async with ABCPClient(browser_config, on_event=event_logger) as browser:
+        from harness.runtime.browser_connection import managed_client, task_recovery_window
+        scope = getattr(self, "spawner", self)
+        async with managed_client(ABCPClient(browser_config, on_event=event_logger),
+                                  window=task_recovery_window(scope)) as browser:
             timings["connectMs"] = int(
                 (time.monotonic() - connect_started) * 1000
             )
@@ -250,6 +253,7 @@ async def bootstrap_schema_cache(self) -> None:
                     or getattr(browser, "connection_details", {}),
                 "message": str(exc),
                 "businessActionsReplayed": 0,
+                "connectionRecovery": getattr(exc, "connection_recovery", None),
             }
         self.logger.write(
             "schema.bootstrap.failed",

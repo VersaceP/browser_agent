@@ -1906,6 +1906,15 @@ def _transport_error_metadata(
     """
 
     metadata: JsonDict = {}
+    recovery = getattr(exc, "connection_recovery", None)
+    if isinstance(recovery, dict):
+        metadata["connectionRecovery"] = recovery
+        metadata["executionOutcome"] = "not_sent" if exc.request_sent is False else "unknown"
+        metadata["next_instruction"] = (
+            "Dispatcher recovery finished. This action was not replayed. Inspect the original "
+            "execution and current page before deciding how to continue; a lost reply does not "
+            "prove that the action failed or succeeded."
+        )
     local_receipt = getattr(exc, "receipt", None)
     if isinstance(local_receipt, dict):
         for key in (

@@ -144,12 +144,14 @@ def note_transport_recovery_required(
     if (
         isinstance(current, dict)
         and str(current.get("fingerprint") or "") == fingerprint
+        and str(current.get("requiredRunId") or "") == str(logger.run_id or "")
         and str(current.get("status") or "") in {"pending", "blocked", "ready"}
     ):
         return dict(current)
     record: JsonDict = {
         "status": "pending",
         "fingerprint": fingerprint,
+        "requiredRunId": str(logger.run_id or ""),
         "fatalCount": len(items),
         "workers": items,
         "requiredAt": _tc().utc_now_iso(),
@@ -163,13 +165,24 @@ def note_transport_recovery_required(
 
 
 def record_transport_recovery_probe(
-    logger: RunLogger, receipt: Any,
+    logger: RunLogger, receipt: Any, *, expected_batch: Optional[JsonDict] = None,
 ) -> Optional[JsonDict]:
     """Attach one bounded probe result to the current required batch."""
     state = _tc().load_task_state(logger)
     current = _recovery_record(state)
     if not isinstance(current, dict):
         return None
+    if expected_batch is not None and any(
+        str(current.get(key) or "") != str(expected_batch.get(key) or "")
+        for key in ("fingerprint", "requiredRunId")
+    ):
+        # Another fatal batch arrived while this probe was in flight. Its
+        # blocker cannot be cleared by the older batch's successful probe.
+        logger.write("transport.recovery.probe_stale", {
+            "expectedFingerprint": expected_batch.get("fingerprint"),
+            "currentFingerprint": current.get("fingerprint"),
+        })
+        return dict(current)
     result = receipt if isinstance(receipt, dict) else {
         "status": "blocked",
         "reason": "invalid recovery probe receipt",
@@ -178,6 +191,8 @@ def record_transport_recovery_probe(
     updated["probeAttempts"] = _nonnegative_int(current.get("probeAttempts")) + 1
     updated["probeStatus"] = str(result.get("status") or "blocked")
     updated["probedAt"] = _tc().utc_now_iso()
+    updated["probeRunId"] = str(logger.run_id or "")
+    updated["probeReceipt"] = dict(result)
     updated["businessActionsReplayed"] = _nonnegative_int(
         result.get("businessActionsReplayed")
     )
@@ -186,6 +201,8 @@ def record_transport_recovery_probe(
     )
     if result.get("reason"):
         updated["reason"] = str(result.get("reason"))[:500]
+    else:
+        updated.pop("reason", None)
     state[TRANSPORT_RECOVERY_KEY] = updated
     _tc().write_task_state(logger, state)
     logger.write("transport.recovery.probe_recorded", {
@@ -231,4 +248,6 @@ def transport_recovery_spawn_rejection(
             "or create a replacement Fleet. Retry the original phase only "
             "after a ready probe receipt."
         ),
+        **({"connectionRecovery": dict(current["probeReceipt"])}
+           if isinstance(current.get("probeReceipt"), dict) else {}),
     }

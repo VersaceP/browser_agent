@@ -1,8 +1,8 @@
 {
   "method": "Network.readApi",
-  "description": "Reads recent Fetch, XHR, and Beacon request hops with supported response metadata and complete text bodies when available.",
+  "description": "Reads a stable page of Fetch, XHR and Beacon request metadata. Read captured bodies separately with Network.readBody.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:4353ee6b25dd1c25bb33c594c8231a1d46faab7783a010b1092fd1c91582bd64",
+  "catalogRevision": "sha256:f14f45a51d9e8c2fec30ee6e50e9cd2003d0d7eb9b217ea8922884f5fa221f76",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -11,31 +11,43 @@
         "type": "string",
         "format": "uuid",
         "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-        "description": "Target page ID whose network snapshot should be read."
+        "description": "Target page ID."
       },
       "sinceMs": {
-        "description": "Optional Unix epoch boundary in milliseconds. Includes requests initiated at exactly this time.",
+        "description": "Inclusive request initiation boundary in Unix epoch milliseconds.",
         "type": "integer",
         "minimum": 0,
         "maximum": 9007199254740991
       },
       "urlPattern": {
-        "description": "Optional RE2 search expression matched against the complete request URL. Maximum length is 4096 characters.",
+        "description": "RE2 search against the complete request URL.",
         "type": "string",
         "minLength": 1,
         "maxLength": 4096
       },
       "responsePattern": {
-        "description": "Optional RE2 search expression matched against complete available JSON or text response bodies. Metadata-only redirect hops are excluded; binary and Base64 bodies are excluded. Maximum length is 4096 characters.",
+        "description": "RE2 search against complete available text responses; unsearchable bodies are counted.",
         "type": "string",
         "minLength": 1,
         "maxLength": 4096
+      },
+      "limit": {
+        "description": "Initial page size, default 100; also bounded by serialized byte size.",
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 200
+      },
+      "cursor": {
+        "description": "Continuation cursor. Supply only pageId and cursor when continuing.",
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256
       },
       "purpose": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "string",
         "minLength": 1,
-        "description": "Describe why you need API response bodies or redirect metadata, e.g., verifying a form submission or extracting dynamic business data"
+        "description": "Describe why you need to inspect network requests or verify a submission."
       }
     },
     "required": [
@@ -52,7 +64,7 @@
         "type": "string",
         "format": "uuid",
         "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-        "description": "Target page ID that owns the snapshot."
+        "description": "Page that owns the request records."
       },
       "apis": {
         "type": "array",
@@ -62,11 +74,15 @@
             "requestId": {
               "type": "string",
               "minLength": 1,
-              "description": "Stable request identifier for this captured request hop."
+              "description": "Identifier of one captured request hop."
             },
             "url": {
               "type": "string",
-              "description": "Complete request URL."
+              "description": "Request URL, limited to a 16 KiB UTF-8 preview."
+            },
+            "urlTruncated": {
+              "type": "boolean",
+              "description": "Whether the displayed URL was truncated."
             },
             "method": {
               "type": "string",
@@ -79,7 +95,7 @@
                 "XHR",
                 "Beacon"
               ],
-              "description": "Captured web API resource category."
+              "description": "Captured API resource category."
             },
             "status": {
               "anyOf": [
@@ -92,7 +108,7 @@
                   "type": "null"
                 }
               ],
-              "description": "HTTP response status, or null when unavailable."
+              "description": "HTTP status, or null before it is available."
             },
             "mimeType": {
               "anyOf": [
@@ -103,37 +119,119 @@
                   "type": "null"
                 }
               ],
-              "description": "Response MIME type, or null when unavailable."
+              "description": "Response MIME type, or null when unknown."
             },
             "requestBody": {
-              "anyOf": [
-                {
-                  "type": "string"
+              "type": "object",
+              "properties": {
+                "bodyId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Page-generation-scoped native body identifier."
                 },
-                {
-                  "type": "null"
+                "state": {
+                  "type": "string",
+                  "enum": [
+                    "pending",
+                    "available",
+                    "partial",
+                    "unavailable",
+                    "evicted"
+                  ],
+                  "description": "Capture and retention state; available includes an empty complete body."
+                },
+                "bytes": {
+                  "anyOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Captured UTF-8 byte length, or null when not known."
+                },
+                "reason": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Reason for incomplete or unavailable content."
                 }
+              },
+              "required": [
+                "bodyId",
+                "state",
+                "bytes",
+                "reason"
               ],
-              "description": "Complete request body when provided by the browser, or null."
+              "additionalProperties": false,
+              "description": "Request-body capture descriptor."
             },
             "responseBody": {
-              "type": "string",
-              "description": "Complete supported JSON or text response body; empty when the browser exposes metadata but not the body."
-            },
-            "responseBodyAvailable": {
-              "type": "boolean",
-              "description": "Whether responseBody contains the complete body. Redirect hops may be false when CDP cannot retrieve their body."
-            },
-            "responseBodyBase64Encoded": {
-              "type": "boolean",
-              "const": false,
-              "description": "Always false because binary/Base64 response bodies are excluded."
+              "type": "object",
+              "properties": {
+                "bodyId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Page-generation-scoped native body identifier."
+                },
+                "state": {
+                  "type": "string",
+                  "enum": [
+                    "pending",
+                    "available",
+                    "partial",
+                    "unavailable",
+                    "evicted"
+                  ],
+                  "description": "Capture and retention state; available includes an empty complete body."
+                },
+                "bytes": {
+                  "anyOf": [
+                    {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Captured UTF-8 byte length, or null when not known."
+                },
+                "reason": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Reason for incomplete or unavailable content."
+                }
+              },
+              "required": [
+                "bodyId",
+                "state",
+                "bytes",
+                "reason"
+              ],
+              "additionalProperties": false,
+              "description": "Response-body capture descriptor."
             },
             "timestamp": {
               "type": "integer",
               "minimum": 0,
               "maximum": 9007199254740991,
-              "description": "Unix epoch request initiation time in milliseconds."
+              "description": "Request initiation Unix epoch milliseconds."
             },
             "durationMs": {
               "anyOf": [
@@ -146,33 +244,59 @@
                   "type": "null"
                 }
               ],
-              "description": "Request duration in milliseconds, or null when unavailable."
+              "description": "Request duration when known."
+            },
+            "finished": {
+              "type": "boolean",
+              "description": "Whether the network request completed or failed."
+            },
+            "failureReason": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Network failure reason, or null."
             }
           },
           "required": [
             "requestId",
             "url",
+            "urlTruncated",
             "method",
             "resourceType",
             "status",
             "mimeType",
             "requestBody",
             "responseBody",
-            "responseBodyAvailable",
-            "responseBodyBase64Encoded",
             "timestamp",
-            "durationMs"
+            "durationMs",
+            "finished",
+            "failureReason"
           ],
-          "additionalProperties": false,
-          "description": "One captured API request hop and its response metadata/body."
+          "additionalProperties": false
         },
-        "description": "Captured API request hops matching all supplied filters."
+        "description": "One page of metadata; bodies are read with Network.readBody."
+      },
+      "nextCursor": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "Continuation cursor, or null at the end."
       },
       "collectionStartedAt": {
         "type": "integer",
         "minimum": 0,
         "maximum": 9007199254740991,
-        "description": "Unix epoch milliseconds when the current collection generation started."
+        "description": "Current capture generation start time."
       },
       "oldestAvailableAt": {
         "anyOf": [
@@ -185,28 +309,36 @@
             "type": "null"
           }
         ],
-        "description": "Oldest retained request timestamp, or null when no records exist."
+        "description": "Oldest retained request initiation time."
       },
       "evictedCount": {
         "type": "integer",
         "minimum": 0,
         "maximum": 9007199254740991,
-        "description": "Records evicted by TTL or bounded FIFO quotas in this generation."
+        "description": "Request records evicted in this generation."
       },
       "pendingCount": {
         "type": "integer",
         "minimum": 0,
         "maximum": 9007199254740991,
-        "description": "Target API requests still awaiting completion or response-body retrieval."
+        "description": "Requests or body captures still pending."
+      },
+      "unsearchedCount": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991,
+        "description": "Snapshot-wide count whose response body could not be searched completely."
       }
     },
     "required": [
       "pageId",
       "apis",
+      "nextCursor",
       "collectionStartedAt",
       "oldestAvailableAt",
       "evictedCount",
-      "pendingCount"
+      "pendingCount",
+      "unsearchedCount"
     ],
     "additionalProperties": false
   },
@@ -230,7 +362,7 @@
             "type": "string",
             "format": "uuid",
             "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
-            "description": "Target page ID that owns the snapshot."
+            "description": "Page that owns the request records."
           },
           "apis": {
             "type": "array",
@@ -240,11 +372,15 @@
                 "requestId": {
                   "type": "string",
                   "minLength": 1,
-                  "description": "Stable request identifier for this captured request hop."
+                  "description": "Identifier of one captured request hop."
                 },
                 "url": {
                   "type": "string",
-                  "description": "Complete request URL."
+                  "description": "Request URL, limited to a 16 KiB UTF-8 preview."
+                },
+                "urlTruncated": {
+                  "type": "boolean",
+                  "description": "Whether the displayed URL was truncated."
                 },
                 "method": {
                   "type": "string",
@@ -257,7 +393,7 @@
                     "XHR",
                     "Beacon"
                   ],
-                  "description": "Captured web API resource category."
+                  "description": "Captured API resource category."
                 },
                 "status": {
                   "anyOf": [
@@ -270,7 +406,7 @@
                       "type": "null"
                     }
                   ],
-                  "description": "HTTP response status, or null when unavailable."
+                  "description": "HTTP status, or null before it is available."
                 },
                 "mimeType": {
                   "anyOf": [
@@ -281,37 +417,119 @@
                       "type": "null"
                     }
                   ],
-                  "description": "Response MIME type, or null when unavailable."
+                  "description": "Response MIME type, or null when unknown."
                 },
                 "requestBody": {
-                  "anyOf": [
-                    {
-                      "type": "string"
+                  "type": "object",
+                  "properties": {
+                    "bodyId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Page-generation-scoped native body identifier."
                     },
-                    {
-                      "type": "null"
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "pending",
+                        "available",
+                        "partial",
+                        "unavailable",
+                        "evicted"
+                      ],
+                      "description": "Capture and retention state; available includes an empty complete body."
+                    },
+                    "bytes": {
+                      "anyOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Captured UTF-8 byte length, or null when not known."
+                    },
+                    "reason": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Reason for incomplete or unavailable content."
                     }
+                  },
+                  "required": [
+                    "bodyId",
+                    "state",
+                    "bytes",
+                    "reason"
                   ],
-                  "description": "Complete request body when provided by the browser, or null."
+                  "additionalProperties": false,
+                  "description": "Request-body capture descriptor."
                 },
                 "responseBody": {
-                  "type": "string",
-                  "description": "Complete supported JSON or text response body; empty when the browser exposes metadata but not the body."
-                },
-                "responseBodyAvailable": {
-                  "type": "boolean",
-                  "description": "Whether responseBody contains the complete body. Redirect hops may be false when CDP cannot retrieve their body."
-                },
-                "responseBodyBase64Encoded": {
-                  "type": "boolean",
-                  "const": false,
-                  "description": "Always false because binary/Base64 response bodies are excluded."
+                  "type": "object",
+                  "properties": {
+                    "bodyId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Page-generation-scoped native body identifier."
+                    },
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "pending",
+                        "available",
+                        "partial",
+                        "unavailable",
+                        "evicted"
+                      ],
+                      "description": "Capture and retention state; available includes an empty complete body."
+                    },
+                    "bytes": {
+                      "anyOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Captured UTF-8 byte length, or null when not known."
+                    },
+                    "reason": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Reason for incomplete or unavailable content."
+                    }
+                  },
+                  "required": [
+                    "bodyId",
+                    "state",
+                    "bytes",
+                    "reason"
+                  ],
+                  "additionalProperties": false,
+                  "description": "Response-body capture descriptor."
                 },
                 "timestamp": {
                   "type": "integer",
                   "minimum": 0,
                   "maximum": 9007199254740991,
-                  "description": "Unix epoch request initiation time in milliseconds."
+                  "description": "Request initiation Unix epoch milliseconds."
                 },
                 "durationMs": {
                   "anyOf": [
@@ -324,33 +542,59 @@
                       "type": "null"
                     }
                   ],
-                  "description": "Request duration in milliseconds, or null when unavailable."
+                  "description": "Request duration when known."
+                },
+                "finished": {
+                  "type": "boolean",
+                  "description": "Whether the network request completed or failed."
+                },
+                "failureReason": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Network failure reason, or null."
                 }
               },
               "required": [
                 "requestId",
                 "url",
+                "urlTruncated",
                 "method",
                 "resourceType",
                 "status",
                 "mimeType",
                 "requestBody",
                 "responseBody",
-                "responseBodyAvailable",
-                "responseBodyBase64Encoded",
                 "timestamp",
-                "durationMs"
+                "durationMs",
+                "finished",
+                "failureReason"
               ],
-              "additionalProperties": false,
-              "description": "One captured API request hop and its response metadata/body."
+              "additionalProperties": false
             },
-            "description": "Captured API request hops matching all supplied filters."
+            "description": "One page of metadata; bodies are read with Network.readBody."
+          },
+          "nextCursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Continuation cursor, or null at the end."
           },
           "collectionStartedAt": {
             "type": "integer",
             "minimum": 0,
             "maximum": 9007199254740991,
-            "description": "Unix epoch milliseconds when the current collection generation started."
+            "description": "Current capture generation start time."
           },
           "oldestAvailableAt": {
             "anyOf": [
@@ -363,28 +607,36 @@
                 "type": "null"
               }
             ],
-            "description": "Oldest retained request timestamp, or null when no records exist."
+            "description": "Oldest retained request initiation time."
           },
           "evictedCount": {
             "type": "integer",
             "minimum": 0,
             "maximum": 9007199254740991,
-            "description": "Records evicted by TTL or bounded FIFO quotas in this generation."
+            "description": "Request records evicted in this generation."
           },
           "pendingCount": {
             "type": "integer",
             "minimum": 0,
             "maximum": 9007199254740991,
-            "description": "Target API requests still awaiting completion or response-body retrieval."
+            "description": "Requests or body captures still pending."
+          },
+          "unsearchedCount": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Snapshot-wide count whose response body could not be searched completely."
           }
         },
         "required": [
           "pageId",
           "apis",
+          "nextCursor",
           "collectionStartedAt",
           "oldestAvailableAt",
           "evictedCount",
-          "pendingCount"
+          "pendingCount",
+          "unsearchedCount"
         ],
         "additionalProperties": false
       }
@@ -438,5 +690,5 @@
     ],
     "additionalProperties": false
   },
-  "purposeHint": "Describe why you need API response bodies or redirect metadata, e.g., verifying a form submission or extracting dynamic business data"
+  "purposeHint": "Describe why you need to inspect network requests or verify a submission."
 }

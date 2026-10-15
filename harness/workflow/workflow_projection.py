@@ -60,6 +60,9 @@ def workflow_execution_facts(result: Any) -> JsonDict:
     """Extract stable execution facts before a large receipt is offloaded."""
     if not isinstance(result, dict):
         return {"status": "unknown", "workflowId": None, "tool_was_executed": False}
+    captured = result.get("workflowExecution")
+    if isinstance(captured, dict):
+        return copy.deepcopy(captured)
     response = result.get("response")
     response = response if isinstance(response, dict) else {}
     data = response.get("data")
@@ -94,6 +97,44 @@ def workflow_execution_facts(result: Any) -> JsonDict:
         "failedErrorCode": data.get("failedErrorCode") or data.get("failedActionCode")
                            or result.get("failedErrorCode") or details.get("failedActionCode"),
     }
+
+
+def capture_workflow_result(logger, result: dict) -> None:
+    """Persist control data before the model copy can truncate its output."""
+    if result.get("workflowResultRef"):
+        return
+    facts = workflow_execution_facts(result)
+    response = result.get("response") or {}
+    data = response.get("data") if isinstance(response, dict) else None
+    control = {"execution": facts, "outputPresent": isinstance(data, dict) and "output" in data,
+               "output": data.get("output") if isinstance(data, dict) else None,
+               "error": data.get("error") if isinstance(data, dict) else result.get("error")}
+    if logger is not None and hasattr(logger, "storage"):
+        row = logger.storage.save_resource(task_id=logger.task_id, run_id=logger.run_id,
+            resource_type="workflow_execution", logical_path=f"workflow/receipts/{uuid.uuid4().hex}.json",
+            content=control)
+        result["workflowResultRef"] = row["saved_path"]
+    result["workflowExecution"] = facts
+
+
+def workflow_execution_result(result: dict, logger=None) -> dict:
+    """Consumer view; indexed execution data takes precedence over display."""
+    reference = result.get("workflowResultRef")
+    if reference and logger is not None:
+        import json
+        row = logger.storage.read_resource(current_task_id=logger.task_id, resource_uri=reference)
+        if not row:
+            raise ValueError("Workflow control receipt is unavailable; reconcile execution before retry")
+        value = row.get("content_json")
+        value = json.loads(value) if isinstance(value, str) else value
+        if not isinstance(value, dict) or not isinstance(value.get("execution"), dict):
+            raise ValueError("Invalid Workflow control receipt")
+        return value
+    response = result.get("response") or {}
+    data = response.get("data") if isinstance(response, dict) else None
+    return {"execution": workflow_execution_facts(result),
+            "outputPresent": isinstance(data, dict) and "output" in data,
+            "output": data.get("output") if isinstance(data, dict) else None}
 
 
 def project_workflow_receipt(

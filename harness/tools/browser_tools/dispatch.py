@@ -26,7 +26,10 @@ from harness.tools.local_fs import local_fs_read
 from harness.tools.local_fs import local_fs_search
 from harness.tools.local_fs import local_fs_list
 from harness.tools.file_tools import local_fs_batch
-from harness.tools.path_authorization import authorize_tool_call
+from harness.tools.path_authorization import (
+    LOCAL_AUTHORIZATION_DESCRIPTION, LOCAL_AUTHORIZATION_SCHEMA,
+    authorize_local_paths, authorize_tool_call,
+)
 from harness.prompts import read_harness_guide
 from harness.prompts import search_harness_guides
 from harness.observation.page_lifecycle import PageLifecycleTracker
@@ -940,7 +943,7 @@ def _record_workflow_definition_before_dispatch(ctx: ToolContext, receipt: JsonD
 async def _browser_read_selected_skill_resource(ctx: ToolContext) -> JsonDict:
     from harness.skill_builder.resources import read_selected_resource
     return read_selected_resource(ctx.agent.runtime, str(ctx.tool_input.get("path") or ""),
-        offset=ctx.tool_input.get("offset", 0), max_chars=ctx.tool_input.get("max_chars", 16000))
+        offset=ctx.tool_input.get("offset", 0), max_chars=ctx.tool_input.get("max_chars", 16000), task_id=ctx.agent.logger.task_id)
 
 
 @BROWSER_TOOLS.register(
@@ -982,11 +985,12 @@ async def _browser_execute_published_skill_workflow(ctx: ToolContext) -> JsonDic
     catalog = SkillCatalog(
         Path(__file__).resolve().parents[3] / "skills",
         resolve_sqlite_path(getattr(config, "storage_sqlite_path", "harness.db"), worktree),
+        worktree_dir=Path(worktree),
     )
     invocation = None
     invocation_open = False
     try:
-        snapshot = catalog.version_path(skill_id, skill_hash)
+        snapshot = catalog.pin_source(skill_id, skill_hash, task_id=ctx.agent.logger.task_id)
         if snapshot is None:
             return {"status": "skill_version_unavailable", "tool_was_executed": False,
                     "skill": skill_id, "hash": skill_hash}
@@ -1667,6 +1671,18 @@ async def _browser_find_in_axtree(ctx: ToolContext) -> JsonDict:
 )
 async def _browser_await_node_change(ctx: ToolContext) -> JsonDict:
     return await _bt()._await_node_change(ctx.agent, ctx.tool_input)
+
+@BROWSER_TOOLS.register(
+    name="local_fs_authorize",
+    description=LOCAL_AUTHORIZATION_DESCRIPTION,
+    input_schema=LOCAL_AUTHORIZATION_SCHEMA,
+    loop_guard=False,
+    trace_type="local_fs_authorize",
+)
+async def _browser_local_fs_authorize(ctx: ToolContext) -> JsonDict:
+    return await authorize_local_paths(ctx.agent, ctx.tool_input.get("paths"),
+                                       ctx.tool_input.get("mode", "read"))
+
 
 @BROWSER_TOOLS.register(
     name="local_fs_search",

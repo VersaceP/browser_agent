@@ -212,7 +212,7 @@ class NotificationHub:
     async def wait_for(
         self,
         predicate: NotificationPredicate,
-        timeout: float,
+        timeout: Optional[float],
         *,
         replay_window_seconds: Optional[float] = None,
         replay_predicate: Optional[NotificationPredicate] = None,
@@ -293,6 +293,12 @@ class NotificationHub:
         self._dedupe_order.clear()
         self._dedupe_keys.clear()
 
+    def fail_waiters(self, failure: BaseException) -> None:
+        """A terminal transport failure is distinct from user cancellation."""
+        for waiter in list(self._waiters):
+            if not waiter.future.done():
+                waiter.future.set_exception(failure)
+
 
 def _connect_supports_proxy_arg() -> bool:
     try:
@@ -361,6 +367,15 @@ class ABCPClient:
         """Local transport fact only; not proof of Fleet/page availability."""
         return self._ws is not None and not self._closed and self._reader_failure is None
 
+    @property
+    def local_agent_id(self) -> Optional[str]:
+        return self._local_agent_id
+
+    def restore_local_identity(self, identity: str) -> None:
+        """Reuse only a server-issued local identity, never a WS auth claim."""
+        if self.config.transport == "local":
+            self._local_agent_id = identity
+
     async def connect(self) -> None:
         self.connection_details = connection_target(self.config)
         if self.config.transport == "local":
@@ -390,6 +405,9 @@ class ABCPClient:
     def _raise_connect_error(self, exc: BaseException) -> None:
         details = {**self.connection_details, "errorType": type(exc).__name__,
                    "errno": getattr(exc, "errno", None)}
+        http_status = getattr(getattr(exc, "response", None), "status_code", None) or getattr(exc, "status_code", None)
+        if isinstance(http_status, int):
+            details["httpStatus"] = http_status
         # Only local validation errors contain messages we construct ourselves.
         reason = f" ({exc})" if type(exc) is ValueError else ""
         failure = ABCPTransportError(
@@ -432,7 +450,7 @@ class ABCPClient:
         connection = exc.connection_details or self.connection_details
         safe_connection = {
             key: connection[key]
-            for key in ("transport", "endpoint", "source", "instanceId", "stage", "errorType", "errno")
+            for key in ("transport", "endpoint", "source", "instanceId", "stage", "errorType", "errno", "httpStatus")
             if key in connection
         }
         payload: JsonDict = {
@@ -699,12 +717,12 @@ class ABCPClient:
     async def wait_for_notification(
         self,
         predicate: NotificationPredicate,
-        timeout: float,
+        timeout: Optional[float],
         *,
         replay_window_seconds: Optional[float] = None,
         replay_predicate: Optional[NotificationPredicate] = None,
     ) -> Optional[JsonDict]:
-        """Wait up to `timeout` seconds for a notification matching `predicate`.
+        """Wait for a matching notification; None has no time deadline.
 
         Set `replay_window_seconds` to also accept any matching notification
         that arrived in the last N seconds (race-safe for "publish-before-wait").
