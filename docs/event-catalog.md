@@ -22,9 +22,9 @@
 
 | 指标 | 数量 |
 |---|---:|
-| 出站 run event 产生点 | 414 |
-| 出站 run event 类型 | 346 |
-| 动态（非字面量）事件名 | 35 |
+| 出站 run event 产生点 | 430 |
+| 出站 run event 类型 | 361 |
+| 动态（非字面量）事件名 | 39 |
 | 出站 trace 产生点 | 49 |
 | 出站 trace type | 36 |
 | 入站平台事件（目录内） | 43 |
@@ -47,13 +47,13 @@
 
 - 平台源码快照 `abcp-platform/`：commit `6b9647d`（`v0.9.35-25-g6b9647d`，2026-10-07）→ §7 的定义、行号与 Agent 投影
 - 已安装 CLI：`0.9.6-beta`
-- 已安装运行时包：`/Applications/WebCross.app/Contents/Resources/app.asar`（6.7 MB，mtime 2026-10-12 10:52）→ §7 `安装包` 列的证据来源
-- 出站扫描范围：`git ls-files --cached --others --exclude-standard '*.py'` 去掉 `tests/`、`docs/` 与本生成器，共 218 个文件
+- 已安装运行时包：`/Applications/WebCross.app/Contents/Resources/app.asar`（6.7 MB，mtime 2026-10-10 17:23）→ §7 `安装包` 列的证据来源
+- 出站扫描范围：`git ls-files --cached --others --exclude-standard '*.py'` 去掉 `tests/`、`docs/` 与本生成器，共 250 个文件
 
 | run event 产生通道 | 产生点 |
 |---|---:|
-| `logger.write` | 340 |
-| `_log` | 41 |
+| `logger.write` | 355 |
+| `_log` | 42 |
 | `_write_agent_event` | 32 |
 | `log_event=` | 1 |
 
@@ -65,30 +65,30 @@
 | `browser` | 44 |
 | `hitl` | 22 |
 | `vl` | 22 |
+| `workflow` | 22 |
 | `agent` | 21 |
-| `workflow` | 20 |
+| `skill_builder` | 19 |
 | `schema` | 15 |
-| `skill_builder` | 15 |
-| `event` | 12 |
+| `event` | 13 |
 | `{}` | 12 |
 | `memory` | 11 |
 | `auth_fleet` | 10 |
 | `context` | 10 |
 | `axtree` | 9 |
 | `fleet_click_gate` | 9 |
+| `skill` | 7 |
 | `event_type` | 6 |
 | `fast_path` | 6 |
 | `progress` | 6 |
 | `storage` | 6 |
 | `download` | 5 |
+| `local_path` | 5 |
 | `page` | 5 |
 | `runtime` | 5 |
 | `direct_mode` | 4 |
 | `exec` | 4 |
-| `local_path` | 4 |
 | `observation` | 4 |
 | `pacing` | 4 |
-| `skill` | 4 |
 | `task_phase` | 4 |
 | `tool` | 4 |
 | `page_session` | 3 |
@@ -104,23 +104,28 @@
 | `row_ledger` | 2 |
 | `task_state` | 2 |
 | `transport` | 2 |
+| `'coding/observations/' + uuid` | 1 |
 | `'hitl` | 1 |
 | `batch_source` | 1 |
 | `challenge` | 1 |
+| `coding/active-trial` | 1 |
 | `completion_receipt` | 1 |
 | `dismiss_overlay` | 1 |
 | `event_name` | 1 |
 | `event_observer` | 1 |
+| `executor` | 1 |
 | `extension_event` | 1 |
 | `log_event` | 1 |
 | `loop_nudge` | 1 |
 | `microloop` | 1 |
+| `mode + '` | 1 |
 | `numeric_claim_extractor` | 1 |
 | `page_inventory` | 1 |
 | `page_stats` | 1 |
 | `prompt` | 1 |
 | `semantic_terminal` | 1 |
 | `snapshot_diff` | 1 |
+| `source + '` | 1 |
 | `tool_batch` | 1 |
 | `worker` | 1 |
 
@@ -141,49 +146,50 @@
 | `harness/tools/browser_tools/hitl.py` | 12 |
 | `harness/fleet/runtime.py` | 11 |
 | `harness/observation/event_observer.py` | 11 |
+| `harness/skill_builder/browser.py` | 11 |
 | `harness/vl/captcha.py` | 11 |
 | `harness/capabilities/bootstrap.py` | 10 |
-| `harness/skill_builder/browser.py` | 10 |
 | `harness/tools/browser_tools/captcha_autosolve.py` | 8 |
 | `harness/context/compaction.py` | 7 |
+| `harness/skill_builder/session.py` | 7 |
 | `harness/tools/browser_tools/axtree_state.py` | 7 |
-| `harness/tools/browser_tools/bindings.py` | 7 |
 
 ## 4. run event 类型全表（出站）
 
 | 事件类型 | 产生点 | 通道 | 位置 |
 |---|---:|---|---|
+| `'coding/observations/' + uuid.uuid4().hex + '.json'` ⚠动态 | 1 | `logger.write` | `harness/skill_builder/browser.py:217` |
 | `'hitl.wait.' + str(outcome['status'])` ⚠动态 | 1 | `logger.write` | `harness/runtime/hitl.py:688` |
-| `agent.cancelled` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:1028` |
+| `agent.cancelled` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:1030` |
 | `agent.compaction_skipped` | 1 | `_write_agent_event` | `harness/runtime/model_support.py:418` |
-| `agent.error` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:1055` |
+| `agent.error` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:1057` |
 | `agent.final` | 1 | `_write_agent_event` | `harness/agents/browser/agent.py:1399` |
-| `agent.interrupted` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:1131` |
-| `agent.model` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:363` |
-| `agent.model_connection_error` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:242` |
-| `agent.model_degenerate_response` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:221` |
-| `agent.model_input_moderation_refused` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:302` |
-| `agent.model_protocol_error` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:277` |
-| `agent.model_rate_limited` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:1035` |
-| `agent.model_timeout` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:261` |
+| `agent.interrupted` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:1133` |
+| `agent.model` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:365` |
+| `agent.model_connection_error` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:244` |
+| `agent.model_degenerate_response` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:223` |
+| `agent.model_input_moderation_refused` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:304` |
+| `agent.model_protocol_error` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:279` |
+| `agent.model_rate_limited` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:1037` |
+| `agent.model_timeout` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:263` |
 | `agent.multimodal_compaction_deferred` | 1 | `_write_agent_event` | `harness/runtime/model_support.py:449` |
-| `agent.multimodal_images_expired` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:317` |
-| `agent.multimodal_screenshot` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:817` |
-| `agent.step.start` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:169` |
+| `agent.multimodal_images_expired` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:319` |
+| `agent.multimodal_screenshot` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:819` |
+| `agent.step.start` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:171` |
 | `agent.step_cap.reminder` | 1 | `_write_agent_event` | `harness/agents/browser/agent.py:1030` |
 | `agent.step_extension.denied` | 1 | `_write_agent_event` | `harness/agents/browser/agent.py:1211` |
 | `agent.step_extension.granted` | 1 | `_write_agent_event` | `harness/agents/browser/agent.py:1242` |
 | `agent.step_extension.requested` | 1 | `_write_agent_event` | `harness/agents/browser/agent.py:1111` |
-| `agent.truncated_response` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:464` |
-| `artifact.delivery_exported` | 1 | `logger.write` | `main.py:2418` |
-| `artifact.delivery_failed` | 1 | `logger.write` | `main.py:2412` |
+| `agent.truncated_response` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:466` |
+| `artifact.delivery_exported` | 1 | `logger.write` | `main.py:2642` |
+| `artifact.delivery_failed` | 1 | `logger.write` | `main.py:2636` |
 | `auth_fleet.ledger_handler_failed` | 1 | `logger.write` | `harness/tools/browser_tools/hitl.py:1736` |
 | `auth_fleet.lost_handler_failed` | 1 | `logger.write` | `harness/tools/browser_tools/page_create.py:142` |
 | `auth_fleet.operator_reset` | 1 | `logger.write` | `harness/spawner/spawner_slots.py:2700` |
 | `auth_fleet.reconciled` | 1 | `logger.write` | `harness/spawner/spawner_slots.py:1575` |
-| `auth_fleet.resolver_claimed_for_page_create` | 1 | `logger.write` | `harness/tools/browser_tools/bindings.py:891` |
-| `auth_fleet.resolver_relinquished` | 1 | `logger.write` | `harness/tools/browser_tools/bindings.py:935` |
-| `auth_fleet.resolver_relinquished_after_page_create` | 1 | `logger.write` | `harness/tools/browser_tools/bindings.py:965` |
+| `auth_fleet.resolver_claimed_for_page_create` | 1 | `logger.write` | `harness/tools/browser_tools/bindings.py:900` |
+| `auth_fleet.resolver_relinquished` | 1 | `logger.write` | `harness/tools/browser_tools/bindings.py:944` |
+| `auth_fleet.resolver_relinquished_after_page_create` | 1 | `logger.write` | `harness/tools/browser_tools/bindings.py:974` |
 | `auth_fleet.session_release_conflict` | 1 | `logger.write` | `harness/spawner/spawner_core.py:1950` |
 | `auth_fleet.session_released` | 1 | `logger.write` | `harness/spawner/spawner_slots.py:2601` |
 | `auth_fleet.verified_record` | 1 | `logger.write` | `harness/spawner/spawner_slots.py:2571` |
@@ -198,84 +204,86 @@
 | `axtree.target_resolution_fallback` | 1 | `logger.write` | `harness/tools/browser_tools/axtree_state.py:966` |
 | `batch_source.materialized` | 1 | `logger.write` | `harness/task_control/cohorts.py:661` |
 | `browser.bootstrap` | 1 | `logger.write` | `harness/agents/browser/agent.py:302` |
-| `browser.call.arguments_prepared` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:538` |
-| `browser.call.arguments_repaired` | 2 | `logger.write` | `harness/tools/browser_tools/capability.py:241`, `harness/tools/browser_tools/capability.py:393` |
-| `browser.call.captcha_auto_solved` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:611` |
-| `browser.call.contract_violation` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:401` |
-| `browser.call.cross_task_memory_rejected` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:412` |
-| `browser.call.dialog_rejected` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:483` |
+| `browser.call.arguments_prepared` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:539` |
+| `browser.call.arguments_repaired` | 2 | `logger.write` | `harness/tools/browser_tools/capability.py:242`, `harness/tools/browser_tools/capability.py:394` |
+| `browser.call.captcha_auto_solved` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:612` |
+| `browser.call.contract_violation` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:402` |
+| `browser.call.cross_task_memory_rejected` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:413` |
+| `browser.call.dialog_rejected` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:484` |
 | `browser.call.dom_get_img_output_normalized` | 1 | `logger.write` | `harness/tools/browser_tools/validation.py:508` |
-| `browser.call.fleet_auth_gated` | 3 | `logger.write` | `harness/tools/browser_tools/capability.py:456`, `harness/tools/browser_tools/capability.py:595`, `harness/tools/browser_tools/capability.py:623` |
-| `browser.call.fleet_binding_rejected` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:427` |
-| `browser.call.internal` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:1708` |
-| `browser.call.lifecycle_gated` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:472` |
-| `browser.call.navigation_context_rejected` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:260` |
-| `browser.call.page_binding_rejected` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:440` |
-| `browser.call.params_error` | 2 | `logger.write` | `harness/tools/browser_tools/capability.py:200`, `harness/tools/browser_tools/capability.py:493` |
-| `browser.call.purpose_added` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:529` |
-| `browser.call.rejected` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:219` |
-| `browser.call.result` | 2 | `logger.write` | `harness/tools/browser_tools/capability.py:1151`, `harness/tools/browser_tools/capability.py:1739` |
-| `browser.call.schema_rejected` | 2 | `logger.write` | `harness/tools/browser_tools/capability.py:236`, `harness/tools/browser_tools/capability.py:558` |
-| `browser.call.screenshot_output_normalized` | 2 | `logger.write` | `harness/tools/browser_tools/capability.py:272`, `harness/tools/browser_tools/capability.py:1457` |
+| `browser.call.fleet_auth_gated` | 3 | `logger.write` | `harness/tools/browser_tools/capability.py:457`, `harness/tools/browser_tools/capability.py:596`, `harness/tools/browser_tools/capability.py:624` |
+| `browser.call.fleet_binding_rejected` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:428` |
+| `browser.call.internal` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:1728` |
+| `browser.call.lifecycle_gated` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:473` |
+| `browser.call.navigation_context_rejected` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:261` |
+| `browser.call.page_binding_rejected` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:441` |
+| `browser.call.params_error` | 2 | `logger.write` | `harness/tools/browser_tools/capability.py:201`, `harness/tools/browser_tools/capability.py:494` |
+| `browser.call.purpose_added` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:530` |
+| `browser.call.rejected` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:220` |
+| `browser.call.result` | 2 | `logger.write` | `harness/tools/browser_tools/capability.py:1166`, `harness/tools/browser_tools/capability.py:1759` |
+| `browser.call.schema_rejected` | 2 | `logger.write` | `harness/tools/browser_tools/capability.py:237`, `harness/tools/browser_tools/capability.py:559` |
+| `browser.call.screenshot_output_normalized` | 2 | `logger.write` | `harness/tools/browser_tools/capability.py:273`, `harness/tools/browser_tools/capability.py:1474` |
 | `browser.call.select_replay_blocked` | 1 | `logger.write` | `harness/tools/browser_tools/navigate.py:2509` |
-| `browser.call.stale_axtree_target` | 2 | `logger.write` | `harness/tools/browser_tools/capability.py:514`, `harness/tools/browser_tools/capability.py:1498` |
+| `browser.call.stale_axtree_target` | 2 | `logger.write` | `harness/tools/browser_tools/capability.py:515`, `harness/tools/browser_tools/capability.py:1515` |
 | `browser.task_checkpoint` | 1 | `logger.write` | `harness/tools/browser_tools/dispatch.py:1484` |
 | `browser.task_review` | 1 | `_write_agent_event` | `harness/agents/browser/control.py:310` |
-| `browser.task_review.checkpoint` | 1 | `logger.write` | `harness/agents/browser/review/task.py:1410` |
+| `browser.task_review.checkpoint` | 1 | `logger.write` | `harness/agents/browser/review/task.py:1405` |
 | `browser.task_review.deferred` | 1 | `_write_agent_event` | `harness/agents/browser/control.py:243` |
-| `browser.task_review.model` | 1 | `logger.write` | `harness/agents/browser/review/task.py:1471` |
-| `browser.task_review.session_unavailable` | 2 | `logger.write` | `harness/agents/browser/review/task.py:1417`, `harness/agents/browser/review/task.py:1436` |
+| `browser.task_review.model` | 1 | `logger.write` | `harness/agents/browser/review/task.py:1466` |
+| `browser.task_review.session_unavailable` | 2 | `logger.write` | `harness/agents/browser/review/task.py:1412`, `harness/agents/browser/review/task.py:1431` |
 | `browser.task_review.skipped` | 2 | `_write_agent_event` | `harness/agents/browser/control.py:205`, `harness/agents/browser/control.py:255` |
 | `browser.task_review.start` | 1 | `_write_agent_event` | `harness/agents/browser/control.py:298` |
-| `browser.task_review.tool` | 1 | `logger.write` | `harness/agents/browser/review/task.py:1587` |
-| `browser.task_review.verdict` | 1 | `logger.write` | `harness/agents/browser/review/task.py:1549` |
+| `browser.task_review.tool` | 1 | `logger.write` | `harness/agents/browser/review/task.py:1582` |
+| `browser.task_review.verdict` | 1 | `logger.write` | `harness/agents/browser/review/task.py:1544` |
 | `browser.tool.routing_rejected` | 1 | `logger.write` | `harness/tools/browser_tools/dispatch.py:813` |
-| `browser.transport.fatal` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:918` |
+| `browser.transport.fatal` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:923` |
 | `challenge.navigation_cleared` | 1 | `logger.write` | `harness/tools/browser_tools/navigate.py:1131` |
+| `coding/active-trial.json` | 1 | `logger.write` | `harness/skill_builder/runtime.py:200` |
 | `collect_items.result` | 2 | `logger.write` | `harness/tools/browser_tools/composites/collect_items.py:792`, `harness/tools/browser_tools/composites/collect_items.py:1279` |
 | `completion_receipt.persisted` | 1 | `logger.write` | `harness/results/completion_receipt.py:618` |
 | `content_completeness.artifact_region_credit` | 1 | `logger.write` | `harness/tools/browser_tools/record_extraction.py:143` |
 | `content_completeness.observed` | 1 | `logger.write` | `harness/tools/browser_tools/navigate.py:1005` |
-| `context.compacted` | 1 | `logger.write` | `harness/context/compaction.py:1177` |
-| `context.compaction_failed` | 1 | `logger.write` | `harness/context/compaction.py:1128` |
-| `context.compaction_fallback` | 1 | `logger.write` | `harness/context/compaction.py:1050` |
-| `context.compaction_rejected` | 1 | `logger.write` | `harness/context/compaction.py:1151` |
+| `context.compacted` | 1 | `logger.write` | `harness/context/compaction.py:1183` |
+| `context.compaction_failed` | 1 | `logger.write` | `harness/context/compaction.py:1134` |
+| `context.compaction_fallback` | 1 | `logger.write` | `harness/context/compaction.py:1056` |
+| `context.compaction_rejected` | 1 | `logger.write` | `harness/context/compaction.py:1157` |
 | `context.compaction_requested` | 1 | `logger.write` | `harness/agents/browser/agent.py:1059` |
-| `context.compaction_skipped` | 3 | `logger.write` | `harness/context/compaction.py:966`, `harness/context/compaction.py:994`, `harness/context/compaction.py:1098` |
-| `context.snapshot.failed` | 1 | `logger.write` | `harness/agents/browser/loop.py:1126` |
+| `context.compaction_skipped` | 3 | `logger.write` | `harness/context/compaction.py:972`, `harness/context/compaction.py:1000`, `harness/context/compaction.py:1104` |
+| `context.snapshot.failed` | 1 | `logger.write` | `harness/agents/browser/loop.py:1128` |
 | `context.snapshot.saved` | 1 | `logger.write` | `harness/utils.py:1153` |
 | `direct_mode.amendment_registered` | 1 | `logger.write` | `harness/agents/browser/task.py:282` |
 | `direct_mode.assignment_started` | 1 | `logger.write` | `harness/agents/browser/task.py:198` |
-| `direct_mode.final` | 1 | `logger.write` | `main.py:2451` |
+| `direct_mode.final` | 1 | `logger.write` | `main.py:2675` |
 | `direct_mode.task_registered` | 1 | `logger.write` | `harness/agents/browser/task.py:434` |
 | `dismiss_overlay.result` | 1 | `logger.write` | `harness/tools/browser_tools/visual.py:81` |
 | `download.event_dropped` | 1 | `logger.write` | `harness/tools/browser_tools/downloads.py:1072` |
 | `download.event_observed` | 1 | `logger.write` | `harness/tools/browser_tools/downloads.py:1096` |
-| `download.operation_reused` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:680` |
+| `download.operation_reused` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:681` |
 | `download.reuse_invalidated` | 1 | `logger.write` | `harness/tools/browser_tools/downloads.py:569` |
-| `download.timeout_reconciled` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:715` |
-| `event` ⚠动态 | 12 | `logger.write` | `harness/agents/browser/agent.py:395`, `harness/fleet/runtime.py:1296`, `harness/observation/event_observer.py:331`, `harness/spawner/spawner_core.py:395` 等 12 处 |
+| `download.timeout_reconciled` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:716` |
+| `event` ⚠动态 | 13 | `logger.write` | `harness/agents/browser/agent.py:395`, `harness/fleet/runtime.py:1340`, `harness/observation/event_observer.py:331`, `harness/skill_runtime/state.py:42` 等 13 处 |
 | `event_name` ⚠动态 | 1 | `logger.write` | `harness/tools/browser_tools/navigate.py:977` |
 | `event_observer.error` | 1 | `logger.write` | `harness/observation/event_observer.py:132` |
 | `event_type` ⚠动态 | 6 | `logger.write` | `harness/agents/browser/agent.py:170`, `harness/agents/browser/task.py:29`, `harness/evidence/extraction_artifacts.py:319`, `harness/tools/browser_tools/visual.py:637` 等 6 处 |
-| `exec.segment.projected` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:1264` |
-| `exec.segment.projection_skipped` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:1256` |
-| `exec.segment.result` | 2 | `logger.write` | `harness/tools/browser_tools/capability.py:1356`, `harness/tools/browser_tools/capability.py:1384` |
-| `extension_event` ⚠动态 | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:998` |
+| `exec.segment.projected` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:1281` |
+| `exec.segment.projection_skipped` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:1273` |
+| `exec.segment.result` | 2 | `logger.write` | `harness/tools/browser_tools/capability.py:1373`, `harness/tools/browser_tools/capability.py:1401` |
+| `executor.operation.started` | 1 | `logger.write` | `harness/skill_runtime/executor.py:53` |
+| `extension_event` ⚠动态 | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:1000` |
 | `fast_path.replan_checkpoint` | 1 | `logger.write` | `harness/task_control/replan.py:508` |
 | `fast_path.replan_checkpoint_business_contract_unavailable` | 1 | `logger.write` | `harness/task_control/replan.py:617` |
 | `fast_path.replan_checkpoint_invalidated` | 1 | `logger.write` | `harness/task_control/replan.py:183` |
 | `fast_path.replan_checkpoint_predecessor_mismatch` | 2 | `logger.write` | `harness/task_control/replan.py:293`, `harness/task_control/replan.py:309` |
 | `fast_path.replan_checkpoint_progress_mismatch` | 1 | `logger.write` | `harness/task_control/replan.py:380` |
-| `fleet_click_gate.acquired` | 1 | `_log` | `harness/fleet/runtime.py:912` |
+| `fleet_click_gate.acquired` | 1 | `_log` | `harness/fleet/runtime.py:956` |
 | `fleet_click_gate.disabled` | 1 | `logger.write` | `harness/spawner/spawner_core.py:182` |
-| `fleet_click_gate.outcome` | 2 | `_log` | `harness/fleet/runtime.py:2010`, `harness/fleet/runtime.py:2048` |
-| `fleet_click_gate.reconciliation_error` | 2 | `_log` | `harness/fleet/runtime.py:1927`, `harness/fleet/runtime.py:1964` |
-| `fleet_click_gate.redirected_to_auth_barrier` | 1 | `_log` | `harness/fleet/runtime.py:1462` |
-| `fleet_click_gate.rejected` | 1 | `_log` | `harness/fleet/runtime.py:891` |
-| `fleet_click_gate.released` | 1 | `_log` | `harness/fleet/runtime.py:762` |
+| `fleet_click_gate.outcome` | 2 | `_log` | `harness/fleet/runtime.py:2057`, `harness/fleet/runtime.py:2095` |
+| `fleet_click_gate.reconciliation_error` | 2 | `_log` | `harness/fleet/runtime.py:1974`, `harness/fleet/runtime.py:2011` |
+| `fleet_click_gate.redirected_to_auth_barrier` | 1 | `_log` | `harness/fleet/runtime.py:1506` |
+| `fleet_click_gate.rejected` | 1 | `_log` | `harness/fleet/runtime.py:935` |
+| `fleet_click_gate.released` | 1 | `_log` | `harness/fleet/runtime.py:806` |
 | `hitl.auto_request_pause` | 1 | `logger.write` | `harness/tools/browser_tools/hitl.py:1304` |
-| `hitl.feedback_model_request` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:196` |
+| `hitl.feedback_model_request` | 1 | `_write_agent_event` | `harness/agents/browser/loop.py:198` |
 | `hitl.feedback_received` | 1 | `logger.write` | `harness/tools/browser_tools/hitl.py:1888` |
 | `hitl.input.failed` | 1 | `logger.write` | `harness/runtime/hitl.py:663` |
 | `hitl.operator_input_received` | 1 | `logger.write` | `harness/runtime/hitl.py:653` |
@@ -292,14 +300,15 @@
 | `hitl.wait.stale_pause_deadlock` | 2 | `logger.write` | `harness/runtime/hitl.py:864`, `harness/runtime/hitl.py:1056` |
 | `hitl.wait.start` | 1 | `logger.write` | `harness/runtime/hitl.py:736` |
 | `hitl.wait.timeout` | 1 | `logger.write` | `harness/runtime/hitl.py:830` |
-| `local_path.access_intent.preflight` | 1 | `_log` | `harness/tools/path_authorization.py:309` |
-| `local_path.authorization.denied` | 1 | `_log` | `harness/tools/path_authorization.py:198` |
-| `local_path.authorization.granted` | 1 | `_log` | `harness/tools/path_authorization.py:207` |
-| `local_path.authorization.requested` | 1 | `_log` | `harness/tools/path_authorization.py:187` |
+| `local_path.access_intent.preflight` | 1 | `_log` | `harness/tools/path_authorization.py:325` |
+| `local_path.authorization.denied` | 1 | `_log` | `harness/tools/path_authorization.py:214` |
+| `local_path.authorization.granted` | 1 | `_log` | `harness/tools/path_authorization.py:223` |
+| `local_path.authorization.inherited` | 1 | `_log` | `harness/tools/path_authorization.py:81` |
+| `local_path.authorization.requested` | 1 | `_log` | `harness/tools/path_authorization.py:203` |
 | `log_event` ⚠动态 | 1 | `_log` | `harness/observation/event_observer.py:181` |
 | `loop_guard.observed` | 1 | `logger.write` | `harness/tools/loop_guard.py:139` |
 | `loop_guard.spend_limit` | 1 | `logger.write` | `harness/tools/loop_guard.py:111` |
-| `loop_nudge.detected` | 1 | `logger.write` | `harness/agents/browser/loop.py:780` |
+| `loop_nudge.detected` | 1 | `logger.write` | `harness/agents/browser/loop.py:782` |
 | `memory.bootstrap` | 1 | `logger.write` | `harness/agents/browser/agent.py:378` |
 | `memory.bootstrap.foreign_context` | 1 | `logger.write` | `harness/agents/browser/agent.py:356` |
 | `memory.bootstrap.get_failed` | 1 | `logger.write` | `harness/agents/browser/agent.py:345` |
@@ -310,6 +319,7 @@
 | `memory.heartbeat.stop_failed` | 1 | `_write_agent_event` | `harness/agents/browser/agent.py:489` |
 | `memory.terminal_checkpoint.failed` | 3 | `logger.write` | `harness/spawner/spawner_worker.py:251`, `harness/spawner/spawner_worker.py:265`, `harness/spawner/spawner_worker.py:275` |
 | `microloop.telemetry` | 1 | `logger.write` | `harness/tools/browser_tools/auto_intercept.py:113` |
+| `mode + '.session.final'` ⚠动态 | 1 | `logger.write` | `harness/skill_runtime/cli.py:103` |
 | `numeric_claim_extractor.call` | 1 | `logger.write` | `harness/results/numeric_facts.py:684` |
 | `observation.watch_closed` | 1 | `_log` | `harness/tools/browser_tools/observation_view.py:298` |
 | `observation.watch_events_delivered` | 1 | `_log` | `harness/tools/browser_tools/observation_view.py:414` |
@@ -328,7 +338,7 @@
 | `page_session.record_failed` | 1 | `logger.write` | `harness/observation/page_session.py:693` |
 | `page_session.recorded` | 1 | `logger.write` | `harness/observation/page_session.py:686` |
 | `page_session.render_failed` | 1 | `logger.write` | `harness/observation/page_session.py:765` |
-| `page_stats.detected` | 1 | `logger.write` | `harness/agents/browser/loop.py:757` |
+| `page_stats.detected` | 1 | `logger.write` | `harness/agents/browser/loop.py:759` |
 | `progress.history_navigation_unverified` | 1 | `logger.write` | `harness/tools/browser_tools/navigate.py:1224` |
 | `progress.mandatory_recovery_credit_used` | 1 | `logger.write` | `harness/tools/browser_tools/progress_obs.py:343` |
 | `progress.observed` | 1 | `logger.write` | `harness/tools/browser_tools/progress_obs.py:384` |
@@ -339,50 +349,57 @@
 | `repair.visual_evidence_abandoned` | 1 | `logger.write` | `harness/tools/browser_tools/record_extraction.py:223` |
 | `repair.visual_evidence_satisfied` | 1 | `logger.write` | `harness/tools/browser_tools/visual.py:363` |
 | `repair.visual_page_rejected` | 1 | `logger.write` | `harness/tools/browser_tools/visual.py:449` |
-| `resume.instruction_received` | 1 | `logger.write` | `main.py:2128` |
-| `resume.projection_built` | 1 | `logger.write` | `main.py:2225` |
-| `resume.started` | 1 | `logger.write` | `main.py:2207` |
+| `resume.instruction_received` | 1 | `logger.write` | `main.py:2352` |
+| `resume.projection_built` | 1 | `logger.write` | `main.py:2449` |
+| `resume.started` | 1 | `logger.write` | `main.py:2431` |
 | `row_ledger.error` | 1 | `logger.write` | `harness/spawner/spawner_worker.py:217` |
 | `row_ledger.recorded` | 1 | `logger.write` | `harness/spawner/spawner_worker.py:222` |
-| `runtime.evaluate.prepared` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:294` |
-| `runtime.evaluate.rejected` | 2 | `logger.write` | `harness/tools/browser_tools/capability.py:286`, `harness/tools/browser_tools/capability.py:1475` |
+| `runtime.evaluate.prepared` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:295` |
+| `runtime.evaluate.rejected` | 2 | `logger.write` | `harness/tools/browser_tools/capability.py:287`, `harness/tools/browser_tools/capability.py:1492` |
 | `runtime.evaluate.trusted_collection_template` | 1 | `logger.write` | `harness/tools/browser_tools/runtime_eval.py:85` |
-| `runtime.evaluate.world_evidence_degraded` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:806` |
+| `runtime.evaluate.world_evidence_degraded` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:807` |
 | `schema.bootstrap.cached` | 3 | `logger.write` | `harness/capabilities/bootstrap.py:124`, `harness/capabilities/bootstrap.py:144`, `harness/capabilities/bootstrap.py:170` |
 | `schema.bootstrap.done` | 1 | `logger.write` | `harness/capabilities/bootstrap.py:227` |
 | `schema.bootstrap.failed` | 3 | `logger.write` | `harness/capabilities/bootstrap.py:77`, `harness/capabilities/bootstrap.py:206`, `harness/capabilities/bootstrap.py:254` |
 | `schema.bootstrap.lock_timeout` | 1 | `logger.write` | `harness/capabilities/bootstrap.py:156` |
 | `schema.bootstrap.timing` | 1 | `logger.write` | `harness/capabilities/bootstrap.py:278` |
 | `schema.bundle.loaded` | 1 | `logger.write` | `harness/capabilities/schema_loader.py:171` |
-| `schema.bundle.reused` | 1 | `logger.write` | `harness/spawner/spawner_worker.py:1209` |
-| `schema.bundle.stale_revision` | 1 | `logger.write` | `harness/spawner/spawner_worker.py:1198` |
+| `schema.bundle.reused` | 1 | `logger.write` | `harness/spawner/spawner_worker.py:1210` |
+| `schema.bundle.stale_revision` | 1 | `logger.write` | `harness/spawner/spawner_worker.py:1199` |
 | `schema.contract.fallback` | 1 | `logger.write` | `harness/capabilities/bootstrap.py:296` |
 | `schema.describeAction.error` | 1 | `logger.write` | `harness/capabilities/schema_loader.py:136` |
 | `schema.describeAction.stale_catalog` | 1 | `logger.write` | `harness/capabilities/schema_loader.py:146` |
-| `semantic_terminal.counterevidence` | 1 | `logger.write` | `harness/spawner/spawner_worker.py:720` |
+| `semantic_terminal.counterevidence` | 1 | `logger.write` | `harness/spawner/spawner_worker.py:721` |
+| `skill.contract.bound` | 1 | `logger.write` | `harness/skill_runtime/session.py:197` |
 | `skill.fast_path.repair_fallback` | 1 | `logger.write` | `harness/tools/browser_tools/record_extraction.py:221` |
 | `skill.invocation.result` | 1 | `logger.write` | `harness/tools/browser_tools/dispatch.py:1046` |
 | `skill.invocation.started` | 1 | `logger.write` | `harness/tools/browser_tools/dispatch.py:1032` |
-| `skill.workflow.scope_rejected` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:367` |
-| `skill_builder.base.current_copy` | 1 | `logger.write` | `harness/skill_builder/session.py:173` |
-| `skill_builder.browser.call` | 1 | `logger.write` | `harness/skill_builder/browser.py:201` |
-| `skill_builder.file.written` | 1 | `logger.write` | `harness/skill_builder/session.py:243` |
-| `skill_builder.fleet.close_failed` | 1 | `logger.write` | `harness/skill_builder/browser.py:75` |
-| `skill_builder.fleet.closed` | 1 | `logger.write` | `harness/skill_builder/browser.py:72` |
-| `skill_builder.model_usage` | 1 | `logger.write` | `harness/skill_builder/session.py:414` |
-| `skill_builder.page.authorization` | 1 | `logger.write` | `harness/skill_builder/browser.py:131` |
-| `skill_builder.page.created` | 1 | `logger.write` | `harness/skill_builder/browser.py:168` |
-| `skill_builder.platform.capabilities` | 1 | `logger.write` | `harness/skill_builder/browser.py:96` |
-| `skill_builder.platform.registration` | 1 | `logger.write` | `harness/skill_builder/browser.py:90` |
-| `skill_builder.started` | 1 | `logger.write` | `harness/skill_builder/session.py:187` |
-| `skill_builder.tool` | 1 | `logger.write` | `harness/skill_builder/session.py:478` |
+| `skill.orchestrator.tool` | 1 | `logger.write` | `harness/skill_runtime/session.py:711` |
+| `skill.trial.failed` | 1 | `logger.write` | `harness/skill_builder/runtime.py:258` |
+| `skill.workflow.scope_rejected` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:368` |
+| `skill_builder.analysis.bound` | 1 | `logger.write` | `harness/skill_builder/session.py:341` |
+| `skill_builder.base.current_copy` | 1 | `logger.write` | `harness/skill_builder/session.py:293` |
+| `skill_builder.base.owner_copy` | 1 | `logger.write` | `harness/skill_builder/session.py:172` |
+| `skill_builder.browser.call` | 1 | `logger.write` | `harness/skill_builder/browser.py:215` |
+| `skill_builder.file.written` | 1 | `logger.write` | `harness/skill_builder/session.py:414` |
+| `skill_builder.fleet.close_failed` | 1 | `logger.write` | `harness/skill_builder/browser.py:76` |
+| `skill_builder.fleet.closed` | 1 | `logger.write` | `harness/skill_builder/browser.py:73` |
+| `skill_builder.model_usage` | 1 | `logger.write` | `harness/skill_builder/session.py:685` |
+| `skill_builder.page.authorization` | 1 | `logger.write` | `harness/skill_builder/browser.py:140` |
+| `skill_builder.page.created` | 1 | `logger.write` | `harness/skill_builder/browser.py:177` |
+| `skill_builder.platform.capabilities` | 1 | `logger.write` | `harness/skill_builder/browser.py:97` |
+| `skill_builder.platform.registration` | 1 | `logger.write` | `harness/skill_builder/browser.py:91` |
+| `skill_builder.started` | 1 | `logger.write` | `harness/skill_builder/session.py:312` |
+| `skill_builder.tool` | 1 | `logger.write` | `harness/skill_builder/session.py:768` |
 | `skill_builder.transport` | 1 | `logger.write` | `harness/skill_builder/browser.py:45` |
-| `skill_builder.trial.result` | 1 | `logger.write` | `harness/skill_builder/browser.py:308` |
-| `skill_builder.trial.start` | 1 | `logger.write` | `harness/skill_builder/browser.py:267` |
-| `snapshot_diff.detected` | 1 | `logger.write` | `harness/agents/browser/loop.py:765` |
+| `skill_builder.trial.result` | 1 | `logger.write` | `harness/skill_builder/browser.py:321` |
+| `skill_builder.trial.start` | 1 | `logger.write` | `harness/skill_builder/browser.py:280` |
+| `skill_builder.workflow.imported` | 1 | `logger.write` | `harness/workflow_mode/artifacts.py:77` |
+| `snapshot_diff.detected` | 1 | `logger.write` | `harness/agents/browser/loop.py:767` |
+| `source + '.model_usage'` ⚠动态 | 1 | `logger.write` | `harness/skill_runtime/usage.py:16` |
 | `spawner.browser.failure_cleanup.cancel_suppressed` | 1 | `logger.write` | `harness/spawner/spawner_worker.py:302` |
 | `spawner.browser.failure_cleanup.failed` | 1 | `logger.write` | `harness/spawner/spawner_worker.py:308` |
-| `spawner.browser.result` | 2 | `logger.write` | `harness/spawner/spawner_worker.py:910`, `harness/spawner/spawner_worker.py:1147` |
+| `spawner.browser.result` | 2 | `logger.write` | `harness/spawner/spawner_worker.py:911`, `harness/spawner/spawner_worker.py:1148` |
 | `spawner.browser.spawn` | 1 | `logger.write` | `harness/spawner/spawner_core.py:2105` |
 | `spawner.browser.start_rejected` | 4 | `logger.write` | `harness/spawner/spawner_core.py:1410`, `harness/spawner/spawner_core.py:1416`, `harness/spawner/spawner_core.py:1451`, `harness/spawner/spawner_core.py:1457` |
 | `spawner.browser_context.persist_failed` | 2 | `logger.write` | `harness/spawner/spawner_core.py:1113`, `harness/spawner/spawner_registry.py:849` |
@@ -432,11 +449,11 @@
 | `spawner.task_session_binding.operator_reset` | 1 | `logger.write` | `harness/spawner/spawner_core.py:566` |
 | `spawner.task_session_binding.write_failed` | 1 | `logger.write` | `harness/spawner/spawner_core.py:629` |
 | `storage.download_registration_failed` | 1 | `logger.write` | `harness/tools/browser_tools/downloads.py:280` |
-| `storage.dual_verify` | 2 | `logger.write` | `main.py:1123`, `main.py:1153` |
+| `storage.dual_verify` | 2 | `logger.write` | `main.py:1322`, `main.py:1352` |
 | `storage.external_file_unregistered` | 1 | `logger.write` | `harness/agents/browser/agent.py:887` |
-| `storage.revision_conflict` | 2 | `logger.write` | `main.py:1122`, `main.py:1150` |
-| `task.fleet_reference.bound` | 1 | `logger.write` | `main.py:2307` |
-| `task.fleet_reference.rejected` | 2 | `logger.write` | `main.py:2286`, `main.py:2299` |
+| `storage.revision_conflict` | 2 | `logger.write` | `main.py:1321`, `main.py:1349` |
+| `task.fleet_reference.bound` | 1 | `logger.write` | `main.py:2531` |
+| `task.fleet_reference.rejected` | 2 | `logger.write` | `main.py:2510`, `main.py:2523` |
 | `task_phase.artifacts_revalidated` | 1 | `logger.write` | `harness/task_control/revalidate.py:129` |
 | `task_phase.blocked_by_dependency` | 2 | `logger.write` | `harness/task_control/phase_lifecycle.py:1220`, `harness/task_control/phase_lifecycle.py:1351` |
 | `task_phase.exhausted` | 1 | `logger.write` | `harness/task_control/phase_lifecycle.py:1321` |
@@ -444,10 +461,10 @@
 | `task_plan.versioned` | 1 | `logger.write` | `harness/task_control/plan_validation.py:2604` |
 | `task_state.initialized` | 1 | `logger.write` | `harness/task_control/plan_validation.py:2800` |
 | `task_state.resume_prepared` | 1 | `logger.write` | `harness/task_control/phase_lifecycle.py:960` |
-| `tool.direct_capability_wrapped` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:145` |
-| `tool.error` | 2 | `logger.write` | `harness/tools/browser_tools/capability.py:160`, `harness/tools/browser_tools/dispatch.py:802` |
+| `tool.direct_capability_wrapped` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:146` |
+| `tool.error` | 2 | `logger.write` | `harness/tools/browser_tools/capability.py:161`, `harness/tools/browser_tools/dispatch.py:802` |
 | `tool.final_answer` | 1 | `logger.write` | `harness/tools/browser_tools/dispatch.py:1534` |
-| `tool_batch.deferred` | 1 | `logger.write` | `harness/agents/browser/loop.py:906` |
+| `tool_batch.deferred` | 1 | `logger.write` | `harness/agents/browser/loop.py:908` |
 | `tool_result.model_visible` | 1 | `logger.write` | `harness/runtime/model_support.py:765` |
 | `tool_result.offloaded` | 1 | `logger.write` | `harness/context/offload.py:577` |
 | `tool_result.preserve_failed` | 1 | `logger.write` | `harness/context/offload.py:448` |
@@ -474,19 +491,21 @@
 | `vl.reality_check.persist_failed` | 1 | `logger.write` | `harness/tools/browser_tools/visual.py:1463` |
 | `vl.visual_recovery_hint` | 1 | `logger.write` | `harness/tools/browser_tools/visual.py:831` |
 | `vl.visual_verify` | 1 | `logger.write` | `harness/tools/browser_tools/visual.py:643` |
-| `worker.failure_trace_save_failed` | 1 | `logger.write` | `harness/spawner/spawner_worker.py:998` |
-| `workflow.auth_fence.before` | 2 | `_log`, `logger.write` | `harness/tools/browser_tools/bindings.py:626`, `harness/workflow/workflow_auth_fence.py:74` |
-| `workflow.auth_generation_changed` | 3 | `_log`, `logger.write` | `harness/tools/browser_tools/bindings.py:631`, `harness/tools/browser_tools/bindings.py:750`, `harness/workflow/workflow_auth_fence.py:106` |
+| `worker.failure_trace_save_failed` | 1 | `logger.write` | `harness/spawner/spawner_worker.py:999` |
+| `workflow.auth_fence.before` | 2 | `_log`, `logger.write` | `harness/tools/browser_tools/bindings.py:635`, `harness/workflow/workflow_auth_fence.py:74` |
+| `workflow.auth_generation_changed` | 3 | `_log`, `logger.write` | `harness/tools/browser_tools/bindings.py:640`, `harness/tools/browser_tools/bindings.py:759`, `harness/workflow/workflow_auth_fence.py:106` |
+| `workflow.builder.notification` | 1 | `logger.write` | `harness/workflow_mode/session.py:197` |
 | `workflow.definition.prepared` | 1 | `logger.write` | `harness/tools/browser_tools/dispatch.py:924` |
 | `workflow.definition.used` | 4 | `logger.write` | `harness/tools/browser_tools/dispatch.py:1104`, `harness/tools/browser_tools/dispatch.py:1153`, `harness/tools/browser_tools/dispatch.py:1289`, `harness/tools/browser_tools/dispatch.py:1319` |
-| `workflow.execute.rejected` | 2 | `logger.write` | `harness/tools/browser_tools/capability.py:378`, `harness/tools/browser_tools/capability.py:388` |
-| `workflow.execute.runtime_disabled` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:350` |
-| `workflow.hitl_barrier.claimed_by_event_observer` | 1 | `_log` | `harness/fleet/runtime.py:1189` |
+| `workflow.execute.rejected` | 2 | `logger.write` | `harness/tools/browser_tools/capability.py:379`, `harness/tools/browser_tools/capability.py:389` |
+| `workflow.execute.runtime_disabled` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:351` |
+| `workflow.hitl_barrier.claimed_by_event_observer` | 1 | `_log` | `harness/fleet/runtime.py:1233` |
 | `workflow.hitl_barrier.event_bridge_error` | 1 | `_log` | `harness/observation/event_observer.py:246` |
 | `workflow.hitl_barrier.event_ignored` | 1 | `_log` | `harness/observation/event_observer.py:255` |
-| `workflow.hitl_barrier.settled` | 1 | `_log` | `harness/fleet/runtime.py:1824` |
-| `workflow.row_quarantined` | 2 | `_log`, `logger.write` | `harness/tools/browser_tools/bindings.py:751`, `harness/workflow/workflow_auth_fence.py:107` |
-| `workflow.script.scope` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:583` |
+| `workflow.hitl_barrier.settled` | 1 | `_log` | `harness/fleet/runtime.py:1871` |
+| `workflow.observation_handoff` | 1 | `logger.write` | `harness/tools/browser_tools/workflow_observation.py:125` |
+| `workflow.row_quarantined` | 2 | `_log`, `logger.write` | `harness/tools/browser_tools/bindings.py:760`, `harness/workflow/workflow_auth_fence.py:107` |
+| `workflow.script.scope` | 1 | `logger.write` | `harness/tools/browser_tools/capability.py:584` |
 | `{}.model_input_moderation_folded` ⚠动态 | 1 | `logger.write` | `harness/runtime/model_support.py:527` |
 | `{}.vl_budget_exceeded` ⚠动态 | 1 | `_log` | `harness/vl/captcha.py:514` |
 | `{}.vl_exhausted` ⚠动态 | 1 | `_log` | `harness/vl/captcha.py:510` |
@@ -504,42 +523,42 @@
 
 | trace type | 产生点 | 位置 |
 |---|---:|---|
-| `browser_call` | 2 | `harness/tools/browser_tools/capability.py:1195`, `harness/tools/browser_tools/capability.py:1744` |
-| `browser_call_params_error` | 2 | `harness/tools/browser_tools/capability.py:209`, `harness/tools/browser_tools/capability.py:499` |
-| `browser_call_rejected` | 1 | `harness/tools/browser_tools/capability.py:225` |
-| `browser_call_schema_rejected` | 2 | `harness/tools/browser_tools/capability.py:237`, `harness/tools/browser_tools/capability.py:566` |
-| `browser_completion_proposal` | 1 | `harness/agents/browser/loop.py:685` |
+| `browser_call` | 2 | `harness/tools/browser_tools/capability.py:1212`, `harness/tools/browser_tools/capability.py:1764` |
+| `browser_call_params_error` | 2 | `harness/tools/browser_tools/capability.py:210`, `harness/tools/browser_tools/capability.py:500` |
+| `browser_call_rejected` | 1 | `harness/tools/browser_tools/capability.py:226` |
+| `browser_call_schema_rejected` | 2 | `harness/tools/browser_tools/capability.py:238`, `harness/tools/browser_tools/capability.py:567` |
+| `browser_completion_proposal` | 1 | `harness/agents/browser/loop.py:687` |
 | `browser_task_checkpoint` | 1 | `harness/tools/browser_tools/dispatch.py:1485` |
-| `captcha_auto_solved` | 1 | `harness/tools/browser_tools/capability.py:612` |
-| `contract_violation` | 2 | `harness/tools/browser_tools/capability.py:407`, `harness/tools/browser_tools/dispatch.py:825` |
-| `cross_task_memory_guard` | 1 | `harness/tools/browser_tools/capability.py:415` |
-| `dialog_guard` | 1 | `harness/tools/browser_tools/capability.py:484` |
+| `captcha_auto_solved` | 1 | `harness/tools/browser_tools/capability.py:613` |
+| `contract_violation` | 2 | `harness/tools/browser_tools/capability.py:408`, `harness/tools/browser_tools/dispatch.py:825` |
+| `cross_task_memory_guard` | 1 | `harness/tools/browser_tools/capability.py:416` |
+| `dialog_guard` | 1 | `harness/tools/browser_tools/capability.py:485` |
 | `final_answer` | 1 | `harness/tools/browser_tools/dispatch.py:1535` |
-| `fleet_auth_gate` | 3 | `harness/tools/browser_tools/capability.py:457`, `harness/tools/browser_tools/capability.py:596`, `harness/tools/browser_tools/capability.py:624` |
-| `fleet_binding_guard` | 1 | `harness/tools/browser_tools/capability.py:428` |
+| `fleet_auth_gate` | 3 | `harness/tools/browser_tools/capability.py:458`, `harness/tools/browser_tools/capability.py:597`, `harness/tools/browser_tools/capability.py:625` |
+| `fleet_binding_guard` | 1 | `harness/tools/browser_tools/capability.py:429` |
 | `loop_guard` | 1 | `harness/tools/browser_tools/dispatch.py:783` |
-| `loop_nudge` | 1 | `harness/agents/browser/loop.py:781` |
+| `loop_nudge` | 1 | `harness/agents/browser/loop.py:783` |
 | `loop_observation` | 1 | `harness/tools/loop_guard.py:142` |
-| `model` | 2 | `harness/agents/browser/loop.py:402`, `harness/events/sinks.py:182` |
-| `navigation_context_rejected` | 1 | `harness/tools/browser_tools/capability.py:264` |
-| `page_binding_guard` | 2 | `harness/tools/browser_tools/capability.py:441`, `harness/tools/browser_tools/dispatch.py:814` |
-| `page_lifecycle_gate` | 1 | `harness/tools/browser_tools/capability.py:473` |
-| `page_stats` | 1 | `harness/agents/browser/loop.py:758` |
+| `model` | 2 | `harness/agents/browser/loop.py:404`, `harness/events/sinks.py:182` |
+| `navigation_context_rejected` | 1 | `harness/tools/browser_tools/capability.py:265` |
+| `page_binding_guard` | 2 | `harness/tools/browser_tools/capability.py:442`, `harness/tools/browser_tools/dispatch.py:814` |
+| `page_lifecycle_gate` | 1 | `harness/tools/browser_tools/capability.py:474` |
+| `page_stats` | 1 | `harness/agents/browser/loop.py:760` |
 | `progress_observation` | 2 | `harness/tools/browser_tools/progress_obs.py:142`, `harness/tools/browser_tools/progress_obs.py:387` |
 | `record` | 1 | `harness/tools/browser_tools/dispatch.py:929` |
 | `root` | 1 | `harness/diagnostics/judge_trace.py:56` |
-| `runtime_evaluation_rejected` | 1 | `harness/tools/browser_tools/capability.py:287` |
-| `snapshot_diff` | 1 | `harness/agents/browser/loop.py:766` |
-| `stale_axtree_target` | 2 | `harness/tools/browser_tools/capability.py:515`, `harness/tools/browser_tools/capability.py:1499` |
+| `runtime_evaluation_rejected` | 1 | `harness/tools/browser_tools/capability.py:288` |
+| `snapshot_diff` | 1 | `harness/agents/browser/loop.py:768` |
+| `stale_axtree_target` | 2 | `harness/tools/browser_tools/capability.py:516`, `harness/tools/browser_tools/capability.py:1516` |
 | `step` | 2 | `harness/observation/exec_observer.py:290`, `harness/observation/exec_observer.py:294` |
 | `tool_after_call_exception` | 1 | `harness/tools/browser_tools/dispatch.py:645` |
 | `tool_arguments_rejected` | 1 | `harness/tools/browser_tools/dispatch.py:625` |
-| `tool_error` | 2 | `harness/tools/browser_tools/capability.py:161`, `harness/tools/browser_tools/dispatch.py:803` |
+| `tool_error` | 2 | `harness/tools/browser_tools/capability.py:162`, `harness/tools/browser_tools/dispatch.py:803` |
 | `tool_exception` | 1 | `harness/tools/browser_tools/dispatch.py:458` |
 | `trace_entry` | 1 | `harness/tools/browser_tools/dispatch.py:841` |
 | `workflow_definition_outcome` | 1 | `harness/tools/browser_tools/dispatch.py:910` |
-| `workflow_policy_rejected` | 2 | `harness/tools/browser_tools/capability.py:379`, `harness/tools/browser_tools/capability.py:389` |
-| `workflow_runtime_disabled` | 1 | `harness/tools/browser_tools/capability.py:351` |
+| `workflow_policy_rejected` | 2 | `harness/tools/browser_tools/capability.py:380`, `harness/tools/browser_tools/capability.py:390` |
+| `workflow_runtime_disabled` | 1 | `harness/tools/browser_tools/capability.py:352` |
 
 ## 6. 消费端
 
@@ -549,71 +568,71 @@
 
 | 位置 | 代码 |
 |---|---|
-| `main.py:1664` | `page = storage.read_events(` |
-| `harness/skill_builder/context.py:47` | `return self.sqlite.read_events(task_id=self.task_id, after_event_id=after,` |
-| `harness/skill_builder/context.py:49` | `return self.file.read_events(task_id=self.task_id, after_event_id=after,` |
-| `harness/agents/browser/review/evidence.py:127` | `rows = store.read_events(task_id=self.task_id,` |
+| `harness/agents/browser/review/evidence.py:141` | `rows = store.read_events(task_id=self.task_id,` |
+| `harness/skill_builder/context.py:76` | `return self.sqlite.read_events(task_id=self.task_id, after_event_id=after,` |
+| `harness/skill_builder/context.py:78` | `return self.file.read_events(task_id=self.task_id, after_event_id=after,` |
 | `harness/storage/dual_store.py:444` | `return self.primary.read_events(` |
 | `harness/storage/dual_store.py:883` | `rows = store.read_events(task_id=task_id, after_event_id=cursor, limit=1000)` |
 | `harness/storage/dual_store.py:905` | `rows = store.read_events(task_id=task_id, after_event_id=cursor, limit=page)` |
 | `harness/storage/sqlite_store.py:412` | `return dao.read_events(` |
+| `main.py:1863` | `page = storage.read_events(` |
 
 ### `.trace` — 读取 agent.trace 列表（80 处）
 
 | 位置 | 代码 |
 |---|---|
-| `harness/tools/browser_tools/dispatch.py:783` | `agent.trace.append({"type": "loop_guard", "result": guard_result})` |
-| `harness/tools/browser_tools/dispatch.py:803` | `agent.trace.append({"type": "tool_error", "result": result})` |
-| `harness/tools/browser_tools/dispatch.py:814` | `agent.trace.append({` |
-| `harness/tools/browser_tools/dispatch.py:825` | `agent.trace.append({"type": "contract_violation", "result": contract_result})` |
-| `harness/tools/browser_tools/dispatch.py:832` | `if action.trace_type:` |
-| `harness/tools/browser_tools/dispatch.py:834` | `trace_entry: JsonDict = {"type": action.trace_type, "result": result}` |
-| `harness/tools/browser_tools/dispatch.py:841` | `agent.trace.append(trace_entry)` |
-| `harness/tools/browser_tools/dispatch.py:910` | `ctx.agent.trace.append({` |
-| `harness/tools/browser_tools/dispatch.py:928` | `ctx.agent.trace = trace` |
-| `harness/tools/browser_tools/dispatch.py:1485` | `ctx.agent.trace.append({"type": "browser_task_checkpoint", "result": checkpoint})` |
-| `harness/tools/browser_tools/dispatch.py:1535` | `ctx.agent.trace.append({"type": "final_answer", "result": result})` |
-| `harness/tools/browser_tools/capability.py:161` | `agent.trace.append({"type": "tool_error", "result": result})` |
-| `harness/tools/browser_tools/capability.py:209` | `agent.trace.append({"type": "browser_call_params_error", "result": result})` |
-| `harness/tools/browser_tools/capability.py:225` | `agent.trace.append({"type": "browser_call_rejected", "result": result})` |
-| `harness/tools/browser_tools/capability.py:237` | `agent.trace.append({"type": "browser_call_schema_rejected", "result": result})` |
-| `harness/tools/browser_tools/capability.py:264` | `agent.trace.append({` |
-| `harness/tools/browser_tools/capability.py:287` | `agent.trace.append({` |
-| `harness/tools/browser_tools/capability.py:351` | `agent.trace.append({` |
-| `harness/tools/browser_tools/capability.py:379` | `agent.trace.append({"type": "workflow_policy_rejected", "result": workflow_error})` |
-| `harness/tools/browser_tools/capability.py:389` | `agent.trace.append({"type": "workflow_policy_rejected", "result": result})` |
-| `harness/tools/browser_tools/capability.py:407` | `agent.trace.append({"type": "contract_violation", "result": contract_result})` |
-| `harness/tools/browser_tools/capability.py:415` | `agent.trace.append({` |
-| `harness/tools/browser_tools/capability.py:428` | `agent.trace.append({` |
-| `harness/tools/browser_tools/capability.py:441` | `agent.trace.append({` |
-| `harness/tools/browser_tools/capability.py:457` | `agent.trace.append({` |
-| `harness/tools/browser_tools/capability.py:473` | `agent.trace.append({` |
-| `harness/tools/browser_tools/capability.py:484` | `agent.trace.append({"type": "dialog_guard", "result": dialog_guard})` |
-| `harness/tools/browser_tools/capability.py:499` | `agent.trace.append({"type": "browser_call_params_error", "result": target_param_guard})` |
-| `harness/tools/browser_tools/capability.py:515` | `agent.trace.append({"type": "stale_axtree_target", "result": stale_target})` |
-| `harness/tools/browser_tools/capability.py:566` | `agent.trace.append({"type": "browser_call_schema_rejected", "result": result})` |
-| `harness/tools/browser_tools/capability.py:596` | `agent.trace.append({` |
-| `harness/tools/browser_tools/capability.py:612` | `agent.trace.append({` |
-| `harness/tools/browser_tools/capability.py:624` | `agent.trace.append({` |
-| `harness/tools/browser_tools/capability.py:954` | `result, exec_observer.trace, agent, step,` |
-| `harness/tools/browser_tools/capability.py:1195` | `agent.trace.append({` |
-| `harness/tools/browser_tools/capability.py:1499` | `agent.trace.append({"type": "stale_axtree_target", "result": stale_target})` |
-| `harness/tools/browser_tools/capability.py:1650` | `result, exec_observer.trace, agent, step,` |
-| `harness/tools/browser_tools/capability.py:1744` | `agent.trace.append({` |
 | `harness/agents/browser/agent.py:70` | `self.trace: List[JsonDict] = []` |
 | `harness/agents/browser/agent.py:85` | `runtime, logger, self.trace, actor_type="browser",` |
+| `harness/agents/browser/agent.py:1150` | `for item in self.trace` |
+| `harness/agents/browser/agent.py:1316` | `for item in (self.trace or []):` |
+| `harness/agents/browser/loop.py:404` | `self.trace.append({` |
+| `harness/agents/browser/loop.py:687` | `self.trace.append({` |
+| `harness/agents/browser/loop.py:760` | `self.trace.append({` |
+| `harness/agents/browser/loop.py:768` | `self.trace.append({` |
+| `harness/agents/browser/loop.py:783` | `self.trace.append({` |
+| `harness/events/sinks.py:133` | `"""Rebuild the legacy ``agent.trace`` entries a consumer still expects.` |
+| `harness/observation/exec_observer.py:140` | `self.trace = ExecTrace()` |
+| `harness/observation/exec_observer.py:157` | `self.trace.duration_ms = int((time.monotonic() - started) * 1000)` |
+| `harness/observation/exec_observer.py:165` | `return self.trace` |
+| `harness/observation/exec_observer.py:188` | `if self.trace.cursor_first is None:` |
+| `harness/observation/exec_observer.py:189` | `self.trace.cursor_first = cursor` |
+| `harness/observation/exec_observer.py:190` | `self.trace.cursor_last = cursor` |
+| `harness/observation/exec_observer.py:202` | `self.trace.page_events[event] = self.trace.page_events.get(event, 0) + 1` |
+| `harness/observation/exec_observer.py:208` | `if workflow_id and not self.trace.workflow_id:` |
+| `harness/observation/exec_observer.py:209` | `self.trace.workflow_id = str(workflow_id)` |
+| `harness/observation/exec_observer.py:213` | `and self.trace.workflow_id` |
+| `harness/observation/exec_observer.py:214` | `and str(workflow_id) != self.trace.workflow_id` |
+| `harness/observation/exec_observer.py:219` | `self.trace.phase = str(payload["status"])` |
+| `harness/observation/exec_observer.py:220` | `self.trace.completed_calls = payload["completedCalls"]` |
+| `harness/observation/exec_observer.py:221` | `self.trace.active_calls = payload.get("activeCalls") or []` |
+| `harness/observation/exec_observer.py:223` | `self.trace.failure = dict(payload["error"])` |
+| `harness/observation/exec_observer.py:231` | `self.trace.variables = dict(variables)` |
+| `harness/observation/exec_observer.py:234` | `self.trace.store_revision = revision` |
+| `harness/observation/exec_observer.py:237` | `self.trace.phase = phase` |
+| `harness/observation/exec_observer.py:239` | `self.trace.failure = {` |
+| `harness/observation/exec_observer.py:245` | `self.trace.failure.update(public_failure(payload))` |
+| `harness/observation/exec_observer.py:249` | `self.trace.failure[key] = value` |
+| `harness/observation/exec_observer.py:252` | `self.trace.phase = "running"` |
+| `harness/observation/exec_observer.py:285` | `self.trace.total_steps += 1` |
+| `harness/observation/exec_observer.py:287` | `self.trace.total_succeeded += 1` |
+| `harness/observation/exec_observer.py:289` | `if len(self.trace.steps) < limit:` |
+| `harness/observation/exec_observer.py:290` | `self.trace.steps.append(step)` |
+| `harness/observation/exec_observer.py:293` | `self.trace.steps = self.trace.steps[:head] + self.trace.steps[head + 1:]` |
+| `harness/observation/exec_observer.py:294` | `self.trace.steps.append(step)` |
+| `harness/observation/exec_observer.py:295` | `self.trace.dropped_steps += 1` |
+| `harness/spawner/spawner_worker.py:650` | `trace_path = self._write_worker_trace(worker_id, harness.trace)` |
 | … | 另有 40 处 |
 
 ### `worker_trace_events` — 读取 worker trace 表（6 处）
 
 | 位置 | 代码 |
 |---|---|
-| `harness/storage/virtual_fs.py:13` | `traces/<worker>.jsonl     -> worker_trace_events` |
-| `harness/storage/virtual_fs.py:141` | `" FROM worker_trace_events WHERE task_id = ?"` |
-| `harness/storage/virtual_fs.py:294` | `"SELECT trace_event_id, trace_json FROM worker_trace_events"` |
 | `harness/storage/dao.py:623` | `"SELECT COALESCE(MAX(sequence_no), 0) FROM worker_trace_events"` |
 | `harness/storage/dao.py:629` | `"INSERT INTO worker_trace_events("` |
 | `harness/storage/dao.py:657` | `sql = "SELECT * FROM worker_trace_events WHERE task_id = ?"` |
+| `harness/storage/virtual_fs.py:13` | `traces/<worker>.jsonl     -> worker_trace_events` |
+| `harness/storage/virtual_fs.py:141` | `" FROM worker_trace_events WHERE task_id = ?"` |
+| `harness/storage/virtual_fs.py:294` | `"SELECT trace_event_id, trace_json FROM worker_trace_events"` |
 
 ### `on_event` — 事件回调（Console/transport）（26 处）
 
@@ -624,18 +643,13 @@
 | `abcp_client.py:1107` | `if not self.on_event:` |
 | `abcp_client.py:1109` | `event_types = getattr(self.on_event, "abcp_event_types", None)` |
 | `abcp_client.py:1119` | `self.on_event(event_type, sanitize(payload, table))` |
-| `main.py:1129` | `on_event=ConsoleProgressReporter(),` |
-| `harness/utils.py:718` | `on_event: Optional[EventSink] = None,` |
-| `harness/utils.py:737` | `self.on_event = on_event` |
-| `harness/utils.py:800` | `self.on_event(event_type, payload) if self.on_event else None` |
-| `harness/utils.py:1026` | `on_event.abcp_event_types = frozenset({"failure", "orphan_response"})` |
-| `harness/utils.py:1027` | `return on_event` |
-| `harness/skill_builder/browser.py:49` | `self.client = ABCPClient(config, on_event=record_transport)` |
+| `harness/agents/browser/loop.py:995` | `extension_event = (` |
+| `harness/agents/browser/loop.py:1000` | `self._write_agent_event(extension_event, {` |
 | `harness/capabilities/bootstrap.py:53` | `async with ABCPClient(browser_config, on_event=event_logger) as browser:` |
+| `harness/fleet/runtime.py:1811` | `name, event_payload = _notification_event(message)` |
 | `harness/planning/fast_path.py:226` | `if (candidate := _successful_collection_event(event)) is not None` |
-| `harness/agents/browser/loop.py:993` | `extension_event = (` |
-| `harness/agents/browser/loop.py:998` | `self._write_agent_event(extension_event, {` |
-| `harness/spawner/spawner_worker.py:372` | `slot.client.on_event = event_logger` |
+| `harness/skill_builder/browser.py:49` | `self.client = ABCPClient(config, on_event=record_transport)` |
+| `harness/spawner/spawner_core.py:2205` | `client = _sp().ABCPClient(self.runtime.browser, on_event=make_browser_event_logger(` |
 | `harness/spawner/spawner_slots.py:1035` | `revision = _registration_event_catalog_revision(registration)` |
 | `harness/spawner/spawner_slots.py:1166` | `client = _sp().ABCPClient(self.runtime.browser, on_event=event_logger)` |
 | `harness/spawner/spawner_slots.py:1190` | `_registration_event_cursor(registration),` |
@@ -643,8 +657,13 @@
 | `harness/spawner/spawner_slots.py:1330` | `registration_cursor=_registration_event_cursor(registration),` |
 | `harness/spawner/spawner_slots.py:1470` | `slot.client.on_event = slot.idle_event_logger` |
 | `harness/spawner/spawner_slots.py:1505` | `_registration_event_cursor(registration),` |
-| `harness/spawner/spawner_core.py:2205` | `client = _sp().ABCPClient(self.runtime.browser, on_event=make_browser_event_logger(` |
-| `harness/fleet/runtime.py:1764` | `name, event_payload = _notification_event(message)` |
+| `harness/spawner/spawner_worker.py:372` | `slot.client.on_event = event_logger` |
+| `harness/utils.py:718` | `on_event: Optional[EventSink] = None,` |
+| `harness/utils.py:737` | `self.on_event = on_event` |
+| `harness/utils.py:800` | `self.on_event(event_type, payload) if self.on_event else None` |
+| `harness/utils.py:1026` | `on_event.abcp_event_types = frozenset({"failure", "orphan_response"})` |
+| `harness/utils.py:1027` | `return on_event` |
+| `main.py:1328` | `on_event=ConsoleProgressReporter(),` |
 
 ### `iter_events(` — 遍历事件流（1 处）
 
@@ -677,22 +696,22 @@
 | `Fleet.restartFailed` | `fleet` | `error` | `user` | — | ✅ | 0 | *无* |
 | `Fleet.restartScheduled` | `fleet` | `info` | `user` | — | ✅ | 0 | *无* |
 | `Fleet.stopped` | `fleet` | `error` | `both` | ✅ | ✅ | 2 | `harness/spawner/spawner_slots.py:2127`, `harness/spawner/spawner_slots.py:2286` |
-| `Hitl.paused` | `hitl` | `blocking` | `both` | ✅ | ✅ | 5 | `harness/fleet/runtime.py:1118`, `harness/fleet/runtime.py:1771` 等 5 处 |
-| `Hitl.resumed` | `hitl` | `info` | `both` | ✅ | ✅ | 2 | `harness/fleet/runtime.py:1771`, `harness/runtime/hitl.py:72` |
+| `Hitl.paused` | `hitl` | `blocking` | `both` | ✅ | ✅ | 5 | `harness/fleet/runtime.py:1162`, `harness/fleet/runtime.py:1818` 等 5 处 |
+| `Hitl.resumed` | `hitl` | `info` | `both` | ✅ | ✅ | 2 | `harness/fleet/runtime.py:1818`, `harness/runtime/hitl.py:72` |
 | `Page.certificateError` | `blocking` | `error` | `user` | — | ✅ | 0 | *无* |
-| `Page.close` | `page` | `info` | `both` | ✅ | ✅ | 27 | `harness/fleet/runtime.py:1679`, `harness/fleet/runtime.py:1804` 等 27 处 |
-| `Page.crashed` | `navigation` | `error` | `both` | ✅ | ✅ | 5 | `harness/fleet/runtime.py:1804`, `harness/observation/event_observer.py:114` 等 5 处 |
+| `Page.close` | `page` | `info` | `both` | ✅ | ✅ | 28 | `harness/fleet/runtime.py:1726`, `harness/fleet/runtime.py:1851` 等 28 处 |
+| `Page.crashed` | `navigation` | `error` | `both` | ✅ | ✅ | 5 | `harness/fleet/runtime.py:1851`, `harness/observation/event_observer.py:114` 等 5 处 |
 | `Page.dialogClosed` | `blocking` | `info` | `both` | ✅ | ✅ | 6 | `harness/observation/browser_reducers.py:164`, `harness/observation/browser_reducers.py:215` 等 6 处 |
 | `Page.dialogOpened` | `blocking` | `blocking` | `both` | ✅ | ✅ | 3 | `harness/observation/browser_reducers.py:164`, `harness/observation/browser_reducers.py:255` 等 3 处 |
 | `Page.loadFailed` | `navigation` | `error` | `both` | ✅ | ✅ | 5 | `harness/observation/page_lifecycle.py:187`, `harness/tools/browser_tools/navigate.py:853` 等 5 处 |
 | `Page.loaded` | `navigation` | `info` | `both` | ✅ | ✅ | 6 | `harness/observation/page_lifecycle.py:183`, `harness/runtime/hitl.py:80` 等 6 处 |
-| `Page.navigate` | `navigation` | `info` | `both` | ✅ | ✅ | 27 | `harness/fleet/runtime.py:1804`, `harness/observation/content_completeness.py:1252` 等 27 处 |
+| `Page.navigate` | `navigation` | `info` | `both` | ✅ | ✅ | 27 | `harness/fleet/runtime.py:1851`, `harness/observation/content_completeness.py:1252` 等 27 处 |
 | `Page.navigationUpdated` | `page` | `info` | `user` | — | ✅ | 0 | *无* |
-| `Page.open` | `page` | `info` | `both` | ✅ | ✅ | 4 | `harness/fleet/runtime.py:1798`, `harness/observation/event_observer.py:116` 等 4 处 |
+| `Page.open` | `page` | `info` | `both` | ✅ | ✅ | 4 | `harness/fleet/runtime.py:1845`, `harness/observation/event_observer.py:116` 等 4 处 |
 | `Page.popupRequested` | `blocking` | `blocking` | `user` | — | ✅ | 0 | *无* |
 | `Page.recovered` | `navigation` | `info` | `both` | ✅ | ✅ | 6 | `harness/observation/event_observer.py:114`, `harness/observation/page_lifecycle.py:206` 等 6 处 |
 | `Page.startedLoading` | `navigation` | `info` | `both` | ✅ | ✅ | 1 | `harness/observation/page_lifecycle.py:175` |
-| `Page.switchTo` | `page` | `info` | `both` | ✅ | ✅ | 8 | `harness/observation/content_completeness.py:1314`, `harness/observation/progress.py:34` 等 8 处 |
+| `Page.switchTo` | `page` | `info` | `both` | ✅ | ✅ | 9 | `harness/observation/content_completeness.py:1314`, `harness/observation/progress.py:34` 等 9 处 |
 | `Page.titleUpdated` | `page` | `info` | `both` | ✅ | ✅ | 1 | `harness/runtime/hitl.py:76` |
 | `System.agentBootstrap` | `system` | `info` | `internal` | — | ✅ | 0 | *无* |
 | `Task.artifactAdded` ⚠两处不一致 | `task` | `info` | `user` | ✅ | ✅ | 0 | *无* |
@@ -710,9 +729,9 @@
 
 | 名字 | 事件目录 | Action 目录 | 引用点（两侧混计） | 位置 |
 |---|---|---|---:|---|
-| `Page.close` | ✅ | ✅ | 27 | `harness/fleet/runtime.py:1679`, `harness/fleet/runtime.py:1804` 等 27 处 |
-| `Page.navigate` | ✅ | ✅ | 27 | `harness/fleet/runtime.py:1804`, `harness/observation/content_completeness.py:1252` 等 27 处 |
-| `Page.switchTo` | ✅ | ✅ | 8 | `harness/observation/content_completeness.py:1314`, `harness/observation/progress.py:34` 等 8 处 |
+| `Page.close` | ✅ | ✅ | 28 | `harness/fleet/runtime.py:1726`, `harness/fleet/runtime.py:1851` 等 28 处 |
+| `Page.navigate` | ✅ | ✅ | 27 | `harness/fleet/runtime.py:1851`, `harness/observation/content_completeness.py:1252` 等 27 处 |
+| `Page.switchTo` | ✅ | ✅ | 9 | `harness/observation/content_completeness.py:1314`, `harness/observation/progress.py:34` 等 9 处 |
 
 ## 9. 平台事件漂移与覆盖差
 
@@ -753,12 +772,12 @@
 | `DOM.axTreeUpdated` | ⚠未知 | ❌ | 2 | `harness/observation/event_observer.py:127`, `harness/observation/event_observer.py:319` |
 | `File.download` | ⚠未知 | ❌ | 5 | `harness/agents/browser/agent.py:788`, `harness/agents/browser/agent.py:821` 等 5 处 |
 | `Page.wheel` | ⚠未知 | ❌ | 8 | `harness/observation/content_completeness.py:1373`, `harness/observation/loop_nudge.py:227` 等 8 处 |
-| `Workflow.cancel` | ⚠未知 | ❌ | 4 | `harness/skill_builder/browser.py:20`, `harness/skill_builder/browser.py:66` 等 4 处 |
+| `Workflow.cancel` | ⚠未知 | ❌ | 4 | `harness/skill_builder/browser.py:20`, `harness/skill_builder/browser.py:67` 等 4 处 |
 | `Bookmark.list` | Action | ❌ | 1 | `harness/runtime/model_support.py:106` |
 | `DOM.get` | 前缀 | ❌ | 1 | `harness/runtime/model_support.py:102` |
-| `DOM.getDetails` | Action | ❌ | 20 | `abcp_client.py:679`, `harness/agents/browser/review/task.py:41` 等 20 处 |
-| `DOM.getImg` | Action | ❌ | 12 | `harness/agents/browser/agent.py:787`, `harness/agents/browser/agent.py:820` 等 12 处 |
-| `DOM.inspectSelect` | Action | ❌ | 14 | `harness/constants.py:238`, `harness/diagnostics/error_classification.py:50` 等 14 处 |
+| `DOM.getDetails` | Action | ❌ | 25 | `abcp_client.py:679`, `harness/agents/browser/review/task.py:42` 等 25 处 |
+| `DOM.getImg` | Action | ❌ | 13 | `harness/agents/browser/agent.py:787`, `harness/agents/browser/agent.py:820` 等 13 处 |
+| `DOM.inspectSelect` | Action | ❌ | 15 | `harness/constants.py:238`, `harness/diagnostics/error_classification.py:50` 等 15 处 |
 | `Download.control` | Action | ❌ | 2 | `harness/agents/browser/agent.py:831`, `harness/agents/browser/agent.py:837` |
 | `Fleet.close` | Action | ❌ | 6 | `devtools/download_path_live_canary.py:103`, `devtools/download_path_live_canary.py:185` 等 6 处 |
 | `Fleet.create` | Action | ❌ | 6 | `devtools/download_path_live_canary.py:103`, `devtools/download_path_live_canary.py:110` 等 6 处 |
@@ -778,15 +797,15 @@
 | `Memory.save` | Action | ❌ | 7 | `harness/agents/browser/agent.py:321`, `harness/agents/browser/agent.py:323` 等 7 处 |
 | `Network.clearCache` | Action | ❌ | 1 | `harness/tools/tool_policy.py:481` |
 | `Network.getCookies` | Action | ❌ | 1 | `harness/tools/tool_policy.py:482` |
-| `Network.readApi` | Action | ❌ | 9 | `abcp_client.py:463`, `abcp_client.py:640` 等 9 处 |
+| `Network.readApi` | Action | ❌ | 11 | `abcp_client.py:463`, `abcp_client.py:640` 等 11 处 |
 | `Network.setCookies` | Action | ❌ | 1 | `harness/tools/tool_policy.py:483` |
 | `Network.setInterception` | Action | ❌ | 1 | `harness/tools/tool_policy.py:484` |
-| `Page.click` | Action | ❌ | 16 | `harness/fleet/runtime.py:578`, `harness/fleet/runtime.py:1701` 等 16 处 |
-| `Page.create` | Action | ❌ | 41 | `devtools/download_path_live_canary.py:103`, `devtools/download_path_live_canary.py:112` 等 41 处 |
-| `Page.go` | Action | ❌ | 18 | `harness/observation/content_completeness.py:1252`, `harness/observation/content_completeness.py:1260` 等 18 处 |
-| `Page.handleDialog` | Action | ❌ | 4 | `harness/tools/browser_tools/axtree_state.py:47`, `harness/tools/browser_tools/capability.py:826` 等 4 处 |
+| `Page.click` | Action | ❌ | 16 | `harness/fleet/runtime.py:622`, `harness/fleet/runtime.py:1748` 等 16 处 |
+| `Page.create` | Action | ❌ | 43 | `devtools/download_path_live_canary.py:103`, `devtools/download_path_live_canary.py:112` 等 43 处 |
+| `Page.go` | Action | ❌ | 19 | `harness/observation/content_completeness.py:1252`, `harness/observation/content_completeness.py:1260` 等 19 处 |
+| `Page.handleDialog` | Action | ❌ | 4 | `harness/tools/browser_tools/axtree_state.py:47`, `harness/tools/browser_tools/capability.py:827` 等 4 处 |
 | `Page.reload` | Action | ❌ | 12 | `harness/observation/content_completeness.py:1252`, `harness/observation/page_fingerprint.py:263` 等 12 处 |
-| `Page.screenshot` | Action | ❌ | 18 | `harness/agents/browser/loop.py:794`, `harness/agents/browser/review/task.py:41` 等 18 处 |
+| `Page.screenshot` | Action | ❌ | 20 | `harness/agents/browser/loop.py:796`, `harness/agents/browser/review/task.py:42` 等 20 处 |
 | `Runtime.evaluate` | Action | ❌ | 20 | `harness/agents/browser/agent.py:1328`, `harness/constants.py:236` 等 20 处 |
 | `System.describe` | 前缀 | ❌ | 1 | `harness/runtime/model_support.py:101` |
 | `System.describeAction` | Action | ❌ | 9 | `devtools/download_path_live_canary.py:105`, `harness/capabilities/schema_loader.py:133` 等 9 处 |
@@ -794,18 +813,18 @@
 | `System.get` | 前缀 | ❌ | 1 | `harness/runtime/model_support.py:99` |
 | `System.getCapabilities` | Action | ❌ | 12 | `devtools/download_path_live_canary.py:101`, `harness/capabilities/bootstrap.py:67` 等 12 处 |
 | `System.list` | 前缀 | ❌ | 1 | `harness/runtime/model_support.py:100` |
-| `System.notification` | 协议方法 | ❌ | 4 | `abcp_client.py:821`, `harness/fleet/runtime.py:599` 等 4 处 |
+| `System.notification` | 协议方法 | ❌ | 4 | `abcp_client.py:821`, `harness/fleet/runtime.py:643` 等 4 处 |
 | `System.register` | Action | ❌ | 11 | `abcp_client.py:687`, `devtools/download_path_live_canary.py:97` 等 11 处 |
-| `Workflow.execute` | Action | ❌ | 45 | `abcp_client.py:584`, `abcp_client.py:615` 等 45 处 |
-| `Workflow.getGuide` | Action | ❌ | 2 | `harness/skill_builder/browser.py:19`, `harness/skill_builder/browser.py:111` |
-| `Workflow.getStatus` | Action | ❌ | 2 | `harness/skill_builder/browser.py:20`, `harness/skill_builder/browser.py:180` |
-| `Workflow.pause` | Action | ❌ | 2 | `harness/skill_builder/browser.py:20`, `harness/skill_builder/browser.py:180` |
-| `Workflow.resume` | Action | ❌ | 2 | `harness/skill_builder/browser.py:20`, `harness/skill_builder/browser.py:180` |
-| `DOM.getAXTree` | Action | ✅ | 75 | `abcp_client.py:679`, `harness/agents/browser/review/evidence.py:37` 等 75 处 |
+| `Workflow.execute` | Action | ❌ | 50 | `abcp_client.py:584`, `abcp_client.py:615` 等 50 处 |
+| `Workflow.getGuide` | Action | ❌ | 2 | `harness/skill_builder/browser.py:19`, `harness/skill_builder/browser.py:119` |
+| `Workflow.getStatus` | Action | ❌ | 2 | `harness/skill_builder/browser.py:20`, `harness/skill_builder/browser.py:189` |
+| `Workflow.pause` | Action | ❌ | 2 | `harness/skill_builder/browser.py:20`, `harness/skill_builder/browser.py:189` |
+| `Workflow.resume` | Action | ❌ | 2 | `harness/skill_builder/browser.py:20`, `harness/skill_builder/browser.py:189` |
+| `DOM.getAXTree` | Action | ✅ | 80 | `abcp_client.py:679`, `harness/agents/browser/review/evidence.py:37` 等 80 处 |
 | `Download.list` | Action | ✅ | 9 | `devtools/download_path_live_canary.py:104`, `devtools/download_path_live_canary.py:153` 等 9 处 |
 | `Download.start` | Action | ✅ | 14 | `devtools/download_path_live_canary.py:104`, `devtools/download_path_live_canary.py:140` 等 14 处 |
 | `File.handleChooser` | Action | ✅ | 9 | `harness/agents/browser/agent.py:789`, `harness/agents/browser/agent.py:822` 等 9 处 |
-| `Page.getState` | Action | ✅ | 61 | `devtools/download_path_live_canary.py:103`, `devtools/download_path_live_canary.py:115` 等 61 处 |
-| `Page.list` | Action | ✅ | 29 | `harness/fleet/runtime.py:1671`, `harness/fleet/runtime.py:1924` 等 29 处 |
+| `Page.getState` | Action | ✅ | 63 | `devtools/download_path_live_canary.py:103`, `devtools/download_path_live_canary.py:115` 等 63 处 |
+| `Page.list` | Action | ✅ | 34 | `harness/fleet/runtime.py:1718`, `harness/fleet/runtime.py:1971` 等 34 处 |
 | `System.listEvents` | Action | ✅ | 1 | `devtools/download_path_live_canary.py:102` |
 

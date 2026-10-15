@@ -2,6 +2,8 @@
 
 更新：2026-10-07。范围为源包协议同步、Skill Builder 合同更新及独立 `/browser` 的显式 Skill 复用策略。
 
+2026-10-12 文档修订：同步 Lead 移除后的运行时归属；下述安装实例与协议证据仍对应原同步日期。
+
 ## 1. 实例与源码分别核对
 
 - 实际安装实例为 WebCross `0.9.7-beta`，已在该实例执行隔离页面测试。
@@ -30,7 +32,14 @@
 
 ## 3. `/browser` 复用策略
 
-保留 BrowserAgent loop，更新其 JS/TS 源包执行合同；已选版本的源包读取和正式 Workflow 入口识别同步到新协议。独立 Skill Runtime 的职责拆分与后续 Builder 恢复/发布改动不属于本次协议提交，保留在工作区。
+保留 BrowserAgent loop。替换常驻旧 DSL 说明，新增仅在独立 Browser 模式且用户显式选择 Skill 时出现的复用说明：
+
+1. 从绑定的 Skill 版本读取正式源包和输入说明。
+2. 模型结合用户目标、当前页面与输入范围判断适用性。
+3. 对适用模板绑定本轮 input，调用 `execute_published_skill_workflow` 执行原文件。
+4. 新语义判断、模板缺口、权限或实际错误发生时，依据原始事实恢复，保留已完成动作和偏离理由。
+
+增加 `read_selected_skill_resource`，只读已绑定的版本；不给整个项目源目录权限。Formal entries 只来自 `workflow.json` 或 `workflows/`，参数示例与开发探针不作为入口。共享协议适配用于独立 BrowserAgent 及 Skill／Workflow 委派的 Browser worker；任务编排由各模式自己的运行时负责。
 
 没有强制 Workflow 使用次数、覆盖率门槛或站点字段门禁。是否合并 segment、何时继续与是否完成，仍由模型判断。
 
@@ -50,13 +59,19 @@
 
 当前安装引擎把代理 Action 调用的位置映射到受信任模块；编译错误和业务脚本抛错能映射到业务源文件。保留真实 source，不伪称所有 Action 的 source 都是业务调用行；诊断同时读取 action、actionCode、调用记录和源包版本。
 
-## 5. Builder 的协议调用
+## 5. Builder 与草稿
 
-Builder 实时读取 Workflow guide 和 Action schema，使用 JS/TS 源包与原生循环、条件和模块。试运行将业务 input、页面/Fleet 绑定与源包分开，并为动态 Action 应用相同的权限约束。
+Builder 实时读取 Workflow guide 和 Action schema，使用 JS/TS 源包与原生循环、条件和模块。代表性变量变化用于检查输入契约，包含值、数组长度、可选输入和映射；不要求穷举所有组合。
 
-可以授权真实测试页和本轮上传文件；清理只关闭 Builder 自建 Fleet，用户认领页面不被关闭。Workflow 运行状态、调用记录、输出是否存在和失败位置分别记录，不能把 succeeded 自动视为业务完成。
+- 正式文件仍在 `worktree/<Builder ID>/coding/builder`，用户选择发布后复制到根目录 skills。
+- `trials/` 工具路径指向同任务 `coding/trials`。探针进入 SQLite 资源索引，发布时不会复制进去。
+- 恢复时只迁移可编辑 Builder 副本中的旧 trials；保留冲突文件并重定位已有外部资源指针。已发布快照的文件和哈希保持原样。
+- 可请求终端授权认领真实测试页、授权文件。清理只关闭 Builder 自建 Fleet，用户认领页面不被清理关闭。
+- 仍为“旧 Skill＋一轮新任务”。发布、编辑、删除由用户决定。
 
-正式发布仍由用户决定。开发探针目录分离、后续日志来源切换、草稿发布恢复与独立 Skill Runtime 属于另外的工作区改动，不包含在本次协议提交中。
+已有拼多多 Skill 采用旧步骤语言，须通过原有修复入口结合执行记录重建，再由用户发布新版本。重启 Harness CLI 后使用更新代码；本轮没有自动覆盖或发布现有 Skill。
+
+Python/Shell 沙箱、grep、公共网络和 Coding Agent 编排仍属于 tau 计划后续阶段；内置 JS 环境不提供这些宿主能力。
 
 ## 6. 验证证据与范围
 
@@ -79,6 +94,10 @@ Builder 实时读取 Workflow guide 和 Action schema，使用 JS/TS 源包与�
 
 未进行真实模型驱动的拼多多发布任务，也没有可比的业务 token/耗时样本。因此不声明实际 Workflow 采用率、任务速度或 token 收益已验收。后续按模型轮次、cache_read/cache_creation/uncached_input、模型耗时、平台/工具 I/O、失败恢复及排除人工等待后的端到端时间评估。
 
-## 本次提交的隔离检查
+## 7. 2026-10-08 Builder 恢复与发布修复
 
-仅以 HEAD 加协议适配代码构建临时副本，14 个相关模块得到 **382 passed / 33 subtests passed**；当前工作区同范围为 **383 passed / 33 subtests passed**。差异是一项属于独立 Builder 探针目录生命周期的测试。临时副本使用测试专用配置和样本，未复制配置密钥，也不依赖未提交的 Skill Runtime。新增原始合同回归及 v0.9.6/v0.9.7 快照一并纳入提交。
+- 日志工具增加 `task_id` 和 `select_source_task`；只读用户明确引用的任务。`/skill-edit --source @任务ID` 可显式切换，SQLite 分开保留初始来源和当前分析绑定。
+- 迁移 7 登记 Builder 发布目标/hash，历史回填仅采用可证实的当前正式版本。发布在同一索引事务更新基准，继续编辑仍能更新版本，并拒绝外部版本冲突。
+- 试运行保留原始结果，并显示调用记录数量、成功/失败记录、output 是否可用；未知数据标 null。最终结果/草稿列表显示目录、版本、分析任务与正式发布状态。
+- 已有 Builder `5a6b075b7714471cad34e2b129fa128c` 的分析绑定已改为 `237a219c88214737a3256a4f9fec513b`，实际概览与日志分页读取成功。工作副本中的错误平台结论已修正，v0.2.0 仍为草稿，正式 v0.1.0 保持原版本。
+- 相关回归 **76 passed / 13 subtests passed**，覆盖新任务读取、越权引用、绑定恢复、创建/发布/编辑/再发布、外部冲突、事务失败和历史迁移；未重新执行业务上传或模型性能评测。

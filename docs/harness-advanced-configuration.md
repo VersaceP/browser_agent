@@ -10,6 +10,27 @@ overrides remain supported, including existing configurations.
 
 ## 内置默认值 / Internal defaults
 
+`browser.reconnect_timeout_seconds` 默认 **60**，允许 0–60 秒。原生连接的启动、
+运行中断线、Workflow 执行器和 HITL 通知读取共用恢复窗口；所有重连尝试、退避、
+注册、事件回放及会话清单查询共享截止时间。每次协议尝试最多 5 秒。
+并发调用共享原连接的恢复任务，同一任务的连接槽共享故障截止时间；已经耗尽的
+恢复回执不会再触发一轮自动探测。显式恢复或新进程可开始新的恢复窗口。
+只有传输暂时不可用才重试；认证拒绝、协议身份不一致、事件游标缺口等返回结构化阻塞。
+这些校验只确认协议与身份连续性；缺失 Fleet/Page 作为事实返回，不自动创建替代资源。
+原身份无法恢复时可在权限允许的前提下通过显式 `/resume` 重新建立任务会话。
+任何已发送的浏览器操作或 `Workflow.execute` 都不会因为重连而重放。
+
+`browser.reconnect_timeout_seconds` defaults to **60** (range 0–60). Native
+startup, active Browser/Workflow execution and HITL notification readers use the
+same recovery mechanism. Attempts, backoff, registration, event replay and session
+inventory share one outage deadline; each protocol attempt is capped at 5 seconds.
+Calls on one connection share a recovery task, and a task's slots share the
+deadline. An exhausted live recovery is not followed by another automatic probe.
+Explicit recovery or a new process may start a new window. Authentication,
+identity and event-cursor failures remain explicit blockers. Missing targets are
+reported as facts; no replacement resources or business actions are dispatched.
+Workflow lifecycle status is recorded separately from missing execution output.
+
 | 配置项 / Option | 默认值 / Default | 说明 / Meaning |
 | --- | --- | --- |
 | `similar_task_fleet_reuse_enabled` | `true` | 为相似任务尝试复用合格 Fleet，显式会话/隔离/恢复路由优先。 / Attempt eligible Fleet reuse; explicit routing takes precedence. |
@@ -54,7 +75,6 @@ or its compaction ratio.
     "fleet_slot_reconnect_backoff_seconds": 0.25,
     "fleet_slot_manual_reset_after_failures": 3,
     "hitl_poll_interval_seconds": 2,
-    "hitl_wait_timeout_seconds": 600,
     "worktree_dir": "worktree",
     "context_file": null,
     "project_context_files": [
@@ -78,11 +98,11 @@ or its compaction ratio.
 - `max_task_fleets`: 单个任务最多占用的 fleet（浏览器实例）数，`0` 表示不限。harness 不会主动关闭 fleet，所以开出来的 fleet 会一直占着额度，直到平台的权威库存不再报告它——从 owner 库存消失的 fleet 会把额度释放回去。计数只统计绑定到本任务 worker 的 fleet，不看 Agent 全局的 `Fleet.list`。任务级 `@<id>`、已绑定的 `session_key`、`reuse_from_worker_id` 指向的 fleet 都计入额度；任务级引用仅在当前权威库存确认时才能使用。到达上限后，没指定 fleet 的 worker 自动复用本任务已有的 fleet（优先挑没有在跑的 worker 占着的那个），`worker_session_isolation_enabled` 的默认隔离让位于上限。只有两种情况没法这么服务，返回 `task_fleet_limit_reached` 回执：一是要求独立身份（显式声明 `needs_isolated_session` 或新开 `session_key`）；二是本任务的 fleet 全部绑给了具名会话——登录态的 cookie jar 不外借。这两种**等待都解不开**（harness 不关 fleet，worker 结束后 fleet 还在；具名会话的绑定也不随 worker 结束而释放），所以回执给的是：改用已有 fleet、走可信恢复流程释放 session binding、或调高上限。拒绝之前 cap 会强制重读一次权威 `Fleet.list`。dispatcher 是从整张 fleets 表作答、不按连接分域，所以一次成功的读取既能找到别的 slot 刚建的 fleet，也能退役任何已被平台回收的 fleet（不论原属哪个 slot）并把额度还回来。读取失败则一律不当作"消失"的证据。
 - `fleet_auth_barrier_enabled`: 登录/验证码按 fleet 全域加门，非 resolver 有界等待且超时不放行。等待时间由 `fleet_auth_barrier_wait_seconds` 控制。
 - `auth_fleet_ledger_path`: 持久化的非敏感已验证会话索引；重启回收的 fleet 在账本对账前不会进入通用复用池。
-- `fleet_slot_reconnect_attempts`: 每轮恢复的有界重连次数。只有服务端返回的协议身份保持连续时，已认证的 fleet 绑定才可复用；transport 故障本身不等于 fleet 已丢失。
-- `fleet_slot_reconnect_backoff_seconds`: 重连间隔的基础时间；不会重放失败的浏览器写操作。
+- `fleet_slot_reconnect_attempts`: 旧式或外部注入连接槽的恢复次数；原生连接使用上述 60 秒窗口，不叠加重试预算。
+- `fleet_slot_reconnect_backoff_seconds`: 旧式连接槽的重连基础间隔；原生连接从 0.5 秒退避至最多 4 秒。
 - `fleet_slot_manual_reset_after_failures`: 连续恢复失败轮次达到该值后返回 `session_manual_reset_required`；只有 host/operator 能使用回执中的 fleet id 和 generation 显式重置。
 - `hitl_poll_interval_seconds`: HITL 解除后的页面状态确认间隔；等待人工回复本身由通知或终端输入驱动。
-- `hitl_wait_timeout_seconds`: 等待人工介入的最长时间。
+- HITL 等待人工回复不限时、不按累计次数拒绝提问，回答及运行中引导不设固定字符上限。旧 `hitl_wait_timeout_seconds`、`hitl_max_pause_rounds_per_page/worker` 配置不再生效。协议请求和回复后的页面状态确认仍有界。
 - `worktree_dir`: 运行日志和 artifacts 的根目录。
 - `context_file`: 兼容保留的单个静态 prompt 上下文文件。新配置优先使用 `project_context_files`。
 - `project_context_files`: 有序的静态项目指令文件；每项可为路径字符串，或 `{ "path": "...", "scope": "..." }`。Harness 会按顺序以转义后的 `<project_context><project_instructions ...>` XML 注入；重复文件只注入一次。只应放稳定文件。
@@ -111,7 +131,6 @@ Optional advanced configuration example:
     "fleet_slot_reconnect_backoff_seconds": 0.25,
     "fleet_slot_manual_reset_after_failures": 3,
     "hitl_poll_interval_seconds": 2,
-    "hitl_wait_timeout_seconds": 600,
     "worktree_dir": "worktree",
     "context_file": null,
     "project_context_files": [
@@ -135,11 +154,11 @@ Optional advanced configuration example:
 - `max_task_fleets`: ceiling on how many distinct fleets (browser instances) one task may occupy; `0` disables it. The harness never closes a fleet, so one it opens holds its budget slot until the platform stops reporting it — a fleet that disappears from the owner inventory releases its slot again. Counted over fleets bound to this task's workers, never over the Agent-global `Fleet.list`. A Fleet named by task-level `@<id>`, a bound `session_key`, or `reuse_from_worker_id` consumes the budget and is honored if current authoritative inventory confirms it. At the ceiling a fleetless worker reuses one of the task's existing fleets, preferring one no running worker holds, and deployment-default `worker_session_isolation_enabled` yields to the cap. Two cases cannot be served that way and get a `task_fleet_limit_reached` receipt instead: a spawn demanding a separate identity (a phase-declared `needs_isolated_session`, or a new `session_key`), and a ceiling where every task fleet is bound to a named session, since a logged-in cookie jar is never lent to a generic worker. Waiting does not clear either one — the harness closes no fleets and a session binding outlives its worker — so the receipt tells the task owner to continue on an existing fleet, release a session binding through auth recovery, or raise the ceiling. Before refusing, the cap re-reads the authoritative `Fleet.list` once. The dispatcher answers that from the whole fleets table with no per-connection scoping, so one successful read both finds a fleet another slot created seconds ago and retires any fleet the platform has dropped — whichever slot owned it — handing its budget back. A failed read is never treated as proof of disappearance.
 - `fleet_auth_barrier_enabled`: make login/CAPTCHA resolution fleet-wide and fail closed for non-resolver workers. `fleet_auth_barrier_wait_seconds` controls the bounded wait.
 - `auth_fleet_ledger_path`: persistent, non-secret verified session index, relative to `worktree_dir` unless absolute. Reclaimed fleets are quarantined until ledger reconciliation restores their restrictions.
-- `fleet_slot_reconnect_attempts`: bounded reconnect attempts per recovery cycle. Each reconnect must retain the server-assigned protocol identity before an authenticated fleet binding is reused; transport loss never proves that the fleet is lost.
-- `fleet_slot_reconnect_backoff_seconds`: base delay between those reconnect attempts. Failed browser mutations are never replayed.
+- `fleet_slot_reconnect_attempts`: legacy or externally supplied slot recovery attempts. Native connections use the shared outage window without another retry budget.
+- `fleet_slot_reconnect_backoff_seconds`: legacy slot backoff; native recovery backs off from 0.5 seconds to at most 4 seconds.
 - `fleet_slot_manual_reset_after_failures`: recovery cycles before spawn returns `session_manual_reset_required`. The binding remains fail-closed until a host/operator explicitly resets it with the reported fleet id and generation.
 - `hitl_poll_interval_seconds`: page-state confirmation interval after HITL release; human feedback is awaited through notifications or terminal input.
-- `hitl_wait_timeout_seconds`: maximum wait time for human intervention.
+- Human HITL waits have no time or cumulative-question quota; answers and live guidance have no fixed character cap. Legacy `hitl_wait_timeout_seconds` and `hitl_max_pause_rounds_per_page/worker` settings are ignored. Protocol calls and page confirmation after a reply remain bounded.
 - `worktree_dir`: root directory for run logs and artifacts.
 - `context_file`: legacy optional single static prompt-context file. It remains supported; prefer `project_context_files` for new configuration.
 - `project_context_files`: ordered static project-instruction files. An item is either a path string or `{ "path": "...", "scope": "..." }`. The harness emits them as escaped `<project_context><project_instructions ...>` XML in that order; duplicate files are injected once. Use stable files only.

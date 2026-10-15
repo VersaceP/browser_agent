@@ -12,9 +12,9 @@ CLI 由 [main.py](../main.py) 加载 [runtime_config.py](../runtime_config.py) �
 | --- | --- | --- | --- |
 | Browser | `main._run_cli_impl` → `BrowserTaskRunner` → `BrowserAgent` | `worker` | 直接执行原始用户请求；BrowserAgent 管理执行上下文、观察、工具调用和完成复核 |
 | Skill | `run_skill_cli` → `SkillSession` | `skill_orchestrator`；未配置时复用 `worker` | 绑定一个已发布 Skill 版本和本轮输入，执行已决定的 Workflow 步骤，处理语义分支与恢复 |
-| Workflow | `run_skill_cli` → `WorkflowSession` | `skill_orchestrator`；未配置时复用 `worker` | 在任务工作区开发、运行和验证可复用程序，管理 Builder 子任务与交付源包 |
+| Workflow | `run_skill_cli` → `WorkflowSession` | `skill_orchestrator`；未配置时复用 `worker` | 在任务工作区开发、运行和验证可复用程序，管理独立 trial 与交付源包 |
 
-模型连接的实际选择集中在 [model_config.py](../harness/runtime/model_config.py)。Browser worker、Builder 子任务和独立 Builder 使用 `worker`；Workflow 主 Agent 和 Skill Orchestrator 可以配置自己的连接。
+模型连接的实际选择集中在 [model_config.py](../harness/runtime/model_config.py)。Browser worker 和独立草稿入口 使用 `worker`；Workflow 主 Agent 和 Skill Orchestrator 可以配置自己的连接。
 
 ```mermaid
 flowchart TD
@@ -28,7 +28,7 @@ flowchart TD
     worker --> tools[浏览器工具、权限、身份、证据]
     tools --> client[ABCPClient / WebCross 连接]
     client --> platform[WebCross：目标解析、浏览器执行、Workflow 编译与执行]
-    workflow --> builder[任务工作区与 Builder 子任务]
+    workflow --> builder[单作者工作区与独立测试页]
 ```
 
 图中的 `WorkflowSession → SkillSession` 表示实现继承和复用；一次 Workflow 任务只有自己的主编排循环，不会再启动一个独立 Skill 主 Agent。
@@ -53,16 +53,16 @@ flowchart TD
 - `SkillSession` 使用自己的模型上下文和持久状态，读取本轮目标、输入、计划、执行回执及待处理事项。
 - 已决定的步骤由执行服务连续运行。服务复用 spawner 的槽位、页面租约和传输，执行这些操作本身不启动 Browser 模型循环；实现见 [executor.py](../harness/skill_runtime/executor.py)。
 - `delegate_browser` 只把一个明确的页面子目标交给 Browser worker，证据和回执返回当前 Skill 会话。
-- `delegate_coding` 创建或恢复任务自己的修复工作区。它属于 Skill／Workflow 的开发与恢复能力；正式 Skill 的编辑和发布仍走各自明确的命令与权限路径。
+- Workflow 主 Agent 直接编辑任务工作区；`/skill` 复用通过 Browser 完成有界操作，源码修订交给 `/skill-edit`。发布仍需用户命令。
 - 结束提案使用原始目标、当前版本、执行事实和独立审查回执。审查可以要求继续、提出必要的人类决策或支持结束；处理代码见 [terminal.py](../harness/skill_runtime/terminal.py)。
 
 这些工具由当前 Skill 会话注册和执行，不依赖已删除的 Lead 工具或根目录兼容导入壳。
 
 ## Workflow：开发与验证源包
 
-[WorkflowSession](../harness/workflow_mode/session.py) 继承 Skill 会话的执行、证据、恢复和结束协议，并增加开发工作区、当前源码执行、隔离测试页面及持久 Builder 子任务。
+[WorkflowSession](../harness/workflow_mode/session.py) 继承 Skill 会话的执行、证据、恢复和结束协议，并增加开发工作区、当前源码执行、隔离测试页面及独立 trial 状态。
 
-主 Agent 可以在自己的开发工作区读取和修改源文件，以当前保存的源码版本运行 Workflow。Builder 子任务有自己的上下文、工作区身份与验证回执；主 Agent 据这些事实判断是否接受实现、继续修订或交付。测试页面与业务页面的归属由已有租约和身份机制约束。
+主 Agent 可以在自己的开发工作区读取和修改源文件，以当前保存的源码版本运行 Workflow。同一个主 Agent 在独立页面试运行同一份源码，测试拥有单独的检查点与回执；不再创建 Builder 子任务或合并另一份源码。测试页面与业务页面的归属由已有租约和身份机制约束。
 
 Workflow 结束后返回任务结果和 `packageRef`。把任务源包转成正式 Skill 使用 Skill Builder 的包装／发布流程；结束 Workflow 任务本身不等同于发布 Skill。命令与文件合同见 [Skill 使用说明](../skills/README.md)。
 
