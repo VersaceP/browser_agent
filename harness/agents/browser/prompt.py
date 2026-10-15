@@ -5,6 +5,7 @@ import json
 from harness.fleet.auth import auth_fleet_memory_guidance
 from harness.capabilities.schema_loader import CapabilityBundle, build_capability_digest
 from harness.workflow.workflow_runtime import workflow_execution_enabled
+from harness.tools.path_authorization import LOCAL_ACCESS_GUIDE
 from harness.runtime.model_support import (
     _guide_manifest_for,
     _webcross_behavioral_guide,
@@ -124,12 +125,11 @@ def build_system_prompt(self) -> str:
     workflow_rule = (
         "- ABCP Workflow execution is enabled for this worker only when the"
         " live capability digest includes Workflow.execute and the matching"
-        " execution tool is visible. Execute only an explicitly selected,"
-        " validated workflow-backed skill or a policy-valid authored"
-        " workflow; otherwise use the disclosed SKILL.md guidance, ordinary"
-        " browser_call, and Harness composites. Never reconstruct hidden"
-        " workflow.json steps from prose. A segment you author through"
-        " execute_browser_workflow is such an authored workflow.\n"
+        " execution tool is visible. Execute only a policy-valid authored"
+        " workflow; otherwise use ordinary browser_call and Harness"
+        " composites. Never reconstruct hidden workflow steps from prose."
+        " A segment you author through execute_browser_workflow is such an"
+        " authored workflow.\n"
         "- Prefer execute_browser_workflow over a run of single browser_call"
         " steps whenever the next few actions are already decided. Submit"
         " ONE SEGMENT: the actions from here up to the next point where you"
@@ -208,10 +208,8 @@ def build_system_prompt(self) -> str:
         " the outcome before considering a retry and obey replayForbidden."
         if workflow_enabled else
         "- ABCP Workflow execution is runtime-gated and currently disabled."
-        " Treat workflow-backed skills as guidance; use ordinary browser_call"
-        " and Harness composites. Do not call Workflow.execute,"
-        " execute_browser_workflow, execute_saved_browser_workflow, or"
-        " execute_published_skill_workflow."
+        " Use ordinary browser_call and Harness composites. Do not call"
+        " Workflow.execute or any workflow execution tool."
     )
     if script_enabled:
         workflow_rule = (
@@ -224,7 +222,12 @@ def build_system_prompt(self) -> str:
             "match the relevant event. A wait timeout throws; inspect it and current effects before recovery. "
             "Read the workflow-segments guide for the current SDK. The old steps/transform/store language "
             "is unavailable on this deployment.\n"
-            "- Combine already-decided operations and deterministic observation processing. Return to "
+            "- Prefer execute_browser_workflow over a sequence of single browser_call steps when "
+            "the upcoming actions and target-selection rules are already decided. Combine those "
+            "actions and deterministic observation processing in one source package up to the next "
+            "decision requiring model judgment. Target ids may be discovered from fresh observations "
+            "inside the script; they need not be known before calling the tool. A lone action needs "
+            "no Workflow. Return to "
             "the model for new semantic decisions, unavailable capabilities or uncertain side effects. "
             "Return compact business evidence as JSON. Read status/output/error/results/source/timing; "
             "succeeded only confirms script execution. Use getStatus/pause/resume/cancel for live control. "
@@ -320,6 +323,7 @@ L1. Contracts, Feedback, Memory
 - Call shapes come from the live capability digest or cached System.describeAction. On a schema error read `methodSchema.inputSchema` and use it exactly as returned, including every `anyOf`/`oneOf` branch, then correct the call. describeAction also returns `resultSchema` (the business result), `outputSchema` (the success envelope) and `failureSchema` (the public failure envelope and field meanings) — read those to interpret a response rather than guessing at field names. A state-changing failure is not retry-safe merely because its params can be changed; follow L5 before dispatching another action.
 - For methods with `requiresPurpose`, the harness fills `purpose` from browser_call.reason or schema `purposeHint`; still provide a specific reason.
 - Preserve the original user's scope, ordering, page/range, identity and delivery destination. If a phase instruction conflicts with the original objective, return the conflicting facts to task owner instead of silently choosing an interpretation. Missing visible rank labels do not require clarification when observed list order and pagination establish the requested targets. Ask task owner to clarify only when available evidence leaves materially different targets or requires changing the requested scope.
+- After form stages or unexpected results, read actual values and relevant page validation messages. If AX lacks that evidence, use bounded DOM/state or a screenshot. Do not infer acceptance from input success. Compare observed constraints with the original user request; ask the user through HITL promptly when a business decision is required, rather than deferring it to the final summary. Technical uncertainty first needs evidence.
 - Reuse verified artifact/page references and previous search results. Before searching logs again, identify the specific missing fact; repeated blocked calls are observations to report, not progress.
 - Never fabricate fleetId, pageId, canonical ids, selectors, URLs, credentials, or extracted values. They must come from response.data, worker input, current DOM/Page evidence, Memory.get task context, or record_extraction artifacts.
 - Fleet routing is coordinator-owned. Read `assignedFleetId` from `<slot_context>` and pass it explicitly to every Page.create. If omitted, the harness injects the same assignment; a different/fabricated fleetId and model-initiated Fleet.create/Fleet.close fail closed. A fresh page is not a fresh fleet. Close disposable pages with Page.close; fleet archive/retention belongs to Dispatcher.
@@ -362,10 +366,11 @@ L3. Lifecycle And HITL
 - Before an authorized consequential action, call Page.getState once if there is any doubt about loading, crash, HITL, dialog, file chooser, page identity, or viewport shift.
 
 L4. Actions, Verification, Data
+{LOCAL_ACCESS_GUIDE}
 - Prefer Input.* and current canonical ids. If a schema accepts id+selector together, they must identify the SAME element: id is primary and selector is the in-dispatch fallback; never invent the pair or issue a second action as a fallback. A receipt resolvedBy=selector-fallback/snapshot-recovery makes the source AX snapshot stale. Never set Input.click force=true to bypass coverage. Standard Input actions already focus, scroll and stabilize; add manual scrolling only for nested/lazy discovery. For a known target, use the locator-based action directly rather than pre-scrolling it. Use Input.scroll for target reveal, explicit container scrolling, viewport displacement, edge scrolling or a state read; choose the surface from current evidence.
 - After an upload control is activated by Input.click, Input.press, or Page.click, call File.handleChooser directly with a current upload target. Do not wait for chooser events or repeat the activating input. Refresh the target after a stale-id recovery; directory upload requires HITL. Read browser.file-upload for the full recovery sequence.
 - Call Download.remove only after current evidence shows the record is completed, failed, or cancelled. Cancel an active record and observe its terminal state before removal; removal never deletes the downloaded file.
-- For local file work, use local_fs_batch when available: it can list authorized directories (op=list), create directories, write UTF-8 text/JSON, stat/hash files, and copy authorized files while preserving their sources. External material and delivery roots require terminal confirmation before execution; use list/search to discover real names instead of guessing. Read and write approvals are separate and task-scoped. Plan the directory scope before submitting child operations: when the task needs multiple sibling directories or all contents of a material/delivery root, request that common parent explicitly first (list/search for READ, mkdir for WRITE), then batch the child operations. Approval of that parent covers its descendants for the same permission; approval of a child does not cover its parent or siblings. For a single required child, request only that child. A broader parent needs its own terminal approval; never widen a previous grant or retry a denied scope through its parent. Inspect every result and cite its file manifest. Relative paths default to task output; do not use file:// as a bypass. It cannot delete/move files or execute code. Application/source and credential paths remain protected. Declare the same delivered file paths in record_extraction rows; unrelated screenshots do not prove delivery. See browser.offload-and-local-fs for scope and partial results.
+- For local file work, use local_fs_batch when available: it can list authorized directories (op=list), create directories, write UTF-8 text/JSON, stat/hash files, and copy authorized files while preserving their sources. External material and delivery roots require terminal confirmation before execution; use list/search to discover real names instead of guessing. Inspect every result and cite its file manifest. Relative paths default to task output; do not use file:// as a bypass. It cannot delete/move files or execute code. Application/source and credential paths remain protected. Declare the same delivered file paths in record_extraction rows; unrelated screenshots do not prove delivery. See browser.offload-and-local-fs for scope and partial results.
 - Before native Input.select, use DOM.inspectSelect and copy the supported type, mode and exact values from its current receipt. For custom controls, use ordinary UI from sufficient current evidence; further inspection should resolve a decision still open. Never treat a failed select as automatically replay-safe.{select_inspection_rule} Consult the guide index when the receipt needs detailed select recovery.
 - Input.drag requires source and destination in the same document. Cross-frame/document endpoints are unsupported; an iframe source needs canonical ids for both endpoints because coordinate or relative destinations have ambiguous frame ownership.
 - Verify state-changing outcomes with sufficient current evidence from the Action contract or result-bearing control, collection or region. Execution acknowledgement alone does not establish business completion. Use Page.getState for lifecycle and DOM/AX or visual evidence for the actual result.

@@ -16,6 +16,7 @@ from harness.observation.browser_call import build_browser_call_runner
 from harness.tools.browser_tools import _close_agent_watches, build_browser_agent_tool_specs, build_browser_tool_dispatcher
 from harness.tools.browser_tools.observation_view import _prepare_browser_result_for_model
 from harness.workflow.workflow_runtime import workflow_execution_enabled
+from harness.runtime.steering import steerable_task, current_steering
 from harness.utils import JsonDict, exception_payload, write_context_snapshot
 from llm import LLMConnectionError, LLMEmptyResponseError, LLMProviderProtocolError, LLMRateLimitError, LLMRequestTimeoutError, input_moderation_rejection, retry_usage_from_attempts
 from harness.runtime.model_support import (
@@ -55,6 +56,7 @@ def _offload_browser_result_for_model(
     return model_result
 
 
+@steerable_task
 async def run_browser_agent(self, task: str) -> str:
     control = self.task_control
     step = 0
@@ -67,9 +69,12 @@ async def run_browser_agent(self, task: str) -> str:
     tools: List[JsonDict] = []
     messages: List[JsonDict] = []
     task_memory_heartbeat: Optional[asyncio.Task] = None
+    steering = current_steering()
+    steering_role = steering.register(f"browser:{self.worker_id}", primary=steering.primary is None) if steering else None
+    self.steering_role = steering_role
     self.base_max_steps = (
         0 if control is not None
-        else max(0, int(self.runtime.harness.max_steps or 0))
+        else max(0, int(self.runtime.harness.worker_max_steps or 0))
     )
     self.effective_max_steps = self.base_max_steps
     self._step_extension_granted_steps = 0
@@ -133,7 +138,9 @@ async def run_browser_agent(self, task: str) -> str:
                 "content": (
                     f"<user_task>\n{task}\n</user_task>\n\n"
                     f"<dynamic_context>\n{dynamic_context}\n</dynamic_context>\n\n"
-                    "Plan autonomously and invoke browser_call to accomplish the task. Call final_answer when you are done."
+                    + ("Follow the explicitly selected Skill's orchestration, bind current inputs and prefer its applicable formal Workflow templates. Use the available tools to resolve gaps and verify the user's goal. Call final_answer when done."
+                     if control is not None and getattr(self.runtime.harness, "forced_skill_id", "")
+                     else "Plan autonomously and invoke browser_call to accomplish the task. Call final_answer when you are done.")
                 ),
             }
         ]
@@ -166,6 +173,9 @@ async def run_browser_agent(self, task: str) -> str:
             )
             if control is not None and messages is not messages_before_compaction:
                 control.restore_compacted_context(messages)
+            if steering:
+                await steering.wait_runnable()
+                steering_role.prepare(messages)
             self._write_agent_event("agent.step.start", {"step": step})
             recorder.turn_start(step)
             recorder.message_start()
@@ -412,6 +422,16 @@ async def run_browser_agent(self, task: str) -> str:
                     ],
                 })
 
+            if steering_role and not model_call_failed and stop_reason not in {"max_tokens", "length", "error", "aborted"}:
+                steering_role.acknowledge()
+            if steering_role and steering_role.pending:
+                messages.append(assistant_message)
+                if tool_calls:
+                    messages.append({"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": str(call["id"]),
+                         "content": json.dumps({"status": "not_executed", "tool_was_executed": False,
+                             "reason": "user_input_pending"})} for call in tool_calls]})
+                continue
             if not tool_calls:
                 # A no-tool turn is an incident (not a self-reported
                 # completion) in two shapes: cut off by the output-token
@@ -655,10 +675,14 @@ async def run_browser_agent(self, task: str) -> str:
                         and isinstance(tool_call.get("input"), dict)
                         and str(tool_call["input"].get("status") or "done") == "done"
                     )
-                    if completion_proposal:
+                    if steering_role and steering_role.pending:
+                        result, should_stop = ({"status": "not_executed", "tool_was_executed": False,
+                            "reason": "user_input_pending"}, False)
+                    elif completion_proposal:
                         review = await control.completion_review(str(tool_call["input"].get("answer") or ""))
                         if (review.get("status") == "reviewed"
-                                and review.get("verdict") == "complete"):
+                                and review.get("verdict") == "complete"
+                                and not (steering_role and steering_role.pending)):
                             rejected_completion_without_action_streak = 0
                             result, should_stop = await dispatch_tool(tool_call, step)
                         else:
@@ -915,6 +939,11 @@ async def run_browser_agent(self, task: str) -> str:
                         "segmentAdviceOffered": batch_workflow_enabled,
                     })
                 if should_stop:
+                    if steering_role and steering_role.pending:
+                        should_stop = False
+                        continue
+                    if steering and steering.primary is steering_role:
+                        steering.commit(steering_role.model_revision)
                     final_answer = result.get("answer", "")
                     model_reported_status = (
                         str(result.get("status")) if result.get("status") else None
@@ -1081,6 +1110,7 @@ async def run_browser_agent(self, task: str) -> str:
                 return final_answer
         raise
     finally:
+        if steering_role: steering_role.close()
         recorder.close(
             status=str(self.final_status or final_status or "unknown"),
             reason=None if completed else "interrupted",

@@ -77,6 +77,20 @@ class ReceiptIndex:
                     "kind": "trace", "runId": self.run_id,
                     "workerId": self.worker_id, "index": index})
 
+    def add_execution_resource(self, reference: str) -> str:
+        """Bind a host-supplied program receipt to existing read/citation tools."""
+        row = self.agent.logger.storage.read_resource(current_task_id=self.task_id, resource_uri=reference)
+        if not row or row.get("task_id") != self.task_id:
+            raise ValueError("Program evidence must belong to this task")
+        raw = row.get("content_json")
+        value = json.loads(raw) if isinstance(raw, str) else raw
+        if not isinstance(value, dict) or not isinstance(value.get("receipt"), dict):
+            raise ValueError("Program evidence is not an actual execution receipt")
+        return self._add({"type": "workflow_execution", "result": value["receipt"],
+            "executionRecord": {k: v for k, v in value.items() if k != "receipt"}},
+            {"kind": "execution_resource", "runId": row.get("run_id") or "",
+             "resourceId": row["resource_id"], "reference": reference})
+
     def _payload(self, row: dict) -> dict:
         raw = row.get("payload_json")
         if raw is None and row.get("payload_resource_id"):

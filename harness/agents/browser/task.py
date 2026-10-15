@@ -16,7 +16,7 @@ from harness.capabilities.bootstrap import bootstrap_schema_cache
 from harness.planning.context import user_context
 from harness.planning.fleet_reference import extract_fleet_reference
 from harness.runtime.resume_context import ResumeContext
-from harness.runtime.worker_recovery import recover_worker_transport
+from harness.runtime.worker_recovery import recover_worker_transport, resume_worker_transport
 from harness.spawner import BrowserAgentSpawner
 from harness.task_control import (accept_task_plan, find_phase, load_task_state,
     mark_phase_exhausted_if_needed, phase_contract, phase_start_rejection,
@@ -52,6 +52,9 @@ class BrowserTaskRunner:
 
     async def _bootstrap_schema_cache(self):
         await bootstrap_schema_cache(self)
+        # Capability bootstrap does not verify Fleet inventory or update a
+        # persisted fatal transport blocker. Resume it before worker dispatch.
+        await resume_worker_transport(self)
 
     async def spawn(self, phase_id):
         phase = find_phase(self.task_plan, phase_id)

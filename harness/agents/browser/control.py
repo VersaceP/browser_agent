@@ -254,11 +254,11 @@ class StandaloneTaskControl:
                 and getattr(agent, "standalone_hitl_timeout", None)):
             agent._write_agent_event("browser.task_review.skipped", {
                 "phase": "progress", "step": agent._current_step,
-                "reason": "hitl_timeout_awaiting_user",
+                "reason": "hitl_wait_awaiting_user",
             })
             tool_results.append({"type": "text", "text": (
-                "HITL timed out without a confirmed page resume. Your todo was saved."
-                " Preserve any recorded user answer; timeout adds no decision or permission."
+                "HITL wait ended without a confirmed page resume. Your todo was saved."
+                " Preserve any recorded user answer; an interrupted wait adds no decision or permission."
                 " Do not write to the paused page."
                 " Report the concrete blocker briefly with final_answer(incomplete)."
             )})

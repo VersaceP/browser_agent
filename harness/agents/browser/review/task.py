@@ -35,6 +35,7 @@ from harness.tools.screenshot_policy import normalize_screenshot_output_params
 from harness.utils import read_task_file_text
 from harness.agents.browser.review.evidence import receipt_index, receipt_view, is_tool_receipt as _is_tool_receipt
 from harness.agents.browser.review.issues import issue_state, active_issues, apply_issue_delta, stage_findings
+from harness.agents.browser.review.query import EvidenceQuery
 
 
 READ_BROWSER_METHODS = frozenset({
@@ -61,7 +62,7 @@ _TOOLS = [
      "input_schema": {"type": "object", "properties": {
          "evidence_id": {"type": "string"}, "offset": {"type": "integer"}},
          "required": ["evidence_id"], "additionalProperties": False}},
-    {"name": "review_search_trace", "description": "Locate attributed task receipts, including prior runs, for a specific unresolved question. Prefer an already supplied evidenceId when known. Follow nextCursor with the same term; excerpts and zero matches do not prove absence.",
+    {"name": "review_search_trace", "description": "Locate attributed task receipts, including prior runs, by literal text (not regex). Prefer an already supplied evidenceId when known. Follow nextCursor with the same term; excerpts and zero matches do not prove absence.",
      "input_schema": {"type": "object", "properties": {
          "term": {"type": "string"}, "cursor": {"type": "string"}}, "required": ["term"]}},
     {"name": "review_file_info", "description": "Check an authorized file's size and optionally its SHA-256; no content is modified.",
@@ -78,12 +79,15 @@ _TOOLS = [
      "input_schema": {"type": "object", "properties": {
          "method": {"type": "string", "enum": sorted(READ_BROWSER_METHODS)},
          "params": {"type": "object"}}, "required": ["method", "params"]}},
-    {"name": "review_query_observation", "description": "Query a supplied page or receipt evidenceId without reading the live page. Group needed facts: at most 8 patterns and 8 keys, each 1-200 characters; limit 1-10 matches each, follow nextOffset when needed. Patterns search decoded lines for full AX captures, otherwise JSON; keys search JSON including encoded strings. Prefer keys and scope for structured results. scope is a JSON pointer; /result/response/data targets a receipt's platform result and /data a reviewer capture. Narrow further using observed paths. Without scope, matches may come from request parameters/purpose or script output; their presence is not outcome proof. Results retain hashes, provenance, paths and coverage limits; they prove historical facts only. Use review_read_trace for necessary full context.",
+    {"name": "review_query_observation", "description": "Query supplied page/receipt evidence without a live read. Batch up to 8 keys, 8 paths and 8 regex patterns. Keys match exact case-sensitive field names by default; key_match=contains explicitly searches name substrings. Paths are absolute JSON pointers; returned paths can be read directly. /$json explicitly decodes a JSON object/array string, e.g. /data/apis/0/responseBody/$json/data. scope narrows keys/patterns; /result/response/data is a receipt result, /data a reviewer capture. Patterns search decoded AX lines or decoded JSON scalar-field objects; pattern_mode=raw searches serialized JSON. Hit offsets refer to the hit path/encoding. contextPaths refer to deduplicated records with literal sibling fields, request identity/time/status; capturedAt is observation capture time, timestamps inside records belong to those records. Follow nextOffset for match pages; valueTruncated means narrow the path. Hashes, source, redaction and coverage bounds remain authoritative. Request/purpose/script matches and old records are not current outcome proof; zero matches do not prove absence.",
      "input_schema": {"type": "object", "properties": {
          "evidence_id": {"type": "string"},
          "patterns": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 200}, "maxItems": 8},
          "keys": {"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 200}, "maxItems": 8},
-         "scope": {"type": "string", "maxLength": 500, "description": "JSON pointer to the subtree to query; empty means the complete source."},
+         "paths": {"type": "array", "items": {"type": "string", "maxLength": 500}, "maxItems": 8},
+         "key_match": {"type": "string", "enum": ["exact", "contains"], "default": "exact"},
+         "pattern_mode": {"type": "string", "enum": ["decoded", "raw"], "default": "decoded"},
+         "scope": {"type": "string", "maxLength": 500, "description": "JSON pointer narrowing keys/patterns, including /$json hops. Paths always start at the complete source root."},
          "offset": {"type": "integer", "minimum": 0},
          "limit": {"type": "integer", "minimum": 1, "maximum": 10, "default": 10}},
          "required": ["evidence_id"]}},
@@ -876,57 +880,65 @@ def _query_observation(agent: Any, raw: dict, evidence: dict, receipts=None) -> 
                           "task receipt evidenceId from this review/read/search tools."}
     patterns = raw.get("patterns") or []
     keys = raw.get("keys") or []
-    if (not isinstance(patterns, list) or not isinstance(keys, list)
-            or not patterns and not keys or len(patterns) > 8 or len(keys) > 8
+    paths = raw.get("paths") or []
+    key_match = raw.get("key_match", "exact")
+    pattern_mode = raw.get("pattern_mode", "decoded")
+    if (not isinstance(patterns, list) or not isinstance(keys, list) or not isinstance(paths, list)
+            or not patterns and not keys and not paths
+            or len(patterns) > 8 or len(keys) > 8 or len(paths) > 8
             or any(not isinstance(item, str) or not item or len(item) > 200
-                   for item in [*patterns, *keys])):
+                   for item in [*patterns, *keys])
+            or any(not isinstance(item, str) or len(item) > 500
+                   or item and not item.startswith("/") for item in paths)
+            or not isinstance(key_match, str) or key_match not in {"exact", "contains"}
+            or not isinstance(pattern_mode, str) or pattern_mode not in {"decoded", "raw"}):
         return {"status": "rejected", "reason": "observation_query_invalid",
-                "detail": "Supply patterns or keys as arrays of at most 8 non-empty strings each, "
-                          "with at most 200 characters per string. Received "
+                "detail": "Supply patterns/keys as arrays of at most 8 non-empty strings each, "
+                          "with at most 200 characters per string, or at most 8 JSON pointer paths. "
+                          "key_match is exact/contains; pattern_mode is decoded/raw. Received "
                           f"patterns={len(patterns) if isinstance(patterns, list) else type(patterns).__name__}, "
-                          f"keys={len(keys) if isinstance(keys, list) else type(keys).__name__}."}
+                          f"keys={len(keys) if isinstance(keys, list) else type(keys).__name__}, "
+                          f"paths={len(paths) if isinstance(paths, list) else type(paths).__name__}."}
     offset = max(0, int(raw.get("offset") or 0))
     limit = max(1, min(10, int(raw.get("limit") or 10)))
     root = None
+    parsed = False
     if len(content) <= 4_000_000:
         try:
             root = json.loads(content)
+            parsed = True
         except ValueError:
             pass
     scope = raw.get("scope") or ""
     if not isinstance(scope, str) or len(scope) > 500 or scope and not scope.startswith("/"):
         return {"status": "rejected", "reason": "observation_scope_invalid"}
+    query = EvidenceQuery(root)
+    scoped = root
     if scope:
-        if root is None:
+        if not parsed:
             return {"status": "unavailable", "reason": "observation_json_unavailable"}
         try:
-            for token in scope[1:].split("/"):
-                if re.search(r"~(?![01])", token):
-                    raise ValueError("Invalid JSON pointer escape")
-                token = token.replace("~1", "/").replace("~0", "~")
-                if isinstance(root, list):
-                    if not re.fullmatch(r"0|[1-9][0-9]*", token):
-                        raise ValueError("Invalid JSON array index")
-                    root = root[int(token)]
-                else:
-                    root = root[token]
+            scoped, _ = query.resolve(scope)
         except (KeyError, IndexError, TypeError, ValueError):
             return {"status": "unavailable", "reason": "observation_scope_not_found"}
-    data = root.get("data") if isinstance(root, dict) else None
+    data = scoped.get("data") if isinstance(scoped, dict) else None
     data_path = "data"
-    if isinstance(root, dict) and root.get("mode") in {"full", "detail"}:
-        data, data_path = root, ""
-    if evidence_id.startswith("receipt:") and not isinstance(data, dict) and isinstance(root, dict):
-        result = root.get("result", root)
+    if isinstance(scoped, dict) and scoped.get("mode") in {"full", "detail"}:
+        data, data_path = scoped, ""
+    if evidence_id.startswith("receipt:") and not isinstance(data, dict) and isinstance(scoped, dict):
+        result = scoped.get("result", scoped)
         response = result.get("response") if isinstance(result, dict) else None
         data = response.get("data") if isinstance(response, dict) else None
-        data_path = "result.response.data" if "result" in root else "response.data"
-    search_text = _json(root) if scope else content
+        data_path = "result.response.data" if "result" in scoped else "response.data"
+    search_text = _json(scoped) if scope else content
     search_source = scope or ("receipt" if evidence_id.startswith("receipt:") else "response")
+    ax_text = None
+    ax_path = ""
     if isinstance(data, dict) and data.get("mode") == "full":
         lines = data.get("lines")
         if isinstance(lines, list) and all(isinstance(line, str) for line in lines):
-            search_text = "\n".join(lines)
+            ax_text = "\n".join(lines)
+            ax_path = scope + ("/" + data_path.replace(".", "/") if data_path else "") + "/lines"
             search_source = (scope + "/" if scope else "") + (data_path + "." if data_path else "") + "lines"
     observation = data.get("observation") if isinstance(data, dict) else None
     if not isinstance(observation, dict) and isinstance(data, dict):
@@ -935,85 +947,33 @@ def _query_observation(agent: Any, raw: dict, evidence: dict, receipts=None) -> 
         provenance["observation"] = {key: observation[key] for key in (
             "pageId", "documentEpoch", "version", "capturedAt", "checkedAt",
             "freshness", "pendingChanges", "source") if key in observation}
-    searchable = search_text[:4_000_000]
-    results: list[dict] = []
-    for pattern in patterns:
-        try:
-            regex = re.compile(pattern, re.IGNORECASE)
-        except re.error as exc:
-            return {"status": "rejected", "reason": "invalid_regex",
-                    "detail": str(exc)[:200]}
-        hits = []
-        next_offset = None
-        for index, match in enumerate(regex.finditer(searchable)):
-            if index < offset:
-                continue
-            if len(hits) >= limit:
-                next_offset = index
-                break
-            start = max(0, match.start() - 120)
-            hits.append({"charOffset": match.start(),
-                "matchLength": match.end() - match.start(),
-                "snippet": searchable[start:start + 400],
-                "snippetStart": start,
-                "snippetTruncated": match.end() + 200 > start + 400})
-        results.append({"type": "regex", "query": pattern, "matches": hits,
-                        "nextOffset": next_offset})
-    if keys:
+    if keys or paths:
         if len(content) > 4_000_000:
-            results.extend({"type": "jsonKey", "query": query,
-                "matches": [], "unavailableReason": "observation_exceeds_json_query_limit"}
-                for query in keys)
             return {"status": "partial", "evidenceId": evidence_id,
-                "sourceSha256": fact["sourceSha256"],
-                "searchSource": search_source, "limit": limit,
-                "historicalObservation": True, "results": results,
-                "coverageTruncated": True, "queryScope": scope, **provenance}
-        if root is None:
+                "sourceSha256": fact["sourceSha256"], "searchSource": search_source,
+                "limit": limit, "historicalObservation": True,
+                "results": [{"type": kind, "query": term, "matches": [],
+                    "unavailableReason": "observation_exceeds_json_query_limit"}
+                    for kind, terms in (("regex", patterns), ("jsonKey", keys), ("jsonPath", paths))
+                    for term in terms],
+                "coverageTruncated": True, "jsonCoverageTruncated": True,
+                "queryScope": scope, **provenance}
+        if not parsed:
             return {"status": "unavailable", "reason": "observation_json_invalid"}
-        found = {key: [] for key in keys}
-        counts = {key: 0 for key in keys}
-        stack = [(root, scope, 0)]
-        seen = 0
-        depth_truncated = False
-        while stack and seen < 100_000:
-            value, path, depth = stack.pop()
-            seen += 1
-            if depth > 14:
-                depth_truncated = True
-                continue
-            if isinstance(value, str) and len(value) <= 2_000_000 and value.lstrip().startswith(("{", "[")):
-                try:
-                    stack.append((json.loads(value), path + "/$json", depth + 1))
-                except ValueError:
-                    pass
-            elif isinstance(value, dict):
-                for name, child in reversed(list(value.items())):
-                    child_path = path + "/" + str(name).replace("~", "~0").replace("/", "~1")
-                    for query in keys:
-                        if query.casefold() in str(name).casefold():
-                            index = counts[query]
-                            counts[query] += 1
-                            if offset <= index < offset + limit:
-                                preview = _json(child)
-                                found[query].append({"path": child_path,
-                                    "value": preview[:3000],
-                                    "valueTruncated": len(preview) > 3000})
-                    stack.append((child, child_path, depth + 1))
-            elif isinstance(value, list):
-                for index in range(len(value) - 1, -1, -1):
-                    stack.append((value[index], path + f"/{index}", depth + 1))
-        for query in keys:
-            results.append({"type": "jsonKey", "query": query,
-                "matches": found[query],
-                "nextOffset": offset + limit if counts[query] > offset + limit else None})
-    return {"status": "partial" if source_incomplete else "done", "evidenceId": evidence_id,
+    try:
+        queried = query.query(scope=scope, patterns=patterns, keys=keys, paths=paths,
+            offset=offset, limit=limit, key_match=key_match,
+            pattern_mode=pattern_mode if parsed else "raw", raw_text=search_text,
+            ax_text=ax_text, ax_path=ax_path)
+    except re.error as exc:
+        return {"status": "rejected", "reason": "invalid_regex", "detail": str(exc)[:200]}
+    incomplete = source_incomplete or len(content) > 4_000_000 or queried["jsonCoverageTruncated"]
+    return {"status": "partial" if incomplete else "done", "evidenceId": evidence_id,
         "sourceSha256": fact["sourceSha256"], "capturedAt": fact.get("capturedAt"),
         "searchSource": search_source, "limit": limit,
-        "historicalObservation": True, "results": results,
-        "coverageTruncated": source_incomplete or len(search_text) > len(searchable),
-        "jsonCoverageTruncated": bool(keys and (seen >= 100_000 or depth_truncated)),
-        "queryScope": scope, **provenance}
+        "historicalObservation": True, "coverageTruncated": incomplete,
+        "keyMatch": key_match, "patternMode": pattern_mode,
+        "queryScope": scope, **queried, **provenance}
 
 
 async def _read_tool(agent: Any, trace: list, name: str, raw: dict,
@@ -1168,10 +1128,17 @@ def _review_result(raw: dict, *, phase: str, goal_hash: str, todo_hash: str,
                    proposal_hash: str, evidence_ids: set[str],
                    fresh_evidence_ids: set[str] | None = None,
                    inspected_evidence_ids: set[str] | None = None,
-                   issues_state: dict | None = None) -> dict[str, Any]:
+                   issues_state: dict | None = None, terminal_proposal: bool = False) -> dict[str, Any]:
     verdict = raw.get("verdict")
     references = raw.get("evidenceIds")
     errors = []
+    terminal = {}
+    if terminal_proposal:
+        from harness.skill_runtime.terminal import validate_terminal_decision
+        try:
+            terminal["terminalDecision"] = validate_terminal_decision(raw.get("terminalDecision"), verdict)
+        except ValueError as exc:
+            errors.append(str(exc))
     for key, expected in (("goalHash", goal_hash), ("todoHash", todo_hash), ("proposalHash", proposal_hash)):
         if raw.get(key) != expected:
             errors.append(f"{key} does not match the supplied binding")
@@ -1214,7 +1181,7 @@ def _review_result(raw: dict, *, phase: str, goal_hash: str, todo_hash: str,
             "evidenceIds": references[:60],
             "suggestedNextAction": raw["suggestedNextAction"].strip()[:1500],
             "goalHash": goal_hash, "todoHash": todo_hash,
-            "proposalHash": proposal_hash}
+            "proposalHash": proposal_hash, **terminal}
 
 
 def _review_continuity(agent: Any, todo: dict, trace: list, receipts=None) -> dict:
@@ -1265,29 +1232,56 @@ def _expire_review_images(messages: list[dict]) -> None:
                 ]
 
 
-async def review_browser_task(*, agent: Any, original_goal: str,
+async def _review_browser_task(*, agent: Any, original_goal: str,
                               operator_inputs: list[dict], phase: str,
-                              final_answer: str = "", question: str = "") -> dict[str, Any]:
+                              final_answer: str = "", question: str = "",
+                              program_context: dict | None = None, steering_role=None) -> dict[str, Any]:
     """Continue this task's isolated reviewer conversation across invocations."""
     todo = todo_snapshot(agent)
     started = time.monotonic()
     prior_review = read_review_state(agent) or {}
     findings = issue_state(prior_review)
     tools = review_tools(agent, phase)
+    terminal_proposal = bool(program_context and "terminalProposal" in program_context)
+    if terminal_proposal:
+        submit = next(tool for tool in tools if tool["name"] == "submit_browser_task_review")
+        submit["input_schema"]["properties"]["terminalDecision"] = {
+            "type": "object", "properties": {
+                "action": {"type": "string", "enum": ["continue", "ask_user", "stop"]},
+                "reason": {"type": "string"}, "question": {"type": "string"}},
+            "required": ["action", "reason"], "additionalProperties": False}
+        submit["input_schema"]["required"].append("terminalDecision")
+        submit["description"] += (
+            " For this Skill/Workflow ending, also supply terminalDecision: continue for recoverable work, "
+            "ask_user with verdict=needs_user and a concrete question for missing human decisions, "
+            "or stop for verified completion/an evidenced external blocker/explicit user direction. "
+            "Explain the choice from evidence; an incomplete proposal does not itself justify stopping.")
     # A later user amendment changes the effective goal without rewriting the
     # immutable original request. Bind the verdict to both in ordered form.
     goal_hash = _sha(_json([original_goal, operator_inputs]))
     goal_evidence_id = "user-goal:" + goal_hash
-    proposal_hash = _sha(final_answer) if phase == "final" else ""
+    proposal_hash = _sha(_json([final_answer, program_context])) if program_context is not None else _sha(final_answer) if phase == "final" else ""
     trace = list(getattr(agent, "trace", []) or [])
     receipt_store = receipt_index(agent, trace)
     receipt_store.load_history()
+    program_ids = set()
+    if program_context is not None:
+        program_context = copy.deepcopy(program_context)
+        for entry in (program_context.get("evidence") or {}).get("workflows", []):
+            for execution in entry.get("currentExecutions", []):
+                try:
+                    evidence_id = receipt_store.add_execution_resource(execution["receiptRef"])
+                except (ValueError, KeyError):
+                    execution["readStatus"] = "unavailable"
+                    continue
+                execution["evidenceId"] = evidence_id
+                program_ids.add(evidence_id)
     receipts = []
     for index, item in enumerate(trace):
         if _is_tool_receipt(item):
             receipts.append({"index": index, "evidenceId": receipt_store.live_ids[index],
                 "type": item.get("type"), "excerpt": _json(receipt_view(item))[:2000]})
-    supplied_ids = {item["evidenceId"] for item in receipts[-8:]} | {goal_evidence_id}
+    supplied_ids = {item["evidenceId"] for item in receipts[-8:]} | {goal_evidence_id} | program_ids
     session = read_review_session(agent) or {}
     messages: list[dict] = copy.deepcopy(session.get("messages", []))
     # The continuous conversation already contains these receipt locators.
@@ -1352,6 +1346,7 @@ async def review_browser_task(*, agent: Any, original_goal: str,
                    "Use complete only when the whole goal is supported; progress_ok is invalid in final."
                    if phase == "final" else
                    "Use progress_ok for supported progress, even if all work is ready; complete is invalid here."),
+               **({"programReview": program_context} if program_context is not None else {}),
                "workerQuestion": question[:2000],
                "proposalHash": proposal_hash, "traceCount": len(trace),
                "recentReceipts": receipts[-8:],
@@ -1440,6 +1435,23 @@ async def review_browser_task(*, agent: Any, original_goal: str,
             output["sessionPersisted"] = checkpoint()
         return output
     while True:
+        if steering_role:
+            await steering_role.owner.wait_runnable()
+            steering_role.prepare(messages)
+            latest = steering_role.owner.latest_inputs(original_goal)
+            if latest != operator_inputs:
+                operator_inputs = latest
+                goal_hash = _sha(_json([original_goal, operator_inputs]))
+                goal_evidence_id = "user-goal:" + goal_hash
+                evidence_ids.add(goal_evidence_id)
+                supplied_ids.add(goal_evidence_id)
+                request.update(operatorInputs=operator_inputs, goalHash=goal_hash,
+                               userGoalEvidenceId=goal_evidence_id)
+                current_request = {"role": "user", "content": _json(request)}
+                messages.append({"role": "user", "content": _json({
+                    "originalUserGoal": original_goal, "operatorInputs": operator_inputs,
+                    "userGoalEvidenceId": goal_evidence_id, "goalHash": goal_hash,
+                    "instruction": "User input changed. Keep valid evidence and issues; reassess the goal. An earlier complete verdict does not establish this amended goal."})})
         window = int(getattr(agent.runtime.harness, "model_context_window_tokens", 500000))
         if estimate_prompt_tokens(_SYSTEM, messages, tools) > int(window * 0.85):
             # Retire raw receipts while preserving the current goal, unresolved
@@ -1484,6 +1496,8 @@ async def review_browser_task(*, agent: Any, original_goal: str,
             return finish({"status": "unavailable", "reason": "reviewer_call_failed",
                     "errorType": type(exc).__name__})
         _expire_review_images(messages)
+        if steering_role and stop not in {"max_tokens", "length", "error", "aborted"}:
+            steering_role.acknowledge()
         if not calls:
             invalid_streak += 1
             if invalid_streak >= 3:
@@ -1505,6 +1519,12 @@ async def review_browser_task(*, agent: Any, original_goal: str,
             name = str(call.get("name") or "")
             raw = call.get("input")
             raw = raw if isinstance(raw, dict) else {}
+            if steering_role and (steering_role.pending or
+                    steering_role.owner.latest_inputs(original_goal) != operator_inputs):
+                results.append({"type": "tool_result", "tool_use_id": str(call.get("id") or ""),
+                    "content": _json({"status": "not_executed", "tool_was_executed": False,
+                        "reason": "user_input_pending", "instruction": "Continue reviewing with the new user input."})})
+                continue
             if name == "submit_browser_task_review":
                 if len(calls) != 1:
                     findings = stage_findings(findings, raw, evidence_ids)
@@ -1544,7 +1564,7 @@ async def review_browser_task(*, agent: Any, original_goal: str,
                     evidence_ids=evidence_ids,
                     fresh_evidence_ids=fresh_evidence_ids,
                     inspected_evidence_ids=set(validated_evidence) | fresh_evidence_ids,
-                    issues_state=findings)
+                    issues_state=findings, terminal_proposal=terminal_proposal)
                 from harness.tools.tool_policy import collect_sensitive_replacements, sanitize_transport_payload
                 agent.logger.write("browser.task_review.verdict", {
                     "reviewId": review_id, "phase": phase,
@@ -1656,6 +1676,17 @@ async def review_browser_task(*, agent: Any, original_goal: str,
             return finish({"status": "unavailable",
                 "reason": "browser_transport_disconnected",
                 "suggestedNextAction": "Recover the browser connection before live review; do not infer that a page or task data was deleted."})
+
+
+async def review_browser_task(**kwargs):
+    from harness.runtime.steering import current_steering
+    manager = current_steering()
+    agent = kwargs["agent"]
+    role = manager.register(f"reviewer:{getattr(agent, 'worker_id', 'owner')}") if manager else None
+    try:
+        return await _review_browser_task(**kwargs, steering_role=role)
+    finally:
+        if role: role.close()
 
 
 __all__ = ["READ_BROWSER_METHODS", "todo_path", "todo_snapshot", "write_todo",

@@ -133,7 +133,7 @@ class BrowserAgent:
             self.task_control.compaction_continuity if self.task_control else None)
         self.base_max_steps = (
             0 if self.standalone_browser_mode
-            else max(0, int(self.runtime.harness.max_steps or 0))
+            else max(0, int(self.runtime.harness.worker_max_steps or 0))
         )
         self.effective_max_steps = self.base_max_steps
         self._step_extension_granted_steps = 0
