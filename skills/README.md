@@ -1,349 +1,225 @@
-# Skills — 可复用任务胶囊约定（P1 contract）
+# Skills
 
-> 本文定义 `skills/<slug>/` 的目录形态、三份文件的字段 schema、以及兜底契约模板。所有字段均经 ABCP 源码核实（`abcp browser/packages/{workflow,actions}/src/`）。
+Published Skills live in `skills/<skill-id>/`. `SKILL.md` describes the goal, inputs,
+outputs, execution conditions and recovery. Formal entries under `workflows/` are
+WebCross JavaScript/TypeScript source packages (`schemaVersion`, `name`, `entry`,
+`files`, optional `timeoutMs`); invocation variables are passed separately as
+`input`. Trials under `trials/` are development probes, not formal entries.
+Existing frontmatter fields and extensions are preserved.
 
----
+## References and matching
 
-## 0. 一个 skill 是什么
+Execute, publish and delete by Skill name or Skill ID. Resolution prefers an exact
+Skill ID, then a case-insensitive exact name, then case-insensitive name containment.
+A single match is selected automatically. Multiple matches print every matching
+name and ID and require an exact selection; no edit-distance guess or recency choice
+is used. `--skill` uses the same name resolver. Quote names containing spaces.
 
-一个可复用的任务胶囊，有**两个可各自缺席的层**（07-07 定案，"层不是类"）：
+Skill IDs identify Skills across versions. A full task ID identifies an execution
+or one Builder authoring conversation. `/skill-create` requires `@` followed by the
+full 32-character source task ID. `/resume` requires the saved task ID (an optional
+`@` prefix is accepted). Neither command uses fuzzy task IDs.
 
-| 层 | 载体 | 作用 |
-|----|------|------|
-| **workflow**（快路径） | workflow.json + fallback.yaml | 冻结的 `Workflow.execute` 步骤序列 + 成功判据 + 兜底契约；happy-path 零页面级 LLM |
-| **hints**（guidance，慢路径捷径） | SKILL.md 的 `## 页面知识（hints）` 小节 | 建议性页面知识（选择器/负知识/遮罩/步数基线），注进 worker 上下文省去重复探索（见 §8） |
+## Commands
 
-- workflow 命中 → 注入运行期参数 → `browser_call(Workflow.execute, …)` 跑确定性步骤。
-- workflow 失败/暂停 → 把失败步 + 累积 variables 交 BrowserAgent 接管。
-- **没有 workflow.json 的目录 = hints-only（guidance）skill**：快路径直接跳过，worker 带着 hints 自己干（p1 型探索任务的正确形态）。
-- p2-p5 型确定性抽取：workflow 为主，hints 可补接管知识；同一 skill 可双层兼有。
+Enter `/skill` to display published Skills and Builder drafts. The input prompt is
+`[skill]>`. User task text and raw evidence retain their original language.
 
----
+| Operation | Command |
+| --- | --- |
+| Select / execute a published Skill | `/<Skill-name-or-ID> [@Fleet-ID] [task]` |
+| Create or update from execution evidence | `/skill-create [Skill-name-or-ID] @<task-id> [request]` |
+| Publish a saved draft | `/skill-publish <Skill-name-or-ID>` |
+| Delete a published Skill or draft | `/skill-delete <Skill-name-or-ID>` |
+| Continue an execution or Builder draft | `/resume <task-id> [instruction]` |
 
-## 1. 目录形态
+Fleet selection is optional. A Skill-only command selects it and waits for the goal.
+A command containing only a Skill and Fleet retains that Fleet for the next goal.
+`/<Skill>` always executes; task IDs in the Fleet position never route to repair.
+Mode navigation remains `/skill`, `/browser` and `/workflow [task]`.
 
-```
-skills/
-├── README.md              # 本文（约定）
-├── _template/             # 空骨架，复制改名即用
-│   ├── SKILL.md
-│   ├── workflow.json
-│   └── fallback.yaml
-└── <task-slug>/           # 一个具体 skill
-    ├── SKILL.md           # 任务身份 + 运行指令 + 兜底契约（人/agent 可读）
-    ├── workflow.json      # Workflow.execute 的 steps + variables 模板
-    └── fallback.yaml      # 结构化成功判据 + 接管策略（机器可判定）
-```
+Publish and delete resolve a Skill before selecting a version. If several drafts
+match, publication lists their task IDs, versions and statuses and prompts for a
+number. Deletion does the same when published files and drafts, or multiple drafts,
+are present. Enter cancels. Non-interactive ambiguity returns the candidates and
+exit code 3 without mutation. Multiple Skill-name matches require re-entering an
+exact name or ID before any version choice. Hashes are read and checked internally;
+users do not need to copy a content hash or specify `--draft` / `--published`.
+Saved draft validation and publication conflict checks still apply. Draft deletion
+checks current file identity, ownership and a content snapshot even for incomplete
+drafts. Active task locks prevent publication, deletion and another resume from
+changing the same owned draft concurrently. Task-owned execution sources survive
+publication and deletion.
 
-新建 skill：`cp -r skills/_template skills/<your-slug>`，逐个填占位符（`<...>` 和 `__FILL__`）。
+Omit the Skill name to create a new Skill; include a published name or ID to update
+that Skill from the named task's evidence. The update copies the task's pinned
+executed version when available, and binds the current published hash for conflict
+checking. Multiple invocations of identical source bytes share one version binding
+and retain all task evidence. If the task used different hashes, the CLI lists the
+source invocations for explicit version selection. Non-interactive or cancelled
+selection returns exit code 3 without starting a Builder. Updating creates a fresh
+draft; `/resume <builder-task-id>` continues an existing authoring conversation.
+Publication remains a separate command.
 
----
+Answering `no` to file, test-page or Fleet authorization refuses that operation and
+returns a denial to the Agent without terminating its model loop. The permission
+is not granted. The Agent can continue with authorized operations or report the
+current task incomplete if its goal cannot be met without that permission.
 
-## 2. SKILL.md
+The old `/skill <name>`, `/skill-edit`, `/skill-repair`, `/skill-draft` and
+`/skill-show` command forms are removed. Use `/skill` for inventory and the printed
+work directory to inspect files. Continue editing with `/resume <builder-task-id>`;
+reference a new source task in the instruction to authorize reading that run.
 
-```markdown
----
-name: <task-slug>                  # 与目录名一致，唯一
-description: |                      # 命中用：自然语言 + 触发条件
-  <一句话任务目标>。
-  Triggers on: domain=<host>,
-  stage_hint=<collection|detail_sections|form_interaction|...>,
-  artifact fields ⊇ {<field>, ...}.
-version: 1                          # 整数；self-heal 回写 +1
-domain: <host 或 *.example.com>     # 命中维度（精确或通配）
-stage_hint: <collection|...>
-fields: [<field>, ...]             # expected_artifact 字段子集
-allow_auto_captcha: false          # 是否允许 VL 自动解 CAPTCHA（默认 false）
----
-
-## 运行指令
-1. 取运行期 pageId / fleetId（来自最近 Page.getState / Page.list）。
-2. 取运行期 variables（每个占位 var 的实际值）。
-3. 调 harness `execute_selected_skill({pageId, fleetId, variables, rows:[]})`；runner
-   从 registry 读取当前所选 skill 的冻结 recipe。慢路径不得把 workflow steps 复制进
-   prompt/browser_call，也不得从 SKILL.md 散文重建它。
-4. **持久化在 workflow 之外**：runner 返回后检查结构化行，由 harness/agent 调
-   `record_extraction` 落盘（见 §4 持久化铁律）。
-5. 按 fallback.yaml 的 success_contract 判定。
-
-## 成功判据（见 fallback.yaml success_contract 的人读版）
-- browser_call 无 error（observation 前缀 "Workflow execution completed:"）。
-- 末端 record_extraction 已落盘且行数 ≥ 1，每行含必填字段。
-
-## 兜底契约（见 fallback.yaml takeover 的人读版）
-- 触发：browser_call 带 error（"Workflow execution failed: ..."）或 success_contract 不成立。
-- 接管输入：result.results[-1]（失败步完整定义+error）、result.variables、result.failedStepPath。
-- agent 动作：Page.getState + DOM.getAXTree 重新感知 → 以 failedStep.purpose 为语义锚继续 → 完成 → record_extraction 落盘。
-```
-
----
-
-## 3. workflow.json
-
-顶层是 `Workflow.execute` 的参数子集。**只放可冻结的部分**；`pageId/fleetId` 是运行期注入，不写进文件。
-
-```jsonc
-{
-  "description": "<workflow 目标一句话>",          // 可选
-  "variables": { "<var>": "" },                   // 初始变量模板，运行期被实际值覆盖
-  "steps": [ /* 见 §3.1 */ ]
-}
+```text
+/pdd-mms-publish-product @<fleet-id> Upload this product folder
+/publish-product Upload this product folder
+/skill-create @<source-task-id> Package the recorded workflow
+/skill-create pdd-mms-publish-product @<new-task-id> Update from this run
+/resume <builder-task-id> Improve using @<new-source-task-id>
+/skill-publish pdd-mms-publish-product
+/skill-delete pdd-mms-publish-product
 ```
 
-这是 Harness 保存的 workflow.json 格式；runner 经 wire adapter 转换为平台的
-`workflow` + `binding`，其中 definition 使用 schemaVersion、name、timeoutMs、
-initialVariables 和 steps。不要把 Harness wrapper 直接作为平台 API 参数发送。
-平台契约参考 [Workflow reference](../abcp-platform/resources/skills/webcross-browser/references/workflow-orchestration.md)，
-Harness 示例参考 [workflow-segments](../harness/prompts/resources/browser/workflow-segments.md)。
+## Execution and repair
 
-### 3.1 七种 step
+`/skill` opens an independent mode alongside `/workflow` and `/browser`. All commands
+above are available from its prompt. Selecting a published Skill with a task
+starts its Orchestrator; selecting without a task waits for input. `--skill`
+starts the same mode. Python 3.12+ is required.
 
-下表与模型可见 schema 同源；`harness/workflow/workflow_schema_source.py` 从平台契约派生，
-`tests/test_workflow_schema_drift.py` 在两者出现分歧时失败。
+### Develop once, package, then reuse
 
-| type | 必填 | 可选 | 说明 |
-|------|------|------|------|
-| `action`（默认，可省 type） | `action` | `id, params, purpose, extract, onError` | 调一个 ABCP action（`Domain.action`） |
-| `waitEvent` | `focus` | `id, pageId, fleetId, taskId, timeout, extract` | 等前一个 Action **之后**的事件；`focus` 见 §3.3 |
-| `readEvents` | `focus` | `id, pageId, fleetId, taskId, extract` | 读前一个 Action **自身窗口**内的事件，立即返回 |
-| `store` | `op, path` | `id, value`（`delete` 外 `value` 必填） | `op` ∈ `set/merge/append/delete` |
-| `if` | `condition, then` | `id, else` | `condition` 见 §3.2；`then/else` 是子 step 数组 |
-| `loop` | `maxIterations, condition, body` | `id` | `maxIterations` 正整数；`body` 子 step 数组 |
-| `transform` | `input, ops, output` | `id` | 见 §3.5；`output` 写入一个 **flat 变量名** |
-
-> **`action` step 没有 `timeout`，也没有 `maxRetries`。** 平台的
-> `workflowActionFields` 不声明它们，而步骤联合是 `.strict()`——带上就是整个
-> workflow 被 -32602 拒。唯一的单步上限是 `waitEvent.timeout`；唯一的总预算是
-> 顶层 `timeout`。
->
-> **`onError` ∈ `stop|continue`，没有 `retry`**，也没有地方能把 retry 挪过去
-> （见 §3.4）。
->
-> **`listen` 不是步骤类型**。它是 harness 的历史拼写，dispatcher 的步骤联合里
-> 没有这个成员，会被 -32602 拒。存量 skill 里的 `listen` 由
-> `workflow_policy._normalize_wait_events()` 在传输前改写成 `waitEvent`，但新写的
-> 不要再用。
->
-> **每个 action step 必写 `purpose`**——失败接管时它是 agent 的语义锚
-> （`steps/action.ts` 也把它注入 params.purpose）。
-
-### 3.2 条件（`if` / `loop` 的 condition）
-```jsonc
-{ "path": "$vars.<key>", "operator": "exists",
-  "value": "<可选，equals/contains/gt 等需要>" }
-```
-operator ∈ `exists, notExists, equals, notEquals, contains, notContains, matches, gt, gte, lt, lte`。
-也支持条件组：`{ "operator": "and"|"or", "conditions": [ <condition|group>, ... ] }`。
-
-> `find` 返回所有匹配项组成的数组，无匹配返回 `[]`。先检查
-> `$vars.matches.length` 等于 1，再用 `jsonpath` 的 `0` 提取唯一项。
-> regex 对数组逐项处理；提取 scalar id 后，按当前观察的 id 格式用 matches 校验。
-> exists 对空串仍成立，不能单独作为有效 id 的守卫。
-
-### 3.3 `waitEvent` / `readEvents` 的 focus 白名单
-
-以当前模型可见 schema 的 focus 枚举为准，分别检查 readEvents 与 waitEvent。
-支持某个事件不代表本次操作一定会产生它。先 readEvents 检查 Action 自身窗口，
-未发现终态事件且预期仍会到达时才 waitEvent。超时是正常数据，必须显式处理，
-不能把超时当作页面已稳定。历史某次没有观测到事件不构成永久禁用理由。
->
-> ⚠️ `Hitl.humanInput` / `Hitl.resumeEvent` **不存在于平台事件目录**——它们是
-> harness 侧通知流的名字。workflow 内侦测 HITL 恢复用 `Hitl.resumed`。
-
-### 3.4 步骤级 onError（没有 workflow 级重试）
-
-Harness 工具的 description、steps、variables、pageId、fleetId、timeout
-由 wire adapter 转换为平台 workflow + binding。不要添加 errorConfig、
-stepTimeout 或 maxRetries；按当前 schema 指定总预算与 waitEvent.timeout。
-
-唯一的错误策略在 step 级：
-
-```jsonc
-{ "action": "...", "onError": "stop" }   // stop(默认) | continue
+```text
+/workflow @<fleet-id> Complete this task and leave a reusable program
+/resume <workflow-task-id> Continue from the recorded effects
+/skill-create @<workflow-task-id> Package the executed program as <skill-name>
+/resume <builder-task-id> Improve the saved draft
+/skill-publish <skill-name>
+/<skill-name> @<fleet-id> Run with the new product and asset mappings
 ```
 
-- `stop`：失败步 terminate + throw → error 信封（**触发 agent 接管的信号**）。
-- `continue`：失败步记 error 但继续，整体仍可能成功；仅用于后续分支明确处理失败的情况。
-- **没有 `retry`**。步骤联合是 `.strict()`，带 `retry` 的步骤让整个 workflow
-  以 -32602 被拒。也没有地方可以把它挪过去。失败的那一步是对着一个你还没重新
-  观察过的页面失败的，盲目重试本来就不对——读回执、重新观察、提交新的一段。
+Workflow mode has one author who writes source, executes business work, and tests
+that same workspace on a separate owned page. Browser may execute planned semantic
+stages or bounded recovery. Equal URLs do not establish equal starting conditions;
+test-page checkpoints never complete business-page work. There is no Builder
+subagent, parallel source copy or merge wait.
 
-### 3.5 变量系统（核实自 `utils/pathResolver.ts` + `steps/action.ts`）
+Source lives in `worktree/<task-id>/coding/workflows/<workspace-id>/builder/`.
+Independent trials keep their own durable task state and SQLite evidence indexes.
+`/skill-create` and Builder `/resume` use the shared agent loop and execution services
+while retaining draft identities, metadata and user-controlled publication.
+Historical Builder logs remain readable as authorized source evidence; resuming an
+old Workflow task does not restart or merge the removed subagent.
 
-**插值 token**（出现在 `params` 任意字符串值，以 `$` 开头才解析）：
 
-| token | 解析目标 | 嵌套 |
-|-------|---------|------|
-| `$cache.observation` | 最新 page observation；完整引用会读取 leased artifact 文本，`.diff` 与 `.detail[nodeId]` 读取对应 leased artifact 文本。 | ✅ 支持点号嵌套 |
-| `$cache.observation.artifact.path` | observation artifact 的路径元数据；不会读取 artifact 内容。 | ✅ |
-| `$last` / `$last.x` | 最近成功的 Action、readEvents 或 waitEvent 结果；结果为 observation 时完整引用读取 artifact 文本。transform 不替换 `$last`。 | ✅ |
-| `$context` | 执行上下文：pageId、fleetId、url、hostname；只读且字段可能未提供。 | ✅ |
-| `$store` / `$store.x` | 显式 store 快照 | ✅ |
-| `$vars.<key>` / `$<key>` | JSON 变量表 | ✅ 支持嵌套字段和数字数组索引；同名字面量 key 优先 |
+The Builder imports the original source bytes, then documents/parameterizes them;
+it should not reconstruct a second implementation from the conversation. Actual
+executed hashes and paths determine what has been verified. The user still
+publishes explicitly. `/<Skill>` runs the pinned
+published files with new input, continuing without model calls while the declared
+facts hold. Existing broken templates are not automatically repaired by this mode.
 
-> 引用必须占整个字符串；不要在普通字符串中嵌入 `$vars.x`。
-> 没有 `$listen` 或 `$steps[N]`。需要保留先前结果时 extract 到变量；
-> `$cache.observation` 可在其他步骤之后继续引用最新观察，但页面变化后必须刷新。
-> 缺失引用抛 workflow-reference-not-found；exists/notExists 可用于缺失检查。
-> find 的空数组和 regex 的空串均须显式处理。
+For repeated rows, inputs should map business keys to assets, for example
+`{key:{color:"red",size:"M"},files:["/approved/red.jpg"]}`. A Workflow discovers the
+current row and its upload control, so row order, count and transient node IDs are
+not fixed inputs. The model resolves the meaning of image assignments; the program
+performs known matching, iteration, waiting and verification. Conflicts and missing
+matches return evidence instead of assigning every file to the first control.
 
-**变量写入的 4 个来源**：
-1. 顶层 `variables`（初始模板 + 运行期覆盖）。
-2. Action 或事件 step 的 extract：路径直接指向结果数据，例如 `url` 而非 `data.url`。DOM.getAXTree 文本使用完整 observation 引用读取，不提取旧版 lines 字段。
-3. `transform` step 的 `output`——写入该变量名。
-4. 引擎 autoExtract（如从 AXTree 自动抽 exampleId）+ `pageId`/`fleetId` 自动注入每个 action step 的 params。
+Task startup pins the published content hash. The Orchestrator reads `SKILL.md`
+and `orchestration.json`, binds this run's values, and asks the Harness to execute
+consecutive decided Workflow stages without a model call between them. Formal
+entries remain WebCross JS/TS source packages. The contract uses workflow,
+browser and decision stages; declared factual `continueWhen` comparisons permit
+automatic continuation. Missing conditions, decisions and unexpected receipts
+return to the owner. Historical JS Skills without orchestration can use an
+explicit task-local plan; legacy steps DSL requires rebuilding.
 
-**变量值为 JSON-compatible 值**，包括 string、number、boolean、array 和 object。
-`transform` 输出与 `store` 可承载结构化值；需要持久化的抽取结果仍由 Harness
-在 Workflow 返回后调用 `record_extraction`。Workflow 内不能调用 Harness-local
-tools，也不能把 `record_extraction` 写成 Action。
+During `/skill` reuse, Browser handles bounded judgment or recovery. Code defects
+and deviations remain in the execution package for a later
+`/resume <builder-task-id> Improve using @<task-id> <advice>`. Reuse does not launch background
+replay or a Coding repair loop; its completion review assesses the business goal
+and discloses program limitations. Separate Builder edit/trial sessions retain
+files, conversation and raw receipts across rounds, compacting complete turns
+when needed. Publication remains a user command. No shared shell
+execution is introduced. Child completion never finishes the owner.
 
-**`Runtime.evaluate` 不得出现在冻结 workflow 中**。运行期 BrowserAgent 也只能把它作为所有结构化原生读取均已失败后的只读末级手段，并显式使用 `world="isolated"`；只有 `non_dom_state` 的专用 blocker 可以由 harness 授权一次严格 main 重试，skill authoring 不得冻结这类表达式。
+A failed Workflow may already have side effects. Check the raw receipt and page
+before retrying. Interrupted running steps resume as uncertain, never as implicit
+replay. Completed execution still requires independent whole-goal review. Drafts
+require explicit publication before ordinary execution.
 
-### 3.6 元素定位纪律（authoring 必守）
-- **运行期重解析**：`DOM.getAXTree → find → 检查唯一匹配 → jsonpath 0 → regex 提取 id → 校验 id → 操作`。
-  完整 `$cache.observation` 或 `$last` 引用可直接交给 `transform`；不要将
-  `$cache.observation.artifact.path` 当作内容。**绝不**把 epoch 绑定的 AXTree id / pageId
-  冻进 workflow.json（导航后旧 id 必失效）。
-- CSS 仅用于真正稳定的 hook；优先 role+name 文本定位。
-- 导航/crash 后先重新等待页面稳定，再读取 `DOM.getAXTree` 并用 transform 提取新 id；
-  需要模型判断、截图或 Harness 工具时结束 segment，交回 Agent。
+`/<Skill-name-or-ID> [@Fleet-ID] [task]` executes a published Skill. Fleet IDs
+accept a full UUID or an 8-character hexadecimal prefix. Omitted Fleet bindings
+follow the existing task browser-context policy.
 
----
+Builder work files live in `worktree/<builder-task-id>/coding/builder/` and have a
+SQLite index. Builder requires Python 3.12 or newer. Logs are readable only for
+tasks explicitly referenced by the user. Referencing another source task in
+`/resume` advice permits the model to select it as the analysis source while
+preserving the original source provenance. `/resume` identifies Builders before
+routing execution tasks to their saved Skill/Browser/Workflow mode, regardless of
+the current prompt mode. Startup prints
+the execution or Builder task ID. Skill tasks retain their plan, inputs, receipts,
+checkpoints and conversation.
 
-## 4. 持久化铁律（record_extraction 是 harness 后置步，不是 workflow step）
+Builder can read the actual consumer contract with `describe_skill_runtime`,
+observe authorized execution and Coding rounds with `observe_skill_run`, and run
+the exact draft through the shared executor with `run_skill_trial`, without a
+nested Orchestrator. Trials have independent IDs, indexed source snapshots and
+receipts. On the same authorized Fleet, code and input changes continue the
+owned trial; changed completed checkpoints yield for `resolve_trial_step`
+reconciliation. `investigate_skill_trial` can request bounded Browser investigation
+or read-only review. `read_draft_execution` compares current code to actual runs.
+Only exact approved READ scopes transfer from Builder to its owned trial.
 
-**核实结论（`abcp browser` 全包零 `record_extraction`）**：`record_extraction` 是 **harness 侧 Python 工具**（`harness/tools/...`），**不是 ABCP action**。workflow 引擎的 `internalRpc` 把每个 `step.action` 当 JSON-RPC method 发给 **ABCP rpcRouter**（`core/context.ts:95`），ABCP action 全是 `Domain.action` 形态，没有 `record_extraction`。**workflow step 里写 `{"action":"record_extraction"}` 会被当成 ABCP 方法 → method not found → 失败。**
+Browser task IDs remain valid `/skill-create` sources. Builder develops and tests
+the new program; Workflow/Skill sources can import saved code and receipts.
+Metadata-only changes preserve byte-identical program evidence; code changes
+need affected-path verification. Task completion alone does not verify a program.
+During explicit Skill execution, `recover_skill_step` records the owner's
+semantic diagnosis and selects investigation, rebinding or deferral. Completion
+of a business checkpoint does not certify an unexecuted program revision;
+`resolve_skill_recovery` preserves the evidenced outcome. Use `/resume <builder-task-id>` for
+subsequent program optimization, explicitly referencing the recorded run.
 
-因此 structured-output 的正确通道是：
+Terminal output groups startup, role messages, tool results and final outcomes.
+During an active task, plain text or `/guide <text>` supplies user guidance to
+the owner, active Browser workers and Reviewer. Reply to HITL/authorization with
+`/answer <question-id> <answer>`; ordinary guidance is never an implicit answer.
+`/messages` shows delivery status, `/pause` stops new dispatch and requests a
+platform Workflow pause, and `/continue` lets the owner reconcile and resume.
+In-flight effects retain their receipts. See
+[runtime user steering](../docs/runtime-user-steering-plan.md).
+Builder prints the draft/version, execution facts and publish/resume commands;
+its complete result is indexed as `coding/builder/result.json`.
 
-| 数据形态 | 通道 |
-|---------|------|
-| **定 schema 的单行**（如一个详情页的 reviews/pros/cons/qa） | workflow 用 `extract`/`transform` 把每个字段写进 **scalar variables** → workflow 返回 → **harness/agent 读 `result.variables` 拼行 → 调 `record_extraction` 落盘** |
-| **多行 / 结构化** | Workflow 可读取 observation、确定性抽取并累积到 variables/store；有歧义时交回 Agent，结果由 Harness 验证后调用 `record_extraction` |
+Execution owners read the exact active Skill files with `read_skill_resource`.
+They prepare local business input using `local_fs_search` and `local_fs_read`.
+External paths trigger the existing terminal READ authorization, shared by the
+same task's Browser workers and restored from the task permission ledger. A
+business answer in `request_skill_input` does not grant file access. File receipts
+remain indexed for input provenance; read permission does not grant write access.
+Step `input` contains business values; `binding.pageId` can reference a prior
+Workflow output. Workflow Fleet events and `Page.list` can discover a new page,
+but page actions remain bound to the authorized execution page. The next stage
+checks Fleet inventory and the existing lease before acting on the new page.
 
-> 一句话：**workflow 负责“拿到值”，harness 负责“落盘”**。workflow.json 的最后一步**不是** record_extraction，而是把字段读进 variables 的那一步。
-
-`workflow.json.structured_output` 现由 registry 与 skill-create fail-closed 拒绝，避免把一个
-必然被 frozen-workflow Runtime 策略拦截的能力继续暴露为可用契约。
-
----
-
-## 5. fallback.yaml（结构化成功判据 + 接管策略）
-
-```yaml
-row_contract:                                           # workflow skill 的批量行角色声明（v1）
-  version: 1
-  identity_variables: [targetUrl]                       # 稳定行身份；必须属于 workflow variables
-  passthrough_variables: [targetUrl, productName]       # 输入中需原样进入落盘行的变量
-  produced_fields: [reviews, price]                     # workflow extract 映射后的输出字段
-  variable_types: { targetUrl: uri, productName: string }
-
-success_contract:
-  workflow_no_error: true                               # browser_call 返回无 error 标志
-  observation_prefix: "Workflow execution completed:"   # 成功 observation 前缀
-  variables_required: [<var>, ...]                      # workflow 必须写入的 scalar 变量
-  # 持久化在 workflow 之后由 harness 做，这里声明落盘后的期望：
-  persisted_rows_at_least: 1
-  fields_required: [<field>, ...]
-  fields_nonempty: [<field>, ...]
-  visual_checks: []          # 可选：VL contract_verify，如 [{type: text_present, text: "提交成功"}]
-                             # 可给单条 check 加 capture：
-                             # {selector: "#status"}（裁剪视觉上下文）；或 {x: 0, y: 0, width: 300, height: 80}（viewport CSS 区域）。
-                             # selector-only 没有 screenshot receipt 的 canonical id + SemanticTree 几何绑定时，VL 只能给建议，不能否决成功契约。
-
-takeover:
-  on_call_error:                                        # Workflow.execute 失败 = 抛异常（见 §6）
-    recover_via: exec_observer                          # 结合终态失败回执与执行事件，见 §6
-    read: [status.failedStepPath, status.error, status.variables, status.results[-1].step]
-    reobserve: [Page.getState, DOM.getAXTree]
-    semantic_anchor: status.results[-1].step.purpose
-  on_contract_unmet:
-    from_step: len(status.results)
-    reason: postcondition_unmet
-
-hitl_boundary:
-  detect: [Hitl.resumed]      # workflow 侧的 HITL 恢复事件（§3.3）
-  action: listen_then_pause   # 侦测到 → 触发 pauseController 暂停，绝不在 workflow 内 resolvePause
-
-maintenance:
-  max_revision_per_failure_class: 3       # 同类失败最多修补次数
-  disable_after_consecutive_failures: 3   # 连续失败 N 次自动禁用 skill
-  canary_ttl_hours: 24
-  auto_disable_on_challenge: false        # 遇挑战不自动禁用（环境因素非 skill 缺陷）
-```
-
-### 5.1 row_contract（批量输入的机器契约）
-
-`row_contract` 只声明字段的**角色和比较类型**，不声明任何站点规则。它是
-`skill_rows` 与上游 validated artifact 做确定性连接的唯一依据：
-
-- `identity_variables`：一行的稳定身份，必须非空、必须同时属于
-  `passthrough_variables`，且每项都是 `workflow.json.variables` 中的变量。
-- `passthrough_variables`：由上游/任务输入提供并应保留到落盘行的变量；harness
-  只补空缺值，绝不覆盖 Lead 明确给出的非空值。
-- `produced_fields`：冻结 workflow 自己产出的字段（应用
-  `success_contract.variable_to_field` 后的名字），用于区分输入与输出责任。
-- `variable_types`：每个 passthrough 变量的比较语义，合法值为
-  `scalar|string|integer|number|boolean|uri`。`scalar` 会把数值与等价数字字符串
-  归一比较，避免 `39` 与 `"39"` 制造假冲突。
-
-`/skill-create` 会从冻结 workflow、期望 artifact 和 validated 样例行生成并校验
-该声明。带变量化 `Page.navigate` 的 workflow 若无法声明稳定 identity 或
-produced fields，质量门必须失败；运行时对旧 skill 仍向后兼容，但不会替它猜测
-显式 `skill_rows` 的身份或透传字段。候选源只取 validated artifacts，先当前
-phase 作用域、后跨 replan 总账；任何集合不一致、重复 identity、字段冲突或多源
-歧义都 fail closed。
-
----
-
-## 6. 结果与失败恢复
-
-读取终态 Workflow.execute 回执的 status、results、variables、store 和 timing。
-Harness 失败回执提供 failedStepPath、failedErrorCode、completedSteps、
-variablesAtFailure 和 storeAtFailure。保留已收集结果，结合页面实际状态恢复。
-Workflow.progress 和 Workflow.getStatus 是摘要，含 variableKeys/resultCount，
-不能代替终态变量值。stepRunId 区分同一 stepPath 的不同循环执行。
-
-已派发动作可能已生效；失败不撤销此前操作。不要机械截取 failedStepPath 后半段，
-也不要重放结果不明的副作用；遵守 replayForbidden。历史版本探针见
-[实测记录](../docs/workflow-execute-live-contract.md)。
-
----
-
-## 7. 校验清单（手填后自查）
-
-- [ ] `name` == 目录名；frontmatter 命中三维（domain/stage_hint/fields）齐全。
-- [ ] 每个 action step 有 `purpose`。
-- [ ] 没有硬编码 AXTree id / pageId；定位走运行期重解析。
-- [ ] waitEvent/readEvents 的 focus 符合当前 schema，且显式处理失败/超时。
-- [ ] 挑战或人工接管需要 Harness 工具时结束 segment，不冻结 Runtime.evaluate。
-- [ ] `$vars.*` 的变量和嵌套路径在使用前存在；缺失检查使用 exists/notExists。
-- [ ] find 结果先检查唯一性，再选择 index 0；regex 提取后的 scalar id 按当前观察格式校验，不能只用 exists。
-- [ ] **最后一步不是 record_extraction**；落盘是 harness 后置步（§4）。
-- [ ] 关键步的 step 级 `onError` 是 `stop`（让失败触发接管）；**没有 `retry`，也没有 `errorConfig`**。
-- [ ] workflow.json 里没有 `runId` / `stepTimeout` / `errorConfig`——平台不接受，会被静默丢弃。
-- [ ] fallback.yaml 的 success_contract 不依赖引擎内部 status。
-
----
-
-## 8. hints（guidance）层——慢路径捷径
-
-**是什么**：SKILL.md 里一个固定标题的小节（`## 页面知识（hints）`，标题匹配"页面知识"或"hints"开头的 H2），存放建议性页面知识：元素在哪（选择器）、优先用什么工具、网站怎么观察、**负知识**（哪些路走不通——如 `/comment/` 链接是噪音）、遮罩关法、滚动/停止判据、步数基线。**quirk 密度，一行一条，只结构化机器要用的部分**（frontmatter 匹配维度 + 一条锚点探针），其余保持散文——别造第二个 workflow DSL。
-
-**怎么生效**：仅显式选择（`/skill <id>`）时，`selected_skill_context`（harness/skill/contract.py）把 hints 连同**探针协议**注进 worker 上下文：
-
-1. hints 是**待验证假设不是事实**；
-2. 采信前先验证锚点探针（hints 首条选择器）在当前页命中；
-3. 探针失败/页面矛盾 → **整段弃用**转自由探索，并在最终 answer 里写 `guidance_stale: <原因>`；
-4. 绝不硬凑证据迁就过期 hint——validators 才是契约。
-
-hints-only skill 定向注入该小节（正文其余部分不占 6000 字预算）；workflow skill 整份注入不变（兜底契约仍是慢路径菜谱）。
-
-**形态**：
-- **hints-only**：目录只有 SKILL.md（刻意无 workflow.json）。快路径直接跳过（`skill.fast_path.hints_only`），不碰引擎、不记 .skill_health.json，autoheal 也不会给它蒸 workflow。适合 p1 型探索任务（lazy-load 滚动、动态停止条件）。
-- **双层**：workflow skill 的 SKILL.md 补同名小节即可（`/skill-create --guidance <任务目录> <已有skill-id>` 自动蒸馏叠加）。
-
-**防腐（独立软通道，不碰 .skill_health.json）**：worker 结束后 harness 把「结局 + 工具调用数 + answer 里的 `guidance_stale` 上报」记进 `skills/.guidance_health.json`（gitignored 运行态）。agent 报 stale 一次、或连续失败 ≥2 次 → `needs_review`（CLI 列表标 `[hints待复审]`）。**只标记、永不禁用**——显式选择绕过 health 的 07-07 语义不变。人工闭环：复核/重蒸馏后 `/skill-create --recheck <id>` 清标记。
-
-**生成**：`/skill-create --guidance <任务目录或trace.jsonl> [skill-id] [--phase <phaseId>]`——知识蒸馏器读**完整 trace（含失败调用）**，与步骤蒸馏器目标相反：挑工具调用最多的 validated trace（探索越多知识越全），产出选择器清单/负知识/遮罩/滚动/步数基线。skill-id 已存在 → 写进其 SKILL.md（status=hints_updated）；否则新建 hints-only（status=created）。同域去重与 workflow 蒸馏共用同一裁决（optimize=叠 hints / new / quit）。
+Publication checks the saved draft hash and the bound published hash. A Builder
+can publish successive edits by replacing `skills/<name>/`; an external change
+produces a conflict. Publication creates no `.versions` archive or new
+`skill_versions` rows and does not require a version-number increment. Existing
+frontmatter fields (including an optional human version label) remain intact.
+Before a task uses a Skill, its exact files are pinned under
+`worktree/<task-id>/skill/sources/<hash>/` and indexed in `skill_task_sources`.
+Publishing or deleting a Skill cannot change those task-owned bytes. Resume and
+repair use the original task's source, not the newly published files.
+Legacy publication snapshots are migrated for invocation, manifest/session and
+Builder references before cleanup; a failed preparation keeps the old archive.
+Stop old Harness processes before first running the new version, because an old
+process still expects `.versions`. Deleting a draft removes only its work files.
+Builder IDs, content hashes and recovery commands appear in inventories.
+A generated draft is not evidence of business success. Mechanical checks cover
+identity, permissions, file structure and protocol contracts; business path and
+completion judgments remain with the Agent using the original goal and evidence.

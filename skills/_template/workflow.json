@@ -1,89 +1,10 @@
 {
-  "description": "<workflow 目标一句话>",
-  "content_completeness": {
-    "shell_markers": [],
-    "expected_regions": [],
-    "suppression_signals": [],
-    "recovery": {
-      "mode": "listing_link_click",
-      "max_attempts_per_item": 2
-    }
-  },
-  "variables": {
-    "targetUrl": "",
-    "headingText": "<目标区块的可见标题文本，用于运行期重解析其 id>"
-  },
-  "steps": [
-    {
-      "action": "Page.navigate",
-      "params": {
-        "url": "$vars.targetUrl"
-      },
-      "onError": "continue",
-      "purpose": "Open the target page. onError:continue — a heavy real page can make the navigate CALL return -32001 timeout while the page still loads; the next waitEvent on Page.loaded settles it."
-    },
-    {
-      "type": "waitEvent",
-      "focus": [
-        "Page.loaded"
-      ],
-      "timeout": 15000
-    },
-    {
-      "action": "Page.getState",
-      "purpose": "Synchronize page state immediately after navigation settlement."
-    },
-    {
-      "action": "DOM.getAXTree",
-      "purpose": "Refresh DOM identity after navigation before using page state."
-    },
-    {
-      "action": "DOM.getAXTree",
-      "purpose": "Read page structure so target element ids are resolved at runtime (never frozen)"
-    },
-    {
-      "type": "transform",
-      "input": "$cache.axTree.lines",
-      "ops": [
-        {
-          "op": "find",
-          "pattern": "$vars.headingText",
-          "mode": "contains"
-        },
-        {
-          "op": "regex",
-          "pattern": "\\[([0-9a-fA-F-]+:\\d+:\\d+)\\]",
-          "group": 1
-        }
-      ],
-      "output": "targetId"
-    },
-    {
-      "type": "if",
-      "condition": {
-        "path": "$vars.targetId",
-        "operator": "matches",
-        "value": "[0-9a-fA-F-]+:\\d+:\\d+"
-      },
-      "then": [
-        {
-          "action": "DOM.getText",
-          "params": {
-            "id": "$vars.targetId"
-          },
-          "purpose": "Read the target section text into a scalar variable",
-          "extract": {
-            "targetText": "text"
-          }
-        }
-      ],
-      "else": [
-        {
-          "action": "DOM.getAXTree",
-          "onError": "continue",
-          "purpose": "Fallback: target id not resolved on first pass; re-read structure (content may have loaded late). Agent takeover continues from here if still missing."
-        }
-      ]
-    }
-  ]
+  "schemaVersion": 1,
+  "name": "replace-with-workflow-name",
+  "description": "Describe one platform-executable unit",
+  "entry": "main.js",
+  "timeoutMs": 60000,
+  "files": {
+    "main.js": "export default async function main({ actions, context }, input) {\n  const page = await actions.Page.getState({ purpose: 'Read the bound page before continuing' });\n  return { pageId: context.pageId, title: page.title, input };\n}\n"
+  }
 }

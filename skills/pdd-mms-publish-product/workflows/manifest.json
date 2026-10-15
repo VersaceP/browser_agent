@@ -1,0 +1,100 @@
+{
+  "schemaVersion": 1,
+  "role": "index-only, not a Workflow.execute source package",
+  "entries": [
+    {
+      "path": "workflows/01-entry.json",
+      "sourceHash": "36388fb8915e5ebda0241b879373c8b5efe4047185d433cc5c90873ffc50c59b",
+      "executionsOfCurrentSource": [
+        {
+          "receipt": "receipts/entry-existing-form-checkpoint.json",
+          "workflowId": "bbef15d4-385e-41a6-9d32-fe7d4e5ee871",
+          "status": "succeeded",
+          "ready": true,
+          "calls": 3
+        }
+      ],
+      "inputFrom": "product",
+      "purpose": "首页登录信号、提示关闭、入口、类目与表单交接",
+      "start": "homePageId；已有分类页或表单时由模型提供 product.resumePageId",
+      "verifiedCoverage": "当前源码验证了已有表单恢复分支；首页与类目写入来自早期版本，新增表单等待分支未整段重测。"
+    },
+    {
+      "path": "workflows/02-title-media.json",
+      "sourceHash": "a8ec44537b37b37999d0ffdc7f7286333fbe884b255f2da724a9d7dadc33fbbf",
+      "executionsOfCurrentSource": [
+        {
+          "receipt": "receipts/media-result-confirmed.json",
+          "workflowId": "0e634096-6ff8-42b8-ad64-e176d92bba4b",
+          "status": "succeeded",
+          "ready": true,
+          "calls": 10
+        }
+      ],
+      "inputFrom": "product",
+      "purpose": "标题、主图、详情图和独立视频槽",
+      "start": "01-entry.output.pageId；相关控件及已有媒体须与当前输入核对",
+      "verifiedCoverage": "主图/详情图/视频指派来自此前版本；当前源码实际确认了已完成结果，未重新指派。"
+    },
+    {
+      "path": "workflows/03-attributes.json",
+      "sourceHash": "ea5ff5510c1673b7a11fc30c517bd7b6759ed541613a45cbfc6d499082cff8d2",
+      "executionsOfCurrentSource": [],
+      "inputFrom": "product",
+      "purpose": "按标签填写属性与虚拟候选列表",
+      "start": "已进入商品表单；模型已提供明确属性值",
+      "verifiedCoverage": "真实填写已成功；之后缓存滚轮锚点的局部改动仅通过语法检查，当前源码尚未执行。"
+    },
+    {
+      "path": "workflows/04-specs-prices.json",
+      "sourceHash": "cc3d79f7bb760a91c3662f43476f2a8a8a318fcae062bffd3d41722d17277aea",
+      "executionsOfCurrentSource": [
+        {
+          "receipt": "receipts/specs-prices-01.json",
+          "workflowId": "b1fb6837-c4d9-470e-b3ef-88238e14da49",
+          "status": "succeeded",
+          "ready": true,
+          "calls": 62
+        }
+      ],
+      "inputFrom": "product",
+      "purpose": "规格值、组合表、统一库存与价格",
+      "start": "当前表单已具有输入所描述的规格类型",
+      "verifiedCoverage": "当前源码真实新增规格并填写了九行价格库存及参考价。"
+    },
+    {
+      "path": "workflows/05-preview-images.json",
+      "sourceHash": "f9f6c3d8652771336a1cfe040536b409045f02d6e21a9c41b3dac33a89175068",
+      "executionsOfCurrentSource": [
+        {
+          "receipt": "receipts/preview-complete-background-attributes.json",
+          "workflowId": "b3efe1e8-e022-4480-9be4-fc21da8425d6",
+          "status": "succeeded",
+          "ready": true,
+          "calls": 80
+        }
+      ],
+      "inputFrom": "product",
+      "purpose": "按当前 SKU 组合匹配预览图",
+      "start": "04-specs-prices 已生成目标 SKU；每行匹配明确文件规则",
+      "verifiedCoverage": "当前源码确认前三行已有上传，实际完成其余六行；独立核验确认九行均有图。"
+    },
+    {
+      "path": "workflows/06-verify.json",
+      "sourceHash": "326205a2ef7e49880b8b70223ac34b543f271347b6b18b6db0390ce156f0b992",
+      "executionsOfCurrentSource": [
+        {
+          "receipt": "receipts/independent-final-verify.json",
+          "workflowId": "f6cedd63-4bae-4e75-895a-60fc0e008014",
+          "status": "succeeded",
+          "ready": true,
+          "calls": 8
+        }
+      ],
+      "inputFrom": "product",
+      "purpose": "独立读取表单实际结果",
+      "start": "同一商品表单；不执行保存或提交",
+      "verifiedCoverage": "当前源码独立核验全部九项检查通过。"
+    }
+  ]
+}

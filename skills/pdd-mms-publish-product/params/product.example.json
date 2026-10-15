@@ -1,0 +1,101 @@
+{
+  "homeUrl": "https://mms.pinduoduo.com/home/",
+  "categoryKeyword": "汉服",
+  "categoryPath": [
+    "女装",
+    "汉服",
+    "汉服套装"
+  ],
+  "title": "黑色雪纺中长款披肩女士复古民族风汉服斗篷演出服走秀无帽舞台装",
+  "attributes": [
+    {
+      "label": "品牌",
+      "value": "美币达"
+    },
+    {
+      "label": "面料俗称",
+      "value": "雪纺"
+    },
+    {
+      "label": "材质",
+      "value": "涤纶（聚酯纤维）"
+    },
+    {
+      "label": "商品货号",
+      "value": "001"
+    },
+    {
+      "label": "上市时节",
+      "value": "2026年秋季"
+    },
+    {
+      "label": "成分含量",
+      "value": "50%（含）-70%（不含）"
+    }
+  ],
+  "specTypes": [
+    {
+      "name": "尺寸",
+      "values": [
+        "肩膀到裙摆1.3米",
+        "肩膀到裙摆1.5米",
+        "肩膀到裙摆1.8米"
+      ]
+    },
+    {
+      "name": "颜色",
+      "values": [
+        "黑色",
+        "乳白色",
+        "绿色"
+      ]
+    }
+  ],
+  "stock": 500,
+  "groupPrice": 59,
+  "singlePrice": 69,
+  "referencePrice": 89,
+  "carouselImages": [
+    "/Users/versace/Desktop/1688_女装汉服_第2页第4-6名/第2页第6名_995586686003/商品图片/main_01.jpg",
+    "/Users/versace/Desktop/1688_女装汉服_第2页第4-6名/第2页第6名_995586686003/商品图片/main_02.jpg",
+    "/Users/versace/Desktop/1688_女装汉服_第2页第4-6名/第2页第6名_995586686003/商品图片/main_03.jpg",
+    "/Users/versace/Desktop/1688_女装汉服_第2页第4-6名/第2页第6名_995586686003/商品图片/main_04.jpg",
+    "/Users/versace/Desktop/1688_女装汉服_第2页第4-6名/第2页第6名_995586686003/商品图片/main_05.jpg"
+  ],
+  "detailImages": [
+    "/Users/versace/Desktop/1688_女装汉服_第2页第4-6名/第2页第6名_995586686003/商品详情图片/detail_01.jpg",
+    "/Users/versace/Desktop/1688_女装汉服_第2页第4-6名/第2页第6名_995586686003/商品详情图片/detail_02.jpg",
+    "/Users/versace/Desktop/1688_女装汉服_第2页第4-6名/第2页第6名_995586686003/商品详情图片/detail_03.jpg",
+    "/Users/versace/Desktop/1688_女装汉服_第2页第4-6名/第2页第6名_995586686003/商品详情图片/detail_04.jpg",
+    "/Users/versace/Desktop/1688_女装汉服_第2页第4-6名/第2页第6名_995586686003/商品详情图片/detail_05.jpg"
+  ],
+  "videos": [
+    "/Users/versace/Desktop/1688_女装汉服_第2页第4-6名/第2页第6名_995586686003/商品视频/主图视频_425513222019.mp4"
+  ],
+  "previewImages": [
+    {
+      "match": {
+        "颜色": "黑色"
+      },
+      "files": [
+        "/Users/versace/Desktop/1688_女装汉服_第2页第4-6名/第2页第6名_995586686003/商品图片/main_01.jpg"
+      ]
+    },
+    {
+      "match": {
+        "颜色": "乳白色"
+      },
+      "files": [
+        "/Users/versace/Desktop/1688_女装汉服_第2页第4-6名/第2页第6名_995586686003/商品图片/main_05.jpg"
+      ]
+    },
+    {
+      "match": {
+        "颜色": "绿色"
+      },
+      "files": [
+        "/Users/versace/Desktop/1688_女装汉服_第2页第4-6名/第2页第6名_995586686003/商品图片/main_04.jpg"
+      ]
+    }
+  ]
+}

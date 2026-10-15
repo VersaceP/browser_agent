@@ -1,0 +1,141 @@
+{
+  "schemaVersion": 1,
+  "steps": [
+    {
+      "id": "01-entry",
+      "kind": "workflow",
+      "path": "workflows/01-entry.json",
+      "input": {
+        "$binding": "/product"
+      },
+      "binding": {
+        "pageId": {
+          "$binding": "/homePageId"
+        }
+      },
+      "continueWhen": [
+        {
+          "pointer": "/output/ready",
+          "equals": true
+        }
+      ],
+      "purpose": "首页登录信号、提示关闭、入口、类目与表单交接"
+    },
+    {
+      "id": "02-title-media",
+      "kind": "workflow",
+      "path": "workflows/02-title-media.json",
+      "input": {
+        "$binding": "/product"
+      },
+      "binding": {
+        "pageId": {
+          "$result": {
+            "step": "01-entry",
+            "pointer": "/output/pageId"
+          }
+        }
+      },
+      "continueWhen": [
+        {
+          "pointer": "/output/ready",
+          "equals": true
+        }
+      ],
+      "purpose": "标题、主图、详情图和独立视频槽"
+    },
+    {
+      "id": "03-attributes",
+      "kind": "workflow",
+      "path": "workflows/03-attributes.json",
+      "input": {
+        "$binding": "/product"
+      },
+      "binding": {
+        "pageId": {
+          "$result": {
+            "step": "01-entry",
+            "pointer": "/output/pageId"
+          }
+        }
+      },
+      "continueWhen": [
+        {
+          "pointer": "/output/ready",
+          "equals": true
+        }
+      ],
+      "purpose": "按标签填写属性与虚拟候选列表"
+    },
+    {
+      "id": "04-specs-prices",
+      "kind": "workflow",
+      "path": "workflows/04-specs-prices.json",
+      "input": {
+        "$binding": "/product"
+      },
+      "binding": {
+        "pageId": {
+          "$result": {
+            "step": "01-entry",
+            "pointer": "/output/pageId"
+          }
+        }
+      },
+      "continueWhen": [
+        {
+          "pointer": "/output/ready",
+          "equals": true
+        }
+      ],
+      "purpose": "规格值、组合表、统一库存与价格"
+    },
+    {
+      "id": "05-preview-images",
+      "kind": "workflow",
+      "path": "workflows/05-preview-images.json",
+      "input": {
+        "$binding": "/product"
+      },
+      "binding": {
+        "pageId": {
+          "$result": {
+            "step": "01-entry",
+            "pointer": "/output/pageId"
+          }
+        }
+      },
+      "continueWhen": [
+        {
+          "pointer": "/output/ready",
+          "equals": true
+        }
+      ],
+      "purpose": "按当前 SKU 组合匹配预览图"
+    },
+    {
+      "id": "06-verify",
+      "kind": "workflow",
+      "path": "workflows/06-verify.json",
+      "input": {
+        "$binding": "/product"
+      },
+      "binding": {
+        "pageId": {
+          "$result": {
+            "step": "01-entry",
+            "pointer": "/output/pageId"
+          }
+        }
+      },
+      "purpose": "独立读取表单实际结果"
+    }
+  ],
+  "metadata": {
+    "sourceTaskId": "8ee7e41ea6e64011aea41ea793e019ec",
+    "inputShape": "{homePageId, product}",
+    "finalAction": "verify-and-return-to-model",
+    "saveOrSubmit": false
+  },
+  "note": "Execute saved packages directly. Preserve existing effects after repair; final goal review is independent of script status."
+}

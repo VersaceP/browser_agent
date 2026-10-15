@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "note": "Replace these stages with the reusable task's actual plan",
+  "steps": [
+    {
+      "id": "prepare-page-and-input",
+      "kind": "browser",
+      "instruction": "Find the user-authorized task page, read the current state, and determine the required inputs. Return facts to the Skill owner."
+    },
+    {
+      "id": "execute",
+      "kind": "workflow",
+      "path": "workflow.json",
+      "input": {"$binding": ""}
+    },
+    {
+      "id": "assess-result",
+      "kind": "decision",
+      "instruction": "Compare actual output with the user goal, resolve remaining work, and request final review when appropriate."
+    }
+  ]
+}

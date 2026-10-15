@@ -1,49 +1,41 @@
 ---
-name: __FILL__-slug
-description: |
-  <一句话任务目标，例如：Extract reviews/pros/cons/qa from a product detail page>.
-  Triggers on: domain=<host>,
-  stage_hint=<collection|detail_sections|form_interaction|...>,
-  artifact fields ⊇ {<field>, ...}.
-version: 1
-domain: <host 或 *.example.com>
-stage_hint: <collection|detail_sections|form_interaction|...>
-fields: [<field>, <field>]
+name: replace-with-skill-name
+version: "1"
+description: Explain the reusable task and when this Skill applies.
+domain: example.com
+fields: []
 allow_auto_captcha: false
 ---
 
-## 运行指令
-1. 取运行期 pageId / fleetId（来自最近 Page.getState / Page.list）。
-2. 取运行期 variables：本次任务每个占位变量的实际值（见 workflow.json 的 `variables`）。
-3. 调用当前所选 skill 的受控 runner（不要读取/复制 workflow steps）：
-   ```
-   execute_selected_skill({
-     pageId, fleetId,
-     variables: { ...<本次实际值> },
-     rows: []
-   })
-   ```
-4. **持久化在 workflow 之外**：runner 返回后检查结构化行，调 harness `record_extraction` 落盘。
-   （workflow.json 的最后一步只负责把字段读进 variables，不调 record_extraction——见 skills/README.md §4。）
-5. 按 fallback.yaml 的 `success_contract` 判定成功；不成立或带 error → 走兜底契约。
+## Goal and inputs
 
-## 内容完整性声明（按需）
-- 如果站点会出现“详情外壳正常、任务区块整体缺失”，在 workflow.json 顶层填写 `content_completeness`；否则删除该空模板字段。
-- `shell_markers` 描述可确认详情外壳已加载的文本/语义标记，`expected_regions` 描述任务必需区块。
-- 站点私有风险字段只放在 `suppression_signals`，不得写进 Harness 通用分类。
-- 此声明只驱动 BrowserAgent 的完整性门控与列表链接恢复，不会把内容抑制路由到 CAPTCHA/HITL。
+Describe the user goal, runtime inputs, page preconditions, and expected outputs.
+Keep business values in execution input. Verify representative value, array-length,
+optional-input and mapping changes; do not copy sample values into source.
 
-## 成功判据（人读版，机器判定见 fallback.yaml）
-- browser_call 无 error（observation 前缀 "Workflow execution completed:"）。
-- workflow 写入了 `variables_required` 列出的全部变量。
-- harness 落盘后行数 ≥ 1，每行含必填字段。
+## Skill orchestration
 
-## 兜底契约（人读版，结构化见 fallback.yaml takeover）
-- 触发：browser_call 带 error（"Workflow execution failed: ..."）或 success_contract 不成立。
-- 接管输入：`result.results[-1]`（失败步完整定义 + error）、`result.variables`（累积快照）、`result.failedStepPath`。
-- agent 动作：
-  1. `Page.getState` + `DOM.getAXTree` 重新感知（导航类失败后 $cache 已被引擎清空）。
-  2. 以 `failedStep.step.purpose` 为语义意图锚，用全套 browser 工具继续。
-  3. 完成后读 variables 拼行 → `record_extraction` 落盘。
-  4. HITL：若 error 含 challenge/captcha，走 `Hitl.requestPause`（harness 既有机制），不自己 resolvePause。
-- self_heal（可选）：成功后若定位路径变化，产出 workflow.json v+1，经 1 次 canary 验证后 promote。
+Maintain orchestration.json with ordered Workflow, Browser and decision stages.
+The Skill Orchestrator binds this run's inputs; the Harness executes decided
+stages continuously. Define factual continueWhen comparisons only where they
+establish the chosen transition; omission yields to the owner. Whole-object
+$binding and backward $result references carry values. Keep action loops in
+Workflow source. Describe judgment, authorization and recovery entry points.
+Resolve page and element identities at run time.
+Keep execution binding separate from business input: binding.pageId may reference
+a previous stage's /output/newPageId. Observe Fleet events or Page.list in source;
+the host admits the next execution page through inventory and lease checks.
+Use the current JS/TS source package (entry/files), default-export main(api,input),
+and return compact JSON evidence. Parameter examples are supporting resources;
+development probes remain in the Builder task worktree.
+
+## Evidence and recovery
+
+State which receipt fields establish progress. A failed Workflow may already
+have changed the page; inspect the returned call records, current page
+state and source locations before deciding how to continue. Persist task data with Harness tools
+after browser execution when the user goal requires an artifact.
+Use the actual consumer contract and run_skill_trial for newly authored paths.
+Existing successful Skill Runtime records may supply validation for the exact
+version and path; success produced by Browser recovery does not validate the
+original source. Record the executed version, inputs and actual operations.
