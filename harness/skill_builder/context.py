@@ -3,33 +3,62 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
 from harness.storage.file_store import FileStore
 from harness.storage.sqlite_store import SqliteStore, build_resource_uri
+from harness.storage.virtual_fs import VirtualTaskFs
+
+
+def task_references(instruction: str) -> set[str]:
+    """Read explicit human references, never task IDs from model/tool text.
+
+    @ references support custom task names; ordinary generated IDs can also
+    appear bare in the user's advice. This grants read scope, not a decision
+    about which task should be analysed.
+    """
+    marked = re.findall(r"(?<![\w/])@([\w][\w.-]{0,119})", instruction)
+    generated = re.findall(
+        r"(?<![A-Za-z0-9_-])(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})(?![A-Za-z0-9_-])",
+        instruction,
+    )
+    return set(marked + generated)
 
 
 class SourceTaskContext:
     def __init__(self, source_task_id: str, worktree_root: Path, sqlite_store: SqliteStore):
         self.task_id = source_task_id.removeprefix("@")
         if not self.task_id or "/" in self.task_id or "\\" in self.task_id or self.task_id in {".", ".."}:
-            raise ValueError("@task_id 格式错误")
+            raise ValueError("Invalid @task_id format")
         self.worktree_root = Path(worktree_root).resolve()
         self.directory = self.worktree_root / self.task_id
         if self.directory.is_symlink() or not self.directory.resolve(strict=False).is_relative_to(self.worktree_root):
-            raise ValueError("来源任务目录越界")
+            raise ValueError("Source task directory escapes the worktree")
         self.sqlite = sqlite_store
         self.file = FileStore(worktree_dir=str(self.worktree_root))
         if self.sqlite.get_task(self.task_id) is None and not self.directory.is_dir():
-            raise FileNotFoundError(f"来源任务不存在: {self.task_id}")
+            raise FileNotFoundError(f"Source task not found: {self.task_id}")
 
     def manifest(self) -> dict[str, Any]:
-        path = self.directory / "task_manifest.json"
-        if not path.is_file() or path.is_symlink():
-            return {}
-        value = json.loads(path.read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else {}
+        if self.sqlite.get_task(self.task_id) is not None:
+            # A database-owned task can have no physical manifest at all. Do
+            # not silently prefer a stale worktree copy over the SQL resource.
+            lines = VirtualTaskFs(self.sqlite, self.task_id).iter_lines("task_manifest.json")
+            if lines is None:
+                return {}
+            value = json.loads("".join(lines))
+        else:
+            path = self.directory / "task_manifest.json"
+            if not path.is_file() or path.is_symlink():
+                return {}
+            value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("Source task manifest must be a JSON object")
+        if str(value.get("taskId") or self.task_id) != self.task_id:
+            raise ValueError("Source task manifest does not match task_id")
+        return value
 
     def invocations(self, skill_id: str | None = None) -> list[dict[str, Any]]:
         sql = "SELECT * FROM skill_invocations WHERE task_id=?"

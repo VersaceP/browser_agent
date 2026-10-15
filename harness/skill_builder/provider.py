@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
+import time
 from typing import Any
 
 from harness._vendor.tau_agent import messages as tau
@@ -12,7 +13,11 @@ from harness.messages import models as neutral
 from llm.contracts import LLMRequest, ToolDefinition
 
 
-def _neutral_message(message: tau.AgentMessage) -> neutral.UserMessage | neutral.AssistantMessage | neutral.ToolResultMessage:
+def _neutral_message(message: tau.AgentMessage) -> neutral.UserMessage | neutral.AssistantMessage | neutral.ToolResultMessage | neutral.CompactionSummaryMessage:
+    if isinstance(message, tau.CompactionSummaryMessage):
+        return neutral.CompactionSummaryMessage(content=message.summary,
+            tokens_before=message.tokens_before, checkpoint_id=message.checkpoint_id,
+            details=message.details, replaced_message_count=message.replaced_message_count)
     if isinstance(message, tau.UserMessage):
         if isinstance(message.content, str):
             content: Any = message.content
@@ -56,6 +61,27 @@ def _neutral_message(message: tau.AgentMessage) -> neutral.UserMessage | neutral
             response_id=message.response_id, raw_stop_reason=message.raw_stop_reason,
         )
     return neutral.UserMessage(content=tau.message_text(message))
+
+
+def _request_message(message: tau.AgentMessage) -> neutral.UserMessage | neutral.AssistantMessage | neutral.ToolResultMessage:
+    """Project session-only checkpoints at the model request boundary.
+
+    Keep the checkpoint identity and facts in the transcript used by subsequent
+    compaction. LLMRequest accepts ordinary conversational messages; its summary
+    projection matches harness.messages.convert.to_model_messages.
+    """
+    converted = _neutral_message(message)
+    if isinstance(message, tau.AssistantMessage) and message.stop_reason == "length":
+        # Raw output remains in durable history. Incomplete thinking cannot be
+        # replayed as a completed provider response. Keep tool-result pairing.
+        calls = [b for b in converted.content if isinstance(b, neutral.ToolCallContent)]
+        return neutral.AssistantMessage(content=[neutral.TextContent(text=
+            "[Harness: response truncated; its tool calls were not executed. "
+            "Consult saved files and completed tool receipts before continuing.]"), *calls],
+            stop_reason="tool_use" if calls else "end_turn")
+    if isinstance(converted, neutral.CompactionSummaryMessage):
+        return neutral.UserMessage(content=converted.content)
+    return converted
 
 
 def _tau_assistant(result: Any, model: str) -> tau.AssistantMessage:
@@ -116,11 +142,13 @@ class HarnessProviderAdapter:
             return
         request = LLMRequest(
             system=[neutral.TextContent(text=system)],
-            messages=[_neutral_message(message) for message in messages],
+            messages=[_request_message(message) for message in messages],
             tools=[ToolDefinition(name=tool.name, description=tool.description,
                                   parameters=dict(tool.parameters)) for tool in tools],
         )
+        started = time.monotonic()
         result = await self.provider.generate(request)
+        result.diagnostics.setdefault("duration_ms", round((time.monotonic() - started) * 1000))
         if self.on_result is not None:
             self.on_result(result)
         assistant = _tau_assistant(result, model)

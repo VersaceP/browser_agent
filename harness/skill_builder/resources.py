@@ -31,16 +31,18 @@ def workflow_entries(snapshot: Path) -> list[dict[str, Any]]:
     return entries
 
 
-def selected_snapshot(runtime: Any) -> tuple[SkillCatalog, Path]:
+def selected_snapshot(runtime: Any, *, task_id: str | None = None) -> tuple[SkillCatalog, Path]:
     config = runtime.harness
     skill_id = str(getattr(config, "forced_skill_id", "") or "")
     content_hash = str(getattr(config, "forced_skill_hash", "") or "")
     if not skill_id or not content_hash:
         raise ValueError("No explicitly selected Skill version")
     catalog = SkillCatalog(Path(__file__).resolve().parents[2] / "skills",
-                           resolve_sqlite_path(config.storage_sqlite_path, config.worktree_dir))
+                           resolve_sqlite_path(config.storage_sqlite_path, config.worktree_dir),
+                           worktree_dir=Path(config.worktree_dir))
     try:
-        snapshot = catalog.version_path(skill_id, content_hash)
+        snapshot = (catalog.pin_source(skill_id, content_hash, task_id=task_id) if task_id
+                    else catalog.source_path(skill_id, content_hash))
         if snapshot is None:
             raise ValueError("Selected Skill snapshot is unavailable")
         return catalog, snapshot
@@ -50,8 +52,8 @@ def selected_snapshot(runtime: Any) -> tuple[SkillCatalog, Path]:
 
 
 def read_selected_resource(runtime: Any, relative: str, *, offset: int = 0,
-                           max_chars: int = 16000) -> dict:
-    catalog, snapshot = selected_snapshot(runtime)
+                           max_chars: int = 16000, task_id: str | None = None) -> dict:
+    catalog, snapshot = selected_snapshot(runtime, task_id=task_id)
     try:
         path = Path(relative)
         if (path.is_absolute() or not path.parts

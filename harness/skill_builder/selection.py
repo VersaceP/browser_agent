@@ -2,27 +2,19 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
-from harness.skill_builder.catalog import SkillCatalog
-from harness.storage.factory import resolve_sqlite_path
 
 
-def selected_skill_context(runtime: Any) -> str:
+def selected_skill_context(runtime: Any, *, task_id: str | None = None) -> str:
     config = runtime.harness
     skill_id = str(getattr(config, "forced_skill_id", "") or "")
     content_hash = str(getattr(config, "forced_skill_hash", "") or "")
     if not skill_id or not content_hash:
         return ""
-    catalog = SkillCatalog(
-        Path(__file__).resolve().parents[2] / "skills",
-        resolve_sqlite_path(config.storage_sqlite_path, config.worktree_dir),
-    )
+    from harness.skill_builder.resources import selected_snapshot
+    catalog, snapshot = selected_snapshot(runtime, task_id=task_id)
     try:
-        snapshot = catalog.version_path(skill_id, content_hash)
-        if snapshot is None:
-            raise RuntimeError(f"选定 Skill 版本不可用: {skill_id}@{content_hash}")
         guide = (snapshot / "SKILL.md").read_text(encoding="utf-8")
         from harness.skill_builder.resources import workflow_entries
         import json

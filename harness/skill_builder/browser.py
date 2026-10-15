@@ -28,6 +28,7 @@ def _platform_error(exc: ABCPTransportError) -> dict[str, Any]:
         "requestSent": exc.request_sent, "requestId": exc.request_id,
         "details": sanitize_transport_payload(exc.rpc_data),
         "message": str(exc)[:500],
+        "connectionRecovery": getattr(exc, "connection_recovery", None),
     }
 
 
@@ -46,13 +47,15 @@ class BuilderBrowser:
                 "kind": kind, "requestId": data.get("id") or data.get("requestId"),
                 "method": data.get("method"),
             })
-        self.client = ABCPClient(config, on_event=record_transport)
+        from harness.runtime.browser_connection import managed_client
+        self.client = managed_client(ABCPClient(config, on_event=record_transport))
         self.logger = logger
         self.runtime = runtime
         self.fleet_id: str | None = None
         self.pages: set[str] = set()
         self.page_fleets: dict[str, str] = {}
         self.capability_methods: set[str] = set()
+        self.capability_catalog = {}
         self.workflow_ids: set[str] = set()
         self.connected = False
         self.active_trial = False
@@ -80,7 +83,11 @@ class BuilderBrowser:
 
     async def _connect(self) -> None:
         if not self.connected:
-            await self.client.connect()
+            try:
+                await self.client.connect()
+            except BaseException:
+                await self.client.close()
+                raise
             self.connected = True
             try:
                 registration = await self.client.call("System.register", {})
@@ -96,6 +103,13 @@ class BuilderBrowser:
             self.logger.write("skill_builder.platform.capabilities",
                               sanitize_transport_payload(capabilities))
             self.capability_methods = {a["method"] for a in (capabilities.get("data") or {}).get("actions", [])}
+            data = capabilities.get("data") or {}
+            self.capability_catalog = {"catalogRevision": data.get("catalogRevision"),
+                "actions": data.get("actions", []), "source": "live System.getCapabilities"}
+
+    async def catalog(self):
+        await self._connect()
+        return self.capability_catalog
 
     async def describe_action(self, method: str) -> dict[str, Any]:
         await self._connect()
@@ -111,17 +125,12 @@ class BuilderBrowser:
         result = await self.client.call("Workflow.getGuide", {})
         data = result.get("data") or {}
         return {"content": (data.get("skillsGuide") or {}).get("value", ""),
-                "guideRevision": data.get("guideRevision"), "source": "live Workflow.getGuide"}
+                "guideRevision": data.get("guideRevision"), "source": "live Workflow.getGuide",
+                "actionCatalog": self.capability_catalog}
 
     async def authorize_files(self, paths: list[str]) -> dict[str, Any]:
-        from harness.tools.path_authorization import authorize_path, canonical
-        granted = []
-        for path in paths:
-            rejected = await authorize_path(self, path, "read")
-            if rejected:
-                return rejected
-            granted.append(str(canonical(self, path)))
-        return {"status": "authorized", "paths": granted}
+        from harness.tools.path_authorization import authorize_local_paths
+        return await authorize_local_paths(self, paths, "read")
 
     async def attach_page(self, page_id: str, fleet_id: str) -> dict[str, Any]:
         from harness.runtime.hitl_input import read_terminal_input
@@ -132,11 +141,15 @@ class BuilderBrowser:
         if not approved:
             return {"status": "permission_denied", "reason": "Test page was not authorized by the user"}
         await self._connect()
-        inventory = await self.client.call("Page.list", {"fleetId": fleet_id})
-        if page_id not in {p.get("pageId") for p in (inventory.get("data") or {}).get("pages", [])}:
+        if page_id not in await self._inventory(fleet_id):
             return {"status": "unknown_page_binding", "reason": "Page was not found in the authorized Fleet"}
         await self.client.call("Page.switchTo", {"pageId": page_id})
         self.pages.add(page_id); self.page_fleets[page_id] = fleet_id
+        store = self._test_store()
+        saved = store.read("coding/test-pages.json", {})
+        saved.setdefault("pages", {})[page_id] = {"fleetId": fleet_id, "independent": False,
+            "authorization": "User explicitly attached this existing test page"}
+        store.write("coding/test-pages.json", saved, "builder_test_pages")
         return {"status": "authorized", "pageId": page_id, "fleetId": fleet_id}
 
     async def _own_fleet(self) -> str:
@@ -152,29 +165,89 @@ class BuilderBrowser:
         self.fleet_id = proposed
         return proposed
 
-    async def create_page(self, url: str = "about:blank") -> dict[str, Any]:
+    def _test_store(self):
+        from harness.skill_runtime.state import SkillStateStore
+        return SkillStateStore(self.logger)
+
+    async def _inventory(self, fleet_id):
+        await self._connect()
+        raw = await self.client.call("Page.list", {"fleetId": fleet_id})
+        ref = self._test_store().write("coding/test-page-inventory.json", raw, "browser_receipt")
+        data = raw.get("data")
+        # Native array contract; legacy envelopes remain readable explicitly.
+        rows = data.get("pages") if isinstance(data, dict) else data
+        if not isinstance(rows, list) or any(not isinstance(p, dict) or not p.get("pageId") for p in rows):
+            raise ValueError(f"Page.list returned an invalid inventory; receipt: {ref}")
+        return {p["pageId"] for p in rows}
+
+    async def restore_page(self, page_id):
+        if page_id in self.pages:
+            return
+        saved = self._test_store().read("coding/test-pages.json", {}).get("pages", {}).get(page_id)
+        if not saved:
+            raise PermissionError("Page is not recorded as this Builder's authorized test page")
+        fleet = saved["fleetId"]
+        if page_id not in await self._inventory(fleet):
+            raise ValueError("Saved test page no longer exists; create a new independent test and restore its prerequisites")
+        self.pages.add(page_id)
+        self.page_fleets[page_id] = fleet
+
+    async def create_page(self, url: str = "about:blank", *, fleet_id=None) -> dict[str, Any]:
+        from harness.runtime.steering import current_steering, dispatch_boundary
+        from types import SimpleNamespace
+        manager = current_steering()
+        revision = manager.revision if manager else 0
+        store = self._test_store()
+        saved = store.read("coding/test-pages.json", {})
+        existing = set()
         try:
-            fleet_id = await self._own_fleet()
+            if fleet_id:
+                if fleet_id not in saved.get("authorizedFleets", []):
+                    from harness.runtime.hitl_input import read_terminal_input
+                    decision = await read_terminal_input(
+                        f"[Skill Builder] 在 Fleet {fleet_id} 新建独立测试页并试运行草稿，可能产生真实业务副作用。"
+                        "已有页面不会作为测试页。输入 yes 授权本任务使用此 Fleet 的新测试页。")
+                    approved = str(decision or "").strip().lower() in {"yes", "y"}
+                    self.logger.write("skill_builder.fleet.authorization", {"fleetId": fleet_id, "approved": approved})
+                    if not approved:
+                        return {"status": "permission_denied", "reason": "Test Fleet was not authorized"}
+                    saved.setdefault("authorizedFleets", []).append(fleet_id)
+                    store.write("coding/test-pages.json", saved, "builder_test_pages")
+                existing = await self._inventory(fleet_id)
+            else:
+                fleet_id = await self._own_fleet()
+            pending = dispatch_boundary(SimpleNamespace(steering_role=manager.primary if manager else None), revision, "Page.create")
+            if pending:
+                return pending
             result = await self.client.call("Page.create", {"fleetId": fleet_id,
                                                             "url": url, "purpose": "Create an isolated Skill Builder test page"})
         except ABCPTransportError as exc:
             return _platform_error(exc)
         data = result.get("data") or {}
-        page_id = str(data.get("pageId") or "")
-        if not page_id or data.get("fleetId") != fleet_id:
-            return {"status": "unknown_page_binding", "response": result}
+        ref = store.write("coding/test-page-created.json", result, "browser_receipt")
+        from harness.runtime.program_validation import validate_test_page
+        try:
+            page_id = validate_test_page(data, fleet_id, existing)
+        except ValueError as exc:
+            return {"status": "unknown_page_binding", "reason": str(exc), "response": result, "receiptRef": ref}
+        saved.setdefault("pages", {})[page_id] = {"fleetId": fleet_id, "receiptRef": ref, "independent": True}
+        store.write("coding/test-pages.json", saved, "builder_test_pages")
         self.pages.add(page_id)
         self.page_fleets[page_id] = fleet_id
         self.logger.write("skill_builder.page.created", {"pageId": page_id,
                                                           "fleetId": fleet_id})
-        return result
+        return {**result, "pageId": page_id, "fleetId": fleet_id, "receiptRef": ref}
 
     async def call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        from harness.runtime.steering import current_steering, dispatch_boundary
+        from types import SimpleNamespace
+        manager = current_steering()
+        input_revision = manager.revision if manager else 0
         method = str(method or "").strip()
         if disabled_reason_for_method(method):
             return {"status": "permission_denied", "reason": disabled_reason_for_method(method)}
         if method == "Page.create":
-            return await self.create_page(str(params.get("url") or "about:blank"))
+            return await self.create_page(str(params.get("url") or "about:blank"), fleet_id=params.get("fleetId"))
         if method not in _READ_METHODS and method not in {"Network.readApi", "File.handleChooser"} and not method.startswith(_PAGE_PREFIXES):
             return {"status": "permission_denied", "reason": "This method is not available to Builder tools"}
         if method in {"Workflow.getStatus", "Workflow.pause", "Workflow.resume", "Workflow.cancel"}:
@@ -191,6 +264,8 @@ class BuilderBrowser:
                 return rejected
         try:
             await self._connect()
+            pending = dispatch_boundary(SimpleNamespace(steering_role=manager.primary if manager else None), input_revision, method)
+            if pending: return pending
             result = await self.client.call(method, params)
         except ABCPTransportError as exc:
             result = _platform_error(exc)
@@ -198,12 +273,16 @@ class BuilderBrowser:
             result = sanitize_network_read_api_response(result)
             if isinstance(result, dict) and result.get("status") == "platform_error":
                 result["message"] = "Network.readApi failed; use rpcCode and redacted details"
-        self.logger.write("skill_builder.browser.call", {
+        evidence = {
             "method": method,
             "paramsSha256": hashlib.sha256(json.dumps(params, sort_keys=True, default=str).encode()).hexdigest(),
             "result": sanitize_transport_payload(result),
-        })
-        return result
+        }
+        self.logger.write("skill_builder.browser.call", evidence)
+        from harness.skill_runtime.state import SkillStateStore
+        ref = SkillStateStore(self.logger).write("coding/observations/" + uuid.uuid4().hex + ".json",
+            evidence, "skill_builder_observation")
+        return {**result, "receiptRef": ref}
 
     def _authorize_steps(self, steps: Any, page_id: str) -> None:
         if not isinstance(steps, list):
@@ -235,6 +314,9 @@ class BuilderBrowser:
 
     async def trial(self, workflow_path: Path, page_id: str,
                     variables: dict[str, Any] | None = None) -> dict[str, Any]:
+        from harness.runtime.steering import current_steering
+        manager = current_steering()
+        input_revision = manager.revision if manager else 0
         if self.active_trial:
             return {"status": "trial_busy", "reason": "A trial is already active in this session"}
         if page_id not in self.pages:
@@ -271,11 +353,23 @@ class BuilderBrowser:
         try:
             self.active_trial = True
             await self._connect()
-            result = await self.client.call("Workflow.execute", {
+            params = {
                 "workflow": execution_package if scope else workflow,
                 **({"input": variables or {}} if scope else {}),
                 "binding": scope["platformBinding"] if scope else {"pageId": page_id, "fleetId": fleet_id},
-            })
+            }
+            from harness.runtime.workflow_steering import controlled_call
+            from harness.observation.exec_observer import ExecObserver
+            from harness.observation.browser_call import build_browser_call_runner
+            from types import SimpleNamespace
+            observer = ExecObserver(self.client, page_id=page_id).start()
+            runner = build_browser_call_runner(browser=self.client, logger=self.logger, capability_methods=self.capability_methods)
+            try:
+                result = await controlled_call(SimpleNamespace(browser=self.client, capability_methods=self.capability_methods,
+                    steering_role=manager.primary if manager else None, _steering_operation_revision=input_revision),
+                                               runner, params, observer)
+            finally:
+                observer.stop()
         except ABCPTransportError as exc:
             result = _platform_error(exc)
         except asyncio.CancelledError:
