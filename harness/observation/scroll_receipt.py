@@ -44,35 +44,52 @@ def looks_like_scroll_receipt(data: Any) -> bool:
 
 
 def scroll_delta_magnitude(data: Any) -> Optional[float]:
-    """Pixels the action actually moved, or None when genuinely unreported.
+    """Measured movement, confirmed zero movement, or None when inconclusive.
 
-    None and 0 must stay distinct: None means no movement receipt was found at
-    all, while 0 is a positive report that the surface did not move.
+    A positive last reliable measurement proves some movement, even if the
+    final observation is unavailable. A zero last measurement cannot prove
+    the surface held still after input unless input completed and the final
+    observation is stable. Goal attainment is a separate fact in both cases.
+    Explicit legacy measurements remain readable; absent evidence is unknown.
     """
     if not isinstance(data, dict):
         return None
 
-    for field in SCROLL_DELTA_FIELDS:
-        magnitude = axis_magnitude(data.get(field))
-        if magnitude is not None:
-            return magnitude
+    magnitudes = [axis_magnitude(data.get(field)) for field in SCROLL_DELTA_FIELDS]
 
     layers = data.get("layers")
     if isinstance(layers, list):
-        magnitudes = [
+        layer_magnitudes = [
             magnitude
             for layer in layers
             if isinstance(layer, dict)
             and (magnitude := axis_magnitude(layer.get("delta"))) is not None
         ]
-        if magnitudes:
-            return max(magnitudes)
+        if layer_magnitudes:
+            magnitudes.append(max(layer_magnitudes))
 
     # Scalar shape from older builds.
     raw = data.get("deltaApplied")
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-        return None
-    return abs(float(raw))
+    if not isinstance(raw, bool) and isinstance(raw, (int, float)):
+        magnitudes.append(abs(float(raw)))
+
+    zero_is_conclusive = True  # Legacy explicit measurements.
+    if any(key in data for key in ("input", "observation", "goal")):
+        input_fact = data.get("input")
+        observation = data.get("observation")
+        zero_is_conclusive = (
+            isinstance(input_fact, dict)
+            and input_fact.get("completed") is True
+            and isinstance(observation, dict)
+            and observation.get("status") == "stable"
+        )
+    # Preserve measured-field precedence for conclusive observations. An
+    # inconclusive zero must not hide positive evidence in another field or
+    # layer. Submitted/requested deltas are never candidates here.
+    for magnitude in magnitudes:
+        if magnitude is not None and (magnitude > 0 or (magnitude == 0 and zero_is_conclusive)):
+            return magnitude
+    return None
 
 
 def _finite_number(value: Any) -> Optional[float]:

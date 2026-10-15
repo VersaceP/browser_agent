@@ -63,8 +63,10 @@ async def run_agent_loop(
     session_id: str | None = None,
     get_steering_messages: Callable[[], Sequence[AgentMessage]] | None = None,
     get_follow_up_messages: Callable[[], Sequence[AgentMessage]] | None = None,
+    has_steering_messages: Callable[[], bool] | None = None,
     before_tool_call: BeforeToolCall | None = None,
     after_tool_call: AfterToolCall | None = None,
+    before_model: Callable[[list[AgentMessage]], Awaitable[list[AgentMessage]]] | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """Run the provider/tool loop and emit Pi-compatible agent events."""
     new_messages = list(prompts)
@@ -122,6 +124,8 @@ async def run_agent_loop(
             # Python async generators cannot pass a yielding callback through a
             # normal await cleanly, so consume the assistant sub-generator and
             # retain its final message through the terminal event.
+            if before_model is not None:
+                messages[:] = await before_model(list(messages))
             assistant = None
             async for event in _assistant_events(
                 provider=provider,
@@ -175,6 +179,19 @@ async def run_agent_loop(
             has_more_tools = bool(calls)
             terminated = False
             for call_index, call in enumerate(calls):
+                if has_steering_messages and has_steering_messages():
+                    for skipped_call in calls[call_index:]:
+                        message = ToolResultMessage(tool_call_id=skipped_call.id,
+                            tool_name=skipped_call.name,
+                            content=[TextContent(text="not_executed: user_input_pending; reconsider with the new user input")],
+                            details={"synthetic": True, "tool_was_executed": False, "reason": "user_input_pending"},
+                            is_error=True)
+                        messages.append(message)
+                        new_messages.append(message)
+                        tool_results.append(message)
+                        yield MessageStartEvent(message=message)
+                        yield MessageEndEvent(message=message)
+                    break
                 async for event in _execute_tool_call(
                     call,
                     tool_by_name,
@@ -208,7 +225,7 @@ async def run_agent_loop(
                     break
 
             yield TurnEndEvent(message=assistant, tool_results=tool_results)
-            if terminated:
+            if terminated and not (has_steering_messages and has_steering_messages()):
                 yield AgentEndEvent(messages=new_messages)
                 return
             turn += 1

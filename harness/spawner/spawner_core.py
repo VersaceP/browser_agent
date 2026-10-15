@@ -2008,6 +2008,8 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                 "name": agent_name,
             }
             if isinstance(exc, ABCPTransportError):
+                if isinstance(getattr(exc, "connection_recovery", None), dict):
+                    result["connectionRecovery"] = exc.connection_recovery
                 result["transportFailure"] = {
                     "code": exc.transport_code, "connectionFatal": exc.connection_fatal,
                     "requestSent": exc.request_sent, "method": exc.rpc_method,
@@ -2199,12 +2201,18 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
         pending = getattr(self, "_connection_recovery_task", None)
         if pending is None or pending.done():
             async def probe():
+                # This explicit probe (including a fresh /resume) may begin a
+                # new window. Completed live recoveries bypass it upstream.
+                from harness.runtime.browser_connection import RecoveryWindow
+                window = getattr(self, "_browser_recovery_window", None)
+                if window is not None and not window.users:
+                    self._browser_recovery_window = RecoveryWindow(self.runtime.browser.reconnect_timeout_seconds)
                 client = None
                 probe_stage = "connect"
                 try:
-                    client = _sp().ABCPClient(self.runtime.browser, on_event=make_browser_event_logger(
+                    client = self._managed_browser_client(_sp().ABCPClient(self.runtime.browser, on_event=make_browser_event_logger(
                         self.logger, self.runtime.harness.log_browser_payloads,
-                        prefix="recovery.transport"))
+                        prefix="recovery.transport")))
                     async def initialize():
                         nonlocal probe_stage
                         await client.connect()
@@ -2214,7 +2222,11 @@ class BrowserAgentSpawner(SpawnerSlotsMixin, SpawnerRegistryMixin, SpawnerWorker
                         await client.call("System.getCapabilities", {"guide": "content"})
                         probe_stage = "Fleet.list"
                         return await client.call("Fleet.list", {})
-                    inventory = await asyncio.wait_for(initialize(), timeout=10.0)
+                    from harness.runtime.browser_connection import RecoveringBrowserClient
+                    if isinstance(client, RecoveringBrowserClient):
+                        inventory = await initialize()
+                    else:
+                        inventory = await asyncio.wait_for(initialize(), timeout=10.0)
                     from harness.fleet.coordinator import handle_records_from_value, resolve_fleet_reference
                     ids = [str(row.get("fleetId") or "") for row in handle_records_from_value(inventory)
                            if row.get("fleetId")]

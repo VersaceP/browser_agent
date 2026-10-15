@@ -13,8 +13,8 @@ _FLEET_REF_RE = re.compile(
 )
 _FLEET_SIGIL_RE = re.compile(r"@[0-9a-f][0-9a-f-]{3,}", re.IGNORECASE)
 FLEET_REFERENCE_SYNTAX = (
-    "Fleet 引用只认一种写法：@ 紧跟 Fleet id，中间不要空格，例如 "
-    "@2677c96a-7a2b-4119-bec8-2e56cf93a5cd（只写前 8 位 @2677c96a 也可以）。"
+    "Fleet references must use @ immediately followed by a Fleet ID, with no space, for example "
+    "@2677c96a-7a2b-4119-bec8-2e56cf93a5cd (the 8-character prefix @2677c96a is also accepted)."
 )
 
 
@@ -24,7 +24,7 @@ def extract_fleet_reference(task: str) -> Tuple[Optional[str], Optional[str]]:
     matches = [match.group(1).lower() for match in _FLEET_REF_RE.finditer(text)]
     unique = list(dict.fromkeys(matches))
     if len(unique) > 1:
-        return None, "任务里出现了多个不同的 Fleet 引用，无法判断该用哪一个。"
+        return None, "The task contains multiple different Fleet references; select one Fleet."
     for match in _FLEET_SIGIL_RE.finditer(text):
         # Workflow advice can cite a generated Harness task (32 hex chars)
         # alongside an explicit Fleet UUID/prefix. It is not a second Fleet.
@@ -33,8 +33,8 @@ def extract_fleet_reference(task: str) -> Tuple[Optional[str], Optional[str]]:
             continue
         if not _FLEET_REF_RE.fullmatch(match.group(0)):
             return None, (
-                f"{match.group(0)} 不是合法的 Fleet id（要 8 位十六进制前缀或完整"
-                f" UUID）。{FLEET_REFERENCE_SYNTAX}"
+                f"{match.group(0)} is not a valid Fleet ID (use an 8-character hexadecimal prefix or a full"
+                f" UUID).{FLEET_REFERENCE_SYNTAX}"
             )
     if unique:
         return unique[0], None

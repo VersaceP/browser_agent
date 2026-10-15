@@ -97,7 +97,7 @@ def _ids_match(left: List[str], right: List[str]) -> bool:
 
 
 def validate_tool_pairing(messages: List[Any]) -> Optional[str]:
-    wire_messages = [_wire_message(message) for message in messages]
+    wire_messages = to_model_messages(messages)
     for index, message in enumerate(wire_messages):
         role = message.get("role")
         if role == "assistant":
@@ -243,8 +243,14 @@ def split_message_pairs(messages: List[Any]) -> List[List[Any]]:
             and _wire_message(next_message).get("role") == "user"
             and message_has_block(next_message, "tool_result")
         ):
-            groups.append([current, next_message])
-            index += 2
+            group = [current]
+            index += 1
+            # Tau has one ToolResultMessage per call; legacy transcripts have
+            # all results in one user message. Both form one atomic turn.
+            while index < len(messages) and message_has_block(messages[index], "tool_result"):
+                group.append(messages[index])
+                index += 1
+            groups.append(group)
             continue
         groups.append([current])
         index += 1
@@ -975,8 +981,8 @@ async def compact_messages_if_needed(
 
     estimated = estimate_prompt_tokens(system_prompt, messages, tools)
     threshold = int(
-        max(1, config.model_context_window_tokens)
-        * max(0.1, min(config.context_compaction_threshold_ratio, 0.95))
+        max(1, getattr(config, "model_context_window_tokens", HarnessConfig.model_context_window_tokens))
+        * max(0.1, min(getattr(config, "context_compaction_threshold_ratio", HarnessConfig.context_compaction_threshold_ratio), 0.95))
     )
     if estimated <= threshold and not force_reason:
         return messages

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import unquote, urlparse
@@ -17,6 +18,35 @@ from urllib.parse import unquote, urlparse
 _STATES = {}
 _LOCKS = {}
 _BARRIERS = {}
+
+LOCAL_ACCESS_GUIDE = """Plan local access from the user's task before requesting files.
+Use local_fs_authorize(paths, mode) to request explicit files or directories without
+reading them; for multiple assets under a task material/delivery directory, request
+that directory once. Choose the scope from the goal, not from a hardcoded site rule.
+A batch gets one terminal decision per permission mode. Only the human can choose
+the displayed directory alternative; yes grants only the displayed requested scopes.
+Directory grants cover descendants for this task and mode, survive resume, and are
+reused by its workers and host-owned READ trials. READ does not grant WRITE, and
+source-task references do not grant a new task access. Do not retry denied scopes
+through ancestors, siblings or another tool. Protected paths and symlinks resolving
+outside the approved scope remain restricted. For uploads, supply the actual
+canonical file paths in Workflow input; a directory grant is not an upload manifest.
+"""
+
+LOCAL_AUTHORIZATION_DESCRIPTION = (
+    "Request task-scoped READ or WRITE permission for explicit local files or directories, "
+    "without reading or changing their contents. Batch paths share one terminal confirmation; "
+    "a directory grant covers descendants for the same permission. Request the task's material "
+    "or delivery directory once when multiple assets are needed. Only the human may approve "
+    "the displayed scope or directory alternative. Existing grants are reused, including after resume."
+)
+LOCAL_AUTHORIZATION_SCHEMA = {
+    'type': 'object', 'properties': {
+        'paths': {'type': 'array', 'minItems': 1,
+                  'items': {'type': 'string', 'minLength': 1}},
+        'mode': {'type': 'string', 'enum': ['read', 'write'], 'default': 'read'},
+    }, 'required': ['paths'], 'additionalProperties': False,
+}
 
 
 def _barrier(value):
@@ -64,6 +94,24 @@ def state(value):
     s['protected'].update(str(Path(p).expanduser().resolve())
                           for p in getattr(cfg, 'protected_local_roots', []) or [])
     return s
+
+
+def inherit_read_permissions(grantor, grantee):
+    """Host-only transfer to a host-created owned trial; never a model tool.
+
+    Copy exact approved READ scopes. WRITE, denials and parent scopes never
+    transfer, and protected-root checks still apply at every later read.
+    """
+    destination = state(grantee)
+    for raw in state(grantor)["readRoots"]:
+        path = Path(raw)
+        if (not protected(grantor, path) and not protected(grantee, path)
+                and not _denied_overlap(grantee, path, 'read')
+                and raw not in destination["readRoots"]):
+            destination["readRoots"].append(raw)
+    _persist(grantee)
+    _log(grantee, 'local_path.authorization.inherited', {
+        'fromTaskId': task_root(grantor).name, 'mode': 'read', 'readRoots': destination['readRoots']})
 
 
 def inside(path, root):
@@ -150,68 +198,170 @@ def _persist(value):
 
 
 async def authorize_path(value, raw, mode='read', base=None):
+    return await authorize_paths(value, [raw], mode, base)
+
+
+async def authorize_paths(value, paths, mode='read', base=None):
+    """One decision for an explicit batch; never infer a grant from file inputs."""
+    if not isinstance(paths, (list, tuple)) or not paths:
+        raise ValueError('paths must be a non-empty array')
+    return await _authorize_requests(value, [(raw, mode, base) for raw in paths])
+
+
+async def authorize_local_paths(value, paths, mode='read'):
+    """Shared public result for Browser, Workflow, Skill and Builder tools."""
+    try:
+        error = await authorize_paths(value, paths, mode)
+        if error:
+            return error
+        resolved = list(dict.fromkeys(str(canonical(value, raw)) for raw in paths))
+        roots = []
+        task = task_root(value)
+        for raw in resolved:
+            path = Path(raw)
+            root = authorized_root_for(value, path, mode=mode)
+            if mode == 'write' and inside(path, task):
+                # Built-in WRITE access covers output subtrees, not task control.
+                root = task / path.relative_to(task).parts[0]
+            if str(root) not in roots:
+                roots.append(str(root))
+        return {'status': 'authorized', 'paths': resolved, 'mode': mode,
+                'scopes': [{'path': root, 'mode': mode} for root in roots]}
+    except (OSError, ValueError) as exc:
+        return {'status': 'failed', 'code': 'local_path_error', 'error': str(exc),
+                'tool_was_executed': False}
+
+
+def _denied_overlap(value, path, mode):
+    return any(m == mode and (inside(path, Path(p)) or inside(Path(p), path))
+               for p, m in state(value)['denied'])
+
+
+def _request_error(value, entries):
+    for raw, mode, base, path in entries:
+        if canonical(value, raw, base) != path:
+            return 'path_changed_during_confirmation'
+        if protected(value, path):
+            return 'protected_path_denied'
+        if _denied_overlap(value, path, mode):
+            return 'external_path_access_denied'
+        if inside(path, task_root(value)) and not allowed(value, path, mode):
+            return 'task_control_write_denied'
+    return None
+
+
+def _directory_option(value, paths, mode):
+    # This is a displayed alternative, not a semantic selection or a grant.
+    # Derive only the nearest existing common directory of the literal paths.
+    directory = Path(os.path.commonpath([p if p.is_dir() else p.parent for p in paths]))
+    if (directory in paths or not directory.is_dir() or protected(value, directory)
+            or _denied_overlap(value, directory, mode)
+            or (inside(directory, task_root(value)) and not allowed(value, directory, mode))):
+        return None
+    return directory
+
+
+async def _authorize_requests(value, requests):
+    entries = []
+    for raw, mode, base in requests:
+        if mode not in ('read', 'write'):
+            raise ValueError('mode must be read or write')
+        entries.append((raw, mode, base, canonical(value, raw, base)))
+    if not entries:
+        return None
     barrier = _barrier(value)
     barrier['pending'] += 1
     barrier['event'].clear()
     try:
-        return await _authorize_path(value, raw, mode, base)
+        key = (asyncio.get_running_loop(), str(task_root(value)))
+        async with _LOCKS.setdefault(key, asyncio.Lock()):
+            error = _request_error(value, entries)
+            if error:
+                return {'status': 'failed', 'code': error, 'tool_was_executed': False}
+            # Keep READ and WRITE decisions distinct, even for a mixed copy batch.
+            for mode in dict.fromkeys(item[1] for item in entries):
+                paths = list(dict.fromkeys(p for _, m, _, p in entries
+                                         if m == mode and not allowed(value, p, mode)))
+                # Only remove scopes already covered by an explicitly supplied
+                # ancestor; do not synthesize a parent grant.
+                paths = [p for p in paths if not any(p != root and inside(p, root)
+                                                    for root in paths)]
+                if not paths:
+                    continue
+                error = await _confirm_paths(value, paths, mode, entries)
+                if error:
+                    return error
+            error = _request_error(value, entries)
+            if error:
+                return {'status': 'failed', 'code': error, 'tool_was_executed': False}
+            return None
     finally:
         barrier['pending'] -= 1
         if not barrier['pending']:
             barrier['event'].set()
 
 
-async def _authorize_path(value, raw, mode='read', base=None):
+async def _confirm_paths(value, paths, mode, entries):
     from harness.runtime.hitl_input import read_terminal_input
-    p = canonical(value, raw, base)
-    if protected(value, p):
-        return {'status': 'failed', 'code': 'protected_path_denied', 'tool_was_executed': False}
-    if allowed(value, p, mode):
-        return None
-    if inside(p, task_root(value)):
-        return {'status': 'failed', 'code': 'task_control_write_denied', 'tool_was_executed': False}
-    # Never silently grant a file's parent. Directory operations grant the
-    # exact displayed directory; single-file calls grant only that file.
-    key = (asyncio.get_running_loop(), str(task_root(value)))
-    async with _LOCKS.setdefault(key, asyncio.Lock()):
-        if allowed(value, p, mode):
-            return None
-        denied = (str(p), mode)
-        if denied in state(value)['denied']:
-            return {'status': 'failed', 'code': 'external_path_access_denied', 'tool_was_executed': False}
-        prompt = (f'\n[本地文件授权] 任务 {task_root(value).name}\n'
-                  f'权限：{mode.upper()}；范围：{p}\n'
-                  '目录授权仅对当前任务、当前权限生效，并包含该目录下的后代；不包含父目录或兄弟目录。符号链接解析到授权范围外时不继承授权。\n'
-                  '批准请输入 yes，拒绝请输入 no。文件内容可能进入模型上下文。\n'
-                  '当前任务已暂停新的模型轮次和工具调用；不限时等待，确认后原 worker 继续。')
-        _log(value, 'local_path.authorization.requested', {'path': str(p), 'mode': mode})
-        while True:
-            answer = await read_terminal_input(prompt)
-            if answer is None or answer.strip().lower() in {'y', 'yes', 'n', 'no'}:
-                break
-            prompt = '未识别授权选择。请输入 yes 批准或 no 拒绝；任务继续等待。'
-        if answer is None:
-            return {'status': 'needs_human', 'code': 'external_path_confirmation_required',
-                    'path': str(p), 'mode': mode, 'tool_was_executed': False}
-        if answer.strip().lower() not in {'y', 'yes'}:
-            state(value)['denied'].add(denied)
-            _log(value, 'local_path.authorization.denied', {'path': str(p), 'mode': mode})
-            return {'status': 'failed', 'code': 'external_path_access_denied', 'tool_was_executed': False}
-        # Re-resolve after terminal wait: symlink changes must not inherit approval.
-        if canonical(value, raw, base) != p or protected(value, p):
-            return {'status': 'failed', 'code': 'path_changed_during_confirmation', 'tool_was_executed': False}
-        # Grant exactly the displayed scope, never a broader existing parent.
-        # A list/search/mkdir call on a directory grants its descendants too.
-        state(value)[mode + 'Roots'].append(str(p))
-        _persist(value)
-        _log(value, 'local_path.authorization.granted', {'path': str(p), 'mode': mode})
-        return None
+    directory = _directory_option(value, paths, mode)
+    authorization_id = uuid.uuid4().hex
+    scope_text = '\n'.join('  ' + json.dumps(str(p), ensure_ascii=False) for p in paths)
+    choices = 'yes = approve all listed scopes once; no = deny.'
+    if directory is not None:
+        choices += ('\ndirectory = approve this directory and its descendants instead: '
+                    + json.dumps(str(directory), ensure_ascii=False))
+    prompt = (f'\n[Local file authorization] Task {task_root(value).name}\n'
+              f'Permission: {mode.upper()}; requested scopes ({len(paths)}):\n{scope_text}\n'
+              'Directory authorization applies only to this task and permission, including descendants. Parents and sibling directories are excluded. Symbolic links outside the authorized scope do not inherit permission.\n'
+              f'{choices}\nFile contents may enter the model context.\n'
+              'New model turns and tool calls are paused without a time limit; the original worker continues after approval.')
+    original_prompt = prompt
+    for p in paths:
+        _log(value, 'local_path.authorization.requested', {
+            'path': str(p), 'mode': mode, 'authorizationId': authorization_id,
+            'directoryOption': str(directory) if directory is not None else None})
+    valid = {'y', 'yes', 'n', 'no'} | ({'directory'} if directory is not None else set())
+    while True:
+        answer = await read_terminal_input(prompt)
+        if answer is None or answer.strip().lower() in valid:
+            break
+        prompt = original_prompt + '\nUnrecognized response. Choose one of the displayed options; the task remains paused.'
+    if answer is None:
+        return {'status': 'needs_human', 'code': 'external_path_confirmation_required',
+                'path': str(paths[0]), 'paths': [str(p) for p in paths],
+                'mode': mode, 'tool_was_executed': False}
+    selection = answer.strip().lower()
+    if selection in {'n', 'no'}:
+        for p in paths:
+            state(value)['denied'].add((str(p), mode))
+            _log(value, 'local_path.authorization.denied', {
+                'path': str(p), 'mode': mode, 'authorizationId': authorization_id})
+        return {'status': 'failed', 'code': 'external_path_access_denied', 'tool_was_executed': False}
+    approved = [directory] if selection == 'directory' else paths
+    # Revalidate every original path after the wait, including symlink targets.
+    checked = entries + [(str(p), mode, None, p) for p in approved]
+    error = _request_error(value, checked)
+    if selection == 'directory' and not directory.is_dir():
+        error = 'path_changed_during_confirmation'
+    if error:
+        return {'status': 'failed', 'code': error, 'tool_was_executed': False}
+    roots = state(value)[mode + 'Roots']
+    roots.extend(str(p) for p in approved if str(p) not in roots)
+    _persist(value)
+    for p in approved:
+        _log(value, 'local_path.authorization.granted', {
+            'path': str(p), 'mode': mode, 'authorizationId': authorization_id,
+            'selection': 'directory' if selection == 'directory' else 'requested'})
+    return None
 
 
 def requests(call):
     name = call.get('name', '')
     args = call.get('input') or {}
-    if name == 'local_fs_read':
+    if name == 'local_fs_authorize':
+        for path in args.get('paths', []):
+            yield path, args.get('mode', 'read'), None
+    elif name == 'local_fs_read':
         yield args.get('path'), 'read', None
     elif name == 'local_fs_search':
         yield args.get('path') or '.', 'read', None
@@ -277,6 +427,7 @@ async def authorize_tool_call(agent, call):
         path_requests = list(requests(call))
         contract = getattr(agent, 'worker_contract', None) or {}
         intent = contract.get('local_access_intent')
+        approvals = []
         if path_requests and intent is not None:
             scopes = normalize_local_access_intent(intent)
             # Preflight only on a call involving a declared scope. Do not ask
@@ -301,8 +452,7 @@ async def authorize_tool_call(agent, call):
                     # A declaration is not a request for every listed mode.
                     # Ask for READ only when this call actually reads, and
                     # WRITE only when it writes. Keep child denials intact.
-                    if any(m == mode and (inside(Path(p), root) or inside(root, Path(p)))
-                           for p, m in state(agent)['denied']):
+                    if _denied_overlap(agent, root, mode):
                         return {'status': 'failed', 'code': 'external_path_access_denied',
                                 'tool_was_executed': False}
                     if not allowed(agent, root, mode):
@@ -310,13 +460,7 @@ async def authorize_tool_call(agent, call):
                             'phaseId': contract.get('phase_id'), 'path': str(root),
                             'mode': mode, 'reason': scope['reason'],
                         })
-                    error = await authorize_path(agent, scope['path'], mode)
-                    if error:
-                        return error
-        for raw, mode, base in path_requests:
-            error = await authorize_path(agent, raw, mode, base)
-            if error:
-                return error
+                    approvals.append((scope['path'], mode, None))
+        return await _authorize_requests(agent, approvals + path_requests)
     except (OSError, ValueError) as exc:
         return {'status': 'failed', 'code': 'local_path_error', 'error': str(exc), 'tool_was_executed': False}
-    return None

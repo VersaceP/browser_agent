@@ -896,6 +896,10 @@ def attach_error_classification(result: JsonDict, *, method: str = "") -> JsonDi
             "method": str(method or result.get("method") or ""),
             "source": "abcp_transport",
         }
+        recovery = result.get("connectionRecovery")
+        if isinstance(recovery, dict) and recovery.get("status") == "ready":
+            classification["connectionRestored"] = True
+            classification["suggested_action"] = "inspect_original_execution_and_page_effects_before_continuing"
         if result.get("exceptionType"):
             classification["exceptionType"] = str(result["exceptionType"])
         if result.get("connectionFatal") is True:

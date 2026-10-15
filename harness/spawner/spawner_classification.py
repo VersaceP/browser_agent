@@ -328,10 +328,10 @@ def _axis_magnitude(value: Any) -> Optional[float]:
     return axis_magnitude(value)
 
 def _scroll_delta_applied(result: JsonDict) -> Optional[float]:
-    """Pixels a scroll action actually moved, or None when unreported.
+    """Measured movement, confirmed zero, or None when the effect is unknown.
 
-    None and 0 must stay distinct: None means no movement receipt was found,
-    while 0 is a positive report that the page did not move.
+    None includes unavailable or moving observations carrying a zero last
+    measurement; it must not be reported as proof that the page did not move.
 
     The shapes live in harness.observation.scroll_receipt because `Input.scroll` and
     `Page.wheel` name their delta differently - reading only `totalDelta` made
@@ -344,28 +344,13 @@ def _scroll_delta_applied(result: JsonDict) -> Optional[float]:
     return scroll_delta_magnitude(data)
 
 def _page_traversal_evidence(trace: Optional[List[JsonDict]]) -> JsonDict:
-    """Did this worker ever move past the first screenful?
+    """Summarize measured movement, unknown effects and collection exhaustion.
 
-    A `target_absent` report can be perfectly self-consistent and still be
-    wrong: the upstream batch says `[]`, the worker enumerates what it can see,
-    a screenshot confirms the target is not there, confidence is high — and the
-    viewport never moved, so every one of those observations describes the same
-    screenful. No judge can catch that, because nothing in the report is false;
-    the missing piece is a mechanical fact about what WE did, which only our
-    own ledger holds.
-
-    Two signals count, both decidable from the trace:
-      * an `Input.scroll` or `Page.wheel` that moved the page — we asked, and
-        the page obeyed
-      * a collection exhaustion proof — we enumerated a container to its end
-
-    "Moved the page" needs the platform's scroll receipt, because a wheel event
-    dispatched into a page that ignores it still returns a success envelope: a
-    worker can scroll three times, travel zero pixels, and look fully traversed.
-    When an observed-delta field is present it decides the question. Older
-    `Input.scroll` builds without a receipt keep the weaker historical reading;
-    `Page.wheel` has a required movement receipt, so a missing one cannot prove
-    traversal.
+    A successful call envelope proves neither movement nor stillness. Count
+    only conclusive movement receipts as moved or zero; keep successful calls
+    without conclusive evidence separately as unknown. This applies equally to
+    modern observations and legacy calls with no measured delta. The ledger
+    supplies facts for the model's coverage judgment, not an absence verdict.
 
     The two branches below verify success DIFFERENTLY on purpose, and the
     asymmetry is load-bearing rather than an oversight. `classify_call_outcome`
@@ -381,6 +366,7 @@ def _page_traversal_evidence(trace: Optional[List[JsonDict]]) -> JsonDict:
     """
     scrolls = 0
     scrolls_without_effect = 0
+    scrolls_with_unknown_effect = 0
     scroll_effect_evidence = "unavailable"
     exhaustion_proofs = 0
     for item in trace or []:
@@ -399,13 +385,7 @@ def _page_traversal_evidence(trace: Optional[List[JsonDict]]) -> JsonDict:
                 continue
             delta = _scroll_delta_applied(result)
             if delta is None:
-                # Old Input.scroll builds shipped no movement receipt, so keep
-                # their weaker historical reading. Page.wheel's current schema
-                # REQUIRES its delta field, so a wheel receipt without one is
-                # malformed and cannot prove that the page moved.
-                data = _scroll_receipt_data(result) or {}
-                if method == "Input.scroll" and not any(key in data for key in ("input", "observation", "goal")):
-                    scrolls += 1
+                scrolls_with_unknown_effect += 1
                 continue
             scroll_effect_evidence = "receipt"
             if delta > 0:
@@ -419,6 +399,7 @@ def _page_traversal_evidence(trace: Optional[List[JsonDict]]) -> JsonDict:
     return {
         "scrolls": scrolls,
         "scrollsWithoutEffect": scrolls_without_effect,
+        "scrollsWithUnknownEffect": scrolls_with_unknown_effect,
         "scrollEffectEvidence": scroll_effect_evidence,
         "exhaustionProofs": exhaustion_proofs,
         "traversed": bool(scrolls or exhaustion_proofs),
@@ -472,20 +453,30 @@ def _semantic_terminal_counterevidence(
         # proves we saved what we saw, never that we looked past the fold.
         try:
             ignored_scrolls = int(traversal.get("scrollsWithoutEffect") or 0)
+            unknown_scrolls = int(traversal.get("scrollsWithUnknownEffect") or 0)
         except (TypeError, ValueError):
             ignored_scrolls = 0
-        finding = (
-            f"{ignored_scrolls} scroll(s) were dispatched and the page did not"
-            " move; no collection was enumerated to exhaustion"
-            if ignored_scrolls
-            # Distinguishable from the above only with a scroll receipt, and
-            # the difference matters: one says the page refused, the other
-            # says we never asked.
-            else (
-                "the page was never scrolled and no collection was enumerated"
-                " to exhaustion"
+            unknown_scrolls = 0
+        if unknown_scrolls:
+            finding = (
+                f"{unknown_scrolls} scroll(s) returned without conclusive"
+                " movement evidence; their effect is unknown"
             )
-        )
+            if ignored_scrolls:
+                finding += (
+                    f"; {ignored_scrolls} other scroll(s) have receipts"
+                    " confirming zero movement"
+                )
+        elif ignored_scrolls:
+            finding = (
+                f"{ignored_scrolls} scroll(s) have receipts confirming the"
+                " page did not move"
+            )
+        else:
+            # Missing movement evidence also includes failed calls whose input
+            # outcome is unknown; it cannot certify that no scroll was tried.
+            finding = "no scroll movement is confirmed by this trace"
+        finding += "; no collection was enumerated to exhaustion"
         return {
             **facts,
             "findings": [finding],

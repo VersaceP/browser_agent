@@ -138,6 +138,8 @@ def _transport_failure_fields(exc: ABCPTransportError) -> JsonDict:
             or "ABCP_TRANSPORT_UNKNOWN"
         ),
     }
+    if isinstance(getattr(exc, "connection_recovery", None), dict):
+        result["connectionRecovery"] = exc.connection_recovery
     if bool(getattr(exc, "connection_fatal", False)):
         result["connectionFatal"] = True
     request_sent = getattr(exc, "request_sent", None)
@@ -196,7 +198,7 @@ class SpawnerWorkerMixin:
                 getattr(harness, "effective_max_steps", None),
                 0,
             ) or optional_int(
-                getattr(worker_harness, "max_steps", None),
+                getattr(worker_harness, "worker_max_steps", None),
                 0,
             ) or int(self.runtime.harness.worker_max_steps or 0)
             steps = int(trace_summary.get("steps") or 0)
@@ -346,13 +348,13 @@ class SpawnerWorkerMixin:
                 self.runtime.harness,
                 # Standalone /browser uses explicit terminal signals; task owner's
                 # delegated workers keep the configured step budget.
-                max_steps=(
+                worker_max_steps=(
                     0 if self.runtime.harness.agent_mode == "browser"
                     else self.runtime.harness.worker_max_steps
                 ),
             ),
         )
-        provider = LLMFactory.create_provider(
+        provider = None if (worker_contract or {}).get("_skill_operation", {}).get("kind") == "service" else LLMFactory.create_provider(
             browser_agent_model_config(worker_runtime)
         )
         event_logger = make_browser_event_logger(
@@ -389,7 +391,8 @@ class SpawnerWorkerMixin:
             if slot_context:
                 effective_context = f"{effective_context}\n\n{slot_context}".strip()
             from harness.skill_builder.selection import selected_skill_context
-            skill_context = selected_skill_context(worker_runtime)
+            skill_context = ("" if worker_runtime.harness.agent_mode == "skill"
+                             else selected_skill_context(worker_runtime, task_id=self.logger.task_id))
             if skill_context:
                 effective_context = f"{effective_context}\n\n{skill_context}".strip()
             prompt_worker_contract = _prompt_worker_contract(worker_contract)
@@ -552,7 +555,7 @@ class SpawnerWorkerMixin:
                         task_session_binding is not None
                         and task_session_binding.requires_exact_page
                     )
-                    else ""
+                    else str((harness.worker_contract.get("_skill_operation") or {}).get("startPageId") or "")
                 ),
             )
             harness.allowed_page_ids = set(page_bindings)
@@ -1563,6 +1566,9 @@ class SpawnerWorkerMixin:
             )
 
     def _next_id(self, prefix: str) -> str:
+        namespace = str(getattr(self, "worker_id_namespace", "") or "")
+        if namespace:
+            prefix = namespace + "-" + prefix
         self._counter += 1
         return f"{prefix}-{self._counter:03d}"
 

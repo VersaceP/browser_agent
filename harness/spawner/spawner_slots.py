@@ -75,6 +75,37 @@ def _client_event_cursor(client: Any) -> Optional[int]:
 
 class SpawnerSlotsMixin:
 
+    def _managed_browser_client(self, client, slot=None):
+        from harness.runtime.browser_connection import managed_client, task_recovery_window
+
+        async def recovered(raw, registration, caps, inventory):
+            if slot is None:
+                return {}
+            if not self._apply_slot_registration(slot, registration, reconnecting=True):
+                raise ValueError("Dispatcher protocol identity changed")
+            available = {str(row.get("fleetId")) for row in handle_records_from_value(inventory)
+                         if row.get("fleetId")}
+            previous_fleets = set(slot.fleet_ids)
+            previous_pages = set(slot.page_registry)
+            observed_pages = set()
+            for fleet_id in sorted(previous_fleets & available):
+                pages = await raw.call("Page.list", {"fleetId": fleet_id})
+                for row in handle_records_from_value(pages):
+                    if row.get("pageId"):
+                        observed_pages.add(str(row["pageId"]))
+                self._update_slot_registry_from_value(slot, pages)
+            # Missing targets are facts for the task owner, never permission
+            # to replace a Fleet/Page or repeat a business operation.
+            slot.registration = registration
+            slot.protocol_initialized = True
+            slot.event_cursor = raw.event_cursor
+            return {"missingFleetIds": sorted(previous_fleets - available),
+                    "missingPageIds": sorted(previous_pages - observed_pages)}
+
+        return managed_client(client, window=task_recovery_window(self),
+                              recovered=recovered if slot else None,
+                              identity=slot.protocol_agent_id if slot else "")
+
     def _apply_worker_session_isolation(
         self,
         worker_contract: JsonDict,
@@ -1163,7 +1194,8 @@ class SpawnerSlotsMixin:
             self.runtime.harness.log_browser_payloads,
             prefix=f"{slot.slot_id}.transport",
         )
-        client = _sp().ABCPClient(self.runtime.browser, on_event=event_logger)
+        client = self._managed_browser_client(
+            _sp().ABCPClient(self.runtime.browser, on_event=event_logger), slot)
         slot.client = client
         slot.idle_event_logger = event_logger
         bootstrap_started = time.monotonic()
@@ -1305,7 +1337,8 @@ class SpawnerSlotsMixin:
             prefix=f"{slot.slot_id}.transport",
         )
         for attempt in range(1, attempts + 1):
-            client = _sp().ABCPClient(self.runtime.browser, on_event=event_logger)
+            client = self._managed_browser_client(
+                _sp().ABCPClient(self.runtime.browser, on_event=event_logger), slot)
             # The old client advances this value as live events are delivered;
             # `slot.event_cursor` remains the durable fallback for adopted
             # clients and test doubles that do not expose the transport field.
@@ -1361,6 +1394,8 @@ class SpawnerSlotsMixin:
                             or getattr(client, "connection_details", {}),
                     },
                 )
+                if getattr(client, "last_recovery", None):
+                    return False  # The shared outage window was already consumed.
                 if attempt < attempts and backoff > 0:
                     await asyncio.sleep(backoff * attempt)
                 continue

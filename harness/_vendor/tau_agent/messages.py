@@ -273,6 +273,9 @@ class CompactionSummaryMessage(WireModel):
     role: Literal["compactionSummary"] = "compactionSummary"
     summary: str
     tokens_before: int
+    checkpoint_id: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+    replaced_message_count: int = 0
     timestamp: int = Field(default_factory=current_timestamp_ms)
 
 

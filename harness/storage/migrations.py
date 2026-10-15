@@ -194,6 +194,60 @@ MIGRATION_0006_SKILL_BUILDER = Migration(
     ],
 )
 
+MIGRATION_0007_BUILDER_BINDINGS = Migration(
+    version=7,
+    name="builder_analysis_and_publication_bindings",
+    statements=[
+        "ALTER TABLE skill_builder_sessions ADD COLUMN analysis_task_id TEXT",
+        "ALTER TABLE skill_builder_sessions ADD COLUMN referenced_tasks_json TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE skill_builder_sessions ADD COLUMN published_skill_id TEXT",
+        "ALTER TABLE skill_builder_sessions ADD COLUMN published_hash TEXT",
+        "UPDATE skill_builder_sessions SET analysis_task_id=source_task_id",
+        # Only a currently published version proves a legacy Builder's target.
+        # A snapshot alone may belong to an interrupted, uncommitted publish.
+        """UPDATE skill_builder_sessions AS s SET
+            published_skill_id=(SELECT i.skill_id FROM skill_index i
+                JOIN skill_versions v ON v.skill_id=i.skill_id AND v.content_hash=i.current_hash
+                WHERE i.deleted=0 AND v.source_task_id=s.builder_task_id
+                AND (s.source_skill_id IS NULL OR i.skill_id=s.source_skill_id)),
+            published_hash=(SELECT i.current_hash FROM skill_index i
+                JOIN skill_versions v ON v.skill_id=i.skill_id AND v.content_hash=i.current_hash
+                WHERE i.deleted=0 AND v.source_task_id=s.builder_task_id
+                AND (s.source_skill_id IS NULL OR i.skill_id=s.source_skill_id))
+            WHERE 1=(SELECT COUNT(*) FROM skill_index i
+                JOIN skill_versions v ON v.skill_id=i.skill_id AND v.content_hash=i.current_hash
+                WHERE i.deleted=0 AND v.source_task_id=s.builder_task_id
+                AND (s.source_skill_id IS NULL OR i.skill_id=s.source_skill_id))""",
+    ],
+)
+
+
+MIGRATION_0008_CODING_OWNER = Migration(
+    version=8,
+    name="coding_repair_owner_workspace",
+    # Like source_task_id, an owner may still use the legacy file backend.
+    # The host validates its identity and path; a SQL FK would hide its logs
+    # by requiring an empty SQL task record to shadow the file-owned task.
+    statements=["ALTER TABLE skill_builder_sessions ADD COLUMN owner_task_id TEXT"],
+)
+
+
+MIGRATION_0009_TASK_SKILL_SOURCES = Migration(
+    version=9,
+    name="task_owned_skill_sources",
+    statements=["""CREATE TABLE skill_task_sources (
+        task_id TEXT NOT NULL,
+        skill_id TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        relative_path TEXT NOT NULL,
+        metadata_json TEXT NOT NULL,
+        files_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (task_id, skill_id, content_hash)
+    )"""],
+)
+
+
 MIGRATIONS: List[Migration] = [
     _load_initial_migration(),
     MIGRATION_0002_GIT_SHA,
@@ -201,6 +255,9 @@ MIGRATIONS: List[Migration] = [
     MIGRATION_0004_EVENT_ENVELOPE,
     MIGRATION_0005_DROP_STRATEGY_ATTEMPTS,
     MIGRATION_0006_SKILL_BUILDER,
+    MIGRATION_0007_BUILDER_BINDINGS,
+    MIGRATION_0008_CODING_OWNER,
+    MIGRATION_0009_TASK_SKILL_SOURCES,
 ]
 
 SCHEMA_VERSION = max(migration.version for migration in MIGRATIONS)

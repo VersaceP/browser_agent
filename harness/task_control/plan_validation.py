@@ -2769,7 +2769,7 @@ def initialize_task_state(
             input_source = _tc().load_task_state(logger)
         except Exception:
             input_source = {}
-    for key in ("operator_inputs", "delegations"):
+    for key in ("operator_inputs", "delegations", "user_steering"):
         state[key] = copy.deepcopy((input_source or {}).get(key) or {})
     state["operator_input_order"] = list((input_source or {}).get("operator_input_order") or [])
     state["resume_input_bindings"] = copy.deepcopy(

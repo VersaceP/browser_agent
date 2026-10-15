@@ -46,6 +46,7 @@ class AgentHarnessConfig:
     session_id: str | None = None
     before_tool_call: BeforeToolCall | None = None
     after_tool_call: AfterToolCall | None = None
+    before_model: Callable[[list[AgentMessage]], Awaitable[list[AgentMessage]]] | None = None
 
 
 class SimpleCancellationToken:
@@ -184,8 +185,10 @@ class AgentHarness:
                 session_id=self._config.session_id,
                 get_steering_messages=self._drain_steering_messages,
                 get_follow_up_messages=self._drain_follow_up_messages,
+                has_steering_messages=lambda: bool(self._steering_queue),
                 before_tool_call=self._config.before_tool_call,
                 after_tool_call=self._config.after_tool_call,
+                before_model=self._config.before_model,
             ):
                 await self._notify(event)
                 yield event
