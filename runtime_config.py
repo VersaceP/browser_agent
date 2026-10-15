@@ -199,8 +199,8 @@ def _validated_browser_agent_max_multimodal_image_bytes(value: Any) -> int:
 
 def _validated_agent_mode(value: Any) -> str:
     mode = str(value or "browser").strip().lower()
-    if mode != "browser":
-        raise ValueError("harness.agent_mode must be 'browser'")
+    if mode not in {"browser", "skill", "workflow"}:
+        raise ValueError("harness.agent_mode must be 'browser', 'skill' or 'workflow'")
     return mode
 
 
@@ -248,34 +248,34 @@ def require_model_connection(data: Any, *, section: str) -> None:
     provider = data.get("provider")
     if not isinstance(provider, str) or not provider.strip():
         problems.append(
-            "provider（供应商，如 allinone、juao、qwen-token-plan、deepseek；"
-            "anthropic / openai 表示官方服务）"
+            "provider (for example allinone, juao, qwen-token-plan or deepseek; "
+            "anthropic / openai identify official services)"
         )
     api = str(data.get("api") or "").strip()
     if api:
         from llm.profiles import API_ALIASES
         if api.lower() not in API_ALIASES:
             problems.append(
-                f"api 取值 {api!r} 无效（请求协议只能是 openai-chat-completions"
-                "、openai-responses 或 anthropic-messages）"
+                f"api value {api!r} is invalid (protocol must be openai-chat-completions"
+                ", openai-responses or anthropic-messages)"
             )
     elif isinstance(provider, str) and provider.strip() and (
         provider.strip().lower() not in _PROTOCOL_IMPLIED_PROVIDERS
     ):
         problems.append(
-            f"api（供应商 {provider.strip()} 必须写请求协议："
-            "openai-chat-completions、openai-responses 或 anthropic-messages）"
+            f"api (provider {provider.strip()} requires an explicit protocol: "
+            "openai-chat-completions, openai-responses or anthropic-messages)"
         )
     if not str(data.get("model_id") or "").strip():
         problems.append("model_id")
     if not str(data.get("api_key") or "").strip():
         api_key_env = str(data.get("api_key_env") or "").strip()
         if not api_key_env:
-            problems.append("api_key 或 api_key_env")
+            problems.append("api_key or api_key_env")
         elif not os.environ.get(api_key_env):
-            problems.append(f"api_key（api_key_env 指向的环境变量 {api_key_env} 没有设置）")
+            problems.append(f"api_key (environment variable {api_key_env} specified by api_key_env is not set)")
     if problems:
-        raise ValueError(f"config.json 的 {section} 段缺少或写错：" + "；".join(problems))
+        raise ValueError(f"config.json {section} section has missing or invalid values: " + "; ".join(problems))
 
 
 @dataclass
@@ -363,6 +363,8 @@ class ABCPClientConfig:
     jwt_token_env: Optional[str] = None
     request_shape: str = "flat"
     connect_timeout_seconds: float = 15
+    # Total outage window, shared by bootstrap, active calls and HITL readers.
+    reconnect_timeout_seconds: float = 60
     call_timeout_seconds: float = 60
     ping_interval_seconds: Optional[float] = 20
     max_message_size_bytes: Optional[int] = 16 * 1024 * 1024
@@ -371,6 +373,10 @@ class ABCPClientConfig:
 
     @classmethod
     def from_dict(cls, data: JsonDict) -> "ABCPClientConfig":
+        import math
+        recovery_timeout = float(data.get("reconnect_timeout_seconds", cls.reconnect_timeout_seconds))
+        if not math.isfinite(recovery_timeout) or recovery_timeout < 0 or recovery_timeout > 60:
+            raise ValueError("browser.reconnect_timeout_seconds must be between 0 and 60")
         transport = data.get("transport", cls.transport)
         if transport not in {"websocket", "local"}:
             raise ValueError("browser.transport must be websocket or local")
@@ -393,6 +399,7 @@ class ABCPClientConfig:
             connect_timeout_seconds=float(
                 data.get("connect_timeout_seconds", cls.connect_timeout_seconds)
             ),
+            reconnect_timeout_seconds=recovery_timeout,
             call_timeout_seconds=float(
                 data.get("call_timeout_seconds", cls.call_timeout_seconds)
             ),
@@ -660,7 +667,6 @@ class VLConfig:
 @dataclass
 class HarnessConfig:
     agent_mode: str = "browser"
-    max_steps: int = 40
     worker_max_steps: int = 40
     # Experimental BrowserAgent continuation.  The current worker may ask for
     # one bounded extension near its step cap; harness guards remain
@@ -911,19 +917,17 @@ class HarnessConfig:
     # Whether a human is actually reachable for this deployment. There is no
     # platform signal to infer it from (ABCP exposes only Hitl.requestPause /
     # Hitl.resolvePause, nothing about operator presence), so it is declared.
-    #   attended   - pause and wait; the budgets below apply.
+    #   attended   - pause and wait for human feedback without a time/round quota.
     #   unattended - nobody will answer, so do not pause at all: hand back a
     #                terminal needs_human verdict immediately and leave the
     #                fleet gate untouched.
-    # Task 48b4d7d7 spent 82 of its 128 minutes waiting for a human who was
-    # never there, and the wait held the whole fleet's auth barrier shut.
     hitl_attendance: str = "attended"
-    hitl_wait_timeout_seconds: float = 900.0
-    # Cumulative pause budget (attended only). `hitl_post_resume_confirm_max_rounds`
-    # bounds rounds WITHIN one tool call; these bound them across calls, which is
-    # what browser-004 escaped by re-pausing four times from four separate calls.
-    hitl_max_pause_rounds_per_page: int = 3
-    hitl_max_pause_rounds_per_worker: int = 3
+    # Deprecated compatibility fields. Human questions are never rejected by
+    # these values; from_dict ignores old overrides. Protocol/state confirmation
+    # remains bounded independently of the time a person needs to answer.
+    hitl_wait_timeout_seconds: Optional[float] = None
+    hitl_max_pause_rounds_per_page: int = 0
+    hitl_max_pause_rounds_per_worker: int = 0
     hitl_no_repause_cooldown_seconds: float = 8.0
     hitl_post_resume_guard_seconds: float = 30.0
     hitl_post_resume_confirm_max_rounds: int = 3
@@ -1002,7 +1006,6 @@ class HarnessConfig:
             agent_mode=_validated_agent_mode(
                 data.get("agent_mode", cls.agent_mode)
             ),
-            max_steps=int(data.get("max_steps", cls.max_steps)),
             worker_max_steps=int(data.get("worker_max_steps", cls.worker_max_steps)),
             browser_agent_step_extension_enabled=(
                 _validated_browser_agent_step_extension_enabled(
@@ -1361,30 +1364,15 @@ class HarnessConfig:
             hitl_attendance=_normalize_hitl_attendance(
                 data.get("hitl_attendance", cls.hitl_attendance)
             ),
-            hitl_max_pause_rounds_per_page=max(0, int(
-                data.get(
-                    "hitl_max_pause_rounds_per_page",
-                    cls.hitl_max_pause_rounds_per_page,
-                )
-            )),
-            hitl_max_pause_rounds_per_worker=max(0, int(
-                data.get(
-                    "hitl_max_pause_rounds_per_worker",
-                    cls.hitl_max_pause_rounds_per_worker,
-                )
-            )),
+            hitl_max_pause_rounds_per_page=0,
+            hitl_max_pause_rounds_per_worker=0,
             page_settlement_timeout_seconds=float(
                 data.get(
                     "page_settlement_timeout_seconds",
                     cls.page_settlement_timeout_seconds,
                 )
             ),
-            hitl_wait_timeout_seconds=float(
-                data.get(
-                    "hitl_wait_timeout_seconds",
-                    cls.hitl_wait_timeout_seconds,
-                )
-            ),
+            hitl_wait_timeout_seconds=None,
             hitl_no_repause_cooldown_seconds=float(
                 data.get(
                     "hitl_no_repause_cooldown_seconds",
@@ -1496,6 +1484,7 @@ _TOP_LEVEL_KEYS = {
     "agent_id",
     "vl",
     "worker",
+    "skill_orchestrator",
     "browser",
     "harness",
 }
@@ -1538,8 +1527,8 @@ def audit_config_keys(raw: JsonDict) -> List[str]:
         unknown = sorted(k for k in section if k not in known)
         if unknown:
             prefix = f"{section_name}." if section_name else ""
-            names = "、".join(prefix + k for k in unknown)
-            warnings.append(f"有不认识的字段（写了也不会生效，已忽略）: {names}")
+            names = ", ".join(prefix + k for k in unknown)
+            warnings.append(f"Unknown fields ignored: {names}")
 
     check("", raw, _TOP_LEVEL_KEYS)
     check(
@@ -1559,11 +1548,11 @@ def audit_config_keys(raw: JsonDict) -> List[str]:
             warnings.append("harness.max_steps is deprecated and ignored; Workflow, Skill and Builder have no fixed model-turn cap")
         if "forced_skill_id" in harness_raw:
             warnings.append(
-                "harness.forced_skill_id 只在运行时通过 --skill / /skill 设置，"
-                "写在 config 里不生效"
+                "harness.forced_skill_id is set at runtime via --skill or /skill; "
+                "setting it in config has no effect"
             )
         if "vl" in harness_raw:
-            warnings.append("vl 配置要放在 config 顶层，放在 harness.vl 里不生效")
+            warnings.append("Place vl at the config top level; harness.vl has no effect")
     return warnings
 
 
@@ -1586,7 +1575,7 @@ def load_runtime_config(config_path: str, *, warn: bool = True) -> RuntimeConfig
         )
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
-        raise ValueError(f"{path.name} 顶层必须是 JSON 对象")
+        raise ValueError(f"{path.name} top level must be a JSON object")
     _reject_top_level_model_keys(raw)
 
     if warn:

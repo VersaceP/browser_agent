@@ -32,12 +32,12 @@
     }
   },
   "browser": {
+    "reconnect_timeout_seconds": 60,
     "ws_url": "ws://127.0.0.1:61168/ws",
     "request_shape": "jsonrpc",
     "jwt_token_env": "ABCP_JWT_TOKEN"
   },
   "harness": {
-    "max_steps": 50,
     "worker_max_steps": 50,
     "workflow_execution_enabled": false,
     "max_task_fleets": 3,

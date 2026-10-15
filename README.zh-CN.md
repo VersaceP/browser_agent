@@ -107,7 +107,6 @@ WebSocket 连接分配；配置该值既不能认证，也不能恢复 WebCross 
     "worker_max_steps": 30,
     "max_browser_agents": 3,
     "max_task_fleets": 3,
-    "hitl_wait_timeout_seconds": 600,
     "worktree_dir": "worktree"
   }
 }
@@ -115,8 +114,19 @@ WebSocket 连接分配；配置该值既不能认证，也不能恢复 WebCross 
 
 - `worker_max_steps`：委派 Browser worker 的轮数上限；独立 `/browser` 不受此轮数限制。
 - `max_browser_agents` / `max_task_fleets`：并行 worker 数和单项任务的浏览器实例数。
-- `hitl_wait_timeout_seconds`：等待人工协助的最长时间。
 - `worktree_dir`：SQLite 数据库和交付文件的根目录。
+
+HITL 提问没有累计次数或自动等待超时，回答和运行中引导没有固定字符上限。
+旧 `hitl_wait_timeout_seconds`、`hitl_max_pause_rounds_per_page/worker` 配置兼容读取但不再生效；
+问题身份、显式 attendance、取消和权限校验继续保留。
+
+Browser、Workflow、Skill 运行时和 Skill Builder 共用本地文件授权。
+模型可通过 `local_fs_authorize` 一次申请材料目录或一批文件；读取和写入分别确认。
+终端回复 `/answer <问题编号> yes` 批准列出的全部范围；如果显示了目录选项，
+回复 `/answer <问题编号> directory` 批准该确切目录及其子目录，`no` 拒绝。
+目录权限在本任务恢复后继续有效，并可供本任务的 Browser 和所属只读试运行复用。
+引用历史来源任务不会自动继承其权限。上传仍须传入实际文件清单。
+已运行的 Python 进程不会热加载源码修改；升级后重启 Harness，再 `/resume <任务ID>`。
 
 独立 `/browser` 自动维护持久 TODO，并在清单变化、主动请求复核和提交完成时进行独立证据复核。
 任务完成必须通过最终复核。无需配置清单或复核的内部参数。
@@ -143,16 +153,55 @@ python main.py --agent-id demo-agent --task "检查当前 Fleet 列表。"
 ```
 
 交互启动后，先选择本次编排入口再输入任务：`/browser` 直达单个
-BrowserAgent。终端会确认本次选择，且不会修改
+BrowserAgent；`/workflow` 开发并执行可复用程序；`/skill` 进入独立 Skill 编排及命令区。终端会确认本次选择，且不会修改
 `config.json`。
+
+CLI 的固定提示、帮助和控制词统一使用英文。任务正文和原始证据可继续使用原语言。
+Skill 名称支持不区分大小写的包含匹配，精确 ID 和精确名称优先。
+唯一匹配自动选择；多个匹配列出全部名称和 ID，等待用户精确指定。
+`/skill` 显示正式 Skill 和草稿，随后使用简短的 `[skill]>` 提示。
+
+保留的操作为 `/<Skill名称或ID> [@FleetID] [需求]`、
+`/skill-create [Skill名称或ID] @<任务ID> [要求]`、`/skill-publish <名称或ID>`、
+`/skill-delete <名称或ID>`、`/resume <任务ID> [补充要求]`。
+创建和恢复的任务 ID 必填；Fleet 可省略。`/skill-create` 不带名称时新建，
+带名称时根据指定任务证据更新该 Skill，生成草稿后另行发布。发布和删除共用名称解析，
+同一个 Skill 有多个草稿或删除版本时展示版本供交互选择，不按时间默选；
+内容哈希和版本冲突由程序内部复核。`/resume` 自动按保存的模式恢复执行任务，也可继续 Builder 草稿，无需先切换模式。
+`/skill`、`/browser`、`/workflow` 保留为模式导航。
+详细用法见 [Skill 命令说明](skills/README.md)。
+
+Skill 模式与 Builder 要求 Python 3.12+。执行已发布 Skill 时启动独立 Orchestrator：
+绑定本轮变量，由 Harness 连续运行已决定的 JS/TS Workflow，
+在判断点或异常处交回模型。Browser 处理有界判断及恢复；程序缺陷记录后通过
+`/resume <Builder任务ID> 根据 @<执行任务ID> 优化` 另行处理。
+复用不启动后台重放或 Coding 修复循环；发布仍需用户命令，业务完成经过独立审查。
+当前不接入共享 Python/Shell。可选顶层 `skill_orchestrator` 单独配置模型；
+未配置时复用 `worker` 连接。
+
+`/workflow [@<Fleet ID> 需求]` 由主 Agent 直接编写、运行任务内文件并读取回执；
+同一个主 Agent 在独立测试页验证当前源码，测试检查点与主页面隔离。Browser 可承担有界语义操作或恢复，
+业务交付和程序验证分别审查。通过 `/skill-create @<Workflow任务ID> 需求` 将确切源码及
+执行证据导入 Builder 草稿，用户发布后由 `/skill` 换变量复用。开发、恢复与验收边界见
+[实施计划](docs/tau-skill-builder-agent-loop-plan.md)。
+
+Dispatcher 断线时，Browser、Workflow 和 Skill 共用默认 60 秒的自动重连窗口。
+恢复期间保留连接身份、事件订阅和任务上下文；已发送但丢失回执的动作返回“结果未知”，不会自动重放。
+Workflow 会保存中断阶段，并在已知原 `workflowId` 时查询其状态；状态查询不能代替丢失的执行输出。
+重连超时或身份、协议校验失败后，保留任务记录供 `/resume <task_id>` 恢复。
+这个窗口不限制工作流执行时长或 HITL 人工回答时间。可在 `browser.reconnect_timeout_seconds`
+配置 0–60 秒（默认 60，0 表示不自动等待重连）。
 
 按 phase 粒度恢复原任务，也可以在同一任务 ID 下追加用户指令：
 
 ```bash
-python main.py --resume worktree/<task_id> --task "补充指令"
+python main.py --resume <task_id> --task "补充指令"
 ```
 
-交互提示符中的等价写法是 `/resume <任务目录> [补充指令]`；省略补充指令则按原任务恢复。
+交互提示符中的等价写法是 `/resume <task_id> [补充指令]`；完整 ID 可带 `@` 前缀，
+旧任务目录路径仍兼容。省略补充指令则按原任务恢复。
+若任务保存了传输阻塞状态，首次浏览器派发前会重新探测连接、能力与 Fleet 清单；
+成功后更新阻塞状态，失败则保留具体原因和任务身份。探测不会重放断线时的浏览器操作。
 原始请求保留在任务 manifest，追加文本作为带来源的用户输入记录。Browser 模式在原阶段
 仍可继续时沿用该阶段；阶段已结束时新建后续阶段，保留旧回执，不自动重放旧提交。
 启动失败前已保存的补充指令仍会在下次普通 resume 时接续；补充指令不能将现有任务改绑到

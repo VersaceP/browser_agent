@@ -80,9 +80,12 @@ CLI_CANCELLED_EXIT_CODE = 130
 
 _INTERACTIVE_AGENT_MODES = {
     "/browser": "browser",
+    "/workflow": "workflow",
 }
 _AGENT_MODE_LABELS = {
-    "browser": "直达单个 BrowserAgent",
+    "browser": "direct BrowserAgent execution",
+    "skill": "Skill orchestration, continuous execution and recovery",
+    "workflow": "Develop, execute and validate reusable Workflows with one author",
 }
 
 
@@ -283,43 +286,45 @@ class ConsoleProgressReporter:
         message = self._format(event_type, payload)
         if message:
             print(message, flush=True)
+            from harness.runtime.hitl_input import notify_terminal_output
+            notify_terminal_output()
 
     def _format(self, event_type: str, payload: Dict[str, Any]) -> Optional[str]:
         if event_type == "browser.task_review.start":
-            return f"[BrowserReview] 开始 {payload.get('phase')} 复核，Browser 步骤 {payload.get('step')}"
+            return f"[BrowserReview] Starting {payload.get('phase')} review at browser step {payload.get('step')}"
         if event_type == "browser.task_review.model":
-            return f"[BrowserReview {payload.get('reviewId')}] 第 {payload.get('round')} 轮：请求模型..."
+            return f"[BrowserReview {payload.get('reviewId')}] Round {payload.get('round')}: requesting model..."
         if event_type == "browser.task_review.tool":
             result = payload.get("result") or {}
             method = (payload.get("input") or {}).get("method")
             detail = result.get("reason") or result.get("error") or ""
             if payload.get("tool") in {"review_search_text", "review_list_files"} \
                     and result.get("status") == "done":
-                detail = (f"{result.get('count', 0)} 条"
-                          f"，续查 {result.get('nextLineOffset') or result.get('nextOffset')}"
-                          if result.get("truncated") else f"{result.get('count', 0)} 条")
+                detail = (f"{result.get('count', 0)} records"
+                          f", next offset {result.get('nextLineOffset') or result.get('nextOffset')}"
+                          if result.get("truncated") else f"{result.get('count', 0)} records")
             return (f"[BrowserReview {payload.get('reviewId')}] {payload.get('tool')}"
                     f"{(' ' + str(method)) if method else ''}: {result.get('status')}"
                     f" {self._short_text(detail, 160)}").rstrip()
         if event_type == "browser.task_review.verdict":
             errors = (payload.get("validation") or {}).get("errors")
             if errors:
-                return f"[BrowserReview] 判决协议需修正: {self._short_text('; '.join(errors), 350)}"
+                return f"[BrowserReview] Review verdict requires protocol repair: {self._short_text('; '.join(errors), 350)}"
             return None  # the completion event prints the verdict once
         if event_type == "browser.task_review":
             return (f"[BrowserReview] {payload.get('verdict') or payload.get('status')}"
-                    f"，模型 {payload.get('modelCalls', '?')} 轮，耗时 {payload.get('durationMs', '?')}ms"
-                    f"，问题 {len(payload.get('issues') or [])} 项："
+                    f", {payload.get('modelCalls', '?')} model calls, {payload.get('durationMs', '?')}ms"
+                    f", {len(payload.get('issues') or [])} issues: "
                     f"{self._short_text(payload.get('reason'), 240)}")
         if event_type == "browser.task_review.skipped":
-            return f"[BrowserReview] 未启动：{payload.get('reason')}"
+            return f"[BrowserReview] Not started: {payload.get('reason')}"
         if event_type == "llm.usage" and payload.get("source") == "browser_task_reviewer":
             return (f"[LLM {payload.get('source')}] cache_read={payload.get('cache_read', 0)} "
                     f"cache_creation={payload.get('cache_creation', 0)} "
                     f"uncached_input={payload.get('uncached_input', 0)} output={payload.get('output', 0)}")
         if event_type == "lifecycle.compaction.start":
             return (
-                "[Compaction] 开始: "
+                "[Compaction] Started: "
                 f"reason={payload.get('reason')} "
                 f"tokens≈{payload.get('estimatedTokensBefore')}"
             )
@@ -327,12 +332,12 @@ class ConsoleProgressReporter:
             status = payload.get("status") or "completed"
             if status == "completed":
                 fallback = (
-                    "（机械降级摘要）"
+                    "(fallback summary)"
                     if payload.get("summaryMode") == "mechanical_fallback"
                     else ""
                 )
                 return (
-                    "[Compaction] 完成: "
+                    "[Compaction] Completed: "
                     f"tokens≈{payload.get('estimatedTokensAfter')} "
                     f"checkpoint={payload.get('checkpointRef') or '-'}{fallback}"
                 )
@@ -340,7 +345,7 @@ class ConsoleProgressReporter:
         if event_type == "agent.step.start":
             return (
                 f"[{self._browser_actor_label(payload)}] "
-                f"第 {payload.get('step')} 步：请求模型..."
+                f"Step {payload.get('step')}: requesting model..."
             )
         if event_type in {"agent.model"}:
             return self._format_model_event(event_type, payload)
@@ -348,62 +353,62 @@ class ConsoleProgressReporter:
             streak = payload.get("streak")
             limit = payload.get("limit")
             ending = isinstance(streak, int) and isinstance(limit, int) and streak >= limit
-            action = "终止本 Worker 并返回未完成状态" if ending else "将按现有恢复策略再次请求模型"
+            action = "terminate this worker and return an incomplete result" if ending else "request the model again using the current recovery policy"
             return (
-                f"[{self._browser_actor_label(payload)}] 连续异常 {streak}/{limit}（本次：输出截断）；"
+                f"[{self._browser_actor_label(payload)}] Consecutive errors {streak}/{limit} (this attempt: output truncated); "
                 f"{action}"
             )
         if event_type == "tool_result.offloaded":
             return self._format_offloaded_tool_result(payload)
         if event_type == "spawner.browser.spawn":
             return (
-                f"[BrowserAgent] 启动 {payload.get('workerId')} "
+                f"[BrowserAgent] Started {payload.get('workerId')} "
                 f"({payload.get('name') or 'unnamed'})"
             )
         if event_type == "spawner.browser.result":
             return self._format_browser_result(payload)
         if event_type == "task_plan.accepted":
             return (
-                f"[TaskPlan] 已接受 {payload.get('phaseCount') or 0} 个 phase: "
+                f"[TaskPlan] Accepted {payload.get('phaseCount') or 0} phases: "
                 f"{payload.get('path')}"
             )
         if event_type == "task_plan.rejected":
             return self._format_task_plan_rejected(payload)
         if event_type == "task_state.initialized":
-            return f"[TaskState] 已初始化: {payload.get('path')}"
+            return f"[TaskState] Initialized: {payload.get('path')}"
         if event_type == "spawner.resume_browser_hint.used":
             page = payload.get("pageId")
-            suffix = f"，页面 {page}" if page else ""
+            suffix = f", page {page}" if page else ""
             return (
-                "[Resume] 原浏览器 Fleet 仍可用，已继续复用 "
-                f"{payload.get('fleetId')}{suffix}。"
+                "[Resume] Original browser Fleet is available and reused: "
+                f"{payload.get('fleetId')}{suffix}. "
             )
         if event_type == "spawner.resume_browser_hint.page_probe_failed":
             return (
-                "[Resume] 原页面已不可用；将尝试保留 Fleet 登录态，"
-                "并从新页面重跑当前 phase。"
+                "[Resume] Original page is unavailable; attempting to preserve the Fleet session "
+                "and restart this phase on a new page."
             )
         if event_type == "spawner.resume_browser_hint.ignored":
             reason = str(payload.get("reason") or "unavailable")
             return (
-                "[Resume] 原浏览器上下文未恢复"
-                f"（{reason}）；将按普通分配从 phase 开头重跑，"
-                "如需登录将重新获取。"
+                "[Resume] Original browser context was not restored"
+                f"({reason}); restarting the phase with normal browser allocation; "
+                "sign in again if needed."
             )
         if event_type == "progress.observed":
             return (
-                f"[Progress] 观察 {payload.get('tool') or '?'}: "
+                f"[Progress] Observed {payload.get('tool') or '?'}: "
                 f"{payload.get('reasonObserved') or 'no progress'}"
             )
         if event_type == "agent.step_cap.reminder":
             return (
                 f"[{self._browser_actor_label(payload)}] "
-                f"接近步数上限: step={payload.get('step')} "
+                f"Approaching step limit: step={payload.get('step')} "
                 f"remaining={payload.get('remaining')}"
             )
         if event_type == "browser.call.params_error":
             return (
-                f"[BrowserCall] 参数错误 {payload.get('method') or '?'}: "
+                f"[BrowserCall] Invalid parameters for {payload.get('method') or '?'}: "
                 f"{self._short_text(payload.get('error'), 140)}"
             )
         if event_type == "spawner.slot.sync_warning":
@@ -411,7 +416,7 @@ class ConsoleProgressReporter:
             first = self._short_text(errors[0] if errors else payload.get("error"), 140)
             suffix = f" (+{len(errors) - 1})" if len(errors) > 1 else ""
             return (
-                f"[Slot] 同步警告 {payload.get('workerId') or ''}: "
+                f"[Slot] Synchronization warning {payload.get('workerId') or ''}: "
                 f"{first}{suffix}"
             )
         if event_type == "tool.record_extraction":
@@ -420,30 +425,36 @@ class ConsoleProgressReporter:
             verdict = payload.get("verdict") or payload.get("status") or "unknown"
             confidence = payload.get("confidence")
             if confidence is None:
-                return f"[VL] 视觉验收: {verdict}"
-            return f"[VL] 视觉验收: {verdict} (confidence={confidence})"
+                return f"[VL] Visual verification: {verdict}"
+            return f"[VL] Visual verification: {verdict} (confidence={confidence})"
         if event_type == "schema.bundle.loaded":
             count = payload.get("schema_count") or 0
             req = payload.get("requires_purpose_count") or 0
             guide_chars = payload.get("agent_guide_chars") or 0
             return (
-                f"[Schema] 加载 {count} 条 method schema "
-                f"({req} 个需要 purpose)；Agent 指南 {guide_chars} 字符。"
+                f"[Schema] Loaded {count} method schemas "
+                f"({req} require purpose); agent guide: {guide_chars} characters."
             )
         if event_type == "loop_guard.warn":
             tool = payload.get("tool") or "?"
             streak = payload.get("streak") or 1
             return (
-                f"[LoopGuard] 拦截重复 {tool}（第 {streak} 次，已不再执行）；"
-                "提示模型切换策略或终止。"
+                f"[LoopGuard] Blocked repeated {tool} (attempt {streak}; not executed); "
+                "asking the model to change its approach or stop."
             )
         if event_type == "loop_guard.force_stop":
             tool = payload.get("tool") or "?"
             streak = payload.get("streak") or 1
             return (
-                f"[LoopGuard] 强制停止：{tool} 连续重复 {streak} 次。"
-                "Worker 已以 extraction_inconclusive 终止。"
+                f"[LoopGuard] Stopped after {streak} consecutive repeated calls to {tool}. "
+                "Worker ended with extraction_inconclusive."
             )
+        if event_type.endswith(".transport.recovery.started"):
+            return f"[Browser connection] Dispatcher disconnected; reconnecting for up to {payload.get('timeoutSeconds', 60):g}s."
+        if event_type.endswith(".transport.recovery.attempt"):
+            return f"[Browser connection] Reconnect attempt {payload.get('attempt')}; {payload.get('remainingSeconds')}s remaining."
+        if event_type.endswith(".transport.recovery.finished"):
+            return f"[Browser connection] {payload.get('status')}; {payload.get('elapsedMs', 0)}ms; business actions replayed: 0."
         if event_type.endswith(".transport.request"):
             actor = event_type.split(".transport.", 1)[0]
             method = str(payload.get("method") or "unknown")
@@ -451,14 +462,14 @@ class ConsoleProgressReporter:
             if method == "System.describeAction":
                 # Suppressed; see schema.bundle.loaded summary.
                 return None
-            return f"[{actor}] 调用浏览器方法: {method}"
+            return f"[{actor}] Browser call: {method}"
         if event_type.endswith(".transport.response"):
             actor = event_type.split(".transport.", 1)[0]
             if self._last_method_by_actor.get(actor) == "System.describeAction":
                 return None
             if payload.get("error"):
-                return f"[{actor}] 浏览器响应: error ({self._format_error(payload)})"
-            return f"[{actor}] 浏览器响应: ok"
+                return f"[{actor}] Browser response: error ({self._format_error(payload)})"
+            return f"[{actor}] Browser response: ok"
         if event_type in {"agent.model_timeout"}:
             attempts = len(
                 payload.get("attempts") or payload.get("timeoutAttempts") or []
@@ -466,13 +477,13 @@ class ConsoleProgressReporter:
             seconds = payload.get("timeoutSeconds")
             will_retry = payload.get("willRetry")
             tail = (
-                "压缩上下文后重试本步。" if will_retry
-                else "重试次数已用尽，本步终止。" if will_retry is False
-                else "本步按空回合处理，由重复守卫接管恢复。"
+                "Compact context and retry this step." if will_retry
+                else "Retries exhausted; this step has stopped." if will_retry is False
+                else "Treating this step as an empty turn; recovery is handled by the repetition guard."
             )
             return (
-                f"[LLM] 模型服务无响应（连续 {seconds}s 未收到新数据，触发空闲超时），"
-                f"连初次请求共尝试 {attempts} 次仍失败；{tail}"
+                f"[LLM] Model idle timeout after {seconds}s without new data; "
+                f"all {attempts} attempts, including the initial request, failed; {tail}"
             )
         if event_type in {"agent.model_connection_error"}:
             # The provider already retried silently; by the time this fires the
@@ -481,19 +492,19 @@ class ConsoleProgressReporter:
             attempts = len(payload.get("attempts") or payload.get("connectionAttempts") or [])
             will_retry = payload.get("willRetry")
             tail = (
-                "压缩上下文后重试本步。" if will_retry
-                else "重试次数已用尽，本步终止。" if will_retry is False
-                else "本步按空回合处理，由重复守卫接管恢复。"
+                "Compact context and retry this step." if will_retry
+                else "Retries exhausted; this step has stopped." if will_retry is False
+                else "Treating this step as an empty turn; recovery is handled by the repetition guard."
             )
             return (
-                f"[LLM] 与模型服务的连接中断（{payload.get('reason') or 'connection error'}），"
-                f"连初次请求共尝试 {attempts} 次仍失败；{tail}"
+                f"[LLM] Model connection interrupted({payload.get('reason') or 'connection error'}); "
+                f"all {attempts} attempts, including the initial request, failed; {tail}"
             )
         if event_type in {"run.error", "agent.error"}:
             error = payload.get("error") or payload.get("errorType") or "unknown error"
-            return f"[错误] {error}"
+            return f"[Error] {error}"
         if event_type in {"agent.final"}:
-            return "[完成] Agent 已生成最终结果。"
+            return "[Finished] Agent returned its final result."
         return None
 
     def _format_model_event(
@@ -513,12 +524,12 @@ class ConsoleProgressReporter:
         telemetry = payload.get("outputTelemetry")
         telemetry = telemetry if isinstance(telemetry, dict) else {}
         output_tokens = telemetry.get("providerOutputTokens")
-        token_note = f"，输出 {output_tokens} tokens" if output_tokens is not None else ""
+        token_note = f", {output_tokens} output tokens" if output_tokens is not None else ""
         if stop_reason == "max_tokens":
             if tool_summaries:
                 return (
-                    f"[{role}] 模型输出达到上限（max_tokens）{token_note}；"
-                    f"响应被截断，已返回工具调用: {'; '.join(tool_summaries)}"
+                    f"[{role}] Model output reached max_tokens{token_note}; "
+                    f"Response truncated; tool calls returned: {'; '.join(tool_summaries)}"
                 )
             has_thinking = (
                 bool(telemetry.get("thinkingBlockCount"))
@@ -527,24 +538,24 @@ class ConsoleProgressReporter:
                 or "redacted_thinking" in (telemetry.get("prefixBlockTypes") or [])
             )
             content_note = (
-                "仅返回推理内容，无正文、无工具调用"
-                if has_thinking and not text else "未产生工具调用"
+                "Only reasoning returned; no text or tool calls"
+                if has_thinking and not text else "No tool calls returned"
             )
             return (
-                f"[{role}] 模型输出达到上限（max_tokens）{token_note}；"
-                f"{content_note}，本步没有执行工具"
+                f"[{role}] Model output reached max_tokens{token_note}; "
+                f"{content_note}; no tools were executed in this step"
             )
         if tool_summaries:
             if text:
                 return (
-                    f"[{role}] 模型返回: {text}；"
-                    f"准备调用: {'; '.join(tool_summaries)}"
+                    f"[{role}] Model response: {text}; "
+                    f"Tool calls: {'; '.join(tool_summaries)}"
                 )
-            return f"[{role}] 模型返回，准备调用: {'; '.join(tool_summaries)}"
+            return f"[{role}] Model returned tool calls: {'; '.join(tool_summaries)}"
         if not text:
-            reason_note = f"，stop_reason={stop_reason}" if stop_reason else ""
-            return f"[{role}] 模型未返回正文或工具调用{reason_note}"
-        return f"[{role}] 模型返回: {text}"
+            reason_note = f", stop_reason={stop_reason}" if stop_reason else ""
+            return f"[{role}] Model returned no text or tool calls{reason_note}"
+        return f"[{role}] Model response: {text}"
 
     @staticmethod
     def _browser_actor_label(payload: Dict[str, Any]) -> str:
@@ -697,13 +708,13 @@ class ConsoleProgressReporter:
                     if len(failure_types) > 4:
                         shown += f",+{len(failure_types) - 4}"
                     parts.append(f"failureTypes={shown}")
-        return f"[BrowserAgent] {worker_id} 结束: {', '.join(parts)}"
+        return f"[BrowserAgent] {worker_id} finished: {', '.join(parts)}"
 
     def _format_task_plan_rejected(self, payload: Dict[str, Any]) -> str:
         errors = payload.get("errors") if isinstance(payload.get("errors"), list) else []
         first = self._short_text(errors[0] if errors else payload.get("error"), 140)
         suffix = f" (+{len(errors) - 1})" if len(errors) > 1 else ""
-        return f"[TaskPlan] 拒绝: {first or 'invalid plan'}{suffix}"
+        return f"[TaskPlan] Rejected: {first or 'invalid plan'}{suffix}"
 
     def _format_record_extraction(self, payload: Dict[str, Any]) -> str:
         name = payload.get("name") or "-"
@@ -712,7 +723,7 @@ class ConsoleProgressReporter:
         warnings = payload.get("schemaWarnings")
         warning_count = len(warnings) if isinstance(warnings, list) else 0
         suffix = f", warnings={warning_count}" if warning_count else ""
-        return f"[Artifact] {name} 写入 {row_count if row_count is not None else '?'} 行: {path}{suffix}"
+        return f"[Artifact] {name} wrote {row_count if row_count is not None else '?'} rows: {path}{suffix}"
 
 
     def _format_offloaded_tool_result(self, payload: Dict[str, Any]) -> str:
@@ -725,7 +736,7 @@ class ConsoleProgressReporter:
             else "?"
         )
         return (
-            f"[ToolResult] {tool} 结果已 offload: {size} bytes -> "
+            f"[ToolResult] {tool} Result offloaded: {size} bytes -> "
             f"{self._short_path(payload.get('relativePath') or payload.get('savedPath'))}"
         )
 
@@ -737,50 +748,117 @@ def _skill_catalog_for_runtime(runtime: Any):
         Path(__file__).resolve().parent / "skills",
         resolve_sqlite_path(runtime.harness.storage_sqlite_path,
                             runtime.harness.worktree_dir),
+        worktree_dir=Path(runtime.harness.worktree_dir),
     )
 
 
-def _selected_skill_version(runtime: Any, skill_id: str) -> str:
+def _selected_skill_binding(runtime: Any, reference: str) -> "tuple[str, str]":
     from harness.skill_builder.catalog import inspect_skill
+    from harness.skill_builder.references import SkillReferences
+    if reference.startswith("@"):
+        raise ValueError("Select a Skill by its name or Skill ID; use /resume for a task ID")
     catalog = _skill_catalog_for_runtime(runtime)
     try:
         catalog.sync_existing()
-        row = catalog.get(skill_id)
-        if row is None or row["deleted"]:
-            raise ValueError(f"未知 Skill: {skill_id}")
+        row = SkillReferences(catalog, Path(runtime.harness.worktree_dir)).published(reference)
+        skill_id = row["skill_id"]
         content_hash = str(row["current_hash"])
         try:
             current_hash = inspect_skill(catalog.root / skill_id)["hash"]
         except Exception as exc:
-            raise ValueError(f"Skill {skill_id} 的正式文件不可读取: {exc}") from exc
+            raise ValueError(f"Skill {skill_id} published files cannot be read: {exc}") from exc
         if current_hash != content_hash:
-            raise ValueError(f"Skill {skill_id} 的正式文件与索引不一致")
-        if catalog.version_path(skill_id, content_hash) is None:
-            raise ValueError(f"Skill {skill_id} 的版本快照不可用")
-        return content_hash
+            raise ValueError(f"Skill {skill_id} published files do not match the index")
+        if catalog.source_path(skill_id, content_hash) is None:
+            raise ValueError(f"Skill {skill_id} published source is unavailable")
+        return skill_id, content_hash
     finally:
         catalog.close()
 
 
 def _available_skill_lines(config_path: str = "config.json") -> List[str]:
+    runtime = load_runtime_config(config_path)
+    catalog = _skill_catalog_for_runtime(runtime)
     try:
-        from runtime_config import load_runtime_config
-        catalog = _skill_catalog_for_runtime(load_runtime_config(config_path))
-        try:
-            catalog.sync_existing()
-            return [_skill_listing(item) for item in catalog.list()]
-        finally:
-            catalog.close()
-    except Exception:
-        return []
+        catalog.sync_existing()
+        return _skill_inventory_lines(catalog.list())
+    finally:
+        catalog.close()
+
+
+def _validate_resume_skill(runtime: Any, reference: str, saved_skill: str) -> None:
+    """Resolve the requested identity without replacing the saved version."""
+    if not reference or reference == saved_skill:
+        return
+    from harness.skill_builder.references import SkillReferences
+    catalog = _skill_catalog_for_runtime(runtime)
+    try:
+        catalog.sync_existing()
+        selected = SkillReferences(catalog, Path(runtime.harness.worktree_dir)).published(reference)
+        if selected["skill_id"] != saved_skill:
+            raise ResumeStateError("Cannot change the selected Skill when resuming a task")
+    finally:
+        catalog.close()
 
 
 def _skill_listing(row: Dict[str, Any]) -> str:
     metadata = json.loads(row.get("metadata_json") or "{}")
-    description = str(metadata.get("description") or "").strip().replace("\n", " ")
-    suffix = f" — {description[:120]}" if description else ""
-    return (f"{row['skill_id']} @{row['current_hash']}"
-            f" (version {row['current_version']}){suffix}")
+    return (f"Name: {metadata.get('name') or row['skill_id']} | Skill ID: {row['skill_id']}"
+            f" | Version: {row['current_version']}\n  Run: /{row['skill_id']} [@Fleet-ID] [task]")
+
+
+def _available_draft_lines(config_path: str = "config.json", reference: Optional[str] = None) -> List[str]:
+    from harness.skill_builder.references import SkillReferences
+    runtime = load_runtime_config(config_path)
+    catalog = _skill_catalog_for_runtime(runtime)
+    try:
+        catalog.sync_existing()
+        drafts = SkillReferences(catalog, Path(runtime.harness.worktree_dir)).drafts(reference)
+        if reference and not drafts:
+            raise ValueError(f"No Builder draft matches {reference!r}. Use /skill to list Skills and drafts.")
+        return _skill_draft_inventory_lines(drafts)
+    finally:
+        catalog.close()
+
+
+def _skill_inventory_lines(rows: List[Dict[str, Any]]) -> List[str]:
+    lines = ["Published Skills (available for execution):"]
+    lines.extend(_skill_listing(row) for row in rows)
+    if not rows:
+        lines.append("(none)")
+    return lines
+
+
+def _skill_draft_inventory_lines(drafts: List[Dict[str, Any]]) -> List[str]:
+    lines = ["Builder drafts:"]
+    if not drafts:
+        lines.append("(none)")
+    for draft in drafts:
+        lines.extend(_skill_draft_lines(draft))
+    return lines
+
+
+def _skill_draft_lines(draft: Dict[str, Any]) -> List[str]:
+    from harness.skill_builder.references import draft_skill_id
+    metadata = draft["metadata"]
+    skill_id = draft_skill_id(draft)
+    name = " ".join(str(metadata.get("name") or skill_id or "name not yet generated").split())
+    task_id = draft["builder_task_id"]
+    status = "active (build incomplete)" if draft["status"] == "active" else draft["status"]
+    lines = [f"Name: {name} | Skill ID: {skill_id or '(not assigned)'} | Draft task ID: {task_id}",
+             f"  Version: {metadata.get('version') or 'unversioned'} | Status: {status}",
+             f"  Directory: {draft.get('work_dir') or 'coding/builder'}",
+             f"  Continue: /resume {task_id} [advice]"]
+    publication = draft.get("publication") or {}
+    if publication.get("currentVersion"):
+        lines.append(f"  Published version: {publication['currentVersion']} | Publication: {publication.get('status')}")
+    if draft.get("file_error"):
+        lines.append(f"  File status: {' '.join(draft['file_error'].split())}")
+    if skill_id:
+        if draft["status"] == "finished" and not draft.get("file_error") and not draft.get("published_same_version"):
+            lines.append(f"  Publish: /skill-publish {shlex.quote(skill_id)}")
+        lines.append(f"  Delete: /skill-delete {shlex.quote(skill_id)}")
+    return lines
 
 
 _CJK_BOUNDARY_RE = re.compile(r"[　-〿㐀-鿿豈-﫿！-～]")
@@ -838,49 +916,97 @@ def _run_coro_blocking(coro: Any) -> Any:
 
 def _handle_skill_builder_command(line: str, *, config_path: str = "config.json") -> int:
     if sys.version_info < (3, 12):
-        print("Skill Builder 需要 Python 3.12+；当前解释器: " + sys.version.split()[0],
+        print("Skill Builder requires Python 3.12+; current interpreter: " + sys.version.split()[0],
               flush=True)
         return 2
     from harness.skill_builder.commands import execute
     try:
-        return execute(line, config_path=config_path, run_blocking=_run_coro_blocking)
+        return execute(line, config_path=config_path, run_blocking=_run_coro_blocking, skill_mode=True)
     except Exception as exc:
-        print(f"Skill Builder 无法完成: {type(exc).__name__}: {exc}", flush=True)
+        print(f"Skill Builder failed: {type(exc).__name__}: {exc}", flush=True)
         return 1
 
 
-def _handle_skill_command(line: str, args: argparse.Namespace) -> str:
-    """Process a `/skill ...` line typed at the task prompt. Mutates args.skill
-    and returns any inline task text after the id (empty -> caller re-prompts)."""
-    tokens = line.split()
-    arg = tokens[1] if len(tokens) > 1 else ""
-    inline_task = " ".join(tokens[2:]).strip()
-    from runtime_config import load_runtime_config
+def _handle_skill_command(line: str, args: argparse.Namespace, *, strict: bool = False) -> str:
+    """Enter Skill mode and show inventory; selection uses /<Skill>."""
+    if line.strip() != "/skill":
+        message = "Usage: /skill to enter and list; /<Skill-name-or-ID> [@Fleet-ID] [task] to select or execute"
+        if strict:
+            raise ValueError(message)
+        print(message)
+        return ""
     runtime = load_runtime_config(getattr(args, "config", "config.json"))
     catalog = _skill_catalog_for_runtime(runtime)
     try:
         catalog.sync_existing()
-        rows = catalog.list()
+        print("\n".join(_skill_inventory_lines(catalog.list())))
+        drafts = catalog.list_drafts(Path(runtime.harness.worktree_dir))
+        if drafts:
+            print("Builder drafts:")
+            for draft in drafts:
+                print("\n".join(_skill_draft_lines(draft)))
     finally:
         catalog.close()
-    ids = [row["skill_id"] for row in rows]
-    if not arg or arg in ("list", "ls", "?"):
-        print("可用技能:", "\n".join(_skill_listing(row) for row in rows) or "(无)")
-        if args.skill:
-            print(f"当前已选: {args.skill}")
-        print("用法: /skill <确切Skill名> 选取；/skill off 取消；"
-              "/skill-create @<task_id> 需求；/<某个Skill名> @<task_id> 修复建议")
+    args.agent_mode = "skill"
+    if getattr(args, "skill", ""):
+        print(f"Selected: {args.skill}")
+    print("Usage: /<Skill> [@Fleet-ID] [task]; /skill-create [Skill-name-or-ID] @<task-id> [request]; "
+          "/skill-publish <name-or-ID>; /skill-delete <name-or-ID>; /resume <task-id> [instruction]")
+    print("Switch mode: /browser or /workflow")
+    return ""
+
+
+def _handle_skill_run_command(line: str, args: argparse.Namespace) -> str:
+    from harness.skill_builder.commands import split_command
+    from harness.skill_builder.references import SkillReferences
+    name, task = split_command(line)
+    reference = name[1:]
+    if reference.startswith("@"):
+        raise ValueError("Select a Skill by its name or Skill ID")
+    fleet, error = extract_fleet_reference(task)
+    if error:
+        raise ValueError(error)
+    if task.startswith("--repair"):
+        raise ValueError("Use /resume <builder-task-id> [advice] to continue a draft")
+    runtime = load_runtime_config(getattr(args, "config", "config.json"))
+    catalog = _skill_catalog_for_runtime(runtime)
+    try:
+        catalog.sync_existing()
+        selected = SkillReferences(catalog, Path(runtime.harness.worktree_dir)).published(reference)
+    finally:
+        catalog.close()
+    args.skill = selected["skill_id"]
+    args.agent_mode = "skill"
+    print(f"Selected Skill: {args.skill} (version {selected['current_version']}; "
+          f"content hash {selected['current_hash']}; bound when the task starts)")
+    # A Fleet-only command selects the Skill; the next line supplies the goal.
+    if fleet and task.lower() == "@" + fleet:
+        args.skill_fleet_reference = "@" + fleet
         return ""
-    if arg in ("off", "none", "clear", "-"):
-        args.skill = ""
-        print("已取消技能强制。")
-        return inline_task
-    if arg not in ids:
-        print(f"未知 Skill {arg!r}。可用: {', '.join(ids) or '(无)'}")
-        return ""
-    args.skill = arg
-    print(f"已选 Skill: {arg}（执行时绑定当前版本）")
-    return inline_task
+    args.skill_fleet_reference = ""
+    return task
+
+
+def _dispatch_skill_command(line: str, args: argparse.Namespace) -> "tuple[int, str]":
+    from harness.skill_builder.commands import command_kind
+    kind = command_kind(line)
+    if kind == "builder":
+        return _handle_skill_builder_command(line, config_path=getattr(args, "config", "config.json")), ""
+    try:
+        if kind == "skill":
+            return 0, _handle_skill_command(line, args, strict=True)
+        if kind == "skill-run":
+            return 0, _handle_skill_run_command(line, args)
+        if kind == "removed":
+            raise ValueError("This command was removed. Use /skill to list; /resume <task-id> "
+                             "to continue a draft; /skill-create @<task-id> to create; "
+                             "/skill-create <Skill-name-or-ID> @<task-id> [request] to update from evidence.")
+        if kind == "invalid":
+            raise ValueError("Invalid command quoting")
+    except Exception as exc:
+        print(f"Skill command failed: {type(exc).__name__}: {exc}", flush=True)
+        return CLI_INPUT_ERROR_EXIT_CODE, ""
+    return 0, ""
 
 
 def _handle_agent_mode_command(line: str, args: argparse.Namespace) -> bool:
@@ -890,21 +1016,28 @@ def _handle_agent_mode_command(line: str, args: argparse.Namespace) -> bool:
     parsed arguments only.  It never rewrites config.json, and it is accepted
     only before a task is submitted from ``read_task``.
     """
+    first = line.strip().split(maxsplit=1)
+    if not first or first[0].lower() not in _INTERACTIVE_AGENT_MODES:
+        return False
     try:
         tokens = shlex.split(line)
     except ValueError as exc:
-        print(f"模式命令参数错误: {exc}")
-        return line.lstrip().startswith(("/browser"))
+        print(f"Invalid mode command arguments: {exc}")
+        return line.lstrip().startswith(("/browser", "/workflow"))
     if not tokens or tokens[0].lower() not in _INTERACTIVE_AGENT_MODES:
         return False
-    if len(tokens) != 1:
-        print("用法: /browser；模式命令不能携带任务文本。")
+    if len(tokens) != 1 and tokens[0].lower() != "/workflow":
+        print("Usage: /browser; submit the task after choosing a mode. /workflow [task] starts Workflow development.")
         return True
     agent_mode = _INTERACTIVE_AGENT_MODES[tokens[0].lower()]
     args.agent_mode = agent_mode
+    # A prior Skill selection must not silently override a later mode choice.
+    args.skill = ""
+    args.skill_fleet_reference = ""
+    args.workflow_task = first[1] if agent_mode == "workflow" and len(first) > 1 else ""
     print(
-        f"已选择 {agent_mode}：{_AGENT_MODE_LABELS[agent_mode]}。"
-        "请继续输入任务；可用 /skill 或 /resume。"
+        f"Selected {agent_mode}: {_AGENT_MODE_LABELS[agent_mode]}. "
+        "Enter a task, or use /skill or /resume."
     )
     return True
 
@@ -926,38 +1059,46 @@ def read_task(args: argparse.Namespace) -> str:
         selected_mode = ""
     if not selected_mode:
         print(
-            "请选择模式：/browser（直达单个 BrowserAgent）。"
+            "Choose a mode: /browser (direct BrowserAgent execution), "
+            "/workflow (develop reusable programs), or /skill (Skill orchestration and commands)."
         )
-        print(f"当前配置默认：{configured_mode}；请选择后再输入任务。")
+        print(f"Configured default: {configured_mode}; choose a mode before entering a task.")
     while True:
-        prompt = (
-            f"[{selected_mode}] 请输入浏览器任务（/resume <任务目录> [补充指令]；"
-            "可先用 /skill <确切名称> 指定技能，/skill 列出；"
-            "/skill-create @<task_id> 创建，/<确切Skill名> @<task_id> 修复）: "
-            if selected_mode
-            else "模式未选择> "
-        )
+        prompt = f"[{selected_mode}]> " if selected_mode else "Choose mode> "
         line = input(prompt).strip()
-        from harness.skill_builder.commands import recognizes as is_builder_command
-        if is_builder_command(line, config_path=getattr(args, "config", "config.json")):
-            _handle_skill_builder_command(line, config_path=getattr(args, "config", "config.json"))
+        from harness.skill_builder.commands import command_kind
+        kind = command_kind(line)
+        if kind in {"builder", "removed", "invalid"}:
+            args.agent_mode = selected_mode = "skill"
+            _dispatch_skill_command(line, args)
             continue
         if _handle_agent_mode_command(line, args):
             selected_mode = str(getattr(args, "agent_mode", "") or "").strip().lower()
+            if getattr(args, "workflow_task", ""):
+                return args.workflow_task
             continue
-        if not selected_mode:
-            print("请先输入 /browser 选择本次编排模式。")
-            continue
-        if line.startswith("/skill"):
-            inline_task = _handle_skill_command(line, args)
+        if kind in {"skill", "skill-run"}:
+            _, inline_task = _dispatch_skill_command(line, args)
+            selected_mode = str(getattr(args, "agent_mode", "") or "")
             if inline_task:
                 return inline_task
+            continue
+        if not selected_mode:
+            print("Choose /browser, /workflow or /skill before submitting a task.")
             continue
         if line == "/resume" or line.startswith("/resume "):
             resumed = _handle_resume_command(line, args)
             if resumed is not None:
                 return resumed
             continue
+        fleet_reference = str(getattr(args, "skill_fleet_reference", "") or "")
+        if selected_mode == "skill" and fleet_reference and line:
+            fleet, error = extract_fleet_reference(line)
+            if error:
+                print(error)
+                continue
+            args.skill_fleet_reference = ""
+            return line if fleet else f"{fleet_reference} {line}"
         return line
 
 
@@ -968,16 +1109,27 @@ def _handle_resume_command(
     """Parse an interactive phase-level resume request without touching disk."""
 
     try:
+        from harness.skill_builder.commands import split_command
+        command, tail = split_command(line)
+        reference, instruction = split_command(tail)
+        if command == "/resume" and re.fullmatch(r"@?[0-9a-fA-F]{32}", reference):
+            args.resume = reference
+            args.resume_instruction = instruction
+            args.skill = ""
+            args.skill_fleet_reference = ""
+            return instruction
         tokens = shlex.split(line)
     except ValueError as exc:
-        print(f"/resume 参数错误: {exc}")
+        print(f"Invalid /resume arguments: {exc}")
         return None
     if len(tokens) < 2:
-        print("用法: /resume <worktree任务目录> [补充指令]")
+        print("Usage: /resume <task-id> [instruction]")
         return None
     path, rest = _recover_task_path(tokens[1:])
     args.resume = path
     args.resume_instruction = " ".join(rest).strip()
+    args.skill = ""
+    args.skill_fleet_reference = ""
     return args.resume_instruction
 
 
@@ -1007,24 +1159,26 @@ def _validate_resume_mode(manifest: Optional[JsonDict], plan: JsonDict, selected
             )
     if selected != original:
         raise ResumeStateError(
-            f"该任务使用 /{original} 模式；请切换到 /{original} 后恢复，不能在 /{selected} 中恢复。"
+            f"This task uses /{original}; switch to /{original} before resuming from /{selected}."
         )
     return original
 
 
 def _resolve_resume_directory(raw_path: str) -> Path:
-    """Resolve a registered DB task or existing directory without creating it."""
+    """Resolve a full task ID (optionally @-prefixed) or a legacy task path."""
 
     raw = str(raw_path or "").strip()
     if not raw:
-        raise ValueError("缺少 worktree 任务目录")
-    candidate = Path(raw).expanduser()
-    candidates = [candidate]
-    if not candidate.is_absolute():
-        candidates.append(Path(__file__).resolve().parent / candidate)
-        if re.fullmatch(r"[0-9a-fA-F]{32}", raw):
-            root = resume_worktree_dir() or Path(__file__).resolve().parent / "worktree"
-            candidates.insert(0, root / raw.lower())
+        raise ValueError("Missing task ID")
+    identifier = raw.removeprefix("@")
+    if re.fullmatch(r"[0-9a-fA-F]{32}", identifier):
+        root = resume_worktree_dir() or Path(__file__).resolve().parent / "worktree"
+        candidates = [root / identifier.lower()]
+    else:
+        candidate = Path(raw).expanduser()
+        candidates = [candidate]
+        if not candidate.is_absolute():
+            candidates.append(Path(__file__).resolve().parent / candidate)
     for item in candidates:
         try:
             resolved = item.resolve(strict=False)
@@ -1035,8 +1189,8 @@ def _resolve_resume_directory(raw_path: str) -> Path:
         if not resolved.exists() and database_has_task(resolved):
             return resolved
     raise ValueError(
-        "任务在数据库中不存在，且 worktree 目录不存在或已被删除；"
-        "无法恢复，也不会自动重建空任务目录"
+        "Task is absent from the database and its worktree directory is missing or deleted; "
+        "cannot resume or recreate an empty task directory"
     )
 
 
@@ -1187,7 +1341,7 @@ def _run_log_location(logger, runtime) -> str:
     if db_authoritative_for(logger):
         database = resolve_sqlite_path(
             runtime.harness.storage_sqlite_path, runtime.harness.worktree_dir)
-        return f"SQLite {database}（任务 {logger.task_id}）"
+        return f"SQLite {database}(task {logger.task_id})"
     return str(logger.path)
 
 
@@ -1811,30 +1965,30 @@ def _confirm_interrupted_replay(
         return True
     joined = ", ".join(phase_ids)
     warning = (
-        f"phase [{joined}] 上次运行中断，或因等待人工处理而结束。"
-        "Worker 的 step/messages 不会恢复；继续将从 phase 开头重跑，"
-        "而上次操作可能已产生外部副作用。"
+        f"Phases [{joined}] were interrupted or stopped for human input in the previous run. "
+        "Worker steps/messages are not restored; these phases will restart from the beginning. "
+        "Previous operations may already have external effects."
     )
     print(warning, flush=True)
     if not sys.stdin.isatty():
         print(
-            "非交互模式默认拒绝重放；确认后请加 "
-            "--resume-retry-interrupted。",
+            "Replay is denied in non-interactive mode; after reviewing, pass "
+            "--resume-retry-interrupted. ",
             flush=True,
         )
         return False
-    answer = input("是否允许完整重跑这些 phase？ [y/N]: ").strip().lower()
+    answer = input("Allow these phases to restart from the beginning? [y/N]: ").strip().lower()
     return answer in {"y", "yes"}
 
 
 _BROWSER_MODE_STATUS_LABELS = {
-    "done": "任务完成",
-    "completed": "任务完成",
-    "validated_done": "任务完成（已验证）",
-    "partial": "部分完成",
-    "incomplete": "未完成",
-    "failed": "失败",
-    "cancelled": "已取消",
+    "done": "completed",
+    "completed": "completed",
+    "validated_done": "completed (validated)",
+    "partial": "partially completed",
+    "incomplete": "incomplete",
+    "failed": "failed",
+    "cancelled": "cancelled",
 }
 
 
@@ -1850,14 +2004,14 @@ def _print_browser_mode_summary(result: JsonDict, task_dir: str, *, logger=None)
     if not isinstance(result, dict):
         return
     status = str(result.get("status") or "").strip().lower()
-    label = _BROWSER_MODE_STATUS_LABELS.get(status, f"状态 {status or 'unknown'}")
+    label = _BROWSER_MODE_STATUS_LABELS.get(status, f"status {status or 'unknown'}")
     worker_status = ""
     direct_exec = result.get("directExecution")
     if isinstance(direct_exec, dict):
         worker_status = str(direct_exec.get("workerStatus") or "").strip()
-    header = f"Browser 模式任务结果: {label}"
+    header = f"Browser task result: {label}"
     if worker_status and worker_status not in {status, "done"}:
-        header += f"（worker 终态: {worker_status}）"
+        header += f"(worker terminal status: {worker_status})"
     print(f"\n══ {header} ══", flush=True)
     answer = str(result.get("answer") or "").strip()
     if answer:
@@ -1868,18 +2022,18 @@ def _print_browser_mode_summary(result: JsonDict, task_dir: str, *, logger=None)
         if isinstance(parsed, dict) and (parsed.get("blockers") or parsed.get("next_steps")):
             # The synthesized fallback receipt: unwrap its human fields
             # instead of printing one escaped JSON line.
-            for key, label in (("blockers", "阻塞"), ("next_steps", "下一步")):
+            for key, label in (("blockers", "Blockers"), ("next_steps", "Next steps")):
                 items = parsed.get(key) or []
                 for item in items[:4]:
                     if isinstance(item, dict):
-                        item = item.get("detail") or item.get("reason") or item.get("message") or item.get("type") or "见完整回执"
+                        item = item.get("detail") or item.get("reason") or item.get("message") or item.get("type") or "See full receipt"
                     print(f"{label}: {str(item)[:400]}", flush=True)
                 if len(items) > 4:
-                    print(f"其余 {len(items) - 4} 项见完整回执。", flush=True)
+                    print(f"{len(items) - 4} more items in the full receipt.", flush=True)
         elif isinstance(parsed, dict) and parsed.get("evidence"):
             for path in parsed.get("evidence") or []:
                 if isinstance(path, str) and (path.startswith(("/", "https://", "http://"))):
-                    print(f"产物: {path}", flush=True)
+                    print(f"Artifact: {path}", flush=True)
         elif isinstance(parsed, dict):
             if parsed.get("summary"):
                 print(str(parsed["summary"]), flush=True)
@@ -1888,18 +2042,23 @@ def _print_browser_mode_summary(result: JsonDict, task_dir: str, *, logger=None)
     delivery = result.get("artifactDelivery")
     if isinstance(delivery, dict) and delivery.get("status") == "failed":
         print(
-            "产物导出失败：有提取文件路径无法直接打开；"
-            "数据仍保存在任务数据库中。"
-            f" 原因：{delivery.get('error')}",
+            "Artifact export failed: some extracted paths cannot be opened directly; "
+            "data remains in the task database."
+            f" Reason: {delivery.get('error')}",
             flush=True,
         )
     error = result.get("error")
     reason = error.get("message") if isinstance(error, dict) else error
     reason = str(reason or result.get("reason") or "").strip()
+    recovery = result.get("connectionRecovery")
+    if not reason and isinstance(recovery, dict) and recovery.get("status") == "blocked":
+        reason = str(recovery.get("reasonCode") or recovery.get("reason") or "Transport recovery probe failed")
+        if recovery.get("probeStage"):
+            reason += f" (probe stage: {recovery['probeStage']})"
     if reason:
         # A worker may return an answer alongside a failure. Show both instead
         # of hiding the failure reason inside the following machine receipt.
-        print(f"原因: {reason}", flush=True)
+        print(f"Reason: {reason}", flush=True)
         for item in result.get("errors") or []:
             print(f"  · {item}", flush=True)
         review = result.get("review")
@@ -1909,9 +2068,9 @@ def _print_browser_mode_summary(result: JsonDict, task_dir: str, *, logger=None)
                 if isinstance(finding, dict) and finding.get("blocking"):
                     print(f"  · {finding.get('reason') or finding}", flush=True)
         if isinstance(review, dict) and review.get("auditPath"):
-                print(f"审核记录: {review['auditPath']}", flush=True)
+                print(f"Review audit: {review['auditPath']}", flush=True)
     if result.get("receiptPath"):
-        print(f"完整回执: {result['receiptPath']}", flush=True)
+        print(f"Full receipt: {result['receiptPath']}", flush=True)
     if status in {"done", "completed", "validated_done"}:
         return
     # Resume reads task_plan.json. A run that died before a plan was accepted
@@ -1924,14 +2083,14 @@ def _print_browser_mode_summary(result: JsonDict, task_dir: str, *, logger=None)
                    else plan_path is not None and plan_path.is_file())
     if plan_exists:
         print(
-            "\n继续: python main.py --config config.json"
-            f"\n然后输入 /browser，再输入 /resume {task_dir}",
+            "\nContinue: python main.py --config config.json"
+            f"\nThen enter /browser, followed by /resume {getattr(logger, 'task_id', '') or Path(task_dir).name}",
             flush=True,
         )
     else:
         print(
-            "\n这次在计划生成阶段就结束了，没有可恢复的计划，/resume 用不了。"
-            "\n按上面的原因改一下任务描述再跑一次即可。",
+            "\nThis run ended during planning; no saved plan is available for /resume."
+            "\nRevise the task using the reason above, then start a new run.",
             flush=True,
         )
 
@@ -1944,7 +2103,7 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
     runtime = load_runtime_config(args.config)
     configured_mode = str(getattr(runtime.harness, "agent_mode", "browser") or "browser").strip().lower()
     if configured_mode not in _AGENT_MODE_LABELS:
-        print("config.json 中 harness.agent_mode 必须是 browser。")
+        print("config.json harness.agent_mode must be browser, skill or workflow.")
         return CLI_INPUT_ERROR_EXIT_CODE
     args.configured_agent_mode = configured_mode
     # Resume helpers run before a logger exists; hand them the configuration
@@ -1956,42 +2115,81 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
     )
     if args.agent_id:
         runtime.agent_id = args.agent_id
-    if args.max_steps:
-        runtime.harness.max_steps = args.max_steps
-        runtime.harness.worker_max_steps = args.max_steps
+    if args.max_steps is not None:
+        print("--max-steps is deprecated and ignored; Workflow/Skill sessions have no model-turn cap.")
     task = read_task(args)
     requested_mode = str(getattr(args, "agent_mode", "") or "").strip().lower()
     if requested_mode:
         if requested_mode not in _AGENT_MODE_LABELS:
-            print("交互模式必须是 /browser。")
+            print("Interactive mode must be /browser, /workflow or /skill.")
             return CLI_INPUT_ERROR_EXIT_CODE
         runtime.harness.agent_mode = requested_mode
     agent_mode = str(getattr(runtime.harness, "agent_mode", "browser") or "browser").strip().lower()
     resume_requested = bool(str(getattr(args, "resume", "") or "").strip())
     if not task and not resume_requested:
-        print("没有收到任务。")
+        print("No task received.")
         return 2
-    from harness.skill_builder.commands import recognizes as is_builder_command
-    if is_builder_command(task, config_path=args.config):
-        return _handle_skill_builder_command(task, config_path=args.config)
+    selection_bound = bool(str(getattr(args, "skill", "") or "").strip())
+    if not resume_requested and not selection_bound and task.strip().split(maxsplit=1)[:1] == ["/workflow"]:
+        _handle_agent_mode_command(task, args)
+        task = getattr(args, "workflow_task", "")
+        if not task:
+            return 0
+    from harness.skill_builder.commands import command_kind
+    if not resume_requested and not selection_bound and command_kind(task) is not None:
+        command_code, task = _dispatch_skill_command(task, args)
+        if command_code or not task:
+            return command_code
+    # Explicit Skill commands choose a peer mode even when typed at another prompt.
+    agent_mode = str(getattr(args, "agent_mode", "") or agent_mode)
+    if str(getattr(args, "skill", "") or "") and not resume_requested:
+        agent_mode = "skill"
+    runtime.harness.agent_mode = agent_mode
     # Explicit selection binds one immutable Skill version for this task.
     forced_skill = str(getattr(args, "skill", "") or "").strip()
     if forced_skill and not resume_requested:
         try:
-            forced_hash = _selected_skill_version(runtime, forced_skill)
+            forced_skill, forced_hash = _selected_skill_binding(runtime, forced_skill)
+            args.skill = forced_skill
         except ValueError as exc:
             print(str(exc), flush=True)
             return CLI_INPUT_ERROR_EXIT_CODE
         runtime.harness.forced_skill_id = forced_skill
         runtime.harness.forced_skill_hash = forced_hash
-        print(f"已选 Skill: {forced_skill}@{forced_hash[:12]}", flush=True)
+        print(f"Selected Skill: {forced_skill}@{forced_hash[:12]}", flush=True)
 
     if resume_requested:
-        resume_manifest = load_task_manifest(_resolve_resume_directory(args.resume))
-        recorded_mode = str(((resume_manifest or {}).get("startup_args") or {}).get("agent_mode") or "").strip().lower()
+        directory = _resolve_resume_directory(args.resume)
+        runtime.harness.worktree_dir = str(directory.parent)
+        configure_resume_storage(backend=runtime.harness.storage_backend,
+                                 worktree_dir=runtime.harness.worktree_dir,
+                                 sqlite_path=runtime.harness.storage_sqlite_path)
+        from harness.skill_builder.commands import builder_resume_record, resume_builder
+        builder_record = builder_resume_record(runtime, directory.name)
+        if builder_record is not None:
+            if sys.version_info < (3, 12):
+                print("Skill Builder requires Python 3.12+.", flush=True)
+                return CLI_INPUT_ERROR_EXIT_CODE
+            from harness.runtime.session_output import result as print_result
+            builder_result = await resume_builder(runtime, builder_record, task)
+            print_result("Skill Builder", builder_result)
+            return 0 if builder_result.get("status") == "draft_saved" else 1
+        resume_manifest = load_task_manifest(directory)
+        recorded_mode = str(
+            ((resume_manifest or {}).get("startup_args") or {}).get("agent_mode") or ""
+        ).strip().lower()
         if recorded_mode and recorded_mode not in _AGENT_MODE_LABELS:
-            print(f"Saved task mode '{recorded_mode}' is no longer supported; this task cannot be resumed. Its saved records remain available.")
+            print(
+                f"Saved task mode '{recorded_mode}' is no longer supported; this task cannot be resumed. "
+                "Its saved records remain available. Start a new task in a supported mode."
+            )
             return CLI_INPUT_ERROR_EXIT_CODE
+        if recorded_mode in _AGENT_MODE_LABELS:
+            args.agent_mode = recorded_mode
+            agent_mode = runtime.harness.agent_mode = recorded_mode
+    if agent_mode in {"skill", "workflow"}:
+        from harness.skill_runtime.cli import run_skill_cli
+        return await run_skill_cli(runtime, args, task, host=sys.modules[__name__])
 
     logger: Optional[RunLogger] = None
     harness: Optional[BrowserTaskRunner] = None
@@ -2025,15 +2223,14 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                     runtime.harness.worktree_dir = str(task_dir.parent)
                     saved_skill = str(manifest.get("forced_skill_id") or "")
                     saved_hash = str((manifest.get("startup_args") or {}).get("forced_skill_hash") or "")
-                    if forced_skill and forced_skill != saved_skill:
-                        raise ResumeStateError("恢复任务不能改选 Skill")
+                    _validate_resume_skill(runtime, forced_skill, saved_skill)
                     if saved_skill:
                         if not saved_hash:
-                            raise ResumeStateError("旧任务未绑定 Skill 版本，无法安全恢复")
+                            raise ResumeStateError("Legacy task has no bound Skill version; cannot resume safely")
                         catalog = _skill_catalog_for_runtime(runtime)
                         try:
-                            if catalog.version_path(saved_skill, saved_hash) is None:
-                                raise ResumeStateError("恢复任务的 Skill 版本快照不可用")
+                            if catalog.source_path(saved_skill, saved_hash, task_id=task_dir.name) is None:
+                                raise ResumeStateError("The resumed task Skill snapshot is unavailable")
                         finally:
                             catalog.close()
                         runtime.harness.forced_skill_id = saved_skill
@@ -2053,22 +2250,22 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                     ).strip()
                     if not original_user_task:
                         raise ResumeStateError(
-                            "task_manifest.json 缺少 original_user_task"
+                            "task_manifest.json is missing original_user_task"
                         )
                 else:
                     original_user_task = recover_legacy_user_task(task_dir)
                     if not original_user_task and sys.stdin.isatty():
                         print(
-                            "这是旧版 worktree，未找到可恢复的原始用户任务。",
+                            "Legacy worktree: the original task could not be recovered.",
                             flush=True,
                         )
                         original_user_task = input(
-                            "请完整重述原始任务（不是本次新指令）: "
+                            "Restate the complete original task: "
                         ).strip()
                     if not original_user_task:
                         raise ResumeStateError(
-                            "旧 worktree 无 manifest，也无法从历史 context "
-                            "恢复原始任务；请在交互模式下重述原始任务"
+                            "Legacy worktree has no manifest and its historical context "
+                            "cannot recover the original task; restate it in interactive mode"
                         )
 
                 if str(task or "").strip():
@@ -2084,8 +2281,8 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                         )
                     ):
                         raise ResumeStateError(
-                            "补充指令不能将已恢复任务改绑到其他 @Fleet；"
-                            "请沿用原任务的 Fleet 或创建新任务"
+                            "Additional instructions cannot rebind a resumed task to another @Fleet; "
+                            "use the original Fleet or create a new task"
                         )
 
                 initial_plan, initial_plan_recovered = _load_initial_plan(
@@ -2247,7 +2444,7 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                 )
             except (ResumeStateError, RunLockError, ValueError, OSError) as exc:
                 run_status = "failed"
-                print(f"无法恢复任务: {exc}", flush=True)
+                print(f"Cannot resume task: {exc}", flush=True)
                 return 2
         else:
             logger = _create_task_logger(runtime)
@@ -2271,7 +2468,7 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
             runtime.harness.runs_dir = str(logger.task_dir)
 
         if logger is None:  # defensive; both setup branches assign it
-            print("无法初始化任务日志。", flush=True)
+            print("Cannot initialize task logging.", flush=True)
             return 2
         _LAST_LOGGER = logger
         route_task = (
@@ -2287,14 +2484,14 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                 "error": fleet_reference_error,
                 "source": "original_user_task",
             })
-            print(f"Fleet 引用错误: {fleet_reference_error}", flush=True)
+            print(f"Invalid Fleet reference: {fleet_reference_error}", flush=True)
             return CLI_INPUT_ERROR_EXIT_CODE
         if task_fleet_reference and not bool(
             getattr(runtime.harness, "fleet_reuse_enabled", True)
         ):
             message = (
-                "任务使用了 @Fleet 引用，但 harness.fleet_reuse_enabled=false，"
-                "无法绑定已有 Fleet。"
+                "The task references @Fleet but harness.fleet_reuse_enabled=false; "
+                "cannot bind an existing Fleet."
             )
             logger.write("task.fleet_reference.rejected", {
                 "fleetReference": task_fleet_reference,
@@ -2328,21 +2525,21 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                 for item in resume_context.report.get("hitlReactivatedPhases") or []
                 if str(item)
             ]
-            print(f"任务已恢复: {logger.task_id}", flush=True)
+            print(f"Task resumed: {logger.task_id}", flush=True)
             print(
-                f"恢复摘要: 保留 {kept} 个已验证 phase；"
-                f"待继续/重试 {len(pending_ids)} 个: "
-                f"{', '.join(pending_ids) or '(无)'}；"
-                f"其中因中断/产物失效重置 {len(reset)} 个: "
-                f"{', '.join(map(str, reset)) or '(无)'}",
+                f"Resume summary: retained {kept} validated phases; "
+                f"{len(pending_ids)} phases to continue/retry: "
+                f"{', '.join(pending_ids) or '(none)'}; "
+                f"{len(reset)} phases reset after interruption or invalid artifacts: "
+                f"{', '.join(map(str, reset)) or '(none)'}",
                 flush=True,
             )
             if hitl_reactivated:
                 print(
-                    f"已重新开放 {len(hitl_reactivated)} 个人工中断"
-                    f"（HITL/本地文件授权）phase: "
-                    f"{', '.join(hitl_reactivated)}；执行到相关操作时会在终端"
-                    "重新请求确认。",
+                    f"Reactivated {len(hitl_reactivated)} human-interrupted "
+                    f"(HITL/local file authorization) phases: "
+                    f"{', '.join(hitl_reactivated)}; the relevant operations will request "
+                    "approval again in the terminal.",
                     flush=True,
                 )
                 interventions = resume_context.report.get(
@@ -2357,32 +2554,32 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
             browser_status = resume_context.report.get("browserRecovery") or {}
             if browser_status.get("candidateRecorded"):
                 print(
-                    "浏览器恢复: 已找到历史 Fleet/Page 候选（尚未验证在线）；"
-                    "连接就绪后按会话约束探活和恢复。"
-                    "此记录不代表 WebCross Dispatcher 当前可用。",
+                    "Browser recovery: historical Fleet/Page candidates found (availability not yet verified); "
+                    "probe and restore the session once connected. "
+                    "This record does not confirm WebCross Dispatcher availability.",
                     flush=True,
                 )
             elif browser_status.get("status") == "disabled_by_config":
                 print(
-                    "浏览器恢复: fleet_reuse_enabled=false，"
-                    "不会尝试恢复原 Fleet，将从新浏览器上下文执行。",
+                    "Browser recovery: fleet_reuse_enabled=false; "
+                    "using a new browser context instead of restoring the original Fleet.",
                     flush=True,
                 )
             else:
                 print(
-                    "浏览器恢复: 无本任务专属候选，将重新分配；"
-                    "需要时会重新登录。",
+                    "Browser recovery: no task-specific candidate found; allocating a browser; "
+                    "sign in again if needed.",
                     flush=True,
                 )
         else:
-            print(f"任务已创建: {logger.task_id}", flush=True)
-        print(f"模式: {agent_mode}", flush=True)
-        print(f"任务目录: {logger.task_dir}", flush=True)
-        print(f"运行日志: {_run_log_location(logger, runtime)}", flush=True)
+            print(f"Task created: {logger.task_id}", flush=True)
+        print(f"Mode: {agent_mode}", flush=True)
+        print(f"Task directory: {logger.task_dir}", flush=True)
+        print(f"Run log: {_run_log_location(logger, runtime)}", flush=True)
         if resume_context is not None:
-            label = "带补充指令继续" if resume_context.instruction else "按原计划恢复"
-            print(f"{label}：先检查浏览器连接；连接不可用时停止，不调用模型或派发 worker。", flush=True)
-        print("Browser 模式：直接启动 BrowserAgent，执行中维护任务清单。", flush=True)
+            label = "Continue with additional instructions" if resume_context.instruction else "Resume the saved plan"
+            print(f"{label}: check the browser connection before model calls or worker dispatch.", flush=True)
+        print("Browser mode: start BrowserAgent directly and maintain the task checklist during execution.", flush=True)
 
         harness = BrowserTaskRunner(
             runtime, logger, resume=resume_context,
@@ -2428,7 +2625,7 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
         if human_output or output_mode == "auto":
             _print_browser_mode_summary(
                 {**browser_result, "receiptPath": result_resource.get("saved_path") or
-                    f"数据库任务 {logger.task_id} / artifacts/browser-result.json"},
+                    f"Database task {logger.task_id} / artifacts/browser-result.json"},
                 str(logger.task_dir or ""),
                 logger=logger,
             )
@@ -2558,11 +2755,11 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
         if not _print_text(answer):
             return CLI_IO_FAILURE_EXIT_CODE
     if logger is not None:
-        if not _print_text(f"\n任务ID: {logger.task_id}"):
+        if not _print_text(f"\nTask ID: {logger.task_id}"):
             return CLI_IO_FAILURE_EXIT_CODE
-        if not _print_text(f"\n任务目录: {logger.task_dir}"):
+        if not _print_text(f"\nTask directory: {logger.task_dir}"):
             return CLI_IO_FAILURE_EXIT_CODE
-        if not _print_text(f"\n运行日志: {_run_log_location(logger, runtime)}"):
+        if not _print_text(f"\nRun log: {_run_log_location(logger, runtime)}"):
             return CLI_IO_FAILURE_EXIT_CODE
     return exit_code
 
@@ -2593,49 +2790,86 @@ async def run_cli(args: argparse.Namespace) -> int:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="ABCP Browser Agent Harness")
     parser.add_argument("--output", choices=("auto", "text", "json"), default="auto",
-                        help="Browser 结果格式：auto 在终端显示简报，管道保留 JSON；完整回执始终保存。")
-    parser.add_argument("task", nargs="?", help="要交给浏览器 agent 完成的任务")
-    parser.add_argument("--task", dest="task_option", help="要交给浏览器 agent 完成的任务")
-    parser.add_argument("--config", default="config.json", help="配置文件路径")
-    parser.add_argument("--agent-id", help="覆盖 config.json 中的 browser.agent_id")
-    parser.add_argument("--max-steps", type=int, help="覆盖最大 agent 编排步数")
+                        help="Browser result format: auto prints a terminal summary or JSON when piped; full receipts are always saved.")
+    parser.add_argument("task", nargs="?", help="Task for the browser agent")
+    parser.add_argument("--task", dest="task_option", help="Task for the browser agent")
+    parser.add_argument("--config", default="config.json", help="Configuration file path")
+    parser.add_argument("--agent-id", help="Override config.json browser.agent_id")
+    parser.add_argument("--max-steps", type=int, help=argparse.SUPPRESS)
     parser.add_argument(
         "--resume",
         default="",
-        metavar="WORKTREE",
-        help="从已有 worktree 目录按 phase 粒度恢复任务",
+        metavar="TASK_ID",
+        help="Resume a saved task by its full task ID (optional @ prefix); legacy task paths are also accepted",
     )
     parser.add_argument(
         "--resume-retry-interrupted",
         action="store_true",
-        help="非交互模式下明确允许完整重跑上次被中断的 phase",
+        help="Allow interrupted phases to restart in non-interactive mode",
     )
     parser.add_argument(
         "--skill",
         dest="skill",
         default="",
-        help="强制本次运行使用的技能 id（等价于 harness.forced_skill_id，无需改 config）",
+        help="Select a Skill by name (unique partial names accepted) or exact Skill ID for this run",
     )
     parser.add_argument(
         "--list-skills",
         action="store_true",
-        help="列出可用技能 id 后退出",
+        help="List published Skills and exit",
     )
+    parser.add_argument("--list-skill-drafts", action="store_true",
+                        help="List saved Builder drafts and exit")
     return parser
 
 
 def _main_impl(argv: Optional[Sequence[str]] = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
-    from harness.skill_builder.commands import recognizes as is_builder_command
-    if raw_argv and is_builder_command(" ".join(shlex.quote(part) for part in raw_argv)):
-        line = " ".join(shlex.quote(part) for part in raw_argv)
-        return _handle_skill_builder_command(line)
+    if raw_argv[:1] == ["/workflow"]:
+        config_args = []
+        if "--config" in raw_argv:
+            index = raw_argv.index("--config")
+            if index + 1 >= len(raw_argv):
+                raise ValueError("--config requires a path")
+            config_args = raw_argv[index:index + 2]
+            del raw_argv[index:index + 2]
+        argv = raw_argv = [*config_args, "--task", " ".join(raw_argv)]
+    from harness.skill_builder.commands import command_kind
+    if raw_argv and command_kind(raw_argv[0]) is not None:
+        config_path = "config.json"
+        if "--config" in raw_argv:
+            index = raw_argv.index("--config")
+            if index + 1 >= len(raw_argv):
+                print("--config requires a configuration file path")
+                return CLI_INPUT_ERROR_EXIT_CODE
+            config_path = raw_argv[index + 1]
+            del raw_argv[index:index + 2]
+        raw_line = " ".join([shlex.quote(raw_argv[0]), *raw_argv[1:]])
+        line = (raw_line if command_kind(raw_line) in {"skill", "skill-run"}
+                else " ".join(shlex.quote(part) for part in raw_argv))
+        command_args = argparse.Namespace(config=config_path, skill="")
+        command_code, task = _dispatch_skill_command(line, command_args)
+        if command_code or not task:
+            return command_code
+        raw_argv = ["--config", config_path, "--skill", command_args.skill, "--task", task]
+        argv = raw_argv
     if raw_argv and raw_argv[0] == "/resume":
+        config_args = []
+        if "--config" in raw_argv:
+            index = raw_argv.index("--config")
+            if index + 1 >= len(raw_argv):
+                print("--config requires a configuration file path")
+                return CLI_INPUT_ERROR_EXIT_CODE
+            config_args = raw_argv[index:index + 2]
+            del raw_argv[index:index + 2]
         if len(raw_argv) < 2:
-            print("用法: /resume <worktree任务目录> [补充指令]")
+            print("Usage: /resume <task-id> [instruction]")
             return 2
-        path, rest = _recover_task_path(raw_argv[1:])
-        raw_argv = ["--resume", path]
+        if re.fullmatch(r"@?[0-9a-fA-F]{32}", raw_argv[1]):
+            path, rest = raw_argv[1], raw_argv[2:]
+        else:
+            path, rest = _recover_task_path(raw_argv[1:])
+        raw_argv = [*config_args, "--resume", path]
         if rest:
             raw_argv.extend(["--task", " ".join(rest)])
         argv = raw_argv
@@ -2643,7 +2877,10 @@ def _main_impl(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     if getattr(args, "list_skills", False):
-        print("可用技能:", "\n".join(_available_skill_lines(args.config)) or "(无)")
+        print("\n".join(_available_skill_lines(args.config)))
+        return 0
+    if getattr(args, "list_skill_drafts", False):
+        print("\n".join(_available_draft_lines(args.config)))
         return 0
     try:
         asyncio.get_running_loop()

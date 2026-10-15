@@ -6,7 +6,7 @@ ABCP Agent Harness connects LLM tool calling to ABCP Browser's WebSocket capabil
 
 ## Requirements
 
-- Python 3.9 or newer for Browser; Skill Builder requires Python 3.12 or newer.
+- Python 3.9 or newer for Browser; Skill mode and Builder require Python 3.12 or newer.
 - An ABCP Browser service reachable over WebSocket.
 - An OpenAI-compatible or Anthropic API key.
 
@@ -112,7 +112,6 @@ Add these common options only when needed:
     "worker_max_steps": 30,
     "max_browser_agents": 3,
     "max_task_fleets": 3,
-    "hitl_wait_timeout_seconds": 600,
     "worktree_dir": "worktree"
   }
 }
@@ -120,8 +119,12 @@ Add these common options only when needed:
 
 - `worker_max_steps`: decision rounds for a delegated Browser worker. Standalone `/browser` has no step limit.
 - `max_browser_agents` / `max_task_fleets`: concurrent workers and browser instances per task.
-- `hitl_wait_timeout_seconds`: maximum wait for human assistance.
 - `worktree_dir`: root directory for the SQLite database and deliverable files.
+
+HITL questions have no cumulative pause quota or automatic human-wait timeout.
+Answers and live guidance have no fixed character cap. Old `hitl_wait_timeout_seconds`
+and `hitl_max_pause_rounds_per_page/worker` overrides are accepted but ignored;
+Question identity, explicit attendance, cancellation and permission checks remain.
 
 Standalone `/browser` maintains a persistent TODO and triggers independent evidence
 review on checklist changes, explicit review requests and completion submissions.
@@ -150,18 +153,64 @@ python main.py --agent-id demo-agent --task "Check the current fleet list."
 ```
 
 For an interactive run, choose the orchestration entry before entering the
-task: type `/browser` for one direct BrowserAgent. The prompt confirms the choice for this run;
+task: type `/browser` for one direct BrowserAgent, `/workflow` for reusable program development,
+or `/skill` for independent Skill execution.
+The prompt confirms the choice for this run;
 it does not modify `config.json`.
+
+CLI help, progress messages and control responses are English.
+Task text and raw evidence can remain in their original language.
+
+`/skill` lists published Skills and drafts, then uses a short `[skill]>` prompt.
+Execute with `/<Skill-name-or-ID> [@Fleet-ID] [task]` or select with `--skill <name>`.
+Names allow a unique case-insensitive partial match; multiple matches display all
+names and IDs for exact selection. Its Orchestrator binds inputs and the Harness
+runs decided JS/TS Workflows, returning at judgment or recovery points. Browser
+handles bounded recovery. Recorded defects can be addressed in a Builder through
+`/resume <builder-task-id> Improve using @<execution-task-id>`. Reuse starts no
+background replay or Coding repair loop. Completion requires independent goal review.
+Shared Python/Shell execution is deferred.
+An optional `skill_orchestrator` model section overrides the default connection
+from `worker`.
+
+`/workflow [@<Fleet ID> task]` lets the main agent write and execute task-local
+files directly. The same author validates the source on an independent page with
+separate trial checkpoints. Browser can handle bounded semantic operations or
+recovery. Business delivery and program validation are reviewed separately.
+`/skill-create @<workflow-task-id> request` imports those exact source files and
+execution evidence into a Builder draft. After user publication, `/skill` reuses
+the programs with new business inputs. See the [implementation plan](docs/tau-skill-builder-agent-loop-plan.md)
+for development, recovery and verification boundaries.
+The Skill command surface is `/<Skill> [@Fleet-ID] [task]`,
+`/skill-create [Skill-name-or-ID] @<task-id> [request]`, `/skill-publish <name-or-ID>`,
+`/skill-delete <name-or-ID>` and `/resume <task-id> [instruction]`. Source and resume
+task IDs are required. `/skill-create` creates a new Skill when the name is omitted,
+and updates the named published Skill when supplied. Publish/delete resolve names identically; multiple draft or
+deletion versions require an explicit interactive selection. Content hashes and
+publication conflicts are checked internally. `/resume` restores the recorded execution mode and also continues Builder
+conversations. `/skill`, `/browser` and `/workflow` remain mode navigation.
+See the [Skill command guide](skills/README.md) for examples and ambiguity behavior.
+
+Browser, Workflow and Skill share a default 60-second automatic reconnect window
+after Dispatcher transport loss. Connection identity, event subscriptions and task
+context survive recovery. Sent calls with lost replies retain an unknown outcome;
+business actions are never replayed automatically. Workflow checkpoints preserve
+the interruption and query the original `workflowId` when available; status does
+not reconstruct missing execution output. A timeout or identity/protocol rejection
+preserves the task for `/resume <task_id>`. This window does not shorten Workflow
+execution or human HITL waiting. `browser.reconnect_timeout_seconds` accepts 0–60
+seconds (default 60; 0 disables automatic waiting).
 
 Resume a task at phase granularity, optionally adding a user instruction under
 the same task ID:
 
 ```bash
-python main.py --resume worktree/<task_id> --task "Additional instruction"
+python main.py --resume <task_id> --task "Additional instruction"
 ```
 
 At the interactive prompt, the equivalent form is
-`/resume <task-directory> [additional instruction]`; omit the instruction for recovery of the original
+`/resume <task_id> [additional instruction]`; the full ID also accepts an `@` prefix,
+and legacy task directory paths remain supported. Omit the instruction for recovery of the original
 task alone. The task manifest keeps the original request, while the amendment
 is recorded as attributed user input. Browser mode continues an open phase or
 creates a new continuation after a terminal phase without replaying its old
@@ -174,6 +223,10 @@ when the process stopped requires confirmation before it is replayed. For
 unattended use, pass `--resume-retry-interrupted` explicitly. Live Fleet/page
 handles are reused only as best-effort task-owned hints and are revalidated
 against the browser inventory; stale hints fall back to normal routing.
+When a fatal transport blocker was saved, the first browser dispatch probes the
+connection, capabilities and Fleet inventory again. A successful probe updates
+the blocker; a failed probe preserves its reason and task identity. The probe
+does not replay the interrupted browser operation.
 
 DB mode resumes from SQLite task records without requiring a physical task
 directory. Missing or malformed plan/state records fail closed and never
