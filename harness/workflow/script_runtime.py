@@ -12,6 +12,26 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 
+class ScopedWorkflowPackage(dict):
+    """Host-created capability package; this identity cannot come from JSON."""
+
+
+def page_scoped_workflow(params: dict) -> bool:
+    package = params.get("_platformWorkflow")
+    if not isinstance(package, ScopedWorkflowPackage):
+        return False
+    scope = getattr(package, "page_scope", None)
+    return bool(scope and scope == (params.get("pageId"), params.get("fleetId"), source_hash(package)))
+
+
+def execution_scope_contract() -> dict:
+    return {"page": "Every action targets the single bound page. Inventory/events do not grant new pages. Return a discovered pageId and continue in a new bound invocation.",
+            "independentTools": ["Page.create", "Page.switchTo", "Page.close", "Page.screenshot", "DOM.getImg", "Network.readApi"],
+            "files": "File.handleChooser accepts only authorized canonical paths supplied in input.",
+            "output": "Return JSON data; normalize absent error fields to null, not undefined.",
+            "recovery": "Execution failure or timeout does not undo earlier actions. Reconcile effects before replay."}
+
+
 def is_script_package(value: Any) -> bool:
     return isinstance(value, dict) and isinstance(value.get("entry"), str) and isinstance(value.get("files"), dict)
 
@@ -175,7 +195,7 @@ export function scopedApi(raw) {
   });
 }
 '''.replace("const scope = SCOPE;", "const scope = " + json.dumps(scope, ensure_ascii=False) + ";", 1)
-    result = copy.deepcopy(document)
+    result = ScopedWorkflowPackage(copy.deepcopy(document))
     result["files"][guard] = code
     result["files"][wrapper] = (
         "import {scopedApi} from " + json.dumps("./" + guard) + ";\n"
@@ -183,6 +203,7 @@ export function scopedApi(raw) {
         "export default async function guarded(raw, input) { return main(scopedApi(raw), input); }\n"
     )
     result["entry"] = wrapper
+    result.page_scope = (page_id, fleet_id, source_hash(result))
     return result, {"sourceHash": source_hash(document), "executionPackageHash": source_hash(result),
                     "scopeEntry": wrapper, "scopeModule": guard, "businessEntry": entry,
                     "sourceFiles": sorted(document["files"]), "authorizedFileCount": len(files),
