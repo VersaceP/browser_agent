@@ -2,15 +2,15 @@
 harness.observation.loop_nudge - Repetition facts from action and page fingerprints.
 
 This detector is deliberately an observer. It never blocks tool execution; it
-produces a small structured observation that BrowserAgent injects into the next
-model turn when the same action keeps repeating while the observed page
-fingerprint is not changing. It reports the repetition and the unchanged
-fingerprint; it does not prescribe what to do about them.
+produces small structured observations for stalled actions and repeated direct
+call sequences. Neither observation decides whether business work is correct
+or whether the next operation can safely run in a Workflow.
 """
 
 from __future__ import annotations
 
 import json
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Tuple
 
@@ -20,11 +20,16 @@ from harness.observation.page_fingerprint import (
     stable_hash,
 )
 from harness.utils import JsonDict
+from harness.results.call_outcome import classify_call_outcome
 
 
 ACTION_HISTORY_WINDOW = 20
 PAGE_HISTORY_WINDOW = 5
 STAGNANT_PAGE_COUNT = 3
+REPETITION_WINDOW_TURNS = 10
+REPETITION_MIN_OCCURRENCES = 3
+REPETITION_MAX_PATTERN = 4
+REPETITION_NOTICE_HISTORY = 32
 
 
 @dataclass
@@ -34,13 +39,20 @@ class ActionLoopNudge:
     pending_nudge: Optional[JsonDict] = None
     last_nudge_key: str = ""
     nudge_count: int = 0
+    repetition_window_turns: int = REPETITION_WINDOW_TURNS
+    pending_repetition_facts: Optional[JsonDict] = None
+    repetition_notice_keys: List[Tuple[str, Tuple[str, ...]]] = field(default_factory=list)
+    repetition_fact_count: int = 0
 
     def record_action(self, tool_call: JsonDict, *, step: int) -> None:
         signature, label = action_signature(tool_call)
         self.recent_actions.append({
             "step": step,
+            "toolCallId": tool_call.get("id"),
             "signature": signature,
             "label": label,
+            **_direct_call_facts(tool_call),
+            "outcome": "unknown",
         })
         if len(self.recent_actions) > ACTION_HISTORY_WINDOW:
             del self.recent_actions[: len(self.recent_actions) - ACTION_HISTORY_WINDOW]
@@ -53,6 +65,7 @@ class ActionLoopNudge:
         step: int,
         agent: Any = None,
         fingerprint: Optional[PageFingerprint] = None,
+        workflow_enabled: bool = False,
     ) -> Optional[JsonDict]:
         if fingerprint is None:
             fingerprint = page_fingerprint_from_result(tool_call, result, agent=agent)
@@ -64,6 +77,13 @@ class ActionLoopNudge:
         nudge = self._maybe_build_nudge(step)
         if nudge is not None:
             self.pending_nudge = nudge
+        if self.recent_actions:
+            action = self.recent_actions[-1]
+            if (action["step"] == step
+                    and action["toolCallId"] == tool_call.get("id")):
+                action["outcome"] = classify_call_outcome(result).verdict
+        if workflow_enabled and self.pending_repetition_facts is None:
+            self.pending_repetition_facts = self._repetition_facts(step)
         return nudge
 
     def consume_nudge(self) -> Optional[JsonDict]:
@@ -76,11 +96,97 @@ class ActionLoopNudge:
             "nudgeCount": self.nudge_count,
             "recentActionCount": len(self.recent_actions),
             "recentPageCount": len(self.recent_pages),
+            "repetitionFactCount": self.repetition_fact_count,
             "lastPageFingerprint": (
                 self.recent_pages[-1].to_log_payload()
                 if self.recent_pages else None
             ),
         }
+
+    def consume_repetition_facts(self) -> Optional[JsonDict]:
+        facts = self.pending_repetition_facts
+        self.pending_repetition_facts = None
+        return facts
+
+    def _repetition_facts(self, step: int) -> Optional[JsonDict]:
+        # Work only with model-issued calls, never Workflow internals or
+        # platform recovery traces. Unsupported tools/page changes delimit the
+        # sequence; do not manufacture adjacency by filtering them away.
+        history = []
+        for item in reversed(self.recent_actions):
+            if (item["step"] <= step - self.repetition_window_turns
+                    or not item.get("pageId") or not item.get("directCall")):
+                break
+            if history and item["pageId"] != history[-1]["pageId"]:
+                break
+            history.append(item)
+        history.reverse()
+        labels = [item["label"] for item in history]
+        for size in range(min(REPETITION_MAX_PATTERN, len(history) // REPETITION_MIN_OCCURRENCES), 0, -1):
+            pattern = labels[-size:]
+            if not any(_input_method(label) for label in pattern):
+                continue
+            # A,A,A is one repeated method, not a new three-action pattern.
+            if any(size % n == 0 and pattern == pattern[:n] * (size // n)
+                   for n in range(1, size)):
+                continue
+            if size == 1:
+                matches = [[item] for item in history if item["label"] == pattern[0]]
+            else:
+                matches = []
+                cursor = len(history)
+                while cursor >= size and labels[cursor - size:cursor] == pattern:
+                    matches.append(history[cursor - size:cursor])
+                    cursor -= size
+                matches.reverse()
+            if len(matches) < REPETITION_MIN_OCCURRENCES:
+                continue
+            calls = [item for match in matches for item in match]
+            turns = len({item["step"] for item in calls})
+            if turns < REPETITION_MIN_OCCURRENCES:
+                continue  # Calls already issued in one turn are not extra rounds.
+            if size == 1 and len({item["signature"] for item in calls}) < 2:
+                continue  # Exact repeats remain covered by the stall observer.
+            # Rotating A,B,C to B,C,A does not justify another prompt.
+            canonical = _canonical_pattern(pattern)
+            page_id = history[-1]["pageId"]
+            if any(page == page_id and size <= len(known)
+                   and any(_canonical_pattern(list((known * 2)[n:n + size])) == canonical
+                           for n in range(len(known)))
+                   for page, known in self.repetition_notice_keys):
+                continue
+            self.repetition_notice_keys.append((page_id, canonical))
+            del self.repetition_notice_keys[:-REPETITION_NOTICE_HISTORY]
+            self.repetition_fact_count += 1
+            counts = Counter(labels)
+            locators = {label: len({item["locatorKey"] for item in calls
+                                   if item["label"] == label and item["locatorKey"]})
+                        for label in dict.fromkeys(pattern)}
+            return {
+                "status": "repetition_facts",
+                "pageId": history[-1]["pageId"],
+                "step": step,
+                "windowModelTurns": self.repetition_window_turns,
+                "retainedToolCalls": len(history),
+                "historyCallLimit": ACTION_HISTORY_WINDOW,
+                "pattern": pattern,
+                "occurrences": len(matches),
+                "matchedToolCalls": len(calls),
+                "matchedModelTurns": turns,
+                "matchedStepRange": [calls[0]["step"], calls[-1]["step"]],
+                "windowMethodCounts": dict(counts.most_common(8)),
+                "locatorVariantsByMethod": locators,
+                "callOutcomes": dict(Counter(item["outcome"] for item in calls)),
+                "workflowAvailable": True,
+                "note": (
+                    "Direct-call counts, not business success or proof of distinct"
+                    " records. Locator changes may be rerenders. If upcoming"
+                    " actions and observation-to-target rules are decided, consider"
+                    " Workflow; otherwise continue inspection. Verify uncertain"
+                    " effects before replay."
+                ),
+            }
+        return None
 
     def _maybe_build_nudge(self, step: int) -> Optional[JsonDict]:
         if not self.recent_actions or not self._page_is_stagnant():
@@ -145,6 +251,36 @@ def action_signature(tool_call: JsonDict) -> Tuple[str, str]:
     normalized = normalize_action_params(label, params)
     payload = {"name": name, "method": method, "params": normalized}
     return stable_hash(payload), label
+
+
+def _input_method(method: str) -> bool:
+    return method.startswith("Input.") or method in {
+        "Page.click", "Page.wheel", "File.handleChooser",
+    }
+
+
+def _canonical_pattern(pattern: List[str]) -> Tuple[str, ...]:
+    return min(tuple(pattern[n:] + pattern[:n]) for n in range(len(pattern)))
+
+
+def _direct_call_facts(tool_call: JsonDict) -> JsonDict:
+    raw = tool_call.get("input") or {}
+    raw = raw if isinstance(raw, dict) else {}
+    method = str(raw.get("method") or "")
+    params = raw.get("params") or {}
+    params = params if isinstance(params, dict) else {}
+    direct = (tool_call.get("name") == "browser_call"
+              and (_input_method(method) or method.startswith("DOM.")
+                   or method == "Page.getState"))
+    locator = {key: params[key] for key in (
+        "target", "id", "nodeId", "targetId", "selector", "nodeIds", "x", "y",
+    ) if key in params}
+    return {
+        "directCall": direct,
+        "pageId": str(params.get("pageId") or ""),
+        # No input text, file names or selectors are echoed by this observer.
+        "locatorKey": stable_hash(locator) if locator else "",
+    }
 
 
 def normalize_action_params(label: str, params: Any) -> Any:

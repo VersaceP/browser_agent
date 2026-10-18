@@ -51,7 +51,7 @@ BrowserTaskRunner 直接派发时保留原始请求、用户补充指令、Fleet
 2. **复核工具前缀。** progress 与 final 使用相同工具定义，减少因工具枚举变化导致的缓存前缀变化。当前复核阶段能否提交某种判决仍由原有判决协议校验。
 3. **SQLite 虚拟文件信息。** `review_file_info` 对任务内数据库资源查询虚拟文件视图，读取大小与哈希，不要求 worktree 下存在物理日志。
 4. **目录观察连续性。** `review_list_files` 的返回保存为任务所属的不可变观察，记录资源 URI、版本、运行身份和内容哈希。后续复核可复用该捕获时的证据；它不证明目录当前仍相同。
-5. **收尾复核触发。** BrowserAgent 在 `update_task_todo` 中声明 `ready_for_final_review=true`，表示下一步拟提交 final_answer。该轮 TODO 更新交由最终复核覆盖，不再根据复选框全部勾完来猜测；即使清单保留未勾的 final_answer，也适用。如果下一轮继续执行或显式请求复核，则恢复进度复核。done 仍必须通过独立复核。
+5. **收尾复核触发。** 当前调度已调整为 TODO 保存与评审分离：`ready_for_final_review=true` 仅提示下一步拟提交 final_answer，继续执行不会自动补进度复核。开启 reviewer 时，Browser 在方案形成后及出现具体疑问时通过 `request_goal_review` 主动请求复核，done 仍必须通过最终独立复核。复选框状态不作为机械触发条件。
 6. **Workflow 恢复。** 外层单动作的状态恢复义务不再阻止 Workflow 内部的 waitEvent/Page.getState 恢复步骤。共用的 schema、Fleet/页面绑定、权限和 HITL admission 路径保留。不会因为允许该段执行而直接清除本地恢复义务。
 7. **时间来源提示。** 要求执行者引用工具回执或媒体元数据中的实际时间，避免估计采集时间。这是提示改进，不是判断所有时间字段的机械门禁。
 

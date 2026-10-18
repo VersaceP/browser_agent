@@ -236,6 +236,15 @@ def build_system_prompt(self) -> str:
             "need already-authorized canonical paths listed in input. Use direct Harness tools for "
             "additional authorization, Network.readApi and unsupported capabilities."
         )
+    if workflow_enabled:
+        workflow_rule += (
+            "\n- If the method is uncertain, probe a representative operation and verify its"
+            " effect, then reassess remaining known work for Workflow. Repeated click/read/type"
+            " sequences can be scripted when observation-to-target rules are decided; method"
+            " counts alone do not establish that. Resolve targets from applicable current"
+            " observations as the page changes, return for new semantic decisions or uncertain"
+            " effects, and reconcile results/remaining work in the existing task todo when present."
+        )
     find_in_axtree_rule = (
         " Outside a workflow, use find_in_axtree when axTreeCache.status=current"
         " rather than rereading a full tree to locate one label. Inside a workflow, search fresh"

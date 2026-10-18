@@ -126,8 +126,11 @@ Answers and live guidance have no fixed character cap. Old `hitl_wait_timeout_se
 and `hitl_max_pause_rounds_per_page/worker` overrides are accepted but ignored;
 Question identity, explicit attendance, cancellation and permission checks remain.
 
-Standalone `/browser` maintains a persistent TODO and triggers independent evidence
-review on checklist changes, explicit review requests and completion submissions.
+Standalone `/browser` maintains a persistent TODO for stage progress, evidence and
+next execution steps. Saves do not trigger review. The Browser requests an initial
+plan check through `request_goal_review` once needed sources are inspected, then
+requests targeted checks for material concerns during execution. Completion
+submissions trigger independent final evidence review.
 Completion requires final review. No checklist or review tuning is needed for setup.
 See [advanced Harness configuration](docs/harness-advanced-configuration.md#english-reference)
 for deployment policies, project instructions and detailed options.

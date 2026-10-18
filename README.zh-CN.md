@@ -128,7 +128,7 @@ Browser、Workflow、Skill 运行时和 Skill Builder 共用本地文件授权�
 引用历史来源任务不会自动继承其权限。上传仍须传入实际文件清单。
 已运行的 Python 进程不会热加载源码修改；升级后重启 Harness，再 `/resume <任务ID>`。
 
-独立 `/browser` 自动维护持久 TODO，并在清单变化、主动请求复核和提交完成时进行独立证据复核。
+独立 `/browser` 在同一份持久 TODO 中记录阶段进展、证据和下一步执行方式。保存待办不触发复核；Browser 读完所需资料并形成初始计划后，通过 `request_goal_review` 请求一次计划复核，执行中针对实质疑点再请求复核，提交完成时进行最终证据复核。
 任务完成必须通过最终复核。无需配置清单或复核的内部参数。
 部署策略、项目指令及详细参数见 [Harness 高级配置](docs/harness-advanced-configuration.md)。
 

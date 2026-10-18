@@ -12,14 +12,10 @@ class StandaloneTaskControl:
     def __init__(self, agent):
         self.agent = agent
         self.pending = False
-        self.deferred = False
-        self.final_requested = False
         self.question = ""
-        self.last_todo_hash = ""
 
     def begin_turn(self):
         self.pending = False
-        self.final_requested = False
         self.question = ""
 
     def compaction_continuity(self):
@@ -54,17 +50,33 @@ class StandaloneTaskControl:
             " final_answer(done) next. The final review covers that update."
             " Keep source details and unresolved items visible; add"
             " discovered requirements and reopen mistaken checks."
+            " For each stage, briefly keep its intended outcome, verified"
+            " progress with receipt references, remaining or uncertain work,"
+            " and the next execution approach in this same todo. Update at"
+            " meaningful stage/batch boundaries or changed evidence, combining"
+            " related changes rather than rewriting after every action. Record"
+            " sources for choices that affect the result; when different"
+            " records need different materials or values, include their"
+            " associations as needed. Mark unresolved choices as uncertain"
+            " and inspect relevant sources before claiming no basis exists."
+            " After execution reconcile actual results and remaining work;"
+            " preserve useful decisions and references on update or resume."
             " For artifact or source capture times, cite the actual tool"
             " receipt or media metadata; do not estimate a timestamp."
             " The original request, attributed later user instructions"
             " and designated materials, not your checklist, define"
             " completion. On resume, add or reopen checklist items"
-            " affected by the new instruction. A checklist write triggers"
-            " independent review. Use request_goal_review when you"
-            " want an additional evidence check. A done final_answer"
-            " is a completion proposal and ends only after independent"
-            " verification. Do not treat a review opinion as authority"
-            " to change the user goal or permissions."
+            " affected by the new instruction. Checklist writes save progress"
+            " without triggering review. Once needed sources are inspected and"
+            " the initial execution plan is formed, use request_goal_review once"
+            " to check that plan against the goal before carrying it out. During"
+            " execution request a targeted review for a material evidence conflict,"
+            " doubtful direction or changed plan; combine related concerns."
+            " Routine progress updates need no review. Reuse prior review history"
+            " on resume/compaction; ask again when the changed goal, plan or"
+            " evidence warrants it. A done final_answer is a completion proposal"
+            " and ends only after independent verification. Do not treat a review"
+            " opinion as authority to change the user goal or permissions."
             " Preserve unresolved requirements when rewriting todo.md;"
             " explain removed or reinterpreted items in the Markdown."
             " When new work invalidates a completed check, reopen the"
@@ -164,7 +176,7 @@ class StandaloneTaskControl:
                 + json.dumps(prior_review, ensure_ascii=False)
                 + "\n</unresolved_browser_review>"
             )
-        self.last_todo_hash = initial_todo["hash"]
+        messages[0]["content"] += self._review_checkpoint(initial_todo)
 
     def restore_compacted_context(self, messages):
         agent = self.agent
@@ -183,8 +195,24 @@ class StandaloneTaskControl:
                + json.dumps(pending_review, ensure_ascii=False)
                + "\n</unresolved_browser_review>\n"
                if pending_review else "")
+            + self._review_checkpoint(restored_todo)
             + "Recheck this progress against the original user goal."
         )})
+
+    def _review_checkpoint(self, todo):
+        from harness.agents.browser.review.task import read_review_state
+        previous = read_review_state(self.agent) or {}
+        if previous.get("status") != "reviewed":
+            return ""
+        checkpoint = {key: previous[key] for key in (
+            "phase", "verdict", "goalHash", "todoHash",
+        ) if key in previous}
+        checkpoint["currentTodoHash"] = todo["hash"]
+        return ("\n<browser_review_checkpoint>\n"
+                + json.dumps(checkpoint, ensure_ascii=False)
+                + "\n</browser_review_checkpoint>\n"
+                "This is a prior review, not approval of later work. Hashes"
+                " identify saved versions; judge goal and evidence applicability.\n")
 
     async def completion_review(self, proposed_answer):
         agent = self.agent
@@ -208,21 +236,13 @@ class StandaloneTaskControl:
             })
         else:
             review = await agent._review_standalone_task(
-                phase="final", final_answer=proposed_answer,
+                phase="final", final_answer=proposed_answer, question=self.question,
             )
         self.pending = False
-        self.deferred = False
+        self.question = ""
         return review
 
     def observe_tool_result(self, tool_call, result):
-        agent = self.agent
-        from harness.agents.browser.review.task import successful_todo_write, todo_snapshot
-        if successful_todo_write(agent, tool_call, result):
-            current_hash = todo_snapshot(agent)["hash"]
-            self.final_requested = result.get("readyForFinalReview") is True
-            if current_hash != self.last_todo_hash or self.final_requested:
-                self.last_todo_hash = current_hash
-                self.pending = True
         if (tool_call.get("name") == "request_goal_review"
                 and isinstance(result, dict)
                 and result.get("status") == "requested"):
@@ -232,26 +252,9 @@ class StandaloneTaskControl:
     async def review_boundary(self):
         agent = self.agent
         tool_results = []
-        if self.deferred:
-            self.pending = True
-        if (self.pending
-                and not self.deferred and not self.question
-                and not getattr(agent, "standalone_hitl_timeout", None)):
-            if self.final_requested:
-                self.deferred = True
-                self.pending = False
-                agent._write_agent_event("browser.task_review.deferred", {
-                    "phase": "progress", "step": agent._current_step,
-                    "reason": "executor_requested_final_review",
-                })
-                tool_results.append({"type": "text", "text": (
-                    "The checklist was saved for final review. Call"
-                    " final_answer next if the whole goal is complete."
-                    " If you continue execution instead, the pending"
-                    " progress review resumes at the next boundary."
-                )})
         if (self.pending
                 and getattr(agent, "standalone_hitl_timeout", None)):
+            self.pending = False
             agent._write_agent_event("browser.task_review.skipped", {
                 "phase": "progress", "step": agent._current_step,
                 "reason": "hitl_wait_awaiting_user",
@@ -263,7 +266,7 @@ class StandaloneTaskControl:
                 " Report the concrete blocker briefly with final_answer(incomplete)."
             )})
         elif self.pending:
-            self.deferred = False
+            self.pending = False
             review = await agent._review_standalone_task(
                 phase="progress", question=self.question,
             )

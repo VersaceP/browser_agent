@@ -1746,7 +1746,8 @@ async def _browser_local_fs_read(ctx: ToolContext) -> JsonDict:
     name="update_task_todo",
     description=(
         "Write the standalone Browser task's full Markdown checklist to its"
-        " task scratchpad. Replace the whole checklist when progress changes;"
+        " task scratchpad. Save meaningful progress and next execution steps;"
+        " saving does not trigger independent review. Replace the whole checklist;"
         " this note is not a user deliverable."
     ),
     input_schema={
@@ -1754,7 +1755,7 @@ async def _browser_local_fs_read(ctx: ToolContext) -> JsonDict:
         "properties": {
             "content": {"type": "string", "minLength": 1},
             "ready_for_final_review": {"type": "boolean", "default": False,
-                "description": "Set true when the next step is final_answer. Saves this update for that final review; it does not approve completion."},
+                "description": "Hint that final_answer is next. Saves only; final_answer(done) triggers review when enabled. This flag does not approve completion or schedule progress review."},
         },
         "required": ["content"], "additionalProperties": False,
     },
@@ -1771,8 +1772,10 @@ async def _browser_update_task_todo(ctx: ToolContext) -> JsonDict:
 @BROWSER_TOOLS.register(
     name="request_goal_review",
     description=(
-        "Ask the independent reviewer to inspect a concrete concern about the"
-        " standalone Browser task. This does not modify the page or the goal."
+        "Request independent review of the formed initial execution plan or"
+        " concrete concerns about changed direction/evidence. Combine related"
+        " concerns; routine checklist saves need no review. This does not modify"
+        " the page or the goal. Completion is reviewed through final_answer(done)."
     ),
     input_schema={
         "type": "object",

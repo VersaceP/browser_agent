@@ -120,6 +120,9 @@ async def run_browser_agent(self, task: str) -> str:
         )
         if control is not None:
             control.configure_tools(tools)
+        workflow_tool_visible = any(
+            spec.get("name") == "execute_browser_workflow" for spec in tools
+        )
         dispatch_tool = build_browser_tool_dispatcher(self)
         self.browser_call_runner = build_browser_call_runner(
             browser=self.browser,
@@ -799,6 +802,10 @@ async def run_browser_agent(self, task: str) -> str:
                     step=step,
                     agent=self,
                     fingerprint=page_observation.get("fingerprint"),
+                    workflow_enabled=(
+                        workflow_execution_enabled(self)
+                        and workflow_tool_visible
+                    ),
                 )
                 if nudge is not None:
                     self.logger.write("loop_nudge.detected", nudge)
@@ -978,6 +985,17 @@ async def run_browser_agent(self, task: str) -> str:
                             f"{json.dumps(nudge, ensure_ascii=False, default=str)}\n"
                             "</loop_nudge>"
                         ),
+                    })
+                repetition = self.loop_nudge.consume_repetition_facts()
+                if repetition is not None:
+                    self.logger.write("browser.repetition.observed", repetition)
+                    self.trace.append({"type": "repetition_facts", "step": step,
+                                       "result": repetition})
+                    tool_results.append({
+                        "type": "text",
+                        "text": ("<repetition_facts>\n"
+                                 + json.dumps(repetition, ensure_ascii=False)
+                                 + "\n</repetition_facts>"),
                     })
                 for block in self._consume_reality_check_blocks():
                     tool_results.append(block)

@@ -87,7 +87,7 @@ or its compaction ratio.
 ```
 
 - `worker_max_steps`: 委派 BrowserAgent 最大执行轮数；独立 `/browser` 任务不受此轮数限制，以显式完成或实际阻塞为终态。
-- 独立 `/browser` 的清单使用任务逻辑路径 `scratchpad/todo.md`，默认存于 SQLite。清单变化、主动调用 `request_goal_review`、以及 `final_answer(done)` 会触发独立证据复核。完成声明只有通过最终复核才会结束任务。复核器可读取授权文件和任务页面观察结果，但不能修改页面。
+- 独立 `/browser` 在任务逻辑路径 `scratchpad/todo.md` 中记录阶段进展、证据引用和下一步执行方式，默认存于 SQLite。保存待办不触发复核；开启复核时，Browser 读完所需资料后通过 `request_goal_review` 请求初始计划复核，后续针对具体疑点或实质性的计划、证据变化请求复核。`final_answer(done)` 触发最终证据复核，通过后才结束任务。`ready_for_final_review` 只是保存时的提示，不安排延后的进度复核。续跑和压缩保留既往复核版本与结论，不因恢复上下文而安排复核。复核器可读取授权文件和任务页面观察结果，但不能修改页面。
 - `max_browser_agent_instances`: 可复用池长期保留的 BrowserAgent slot 目标数。idle slot 会保留 ABCP 连接和页面 registry；有效池容量至少等于 `max_browser_agents`。普通新 worker 只复用连接并从新页面开始；显式 continuation 才会复用旧页面候选。
 - `max_browser_agents`: 同时运行的 browser worker 权威上限。
 - `fleet_reuse_enabled`: 由协调器为 worker 确定性分配 fleet，并将无 fleetId 的 `Page.create` 收敛到该分配。通用任务可复用合格 slot 的 fleet；新建 `session_key` 或独立 worker 会开新 fleet。已有 Fleet 只可在原始用户任务中写作 `@<完整 UUID 或唯一前缀>`；运行时以权威库存解析，目标不存在或歧义时失败，绝不创建替代 Fleet。具名/隔离 fleet 不会进入通用复用池。
@@ -143,7 +143,7 @@ Optional advanced configuration example:
 ```
 
 - `worker_max_steps`: maximum rounds for a BrowserAgent delegated by a task owner. A standalone `/browser` task has no step limit and ends on an explicit completion or real blocker.
-- Standalone `/browser` maintains its checklist at the logical task path `scratchpad/todo.md`, stored in SQLite by default. Checklist changes, an explicit `request_goal_review`, and `final_answer(done)` trigger independent evidence review. A done answer ends the task only after the final review verifies it. The reviewer can read authorized files and task-bound page observations but cannot change the page.
+- Standalone `/browser` maintains stage progress, evidence references and next execution steps at the logical task path `scratchpad/todo.md`, stored in SQLite by default. Saves do not trigger review. Browser requests an initial plan check through `request_goal_review` after inspecting needed sources; further progress checks are requested for concrete concerns or material plan/evidence changes. `final_answer(done)` triggers final evidence review and ends only after verification. `ready_for_final_review` is a save-time hint, not a deferred progress-review trigger. Resume/compaction retain prior review versions and findings without scheduling review merely for restoration. The reviewer can read authorized files and task-bound page observations but cannot change the page.
 - `max_browser_agent_instances`: target number of live BrowserAgent slots kept in the reusable pool. Idle slots keep their ABCP connection and page registry. The effective pool is raised to at least `max_browser_agents`.
 - `max_browser_agents`: authoritative maximum number of concurrently running browser workers.
 - `fleet_reuse_enabled`: deterministically assign each worker a fleet and force `Page.create` into it. Generic work may reuse an eligible slot fleet; a new `session_key` or isolated worker gets a fresh fleet. An existing Fleet is bound only when the original user task contains `@<full UUID or unique prefix>`; the runtime resolves it from authoritative inventory and never creates a replacement. Named/isolated fleets never become the generic slot default. Lost named sessions fail with `session_fleet_lost` instead of silently rebinding. Model-initiated `Fleet.create`/`Fleet.close` and out-of-assignment fleet ids fail closed; explicit page continuations may receive prior page candidates.
