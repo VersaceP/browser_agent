@@ -55,6 +55,8 @@ def to_platform_execute_params(params: Any) -> Any:
     """Translate flat harness params; params already in wire form pass through."""
     if not isinstance(params, dict) or "workflow" in params:
         return params
+    if "workshopId" in params:
+        raise ValueError("Resolve and scope the saved Workshop snapshot before dispatching Workflow.execute")
     preserved = params.get("_platformWorkflow")
     if isinstance(preserved, dict):
         binding = {

@@ -84,6 +84,7 @@ class WorkflowContract:
     action_shorthand: Optional[StepShape]
     transform_ops: Dict[str, StepShape]
     condition_operators: Dict[str, FrozenSet[str]]
+    execute_forms: Dict[str, JsonDict] = field(default_factory=dict)
 
     def effective_required(self, step_type: str) -> FrozenSet[str]:
         """Fields a step of this type cannot omit under ANY union member.
@@ -213,7 +214,11 @@ def _derive(path: Path) -> WorkflowContract:
         raise PlatformSchemaUnavailable(f"{path} is not valid JSON: {exc}") from exc
     if not isinstance(parsed, dict) or not isinstance(parsed.get("inputSchema"), dict):
         raise PlatformSchemaUnavailable(f"{path} has no inputSchema")
-    schema = _harness_execute_view(parsed["inputSchema"])
+    forms = _execute_forms(parsed["inputSchema"])
+    # The flat compatibility view describes ONE execution form. Union branches
+    # must not merge required fields (workflow and workshopId are alternatives).
+    selected = forms.get("source") or forms.get("legacy") or forms.get("saved")
+    schema = _harness_execute_view(selected)
     defs = schema.get("$defs") or {}
     members = _step_union_members(schema, defs)
     return WorkflowContract(
@@ -229,7 +234,41 @@ def _derive(path: Path) -> WorkflowContract:
         action_shorthand=_action_shorthand(members),
         transform_ops=_transform_ops(members),
         condition_operators=_condition_operators(members, defs),
+        execute_forms=forms,
     )
+
+
+def _execute_forms(schema: JsonDict) -> Dict[str, JsonDict]:
+    """Recognize declared wire forms; an unknown shape is never legacy steps."""
+    forms: Dict[str, JsonDict] = {}
+    defs = schema.get("$defs") or {}
+
+    def walk(node: JsonDict) -> None:
+        ref = node.get("$ref", "")
+        if ref.startswith("#/$defs/"):
+            node = defs.get(ref.rsplit("/", 1)[-1], {})
+        for key in ("anyOf", "oneOf"):
+            if isinstance(node.get(key), list):
+                for branch in node[key]:
+                    if isinstance(branch, dict):
+                        walk(branch)
+                return
+        props = node.get("properties") or {}
+        package = (props.get("workflow") or {}).get("properties") or {}
+        kind = ("source" if {"entry", "files"} <= package.keys() else
+                "legacy" if "steps" in package or "steps" in props else
+                "saved" if "workshopId" in props else None)
+        if kind:
+            if kind in forms:
+                raise PlatformSchemaUnavailable(f"Ambiguous Workflow.execute {kind} contract")
+            forms[kind] = {**node, **({"$defs": defs} if defs else {})}
+
+    walk(schema)
+    if not forms:
+        raise PlatformSchemaUnavailable(
+            "Unsupported Workflow.execute contract: no source package, saved Workshop, or legacy steps form. "
+            "Update the Harness protocol adapter for this catalog revision.")
+    return forms
 
 
 # WorkflowDefinitionV1 field -> the flat harness param it arrives from.

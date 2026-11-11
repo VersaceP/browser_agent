@@ -1,6 +1,6 @@
-// Harness response helpers v1. WebCross Workflow SDK returns action VALUES,
+// Harness response helpers v2. WebCross Workflow SDK returns action VALUES,
 // unlike the host RPC envelope {data: value}. Read the live schema after upgrades.
-export const helperVersion = "1";
+export const helperVersion = "2";
 
 export function requireArray(value, action) {
   if (!Array.isArray(value)) {
@@ -26,9 +26,13 @@ export function pageRows(value) {
 
 export function errorFact(error, action) {
   // Preserve enumerable platform fields and standard Error properties.
-  return { ...error, name: error?.name, message: error?.message ?? String(error),
-    code: error?.code, details: error?.details, action };
+  return { ...error, name: error?.name ?? null, message: error?.message ?? String(error),
+    code: error?.code ?? null, details: error?.details ?? null, action };
 }
+
+// An observation failure is not an empty observation. Callers return this
+// fact with completed/remaining work; only a successful read may enter a
+// condition wait. No retry or choice of business recovery is hidden here.
 
 export async function captureAction(action, invoke) {
   // Successful empty values and failed calls are distinct; no automatic retries.

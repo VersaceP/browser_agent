@@ -162,6 +162,8 @@ def project_workflow_receipt(
     if not isinstance(steps, list) or not steps:
         return None
     if "output" in data:
+        from harness.workflow.call_facts import call_facts
+        data["callFacts"] = call_facts(data)
         candidates = {i for i, call in enumerate(steps)
                       if isinstance(call, dict) and "value" in call
                       and json_size_bytes(call["value"]) > inline_result_bytes}
