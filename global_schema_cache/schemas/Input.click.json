@@ -1,8 +1,8 @@
 {
   "method": "Input.click",
-  "description": "Performs one or more clicks using a target id from page observation or a unique selector. For page-viewport coordinates, use Page.click. Reports click sequence completion and any dialog or file-chooser follow-up.",
+  "description": "Performs one or more clicks using a target id from page observation or a unique selector. For page-viewport coordinates, use Page.click. Reports click sequence completion and any dialog or file-chooser follow-up. A single click also reports synchronously opened pages without waiting for them to load. When an attributed download starts, waits within the Action deadline for its save dialog or a no-dialog outcome.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:f14f45a51d9e8c2fec30ee6e50e9cd2003d0d7eb9b217ea8922884f5fa221f76",
+  "catalogRevision": "sha256:2e55483dc7290e98387fd0a733945a10ed267ea41932e03ab02fd12c67f68fe5",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -84,14 +84,48 @@
         "description": "How the target was located.",
         "type": "string"
       },
+      "openedPages": {
+        "description": "Pages synchronously opened by a single click; omitted when none were confirmed.",
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "pageId": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+              "description": "Registered ID of the newly opened page."
+            },
+            "url": {
+              "type": "string",
+              "description": "Requested URL when the new page was registered."
+            },
+            "title": {
+              "description": "Page title known at registration, when available.",
+              "type": "string"
+            },
+            "lifecycle": {
+              "type": "string",
+              "const": "loading",
+              "description": "Loading state at registration; document readiness is not confirmed."
+            }
+          },
+          "required": [
+            "pageId",
+            "url",
+            "lifecycle"
+          ],
+          "additionalProperties": false
+        }
+      },
       "dialog": {
-        "description": "Page dialog returned by this click; handled alerts are not returned here.",
+        "description": "Registered dialog opened by this click; handled alerts and intercepted choosers are not returned here.",
         "type": "object",
         "properties": {
           "id": {
             "type": "string",
             "minLength": 1,
-            "description": "Dialog ID to pass to Page.handleDialog."
+            "description": "Identifier of the pending dialog."
           },
           "type": {
             "type": "string",
@@ -99,20 +133,63 @@
               "alert",
               "confirm",
               "prompt",
-              "beforeunload"
+              "beforeunload",
+              "file-save",
+              "file-open",
+              "directory"
             ],
-            "description": "Page dialog type."
+            "description": "Kind of pending dialog."
           },
           "message": {
             "type": "string",
-            "description": "Dialog message supplied by the page."
+            "maxLength": 16384,
+            "description": "Dialog message or title."
           },
           "defaultValue": {
-            "description": "Default value for a prompt dialog.",
-            "type": "string"
+            "type": "string",
+            "maxLength": 4096,
+            "description": "Default prompt value, without user input."
+          },
+          "supportedActions": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "accept",
+                "cancel",
+                "select-files"
+              ]
+            },
+            "description": "Operations supported by this dialog."
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "opening",
+              "open",
+              "resolving"
+            ],
+            "description": "Current native lifecycle state."
+          },
+          "multiple": {
+            "description": "Whether the original file request accepts multiple files.",
+            "type": "boolean"
+          },
+          "acceptTypes": {
+            "description": "File filters from the original request; browser and permission checks remain authoritative.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "downloadId": {
+            "description": "Existing download waiting for this save destination.",
+            "type": "string",
+            "minLength": 1
           },
           "truncated": {
-            "description": "Whether the dialog message was shortened.",
+            "description": "Whether native dialog text was shortened.",
             "type": "boolean",
             "const": true
           }
@@ -123,6 +200,108 @@
           "message"
         ],
         "additionalProperties": false
+      },
+      "blockingInteractions": {
+        "type": "object",
+        "properties": {
+          "dialogs": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Identifier of the pending dialog."
+                },
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "alert",
+                    "confirm",
+                    "prompt",
+                    "beforeunload",
+                    "file-save",
+                    "file-open",
+                    "directory"
+                  ],
+                  "description": "Kind of pending dialog."
+                },
+                "message": {
+                  "type": "string",
+                  "maxLength": 16384,
+                  "description": "Dialog message or title."
+                },
+                "defaultValue": {
+                  "type": "string",
+                  "maxLength": 4096,
+                  "description": "Default prompt value, without user input."
+                },
+                "supportedActions": {
+                  "minItems": 1,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "accept",
+                      "cancel",
+                      "select-files"
+                    ]
+                  },
+                  "description": "Operations supported by this dialog."
+                },
+                "state": {
+                  "type": "string",
+                  "enum": [
+                    "opening",
+                    "open",
+                    "resolving"
+                  ],
+                  "description": "Current native lifecycle state."
+                },
+                "multiple": {
+                  "description": "Whether the original file request accepts multiple files.",
+                  "type": "boolean"
+                },
+                "acceptTypes": {
+                  "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "downloadId": {
+                  "description": "Existing download waiting for this save destination.",
+                  "type": "string",
+                  "minLength": 1
+                },
+                "pageId": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                  "description": "Page that owns this active native dialog."
+                }
+              },
+              "required": [
+                "id",
+                "type",
+                "message",
+                "defaultValue",
+                "supportedActions",
+                "state",
+                "pageId"
+              ],
+              "additionalProperties": false
+            },
+            "description": "Current native dialogs, independently of the business result."
+          }
+        },
+        "required": [
+          "dialogs"
+        ],
+        "additionalProperties": false,
+        "description": "Present only when current native dialogs were observed."
       }
     },
     "additionalProperties": {}
@@ -173,14 +352,48 @@
             "description": "How the target was located.",
             "type": "string"
           },
+          "openedPages": {
+            "description": "Pages synchronously opened by a single click; omitted when none were confirmed.",
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "pageId": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                  "description": "Registered ID of the newly opened page."
+                },
+                "url": {
+                  "type": "string",
+                  "description": "Requested URL when the new page was registered."
+                },
+                "title": {
+                  "description": "Page title known at registration, when available.",
+                  "type": "string"
+                },
+                "lifecycle": {
+                  "type": "string",
+                  "const": "loading",
+                  "description": "Loading state at registration; document readiness is not confirmed."
+                }
+              },
+              "required": [
+                "pageId",
+                "url",
+                "lifecycle"
+              ],
+              "additionalProperties": false
+            }
+          },
           "dialog": {
-            "description": "Page dialog returned by this click; handled alerts are not returned here.",
+            "description": "Registered dialog opened by this click; handled alerts and intercepted choosers are not returned here.",
             "type": "object",
             "properties": {
               "id": {
                 "type": "string",
                 "minLength": 1,
-                "description": "Dialog ID to pass to Page.handleDialog."
+                "description": "Identifier of the pending dialog."
               },
               "type": {
                 "type": "string",
@@ -188,20 +401,63 @@
                   "alert",
                   "confirm",
                   "prompt",
-                  "beforeunload"
+                  "beforeunload",
+                  "file-save",
+                  "file-open",
+                  "directory"
                 ],
-                "description": "Page dialog type."
+                "description": "Kind of pending dialog."
               },
               "message": {
                 "type": "string",
-                "description": "Dialog message supplied by the page."
+                "maxLength": 16384,
+                "description": "Dialog message or title."
               },
               "defaultValue": {
-                "description": "Default value for a prompt dialog.",
-                "type": "string"
+                "type": "string",
+                "maxLength": 4096,
+                "description": "Default prompt value, without user input."
+              },
+              "supportedActions": {
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "accept",
+                    "cancel",
+                    "select-files"
+                  ]
+                },
+                "description": "Operations supported by this dialog."
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "opening",
+                  "open",
+                  "resolving"
+                ],
+                "description": "Current native lifecycle state."
+              },
+              "multiple": {
+                "description": "Whether the original file request accepts multiple files.",
+                "type": "boolean"
+              },
+              "acceptTypes": {
+                "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "downloadId": {
+                "description": "Existing download waiting for this save destination.",
+                "type": "string",
+                "minLength": 1
               },
               "truncated": {
-                "description": "Whether the dialog message was shortened.",
+                "description": "Whether native dialog text was shortened.",
                 "type": "boolean",
                 "const": true
               }
@@ -212,6 +468,108 @@
               "message"
             ],
             "additionalProperties": false
+          },
+          "blockingInteractions": {
+            "type": "object",
+            "properties": {
+              "dialogs": {
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Identifier of the pending dialog."
+                    },
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "alert",
+                        "confirm",
+                        "prompt",
+                        "beforeunload",
+                        "file-save",
+                        "file-open",
+                        "directory"
+                      ],
+                      "description": "Kind of pending dialog."
+                    },
+                    "message": {
+                      "type": "string",
+                      "maxLength": 16384,
+                      "description": "Dialog message or title."
+                    },
+                    "defaultValue": {
+                      "type": "string",
+                      "maxLength": 4096,
+                      "description": "Default prompt value, without user input."
+                    },
+                    "supportedActions": {
+                      "minItems": 1,
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "enum": [
+                          "accept",
+                          "cancel",
+                          "select-files"
+                        ]
+                      },
+                      "description": "Operations supported by this dialog."
+                    },
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "opening",
+                        "open",
+                        "resolving"
+                      ],
+                      "description": "Current native lifecycle state."
+                    },
+                    "multiple": {
+                      "description": "Whether the original file request accepts multiple files.",
+                      "type": "boolean"
+                    },
+                    "acceptTypes": {
+                      "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "downloadId": {
+                      "description": "Existing download waiting for this save destination.",
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "pageId": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                      "description": "Page that owns this active native dialog."
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "type",
+                    "message",
+                    "defaultValue",
+                    "supportedActions",
+                    "state",
+                    "pageId"
+                  ],
+                  "additionalProperties": false
+                },
+                "description": "Current native dialogs, independently of the business result."
+              }
+            },
+            "required": [
+              "dialogs"
+            ],
+            "additionalProperties": false,
+            "description": "Present only when current native dialogs were observed."
           }
         },
         "additionalProperties": {}
@@ -225,44 +583,139 @@
     "additionalProperties": false
   },
   "failureSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "properties": {
-      "error": {
+      "code": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Stable public failure code."
+      },
+      "message": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Concise public explanation of the failure."
+      },
+      "observation": {
+        "description": "Directly observed failure fact.",
+        "type": "string"
+      },
+      "suggested_prompt": {
+        "description": "Guidance for the next recovery operation.",
+        "type": "string"
+      },
+      "details": {
+        "description": "Public details filtered by the failure definition allowlist.",
+        "type": "object",
+        "properties": {},
+        "additionalProperties": {}
+      },
+      "blockingInteractions": {
         "type": "object",
         "properties": {
-          "code": {
-            "type": "string",
-            "description": "Stable public failure code."
-          },
-          "message": {
-            "type": "string",
-            "description": "Concise public explanation for the failure code."
+          "dialogs": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Identifier of the pending dialog."
+                },
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "alert",
+                    "confirm",
+                    "prompt",
+                    "beforeunload",
+                    "file-save",
+                    "file-open",
+                    "directory"
+                  ],
+                  "description": "Kind of pending dialog."
+                },
+                "message": {
+                  "type": "string",
+                  "maxLength": 16384,
+                  "description": "Dialog message or title."
+                },
+                "defaultValue": {
+                  "type": "string",
+                  "maxLength": 4096,
+                  "description": "Default prompt value, without user input."
+                },
+                "supportedActions": {
+                  "minItems": 1,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "accept",
+                      "cancel",
+                      "select-files"
+                    ]
+                  },
+                  "description": "Operations supported by this dialog."
+                },
+                "state": {
+                  "type": "string",
+                  "enum": [
+                    "opening",
+                    "open",
+                    "resolving"
+                  ],
+                  "description": "Current native lifecycle state."
+                },
+                "multiple": {
+                  "description": "Whether the original file request accepts multiple files.",
+                  "type": "boolean"
+                },
+                "acceptTypes": {
+                  "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "downloadId": {
+                  "description": "Existing download waiting for this save destination.",
+                  "type": "string",
+                  "minLength": 1
+                },
+                "pageId": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                  "description": "Page that owns this active native dialog."
+                }
+              },
+              "required": [
+                "id",
+                "type",
+                "message",
+                "defaultValue",
+                "supportedActions",
+                "state",
+                "pageId"
+              ],
+              "additionalProperties": false
+            },
+            "description": "Current native dialogs, independently of the business result."
           }
         },
         "required": [
-          "code",
-          "message"
+          "dialogs"
         ],
-        "additionalProperties": false
-      },
-      "observation": {
-        "type": "string",
-        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
-      },
-      "suggested_prompt": {
-        "type": "string",
-        "description": "Guidance to re-observe current state and choose the next operation."
-      },
-      "details": {
-        "type": "object",
-        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
-        "additionalProperties": true
+        "additionalProperties": false,
+        "description": "Present only when current native dialogs were observed."
       }
     },
     "required": [
-      "error",
-      "observation",
-      "suggested_prompt"
+      "code",
+      "message"
     ],
     "additionalProperties": false
   },

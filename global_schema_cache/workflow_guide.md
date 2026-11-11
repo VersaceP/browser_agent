@@ -6,50 +6,15 @@ Use Workflow when the flow, conditions, and stopping rules are already clear, su
 
 When new page content requires a decision, let the Agent read the result and decide the next step.
 
-## Write and run immediately
+## Before authoring
 
-Provide source directly in a `Workflow.execute` request. The platform validates, compiles in memory, and runs the script.
+Use the current Workflow.execute contract for source-package, input,
+binding, and result fields. Discover the Action and event contracts needed
+by the script before composing it.
 
-This example constructs a request to read the selected page. Set `pageId` to the page chosen for this execution.
-
-```js
-const source = `
-export default async function main({ actions }) {
-  const page = await actions.Page.getState({
-    purpose: "读取当前页面信息"
-  });
-
-  return {
-    title: page.title,
-    url: page.url
-  };
-}
-`;
-
-const params = {
-  workflow: {
-    schemaVersion: 1,
-    name: "读取当前页面",
-    entry: "main.js",
-    files: {
-      "main.js": source,
-    },
-  },
-  binding: {
-    pageId,
-  },
-};
-```
-
-Pass `params` to `Workflow.execute`.
-
-| Parameter  | Meaning                                              |
-| ---------- | ---------------------------------------------------- |
-| `workflow` | Name, entry module, and source files                 |
-| `input`    | Business input passed to the entry; defaults to `{}` |
-| `binding`  | Page or Fleet used for this execution                |
-
-Compilation errors include available source locations. Correct the source and submit again.
+Use this guide for the script entry, SDK, event waiting, concurrency,
+return values, and packaging. Apply the Browser Skill's task, evidence,
+and recovery rules.
 
 ## Entry and business logic
 
@@ -63,7 +28,7 @@ Default-export the entry function. Its first argument provides platform capabili
 | `readText` | Read observation artifact text                      |
 | `sleep`    | Wait for a duration in milliseconds                 |
 
-`context` contains `workflowId`, `taskId`, and available page, Fleet, URL, and hostname information. Call `Page.getState` for current page state.
+`context` contains `workflowId`, `taskId`, and available page, Fleet, URL, and hostname information.
 
 Use native JavaScript or TypeScript variables, conditions, loops, functions, classes, exceptions, and data transformations. Pass required capabilities to helper modules.
 
@@ -89,11 +54,11 @@ export default async function main(
   const pageId = context.pageId;
 
   if (!pageId) {
-    throw new Error("需要绑定页面");
+    throw new Error("Bind a page before running this workflow.");
   }
 
   if (typeof input?.url !== "string") {
-    throw new Error("需要提供目标地址");
+    throw new Error("Provide a target URL.");
   }
 
   const url = input.url;
@@ -114,18 +79,21 @@ export default async function main(
       actions.Page.navigate({
         pageId,
         url,
-        purpose: "打开目标页面",
+        purpose: "Open the target page.",
       }),
   );
 
   if (event.event === "Page.loadFailed") {
-    throw new Error("页面加载失败");
+    throw new Error("The page failed to load.");
   }
 
   const observation = await actions.DOM.getAXTree({
     pageId,
-    purpose: "读取页面结构",
+    purpose: "Inspect the page structure.",
   });
+  if (observation.freshness === "unavailable") {
+    return { ...observation, url };
+  }
   const text = await readText(observation.artifact);
 
   return {
@@ -165,7 +133,9 @@ Provide this `input` through `Workflow.execute`:
 
 `waitFor(options, trigger)` subscribes before invoking the trigger and can receive an event that arrives before the Action returns. Filter by page scope and business conditions; keep related operations on one page sequential.
 
-Use `freshness` and `completeness` to assess whether the observation meets the next operation's needs. `DOM.getDetails` accepts `version` and `nodeIds` for saved-version reads or `query` for live reads. Read its returned `details` directly.
+Use readText to read an observation artifact returned to the workflow.
+Interpret each Action result using its current contract, and choose the
+evidence needed for the next decision according to the Browser Skill.
 
 ## Concurrency and return values
 
@@ -177,19 +147,13 @@ Return JSON data, preferably an object organized by business meaning. No return 
 
 Output is limited to 4 MiB. Save larger reports through file Actions and return a summary with file information. Workshop file exports use `output.file` for the file Action's result.
 
-## Results and controls
-
-Read the execution result's `status` first:
-
-- `succeeded`: read `output`.
-- `failed`: read `error` and the call records.
-- `cancelled`: inspect call records to determine effects already produced.
-
-`results` contains platform call status, timing, and available source locations. Values omitted for size include `valueOmittedReason`.
-
-Use `Workflow.getStatus` to inspect an execution and `Workflow.pause`, `Workflow.resume`, or `Workflow.cancel` to control it. Pause takes effect at an asynchronous job boundary; resume continues the live environment. Manual retry starts a new execution from the entry.
-
 ## Save and import into Workshop
+
+Use `Workflow.list` to discover existing saved scripts before authoring a replacement. `query` matches partial titles and descriptions without case sensitivity; an exact `workshopId` lookup returns the complete manifest. Listings include disabled records and current folder IDs.
+
+Use `Workflow.upsert` with a complete Workshop manifest to save a script directly. Omit `workshopId` to create; include an existing ID to replace its document. Omitted folder and enablement settings are preserved on update. Same-folder name conflicts require an explicit record ID or a different name. `Workflow.remove` deletes one saved record.
+
+Execute a saved script with `Workflow.execute` and `workshopId`, plus optional `input` and `binding`. Do not also supply `workflow`. Explicit execution is independent of menu enablement and hostname rules. The returned `workflowId` identifies the execution. Its Task retry plan captures source independently of later saved-record changes.
 
 A local project contains `workflow.json`, the editor type file, and scripts under `src`.
 
@@ -198,7 +162,7 @@ A local project contains `workflow.json`, the editor type file, and scripts unde
 ```json
 {
   "schemaVersion": 1,
-  "name": "读取当前页面",
+  "name": "Read current page",
   "entry": "src/main.js",
   "timeoutMs": 60000,
   "availability": {

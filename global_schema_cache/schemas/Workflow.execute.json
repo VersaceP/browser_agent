@@ -1,131 +1,133 @@
 {
   "method": "Workflow.execute",
-  "description": "Compiles and runs a JavaScript or TypeScript source package in an isolated workflow.",
+  "description": "Compiles and runs an inline JavaScript or TypeScript package or a saved Workshop record. Supply exactly one of workflow or workshopId; both accept optional input and binding. Menu enablement and host rules do not restrict explicit execution.",
   "requiresPurpose": false,
-  "catalogRevision": "sha256:f14f45a51d9e8c2fec30ee6e50e9cd2003d0d7eb9b217ea8922884f5fa221f76",
+  "catalogRevision": "sha256:2e55483dc7290e98387fd0a733945a10ed267ea41932e03ab02fd12c67f68fe5",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "type": "object",
-    "properties": {
-      "workflow": {
+    "anyOf": [
+      {
         "type": "object",
         "properties": {
-          "schemaVersion": {
-            "type": "number",
-            "const": 1,
-            "description": "Workflow document schema version."
-          },
-          "name": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 200,
-            "description": "Human-readable script name."
-          },
-          "description": {
-            "description": "Optional script description.",
-            "type": "string",
-            "maxLength": 2000
-          },
-          "timeoutMs": {
-            "description": "Total deadline in milliseconds, including pauses.",
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 3600000
-          },
-          "entry": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 512,
-            "description": "Module exporting the entry function."
-          },
-          "files": {
+          "workflow": {
             "type": "object",
-            "propertyNames": {
-              "type": "string",
-              "minLength": 1,
-              "maxLength": 512
+            "properties": {
+              "schemaVersion": {
+                "type": "number",
+                "const": 1,
+                "description": "Workflow document schema version."
+              },
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200,
+                "description": "Human-readable script name."
+              },
+              "description": {
+                "description": "Optional script description.",
+                "type": "string",
+                "maxLength": 2000
+              },
+              "timeoutMs": {
+                "description": "Total deadline in milliseconds, including pauses.",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 3600000
+              },
+              "entry": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 512,
+                "description": "Module exporting the entry function."
+              },
+              "files": {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 512
+                },
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "description": "Package sources indexed by normalized path."
+              }
             },
-            "additionalProperties": {
-              "type": "string"
+            "required": [
+              "schemaVersion",
+              "name",
+              "entry",
+              "files"
+            ],
+            "additionalProperties": true,
+            "description": "Source package compiled in memory."
+          },
+          "input": {
+            "description": "JSON business input; defaults to an empty object."
+          },
+          "binding": {
+            "description": "Execution-specific resource binding.",
+            "type": "object",
+            "properties": {
+              "pageId": {
+                "description": "Page bound to this execution.",
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              },
+              "fleetId": {
+                "description": "Fleet bound to this execution.",
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              }
             },
-            "description": "Package sources indexed by normalized path."
+            "additionalProperties": true
           }
         },
         "required": [
-          "schemaVersion",
-          "name",
-          "entry",
-          "files"
+          "workflow"
         ],
-        "additionalProperties": true,
-        "description": "Source package compiled in memory."
+        "additionalProperties": true
       },
-      "input": {
-        "description": "JSON business input; defaults to an empty object.",
-        "allOf": [
-          {
-            "$ref": "#/$defs/__schema0"
-          },
-          {}
-        ]
-      },
-      "binding": {
-        "description": "Execution-specific resource binding.",
+      {
         "type": "object",
         "properties": {
-          "pageId": {
-            "description": "Page bound to this execution.",
+          "workshopId": {
             "type": "string",
-            "minLength": 1,
-            "maxLength": 200
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Saved Workshop record to execute. Mutually exclusive with workflow."
           },
-          "fleetId": {
-            "description": "Fleet bound to this execution.",
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 200
+          "input": {
+            "description": "JSON business input; defaults to an empty object."
+          },
+          "binding": {
+            "description": "Execution-specific resource binding.",
+            "type": "object",
+            "properties": {
+              "pageId": {
+                "description": "Page bound to this execution.",
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              },
+              "fleetId": {
+                "description": "Fleet bound to this execution.",
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              }
+            },
+            "additionalProperties": true
           }
         },
+        "required": [
+          "workshopId"
+        ],
         "additionalProperties": true
       }
-    },
-    "required": [
-      "workflow"
-    ],
-    "additionalProperties": true,
-    "$defs": {
-      "__schema0": {
-        "anyOf": [
-          {
-            "type": "string"
-          },
-          {
-            "type": "number"
-          },
-          {
-            "type": "boolean"
-          },
-          {
-            "type": "null"
-          },
-          {
-            "type": "array",
-            "items": {
-              "$ref": "#/$defs/__schema0"
-            }
-          },
-          {
-            "type": "object",
-            "propertyNames": {
-              "type": "string"
-            },
-            "additionalProperties": {
-              "$ref": "#/$defs/__schema0"
-            }
-          }
-        ]
-      }
-    }
+    ]
   },
   "resultSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -153,12 +155,6 @@
         "description": "Final business execution state."
       },
       "output": {
-        "allOf": [
-          {
-            "$ref": "#/$defs/__schema0"
-          },
-          {}
-        ],
         "description": "JSON entry return, or null on failure or no return."
       },
       "results": {
@@ -184,6 +180,10 @@
             },
             "action": {
               "description": "Canonical Action name.",
+              "type": "string"
+            },
+            "purpose": {
+              "description": "Intent supplied by the Action caller.",
               "type": "string"
             },
             "source": {
@@ -306,13 +306,7 @@
               "additionalProperties": false
             },
             "value": {
-              "description": "Retained business value.",
-              "allOf": [
-                {
-                  "$ref": "#/$defs/__schema0"
-                },
-                {}
-              ]
+              "description": "Retained business value."
             },
             "valueOmittedReason": {
               "description": "Why a business value was omitted from the trace.",
@@ -431,40 +425,7 @@
       "results",
       "timing"
     ],
-    "additionalProperties": false,
-    "$defs": {
-      "__schema0": {
-        "anyOf": [
-          {
-            "type": "string"
-          },
-          {
-            "type": "number"
-          },
-          {
-            "type": "boolean"
-          },
-          {
-            "type": "null"
-          },
-          {
-            "type": "array",
-            "items": {
-              "$ref": "#/$defs/__schema0"
-            }
-          },
-          {
-            "type": "object",
-            "propertyNames": {
-              "type": "string"
-            },
-            "additionalProperties": {
-              "$ref": "#/$defs/__schema0"
-            }
-          }
-        ]
-      }
-    }
+    "additionalProperties": false
   },
   "outputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -504,12 +465,6 @@
             "description": "Final business execution state."
           },
           "output": {
-            "allOf": [
-              {
-                "$ref": "#/$defs/__schema0"
-              },
-              {}
-            ],
             "description": "JSON entry return, or null on failure or no return."
           },
           "results": {
@@ -535,6 +490,10 @@
                 },
                 "action": {
                   "description": "Canonical Action name.",
+                  "type": "string"
+                },
+                "purpose": {
+                  "description": "Intent supplied by the Action caller.",
                   "type": "string"
                 },
                 "source": {
@@ -657,13 +616,7 @@
                   "additionalProperties": false
                 },
                 "value": {
-                  "description": "Retained business value.",
-                  "allOf": [
-                    {
-                      "$ref": "#/$defs/__schema0"
-                    },
-                    {}
-                  ]
+                  "description": "Retained business value."
                 },
                 "valueOmittedReason": {
                   "description": "Why a business value was omitted from the trace.",
@@ -790,80 +743,142 @@
       "suggested_prompt",
       "data"
     ],
-    "additionalProperties": false,
-    "$defs": {
-      "__schema0": {
-        "anyOf": [
-          {
-            "type": "string"
-          },
-          {
-            "type": "number"
-          },
-          {
-            "type": "boolean"
-          },
-          {
-            "type": "null"
-          },
-          {
-            "type": "array",
-            "items": {
-              "$ref": "#/$defs/__schema0"
-            }
-          },
-          {
-            "type": "object",
-            "propertyNames": {
-              "type": "string"
-            },
-            "additionalProperties": {
-              "$ref": "#/$defs/__schema0"
-            }
-          }
-        ]
-      }
-    }
+    "additionalProperties": false
   },
   "failureSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "properties": {
-      "error": {
+      "code": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Stable public failure code."
+      },
+      "message": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Concise public explanation of the failure."
+      },
+      "observation": {
+        "description": "Directly observed failure fact.",
+        "type": "string"
+      },
+      "suggested_prompt": {
+        "description": "Guidance for the next recovery operation.",
+        "type": "string"
+      },
+      "details": {
+        "description": "Public details filtered by the failure definition allowlist.",
+        "type": "object",
+        "properties": {},
+        "additionalProperties": {}
+      },
+      "blockingInteractions": {
         "type": "object",
         "properties": {
-          "code": {
-            "type": "string",
-            "description": "Stable public failure code."
-          },
-          "message": {
-            "type": "string",
-            "description": "Concise public explanation for the failure code."
+          "dialogs": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Identifier of the pending dialog."
+                },
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "alert",
+                    "confirm",
+                    "prompt",
+                    "beforeunload",
+                    "file-save",
+                    "file-open",
+                    "directory"
+                  ],
+                  "description": "Kind of pending dialog."
+                },
+                "message": {
+                  "type": "string",
+                  "maxLength": 16384,
+                  "description": "Dialog message or title."
+                },
+                "defaultValue": {
+                  "type": "string",
+                  "maxLength": 4096,
+                  "description": "Default prompt value, without user input."
+                },
+                "supportedActions": {
+                  "minItems": 1,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "accept",
+                      "cancel",
+                      "select-files"
+                    ]
+                  },
+                  "description": "Operations supported by this dialog."
+                },
+                "state": {
+                  "type": "string",
+                  "enum": [
+                    "opening",
+                    "open",
+                    "resolving"
+                  ],
+                  "description": "Current native lifecycle state."
+                },
+                "multiple": {
+                  "description": "Whether the original file request accepts multiple files.",
+                  "type": "boolean"
+                },
+                "acceptTypes": {
+                  "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "downloadId": {
+                  "description": "Existing download waiting for this save destination.",
+                  "type": "string",
+                  "minLength": 1
+                },
+                "pageId": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                  "description": "Page that owns this active native dialog."
+                }
+              },
+              "required": [
+                "id",
+                "type",
+                "message",
+                "defaultValue",
+                "supportedActions",
+                "state",
+                "pageId"
+              ],
+              "additionalProperties": false
+            },
+            "description": "Current native dialogs, independently of the business result."
           }
         },
         "required": [
-          "code",
-          "message"
+          "dialogs"
         ],
-        "additionalProperties": false
-      },
-      "observation": {
-        "type": "string",
-        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
-      },
-      "suggested_prompt": {
-        "type": "string",
-        "description": "Guidance to re-observe current state and choose the next operation."
-      },
-      "details": {
-        "type": "object",
-        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
-        "additionalProperties": true
+        "additionalProperties": false,
+        "description": "Present only when current native dialogs were observed."
       }
     },
     "required": [
-      "error",
-      "observation",
-      "suggested_prompt"
+      "code",
+      "message"
     ],
     "additionalProperties": false
   }

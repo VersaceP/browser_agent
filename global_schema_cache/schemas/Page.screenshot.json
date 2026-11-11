@@ -1,8 +1,8 @@
 {
   "method": "Page.screenshot",
-  "description": "Captures the full page, viewport, rectangular region, or resolved element as an image.",
+  "description": "Captures the full page, viewport, rectangular region, or resolved element as an image. Full-page and viewport results also include page structure when available.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:f14f45a51d9e8c2fec30ee6e50e9cd2003d0d7eb9b217ea8922884f5fa221f76",
+  "catalogRevision": "sha256:2e55483dc7290e98387fd0a733945a10ed267ea41932e03ab02fd12c67f68fe5",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -69,7 +69,7 @@
             ]
           },
           "path": {
-            "description": "Output path when format is \"file\".",
+            "description": "Output file path. Defaults to an automatically named PNG in Documents/Webcross/Screenshot.",
             "type": "string"
           },
           "quality": {
@@ -100,7 +100,7 @@
   },
   "resultSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "oneOf": [
+    "anyOf": [
       {
         "type": "object",
         "properties": {
@@ -151,6 +151,283 @@
             "type": "string",
             "const": "full-page",
             "description": "Capture mode used."
+          },
+          "axTree": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "pageId": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                    "description": "The page that owns this observation."
+                  },
+                  "checkedAt": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$",
+                    "description": "When the page state was checked."
+                  },
+                  "freshness": {
+                    "type": "string",
+                    "enum": [
+                      "current",
+                      "pending"
+                    ],
+                    "description": "Whether the page stayed stable during capture."
+                  },
+                  "pendingChanges": {
+                    "type": "boolean",
+                    "description": "Whether more page changes remain pending."
+                  },
+                  "completeness": {
+                    "type": "string",
+                    "enum": [
+                      "complete",
+                      "partial"
+                    ],
+                    "description": "Whether every accessible frame was observed."
+                  },
+                  "mode": {
+                    "type": "string",
+                    "const": "full",
+                    "description": "The current page view artifact."
+                  },
+                  "version": {
+                    "type": "string",
+                    "pattern": "^v_[0-9a-f]{16}_[0-9a-z]+$",
+                    "description": "The current page view identifier."
+                  },
+                  "artifact": {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "full",
+                        "description": "The current page view artifact."
+                      },
+                      "path": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Read the observation artifact at this path."
+                      },
+                      "format": {
+                        "type": "string",
+                        "const": "text",
+                        "description": "The observation text format."
+                      },
+                      "bytes": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991,
+                        "description": "Artifact size in bytes."
+                      },
+                      "sha256": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}$",
+                        "description": "Artifact content hash."
+                      },
+                      "expiresAt": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$",
+                        "description": "The time until the artifact is available."
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "path",
+                      "format",
+                      "bytes",
+                      "sha256",
+                      "expiresAt"
+                    ],
+                    "additionalProperties": false,
+                    "description": "The current page view artifact reference."
+                  },
+                  "limitations": {
+                    "description": "Capture limitations, including failure reasons when reusing a pending view.",
+                    "maxItems": 129,
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "frameId": {
+                          "description": "The affected frame, when its current identity is available.",
+                          "type": "string",
+                          "pattern": "^f_[0-9a-f]{32}$"
+                        },
+                        "reason": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Capture reason, or partial-observation when no specific reason is available."
+                        }
+                      },
+                      "required": [
+                        "reason"
+                      ],
+                      "additionalProperties": false,
+                      "description": "A limitation of the captured page view."
+                    }
+                  }
+                },
+                "required": [
+                  "pageId",
+                  "checkedAt",
+                  "freshness",
+                  "pendingChanges",
+                  "completeness",
+                  "mode",
+                  "version",
+                  "artifact"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "pageId": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                    "description": "The page that owns this observation."
+                  },
+                  "mode": {
+                    "type": "string",
+                    "const": "full",
+                    "description": "The full page observation request."
+                  },
+                  "checkedAt": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$",
+                    "description": "When the page state was checked."
+                  },
+                  "freshness": {
+                    "type": "string",
+                    "const": "unavailable",
+                    "description": "No readable page observation is available for this request."
+                  },
+                  "reason": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Why this observation is unavailable."
+                  }
+                },
+                "required": [
+                  "pageId",
+                  "mode",
+                  "checkedAt",
+                  "freshness",
+                  "reason"
+                ],
+                "additionalProperties": false
+              }
+            ],
+            "description": "Page structure with its availability, freshness, and completeness."
+          },
+          "blockingInteractions": {
+            "type": "object",
+            "properties": {
+              "dialogs": {
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Identifier of the pending dialog."
+                    },
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "alert",
+                        "confirm",
+                        "prompt",
+                        "beforeunload",
+                        "file-save",
+                        "file-open",
+                        "directory"
+                      ],
+                      "description": "Kind of pending dialog."
+                    },
+                    "message": {
+                      "type": "string",
+                      "maxLength": 16384,
+                      "description": "Dialog message or title."
+                    },
+                    "defaultValue": {
+                      "type": "string",
+                      "maxLength": 4096,
+                      "description": "Default prompt value, without user input."
+                    },
+                    "supportedActions": {
+                      "minItems": 1,
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "enum": [
+                          "accept",
+                          "cancel",
+                          "select-files"
+                        ]
+                      },
+                      "description": "Operations supported by this dialog."
+                    },
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "opening",
+                        "open",
+                        "resolving"
+                      ],
+                      "description": "Current native lifecycle state."
+                    },
+                    "multiple": {
+                      "description": "Whether the original file request accepts multiple files.",
+                      "type": "boolean"
+                    },
+                    "acceptTypes": {
+                      "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "downloadId": {
+                      "description": "Existing download waiting for this save destination.",
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "pageId": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                      "description": "Page that owns this active native dialog."
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "type",
+                    "message",
+                    "defaultValue",
+                    "supportedActions",
+                    "state",
+                    "pageId"
+                  ],
+                  "additionalProperties": false
+                },
+                "description": "Current native dialogs, independently of the business result."
+              }
+            },
+            "required": [
+              "dialogs"
+            ],
+            "additionalProperties": false,
+            "description": "Present only when current native dialogs were observed."
           }
         },
         "required": [
@@ -160,7 +437,8 @@
           "height",
           "scaleFactor",
           "target",
-          "mode"
+          "mode",
+          "axTree"
         ],
         "additionalProperties": false
       },
@@ -214,6 +492,283 @@
             "type": "string",
             "const": "viewport",
             "description": "Capture mode used."
+          },
+          "axTree": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "pageId": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                    "description": "The page that owns this observation."
+                  },
+                  "checkedAt": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$",
+                    "description": "When the page state was checked."
+                  },
+                  "freshness": {
+                    "type": "string",
+                    "enum": [
+                      "current",
+                      "pending"
+                    ],
+                    "description": "Whether the page stayed stable during capture."
+                  },
+                  "pendingChanges": {
+                    "type": "boolean",
+                    "description": "Whether more page changes remain pending."
+                  },
+                  "completeness": {
+                    "type": "string",
+                    "enum": [
+                      "complete",
+                      "partial"
+                    ],
+                    "description": "Whether every accessible frame was observed."
+                  },
+                  "mode": {
+                    "type": "string",
+                    "const": "full",
+                    "description": "The current page view artifact."
+                  },
+                  "version": {
+                    "type": "string",
+                    "pattern": "^v_[0-9a-f]{16}_[0-9a-z]+$",
+                    "description": "The current page view identifier."
+                  },
+                  "artifact": {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "full",
+                        "description": "The current page view artifact."
+                      },
+                      "path": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Read the observation artifact at this path."
+                      },
+                      "format": {
+                        "type": "string",
+                        "const": "text",
+                        "description": "The observation text format."
+                      },
+                      "bytes": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991,
+                        "description": "Artifact size in bytes."
+                      },
+                      "sha256": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}$",
+                        "description": "Artifact content hash."
+                      },
+                      "expiresAt": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$",
+                        "description": "The time until the artifact is available."
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "path",
+                      "format",
+                      "bytes",
+                      "sha256",
+                      "expiresAt"
+                    ],
+                    "additionalProperties": false,
+                    "description": "The current page view artifact reference."
+                  },
+                  "limitations": {
+                    "description": "Capture limitations, including failure reasons when reusing a pending view.",
+                    "maxItems": 129,
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "frameId": {
+                          "description": "The affected frame, when its current identity is available.",
+                          "type": "string",
+                          "pattern": "^f_[0-9a-f]{32}$"
+                        },
+                        "reason": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Capture reason, or partial-observation when no specific reason is available."
+                        }
+                      },
+                      "required": [
+                        "reason"
+                      ],
+                      "additionalProperties": false,
+                      "description": "A limitation of the captured page view."
+                    }
+                  }
+                },
+                "required": [
+                  "pageId",
+                  "checkedAt",
+                  "freshness",
+                  "pendingChanges",
+                  "completeness",
+                  "mode",
+                  "version",
+                  "artifact"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "pageId": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                    "description": "The page that owns this observation."
+                  },
+                  "mode": {
+                    "type": "string",
+                    "const": "full",
+                    "description": "The full page observation request."
+                  },
+                  "checkedAt": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$",
+                    "description": "When the page state was checked."
+                  },
+                  "freshness": {
+                    "type": "string",
+                    "const": "unavailable",
+                    "description": "No readable page observation is available for this request."
+                  },
+                  "reason": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Why this observation is unavailable."
+                  }
+                },
+                "required": [
+                  "pageId",
+                  "mode",
+                  "checkedAt",
+                  "freshness",
+                  "reason"
+                ],
+                "additionalProperties": false
+              }
+            ],
+            "description": "Page structure with its availability, freshness, and completeness."
+          },
+          "blockingInteractions": {
+            "type": "object",
+            "properties": {
+              "dialogs": {
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Identifier of the pending dialog."
+                    },
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "alert",
+                        "confirm",
+                        "prompt",
+                        "beforeunload",
+                        "file-save",
+                        "file-open",
+                        "directory"
+                      ],
+                      "description": "Kind of pending dialog."
+                    },
+                    "message": {
+                      "type": "string",
+                      "maxLength": 16384,
+                      "description": "Dialog message or title."
+                    },
+                    "defaultValue": {
+                      "type": "string",
+                      "maxLength": 4096,
+                      "description": "Default prompt value, without user input."
+                    },
+                    "supportedActions": {
+                      "minItems": 1,
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "enum": [
+                          "accept",
+                          "cancel",
+                          "select-files"
+                        ]
+                      },
+                      "description": "Operations supported by this dialog."
+                    },
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "opening",
+                        "open",
+                        "resolving"
+                      ],
+                      "description": "Current native lifecycle state."
+                    },
+                    "multiple": {
+                      "description": "Whether the original file request accepts multiple files.",
+                      "type": "boolean"
+                    },
+                    "acceptTypes": {
+                      "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "downloadId": {
+                      "description": "Existing download waiting for this save destination.",
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "pageId": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                      "description": "Page that owns this active native dialog."
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "type",
+                    "message",
+                    "defaultValue",
+                    "supportedActions",
+                    "state",
+                    "pageId"
+                  ],
+                  "additionalProperties": false
+                },
+                "description": "Current native dialogs, independently of the business result."
+              }
+            },
+            "required": [
+              "dialogs"
+            ],
+            "additionalProperties": false,
+            "description": "Present only when current native dialogs were observed."
           }
         },
         "required": [
@@ -223,7 +778,8 @@
           "height",
           "scaleFactor",
           "target",
-          "mode"
+          "mode",
+          "axTree"
         ],
         "additionalProperties": false
       },
@@ -277,6 +833,108 @@
             "type": "string",
             "const": "region",
             "description": "Capture mode used."
+          },
+          "blockingInteractions": {
+            "type": "object",
+            "properties": {
+              "dialogs": {
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Identifier of the pending dialog."
+                    },
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "alert",
+                        "confirm",
+                        "prompt",
+                        "beforeunload",
+                        "file-save",
+                        "file-open",
+                        "directory"
+                      ],
+                      "description": "Kind of pending dialog."
+                    },
+                    "message": {
+                      "type": "string",
+                      "maxLength": 16384,
+                      "description": "Dialog message or title."
+                    },
+                    "defaultValue": {
+                      "type": "string",
+                      "maxLength": 4096,
+                      "description": "Default prompt value, without user input."
+                    },
+                    "supportedActions": {
+                      "minItems": 1,
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "enum": [
+                          "accept",
+                          "cancel",
+                          "select-files"
+                        ]
+                      },
+                      "description": "Operations supported by this dialog."
+                    },
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "opening",
+                        "open",
+                        "resolving"
+                      ],
+                      "description": "Current native lifecycle state."
+                    },
+                    "multiple": {
+                      "description": "Whether the original file request accepts multiple files.",
+                      "type": "boolean"
+                    },
+                    "acceptTypes": {
+                      "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "downloadId": {
+                      "description": "Existing download waiting for this save destination.",
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "pageId": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                      "description": "Page that owns this active native dialog."
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "type",
+                    "message",
+                    "defaultValue",
+                    "supportedActions",
+                    "state",
+                    "pageId"
+                  ],
+                  "additionalProperties": false
+                },
+                "description": "Current native dialogs, independently of the business result."
+              }
+            },
+            "required": [
+              "dialogs"
+            ],
+            "additionalProperties": false,
+            "description": "Present only when current native dialogs were observed."
           }
         },
         "required": [
@@ -433,6 +1091,108 @@
               }
             ],
             "description": "Optional unified target detail; null means the screenshot succeeded but the detail read did not."
+          },
+          "blockingInteractions": {
+            "type": "object",
+            "properties": {
+              "dialogs": {
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Identifier of the pending dialog."
+                    },
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "alert",
+                        "confirm",
+                        "prompt",
+                        "beforeunload",
+                        "file-save",
+                        "file-open",
+                        "directory"
+                      ],
+                      "description": "Kind of pending dialog."
+                    },
+                    "message": {
+                      "type": "string",
+                      "maxLength": 16384,
+                      "description": "Dialog message or title."
+                    },
+                    "defaultValue": {
+                      "type": "string",
+                      "maxLength": 4096,
+                      "description": "Default prompt value, without user input."
+                    },
+                    "supportedActions": {
+                      "minItems": 1,
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "enum": [
+                          "accept",
+                          "cancel",
+                          "select-files"
+                        ]
+                      },
+                      "description": "Operations supported by this dialog."
+                    },
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "opening",
+                        "open",
+                        "resolving"
+                      ],
+                      "description": "Current native lifecycle state."
+                    },
+                    "multiple": {
+                      "description": "Whether the original file request accepts multiple files.",
+                      "type": "boolean"
+                    },
+                    "acceptTypes": {
+                      "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "downloadId": {
+                      "description": "Existing download waiting for this save destination.",
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "pageId": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                      "description": "Page that owns this active native dialog."
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "type",
+                    "message",
+                    "defaultValue",
+                    "supportedActions",
+                    "state",
+                    "pageId"
+                  ],
+                  "additionalProperties": false
+                },
+                "description": "Current native dialogs, independently of the business result."
+              }
+            },
+            "required": [
+              "dialogs"
+            ],
+            "additionalProperties": false,
+            "description": "Present only when current native dialogs were observed."
           }
         },
         "required": [
@@ -463,7 +1223,7 @@
       },
       "data": {
         "description": "Validated business result returned by the Action.",
-        "oneOf": [
+        "anyOf": [
           {
             "type": "object",
             "properties": {
@@ -514,6 +1274,283 @@
                 "type": "string",
                 "const": "full-page",
                 "description": "Capture mode used."
+              },
+              "axTree": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "pageId": {
+                        "type": "string",
+                        "format": "uuid",
+                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                        "description": "The page that owns this observation."
+                      },
+                      "checkedAt": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$",
+                        "description": "When the page state was checked."
+                      },
+                      "freshness": {
+                        "type": "string",
+                        "enum": [
+                          "current",
+                          "pending"
+                        ],
+                        "description": "Whether the page stayed stable during capture."
+                      },
+                      "pendingChanges": {
+                        "type": "boolean",
+                        "description": "Whether more page changes remain pending."
+                      },
+                      "completeness": {
+                        "type": "string",
+                        "enum": [
+                          "complete",
+                          "partial"
+                        ],
+                        "description": "Whether every accessible frame was observed."
+                      },
+                      "mode": {
+                        "type": "string",
+                        "const": "full",
+                        "description": "The current page view artifact."
+                      },
+                      "version": {
+                        "type": "string",
+                        "pattern": "^v_[0-9a-f]{16}_[0-9a-z]+$",
+                        "description": "The current page view identifier."
+                      },
+                      "artifact": {
+                        "type": "object",
+                        "properties": {
+                          "kind": {
+                            "type": "string",
+                            "const": "full",
+                            "description": "The current page view artifact."
+                          },
+                          "path": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Read the observation artifact at this path."
+                          },
+                          "format": {
+                            "type": "string",
+                            "const": "text",
+                            "description": "The observation text format."
+                          },
+                          "bytes": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991,
+                            "description": "Artifact size in bytes."
+                          },
+                          "sha256": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{64}$",
+                            "description": "Artifact content hash."
+                          },
+                          "expiresAt": {
+                            "type": "string",
+                            "format": "date-time",
+                            "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$",
+                            "description": "The time until the artifact is available."
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "path",
+                          "format",
+                          "bytes",
+                          "sha256",
+                          "expiresAt"
+                        ],
+                        "additionalProperties": false,
+                        "description": "The current page view artifact reference."
+                      },
+                      "limitations": {
+                        "description": "Capture limitations, including failure reasons when reusing a pending view.",
+                        "maxItems": 129,
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "frameId": {
+                              "description": "The affected frame, when its current identity is available.",
+                              "type": "string",
+                              "pattern": "^f_[0-9a-f]{32}$"
+                            },
+                            "reason": {
+                              "type": "string",
+                              "minLength": 1,
+                              "description": "Capture reason, or partial-observation when no specific reason is available."
+                            }
+                          },
+                          "required": [
+                            "reason"
+                          ],
+                          "additionalProperties": false,
+                          "description": "A limitation of the captured page view."
+                        }
+                      }
+                    },
+                    "required": [
+                      "pageId",
+                      "checkedAt",
+                      "freshness",
+                      "pendingChanges",
+                      "completeness",
+                      "mode",
+                      "version",
+                      "artifact"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "pageId": {
+                        "type": "string",
+                        "format": "uuid",
+                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                        "description": "The page that owns this observation."
+                      },
+                      "mode": {
+                        "type": "string",
+                        "const": "full",
+                        "description": "The full page observation request."
+                      },
+                      "checkedAt": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$",
+                        "description": "When the page state was checked."
+                      },
+                      "freshness": {
+                        "type": "string",
+                        "const": "unavailable",
+                        "description": "No readable page observation is available for this request."
+                      },
+                      "reason": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Why this observation is unavailable."
+                      }
+                    },
+                    "required": [
+                      "pageId",
+                      "mode",
+                      "checkedAt",
+                      "freshness",
+                      "reason"
+                    ],
+                    "additionalProperties": false
+                  }
+                ],
+                "description": "Page structure with its availability, freshness, and completeness."
+              },
+              "blockingInteractions": {
+                "type": "object",
+                "properties": {
+                  "dialogs": {
+                    "minItems": 1,
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Identifier of the pending dialog."
+                        },
+                        "type": {
+                          "type": "string",
+                          "enum": [
+                            "alert",
+                            "confirm",
+                            "prompt",
+                            "beforeunload",
+                            "file-save",
+                            "file-open",
+                            "directory"
+                          ],
+                          "description": "Kind of pending dialog."
+                        },
+                        "message": {
+                          "type": "string",
+                          "maxLength": 16384,
+                          "description": "Dialog message or title."
+                        },
+                        "defaultValue": {
+                          "type": "string",
+                          "maxLength": 4096,
+                          "description": "Default prompt value, without user input."
+                        },
+                        "supportedActions": {
+                          "minItems": 1,
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "enum": [
+                              "accept",
+                              "cancel",
+                              "select-files"
+                            ]
+                          },
+                          "description": "Operations supported by this dialog."
+                        },
+                        "state": {
+                          "type": "string",
+                          "enum": [
+                            "opening",
+                            "open",
+                            "resolving"
+                          ],
+                          "description": "Current native lifecycle state."
+                        },
+                        "multiple": {
+                          "description": "Whether the original file request accepts multiple files.",
+                          "type": "boolean"
+                        },
+                        "acceptTypes": {
+                          "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "downloadId": {
+                          "description": "Existing download waiting for this save destination.",
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "pageId": {
+                          "type": "string",
+                          "format": "uuid",
+                          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                          "description": "Page that owns this active native dialog."
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "type",
+                        "message",
+                        "defaultValue",
+                        "supportedActions",
+                        "state",
+                        "pageId"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "description": "Current native dialogs, independently of the business result."
+                  }
+                },
+                "required": [
+                  "dialogs"
+                ],
+                "additionalProperties": false,
+                "description": "Present only when current native dialogs were observed."
               }
             },
             "required": [
@@ -523,7 +1560,8 @@
               "height",
               "scaleFactor",
               "target",
-              "mode"
+              "mode",
+              "axTree"
             ],
             "additionalProperties": false
           },
@@ -577,6 +1615,283 @@
                 "type": "string",
                 "const": "viewport",
                 "description": "Capture mode used."
+              },
+              "axTree": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "pageId": {
+                        "type": "string",
+                        "format": "uuid",
+                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                        "description": "The page that owns this observation."
+                      },
+                      "checkedAt": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$",
+                        "description": "When the page state was checked."
+                      },
+                      "freshness": {
+                        "type": "string",
+                        "enum": [
+                          "current",
+                          "pending"
+                        ],
+                        "description": "Whether the page stayed stable during capture."
+                      },
+                      "pendingChanges": {
+                        "type": "boolean",
+                        "description": "Whether more page changes remain pending."
+                      },
+                      "completeness": {
+                        "type": "string",
+                        "enum": [
+                          "complete",
+                          "partial"
+                        ],
+                        "description": "Whether every accessible frame was observed."
+                      },
+                      "mode": {
+                        "type": "string",
+                        "const": "full",
+                        "description": "The current page view artifact."
+                      },
+                      "version": {
+                        "type": "string",
+                        "pattern": "^v_[0-9a-f]{16}_[0-9a-z]+$",
+                        "description": "The current page view identifier."
+                      },
+                      "artifact": {
+                        "type": "object",
+                        "properties": {
+                          "kind": {
+                            "type": "string",
+                            "const": "full",
+                            "description": "The current page view artifact."
+                          },
+                          "path": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Read the observation artifact at this path."
+                          },
+                          "format": {
+                            "type": "string",
+                            "const": "text",
+                            "description": "The observation text format."
+                          },
+                          "bytes": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991,
+                            "description": "Artifact size in bytes."
+                          },
+                          "sha256": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{64}$",
+                            "description": "Artifact content hash."
+                          },
+                          "expiresAt": {
+                            "type": "string",
+                            "format": "date-time",
+                            "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$",
+                            "description": "The time until the artifact is available."
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "path",
+                          "format",
+                          "bytes",
+                          "sha256",
+                          "expiresAt"
+                        ],
+                        "additionalProperties": false,
+                        "description": "The current page view artifact reference."
+                      },
+                      "limitations": {
+                        "description": "Capture limitations, including failure reasons when reusing a pending view.",
+                        "maxItems": 129,
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "frameId": {
+                              "description": "The affected frame, when its current identity is available.",
+                              "type": "string",
+                              "pattern": "^f_[0-9a-f]{32}$"
+                            },
+                            "reason": {
+                              "type": "string",
+                              "minLength": 1,
+                              "description": "Capture reason, or partial-observation when no specific reason is available."
+                            }
+                          },
+                          "required": [
+                            "reason"
+                          ],
+                          "additionalProperties": false,
+                          "description": "A limitation of the captured page view."
+                        }
+                      }
+                    },
+                    "required": [
+                      "pageId",
+                      "checkedAt",
+                      "freshness",
+                      "pendingChanges",
+                      "completeness",
+                      "mode",
+                      "version",
+                      "artifact"
+                    ],
+                    "additionalProperties": false
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "pageId": {
+                        "type": "string",
+                        "format": "uuid",
+                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                        "description": "The page that owns this observation."
+                      },
+                      "mode": {
+                        "type": "string",
+                        "const": "full",
+                        "description": "The full page observation request."
+                      },
+                      "checkedAt": {
+                        "type": "string",
+                        "format": "date-time",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$",
+                        "description": "When the page state was checked."
+                      },
+                      "freshness": {
+                        "type": "string",
+                        "const": "unavailable",
+                        "description": "No readable page observation is available for this request."
+                      },
+                      "reason": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Why this observation is unavailable."
+                      }
+                    },
+                    "required": [
+                      "pageId",
+                      "mode",
+                      "checkedAt",
+                      "freshness",
+                      "reason"
+                    ],
+                    "additionalProperties": false
+                  }
+                ],
+                "description": "Page structure with its availability, freshness, and completeness."
+              },
+              "blockingInteractions": {
+                "type": "object",
+                "properties": {
+                  "dialogs": {
+                    "minItems": 1,
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Identifier of the pending dialog."
+                        },
+                        "type": {
+                          "type": "string",
+                          "enum": [
+                            "alert",
+                            "confirm",
+                            "prompt",
+                            "beforeunload",
+                            "file-save",
+                            "file-open",
+                            "directory"
+                          ],
+                          "description": "Kind of pending dialog."
+                        },
+                        "message": {
+                          "type": "string",
+                          "maxLength": 16384,
+                          "description": "Dialog message or title."
+                        },
+                        "defaultValue": {
+                          "type": "string",
+                          "maxLength": 4096,
+                          "description": "Default prompt value, without user input."
+                        },
+                        "supportedActions": {
+                          "minItems": 1,
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "enum": [
+                              "accept",
+                              "cancel",
+                              "select-files"
+                            ]
+                          },
+                          "description": "Operations supported by this dialog."
+                        },
+                        "state": {
+                          "type": "string",
+                          "enum": [
+                            "opening",
+                            "open",
+                            "resolving"
+                          ],
+                          "description": "Current native lifecycle state."
+                        },
+                        "multiple": {
+                          "description": "Whether the original file request accepts multiple files.",
+                          "type": "boolean"
+                        },
+                        "acceptTypes": {
+                          "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "downloadId": {
+                          "description": "Existing download waiting for this save destination.",
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "pageId": {
+                          "type": "string",
+                          "format": "uuid",
+                          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                          "description": "Page that owns this active native dialog."
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "type",
+                        "message",
+                        "defaultValue",
+                        "supportedActions",
+                        "state",
+                        "pageId"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "description": "Current native dialogs, independently of the business result."
+                  }
+                },
+                "required": [
+                  "dialogs"
+                ],
+                "additionalProperties": false,
+                "description": "Present only when current native dialogs were observed."
               }
             },
             "required": [
@@ -586,7 +1901,8 @@
               "height",
               "scaleFactor",
               "target",
-              "mode"
+              "mode",
+              "axTree"
             ],
             "additionalProperties": false
           },
@@ -640,6 +1956,108 @@
                 "type": "string",
                 "const": "region",
                 "description": "Capture mode used."
+              },
+              "blockingInteractions": {
+                "type": "object",
+                "properties": {
+                  "dialogs": {
+                    "minItems": 1,
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Identifier of the pending dialog."
+                        },
+                        "type": {
+                          "type": "string",
+                          "enum": [
+                            "alert",
+                            "confirm",
+                            "prompt",
+                            "beforeunload",
+                            "file-save",
+                            "file-open",
+                            "directory"
+                          ],
+                          "description": "Kind of pending dialog."
+                        },
+                        "message": {
+                          "type": "string",
+                          "maxLength": 16384,
+                          "description": "Dialog message or title."
+                        },
+                        "defaultValue": {
+                          "type": "string",
+                          "maxLength": 4096,
+                          "description": "Default prompt value, without user input."
+                        },
+                        "supportedActions": {
+                          "minItems": 1,
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "enum": [
+                              "accept",
+                              "cancel",
+                              "select-files"
+                            ]
+                          },
+                          "description": "Operations supported by this dialog."
+                        },
+                        "state": {
+                          "type": "string",
+                          "enum": [
+                            "opening",
+                            "open",
+                            "resolving"
+                          ],
+                          "description": "Current native lifecycle state."
+                        },
+                        "multiple": {
+                          "description": "Whether the original file request accepts multiple files.",
+                          "type": "boolean"
+                        },
+                        "acceptTypes": {
+                          "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "downloadId": {
+                          "description": "Existing download waiting for this save destination.",
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "pageId": {
+                          "type": "string",
+                          "format": "uuid",
+                          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                          "description": "Page that owns this active native dialog."
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "type",
+                        "message",
+                        "defaultValue",
+                        "supportedActions",
+                        "state",
+                        "pageId"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "description": "Current native dialogs, independently of the business result."
+                  }
+                },
+                "required": [
+                  "dialogs"
+                ],
+                "additionalProperties": false,
+                "description": "Present only when current native dialogs were observed."
               }
             },
             "required": [
@@ -796,6 +2214,108 @@
                   }
                 ],
                 "description": "Optional unified target detail; null means the screenshot succeeded but the detail read did not."
+              },
+              "blockingInteractions": {
+                "type": "object",
+                "properties": {
+                  "dialogs": {
+                    "minItems": 1,
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Identifier of the pending dialog."
+                        },
+                        "type": {
+                          "type": "string",
+                          "enum": [
+                            "alert",
+                            "confirm",
+                            "prompt",
+                            "beforeunload",
+                            "file-save",
+                            "file-open",
+                            "directory"
+                          ],
+                          "description": "Kind of pending dialog."
+                        },
+                        "message": {
+                          "type": "string",
+                          "maxLength": 16384,
+                          "description": "Dialog message or title."
+                        },
+                        "defaultValue": {
+                          "type": "string",
+                          "maxLength": 4096,
+                          "description": "Default prompt value, without user input."
+                        },
+                        "supportedActions": {
+                          "minItems": 1,
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "enum": [
+                              "accept",
+                              "cancel",
+                              "select-files"
+                            ]
+                          },
+                          "description": "Operations supported by this dialog."
+                        },
+                        "state": {
+                          "type": "string",
+                          "enum": [
+                            "opening",
+                            "open",
+                            "resolving"
+                          ],
+                          "description": "Current native lifecycle state."
+                        },
+                        "multiple": {
+                          "description": "Whether the original file request accepts multiple files.",
+                          "type": "boolean"
+                        },
+                        "acceptTypes": {
+                          "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "downloadId": {
+                          "description": "Existing download waiting for this save destination.",
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "pageId": {
+                          "type": "string",
+                          "format": "uuid",
+                          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                          "description": "Page that owns this active native dialog."
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "type",
+                        "message",
+                        "defaultValue",
+                        "supportedActions",
+                        "state",
+                        "pageId"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "description": "Current native dialogs, independently of the business result."
+                  }
+                },
+                "required": [
+                  "dialogs"
+                ],
+                "additionalProperties": false,
+                "description": "Present only when current native dialogs were observed."
               }
             },
             "required": [
@@ -821,44 +2341,139 @@
     "additionalProperties": false
   },
   "failureSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "properties": {
-      "error": {
+      "code": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Stable public failure code."
+      },
+      "message": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Concise public explanation of the failure."
+      },
+      "observation": {
+        "description": "Directly observed failure fact.",
+        "type": "string"
+      },
+      "suggested_prompt": {
+        "description": "Guidance for the next recovery operation.",
+        "type": "string"
+      },
+      "details": {
+        "description": "Public details filtered by the failure definition allowlist.",
+        "type": "object",
+        "properties": {},
+        "additionalProperties": {}
+      },
+      "blockingInteractions": {
         "type": "object",
         "properties": {
-          "code": {
-            "type": "string",
-            "description": "Stable public failure code."
-          },
-          "message": {
-            "type": "string",
-            "description": "Concise public explanation for the failure code."
+          "dialogs": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Identifier of the pending dialog."
+                },
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "alert",
+                    "confirm",
+                    "prompt",
+                    "beforeunload",
+                    "file-save",
+                    "file-open",
+                    "directory"
+                  ],
+                  "description": "Kind of pending dialog."
+                },
+                "message": {
+                  "type": "string",
+                  "maxLength": 16384,
+                  "description": "Dialog message or title."
+                },
+                "defaultValue": {
+                  "type": "string",
+                  "maxLength": 4096,
+                  "description": "Default prompt value, without user input."
+                },
+                "supportedActions": {
+                  "minItems": 1,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "accept",
+                      "cancel",
+                      "select-files"
+                    ]
+                  },
+                  "description": "Operations supported by this dialog."
+                },
+                "state": {
+                  "type": "string",
+                  "enum": [
+                    "opening",
+                    "open",
+                    "resolving"
+                  ],
+                  "description": "Current native lifecycle state."
+                },
+                "multiple": {
+                  "description": "Whether the original file request accepts multiple files.",
+                  "type": "boolean"
+                },
+                "acceptTypes": {
+                  "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "downloadId": {
+                  "description": "Existing download waiting for this save destination.",
+                  "type": "string",
+                  "minLength": 1
+                },
+                "pageId": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                  "description": "Page that owns this active native dialog."
+                }
+              },
+              "required": [
+                "id",
+                "type",
+                "message",
+                "defaultValue",
+                "supportedActions",
+                "state",
+                "pageId"
+              ],
+              "additionalProperties": false
+            },
+            "description": "Current native dialogs, independently of the business result."
           }
         },
         "required": [
-          "code",
-          "message"
+          "dialogs"
         ],
-        "additionalProperties": false
-      },
-      "observation": {
-        "type": "string",
-        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
-      },
-      "suggested_prompt": {
-        "type": "string",
-        "description": "Guidance to re-observe current state and choose the next operation."
-      },
-      "details": {
-        "type": "object",
-        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
-        "additionalProperties": true
+        "additionalProperties": false,
+        "description": "Present only when current native dialogs were observed."
       }
     },
     "required": [
-      "error",
-      "observation",
-      "suggested_prompt"
+      "code",
+      "message"
     ],
     "additionalProperties": false
   },

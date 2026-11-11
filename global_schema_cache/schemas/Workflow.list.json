@@ -1,0 +1,679 @@
+{
+  "method": "Workflow.list",
+  "description": "Lists saved Workshop workflows, including disabled records. query and url are mutually exclusive; either can be combined with folderId and limit. Pass workshopId alone to read a complete manifest. limit must be an integer from 1 to 1000 and defaults to 500.",
+  "requiresPurpose": false,
+  "catalogRevision": "sha256:2e55483dc7290e98387fd0a733945a10ed267ea41932e03ab02fd12c67f68fe5",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "workshopId": {
+        "description": "Saved record ID. Use alone, without query, url, folderId, or limit, to read its complete manifest.",
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+      },
+      "query": {
+        "description": "Non-empty, case-insensitive partial title (name) or description search. Mutually exclusive with url and workshopId.",
+        "type": "string",
+        "minLength": 1
+      },
+      "url": {
+        "description": "Match the URL hostname against availability rules, including disabled records. Mutually exclusive with query and workshopId.",
+        "type": "string",
+        "format": "uri"
+      },
+      "folderId": {
+        "description": "Folder filter; null selects root, omission selects all folders.",
+        "anyOf": [
+          {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "limit": {
+        "description": "Maximum summaries to return; integer from 1 to 1000, defaults to 500. Cannot be combined with workshopId.",
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 1000
+      }
+    },
+    "additionalProperties": true
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "revision": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991,
+        "description": "Current catalog revision."
+      },
+      "folders": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "folderId": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+              "description": "Saved folder ID."
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "description": "Folder display name."
+            },
+            "sortOrder": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991,
+              "description": "Folder catalog order."
+            }
+          },
+          "required": [
+            "folderId",
+            "name",
+            "sortOrder"
+          ],
+          "additionalProperties": false
+        },
+        "description": "Current catalog folders."
+      },
+      "items": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "workshopId": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+              "description": "Saved workflow record ID."
+            },
+            "folderId": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Folder ID; null for root."
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200,
+              "description": "Workflow display name."
+            },
+            "description": {
+              "type": "string",
+              "maxLength": 2000,
+              "description": "Workflow purpose."
+            },
+            "hostnamePatterns": {
+              "maxItems": 32,
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "description": "Hostname patterns controlling browser menu availability."
+            },
+            "allHosts": {
+              "type": "boolean",
+              "description": "Whether menu availability covers all hosts."
+            },
+            "sortOrder": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991,
+              "description": "Workflow catalog order."
+            },
+            "enabled": {
+              "type": "boolean",
+              "description": "Whether the workflow appears in browser menus."
+            },
+            "revision": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991,
+              "description": "Saved workflow revision."
+            },
+            "manifest": {
+              "description": "Full saved document, returned only for an exact ID lookup.",
+              "type": "object",
+              "properties": {
+                "schemaVersion": {
+                  "type": "number",
+                  "const": 1,
+                  "description": "Workflow document schema version."
+                },
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200,
+                  "description": "Human-readable script name."
+                },
+                "description": {
+                  "description": "Optional script description.",
+                  "type": "string",
+                  "maxLength": 2000
+                },
+                "timeoutMs": {
+                  "description": "Total deadline in milliseconds, including pauses.",
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 3600000
+                },
+                "entry": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 512,
+                  "description": "Module exporting the entry function."
+                },
+                "files": {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 512
+                  },
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "description": "Package sources indexed by normalized path."
+                },
+                "kind": {
+                  "type": "string",
+                  "const": "webcross-workshop",
+                  "description": "Workshop document format."
+                },
+                "availability": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "mode": {
+                          "type": "string",
+                          "const": "hosts",
+                          "description": "Show in menus on matching hostnames."
+                        },
+                        "hostnamePatterns": {
+                          "minItems": 1,
+                          "maxItems": 32,
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 256
+                          },
+                          "description": "Hostname patterns controlling browser menu availability."
+                        }
+                      },
+                      "required": [
+                        "mode",
+                        "hostnamePatterns"
+                      ],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "mode": {
+                          "type": "string",
+                          "const": "all-hosts",
+                          "description": "Show in menus on every hostname."
+                        }
+                      },
+                      "required": [
+                        "mode"
+                      ],
+                      "additionalProperties": false
+                    }
+                  ],
+                  "description": "Browser menu availability; does not restrict explicit Agent execution."
+                }
+              },
+              "required": [
+                "schemaVersion",
+                "name",
+                "entry",
+                "files",
+                "kind",
+                "availability"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "workshopId",
+            "folderId",
+            "name",
+            "description",
+            "hostnamePatterns",
+            "allHosts",
+            "sortOrder",
+            "enabled",
+            "revision"
+          ],
+          "additionalProperties": false
+        },
+        "description": "Matching workflow summaries; exact ID lookups include the manifest."
+      }
+    },
+    "required": [
+      "revision",
+      "folders",
+      "items"
+    ],
+    "additionalProperties": false
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Facts directly observed by the Action or returned by its declared result schema."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "data": {
+        "description": "Validated business result returned by the Action.",
+        "type": "object",
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Current catalog revision."
+          },
+          "folders": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "folderId": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                  "description": "Saved folder ID."
+                },
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200,
+                  "description": "Folder display name."
+                },
+                "sortOrder": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991,
+                  "description": "Folder catalog order."
+                }
+              },
+              "required": [
+                "folderId",
+                "name",
+                "sortOrder"
+              ],
+              "additionalProperties": false
+            },
+            "description": "Current catalog folders."
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "workshopId": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                  "description": "Saved workflow record ID."
+                },
+                "folderId": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Folder ID; null for root."
+                },
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200,
+                  "description": "Workflow display name."
+                },
+                "description": {
+                  "type": "string",
+                  "maxLength": 2000,
+                  "description": "Workflow purpose."
+                },
+                "hostnamePatterns": {
+                  "maxItems": 32,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  "description": "Hostname patterns controlling browser menu availability."
+                },
+                "allHosts": {
+                  "type": "boolean",
+                  "description": "Whether menu availability covers all hosts."
+                },
+                "sortOrder": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991,
+                  "description": "Workflow catalog order."
+                },
+                "enabled": {
+                  "type": "boolean",
+                  "description": "Whether the workflow appears in browser menus."
+                },
+                "revision": {
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991,
+                  "description": "Saved workflow revision."
+                },
+                "manifest": {
+                  "description": "Full saved document, returned only for an exact ID lookup.",
+                  "type": "object",
+                  "properties": {
+                    "schemaVersion": {
+                      "type": "number",
+                      "const": 1,
+                      "description": "Workflow document schema version."
+                    },
+                    "name": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 200,
+                      "description": "Human-readable script name."
+                    },
+                    "description": {
+                      "description": "Optional script description.",
+                      "type": "string",
+                      "maxLength": 2000
+                    },
+                    "timeoutMs": {
+                      "description": "Total deadline in milliseconds, including pauses.",
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 3600000
+                    },
+                    "entry": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 512,
+                      "description": "Module exporting the entry function."
+                    },
+                    "files": {
+                      "type": "object",
+                      "propertyNames": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 512
+                      },
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "description": "Package sources indexed by normalized path."
+                    },
+                    "kind": {
+                      "type": "string",
+                      "const": "webcross-workshop",
+                      "description": "Workshop document format."
+                    },
+                    "availability": {
+                      "oneOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "mode": {
+                              "type": "string",
+                              "const": "hosts",
+                              "description": "Show in menus on matching hostnames."
+                            },
+                            "hostnamePatterns": {
+                              "minItems": 1,
+                              "maxItems": 32,
+                              "type": "array",
+                              "items": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 256
+                              },
+                              "description": "Hostname patterns controlling browser menu availability."
+                            }
+                          },
+                          "required": [
+                            "mode",
+                            "hostnamePatterns"
+                          ],
+                          "additionalProperties": false
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "mode": {
+                              "type": "string",
+                              "const": "all-hosts",
+                              "description": "Show in menus on every hostname."
+                            }
+                          },
+                          "required": [
+                            "mode"
+                          ],
+                          "additionalProperties": false
+                        }
+                      ],
+                      "description": "Browser menu availability; does not restrict explicit Agent execution."
+                    }
+                  },
+                  "required": [
+                    "schemaVersion",
+                    "name",
+                    "entry",
+                    "files",
+                    "kind",
+                    "availability"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "required": [
+                "workshopId",
+                "folderId",
+                "name",
+                "description",
+                "hostnamePatterns",
+                "allHosts",
+                "sortOrder",
+                "enabled",
+                "revision"
+              ],
+              "additionalProperties": false
+            },
+            "description": "Matching workflow summaries; exact ID lookups include the manifest."
+          }
+        },
+        "required": [
+          "revision",
+          "folders",
+          "items"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "code": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Stable public failure code."
+      },
+      "message": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Concise public explanation of the failure."
+      },
+      "observation": {
+        "description": "Directly observed failure fact.",
+        "type": "string"
+      },
+      "suggested_prompt": {
+        "description": "Guidance for the next recovery operation.",
+        "type": "string"
+      },
+      "details": {
+        "description": "Public details filtered by the failure definition allowlist.",
+        "type": "object",
+        "properties": {},
+        "additionalProperties": {}
+      },
+      "blockingInteractions": {
+        "type": "object",
+        "properties": {
+          "dialogs": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Identifier of the pending dialog."
+                },
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "alert",
+                    "confirm",
+                    "prompt",
+                    "beforeunload",
+                    "file-save",
+                    "file-open",
+                    "directory"
+                  ],
+                  "description": "Kind of pending dialog."
+                },
+                "message": {
+                  "type": "string",
+                  "maxLength": 16384,
+                  "description": "Dialog message or title."
+                },
+                "defaultValue": {
+                  "type": "string",
+                  "maxLength": 4096,
+                  "description": "Default prompt value, without user input."
+                },
+                "supportedActions": {
+                  "minItems": 1,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "accept",
+                      "cancel",
+                      "select-files"
+                    ]
+                  },
+                  "description": "Operations supported by this dialog."
+                },
+                "state": {
+                  "type": "string",
+                  "enum": [
+                    "opening",
+                    "open",
+                    "resolving"
+                  ],
+                  "description": "Current native lifecycle state."
+                },
+                "multiple": {
+                  "description": "Whether the original file request accepts multiple files.",
+                  "type": "boolean"
+                },
+                "acceptTypes": {
+                  "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "downloadId": {
+                  "description": "Existing download waiting for this save destination.",
+                  "type": "string",
+                  "minLength": 1
+                },
+                "pageId": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                  "description": "Page that owns this active native dialog."
+                }
+              },
+              "required": [
+                "id",
+                "type",
+                "message",
+                "defaultValue",
+                "supportedActions",
+                "state",
+                "pageId"
+              ],
+              "additionalProperties": false
+            },
+            "description": "Current native dialogs, independently of the business result."
+          }
+        },
+        "required": [
+          "dialogs"
+        ],
+        "additionalProperties": false,
+        "description": "Present only when current native dialogs were observed."
+      }
+    },
+    "required": [
+      "code",
+      "message"
+    ],
+    "additionalProperties": false
+  }
+}

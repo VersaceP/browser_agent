@@ -1,8 +1,8 @@
 {
   "method": "File.write",
-  "description": "Writes bounded Markdown content into the managed local WebCross export directory.",
+  "description": "Saves content as a local file.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:f14f45a51d9e8c2fec30ee6e50e9cd2003d0d7eb9b217ea8922884f5fa221f76",
+  "catalogRevision": "sha256:2e55483dc7290e98387fd0a733945a10ed267ea41932e03ab02fd12c67f68fe5",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -15,33 +15,32 @@
       },
       "content": {
         "type": "string",
-        "minLength": 1,
-        "maxLength": 4194304,
-        "description": "Markdown content to save as a local artifact."
+        "maxLength": 1073741824,
+        "description": "Text content to save as UTF-8, up to 1024 MiB of encoded bytes."
       },
       "directory": {
-        "default": "markdown",
-        "description": "Relative export directory under WebCross/exports.",
+        "default": ".",
+        "description": "Relative directory for the exported file.",
         "type": "string",
         "minLength": 1,
         "maxLength": 160
       },
       "fileName": {
-        "description": "Markdown file name without path separators. Defaults to the current task or execution ID.",
+        "description": "File name, including any extension, without path separators. Defaults to the current task or execution ID.",
         "type": "string",
         "minLength": 1,
         "maxLength": 160
       },
       "overwrite": {
         "default": false,
-        "description": "Whether an existing Markdown file may be replaced.",
+        "description": "Whether an existing file may be replaced.",
         "type": "boolean"
       },
       "purpose": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "string",
         "minLength": 1,
-        "description": "Describe why the Markdown artifact should be saved locally and identify the export being produced."
+        "description": "Describe why the file should be saved locally."
       }
     },
     "required": [
@@ -66,23 +65,18 @@
       "savedPath": {
         "type": "string",
         "minLength": 1,
-        "description": "Absolute path of the saved Markdown file."
+        "description": "Absolute path of the saved file."
       },
       "relativePath": {
         "type": "string",
         "minLength": 1,
-        "description": "Path relative to the WebCross export root."
+        "description": "Path relative to the export directory."
       },
       "bytes": {
         "type": "integer",
         "minimum": 0,
         "maximum": 9007199254740991,
         "description": "UTF-8 byte length of the saved content."
-      },
-      "mimeType": {
-        "type": "string",
-        "const": "text/markdown",
-        "description": "MIME type of the saved artifact."
       },
       "overwritten": {
         "type": "boolean",
@@ -94,7 +88,6 @@
       "savedPath",
       "relativePath",
       "bytes",
-      "mimeType",
       "overwritten"
     ],
     "additionalProperties": false
@@ -124,23 +117,18 @@
           "savedPath": {
             "type": "string",
             "minLength": 1,
-            "description": "Absolute path of the saved Markdown file."
+            "description": "Absolute path of the saved file."
           },
           "relativePath": {
             "type": "string",
             "minLength": 1,
-            "description": "Path relative to the WebCross export root."
+            "description": "Path relative to the export directory."
           },
           "bytes": {
             "type": "integer",
             "minimum": 0,
             "maximum": 9007199254740991,
             "description": "UTF-8 byte length of the saved content."
-          },
-          "mimeType": {
-            "type": "string",
-            "const": "text/markdown",
-            "description": "MIME type of the saved artifact."
           },
           "overwritten": {
             "type": "boolean",
@@ -152,7 +140,6 @@
           "savedPath",
           "relativePath",
           "bytes",
-          "mimeType",
           "overwritten"
         ],
         "additionalProperties": false
@@ -166,46 +153,141 @@
     "additionalProperties": false
   },
   "failureSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "properties": {
-      "error": {
+      "code": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Stable public failure code."
+      },
+      "message": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Concise public explanation of the failure."
+      },
+      "observation": {
+        "description": "Directly observed failure fact.",
+        "type": "string"
+      },
+      "suggested_prompt": {
+        "description": "Guidance for the next recovery operation.",
+        "type": "string"
+      },
+      "details": {
+        "description": "Public details filtered by the failure definition allowlist.",
+        "type": "object",
+        "properties": {},
+        "additionalProperties": {}
+      },
+      "blockingInteractions": {
         "type": "object",
         "properties": {
-          "code": {
-            "type": "string",
-            "description": "Stable public failure code."
-          },
-          "message": {
-            "type": "string",
-            "description": "Concise public explanation for the failure code."
+          "dialogs": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Identifier of the pending dialog."
+                },
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "alert",
+                    "confirm",
+                    "prompt",
+                    "beforeunload",
+                    "file-save",
+                    "file-open",
+                    "directory"
+                  ],
+                  "description": "Kind of pending dialog."
+                },
+                "message": {
+                  "type": "string",
+                  "maxLength": 16384,
+                  "description": "Dialog message or title."
+                },
+                "defaultValue": {
+                  "type": "string",
+                  "maxLength": 4096,
+                  "description": "Default prompt value, without user input."
+                },
+                "supportedActions": {
+                  "minItems": 1,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "accept",
+                      "cancel",
+                      "select-files"
+                    ]
+                  },
+                  "description": "Operations supported by this dialog."
+                },
+                "state": {
+                  "type": "string",
+                  "enum": [
+                    "opening",
+                    "open",
+                    "resolving"
+                  ],
+                  "description": "Current native lifecycle state."
+                },
+                "multiple": {
+                  "description": "Whether the original file request accepts multiple files.",
+                  "type": "boolean"
+                },
+                "acceptTypes": {
+                  "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "downloadId": {
+                  "description": "Existing download waiting for this save destination.",
+                  "type": "string",
+                  "minLength": 1
+                },
+                "pageId": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                  "description": "Page that owns this active native dialog."
+                }
+              },
+              "required": [
+                "id",
+                "type",
+                "message",
+                "defaultValue",
+                "supportedActions",
+                "state",
+                "pageId"
+              ],
+              "additionalProperties": false
+            },
+            "description": "Current native dialogs, independently of the business result."
           }
         },
         "required": [
-          "code",
-          "message"
+          "dialogs"
         ],
-        "additionalProperties": false
-      },
-      "observation": {
-        "type": "string",
-        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
-      },
-      "suggested_prompt": {
-        "type": "string",
-        "description": "Guidance to re-observe current state and choose the next operation."
-      },
-      "details": {
-        "type": "object",
-        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
-        "additionalProperties": true
+        "additionalProperties": false,
+        "description": "Present only when current native dialogs were observed."
       }
     },
     "required": [
-      "error",
-      "observation",
-      "suggested_prompt"
+      "code",
+      "message"
     ],
     "additionalProperties": false
   },
-  "purposeHint": "Describe why the Markdown artifact should be saved locally and identify the export being produced."
+  "purposeHint": "Describe why the file should be saved locally."
 }

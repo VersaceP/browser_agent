@@ -2,7 +2,7 @@
   "method": "Download.list",
   "description": "Lists recent download records for a Fleet, optionally filtered by ID or lifecycle state.",
   "requiresPurpose": true,
-  "catalogRevision": "sha256:f14f45a51d9e8c2fec30ee6e50e9cd2003d0d7eb9b217ea8922884f5fa221f76",
+  "catalogRevision": "sha256:2e55483dc7290e98387fd0a733945a10ed267ea41932e03ab02fd12c67f68fe5",
   "inputSchema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -72,7 +72,7 @@
             "type": "integer",
             "minimum": 0,
             "maximum": 9007199254740991,
-            "description": "Number of records waiting for a page-initiated download."
+            "description": "Number of records waiting for a page download or a save decision."
           },
           "active": {
             "type": "integer",
@@ -99,206 +99,496 @@
       "downloads": {
         "type": "array",
         "items": {
-          "type": "object",
-          "properties": {
-            "downloadId": {
-              "type": "string",
-              "minLength": 1,
-              "description": "Opaque download record ID."
-            },
-            "sourceType": {
-              "type": "string",
-              "enum": [
-                "url",
-                "page"
-              ],
-              "description": "Whether the download came from a direct URL or a page-initiated request."
-            },
-            "pageId": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Page ID that owns or initiated the download, when applicable."
-            },
-            "documentRevision": {
-              "anyOf": [
-                {
-                  "type": "integer",
-                  "minimum": -9007199254740991,
-                  "maximum": 9007199254740991
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Document revision observed when the page download was reserved."
-            },
-            "requestedUrl": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "URL originally requested for a direct download, when available."
-            },
-            "finalUrl": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Final URL observed by the browser, when available."
-            },
-            "filename": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Filename reported by the download host, when available."
-            },
-            "savePath": {
-              "type": "string",
-              "description": "Destination path selected for the download."
-            },
-            "state": {
-              "type": "string",
-              "enum": [
-                "waiting",
-                "downloading",
-                "paused",
-                "completed",
-                "failed",
-                "cancelled"
-              ],
-              "description": "Current download lifecycle state."
-            },
-            "totalBytes": {
-              "type": "number",
-              "minimum": 0,
-              "description": "Total byte length when known; zero means the host has not reported it."
-            },
-            "receivedBytes": {
-              "type": "number",
-              "minimum": 0,
-              "description": "Bytes received so far."
-            },
-            "mimeType": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "MIME type reported by the download host, when available."
-            },
-            "expiresAt": {
-              "anyOf": [
-                {
-                  "type": "number"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Reservation expiry timestamp in milliseconds, or null when not reserved."
-            },
-            "createdAt": {
-              "type": "number",
-              "description": "Record creation timestamp in milliseconds."
-            },
-            "startedAt": {
-              "anyOf": [
-                {
-                  "type": "number"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Download start timestamp in milliseconds, when started."
-            },
-            "updatedAt": {
-              "type": "number",
-              "description": "Last record update timestamp in milliseconds."
-            },
-            "completedAt": {
-              "anyOf": [
-                {
-                  "type": "number"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Completion timestamp in milliseconds, when terminal."
-            },
-            "failure": {
+          "anyOf": [
+            {
               "type": "object",
               "properties": {
-                "code": {
+                "kind": {
                   "type": "string",
-                  "minLength": 1,
-                  "description": "Stable public failure code."
+                  "const": "pending-dialog",
+                  "description": "A native save request not yet represented by a visible download record."
                 },
-                "message": {
+                "downloadId": {
                   "type": "string",
                   "minLength": 1,
-                  "description": "Concise public explanation of the failure."
+                  "description": "Original native download identifier."
                 },
-                "suggested_prompt": {
+                "sourceType": {
+                  "type": "string",
+                  "const": "page",
+                  "description": "Download initiated by a page."
+                },
+                "pageId": {
                   "type": "string",
                   "minLength": 1,
-                  "description": "Next-observation guidance for the Agent."
+                  "description": "Page that owns the save request."
+                },
+                "state": {
+                  "type": "string",
+                  "const": "waiting",
+                  "description": "Waiting for a save decision."
+                },
+                "dialog": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Identifier of the pending dialog."
+                    },
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "alert",
+                        "confirm",
+                        "prompt",
+                        "beforeunload",
+                        "file-save",
+                        "file-open",
+                        "directory"
+                      ],
+                      "description": "Kind of pending dialog."
+                    },
+                    "message": {
+                      "type": "string",
+                      "maxLength": 16384,
+                      "description": "Dialog message or title."
+                    },
+                    "defaultValue": {
+                      "type": "string",
+                      "maxLength": 4096,
+                      "description": "Default prompt value, without user input."
+                    },
+                    "supportedActions": {
+                      "minItems": 1,
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "enum": [
+                          "accept",
+                          "cancel",
+                          "select-files"
+                        ]
+                      },
+                      "description": "Operations supported by this dialog."
+                    },
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "opening",
+                        "open",
+                        "resolving"
+                      ],
+                      "description": "Current native lifecycle state."
+                    },
+                    "multiple": {
+                      "description": "Whether the original file request accepts multiple files.",
+                      "type": "boolean"
+                    },
+                    "acceptTypes": {
+                      "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "downloadId": {
+                      "description": "Existing download waiting for this save destination.",
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "type",
+                    "message",
+                    "defaultValue",
+                    "supportedActions",
+                    "state"
+                  ],
+                  "additionalProperties": false,
+                  "description": "Current native save request and its supported actions."
                 }
               },
               "required": [
-                "code",
-                "message",
-                "suggested_prompt"
+                "kind",
+                "downloadId",
+                "sourceType",
+                "pageId",
+                "state",
+                "dialog"
               ],
-              "additionalProperties": false,
-              "description": "Structured failure details for a terminal download."
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "dialog": {
+                  "description": "Current native save dialog associated with this download.",
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Identifier of the pending dialog."
+                    },
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "alert",
+                        "confirm",
+                        "prompt",
+                        "beforeunload",
+                        "file-save",
+                        "file-open",
+                        "directory"
+                      ],
+                      "description": "Kind of pending dialog."
+                    },
+                    "message": {
+                      "type": "string",
+                      "maxLength": 16384,
+                      "description": "Dialog message or title."
+                    },
+                    "defaultValue": {
+                      "type": "string",
+                      "maxLength": 4096,
+                      "description": "Default prompt value, without user input."
+                    },
+                    "supportedActions": {
+                      "minItems": 1,
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "enum": [
+                          "accept",
+                          "cancel",
+                          "select-files"
+                        ]
+                      },
+                      "description": "Operations supported by this dialog."
+                    },
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "opening",
+                        "open",
+                        "resolving"
+                      ],
+                      "description": "Current native lifecycle state."
+                    },
+                    "multiple": {
+                      "description": "Whether the original file request accepts multiple files.",
+                      "type": "boolean"
+                    },
+                    "acceptTypes": {
+                      "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "downloadId": {
+                      "description": "Existing download waiting for this save destination.",
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "type",
+                    "message",
+                    "defaultValue",
+                    "supportedActions",
+                    "state"
+                  ],
+                  "additionalProperties": false
+                },
+                "downloadId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Opaque download record ID."
+                },
+                "sourceType": {
+                  "type": "string",
+                  "enum": [
+                    "url",
+                    "page"
+                  ],
+                  "description": "Whether the download came from a direct URL or a page-initiated request."
+                },
+                "pageId": {
+                  "description": "Page ID that owns or initiated the download, when applicable.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "documentRevision": {
+                  "anyOf": [
+                    {
+                      "type": "integer",
+                      "minimum": -9007199254740991,
+                      "maximum": 9007199254740991
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "Document revision observed when the page download was reserved."
+                },
+                "requestedUrl": {
+                  "description": "URL originally requested for a direct download, when available.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "finalUrl": {
+                  "description": "Final URL observed by the browser, when available.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "filename": {
+                  "description": "Filename reported by the download host, when available.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "savePath": {
+                  "type": "string",
+                  "description": "Destination path selected for the download."
+                },
+                "state": {
+                  "type": "string",
+                  "enum": [
+                    "waiting",
+                    "downloading",
+                    "paused",
+                    "completed",
+                    "failed",
+                    "cancelled"
+                  ],
+                  "description": "Current download lifecycle state."
+                },
+                "totalBytes": {
+                  "type": "number",
+                  "minimum": 0,
+                  "description": "Total byte length when known; zero means the host has not reported it."
+                },
+                "receivedBytes": {
+                  "type": "number",
+                  "minimum": 0,
+                  "description": "Bytes received so far."
+                },
+                "mimeType": {
+                  "description": "MIME type reported by the download host, when available.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "expiresAt": {
+                  "description": "Reservation expiry timestamp in milliseconds, or null when not reserved.",
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "createdAt": {
+                  "type": "number",
+                  "description": "Record creation timestamp in milliseconds."
+                },
+                "startedAt": {
+                  "description": "Download start timestamp in milliseconds, when started.",
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "updatedAt": {
+                  "type": "number",
+                  "description": "Last record update timestamp in milliseconds."
+                },
+                "completedAt": {
+                  "description": "Completion timestamp in milliseconds, when terminal.",
+                  "type": [
+                    "number",
+                    "null"
+                  ]
+                },
+                "failure": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Stable public failure code."
+                    },
+                    "message": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Concise public explanation of the failure."
+                    },
+                    "suggested_prompt": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Next-observation guidance for the Agent."
+                    },
+                    "details": {
+                      "description": "Public file permission recovery details.",
+                      "type": "object",
+                      "properties": {
+                        "allowedDirectories": {
+                          "description": "User-configured directories available for an explicit retry.",
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "minLength": 1
+                          }
+                        }
+                      },
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "code",
+                    "message",
+                    "suggested_prompt"
+                  ],
+                  "additionalProperties": false,
+                  "description": "Structured failure details for a terminal download."
+                }
+              },
+              "required": [
+                "downloadId",
+                "sourceType",
+                "pageId",
+                "documentRevision",
+                "requestedUrl",
+                "finalUrl",
+                "filename",
+                "savePath",
+                "state",
+                "totalBytes",
+                "receivedBytes",
+                "mimeType",
+                "expiresAt",
+                "createdAt",
+                "startedAt",
+                "updatedAt",
+                "completedAt"
+              ],
+              "additionalProperties": {}
             }
-          },
-          "required": [
-            "downloadId",
-            "sourceType",
-            "pageId",
-            "documentRevision",
-            "requestedUrl",
-            "finalUrl",
-            "filename",
-            "savePath",
-            "state",
-            "totalBytes",
-            "receivedBytes",
-            "mimeType",
-            "expiresAt",
-            "createdAt",
-            "startedAt",
-            "updatedAt",
-            "completedAt"
-          ],
-          "additionalProperties": {}
+          ]
         },
-        "description": "Download records ordered by the action implementation."
+        "description": "Visible downloads and current save requests, with dialog-associated entries first."
+      },
+      "blockingInteractions": {
+        "type": "object",
+        "properties": {
+          "dialogs": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Identifier of the pending dialog."
+                },
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "alert",
+                    "confirm",
+                    "prompt",
+                    "beforeunload",
+                    "file-save",
+                    "file-open",
+                    "directory"
+                  ],
+                  "description": "Kind of pending dialog."
+                },
+                "message": {
+                  "type": "string",
+                  "maxLength": 16384,
+                  "description": "Dialog message or title."
+                },
+                "defaultValue": {
+                  "type": "string",
+                  "maxLength": 4096,
+                  "description": "Default prompt value, without user input."
+                },
+                "supportedActions": {
+                  "minItems": 1,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "accept",
+                      "cancel",
+                      "select-files"
+                    ]
+                  },
+                  "description": "Operations supported by this dialog."
+                },
+                "state": {
+                  "type": "string",
+                  "enum": [
+                    "opening",
+                    "open",
+                    "resolving"
+                  ],
+                  "description": "Current native lifecycle state."
+                },
+                "multiple": {
+                  "description": "Whether the original file request accepts multiple files.",
+                  "type": "boolean"
+                },
+                "acceptTypes": {
+                  "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "downloadId": {
+                  "description": "Existing download waiting for this save destination.",
+                  "type": "string",
+                  "minLength": 1
+                },
+                "pageId": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                  "description": "Page that owns this active native dialog."
+                }
+              },
+              "required": [
+                "id",
+                "type",
+                "message",
+                "defaultValue",
+                "supportedActions",
+                "state",
+                "pageId"
+              ],
+              "additionalProperties": false
+            },
+            "description": "Current native dialogs, independently of the business result."
+          }
+        },
+        "required": [
+          "dialogs"
+        ],
+        "additionalProperties": false,
+        "description": "Present only when current native dialogs were observed."
       }
     },
     "required": [
@@ -336,7 +626,7 @@
                 "type": "integer",
                 "minimum": 0,
                 "maximum": 9007199254740991,
-                "description": "Number of records waiting for a page-initiated download."
+                "description": "Number of records waiting for a page download or a save decision."
               },
               "active": {
                 "type": "integer",
@@ -363,206 +653,496 @@
           "downloads": {
             "type": "array",
             "items": {
-              "type": "object",
-              "properties": {
-                "downloadId": {
-                  "type": "string",
-                  "minLength": 1,
-                  "description": "Opaque download record ID."
-                },
-                "sourceType": {
-                  "type": "string",
-                  "enum": [
-                    "url",
-                    "page"
-                  ],
-                  "description": "Whether the download came from a direct URL or a page-initiated request."
-                },
-                "pageId": {
-                  "anyOf": [
-                    {
-                      "type": "string"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ],
-                  "description": "Page ID that owns or initiated the download, when applicable."
-                },
-                "documentRevision": {
-                  "anyOf": [
-                    {
-                      "type": "integer",
-                      "minimum": -9007199254740991,
-                      "maximum": 9007199254740991
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ],
-                  "description": "Document revision observed when the page download was reserved."
-                },
-                "requestedUrl": {
-                  "anyOf": [
-                    {
-                      "type": "string"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ],
-                  "description": "URL originally requested for a direct download, when available."
-                },
-                "finalUrl": {
-                  "anyOf": [
-                    {
-                      "type": "string"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ],
-                  "description": "Final URL observed by the browser, when available."
-                },
-                "filename": {
-                  "anyOf": [
-                    {
-                      "type": "string"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ],
-                  "description": "Filename reported by the download host, when available."
-                },
-                "savePath": {
-                  "type": "string",
-                  "description": "Destination path selected for the download."
-                },
-                "state": {
-                  "type": "string",
-                  "enum": [
-                    "waiting",
-                    "downloading",
-                    "paused",
-                    "completed",
-                    "failed",
-                    "cancelled"
-                  ],
-                  "description": "Current download lifecycle state."
-                },
-                "totalBytes": {
-                  "type": "number",
-                  "minimum": 0,
-                  "description": "Total byte length when known; zero means the host has not reported it."
-                },
-                "receivedBytes": {
-                  "type": "number",
-                  "minimum": 0,
-                  "description": "Bytes received so far."
-                },
-                "mimeType": {
-                  "anyOf": [
-                    {
-                      "type": "string"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ],
-                  "description": "MIME type reported by the download host, when available."
-                },
-                "expiresAt": {
-                  "anyOf": [
-                    {
-                      "type": "number"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ],
-                  "description": "Reservation expiry timestamp in milliseconds, or null when not reserved."
-                },
-                "createdAt": {
-                  "type": "number",
-                  "description": "Record creation timestamp in milliseconds."
-                },
-                "startedAt": {
-                  "anyOf": [
-                    {
-                      "type": "number"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ],
-                  "description": "Download start timestamp in milliseconds, when started."
-                },
-                "updatedAt": {
-                  "type": "number",
-                  "description": "Last record update timestamp in milliseconds."
-                },
-                "completedAt": {
-                  "anyOf": [
-                    {
-                      "type": "number"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ],
-                  "description": "Completion timestamp in milliseconds, when terminal."
-                },
-                "failure": {
+              "anyOf": [
+                {
                   "type": "object",
                   "properties": {
-                    "code": {
+                    "kind": {
                       "type": "string",
-                      "minLength": 1,
-                      "description": "Stable public failure code."
+                      "const": "pending-dialog",
+                      "description": "A native save request not yet represented by a visible download record."
                     },
-                    "message": {
+                    "downloadId": {
                       "type": "string",
                       "minLength": 1,
-                      "description": "Concise public explanation of the failure."
+                      "description": "Original native download identifier."
                     },
-                    "suggested_prompt": {
+                    "sourceType": {
+                      "type": "string",
+                      "const": "page",
+                      "description": "Download initiated by a page."
+                    },
+                    "pageId": {
                       "type": "string",
                       "minLength": 1,
-                      "description": "Next-observation guidance for the Agent."
+                      "description": "Page that owns the save request."
+                    },
+                    "state": {
+                      "type": "string",
+                      "const": "waiting",
+                      "description": "Waiting for a save decision."
+                    },
+                    "dialog": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Identifier of the pending dialog."
+                        },
+                        "type": {
+                          "type": "string",
+                          "enum": [
+                            "alert",
+                            "confirm",
+                            "prompt",
+                            "beforeunload",
+                            "file-save",
+                            "file-open",
+                            "directory"
+                          ],
+                          "description": "Kind of pending dialog."
+                        },
+                        "message": {
+                          "type": "string",
+                          "maxLength": 16384,
+                          "description": "Dialog message or title."
+                        },
+                        "defaultValue": {
+                          "type": "string",
+                          "maxLength": 4096,
+                          "description": "Default prompt value, without user input."
+                        },
+                        "supportedActions": {
+                          "minItems": 1,
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "enum": [
+                              "accept",
+                              "cancel",
+                              "select-files"
+                            ]
+                          },
+                          "description": "Operations supported by this dialog."
+                        },
+                        "state": {
+                          "type": "string",
+                          "enum": [
+                            "opening",
+                            "open",
+                            "resolving"
+                          ],
+                          "description": "Current native lifecycle state."
+                        },
+                        "multiple": {
+                          "description": "Whether the original file request accepts multiple files.",
+                          "type": "boolean"
+                        },
+                        "acceptTypes": {
+                          "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "downloadId": {
+                          "description": "Existing download waiting for this save destination.",
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "type",
+                        "message",
+                        "defaultValue",
+                        "supportedActions",
+                        "state"
+                      ],
+                      "additionalProperties": false,
+                      "description": "Current native save request and its supported actions."
                     }
                   },
                   "required": [
-                    "code",
-                    "message",
-                    "suggested_prompt"
+                    "kind",
+                    "downloadId",
+                    "sourceType",
+                    "pageId",
+                    "state",
+                    "dialog"
                   ],
-                  "additionalProperties": false,
-                  "description": "Structured failure details for a terminal download."
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "dialog": {
+                      "description": "Current native save dialog associated with this download.",
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Identifier of the pending dialog."
+                        },
+                        "type": {
+                          "type": "string",
+                          "enum": [
+                            "alert",
+                            "confirm",
+                            "prompt",
+                            "beforeunload",
+                            "file-save",
+                            "file-open",
+                            "directory"
+                          ],
+                          "description": "Kind of pending dialog."
+                        },
+                        "message": {
+                          "type": "string",
+                          "maxLength": 16384,
+                          "description": "Dialog message or title."
+                        },
+                        "defaultValue": {
+                          "type": "string",
+                          "maxLength": 4096,
+                          "description": "Default prompt value, without user input."
+                        },
+                        "supportedActions": {
+                          "minItems": 1,
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "enum": [
+                              "accept",
+                              "cancel",
+                              "select-files"
+                            ]
+                          },
+                          "description": "Operations supported by this dialog."
+                        },
+                        "state": {
+                          "type": "string",
+                          "enum": [
+                            "opening",
+                            "open",
+                            "resolving"
+                          ],
+                          "description": "Current native lifecycle state."
+                        },
+                        "multiple": {
+                          "description": "Whether the original file request accepts multiple files.",
+                          "type": "boolean"
+                        },
+                        "acceptTypes": {
+                          "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "downloadId": {
+                          "description": "Existing download waiting for this save destination.",
+                          "type": "string",
+                          "minLength": 1
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "type",
+                        "message",
+                        "defaultValue",
+                        "supportedActions",
+                        "state"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "downloadId": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Opaque download record ID."
+                    },
+                    "sourceType": {
+                      "type": "string",
+                      "enum": [
+                        "url",
+                        "page"
+                      ],
+                      "description": "Whether the download came from a direct URL or a page-initiated request."
+                    },
+                    "pageId": {
+                      "description": "Page ID that owns or initiated the download, when applicable.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "documentRevision": {
+                      "anyOf": [
+                        {
+                          "type": "integer",
+                          "minimum": -9007199254740991,
+                          "maximum": 9007199254740991
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ],
+                      "description": "Document revision observed when the page download was reserved."
+                    },
+                    "requestedUrl": {
+                      "description": "URL originally requested for a direct download, when available.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "finalUrl": {
+                      "description": "Final URL observed by the browser, when available.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "filename": {
+                      "description": "Filename reported by the download host, when available.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "savePath": {
+                      "type": "string",
+                      "description": "Destination path selected for the download."
+                    },
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "waiting",
+                        "downloading",
+                        "paused",
+                        "completed",
+                        "failed",
+                        "cancelled"
+                      ],
+                      "description": "Current download lifecycle state."
+                    },
+                    "totalBytes": {
+                      "type": "number",
+                      "minimum": 0,
+                      "description": "Total byte length when known; zero means the host has not reported it."
+                    },
+                    "receivedBytes": {
+                      "type": "number",
+                      "minimum": 0,
+                      "description": "Bytes received so far."
+                    },
+                    "mimeType": {
+                      "description": "MIME type reported by the download host, when available.",
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "expiresAt": {
+                      "description": "Reservation expiry timestamp in milliseconds, or null when not reserved.",
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    },
+                    "createdAt": {
+                      "type": "number",
+                      "description": "Record creation timestamp in milliseconds."
+                    },
+                    "startedAt": {
+                      "description": "Download start timestamp in milliseconds, when started.",
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    },
+                    "updatedAt": {
+                      "type": "number",
+                      "description": "Last record update timestamp in milliseconds."
+                    },
+                    "completedAt": {
+                      "description": "Completion timestamp in milliseconds, when terminal.",
+                      "type": [
+                        "number",
+                        "null"
+                      ]
+                    },
+                    "failure": {
+                      "type": "object",
+                      "properties": {
+                        "code": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Stable public failure code."
+                        },
+                        "message": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Concise public explanation of the failure."
+                        },
+                        "suggested_prompt": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Next-observation guidance for the Agent."
+                        },
+                        "details": {
+                          "description": "Public file permission recovery details.",
+                          "type": "object",
+                          "properties": {
+                            "allowedDirectories": {
+                              "description": "User-configured directories available for an explicit retry.",
+                              "type": "array",
+                              "items": {
+                                "type": "string",
+                                "minLength": 1
+                              }
+                            }
+                          },
+                          "additionalProperties": false
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message",
+                        "suggested_prompt"
+                      ],
+                      "additionalProperties": false,
+                      "description": "Structured failure details for a terminal download."
+                    }
+                  },
+                  "required": [
+                    "downloadId",
+                    "sourceType",
+                    "pageId",
+                    "documentRevision",
+                    "requestedUrl",
+                    "finalUrl",
+                    "filename",
+                    "savePath",
+                    "state",
+                    "totalBytes",
+                    "receivedBytes",
+                    "mimeType",
+                    "expiresAt",
+                    "createdAt",
+                    "startedAt",
+                    "updatedAt",
+                    "completedAt"
+                  ],
+                  "additionalProperties": {}
                 }
-              },
-              "required": [
-                "downloadId",
-                "sourceType",
-                "pageId",
-                "documentRevision",
-                "requestedUrl",
-                "finalUrl",
-                "filename",
-                "savePath",
-                "state",
-                "totalBytes",
-                "receivedBytes",
-                "mimeType",
-                "expiresAt",
-                "createdAt",
-                "startedAt",
-                "updatedAt",
-                "completedAt"
-              ],
-              "additionalProperties": {}
+              ]
             },
-            "description": "Download records ordered by the action implementation."
+            "description": "Visible downloads and current save requests, with dialog-associated entries first."
+          },
+          "blockingInteractions": {
+            "type": "object",
+            "properties": {
+              "dialogs": {
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Identifier of the pending dialog."
+                    },
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "alert",
+                        "confirm",
+                        "prompt",
+                        "beforeunload",
+                        "file-save",
+                        "file-open",
+                        "directory"
+                      ],
+                      "description": "Kind of pending dialog."
+                    },
+                    "message": {
+                      "type": "string",
+                      "maxLength": 16384,
+                      "description": "Dialog message or title."
+                    },
+                    "defaultValue": {
+                      "type": "string",
+                      "maxLength": 4096,
+                      "description": "Default prompt value, without user input."
+                    },
+                    "supportedActions": {
+                      "minItems": 1,
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "enum": [
+                          "accept",
+                          "cancel",
+                          "select-files"
+                        ]
+                      },
+                      "description": "Operations supported by this dialog."
+                    },
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "opening",
+                        "open",
+                        "resolving"
+                      ],
+                      "description": "Current native lifecycle state."
+                    },
+                    "multiple": {
+                      "description": "Whether the original file request accepts multiple files.",
+                      "type": "boolean"
+                    },
+                    "acceptTypes": {
+                      "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "downloadId": {
+                      "description": "Existing download waiting for this save destination.",
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "pageId": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                      "description": "Page that owns this active native dialog."
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "type",
+                    "message",
+                    "defaultValue",
+                    "supportedActions",
+                    "state",
+                    "pageId"
+                  ],
+                  "additionalProperties": false
+                },
+                "description": "Current native dialogs, independently of the business result."
+              }
+            },
+            "required": [
+              "dialogs"
+            ],
+            "additionalProperties": false,
+            "description": "Present only when current native dialogs were observed."
           }
         },
         "required": [
@@ -580,44 +1160,139 @@
     "additionalProperties": false
   },
   "failureSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "properties": {
-      "error": {
+      "code": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Stable public failure code."
+      },
+      "message": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Concise public explanation of the failure."
+      },
+      "observation": {
+        "description": "Directly observed failure fact.",
+        "type": "string"
+      },
+      "suggested_prompt": {
+        "description": "Guidance for the next recovery operation.",
+        "type": "string"
+      },
+      "details": {
+        "description": "Public details filtered by the failure definition allowlist.",
+        "type": "object",
+        "properties": {},
+        "additionalProperties": {}
+      },
+      "blockingInteractions": {
         "type": "object",
         "properties": {
-          "code": {
-            "type": "string",
-            "description": "Stable public failure code."
-          },
-          "message": {
-            "type": "string",
-            "description": "Concise public explanation for the failure code."
+          "dialogs": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Identifier of the pending dialog."
+                },
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "alert",
+                    "confirm",
+                    "prompt",
+                    "beforeunload",
+                    "file-save",
+                    "file-open",
+                    "directory"
+                  ],
+                  "description": "Kind of pending dialog."
+                },
+                "message": {
+                  "type": "string",
+                  "maxLength": 16384,
+                  "description": "Dialog message or title."
+                },
+                "defaultValue": {
+                  "type": "string",
+                  "maxLength": 4096,
+                  "description": "Default prompt value, without user input."
+                },
+                "supportedActions": {
+                  "minItems": 1,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "accept",
+                      "cancel",
+                      "select-files"
+                    ]
+                  },
+                  "description": "Operations supported by this dialog."
+                },
+                "state": {
+                  "type": "string",
+                  "enum": [
+                    "opening",
+                    "open",
+                    "resolving"
+                  ],
+                  "description": "Current native lifecycle state."
+                },
+                "multiple": {
+                  "description": "Whether the original file request accepts multiple files.",
+                  "type": "boolean"
+                },
+                "acceptTypes": {
+                  "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "downloadId": {
+                  "description": "Existing download waiting for this save destination.",
+                  "type": "string",
+                  "minLength": 1
+                },
+                "pageId": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                  "description": "Page that owns this active native dialog."
+                }
+              },
+              "required": [
+                "id",
+                "type",
+                "message",
+                "defaultValue",
+                "supportedActions",
+                "state",
+                "pageId"
+              ],
+              "additionalProperties": false
+            },
+            "description": "Current native dialogs, independently of the business result."
           }
         },
         "required": [
-          "code",
-          "message"
+          "dialogs"
         ],
-        "additionalProperties": false
-      },
-      "observation": {
-        "type": "string",
-        "description": "Directly observed failure fact; it must not infer an unobserved browser side effect."
-      },
-      "suggested_prompt": {
-        "type": "string",
-        "description": "Guidance to re-observe current state and choose the next operation."
-      },
-      "details": {
-        "type": "object",
-        "description": "Only fields listed by the public error definition detailFields are returned; private execution diagnostics are omitted.",
-        "additionalProperties": true
+        "additionalProperties": false,
+        "description": "Present only when current native dialogs were observed."
       }
     },
     "required": [
-      "error",
-      "observation",
-      "suggested_prompt"
+      "code",
+      "message"
     ],
     "additionalProperties": false
   },

@@ -1,0 +1,1619 @@
+{
+  "method": "Input.move",
+  "description": "Moves the pointer without mouse-down, mouse-up, or click events. Omit auto for a target or coordinate move; auto=true starts or updates bounded automatic movement; auto=false stops it. A container leaving the viewport stops normally and emits Input.moveStopped.",
+  "requiresPurpose": true,
+  "catalogRevision": "sha256:2e55483dc7290e98387fd0a733945a10ed267ea41932e03ab02fd12c67f68fe5",
+  "inputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "anyOf": [
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Page containing the mouse movement."
+          },
+          "container": {
+            "description": "Not accepted in this request form.",
+            "not": {}
+          },
+          "region": {
+            "description": "Not accepted in this request form.",
+            "not": {}
+          },
+          "intervalMs": {
+            "description": "Not accepted in this request form.",
+            "not": {}
+          },
+          "auto": {
+            "description": "Not accepted in this request form.",
+            "not": {}
+          },
+          "id": {
+            "type": "string",
+            "pattern": "^n_[0-9a-f]{16}$",
+            "description": "An opaque node ID from the current observation. Do not parse it."
+          },
+          "selector": {
+            "description": "Unique target selector.",
+            "type": "string",
+            "minLength": 1
+          },
+          "x": {
+            "description": "Not accepted in this request form.",
+            "not": {}
+          },
+          "y": {
+            "description": "Not accepted in this request form.",
+            "not": {}
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "Describe the movement or collection-related start or stop goal."
+          }
+        },
+        "required": [
+          "pageId",
+          "purpose"
+        ],
+        "additionalProperties": true
+      },
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Page containing the mouse movement."
+          },
+          "container": {
+            "description": "Not accepted in this request form.",
+            "not": {}
+          },
+          "region": {
+            "description": "Not accepted in this request form.",
+            "not": {}
+          },
+          "intervalMs": {
+            "description": "Not accepted in this request form.",
+            "not": {}
+          },
+          "auto": {
+            "description": "Not accepted in this request form.",
+            "not": {}
+          },
+          "id": {
+            "description": "Not accepted in this request form.",
+            "not": {}
+          },
+          "selector": {
+            "description": "Not accepted in this request form.",
+            "not": {}
+          },
+          "x": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Horizontal CSS coordinate in the main viewport."
+          },
+          "y": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Vertical CSS coordinate in the main viewport."
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "Describe the movement or collection-related start or stop goal."
+          }
+        },
+        "required": [
+          "pageId",
+          "x",
+          "y",
+          "purpose"
+        ],
+        "additionalProperties": true
+      },
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Page containing the mouse movement."
+          },
+          "id": {
+            "description": "Not accepted in this request form.",
+            "not": {}
+          },
+          "selector": {
+            "description": "Not accepted in this request form.",
+            "not": {}
+          },
+          "x": {
+            "description": "Not accepted in this request form.",
+            "not": {}
+          },
+          "y": {
+            "description": "Not accepted in this request form.",
+            "not": {}
+          },
+          "auto": {
+            "type": "boolean",
+            "const": true,
+            "description": "Start or update automatic page movement."
+          },
+          "container": {
+            "description": "Automatic movement container, mutually exclusive with region.",
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^n_[0-9a-f]{16}$",
+                "description": "An opaque node ID from the current observation. Do not parse it."
+              },
+              "selector": {
+                "description": "Unique CSS selector used when id is absent, unavailable, or stale. ID takes priority when both are provided.",
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "additionalProperties": true
+          },
+          "region": {
+            "description": "Automatic movement rectangle in the main viewport.",
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Horizontal CSS coordinate in the main viewport."
+              },
+              "y": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Vertical CSS coordinate in the main viewport."
+              },
+              "width": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description": "Region width in CSS pixels."
+              },
+              "height": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description": "Region height in CSS pixels."
+              }
+            },
+            "required": [
+              "x",
+              "y",
+              "width",
+              "height"
+            ],
+            "additionalProperties": true
+          },
+          "intervalMs": {
+            "default": 3000,
+            "description": "Delay after each completed movement in milliseconds; defaults to 3000.",
+            "type": "integer",
+            "minimum": 500,
+            "maximum": 60000
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "Describe the movement or collection-related start or stop goal."
+          }
+        },
+        "required": [
+          "pageId",
+          "auto",
+          "intervalMs",
+          "purpose"
+        ],
+        "additionalProperties": true
+      },
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Page containing the mouse movement."
+          },
+          "id": {
+            "description": "Not accepted in this request form.",
+            "not": {}
+          },
+          "selector": {
+            "description": "Not accepted in this request form.",
+            "not": {}
+          },
+          "x": {
+            "description": "Not accepted in this request form.",
+            "not": {}
+          },
+          "y": {
+            "description": "Not accepted in this request form.",
+            "not": {}
+          },
+          "container": {
+            "description": "Not accepted in this request form.",
+            "not": {}
+          },
+          "region": {
+            "description": "Not accepted in this request form.",
+            "not": {}
+          },
+          "intervalMs": {
+            "description": "Not accepted in this request form.",
+            "not": {}
+          },
+          "auto": {
+            "type": "boolean",
+            "const": false,
+            "description": "Stop automatic movement and wait for cancellation."
+          },
+          "purpose": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "string",
+            "minLength": 1,
+            "description": "Describe the movement or collection-related start or stop goal."
+          }
+        },
+        "required": [
+          "pageId",
+          "auto",
+          "purpose"
+        ],
+        "additionalProperties": true
+      }
+    ]
+  },
+  "resultSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "anyOf": [
+      {
+        "type": "object",
+        "properties": {
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Page containing the mouse movement."
+          },
+          "status": {
+            "type": "string",
+            "const": "moved",
+            "description": "The requested pointer movement completed."
+          },
+          "point": {
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Horizontal CSS coordinate in the main viewport."
+              },
+              "y": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Vertical CSS coordinate in the main viewport."
+              }
+            },
+            "required": [
+              "x",
+              "y"
+            ],
+            "additionalProperties": false,
+            "description": "Actual final pointer position."
+          },
+          "resolvedBy": {
+            "type": "string",
+            "enum": [
+              "id",
+              "selector",
+              "selector-fallback",
+              "coordinates"
+            ],
+            "description": "Resolution source for this movement."
+          },
+          "blockingInteractions": {
+            "type": "object",
+            "properties": {
+              "dialogs": {
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Identifier of the pending dialog."
+                    },
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "alert",
+                        "confirm",
+                        "prompt",
+                        "beforeunload",
+                        "file-save",
+                        "file-open",
+                        "directory"
+                      ],
+                      "description": "Kind of pending dialog."
+                    },
+                    "message": {
+                      "type": "string",
+                      "maxLength": 16384,
+                      "description": "Dialog message or title."
+                    },
+                    "defaultValue": {
+                      "type": "string",
+                      "maxLength": 4096,
+                      "description": "Default prompt value, without user input."
+                    },
+                    "supportedActions": {
+                      "minItems": 1,
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "enum": [
+                          "accept",
+                          "cancel",
+                          "select-files"
+                        ]
+                      },
+                      "description": "Operations supported by this dialog."
+                    },
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "opening",
+                        "open",
+                        "resolving"
+                      ],
+                      "description": "Current native lifecycle state."
+                    },
+                    "multiple": {
+                      "description": "Whether the original file request accepts multiple files.",
+                      "type": "boolean"
+                    },
+                    "acceptTypes": {
+                      "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "downloadId": {
+                      "description": "Existing download waiting for this save destination.",
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "pageId": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                      "description": "Page that owns this active native dialog."
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "type",
+                    "message",
+                    "defaultValue",
+                    "supportedActions",
+                    "state",
+                    "pageId"
+                  ],
+                  "additionalProperties": false
+                },
+                "description": "Current native dialogs, independently of the business result."
+              }
+            },
+            "required": [
+              "dialogs"
+            ],
+            "additionalProperties": false,
+            "description": "Present only when current native dialogs were observed."
+          }
+        },
+        "required": [
+          "pageId",
+          "status",
+          "point",
+          "resolvedBy"
+        ],
+        "additionalProperties": false
+      },
+      {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "const": "running",
+            "description": "Automatic movement is enabled."
+          },
+          "runId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Identity of the current automatic configuration."
+          },
+          "config": {
+            "type": "object",
+            "properties": {
+              "intervalMs": {
+                "type": "integer",
+                "minimum": 500,
+                "maximum": 60000,
+                "description": "Milliseconds to wait after each completed movement."
+              },
+              "container": {
+                "description": "Container limiting automatic movement.",
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "description": "Target ID from the current document.",
+                    "type": "string",
+                    "pattern": "^n_[0-9a-f]{16}$"
+                  },
+                  "selector": {
+                    "description": "Unique container selector.",
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "additionalProperties": false
+              },
+              "region": {
+                "description": "Viewport rectangle limiting automatic movement.",
+                "type": "object",
+                "properties": {
+                  "x": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Horizontal CSS coordinate in the main viewport."
+                  },
+                  "y": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Vertical CSS coordinate in the main viewport."
+                  },
+                  "width": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "description": "Region width in CSS pixels."
+                  },
+                  "height": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "description": "Region height in CSS pixels."
+                  }
+                },
+                "required": [
+                  "x",
+                  "y",
+                  "width",
+                  "height"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "intervalMs"
+            ],
+            "additionalProperties": false,
+            "description": "Effective automatic movement configuration."
+          },
+          "effectiveRegion": {
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Horizontal CSS coordinate in the main viewport."
+              },
+              "y": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Vertical CSS coordinate in the main viewport."
+              },
+              "width": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description": "Region width in CSS pixels."
+              },
+              "height": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description": "Region height in CSS pixels."
+              }
+            },
+            "required": [
+              "x",
+              "y",
+              "width",
+              "height"
+            ],
+            "additionalProperties": false,
+            "description": "Most recently confirmed movement region."
+          },
+          "resolution": {
+            "description": "Most recent container resolution.",
+            "type": "object",
+            "properties": {
+              "container": {
+                "type": "object",
+                "properties": {
+                  "source": {
+                    "type": "string",
+                    "enum": [
+                      "id",
+                      "selector",
+                      "selector-fallback"
+                    ],
+                    "description": "Container resolution source."
+                  }
+                },
+                "required": [
+                  "source"
+                ],
+                "additionalProperties": false,
+                "description": "Container resolution."
+              }
+            },
+            "required": [
+              "container"
+            ],
+            "additionalProperties": false
+          },
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Page containing the mouse movement."
+          },
+          "blockingInteractions": {
+            "type": "object",
+            "properties": {
+              "dialogs": {
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Identifier of the pending dialog."
+                    },
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "alert",
+                        "confirm",
+                        "prompt",
+                        "beforeunload",
+                        "file-save",
+                        "file-open",
+                        "directory"
+                      ],
+                      "description": "Kind of pending dialog."
+                    },
+                    "message": {
+                      "type": "string",
+                      "maxLength": 16384,
+                      "description": "Dialog message or title."
+                    },
+                    "defaultValue": {
+                      "type": "string",
+                      "maxLength": 4096,
+                      "description": "Default prompt value, without user input."
+                    },
+                    "supportedActions": {
+                      "minItems": 1,
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "enum": [
+                          "accept",
+                          "cancel",
+                          "select-files"
+                        ]
+                      },
+                      "description": "Operations supported by this dialog."
+                    },
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "opening",
+                        "open",
+                        "resolving"
+                      ],
+                      "description": "Current native lifecycle state."
+                    },
+                    "multiple": {
+                      "description": "Whether the original file request accepts multiple files.",
+                      "type": "boolean"
+                    },
+                    "acceptTypes": {
+                      "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "downloadId": {
+                      "description": "Existing download waiting for this save destination.",
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "pageId": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                      "description": "Page that owns this active native dialog."
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "type",
+                    "message",
+                    "defaultValue",
+                    "supportedActions",
+                    "state",
+                    "pageId"
+                  ],
+                  "additionalProperties": false
+                },
+                "description": "Current native dialogs, independently of the business result."
+              }
+            },
+            "required": [
+              "dialogs"
+            ],
+            "additionalProperties": false,
+            "description": "Present only when current native dialogs were observed."
+          }
+        },
+        "required": [
+          "status",
+          "runId",
+          "config",
+          "effectiveRegion",
+          "pageId"
+        ],
+        "additionalProperties": false
+      },
+      {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "const": "stopped",
+            "description": "Automatic mouse movement has stopped."
+          },
+          "runId": {
+            "description": "Most recent automatic configuration identity.",
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "not-started",
+              "requested",
+              "container-out-of-view",
+              "navigation",
+              "page-closed",
+              "renderer-lost",
+              "hitl-paused",
+              "dialog-opened",
+              "host-stopped",
+              "region-unavailable",
+              "movement-failed"
+            ],
+            "description": "Reason movement stopped."
+          },
+          "error": {
+            "description": "Public failure for an abnormal stop.",
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Public failure code."
+              },
+              "message": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Public failure message."
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ],
+            "additionalProperties": false
+          },
+          "pageId": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+            "description": "Page containing the mouse movement."
+          },
+          "blockingInteractions": {
+            "type": "object",
+            "properties": {
+              "dialogs": {
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "Identifier of the pending dialog."
+                    },
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "alert",
+                        "confirm",
+                        "prompt",
+                        "beforeunload",
+                        "file-save",
+                        "file-open",
+                        "directory"
+                      ],
+                      "description": "Kind of pending dialog."
+                    },
+                    "message": {
+                      "type": "string",
+                      "maxLength": 16384,
+                      "description": "Dialog message or title."
+                    },
+                    "defaultValue": {
+                      "type": "string",
+                      "maxLength": 4096,
+                      "description": "Default prompt value, without user input."
+                    },
+                    "supportedActions": {
+                      "minItems": 1,
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "enum": [
+                          "accept",
+                          "cancel",
+                          "select-files"
+                        ]
+                      },
+                      "description": "Operations supported by this dialog."
+                    },
+                    "state": {
+                      "type": "string",
+                      "enum": [
+                        "opening",
+                        "open",
+                        "resolving"
+                      ],
+                      "description": "Current native lifecycle state."
+                    },
+                    "multiple": {
+                      "description": "Whether the original file request accepts multiple files.",
+                      "type": "boolean"
+                    },
+                    "acceptTypes": {
+                      "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "downloadId": {
+                      "description": "Existing download waiting for this save destination.",
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "pageId": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                      "description": "Page that owns this active native dialog."
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "type",
+                    "message",
+                    "defaultValue",
+                    "supportedActions",
+                    "state",
+                    "pageId"
+                  ],
+                  "additionalProperties": false
+                },
+                "description": "Current native dialogs, independently of the business result."
+              }
+            },
+            "required": [
+              "dialogs"
+            ],
+            "additionalProperties": false,
+            "description": "Present only when current native dialogs were observed."
+          }
+        },
+        "required": [
+          "status",
+          "reason",
+          "pageId"
+        ],
+        "additionalProperties": false
+      }
+    ]
+  },
+  "outputSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "observation": {
+        "type": "string",
+        "description": "Facts directly observed by the Action or returned by its declared result schema."
+      },
+      "suggested_prompt": {
+        "type": "string",
+        "description": "Guidance to re-observe current state and choose the next operation."
+      },
+      "data": {
+        "description": "Validated business result returned by the Action.",
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "pageId": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                "description": "Page containing the mouse movement."
+              },
+              "status": {
+                "type": "string",
+                "const": "moved",
+                "description": "The requested pointer movement completed."
+              },
+              "point": {
+                "type": "object",
+                "properties": {
+                  "x": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Horizontal CSS coordinate in the main viewport."
+                  },
+                  "y": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Vertical CSS coordinate in the main viewport."
+                  }
+                },
+                "required": [
+                  "x",
+                  "y"
+                ],
+                "additionalProperties": false,
+                "description": "Actual final pointer position."
+              },
+              "resolvedBy": {
+                "type": "string",
+                "enum": [
+                  "id",
+                  "selector",
+                  "selector-fallback",
+                  "coordinates"
+                ],
+                "description": "Resolution source for this movement."
+              },
+              "blockingInteractions": {
+                "type": "object",
+                "properties": {
+                  "dialogs": {
+                    "minItems": 1,
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Identifier of the pending dialog."
+                        },
+                        "type": {
+                          "type": "string",
+                          "enum": [
+                            "alert",
+                            "confirm",
+                            "prompt",
+                            "beforeunload",
+                            "file-save",
+                            "file-open",
+                            "directory"
+                          ],
+                          "description": "Kind of pending dialog."
+                        },
+                        "message": {
+                          "type": "string",
+                          "maxLength": 16384,
+                          "description": "Dialog message or title."
+                        },
+                        "defaultValue": {
+                          "type": "string",
+                          "maxLength": 4096,
+                          "description": "Default prompt value, without user input."
+                        },
+                        "supportedActions": {
+                          "minItems": 1,
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "enum": [
+                              "accept",
+                              "cancel",
+                              "select-files"
+                            ]
+                          },
+                          "description": "Operations supported by this dialog."
+                        },
+                        "state": {
+                          "type": "string",
+                          "enum": [
+                            "opening",
+                            "open",
+                            "resolving"
+                          ],
+                          "description": "Current native lifecycle state."
+                        },
+                        "multiple": {
+                          "description": "Whether the original file request accepts multiple files.",
+                          "type": "boolean"
+                        },
+                        "acceptTypes": {
+                          "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "downloadId": {
+                          "description": "Existing download waiting for this save destination.",
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "pageId": {
+                          "type": "string",
+                          "format": "uuid",
+                          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                          "description": "Page that owns this active native dialog."
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "type",
+                        "message",
+                        "defaultValue",
+                        "supportedActions",
+                        "state",
+                        "pageId"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "description": "Current native dialogs, independently of the business result."
+                  }
+                },
+                "required": [
+                  "dialogs"
+                ],
+                "additionalProperties": false,
+                "description": "Present only when current native dialogs were observed."
+              }
+            },
+            "required": [
+              "pageId",
+              "status",
+              "point",
+              "resolvedBy"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "const": "running",
+                "description": "Automatic movement is enabled."
+              },
+              "runId": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                "description": "Identity of the current automatic configuration."
+              },
+              "config": {
+                "type": "object",
+                "properties": {
+                  "intervalMs": {
+                    "type": "integer",
+                    "minimum": 500,
+                    "maximum": 60000,
+                    "description": "Milliseconds to wait after each completed movement."
+                  },
+                  "container": {
+                    "description": "Container limiting automatic movement.",
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "description": "Target ID from the current document.",
+                        "type": "string",
+                        "pattern": "^n_[0-9a-f]{16}$"
+                      },
+                      "selector": {
+                        "description": "Unique container selector.",
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "region": {
+                    "description": "Viewport rectangle limiting automatic movement.",
+                    "type": "object",
+                    "properties": {
+                      "x": {
+                        "type": "number",
+                        "minimum": 0,
+                        "description": "Horizontal CSS coordinate in the main viewport."
+                      },
+                      "y": {
+                        "type": "number",
+                        "minimum": 0,
+                        "description": "Vertical CSS coordinate in the main viewport."
+                      },
+                      "width": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "description": "Region width in CSS pixels."
+                      },
+                      "height": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "description": "Region height in CSS pixels."
+                      }
+                    },
+                    "required": [
+                      "x",
+                      "y",
+                      "width",
+                      "height"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "intervalMs"
+                ],
+                "additionalProperties": false,
+                "description": "Effective automatic movement configuration."
+              },
+              "effectiveRegion": {
+                "type": "object",
+                "properties": {
+                  "x": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Horizontal CSS coordinate in the main viewport."
+                  },
+                  "y": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Vertical CSS coordinate in the main viewport."
+                  },
+                  "width": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "description": "Region width in CSS pixels."
+                  },
+                  "height": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "description": "Region height in CSS pixels."
+                  }
+                },
+                "required": [
+                  "x",
+                  "y",
+                  "width",
+                  "height"
+                ],
+                "additionalProperties": false,
+                "description": "Most recently confirmed movement region."
+              },
+              "resolution": {
+                "description": "Most recent container resolution.",
+                "type": "object",
+                "properties": {
+                  "container": {
+                    "type": "object",
+                    "properties": {
+                      "source": {
+                        "type": "string",
+                        "enum": [
+                          "id",
+                          "selector",
+                          "selector-fallback"
+                        ],
+                        "description": "Container resolution source."
+                      }
+                    },
+                    "required": [
+                      "source"
+                    ],
+                    "additionalProperties": false,
+                    "description": "Container resolution."
+                  }
+                },
+                "required": [
+                  "container"
+                ],
+                "additionalProperties": false
+              },
+              "pageId": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                "description": "Page containing the mouse movement."
+              },
+              "blockingInteractions": {
+                "type": "object",
+                "properties": {
+                  "dialogs": {
+                    "minItems": 1,
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Identifier of the pending dialog."
+                        },
+                        "type": {
+                          "type": "string",
+                          "enum": [
+                            "alert",
+                            "confirm",
+                            "prompt",
+                            "beforeunload",
+                            "file-save",
+                            "file-open",
+                            "directory"
+                          ],
+                          "description": "Kind of pending dialog."
+                        },
+                        "message": {
+                          "type": "string",
+                          "maxLength": 16384,
+                          "description": "Dialog message or title."
+                        },
+                        "defaultValue": {
+                          "type": "string",
+                          "maxLength": 4096,
+                          "description": "Default prompt value, without user input."
+                        },
+                        "supportedActions": {
+                          "minItems": 1,
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "enum": [
+                              "accept",
+                              "cancel",
+                              "select-files"
+                            ]
+                          },
+                          "description": "Operations supported by this dialog."
+                        },
+                        "state": {
+                          "type": "string",
+                          "enum": [
+                            "opening",
+                            "open",
+                            "resolving"
+                          ],
+                          "description": "Current native lifecycle state."
+                        },
+                        "multiple": {
+                          "description": "Whether the original file request accepts multiple files.",
+                          "type": "boolean"
+                        },
+                        "acceptTypes": {
+                          "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "downloadId": {
+                          "description": "Existing download waiting for this save destination.",
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "pageId": {
+                          "type": "string",
+                          "format": "uuid",
+                          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                          "description": "Page that owns this active native dialog."
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "type",
+                        "message",
+                        "defaultValue",
+                        "supportedActions",
+                        "state",
+                        "pageId"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "description": "Current native dialogs, independently of the business result."
+                  }
+                },
+                "required": [
+                  "dialogs"
+                ],
+                "additionalProperties": false,
+                "description": "Present only when current native dialogs were observed."
+              }
+            },
+            "required": [
+              "status",
+              "runId",
+              "config",
+              "effectiveRegion",
+              "pageId"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "status": {
+                "type": "string",
+                "const": "stopped",
+                "description": "Automatic mouse movement has stopped."
+              },
+              "runId": {
+                "description": "Most recent automatic configuration identity.",
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+              },
+              "reason": {
+                "type": "string",
+                "enum": [
+                  "not-started",
+                  "requested",
+                  "container-out-of-view",
+                  "navigation",
+                  "page-closed",
+                  "renderer-lost",
+                  "hitl-paused",
+                  "dialog-opened",
+                  "host-stopped",
+                  "region-unavailable",
+                  "movement-failed"
+                ],
+                "description": "Reason movement stopped."
+              },
+              "error": {
+                "description": "Public failure for an abnormal stop.",
+                "type": "object",
+                "properties": {
+                  "code": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Public failure code."
+                  },
+                  "message": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Public failure message."
+                  }
+                },
+                "required": [
+                  "code",
+                  "message"
+                ],
+                "additionalProperties": false
+              },
+              "pageId": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                "description": "Page containing the mouse movement."
+              },
+              "blockingInteractions": {
+                "type": "object",
+                "properties": {
+                  "dialogs": {
+                    "minItems": 1,
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "minLength": 1,
+                          "description": "Identifier of the pending dialog."
+                        },
+                        "type": {
+                          "type": "string",
+                          "enum": [
+                            "alert",
+                            "confirm",
+                            "prompt",
+                            "beforeunload",
+                            "file-save",
+                            "file-open",
+                            "directory"
+                          ],
+                          "description": "Kind of pending dialog."
+                        },
+                        "message": {
+                          "type": "string",
+                          "maxLength": 16384,
+                          "description": "Dialog message or title."
+                        },
+                        "defaultValue": {
+                          "type": "string",
+                          "maxLength": 4096,
+                          "description": "Default prompt value, without user input."
+                        },
+                        "supportedActions": {
+                          "minItems": 1,
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "enum": [
+                              "accept",
+                              "cancel",
+                              "select-files"
+                            ]
+                          },
+                          "description": "Operations supported by this dialog."
+                        },
+                        "state": {
+                          "type": "string",
+                          "enum": [
+                            "opening",
+                            "open",
+                            "resolving"
+                          ],
+                          "description": "Current native lifecycle state."
+                        },
+                        "multiple": {
+                          "description": "Whether the original file request accepts multiple files.",
+                          "type": "boolean"
+                        },
+                        "acceptTypes": {
+                          "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        },
+                        "downloadId": {
+                          "description": "Existing download waiting for this save destination.",
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "pageId": {
+                          "type": "string",
+                          "format": "uuid",
+                          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                          "description": "Page that owns this active native dialog."
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "type",
+                        "message",
+                        "defaultValue",
+                        "supportedActions",
+                        "state",
+                        "pageId"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "description": "Current native dialogs, independently of the business result."
+                  }
+                },
+                "required": [
+                  "dialogs"
+                ],
+                "additionalProperties": false,
+                "description": "Present only when current native dialogs were observed."
+              }
+            },
+            "required": [
+              "status",
+              "reason",
+              "pageId"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    },
+    "required": [
+      "observation",
+      "suggested_prompt",
+      "data"
+    ],
+    "additionalProperties": false
+  },
+  "failureSchema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "code": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Stable public failure code."
+      },
+      "message": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Concise public explanation of the failure."
+      },
+      "observation": {
+        "description": "Directly observed failure fact.",
+        "type": "string"
+      },
+      "suggested_prompt": {
+        "description": "Guidance for the next recovery operation.",
+        "type": "string"
+      },
+      "details": {
+        "description": "Public details filtered by the failure definition allowlist.",
+        "type": "object",
+        "properties": {},
+        "additionalProperties": {}
+      },
+      "blockingInteractions": {
+        "type": "object",
+        "properties": {
+          "dialogs": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Identifier of the pending dialog."
+                },
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "alert",
+                    "confirm",
+                    "prompt",
+                    "beforeunload",
+                    "file-save",
+                    "file-open",
+                    "directory"
+                  ],
+                  "description": "Kind of pending dialog."
+                },
+                "message": {
+                  "type": "string",
+                  "maxLength": 16384,
+                  "description": "Dialog message or title."
+                },
+                "defaultValue": {
+                  "type": "string",
+                  "maxLength": 4096,
+                  "description": "Default prompt value, without user input."
+                },
+                "supportedActions": {
+                  "minItems": 1,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "accept",
+                      "cancel",
+                      "select-files"
+                    ]
+                  },
+                  "description": "Operations supported by this dialog."
+                },
+                "state": {
+                  "type": "string",
+                  "enum": [
+                    "opening",
+                    "open",
+                    "resolving"
+                  ],
+                  "description": "Current native lifecycle state."
+                },
+                "multiple": {
+                  "description": "Whether the original file request accepts multiple files.",
+                  "type": "boolean"
+                },
+                "acceptTypes": {
+                  "description": "File filters from the original request; browser and permission checks remain authoritative.",
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "downloadId": {
+                  "description": "Existing download waiting for this save destination.",
+                  "type": "string",
+                  "minLength": 1
+                },
+                "pageId": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+                  "description": "Page that owns this active native dialog."
+                }
+              },
+              "required": [
+                "id",
+                "type",
+                "message",
+                "defaultValue",
+                "supportedActions",
+                "state",
+                "pageId"
+              ],
+              "additionalProperties": false
+            },
+            "description": "Current native dialogs, independently of the business result."
+          }
+        },
+        "required": [
+          "dialogs"
+        ],
+        "additionalProperties": false,
+        "description": "Present only when current native dialogs were observed."
+      }
+    },
+    "required": [
+      "code",
+      "message"
+    ],
+    "additionalProperties": false
+  },
+  "purposeHint": "Describe the movement or collection-related start or stop goal."
+}
