@@ -36,6 +36,10 @@ class ResumeStateError(RuntimeError):
     """An existing task cannot be resumed safely from its files."""
 
 
+class TaskRecordMissingError(ResumeStateError):
+    """The configured database opened successfully but does not own the task."""
+
+
 class RunLockError(ResumeStateError):
     """A task run lock could not be acquired safely."""
 
@@ -393,7 +397,6 @@ def write_task_manifest(
     original_user_task: str,
     task_id: str = "",
     config_path: Optional[str] = None,
-    forced_skill_id: Optional[str] = None,
     agent_id: Optional[str] = None,
     startup_args: Optional[JsonDict] = None,
 ) -> JsonDict:
@@ -429,7 +432,6 @@ def write_task_manifest(
         "original_user_task": task_text,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "config_path": str(config_path or ""),
-        "forced_skill_id": str(forced_skill_id or ""),
         "agent_id": str(agent_id or ""),
     }
     if isinstance(startup_args, dict) and startup_args:
@@ -588,22 +590,29 @@ def load_task_manifest(
     if _database_is_authoritative(task_dir):
         from harness.storage.virtual_fs import VirtualTaskFs
         with _worktree_database(task_dir) as store:
-            if store is not None and _database_owns_task(store, task_dir.name):
-                lines = VirtualTaskFs(store, task_dir.name).iter_lines(TASK_MANIFEST_FILE)
-                if lines is not None:
-                    try:
-                        value = json.loads("".join(lines))
-                    except json.JSONDecodeError as exc:
-                        raise ResumeStateError("malformed task manifest in database") from exc
-                    if isinstance(value, dict):
-                        if str(value.get("taskId") or task_dir.name) != task_dir.name:
-                            raise ResumeStateError("task manifest identity differs from database task")
-                        return value
-                    raise ResumeStateError("task manifest in database is not an object")
-                if required:
-                    raise ResumeStateError("task manifest is missing from task database")
-                return None
-        raise ResumeStateError("task database is unavailable for task manifest")
+            if store is None:
+                raise ResumeStateError(
+                    f"task database is unavailable for task manifest: {resume_sqlite_path(task_dir)}"
+                )
+            if not _database_owns_task(store, task_dir.name):
+                raise TaskRecordMissingError(
+                    f"task {task_dir.name} is not registered in the task database: "
+                    f"{resume_sqlite_path(task_dir)}"
+                )
+            lines = VirtualTaskFs(store, task_dir.name).iter_lines(TASK_MANIFEST_FILE)
+            if lines is not None:
+                try:
+                    value = json.loads("".join(lines))
+                except json.JSONDecodeError as exc:
+                    raise ResumeStateError("malformed task manifest in database") from exc
+                if isinstance(value, dict):
+                    if str(value.get("taskId") or task_dir.name) != task_dir.name:
+                        raise ResumeStateError("task manifest identity differs from database task")
+                    return value
+                raise ResumeStateError("task manifest in database is not an object")
+            if required:
+                raise ResumeStateError("task manifest is missing from task database")
+            return None
     if not path.exists() and not required:
         return None
     return _load_json_object_strict(path, label="task manifest")

@@ -1,30 +1,8 @@
-"""
-harness.runtime.hitl - Shared HITL wait helper for BrowserAgent callers.
+"""Wait for explicit human control handoff through HITL events or terminal input.
 
-After Hitl.requestPause succeeds, the agent must NOT continue calling tools —
-ABCP rejects most tools while the page is paused (see prior investigation:
-getTaskSummary routing-error, resumeEvent method-not-found, getActionLog
-ERR_PAGE_PAUSED).
-
-Protocol boundary: HITL progress is notification-driven. Page state may confirm
-that a notification has settled, but Page.getState never creates a resume
-signal on its own. This helper resumes via two notification paths:
-
-  1. Explicit `Hitl.resumed`-style notification — kept as a fast path for
-     builds/panels that do emit it.
-  2. Verified settlement — lifecycle events (Page.loaded / Page.titleUpdated
-     on the paused pageId) act as *verification triggers*, never as resume
-     signals by themselves: the optional `challenge_verifier` (VL adjudicator)
-     makes the final call that the challenge surface is gone; if no usable
-     verdict is available, a qualifying post-pause title that no longer looks
-     like a challenge is required. Only after that evidence does the helper
-     call Hitl.resolvePause and confirm via Page.getState.
-Without a `challenge_verifier`, lifecycle events are ignored entirely (strict
-explicit-resume contract — challenge pages load, fail, and retitle themselves
-without human intervention).
-
-This helper reports which notification fired (for telemetry and post-mortem
-analysis).
+Page lifecycle and title changes never release a pause. The helper confirms the
+platform pause state after a human handoff; task accessibility and further help
+are decisions for the BrowserAgent using the original goal and current evidence.
 """
 
 import asyncio
@@ -32,14 +10,9 @@ import sys
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from abcp_client import ABCPClient
-from harness.observation.challenge_detector import (
-    VL_CLEARANCE_VERDICTS,
-    is_lingering_loading_title,
-    title_looks_like_challenge,
-)
 from harness.diagnostics import WorkerDiagnostics
 from harness.utils import RunLogger
 
@@ -49,13 +22,6 @@ STALE_PAUSE_DEADLOCK = "stale_pause_deadlock"
 RESOLVE_PAUSE_PURPOSE = (
     "Resolve HITL pause after an explicit HITL resume notification."
 )
-VERIFIED_RESOLVE_PURPOSE = (
-    "Human completed the challenge: post-pause lifecycle events show a"
-    " non-challenge surface and the verifier confirmed it; resolving the"
-    " HITL pause to resume automation."
-)
-_SETTLEMENT_VERIFIER_MAX_CALLS = 3
-
 
 def _normalize_notification_type(value: Any) -> str:
     """Normalize ABCP event spellings such as Page.loaded/page_loaded."""
@@ -72,39 +38,7 @@ _RESUME_NOTIFICATION_TYPES = frozenset(_normalize_notification_type(item) for it
     "hitl_resumed",
     "Hitl.resumed",
 })
-_PAGE_TITLE_UPDATED_TYPES = frozenset(_normalize_notification_type(item) for item in {
-    "page_title_updated",
-    "Page.titleUpdated",
-})
-_PAGE_LOADED_TYPES = frozenset(_normalize_notification_type(item) for item in {
-    "page_loaded",
-    "Page.loaded",
-})
-_PAGE_NAVIGATED_TYPES = frozenset(_normalize_notification_type(item) for item in {
-    "page_navigate",
-    "Page.navigate",
-})
-_CHALLENGE_URL_MARKERS = (
-    "__cf_chl",
-    "cf_chl",
-    "cdn-cgi/challenge-platform",
-)
-
 _PAUSED_STATE_MARKERS = ("paused", "err_page_paused", "human intervention")
-_CHALLENGE_STATE_MARKERS = (
-    "captcha",
-    "cf-chl",
-    "cloudflare security",
-    "performing security verification",
-    "verify you are human",
-    "验证码",
-    "人机验证",
-)
-
-
-def _is_challenge_url(url: Any) -> bool:
-    value = str(url or "").lower()
-    return bool(value and any(marker in value for marker in _CHALLENGE_URL_MARKERS))
 
 
 def _notification_view(msg: Dict[str, Any]) -> Dict[str, Any]:
@@ -146,57 +80,6 @@ def _notification_view(msg: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _notification_signal(
-    msg: Dict[str, Any],
-    page_id: str,
-    pause_snapshot: Optional[Dict[str, Any]] = None,
-) -> Optional[str]:
-    if not isinstance(msg, dict):
-        return None
-    view = _notification_view(msg)
-    ntype = view.get("type")
-    if not ntype:
-        return None
-
-    msg_page_id = view.get("pageId")
-
-    if ntype in _RESUME_NOTIFICATION_TYPES:
-        if not msg_page_id or str(msg_page_id) == str(page_id):
-            return "explicit_resume"
-        return None
-
-    if not msg_page_id or str(msg_page_id) != str(page_id):
-        return None
-
-    if ntype in _PAGE_TITLE_UPDATED_TYPES:
-        title = view.get("title")
-        if isinstance(title, str) and title.strip() and not is_lingering_loading_title(title):
-            return "page_settled"
-        return None
-
-    if ntype in _PAGE_LOADED_TYPES:
-        url = view.get("url")
-        if isinstance(url, str) and url.strip() and not _is_challenge_url(url):
-            return "page_settled"
-
-    if ntype in _PAGE_NAVIGATED_TYPES:
-        url = view.get("url")
-        if not isinstance(url, str) or not url.strip() or _is_challenge_url(url):
-            return None
-        paused_url = (
-            str(pause_snapshot.get("url") or "").strip()
-            if isinstance(pause_snapshot, dict)
-            else ""
-        )
-        if paused_url and url.strip() == paused_url:
-            return None
-        if not paused_url:
-            return None
-        return "page_settled"
-
-    return None
-
-
 def _make_resume_predicate_strict(page_id: str):
     """Match ONLY explicit HITL resume notifications.
 
@@ -224,25 +107,6 @@ def _make_resume_predicate_strict(page_id: str):
 def _is_paused_error_text(value: Any) -> bool:
     text = str(value or "").lower()
     return any(marker in text for marker in _PAUSED_STATE_MARKERS)
-
-
-def _title_clears_challenge(title: Any, pause_snapshot: Optional[Dict[str, Any]]) -> bool:
-    """True iff a post-pause title is strong evidence the challenge is gone:
-    non-empty, no challenge/interstitial wording from the shared union
-    vocabulary (covers lingering titles, "Attention Required! | Cloudflare",
-    etc.), and (when the pre-pause snapshot is known) actually different from
-    the paused title.
-    """
-    text = str(title or "").strip()
-    if not text:
-        return False
-    if title_looks_like_challenge(text):
-        return False
-    if isinstance(pause_snapshot, dict):
-        paused_title = str(pause_snapshot.get("title") or "").strip()
-        if paused_title and paused_title == text:
-            return False
-    return True
 
 
 async def _close_deadlocked_page(
@@ -295,9 +159,9 @@ async def _resolve_after_verified_settlement(
     page_id: str,
     deadline: float,
     poll_interval_seconds: float,
-    purpose: str = VERIFIED_RESOLVE_PURPOSE,
+    purpose: str = RESOLVE_PAUSE_PURPOSE,
 ) -> Dict[str, Any]:
-    """Issue Hitl.resolvePause after verified settlement, then confirm.
+    """Release control after explicit terminal feedback, then confirm pause state.
 
     The panel never clears the pause flag on its own, so unlike the
     explicit-resume path we resolve first and only then poll Page.getState.
@@ -440,6 +304,12 @@ def _state_indicates_still_paused(state_response: Any) -> bool:
         return True
 
     body, data = _page_state_body(state_response)
+    hitl = data.get("hitl") if isinstance(data.get("hitl"), dict) else {}
+    errors = [_meaningful_error_text(source) for source in
+              (state_response.get("error"), body.get("error"), data.get("error"))]
+    if (hitl.get("isPaused") is False and not any(errors)
+            and str(data.get("status") or "").lower() != "paused"):
+        return False
     haystack_parts: List[str] = []
     for key in ("observation", "suggested_prompt"):
         val = body.get(key)
@@ -468,30 +338,6 @@ def _state_indicates_still_paused(state_response: Any) -> bool:
         return True
 
     return False
-
-
-def _state_looks_like_challenge_surface(state_response: Any) -> bool:
-    if not isinstance(state_response, dict):
-        return False
-    body, data = _page_state_body(state_response)
-    title = str(data.get("title") or "")
-    url = str(data.get("url") or "")
-    if title and title_looks_like_challenge(title):
-        return True
-    if _is_challenge_url(url):
-        return True
-
-    haystack_parts: List[str] = []
-    for key in ("observation", "suggested_prompt"):
-        value = body.get(key)
-        if isinstance(value, str) and value:
-            haystack_parts.append(value.lower())
-    for key in ("title", "url", "status", "errorMessage"):
-        value = data.get(key)
-        if isinstance(value, str) and value:
-            haystack_parts.append(value.lower())
-    haystack = " ".join(haystack_parts)
-    return any(marker in haystack for marker in _CHALLENGE_STATE_MARKERS)
 
 
 async def _confirm_unpaused_after_settlement(
@@ -574,10 +420,7 @@ async def _confirm_unpaused_after_settlement(
             "method": "Page.getState",
             "result": _slim_evidence(state),
         })
-        if (
-            not _state_indicates_still_paused(state)
-            and not _state_looks_like_challenge_surface(state)
-        ):
+        if not _state_indicates_still_paused(state):
             return {
                 "status": "resumed",
                 "state": state,
@@ -597,11 +440,6 @@ async def _confirm_unpaused_after_settlement(
                     checks.append(close_result)
                     return _stale_pause_deadlock_payload(checks, close_result)
                 continue
-        elif _state_looks_like_challenge_surface(state):
-            last_blocker_reason = (
-                "Page.getState no longer looks paused, but it still looks like"
-                " a challenge surface."
-            )
         elif _state_indicates_still_paused(state):
             last_blocker_reason = (
                 "Page.getState did not confirm a usable unpaused page."
@@ -613,6 +451,10 @@ async def _confirm_unpaused_after_settlement(
     }
 
 
+from harness.runtime.wait_timing import timed_human_wait
+
+
+@timed_human_wait
 async def wait_for_hitl_resume(
     *,
     browser: ABCPClient,
@@ -621,8 +463,6 @@ async def wait_for_hitl_resume(
     poll_interval_seconds: float,
     diagnostics: Optional[WorkerDiagnostics],
     logger: Optional[RunLogger],
-    challenge_verifier=None,
-    pause_snapshot=None,
     input_handler=None,
     pause_reason: str = "等待用户协助或确认",
 ) -> Dict[str, Any]:
@@ -636,8 +476,7 @@ async def wait_for_hitl_resume(
     event_task = asyncio.create_task(_wait_for_hitl_events(
         browser=browser, page_id=page_id, timeout_seconds=timeout_seconds,
         poll_interval_seconds=poll_interval_seconds, diagnostics=diagnostics,
-        logger=logger, challenge_verifier=challenge_verifier,
-        pause_snapshot=pause_snapshot,
+        logger=logger,
     ))
     input_task = asyncio.create_task(handler(page_id, pause_reason))
     started = time.monotonic()
@@ -721,405 +560,73 @@ async def wait_for_hitl_resume(
 
 
 async def _wait_for_hitl_events(
-    *,
-    browser: ABCPClient,
-    page_id: str,
-    timeout_seconds: Optional[float] = None,
-    poll_interval_seconds: float,
-    diagnostics: Optional[WorkerDiagnostics],
+    *, browser: ABCPClient, page_id: str, timeout_seconds: Optional[float],
+    poll_interval_seconds: float, diagnostics: Optional[WorkerDiagnostics],
     logger: Optional[RunLogger],
-    challenge_verifier: Optional[
-        Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]
-    ] = None,
-    pause_snapshot: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Wait for resume, with no human deadline when timeout_seconds is None.
+    """Only an explicit platform resume returns control on the event path.
 
-    Resume can be established by an explicit Agent-visible HITL notification or
-    by a verifier-backed lifecycle notification followed by Hitl.resolvePause.
-    Page.getState is used only after such a notification to confirm settlement;
-    it is never polled to infer that a missing resume notification occurred.
-    `pause_snapshot` ({"url", "title"} captured at pause time) supplies the
-    verifier comparison baseline.
-
-    Returns a structured outcome consumed by the caller. BrowserAgent enriches
-    the tool_result with the HITL wait outcome.
+    Lifecycle/title changes and model availability cannot establish human intent.
+    Confirm the protocol pause state, leaving task accessibility to the agent.
     """
     if diagnostics is not None:
         diagnostics.mark_hitl_wait_entered(page_id)
     if logger is not None:
-        logger.write(
-            "hitl.wait.start",
-            {
-                "pageId": page_id,
-                "timeoutSeconds": timeout_seconds,
-                "pollIntervalSeconds": poll_interval_seconds,
-                "hasChallengeVerifier": challenge_verifier is not None,
-            },
-        )
-
+        logger.write("hitl.wait.start", {
+            "pageId": page_id, "timeoutSeconds": timeout_seconds,
+            "pollIntervalSeconds": poll_interval_seconds,
+        })
     started = time.monotonic()
-    deadline = (started + max(0.0, timeout_seconds)
-                if timeout_seconds is not None else None)
-    strict_predicate = _make_resume_predicate_strict(page_id)
-
-    def settlement_predicate(msg: Dict[str, Any]) -> bool:
-        return _notification_signal(msg, page_id, pause_snapshot) is not None
-
-    # Settlement triggers are only observed when a verifier can adjudicate
-    # them; otherwise stay on the strict explicit-resume contract. The replay
-    # scan is always strict: stale lifecycle events from before the pause must
-    # never re-fire as settlement triggers.
-    live_predicate = (
-        settlement_predicate if challenge_verifier is not None else strict_predicate
-    )
-
-    async def via_notification() -> Optional[Dict[str, Any]]:
-        remaining = deadline - time.monotonic() if deadline is not None else None
-        if remaining is not None and remaining <= 0:
-            return None
-        msg = await browser.wait_for_notification(
-            live_predicate,
-            timeout=remaining,
-            replay_window_seconds=5.0,
-            replay_predicate=strict_predicate,
+    deadline = started + max(0.0, timeout_seconds) if timeout_seconds is not None else None
+    predicate = _make_resume_predicate_strict(page_id)
+    error = None
+    try:
+        message = await browser.wait_for_notification(
+            predicate, timeout=max(0.0, deadline - time.monotonic()) if deadline is not None else None,
+            replay_window_seconds=5.0, replay_predicate=predicate,
         )
-        if msg is None:
-            return None
-        return {
-            "signal": _notification_signal(msg, page_id, pause_snapshot),
-            "message": msg,
-        }
-
-    # IMPORTANT: surface unexpected exceptions from the notification branch
-    # instead of silently dropping them. A swallowed TypeError here previously masked a
-    # signature mismatch between ABCPClient.wait_for_notification and the
-    # underlying hub (the helper looked like it "timed out" in 30ms when in
-    # fact the notification branch had blown up on an unknown kwarg).
-    task_errors: List[Dict[str, Any]] = []
-    verifier_calls = 0
-    # Latches for the whole pause: once the oracle has seen a challenge, weaker
-    # evidence may never release it.
-    challenge_ever_confirmed = False
-    last_settled_title = ""
-    last_settled_url = ""
-    settlement_rejections: List[Dict[str, Any]] = []
-
-    def elapsed_ms_now() -> int:
-        return int((time.monotonic() - started) * 1000)
-
-    while True:
-        try:
-            value = await via_notification()
-        except Exception as exc:
-            branch = "notification"
-            task_errors.append({
-                "branch": branch,
-                "errorType": type(exc).__name__,
-                "error": str(exc)[:500],
-            })
-            if logger is not None:
-                logger.write("hitl.wait.branch_error", {
-                    "pageId": page_id,
-                    "branch": branch,
-                    "errorType": type(exc).__name__,
-                    "error": str(exc)[:500],
-                })
-            value = None
-
-        if not isinstance(value, dict):
-            if diagnostics is not None and timeout_seconds is not None:
-                diagnostics.mark_hitl_wait_timed_out()
-            outcome = {
-                "status": "timeout" if timeout_seconds is not None else "waiting",
-                "pageId": page_id,
-                "elapsedMs": elapsed_ms_now(),
-                "timeoutSeconds": timeout_seconds,
-            }
-            if timeout_seconds is None:
-                outcome["reason"] = (
-                    "notification_channel_failed" if task_errors else "notification_channel_ended"
-                )
-            if task_errors:
-                # A sub-millisecond "timeout" usually means a branch errored out
-                # before doing real work. Surface it so callers know to look.
-                outcome["branch_errors"] = task_errors
-            if settlement_rejections:
-                outcome["settlementRejections"] = settlement_rejections[-3:]
-            if logger is not None:
-                logger.write("hitl.wait." + outcome["status"], outcome)
-            return outcome
-
-        via = "notification"
-        signal = str(value.get("signal") or "")
-        message = value.get("message")
-        evidence = message if isinstance(message, dict) else value
-
-        if signal == "explicit_resume":
-            confirmation = await _confirm_unpaused_after_settlement(
-                browser=browser,
-                page_id=page_id,
-                deadline=deadline if deadline is not None else time.monotonic() + 10.0,
-                poll_interval_seconds=poll_interval_seconds,
-            )
-            if confirmation.get("status") != "resumed":
-                if confirmation.get("status") == STALE_PAUSE_DEADLOCK:
-                    if diagnostics is not None:
-                        diagnostics.mark_hitl_stale_pause_deadlock()
-                    outcome = {
-                        "status": STALE_PAUSE_DEADLOCK,
-                        "via": via,
-                        "pageId": page_id,
-                        "elapsedMs": elapsed_ms_now(),
-                        "deadlock": True,
-                        "closed": bool(confirmation.get("closed")),
-                        "evidence": {
-                            "resume": _slim_evidence(evidence),
-                            "confirmation": confirmation.get("checks", []),
-                        },
-                        "reason": confirmation.get("reason")
-                        or "HITL pause could not be resolved after explicit resume.",
-                    }
-                    if logger is not None:
-                        logger.write("hitl.wait.stale_pause_deadlock", outcome)
-                    return outcome
-                if diagnostics is not None:
-                    diagnostics.mark_hitl_page_settled()
-                confirmation_reason = str(confirmation.get("reason") or "").strip()
-                outcome = {
-                    "status": PAGE_SETTLED_AFTER_HITL,
-                    "via": via,
-                    "pageId": page_id,
-                    "elapsedMs": elapsed_ms_now(),
-                    "evidence": {
-                        "settlement": _slim_evidence(evidence),
-                        "confirmation": confirmation.get("checks", []),
-                    },
-                    "reason": (
-                        "An explicit HITL resume was observed, but Page.getState still reports the"
-                        f" page as paused: {confirmation_reason}"
-                        if confirmation_reason
-                        else (
-                            "The page produced an explicit HITL resume signal, but"
-                            " confirmation did not find a usable unpaused page."
-                            " Wait for platform auto-recovery or restart the browser"
-                            " phase with a fresh page."
-                        )
-                    ),
-                }
-                if logger is not None:
-                    logger.write("hitl.wait.page_settled_after_hitl", outcome)
-                return outcome
-            if diagnostics is not None:
-                diagnostics.mark_hitl_resumed()
-            outcome = {
-                "status": "resumed",
-                "via": via,
-                "pageId": page_id,
-                "elapsedMs": elapsed_ms_now(),
-                "evidence": _slim_evidence({
-                    "settlement": _slim_evidence(evidence),
-                    "confirmation": _slim_evidence(confirmation.get("state")),
-                }),
-            }
-            if logger is not None:
-                logger.write("hitl.wait.resumed", outcome)
-            return outcome
-
-        # Settlement signals on the paused pageId. Never a resume by
-        # themselves: Page.titleUpdated only caches the candidate title as
-        # evidence; Page.loaded or a post-pause Page.navigate with a changed
-        # URL triggers adjudication (VL first, cached title as fallback), and
-        # only a verified pass leads to resolvePause.
-        if challenge_verifier is None:
-            continue
-        view = _notification_view(evidence)
-        event_title = str(view.get("title") or "").strip()
-        event_url = str(view.get("url") or "").strip()
-        if event_title:
-            last_settled_title = event_title
-        if event_url:
-            last_settled_url = event_url
-        if str(view.get("type") or "") not in (_PAGE_LOADED_TYPES | _PAGE_NAVIGATED_TYPES):
-            if logger is not None:
-                logger.write("hitl.wait.settlement_check", {
-                    "decision": "cached_evidence_only",
-                    "pageId": page_id,
-                    "event": str(view.get("type") or ""),
-                    "title": last_settled_title[:200],
-                    "url": last_settled_url[:300],
-                })
-            continue
-        evidence_view: Dict[str, Any] = {
-            "pageId": page_id,
-            "event": str(view.get("type") or ""),
-            "title": last_settled_title[:200],
-            "url": last_settled_url[:300],
-        }
-        if isinstance(pause_snapshot, dict):
-            evidence_view["pausedTitle"] = str(pause_snapshot.get("title") or "")[:200]
-            evidence_view["pausedUrl"] = str(pause_snapshot.get("url") or "")[:300]
-
-        decision = ""
-        decision_info: Dict[str, Any] = {}
-        verifier_ran = False
-        if verifier_calls < _SETTLEMENT_VERIFIER_MAX_CALLS:
-            verifier_calls += 1
-            verifier_ran = True
-            try:
-                raw_verdict = await challenge_verifier(dict(evidence_view))
-            except Exception as exc:
-                raw_verdict = {
-                    "verdict": "unavailable",
-                    "errorType": type(exc).__name__,
-                    "error": str(exc)[:300],
-                }
-            if not isinstance(raw_verdict, dict):
-                raw_verdict = {"verdict": str(raw_verdict)}
-            verdict = str(raw_verdict.get("verdict") or "uncertain").strip().lower()
-            decision_info = {
-                "gate": "vl",
-                "verdict": verdict,
-                "reason": str(raw_verdict.get("reason") or "")[:300],
-            }
-            if verdict == "confirmed_challenge":
-                decision = "challenge"
-                challenge_ever_confirmed = True
-            elif verdict in VL_CLEARANCE_VERDICTS:
-                decision = "passed"
-        if not decision:
-            if challenge_ever_confirmed:
-                # The oracle SAW the challenge during this pause. Spending the
-                # verifier budget does not make that observation go away, and a
-                # later title change is not evidence that a human cleared it —
-                # resuming here would hand the worker a page the run already
-                # knows is blocked. Only an explicit visual clearance, or the
-                # human resolving the pause, may end it now.
-                decision = "insufficient"
-                decision_info = {
-                    **decision_info,
-                    "titleEvidenceSuppressed": True,
-                    "titleEvidenceSuppressedReason": (
-                        "a challenge was visually confirmed during this pause;"
-                        " only visual clearance can release it"
-                    ),
-                }
-            elif verifier_ran:
-                # The visual oracle ran and could not confirm a clear. A title
-                # is far too weak to overrule that on its own: a page can
-                # retitle for any reason while the challenge is still up, and
-                # the check cannot tell a real destination title from a
-                # corrupted one. Keep waiting for an event the oracle can read
-                # rather than resuming the worker onto an unverified page.
-                decision = "insufficient"
-                decision_info = {
-                    **decision_info,
-                    "titleEvidenceSuppressed": True,
-                    "titleEvidenceSuppressedReason": (
-                        "visual clearance was not confirmed; a title change"
-                        " alone cannot release a HITL pause"
-                    ),
-                }
-            elif _title_clears_challenge(last_settled_title, pause_snapshot):
-                # Bounded escape hatch: the verifier budget is spent, so the
-                # only remaining evidence is the title. Reaching here already
-                # means several adjudications failed to confirm a challenge.
-                decision = "passed"
-                decision_info = {
-                    **decision_info,
-                    "gate": "title_evidence_after_verifier_budget",
-                    "verifierCalls": verifier_calls,
-                }
-            else:
-                decision = "insufficient"
+    except Exception as exc:
+        error = {"branch": "notification", "errorType": type(exc).__name__, "error": str(exc)[:500]}
+        message = None
         if logger is not None:
-            logger.write("hitl.wait.settlement_check", {
-                "decision": decision,
-                **evidence_view,
-                **decision_info,
-            })
-        if decision != "passed":
-            settlement_rejections.append({
-                "decision": decision,
-                "event": evidence_view["event"],
-                "title": evidence_view["title"],
-                "url": evidence_view["url"],
-                **decision_info,
-            })
-            continue
-
-        resolution = await _resolve_after_verified_settlement(
-            browser=browser,
-            page_id=page_id,
+            logger.write("hitl.wait.branch_error", {"pageId": page_id, **error})
+    if not isinstance(message, dict):
+        outcome = {
+            "status": "timeout" if timeout_seconds is not None else "waiting",
+            "pageId": page_id, "timeoutSeconds": timeout_seconds,
+        }
+        if timeout_seconds is None:
+            outcome["reason"] = "notification_channel_failed" if error else "notification_channel_ended"
+        if error:
+            outcome["branch_errors"] = [error]
+        if diagnostics is not None and timeout_seconds is not None:
+            diagnostics.mark_hitl_wait_timed_out()
+    else:
+        confirmation = await _confirm_unpaused_after_settlement(
+            browser=browser, page_id=page_id,
             deadline=deadline if deadline is not None else time.monotonic() + 10.0,
             poll_interval_seconds=poll_interval_seconds,
         )
-        if resolution.get("status") == STALE_PAUSE_DEADLOCK:
+        status = str(confirmation.get("status") or PAGE_SETTLED_AFTER_HITL)
+        outcome = {"status": status, "via": "notification", "pageId": page_id,
+                   "evidence": {"resume": _slim_evidence(message),
+                                "confirmation": _slim_evidence(confirmation.get("state"))}}
+        if status == "resumed":
             if diagnostics is not None:
-                diagnostics.mark_hitl_stale_pause_deadlock()
-            outcome = {
-                "status": STALE_PAUSE_DEADLOCK,
-                "via": via,
-                "signal": "verified_settlement",
-                "pageId": page_id,
-                "elapsedMs": elapsed_ms_now(),
-                "deadlock": True,
-                "closed": bool(resolution.get("closed")),
-                "evidence": {
-                    "settlement": {**evidence_view, **decision_info},
-                    "confirmation": resolution.get("checks", []),
-                },
-                "reason": resolution.get("reason")
-                or "HITL pause could not be resolved after verified settlement.",
-            }
-            if logger is not None:
-                logger.write("hitl.wait.stale_pause_deadlock", outcome)
-            return outcome
-        if resolution.get("status") != "resumed":
-            if diagnostics is not None:
+                diagnostics.mark_hitl_resumed()
+        else:
+            outcome["reason"] = confirmation.get("reason") or "Platform pause state was not confirmed clear after human resume."
+            outcome["evidence"]["confirmation"] = confirmation.get("checks", [])
+            if status == STALE_PAUSE_DEADLOCK:
+                outcome.update(deadlock=True, closed=bool(confirmation.get("closed")))
+                if diagnostics is not None:
+                    diagnostics.mark_hitl_stale_pause_deadlock()
+            elif diagnostics is not None:
                 diagnostics.mark_hitl_page_settled()
-            resolution_reason = str(resolution.get("reason") or "").strip()
-            outcome = {
-                "status": PAGE_SETTLED_AFTER_HITL,
-                "via": via,
-                "signal": "verified_settlement",
-                "pageId": page_id,
-                "elapsedMs": elapsed_ms_now(),
-                "evidence": {
-                    "settlement": {**evidence_view, **decision_info},
-                    "confirmation": resolution.get("checks", []),
-                },
-                "reason": (
-                    "Settlement was verified and Hitl.resolvePause was issued,"
-                    " but Page.getState still reports the page as paused:"
-                    f" {resolution_reason}"
-                    if resolution_reason
-                    else (
-                        "Settlement was verified and Hitl.resolvePause was"
-                        " issued, but confirmation did not find a usable"
-                        " unpaused page."
-                    )
-                ),
-            }
-            if logger is not None:
-                logger.write("hitl.wait.page_settled_after_hitl", outcome)
-            return outcome
-        if diagnostics is not None:
-            diagnostics.mark_hitl_resumed()
-        outcome = {
-            "status": "resumed",
-            "via": via,
-            "signal": "verified_settlement",
-            "pageId": page_id,
-            "elapsedMs": elapsed_ms_now(),
-            "evidence": {
-                "settlement": {**evidence_view, **decision_info},
-                "confirmation": _slim_evidence(resolution.get("state")),
-            },
-        }
-        if logger is not None:
-            logger.write("hitl.wait.resumed", outcome)
-        return outcome
+    outcome["elapsedMs"] = int((time.monotonic() - started) * 1000)
+    if logger is not None:
+        logger.write("hitl.wait." + outcome["status"], outcome)
+    return outcome
 
 
 def _slim_evidence(value: Any) -> Any:

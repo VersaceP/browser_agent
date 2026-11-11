@@ -82,7 +82,10 @@ class TerminalInputBroker:
             return
         if self.task_manager and not text.startswith('/answer '):
             try:
-                if text == '/messages': self.task_manager.status()
+                command = text.split(maxsplit=1)[0] if text else ''
+                handler = getattr(self.task_manager, 'control_handlers', {}).get(command)
+                if handler is not None: handler(text)
+                elif text == '/messages': self.task_manager.status()
                 elif text in {'/pause', '/continue'}: self.task_manager.accept(text, control=True)
                 elif text.startswith('/guide '): self._guide(text[7:])
                 elif text.startswith('/'):
@@ -309,4 +312,6 @@ async def read_terminal_input(prompt: str, *, question_id=None, guidance_interru
     broker = _brokers.get(loop)
     if broker is None:
         broker = _brokers[loop] = TerminalInputBroker(loop, sys.stdin)
-    return await broker.read(prompt, question_id, guidance_interruptible=guidance_interruptible)
+    from harness.runtime.wait_timing import human_wait
+    with human_wait():
+        return await broker.read(prompt, question_id, guidance_interruptible=guidance_interruptible)

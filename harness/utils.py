@@ -321,6 +321,7 @@ class UsageBucket:
     degenerate_retries: int = 0
     connection_retries: int = 0
     stream_decode_retries: int = 0
+    rate_limit_retries: int = 0
 
     def add(
         self,
@@ -332,6 +333,7 @@ class UsageBucket:
         degenerate_retries: int = 0,
         connection_retries: int = 0,
         stream_decode_retries: int = 0,
+        rate_limit_retries: int = 0,
     ) -> None:
         self.calls += 1
         self.cache_read += cache_read
@@ -343,6 +345,7 @@ class UsageBucket:
             degenerate_retries=degenerate_retries,
             connection_retries=connection_retries,
             stream_decode_retries=stream_decode_retries,
+            rate_limit_retries=rate_limit_retries,
         )
 
     def add_retries(
@@ -352,11 +355,13 @@ class UsageBucket:
         degenerate_retries: int = 0,
         connection_retries: int = 0,
         stream_decode_retries: int = 0,
+        rate_limit_retries: int = 0,
     ) -> None:
         self.timeout_retries += timeout_retries
         self.degenerate_retries += degenerate_retries
         self.connection_retries += connection_retries
         self.stream_decode_retries += stream_decode_retries
+        self.rate_limit_retries += rate_limit_retries
 
     def summary(self) -> JsonDict:
         return {
@@ -369,6 +374,7 @@ class UsageBucket:
             "degenerate_retries": self.degenerate_retries,
             "connection_retries": self.connection_retries,
             "stream_decode_retries": self.stream_decode_retries,
+            "rate_limit_retries": self.rate_limit_retries,
             "cache_read_rate": _cache_rate(
                 self.cache_read,
                 self.cache_creation,
@@ -388,6 +394,8 @@ class UsageAggregator:
     warnings: List[str] = field(default_factory=list)
     context_hashes: Set[str] = field(default_factory=set)
     _states: Dict[str, UsageState] = field(default_factory=dict)
+    _counter_availability: Dict[str, bool] = field(default_factory=lambda: {
+        "cache_read": True, "cache_creation": True, "uncached_input": True, "output": True})
 
     def add_failed_call_retries(self, usage: JsonDict, *, source: str) -> None:
         """Fold retries from a call that raised instead of returning.
@@ -403,6 +411,7 @@ class UsageAggregator:
                 "degenerate_retries",
                 "connection_retries",
                 "stream_decode_retries",
+                "rate_limit_retries",
             )
         }
         if not any(counters.values()):
@@ -423,6 +432,10 @@ class UsageAggregator:
         conversation_id: str,
         context_hash: Optional[str] = None,
     ) -> JsonDict:
+        available = usage.get("counterAvailability") or {}
+        for canonical, alias in (("cache_read", "cacheRead"), ("cache_creation", "cacheCreation"),
+                                 ("uncached_input", "uncachedInput"), ("output", "output")):
+            self._counter_availability[canonical] &= available.get(canonical, available.get(alias)) is True
         cache_read = _usage_int(usage, "cache_read")
         cache_creation = _usage_int(usage, "cache_creation")
         uncached_input = _usage_int(usage, "uncached_input")
@@ -431,6 +444,7 @@ class UsageAggregator:
         degenerate_retries = _usage_int(usage, "degenerate_retries")
         connection_retries = _usage_int(usage, "connection_retries")
         stream_decode_retries = _usage_int(usage, "stream_decode_retries")
+        rate_limit_retries = _usage_int(usage, "rate_limit_retries")
 
         for bucket in (
             self.total,
@@ -445,6 +459,7 @@ class UsageAggregator:
                 degenerate_retries=degenerate_retries,
                 connection_retries=connection_retries,
                 stream_decode_retries=stream_decode_retries,
+                rate_limit_retries=rate_limit_retries,
             )
         if context_hash:
             self.context_hashes.add(context_hash)
@@ -496,6 +511,7 @@ class UsageAggregator:
             "degenerate_retries": degenerate_retries,
             "connection_retries": connection_retries,
             "stream_decode_retries": stream_decode_retries,
+            "rate_limit_retries": rate_limit_retries,
             "cache_read_rate": _cache_rate(
                 cache_read,
                 cache_creation,
@@ -508,6 +524,7 @@ class UsageAggregator:
 
     def summary(self) -> JsonDict:
         summary = self.total.summary()
+        summary["counterAvailability"] = dict(self._counter_availability)
         summary.update({
             "hit_rate": summary["cache_read_rate"],
             "estimated_cost_usd": None,
@@ -1005,6 +1022,22 @@ def make_browser_event_logger(
     enabled: bool,
     prefix: str = "browser.transport",
 ) -> Optional[Any]:
+    # Count routing facts before the payload-tracing filter. No action body is
+    # copied, serialized or logged merely to measure I/O.
+    metrics = getattr(logger, 'transport_metrics', None)
+    if metrics is None:
+        metrics = {'requestAttempts': 0, 'failureEvents': 0, 'requestsByMethod': {}}
+        logger.transport_metrics = metrics
+
+    def record_metrics(event_type: str, payload: JsonDict) -> None:
+        if event_type == 'request':
+            method = payload.get('method') or 'unknown'
+            metrics['requestAttempts'] += 1
+            counts = metrics['requestsByMethod']
+            counts[method] = counts.get(method, 0) + 1
+        elif event_type == 'failure':
+            metrics['failureEvents'] += 1
+
     def on_event(event_type: str, payload: JsonDict) -> None:
         # A disabled payload trace still needs one compact failure record.
         # The client constructs this from typed transport/protocol facts;
@@ -1024,6 +1057,7 @@ def make_browser_event_logger(
     # A failure-only logger must not pay full payload logging costs on success.
     if not enabled:
         on_event.abcp_event_types = frozenset({"failure", "orphan_response"})
+    on_event.abcp_metrics = record_metrics
     return on_event
 
 

@@ -116,12 +116,21 @@ def result(label, value):
                 print(f"  - {item}", flush=True)
     evidence = value.get("programEvidence") or value.get("validation")
     if isinstance(evidence, dict):
+        coverage = (evidence.get("stageValidation") or {}).get("goalCoverage") or evidence.get("goalCoverage")
+        if isinstance(coverage, dict):
+            print("\n目标覆盖声明（不等于实际验证；发布由用户决定）:", flush=True)
+            if coverage.get("status") != "declared":
+                print("  - 尚未声明完整目标与阶段的对应关系，不能据现有阶段推断全流程可复用。", flush=True)
+            for item in coverage.get("requirements", []):
+                print(f"  - {item.get('requirement', '(invalid requirement)')}: {item.get('coverage', 'unknown')}"
+                      + ("；源码或阶段已变化，需重新核对" if item.get("versionStatus") == "stale" else ""), flush=True)
         stages = (evidence.get("stageValidation") or {}).get("stages", [])
         if stages:
             print("\n程序阶段验证（当前源码与合同，页面及来源见回执）:", flush=True)
             for stage in stages:
                 assessment = stage.get("assessment") or {}
                 print(f"  - {stage['id']}: {assessment.get('verdict', 'unassessed')}"
+                      + f"；验证路径={assessment.get('executionScope', 'unspecified')}"
                       + (f" — {assessment['reason']}" if assessment.get('reason') else ""), flush=True)
         paths = evidence.get("workflows", [])
         if paths:
@@ -134,8 +143,9 @@ def result(label, value):
 
 
 def tool_start(label, name, *, task_id, args):
-    page = args.get("page_id") or (args.get("params") or {}).get("pageId")
-    stage = (args.get("stage") or {}).get("id") or args.get("step_id")
+    params, stage = args.get("params"), args.get("stage")
+    page = args.get("page_id") or (params.get("pageId") if isinstance(params, dict) else None)
+    stage = (stage.get("id") if isinstance(stage, dict) else stage) or args.get("step_id")
     block(label, "开始 · " + name, [("任务", "@" + task_id), ("页面", page), ("阶段", stage)])
 
 

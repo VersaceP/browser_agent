@@ -113,6 +113,8 @@ class TaskSteering:
         self.workflow_controls = set()
         self.workflow_tasks = {}
         self.workflow_runners = {}
+        # Command name -> callable(line); registered by the running session.
+        self.control_handlers = {}
 
     def show(self, text):
         if not self.quiet:

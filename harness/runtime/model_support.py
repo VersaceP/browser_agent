@@ -10,7 +10,7 @@ from harness.context.compaction import compact_messages_if_needed, estimate_prom
 from harness.messages.convert import to_model_messages
 from runtime_config import HarnessConfig, RuntimeConfig
 from harness.constants import CONTEXT_LIMIT_ERROR_MARKERS, WORKER_STATUS_INCOMPLETE
-from harness.context.offload import fold_tool_results_after_moderation, offload_large_tool_result, preserve_complete_tool_payload
+from harness.context.offload import attach_payload_preservation_notice, fold_tool_results_after_moderation, offload_large_tool_result, preserve_complete_tool_payload
 from harness.evidence.file_evidence import saved_paths_from_value
 from harness.prompts import guide_manifest
 from harness.prompts import guide_registry_errors
@@ -66,6 +66,8 @@ def llm_rate_limit_terminal_result(exc: LLMRateLimitError) -> JsonDict:
         detail = "The configured LLM allocation quota is exhausted."
     else:
         detail = "The configured LLM provider is temporarily rate limited."
+        if incident.get("rateLimitRetries"):
+            detail += f" Automatic recovery stopped after {incident['rateLimitRetries']} retries."
     if exc.reset_at:
         detail += f" Provider reset time: {exc.reset_at}."
     elif exc.retry_after_seconds is not None:
@@ -119,7 +121,6 @@ _STATE_BOUNDARY_HARNESS_TOOLS = {
     "navigate_verified",
     "dismiss_overlay",
     "collect_items",
-    "execute_published_skill_workflow",
     "execute_browser_workflow",
     "execute_saved_browser_workflow",
     "request_step_extension",
@@ -150,12 +151,21 @@ def _webcross_behavioral_guide(
     start_marker = "## 1. Action Feedback"
     start = text.find(start_marker)
     if start < 0:
-        return ""
-    # Only the numbered protocol sections belong in the worker prompt. The
-    # following workflow appendix can change title across platform releases.
-    appendix = re.search(r"^## (?!\d+\.\s)", text[start:], re.MULTILINE)
-    end = start + appendix.start() if appendix else len(text)
-    behavioral = text[start:end].strip()
+        # Current guides use semantic headings instead of numbered protocol
+        # sections. Keep their behavioral source, excluding client setup and
+        # host-only reference loading. Unknown layouts remain explicitly absent.
+        if "## Task loop" not in text or "## Evidence" not in text:
+            return ""
+        sections = re.split(r"(?=^## )", text, flags=re.MULTILINE)
+        behavioral = "\n\n".join(section.strip() for section in sections
+            if section.startswith("## ") and section.splitlines()[0] not in {
+                "## References", "## Connection", "## Connection and recovery",
+            })
+    else:
+        # Only the numbered protocol sections belong in the worker prompt.
+        appendix = re.search(r"^## (?!\d+\.\s)", text[start:], re.MULTILINE)
+        end = start + appendix.start() if appendix else len(text)
+        behavioral = text[start:end].strip()
 
     # Standalone browser_call hydrates and verifies the full artifact before
     # returning it. The platform's direct-client file instruction would
@@ -572,15 +582,7 @@ def offload_tool_result_for_model(
     if isinstance(projected, dict) and "_offloaded" in projected:
         # Already moved to disk whole; a second pointer would be noise.
         return projected
-    notice = {key: value for key, value in complete.items() if value is not None}
-    if isinstance(projected, dict):
-        return {**projected, "_truncation": notice}
-    # A bare string or list is a legitimate tool result, and it is about to be
-    # cut at max_observation_chars. Attaching the notice to a dict was the only
-    # branch implemented, so those results were preserved on disk and the model
-    # was never told where. Wrapping is a shape change, but it only happens to
-    # a value that was going to reach the model incomplete either way.
-    return {"result": projected, "_truncation": notice}
+    return attach_payload_preservation_notice(projected, complete)
 
 
 def _json_size_bytes(value: Any) -> int:
@@ -894,6 +896,11 @@ async def compact_and_track_prefix_rebuild(
     )
     if rebuilt is not messages:
         agent._cache_pressure = CachePressureState(awaiting_prefix_reuse=True)
+        if actor == "browser_agent":
+            from harness.observation.observation_channel import observation_channel
+            from harness.tools.browser_tools.observation_view import _consumer_id
+
+            observation_channel().reset_consumer_view(_consumer_id(agent))
     return rebuilt
 
 

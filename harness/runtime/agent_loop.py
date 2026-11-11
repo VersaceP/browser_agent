@@ -1,14 +1,13 @@
-"""Shared authoring/execution loop for Workflow, Skill reuse and draft commands.
+"""Shared Tau model loop for Workflow task and author sessions.
 
-Profiles own tools, permissions, facts, transcript paths and terminal decisions.
-There is one model conversation: trials call the executor, never another owner.
+Sessions own tools, permissions, facts, transcript paths and terminal decisions.
 """
 from __future__ import annotations
 
 from harness._vendor.tau_agent import AgentHarness, AgentHarnessConfig
 from harness._vendor.tau_agent.events import MessageEndEvent
 from harness.runtime.session_output import progress_events
-from harness.skill_builder.continuity import SessionCompactor
+from harness.runtime.tau_bridge import SessionCompactor
 from harness.runtime.steering import current_steering
 from harness._vendor.tau_agent.messages import AssistantMessage, UserMessage
 
@@ -23,7 +22,8 @@ def stop_facts(message):
 
 async def agent_events(*, logger, runtime_config, raw_provider, provider, model,
                        system, tools, messages, prompt, context_path, actor, facts,
-                       prepare_context, label, quiet=False, usage_sink=None):
+                       prepare_context, label, quiet=False, usage_sink=None,
+                       completion_pending=None, persist_context=None):
     manager = current_steering()
     role = manager.register(actor, primary=manager.primary is None) if manager else None
     def current_facts():
@@ -34,7 +34,7 @@ async def agent_events(*, logger, runtime_config, raw_provider, provider, model,
         return value
     compactor = SessionCompactor(logger=logger, config=runtime_config, provider=raw_provider,
         system=system, tools=tools, context_path=context_path, actor=actor, facts=current_facts,
-        usage_sink=usage_sink)
+        usage_sink=usage_sink, persist_context=persist_context)
 
     async def before_model(current):
         if manager: await manager.wait_runnable()
@@ -69,7 +69,21 @@ async def agent_events(*, logger, runtime_config, raw_provider, provider, model,
                     if not any(message is event.message for message in active):
                         active.append(event.message)
                 yield event, active
-            if last is None or last.stop_reason not in {"length", "error", "aborted"}:
+            if last is None:
+                break
+            if last.stop_reason not in {"length", "error", "aborted"}:
+                if completion_pending is not None and completion_pending():
+                    logger.write("agent.completion.missing", {"actor": actor, **stop_facts(last)})
+                    prompt = ("[Harness protocol recovery] Your response ended without the required "
+                        "completion tool. The task remains open. Keep all completed executions and "
+                        "their saved results; do not replay actions to fix this protocol omission. "
+                        "Continue authorized work from those facts. If you need user input, use ask_user "
+                        "when available and wait for the answer in this task; do not end merely to ask "
+                        "a question in a final report. When ready to hand off, submit finish (or save_draft "
+                        "for an author) with your supported conclusion and remaining work. "
+                        "If a tool rejected the conclusion, correct its structure or evidence "
+                        "references. A natural-language final answer does not record completion.")
+                    continue
                 break
             stopped = stop_facts(last)
             logger.write("agent.model.stopped", {"actor": actor, **stopped})
