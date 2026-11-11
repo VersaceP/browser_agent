@@ -56,6 +56,7 @@ class OpenAIResponsesProvider(OpenAIProvider):
         diagnostics = {"timeout_attempts": attempts,
             "nonstream_fallback_used": any(a.get("reason") == "nonstream_fallback" for a in attempts)}
         for name, reason in (("timeout", "timeout"), ("connection", "connection_error"),
-                             ("stream_decode", "stream_decode_error"), ("degenerate", "degenerate_response")):
+                             ("stream_decode", "stream_decode_error"), ("degenerate", "degenerate_response"),
+                             ("rate_limit", "rate_limited")):
             diagnostics[name + "_retries"] = sum(a.get("reason") == reason for a in attempts)
         return decode_response(response, self.config, diagnostics)

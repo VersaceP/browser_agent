@@ -427,6 +427,10 @@ class OpenAIProvider(BaseLLMProvider):
                 1 for item in timeout_attempts
                 if item.get("reason") == "stream_decode_error"
             ),
+            "rate_limit_retries": sum(
+                1 for item in timeout_attempts
+                if item.get("reason") == "rate_limited"
+            ),
             "nonstream_fallback_used": any(
                 item.get("reason") == "nonstream_fallback"
                 for item in timeout_attempts

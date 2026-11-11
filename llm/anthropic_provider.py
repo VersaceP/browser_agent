@@ -29,6 +29,7 @@ from runtime_config import ModelConfig
 from llm.adapters import encode_request, decode_response
 from llm.contracts import LLMRequest, LLMResult
 from llm.profiles import resolve_target
+from llm.stream_diagnostics import ACTIVE_CAPTURE, StreamCapture, install_capture, observe_sdk_events
 
 
 def _degenerate_response_problem(response: Any) -> Optional[Dict[str, Any]]:
@@ -152,13 +153,16 @@ class AnthropicProvider(BaseLLMProvider):
             messages.stream() also avoids the Anthropic SDK's non-streaming
             ten-minute guard for large max_tokens values.
             """
-            manager = self.client.messages.stream(**request_kwargs)
-            stream = await asyncio.wait_for(
-                manager.__aenter__(),
-                timeout=self._llm_timeout_seconds(),
-            )
+            install_capture(self.client)
+            capture = StreamCapture()
+            capture_token = ACTIVE_CAPTURE.set(capture)
             active_error: Optional[BaseException] = None
+            manager = self.client.messages.stream(**request_kwargs)
+            stream = None
             try:
+                stream = await asyncio.wait_for(
+                    manager.__aenter__(), timeout=self._llm_timeout_seconds())
+                observe_sdk_events(stream, capture)
                 if hasattr(stream, "__aiter__"):
                     async for _event in self._iterate_with_llm_idle_timeout(stream):
                         pass
@@ -169,23 +173,26 @@ class AnthropicProvider(BaseLLMProvider):
             except BaseException as exc:
                 if _is_anthropic_stream_tool_decode_error(exc):
                     wrapped = LLMStreamDecodeError(
-                        "Anthropic stream contained malformed incremental tool JSON"
+                        "Anthropic stream contained malformed incremental tool JSON",
+                        diagnostics=capture.failure(exc),
                     )
                     active_error = wrapped
                     raise wrapped from exc
                 active_error = exc
                 raise
             finally:
+                ACTIVE_CAPTURE.reset(capture_token)
                 exit_args = (
                     (type(active_error), active_error, active_error.__traceback__)
                     if active_error is not None
                     else (None, None, None)
                 )
                 try:
-                    await asyncio.wait_for(
-                        manager.__aexit__(*exit_args),
-                        timeout=self._llm_timeout_seconds(),
-                    )
+                    if stream is not None:
+                        await asyncio.wait_for(
+                            manager.__aexit__(*exit_args),
+                            timeout=self._llm_timeout_seconds(),
+                        )
                 except Exception:
                     if active_error is None:
                         raise
@@ -265,6 +272,10 @@ class AnthropicProvider(BaseLLMProvider):
             "stream_decode_retries": sum(
                 1 for item in timeout_attempts
                 if item.get("reason") == "stream_decode_error"
+            ),
+            "rate_limit_retries": sum(
+                1 for item in timeout_attempts
+                if item.get("reason") == "rate_limited"
             ),
             "nonstream_fallback_used": any(
                 item.get("reason") == "nonstream_fallback"

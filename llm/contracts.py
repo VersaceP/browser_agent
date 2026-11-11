@@ -67,6 +67,12 @@ class TokenUsage(Contract):
             "uncached_input": max(0, (self.input_tokens or 0) - cached - written),
             "output": self.output_tokens or 0,
             "usage_missing": self.input_tokens is None and self.output_tokens is None,
+            "counterAvailability": {
+                "cache_read": self.cache_read_tokens is not None,
+                "cache_creation": self.cache_write_tokens is not None,
+                "uncached_input": all(v is not None for v in
+                    (self.input_tokens, self.cache_read_tokens, self.cache_write_tokens)),
+                "output": self.output_tokens is not None},
         }
 
 

@@ -4,9 +4,14 @@ llm.base - Shared LLM provider interface.
 
 import asyncio
 import importlib
+import logging
+import math
+import random
 import re
 import time
 from abc import ABC
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 
 from runtime_config import ModelConfig
@@ -83,9 +88,48 @@ def _response_header(exc: BaseException, name: str) -> str:
         return ""
     try:
         value = headers.get(name)
+        if value is None:
+            value = next((v for k, v in headers.items() if str(k).lower() == name.lower()), None)
     except Exception:
         return ""
     return str(value or "").strip()
+
+
+def _http_retry_after_seconds(raw: str) -> Optional[float]:
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        try:
+            date = parsedate_to_datetime(raw)
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=timezone.utc)
+            seconds = date.timestamp() - time.time()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return max(0.0, seconds) if math.isfinite(seconds) else None
+
+
+def _reset_delay_seconds(raw: str) -> Optional[float]:
+    """Interpret unambiguous epoch/ISO reset times, never guess a missing year."""
+    if not raw:
+        return None
+    try:
+        epoch = float(raw)
+        if not math.isfinite(epoch) or epoch < 1_000_000_000:
+            return None
+        if epoch >= 100_000_000_000:
+            epoch /= 1000.0
+    except (TypeError, ValueError):
+        try:
+            date = datetime.fromisoformat(raw.replace(" UTC", "+00:00").replace("Z", "+00:00"))
+            if date.tzinfo is None:
+                return None
+            epoch = date.timestamp()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return max(0.0, epoch - time.time())
 
 
 def rate_limit_error_details(exc: BaseException) -> Optional[Dict[str, Any]]:
@@ -137,12 +181,7 @@ def rate_limit_error_details(exc: BaseException) -> Optional[Dict[str, Any]]:
         return None
 
     retry_after_raw = _response_header(exc, "retry-after")
-    retry_after_seconds: Optional[float] = None
-    try:
-        if retry_after_raw:
-            retry_after_seconds = max(0.0, float(retry_after_raw))
-    except (TypeError, ValueError):
-        retry_after_seconds = None
+    retry_after_seconds = _http_retry_after_seconds(retry_after_raw)
 
     reset_at = (
         _response_header(exc, "x-ratelimit-reset")
@@ -164,8 +203,8 @@ def rate_limit_error_details(exc: BaseException) -> Optional[Dict[str, Any]]:
         "providerCode": provider_code,
         "providerMessage": provider_message,
         "requestId": request_id,
-        # No automatic retry inside the current agent loop. A host may offer a
-        # later retry when the provider supplied a reset/delay signal.
+        # Classification alone does not dispatch a retry. The request layer
+        # records its bounded retry decision and attempts separately.
         "automaticRetry": False,
         "retryable": kind != "quota_exhausted" or bool(reset_at) or retry_after_seconds is not None,
         "retryAfterSeconds": retry_after_seconds,
@@ -185,6 +224,7 @@ _RETRY_COUNTER_BY_REASON = {
     "degenerate_response": "degenerate_retries",
     "connection_error": "connection_retries",
     "stream_decode_error": "stream_decode_retries",
+    "rate_limited": "rate_limit_retries",
 }
 
 
@@ -210,6 +250,10 @@ def retry_usage_from_attempts(attempts: List[Dict[str, Any]]) -> Dict[str, int]:
         key = _RETRY_COUNTER_BY_REASON.get(str(attempts[-1].get("reason") or ""))
         if key and counts[key] > 0:
             counts[key] -= 1
+    # Keep the existing failed-call counter shape when no throttling retry
+    # occurred. The new counter is additive for calls that performed one.
+    if not counts["rate_limit_retries"]:
+        counts.pop("rate_limit_retries")
     return counts
 
 
@@ -332,11 +376,9 @@ class LLMProviderResponseError(Exception):
 class LLMRateLimitError(Exception):
     """Normalized provider throttling/quota failure.
 
-    The current agent run must not blindly retry this exception. Provider SDKs
-    already apply their own bounded 429 policy, and an allocation quota can be
-    unavailable for days. Callers receive structured timing metadata so a host
-    can offer an explicit retry/resume action without treating the incident as
-    an internal harness crash.
+    Raised after bounded request-layer recovery, or immediately for exhausted
+    quota. SDK retries are disabled, so this layer owns the retry budget. Once
+    raised, callers preserve state for resume instead of starting another loop.
     """
 
     def __init__(
@@ -346,6 +388,7 @@ class LLMRateLimitError(Exception):
         model: str,
         operation: str,
         details: Dict[str, Any],
+        attempts: Optional[List[Dict[str, Any]]] = None,
     ):
         self.provider = provider
         self.model = model
@@ -359,6 +402,8 @@ class LLMRateLimitError(Exception):
         self.retryable = bool(details.get("retryable", True))
         self.retry_after_seconds = details.get("retryAfterSeconds")
         self.reset_at = str(details.get("resetAt") or "")
+        self.attempts = list(attempts or [])
+        self.retry_stop_reason = str(details.get("retryStopReason") or "")
         super().__init__(
             f"{provider}.{operation} {self.kind} for model {model}"
             + (f" ({self.provider_code})" if self.provider_code else "")
@@ -379,6 +424,9 @@ class LLMRateLimitError(Exception):
             "retryable": self.retryable,
             "retryAfterSeconds": self.retry_after_seconds,
             "resetAt": self.reset_at or None,
+            "attempts": self.attempts,
+            "retryStopReason": self.retry_stop_reason or None,
+            "rateLimitRetries": retry_usage_from_attempts(self.attempts).get("rate_limit_retries", 0),
         }
 
 
@@ -390,8 +438,9 @@ class LLMStreamDecodeError(Exception):
     worker to repeatedly "repair" a request that the model never produced.
     """
 
-    def __init__(self, message: str, *, raw_arguments: str = ""):
+    def __init__(self, message: str, *, raw_arguments: str = "", diagnostics: Optional[Dict[str, Any]] = None):
         self.raw_arguments = raw_arguments
+        self.diagnostics = diagnostics or {}
         super().__init__(message)
 
 
@@ -527,6 +576,89 @@ class BaseLLMProvider(ABC):
         backoff_seconds = self._llm_timeout_backoff_seconds()
         retry_interval_seconds = self._llm_timeout_retry_interval_seconds()
         attempts: List[Dict[str, Any]] = []
+        rate_retries = 0
+        rate_wait = 0.0
+        try:
+            rate_max_retries = max(0, min(10, int(self.config.llm_rate_limit_max_retries)))
+        except (TypeError, ValueError, OverflowError, AttributeError):
+            rate_max_retries = 3
+
+        def _finite_setting(name: str, default: float) -> float:
+            try:
+                value = float(getattr(self.config, name))
+                return max(0.0, value) if math.isfinite(value) else default
+            except (TypeError, ValueError, AttributeError):
+                return default
+
+        rate_backoff = _finite_setting("llm_rate_limit_backoff_seconds", 5.0)
+        rate_max_wait = _finite_setting("llm_rate_limit_max_wait_seconds", 90.0)
+        started = time.monotonic()
+
+        async def _invoke(factory: Callable[[], Any], *, managed: bool, stage: str = "normal") -> Any:
+            # Share one throttle budget across normal attempts and the reserved
+            # fallback. Each individual request keeps its own timeout; waiting
+            # for Retry-After must not consume that request's idle timeout.
+            nonlocal rate_retries, rate_wait, started
+            while True:
+                started = time.monotonic()
+                try:
+                    if managed:
+                        return await factory()
+                    return await asyncio.wait_for(factory(), timeout=timeout_seconds)
+                except Exception as exc:
+                    if isinstance(exc, LLMRateLimitError):
+                        raise
+                    details = rate_limit_error_details(exc)
+                    if details is None:
+                        raise
+                    entry = {
+                        "attempt": len(attempts) + 1,
+                        "reason": details["kind"],
+                        "elapsed_seconds": round(time.monotonic() - started, 3),
+                        "requestId": details["requestId"],
+                        "providerCode": details["providerCode"],
+                        "message": details["providerMessage"],
+                        "statusCode": details["statusCode"],
+                        "retryAfterSeconds": details["retryAfterSeconds"],
+                        "resetAt": details["resetAt"],
+                        "usage_available": False,
+                        "stage": stage,
+                    }
+                    attempts.append(entry)
+                    hints = [value for value in (
+                        details["retryAfterSeconds"],
+                        _reset_delay_seconds(details["resetAt"]),
+                    ) if value is not None]
+                    delay = (max(hints) if hints else
+                             rate_backoff * (2 ** rate_retries) * random.uniform(1.0, 1.2))
+                    if not hints:
+                        delay = round(delay, 3)
+                    stop = (
+                        "quota_exhausted" if details["kind"] == "quota_exhausted" else
+                        "retry_budget_exhausted" if rate_retries >= rate_max_retries else
+                        "wait_budget_exceeded" if delay > rate_max_wait - rate_wait else
+                        ""
+                    )
+                    if stop:
+                        entry["retryStopReason"] = stop
+                        raise LLMRateLimitError(
+                            provider=provider, model=self.config.model_id,
+                            operation=operation,
+                            details={**details, "automaticRetry": rate_retries > 0,
+                                     "retryStopReason": stop},
+                            attempts=attempts,
+                        ) from exc
+                    entry["next_retry_delay_seconds"] = delay
+                    entry["delay_source"] = "provider" if hints else "exponential_jitter"
+                    rate_retries += 1
+                    logging.getLogger(__name__).warning(
+                        "%s.%s rate limited: retry %d/%d after %.3fs (request_id=%s)",
+                        provider, operation, rate_retries, rate_max_retries,
+                        delay, details["requestId"] or "unavailable",
+                    )
+                    waiting = time.monotonic()
+                    await asyncio.sleep(delay)
+                    rate_wait += max(delay, time.monotonic() - waiting)
 
         def _retry_delay(attempt_index: int) -> float:
             if retry_interval_seconds is None:
@@ -534,20 +666,13 @@ class BaseLLMProvider(ABC):
             return round(retry_interval_seconds, 3)
 
         for attempt_index in range(max_retries + 1):
-            attempt_number = attempt_index + 1
             started = time.monotonic()
             try:
-                if timeout_managed:
-                    response = await request_factory()
-                else:
-                    response = await asyncio.wait_for(
-                        request_factory(),
-                        timeout=timeout_seconds,
-                    )
+                response = await _invoke(request_factory, managed=timeout_managed)
             except (asyncio.TimeoutError, TimeoutError) as exc:
                 elapsed = round(time.monotonic() - started, 3)
                 attempts.append({
-                    "attempt": attempt_number,
+                    "attempt": len(attempts) + 1,
                     "reason": "timeout",
                     "timeout_seconds": timeout_seconds,
                     "elapsed_seconds": elapsed,
@@ -569,12 +694,14 @@ class BaseLLMProvider(ABC):
             except LLMStreamDecodeError as exc:
                 elapsed = round(time.monotonic() - started, 3)
                 attempts.append({
-                    "attempt": attempt_number,
+                    "attempt": len(attempts) + 1,
                     "reason": "stream_decode_error",
                     "error_type": type(exc).__name__,
                     "error": str(exc) or type(exc).__name__,
                     "elapsed_seconds": elapsed,
                 })
+                if exc.diagnostics:
+                    attempts[-1]["stream_diagnostics"] = exc.diagnostics
                 if attempt_index < max_retries:
                     delay = _retry_delay(attempt_index)
                     attempts[-1]["next_retry_delay_seconds"] = delay
@@ -592,11 +719,10 @@ class BaseLLMProvider(ABC):
                     ) from exc
 
                 fallback_started = time.monotonic()
-                fallback_attempt = max_retries + 2
                 try:
-                    fallback_response = await asyncio.wait_for(
-                        reserved_nonstream_fallback_factory(),
-                        timeout=timeout_seconds,
+                    fallback_response = await _invoke(
+                        reserved_nonstream_fallback_factory, managed=False,
+                        stage="nonstream_fallback",
                     )
                     fallback_problem = (
                         fallback_response_validator(fallback_response)
@@ -611,18 +737,12 @@ class BaseLLMProvider(ABC):
                 except BaseException as fallback_exc:
                     if isinstance(fallback_exc, asyncio.CancelledError):
                         raise
-                    rate_limit = rate_limit_error_details(fallback_exc)
-                    if rate_limit is not None:
-                        raise LLMRateLimitError(
-                            provider=provider,
-                            model=self.config.model_id,
-                            operation=operation,
-                            details=rate_limit,
-                        ) from fallback_exc
+                    if isinstance(fallback_exc, LLMRateLimitError):
+                        raise
                     if isinstance(fallback_exc, LLMProviderResponseError):
                         raise
                     attempts.append({
-                        "attempt": fallback_attempt,
+                        "attempt": len(attempts) + 1,
                         "reason": "nonstream_fallback_failed",
                         "error_type": type(fallback_exc).__name__,
                         "error": str(fallback_exc) or type(fallback_exc).__name__,
@@ -639,7 +759,7 @@ class BaseLLMProvider(ABC):
                         fallback_attempted=True,
                     ) from fallback_exc
                 attempts.append({
-                    "attempt": fallback_attempt,
+                    "attempt": len(attempts) + 1,
                     "reason": "nonstream_fallback",
                     "outcome": "success",
                     "elapsed_seconds": round(
@@ -649,20 +769,14 @@ class BaseLLMProvider(ABC):
                 })
                 return fallback_response, attempts
             except Exception as exc:
-                rate_limit = rate_limit_error_details(exc)
-                if rate_limit is not None:
-                    raise LLMRateLimitError(
-                        provider=provider,
-                        model=self.config.model_id,
-                        operation=operation,
-                        details=rate_limit,
-                    ) from exc
+                if isinstance(exc, LLMRateLimitError):
+                    raise
                 reason = connection_failure_reason(exc)
                 if reason is None:
                     raise
                 elapsed = round(time.monotonic() - started, 3)
                 attempts.append({
-                    "attempt": attempt_number,
+                    "attempt": len(attempts) + 1,
                     "reason": "connection_error",
                     "error_type": reason,
                     "error": str(exc) or reason,
@@ -688,7 +802,7 @@ class BaseLLMProvider(ABC):
                 return response, attempts
             elapsed = round(time.monotonic() - started, 3)
             attempts.append({
-                "attempt": attempt_number,
+                "attempt": len(attempts) + 1,
                 "reason": "degenerate_response",
                 "problem": problem,
                 "elapsed_seconds": elapsed,
