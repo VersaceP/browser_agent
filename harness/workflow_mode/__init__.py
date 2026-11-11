@@ -1,1 +1,1 @@
-"""Workflow development on the shared Skill executor and persistent Coding loop."""
+"""Workflow mode: author, publish and run WebCross Workshop packages."""
