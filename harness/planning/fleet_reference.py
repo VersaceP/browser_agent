@@ -7,14 +7,15 @@ from typing import Optional, Tuple
 
 
 _FLEET_REF_RE = re.compile(
-    r"@([0-9a-f]{8}(?:-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?)"
+    r"@(?:fleet[-_:])?([0-9a-f]{8}(?:-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?)"
     r"(?![0-9a-f-])",
     re.IGNORECASE,
 )
-_FLEET_SIGIL_RE = re.compile(r"@[0-9a-f][0-9a-f-]{3,}", re.IGNORECASE)
+_FLEET_SIGIL_RE = re.compile(r"@(?:fleet[-_:]?\S*|[0-9a-f][0-9a-f-]{3,})", re.IGNORECASE)
 FLEET_REFERENCE_SYNTAX = (
     "Fleet references must use @ immediately followed by a Fleet ID, with no space, for example "
-    "@2677c96a-7a2b-4119-bec8-2e56cf93a5cd (the 8-character prefix @2677c96a is also accepted)."
+    "@2677c96a-7a2b-4119-bec8-2e56cf93a5cd (the 8-character prefix @2677c96a and the label form "
+    "@fleet-2677c96a-... are also accepted)."
 )
 
 
@@ -23,6 +24,8 @@ def extract_fleet_reference(task: str) -> Tuple[Optional[str], Optional[str]]:
     text = str(task or "")
     matches = [match.group(1).lower() for match in _FLEET_REF_RE.finditer(text)]
     unique = list(dict.fromkeys(matches))
+    # A prefix and the full UUID it starts name the same Fleet.
+    unique = [m for m in unique if not any(o != m and o.startswith(m) for o in unique)]
     if len(unique) > 1:
         return None, "The task contains multiple different Fleet references; select one Fleet."
     for match in _FLEET_SIGIL_RE.finditer(text):

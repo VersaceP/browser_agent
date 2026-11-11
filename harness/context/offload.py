@@ -88,12 +88,10 @@ def serialized_offload_text(content: Any) -> str:
 
 
 def page_view_blob_path(observations_dir: Path, prefix: str, page_id: str) -> Path:
-    """Where one page's current full view lives: the same path on every read.
+    """Base name for one page; storage adds the immutable content identity.
 
-    A read-scoped name stored the same page once per read — five reads of one
-    unchanged search page cost five ~400KB files and five database rows, and
-    every superseded copy was unreachable, because only the current version of
-    a logical path answers local_fs_read.
+    Identical reads can share a resource, but changed views must retain their
+    own address so old receipts cannot resolve to a newer page's bytes.
     """
     parts = [part for part in (
         safe_path_component(prefix, "agent") if prefix else "",
@@ -140,7 +138,13 @@ def store_offloaded_payload(
             logger._offload_content_index = index
         except Exception:
             index = {}
-    existing = index.get(digest)
+    # A logical resource path resolves to its current version in every storage
+    # backend. Bind the filename to the bytes before publishing that path; an
+    # A -> B -> A view must never reuse A's address after B has overwritten it.
+    # Bound the descriptive prefix because capability/prefix names can be long.
+    path = path.with_name(f"{safe_path_component(path.stem)}-{digest}{path.suffix}")
+    index_key = (str(Path(logger.task_dir).resolve()), digest, media_type)
+    existing = index.get(index_key)
     if existing:
         facts["savedPath"] = existing
         facts["sameContentAs"] = existing
@@ -153,7 +157,7 @@ def store_offloaded_payload(
         media_type=media_type,
     )
     resolved = str(path.resolve())
-    index[digest] = resolved
+    index[index_key] = resolved
     facts["savedPath"] = resolved
     return facts
 
@@ -391,6 +395,63 @@ def _longest_string(value: Any, limit: int) -> bool:
     return False
 
 
+def _projection_omissions(value: Any, limit: int) -> JsonDict:
+    """Bounded, factual description of strings the model projection will cut."""
+    fields: List[JsonDict] = []
+    count = 0
+
+    def visit(item: Any, path: str) -> None:
+        nonlocal count
+        if isinstance(item, str) and len(item) > limit:
+            count += 1
+            if len(fields) < 32:
+                fields.append({
+                    "path": path[:300],
+                    **({"pathTruncated": True} if len(path) > 300 else {}),
+                    "originalChars": len(item),
+                    "retainedChars": limit,
+                    "omittedChars": len(item) - limit,
+                })
+        elif isinstance(item, dict):
+            for key, child in item.items():
+                escaped = str(key).replace("~", "~0").replace("/", "~1")
+                visit(child, f"{path}/{escaped}")
+        elif isinstance(item, (list, tuple)):
+            for index, child in enumerate(item):
+                visit(child, f"{path}/{index}")
+
+    visit(value, "")
+    return {"omittedFields": fields, "omittedFieldCount": count,
+            "omittedFieldsTruncated": count > len(fields)}
+
+
+def _write_offload_event(logger: RunLogger, event: str, facts: JsonDict) -> None:
+    # The resource store and event log may share the same failed disk/database.
+    # Losing a diagnostic must not discard a browser result already received.
+    try:
+        logger.write(event, facts)
+    except Exception:
+        pass
+
+
+def attach_payload_preservation_notice(result: Any, receipt: Optional[JsonDict]) -> Any:
+    """Keep recovery and upstream loss visible through repeated projections."""
+    if not receipt:
+        return result
+    notice = {key: value for key, value in receipt.items() if value is not None}
+    if isinstance(result, dict):
+        previous = result.get("_truncation")
+        if isinstance(previous, dict) and previous.get("sourceComplete") is False:
+            # Saving a later partial copy cannot recover text already lost by
+            # an earlier projection. Its file is useful, but is not the original.
+            if previous != notice:
+                notice["upstreamLoss"] = previous
+            notice["sourceComplete"] = False
+            notice["fullPayloadAvailable"] = False
+        return {**result, "_truncation": notice}
+    return {"result": result, "_truncation": notice}
+
+
 def preserve_complete_tool_payload(
     *,
     logger: RunLogger,
@@ -399,6 +460,7 @@ def preserve_complete_tool_payload(
     step: Optional[int],
     prefix: str = "",
     projection_limit: int,
+    force: bool = False,
 ) -> Optional[JsonDict]:
     """Write the complete payload to disk BEFORE anything is trimmed.
 
@@ -412,13 +474,12 @@ def preserve_complete_tool_payload(
     Returns None when trimming would remove nothing, because then the model
     receipt IS the complete payload and a second copy would be waste.
 
-    "Complete" means complete as persisted. Result redaction is a no-op today
-    (parameters, not results, are the redacted surface), but the hash is named
-    for what was written rather than for the input, so it stays honest the day
-    a result-side redaction is added.
+    "Complete" refers to the received receipt after credential redaction,
+    not an unredacted wire response or a guarantee of upstream capture coverage.
+    A failed preservation returns explicit loss facts, without an invented path.
     """
 
-    if not _longest_string(result, projection_limit):
+    if not force and not _longest_string(result, projection_limit):
         return None
 
     original_bytes = json_size_bytes(result)
@@ -428,7 +489,6 @@ def preserve_complete_tool_payload(
     persisted_sha256 = hashlib.sha256(
         serialized_offload_text(result).encode("utf-8")
     ).hexdigest()
-    tool_results_dir = task_subdir(logger, "tool_results")
     safe_tool = safe_path_component(tool_name.replace(".", "-"), "tool")
     safe_prefix = safe_path_component(prefix, "agent") if prefix else ""
     parts = [
@@ -437,23 +497,44 @@ def preserve_complete_tool_payload(
             uuid.uuid4().hex[:8],
         ) if part
     ]
-    path = tool_results_dir / ("-".join(parts) + ".json")
     try:
+        path = task_subdir(logger, "tool_results") / ("-".join(parts) + ".json")
         facts = store_offloaded_payload(
             logger, path, resource_type="tool_result_complete", content=result,
         )
     except Exception as exc:  # noqa: BLE001 - a failed preserve must not fail the call
         # Reporting a savedPath that does not exist would be worse than
         # reporting none: the model would page a file that is not there.
-        logger.write(
+        _write_offload_event(
+            logger,
             "tool_result.preserve_failed",
             {"tool": tool_name, "step": step, "error": str(exc)[:300]},
         )
-        return None
+        omissions = _projection_omissions(result, projection_limit)
+        will_trim = bool(omissions["omittedFieldCount"])
+        return {
+            "sourceComplete": not will_trim,
+            "projectionTruncated": will_trim,
+            "preservationStatus": "failed",
+            "fullPayloadAvailable": False,
+            "originalBytes": original_bytes,
+            "projectionLimitChars": int(projection_limit),
+            "reason": "preservation_failed",
+            "errorType": type(exc).__name__,
+            **omissions,
+            "next_instruction": (
+                "The complete receipt could not be saved. Omitted text is"
+                " unavailable here; do not infer absence or an outcome from"
+                " the missing text. Use retained evidence or an authorized"
+                " read to resolve uncertainty before deciding how to continue."
+            ),
+        }
 
     return {
         "sourceComplete": True,
         "projectionTruncated": True,
+        "preservationStatus": "saved",
+        "fullPayloadAvailable": True,
         "savedPath": facts.get("savedPath"),
         "persistedPayloadSha256": persisted_sha256,
         "contentAddress": facts.get("contentHash"),
@@ -523,7 +604,6 @@ def offload_large_tool_result(
     if byte_size <= threshold_bytes:
         return result
 
-    tool_results_dir = task_subdir(logger, "tool_results")
     safe_tool = safe_path_component(tool_name.replace(".", "-"), "tool")
     safe_prefix = safe_path_component(prefix, "agent") if prefix else ""
     filename_parts = [
@@ -534,10 +614,23 @@ def offload_large_tool_result(
             uuid.uuid4().hex[:8],
         ) if part
     ]
-    path = tool_results_dir / ("-".join(filename_parts) + ".json")
-    facts = store_offloaded_payload(
-        logger, path, resource_type="tool_result", content=result,
-    )
+    try:
+        path = task_subdir(logger, "tool_results") / ("-".join(filename_parts) + ".json")
+        facts = store_offloaded_payload(
+            logger, path, resource_type="tool_result", content=result,
+        )
+    except Exception as exc:
+        failure = {"reason": "offload_failed", "errorType": type(exc).__name__,
+                   "originalBytes": byte_size, "recoveryReferenceAvailable": False}
+        _write_offload_event(logger, "tool_result.offload_failed", {
+            "tool": tool_name, "step": step, **failure,
+        })
+        # Preserve the received result inline. The caller's string budget and
+        # preservation notice still apply; an offload failure is not an Action
+        # failure and must not invite replay of an already executed operation.
+        return {**result, "_offloadFailure": failure} if isinstance(result, dict) else {
+            "result": result, "_offloadFailure": failure,
+        }
 
     stub: JsonDict = {
         "_offloaded": True,
@@ -555,6 +648,8 @@ def offload_large_tool_result(
     if recovery:
         stub["recoveryOverview"] = recovery
     if isinstance(result, dict):
+        if isinstance(result.get("_truncation"), dict):
+            stub["_truncation"] = result["_truncation"]
         for key in GENERIC_TOOL_RESULT_KEEP_KEYS:
             if key in result:
                 stub[key] = outline_large_field(result[key])
@@ -574,7 +669,8 @@ def offload_large_tool_result(
         relative_path = str(saved_path.resolve().relative_to(logger.task_dir.resolve()))
     except ValueError:
         relative_path = str(saved_path)
-    logger.write(
+    _write_offload_event(
+        logger,
         "tool_result.offloaded",
         {
             "tool": tool_name,
@@ -601,6 +697,32 @@ def offload_large_response_fields(
     step: Optional[int],
     prefix: str = "",
     threshold_bytes: int = DEFAULT_OFFLOAD_THRESHOLD_BYTES,
+) -> Any:
+    try:
+        return _offload_large_response_fields(
+            logger=logger, method=method, params=params, response=response,
+            step=step, prefix=prefix, threshold_bytes=threshold_bytes,
+        )
+    except Exception as exc:
+        # A failed field save must leave the received response available for
+        # the normal complete-payload preservation and model projection path.
+        failure = {"reason": "field_offload_failed", "errorType": type(exc).__name__,
+                   "recoveryReferenceAvailable": False}
+        _write_offload_event(logger, "tool_result.field_offload_failed", {
+            "method": method, "step": step, **failure,
+        })
+        return {**response, "_offloadFailure": failure} if isinstance(response, dict) else response
+
+
+def _offload_large_response_fields(
+    *,
+    logger: RunLogger,
+    method: str,
+    params: JsonDict,
+    response: Any,
+    step: Optional[int],
+    prefix: str,
+    threshold_bytes: int,
 ) -> Any:
     if method not in OFFLOAD_METHODS or not isinstance(response, dict):
         return response
