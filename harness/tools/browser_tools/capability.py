@@ -31,7 +31,8 @@ from harness.utils import JsonDict
 from harness.utils import optional_int
 from harness.workflow.workflow_runtime import workflow_execution_disabled_result
 from harness.workflow.workflow_runtime import workflow_execution_enabled
-from .axtree_state import _current_axtree_lines, _current_axtree_nodes
+from .axtree_state import _current_axtree_lines, _axtree_nodes_from_lines
+from harness.observation.axtree_format import parse_axtree_line
 from .axtree_state import _browser_side_rematch_mode
 from .axtree_state import _check_stale_axtree_target
 from .axtree_state import _observe_axtree_state_after
@@ -127,8 +128,6 @@ async def _execute_browser_capability_tool(
     tool_name: str,
     tool_input: JsonDict,
     step: int,
-    *,
-    published_skill_workflow: bool = False,
 ) -> Tuple[JsonDict, bool]:
     from harness.runtime.steering import current_steering, dispatch_boundary
     steering_revision = current_steering().revision if current_steering() else 0
@@ -211,6 +210,13 @@ async def _execute_browser_capability_tool(
         )
         agent.trace.append({"type": "browser_call_params_error", "result": result})
         return result, False
+
+    from harness.workflow.access import write_denial
+    persistence_denial = write_denial(agent, method, params)
+    if persistence_denial is not None:
+        agent.logger.write("browser.call.permission_denied", persistence_denial)
+        agent.trace.append({"type": "permission_denied", "result": persistence_denial})
+        return persistence_denial, False
 
     if agent.capability_methods and method not in agent.capability_methods:
         result = {
@@ -310,8 +316,40 @@ async def _execute_browser_capability_tool(
             params["returnByValue"] = True
 
     if method == "Workflow.execute":
+        if "workshopId" in params:
+            if not workflow_execution_enabled(agent):
+                return workflow_execution_disabled_result(source="browser_call.Workflow.execute"), False
+            if "workflow" in params:
+                return {"status": "invalid_params", "tool_was_executed": False,
+                        "error": "Supply exactly one of workflow or workshopId"}, False
+            wire_issues = validate_schema(params, method_input_schema)
+            if wire_issues:
+                return capability_argument_error(tool_name, method, wire_issues), False
+            denied = _bt()._check_worker_contract(agent, method)
+            if denied:
+                return denied, False
+            from harness.workflow.workshop import prepare_saved_execution
+            try:
+                inline, snapshot = await prepare_saved_execution(agent, params)
+            except Exception as exc:
+                failure = {"status": "workshop_snapshot_unavailable", "tool_was_executed": False,
+                           "error": str(exc), "errorType": type(exc).__name__,
+                           "lookupReceiptRef": getattr(exc, "lookup_receipt", None),
+                           "next_instruction": "Inspect the lookup failure; no workflow was dispatched."}
+                if isinstance(exc, ABCPTransportError):
+                    from harness.workflow_mode.platform import platform_error
+                    failure["lookupFailure"] = platform_error(exc)
+                agent.logger.write("workflow.workshop.lookup_failed", failure)
+                return failure, False
+            result, stop = await _execute_browser_capability_tool(agent, "browser_call", {
+                "method": method, "params": inline, "reason": reason}, step)
+            result["workshopSnapshot"] = snapshot
+            result["workflowDefinition"] = snapshot["workflowDefinition"]
+            agent.logger.write("workflow.workshop.execution", {"snapshot": snapshot,
+                               "status": result.get("status"), "workflowExecution": result.get("workflowExecution")})
+            return result, stop
         from harness.workflow.script_runtime import (is_script_package,
-            script_contract_available, scope_package, input_files)
+            script_contract_available, scope_package, input_files, execution_timeout_ms)
         script_request = isinstance(params.get("workflow"), dict) and is_script_package(params["workflow"])
         if script_request:
             if not workflow_execution_enabled(agent):
@@ -323,7 +361,7 @@ async def _execute_browser_capability_tool(
             binding = params.get("binding") or {}
             business_input = params.get("input", {})
             params = {"description": document.get("description") or document.get("name"),
-                      "timeout": document.get("timeoutMs", 600000), **binding,
+                      "timeout": execution_timeout_ms(document), **binding,
                       "_platformWorkflow": document, "_platformInput": business_input}
         elif script_contract_available():
             return {"status": "workflow_source_required", "tool_was_executed": False,
@@ -342,10 +380,6 @@ async def _execute_browser_capability_tool(
                 "timeout": document.get("timeoutMs", 600000),
                 **params.get("binding", {}),
             }
-            if published_skill_workflow:
-                params["_platformWorkflow"] = document
-        elif published_skill_workflow:
-            return {"status": "invalid_skill_workflow", "tool_was_executed": False}, False
         if not workflow_execution_enabled(agent):
             disabled = workflow_execution_disabled_result(
                 source="browser_call.Workflow.execute"
@@ -356,46 +390,32 @@ async def _execute_browser_capability_tool(
                 "result": disabled,
             })
             return disabled, False
-        if published_skill_workflow:
-            from harness.skill_builder.workflow_scope import workflow_action_scope_error
-            scope_error = workflow_action_scope_error(
-                params["_platformWorkflow"],
-                capability_methods=getattr(agent, "capability_methods", set()),
-                page_id=str(params.get("pageId") or ""),
-                fleet_id=str(params.get("fleetId") or ""),
-            )
-            if scope_error:
-                result = {"status": "permission_denied", "tool_was_executed": False,
-                          "error": scope_error}
-                agent.logger.write("skill.workflow.scope_rejected", result)
-                return result, False
-        else:
-            normalized_workflow, workflow_error = validate_workflow_params(
-                params,
-                capability_methods=getattr(agent, "capability_methods", set()),
-                allow_runtime=False,
-                enforce_lifecycle=True,
-            )
-            if workflow_error is not None:
-                attach_method_schema(workflow_error, method, agent.method_schemas)
-                agent.logger.write("workflow.execute.rejected", workflow_error)
-                agent.trace.append({"type": "workflow_policy_rejected", "result": workflow_error})
-                return workflow_error, False
-            params = dict(normalized_workflow)
-            from harness.tools.capability_repairs import prepare_workflow_literal_arguments
-            params, workflow_repairs, workflow_repair_issues = prepare_workflow_literal_arguments(
-                params, agent.method_schemas,
-            )
-            if workflow_repair_issues:
-                result = capability_argument_error(tool_name, method, workflow_repair_issues)
-                agent.logger.write("workflow.execute.rejected", result)
-                agent.trace.append({"type": "workflow_policy_rejected", "result": result})
-                return result, False
-            if workflow_repairs:
-                argument_repairs.extend(workflow_repairs)
-                agent.logger.write("browser.call.arguments_repaired", {
-                    "method": method, "repairs": workflow_repairs,
-                })
+        normalized_workflow, workflow_error = validate_workflow_params(
+            params,
+            capability_methods=getattr(agent, "capability_methods", set()),
+            allow_runtime=False,
+            enforce_lifecycle=True,
+        )
+        if workflow_error is not None:
+            attach_method_schema(workflow_error, method, agent.method_schemas)
+            agent.logger.write("workflow.execute.rejected", workflow_error)
+            agent.trace.append({"type": "workflow_policy_rejected", "result": workflow_error})
+            return workflow_error, False
+        params = dict(normalized_workflow)
+        from harness.tools.capability_repairs import prepare_workflow_literal_arguments
+        params, workflow_repairs, workflow_repair_issues = prepare_workflow_literal_arguments(
+            params, agent.method_schemas,
+        )
+        if workflow_repair_issues:
+            result = capability_argument_error(tool_name, method, workflow_repair_issues)
+            agent.logger.write("workflow.execute.rejected", result)
+            agent.trace.append({"type": "workflow_policy_rejected", "result": result})
+            return result, False
+        if workflow_repairs:
+            argument_repairs.extend(workflow_repairs)
+            agent.logger.write("browser.call.arguments_repaired", {
+                "method": method, "repairs": workflow_repairs,
+            })
 
     contract_result = _bt()._check_worker_contract(agent, method)
     if contract_result is not None:
@@ -579,7 +599,8 @@ async def _execute_browser_capability_tool(
             guarded, scope = scope_package(params["_platformWorkflow"],
                 page_id=str(params.get("pageId") or ""),
                 fleet_id=str(params.get("fleetId") or ""), methods=methods,
-                files=input_files(agent, params.get("_platformInput", {})))
+                files=input_files(agent, params.get("_platformInput", {})),
+                write_policy=_agent_write_policy(agent))
         except ValueError as exc:
             return {"status": "invalid_workflow_package", "tool_was_executed": False,
                     "error": str(exc)}, False
@@ -603,22 +624,6 @@ async def _execute_browser_capability_tool(
             "result": page_create_claim_guard,
         })
         return page_create_claim_guard, False
-    # A bounded VL solve runs before the pause is issued. It claims the fleet auth
-    # barrier itself (inside the autosolver) so concurrent same-fleet workers can
-    # never drive the same challenge; on success it verifies and releases the
-    # barrier, on failure it keeps ownership and the pause below inherits it.
-    captcha_short_circuit = await _bt()._maybe_autosolve_before_model_pause(
-        agent, method, params, step
-    )
-    if captcha_short_circuit is not None:
-        agent.logger.write("browser.call.captcha_auto_solved", captcha_short_circuit)
-        agent.trace.append({
-            "type": "captcha_auto_solved",
-            "method": method,
-            "params": shown_params(),
-            "result": captcha_short_circuit,
-        })
-        return captcha_short_circuit, False
     hitl_claim_guard = await _bt()._claim_fleet_auth_barrier_for_hitl(
         agent, method, params
     )
@@ -661,13 +666,6 @@ async def _execute_browser_capability_tool(
         # mid-call (race fix) without letting a cross-page event suppress it.
         event_serial_before = int(getattr(agent, "axtree_event_serial", 0) or 0)
         page_before = str(getattr(agent, "axtree_page_id", "") or "")
-        if method == "Hitl.requestPause":
-            await _bt()._capture_hitl_pause_snapshot(
-                agent,
-                runner,
-                str(params.get("pageId") or ""),
-                step,
-            )
         _bt()._page_lifecycle_before_action(agent, method, params)
         reused_download = (
             _bt()._reusable_download_response(agent, params)
@@ -888,7 +886,7 @@ async def _execute_browser_capability_tool(
         ):
             structural_challenge = None
         if structural_challenge:
-            result["structuralChallenge"] = structural_challenge
+            result["challengeComponent"] = structural_challenge
         if runtime_receipt:
             result["runtimePolicy"] = runtime_receipt
             if runtime_receipt.get("resultMode") == "json":
@@ -1034,7 +1032,7 @@ async def _execute_browser_capability_tool(
     _bt()._fleet_auth_barrier_after_call(agent, method, result, params)
     result = _bt()._attach_runtime_strategy_hints(result, method=method)
     if not page_create_should_stop:
-        result = await _bt()._maybe_auto_hitl_for_challenge(agent, method, params, result, step)
+        result = await _bt()._observe_challenge_signals(agent, method, params, result, step)
     result = _bt()._attach_normalized_handles(result)
     result = _bt()._settle_page_inventory_signal(
         agent,
@@ -1166,7 +1164,8 @@ async def _execute_browser_capability_tool(
         prefix=agent.runtime.agent_id,
         # Read defensively, like the rest of this module reads harness config:
         # a preservation step must never be the reason a browser call raises.
-        projection_limit=1 if method == "Workflow.execute" and script_request else int(
+        force=bool(method == "Workflow.execute" and script_request),
+        projection_limit=int(
             getattr(
                 getattr(agent.runtime, "harness", None),
                 "max_observation_chars",
@@ -1187,6 +1186,7 @@ async def _execute_browser_capability_tool(
     if (
         method == "Runtime.evaluate"
         and complete_payload
+        and complete_payload.get("savedPath")
         and _bt()._record_extraction_persisted(result.get("recordExtraction"))
         and "runtimeValue" in result
         and not result.get("runtimeJSONError")
@@ -1242,11 +1242,9 @@ def _attach_complete_payload(
 
     if not complete or not isinstance(model_result, dict):
         return model_result
-    model_result = dict(model_result)
-    model_result["_truncation"] = {
-        key: value for key, value in complete.items() if value is not None
-    }
-    return model_result
+    from harness.context.offload import attach_payload_preservation_notice
+
+    return attach_payload_preservation_notice(model_result, complete)
 
 
 _TRUSTED_COLLECTION_RUNTIME_TOKEN = object()
@@ -1387,6 +1385,8 @@ def _attach_exec_trace(
                 "step": step, "workflowId": data.get("workflowId"),
                 "phase": "completed" if facts["status"] == "succeeded" else facts["status"],
                 "format": "js-ts-source-package", "executedStepCount": len(calls),
+                "executionOrigin": getattr(agent, "_workflow_execution_origin", None),
+                "callFacts": facts.get("callFacts"),
                 "actionsObserved": sum(c.get("kind") == "action" for c in calls),
                 "actionsSucceeded": sum(c.get("kind") == "action" and c.get("status") == "succeeded" for c in calls),
                 "completedCalls": len(calls), "source": (data.get("error") or {}).get("source"),
@@ -1602,13 +1602,6 @@ async def _invoke_browser_method(
         # intent armed here would outlive its action and let an unrelated site
         # popup claim it. Adoption is a model-facing grant, so only the
         # model's own dispatch path arms one.
-        if method == "Hitl.requestPause":
-            await _bt()._capture_hitl_pause_snapshot(
-                agent,
-                runner,
-                str(params.get("pageId") or ""),
-                step,
-            )
         _bt()._page_lifecycle_before_action(agent, method, params)
         pending = dispatch_boundary(agent, steering_revision, method)
         if pending:
@@ -1644,7 +1637,7 @@ async def _invoke_browser_method(
         ):
             structural_challenge = None
         if structural_challenge:
-            result["structuralChallenge"] = structural_challenge
+            result["challengeComponent"] = structural_challenge
         if runtime_receipt:
             result["runtimePolicy"] = runtime_receipt
         if isinstance(response, dict) and response.get("error"):
@@ -1730,7 +1723,7 @@ async def _invoke_browser_method(
     _bt()._fleet_auth_barrier_after_call(agent, method, result, params)
     result = _bt()._attach_runtime_strategy_hints(result, method=method)
     if not internal:
-        result = await _bt()._maybe_auto_hitl_for_challenge(agent, method, params, result, step)
+        result = await _bt()._observe_challenge_signals(agent, method, params, result, step)
     result = _bt()._attach_normalized_handles(result)
     result = _bt()._settle_page_inventory_signal(agent, method, params, result)
     _observe_axtree_state_after(
@@ -1860,7 +1853,9 @@ def _find_in_axtree(agent: Any, tool_input: JsonDict) -> JsonDict:
             "next_instruction": "Call DOM.getAXTree to refresh the AXTree before searching it.",
         }
 
-    nodes = _current_axtree_nodes(agent)
+    # A stored immutable view need only be fetched once for this search.
+    lines = _current_axtree_lines(agent)
+    nodes = list(getattr(agent, "axtree_nodes", []) or []) or _axtree_nodes_from_lines(lines)
     if not nodes:
         return {
             "status": "needs_fresh_axtree",
@@ -1910,10 +1905,29 @@ def _find_in_axtree(agent: Any, tool_input: JsonDict) -> JsonDict:
             return bool(query_re.search(value))
         return needle in candidate
 
-    lines = _current_axtree_lines(agent)
     current_ids = set(getattr(agent, "axtree_ids", set()) or set())
     matches: List[JsonDict] = []
+    ancestors: List[JsonDict] = []
+    related_nodes: JsonDict = {}
+
+    def related(node: JsonDict) -> None:
+        node_id = str(node.get("id") or "")
+        if node_id in related_nodes:
+            return
+        facts = {key: node[key] for key in ("id", "role", "name", "rect", "flags", "lineNumber") if key in node}
+        parsed = parse_axtree_line(str(node.get("line") or "")) or {}
+        if isinstance(parsed.get("scroll"), dict):
+            facts["scroll"] = parsed["scroll"]
+        related_nodes[node_id] = facts
+
     for node in nodes:
+        depth = optional_int(node.get("depth"), -1)
+        depth = depth if depth is not None else -1
+        if depth < 0 or str(node.get("role") or "").lower() == "rootwebarea":
+            ancestors.clear()
+        while ancestors and (optional_int(ancestors[-1].get("depth"), -1) or 0) >= depth:
+            ancestors.pop()
+        ancestors.append(node)
         if role and str(node.get("role") or "").lower() != role:
             continue
         if interactive_only and not bool(node.get("interactive")):
@@ -1946,6 +1960,17 @@ def _find_in_axtree(agent: Any, tool_input: JsonDict) -> JsonDict:
         node_rect = node.get("rect")
         if isinstance(node_rect, dict):
             entry["rect"] = node_rect
+        # These are relationships in the published view, not DOM-parent or
+        # business-row claims. Missing depths never invent a direct parent.
+        parents = ancestors[:-1]
+        parent = parents[-1] if parents and parents[-1].get("depth") == depth - 1 else None
+        scrolls = [item for item in reversed(parents) if "scroll" in (item.get("flags") or [])]
+        entry["viewParentId"] = parent.get("id") if parent else None
+        entry["scrollAncestorIds"] = [item["id"] for item in scrolls]
+        entry["viewAncestryComplete"] = len(parents) == depth and all(
+            item.get("depth") == index for index, item in enumerate(parents))
+        for item in ([parent] if parent else []) + scrolls:
+            related(item)
         matches.append(entry)
         if len(matches) >= max_results:
             break
@@ -1957,9 +1982,20 @@ def _find_in_axtree(agent: Any, tool_input: JsonDict) -> JsonDict:
         "axtreeEpoch": int(getattr(agent, "axtree_epoch", 0) or 0),
         "count": len(matches),
         "matches": matches,
+        "relatedNodes": related_nodes,
+        "structureSource": "depths and explicit scroll facts in the current cached view; not DOM ancestry or total data coverage",
         "next_instruction": (
             "Use a returned full id with Input.* or a bounded DOM.getDetails query."
             if matches
             else "No matching node exists in the current AXTree snapshot; refresh or change query."
         ),
     }
+
+
+def _agent_write_policy(agent):
+    """Path facts for the in-package write guard; none when the task identity is unknown."""
+    from harness.tools.path_authorization import write_policy
+    try:
+        return write_policy(agent)
+    except (AttributeError, TypeError):
+        return None

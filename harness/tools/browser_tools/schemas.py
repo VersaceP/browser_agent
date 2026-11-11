@@ -5,7 +5,7 @@ from typing import Dict, Tuple
 from harness.utils import JsonDict
 from harness.workflow.workflow_policy import listenable_events
 from harness.workflow.workflow_schema_source import platform_constraints, workflow_contract
-from harness.workflow.script_runtime import script_tool_schema
+from harness.workflow.script_runtime import script_tool_schema, script_contract_available
 
 
 def _workflow_condition_schema() -> JsonDict:
@@ -395,7 +395,7 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                         " when the person must resolve login, verification or a"
                         " page challenge. Use information_request when asking"
                         " for task facts. Omit when the reason is uncertain;"
-                        " observed challenge state can still trigger recovery."
+                        " The model decides from current evidence and user feedback."
                     ),
                 },
                 "runtime_policy": {
@@ -473,7 +473,7 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
             "required": ["method", "params", "reason"],
             "additionalProperties": False,
         },
-        "execute_browser_workflow": script_tool_schema() if "workflow" in workflow_contract().execute_properties else {
+        "execute_browser_workflow": script_tool_schema() if script_contract_available() else {
             "type": "object",
             "$defs": _workflow_step_definitions(),
             "properties": {
@@ -1095,6 +1095,12 @@ def _browser_input_schemas(capability_methods: Tuple[str, ...]) -> Dict[str, Jso
                     "default": None,
                     "description": "Only for .jsonl files: restrict the search to lines whose `type` matches this string. Pass null when not needed (searching .txt offloads, listing files, plain grep). The strings \"null\"/\"none\" are treated as null.",
                 },
+                "cursor": {"type": ["string", "null"], "default": None,
+                           "description": "Opaque nextCursor from the previous batch. Repeat the same path, glob, pattern and event_type; budgets may change. Omit/null to start a new search. Cursors expire and do not survive a process restart."},
+                "max_scan_entries": {"type": "integer", "minimum": 1, "maximum": 100000,
+                                     "default": 5000, "description": "Per-batch scan-work budget; a partial batch may contain zero matches and still have nextCursor."},
+                "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 30000,
+                               "default": 2000, "description": "Cooperative per-batch scan time budget. It cannot interrupt an in-progress OS filesystem operation."},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
                 "max_bytes_per_hit": {"type": "integer", "minimum": 200, "maximum": 20000, "default": 2000},
                 "max_total_bytes": {"type": "integer", "minimum": 1000, "maximum": 200000, "default": 20000},

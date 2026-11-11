@@ -23,7 +23,7 @@ from harness.diagnostics.error_classification import attach_error_classification
 from harness.runtime.lifecycle import LifecycleContext
 from harness.runtime.lifecycle import lifecycle_for
 from harness.tools.local_fs import local_fs_read
-from harness.tools.local_fs import local_fs_search
+from harness.tools.local_search_async import local_fs_search_async
 from harness.tools.local_fs import local_fs_list
 from harness.tools.file_tools import local_fs_batch
 from harness.tools.path_authorization import (
@@ -933,141 +933,6 @@ def _record_workflow_definition_before_dispatch(ctx: ToolContext, receipt: JsonD
 
 
 @BROWSER_TOOLS.register(
-    name="read_selected_skill_resource",
-    description="Read a bounded text file from the exact Skill version selected for this Browser task. Read formal source packages and input definitions before binding this run's values. This does not grant project-source access.",
-    input_schema={"type": "object", "properties": {"path": {"type": "string"},
-        "offset": {"type": "integer", "minimum": 0}, "max_chars": {"type": "integer", "minimum": 1, "maximum": 50000}},
-        "required": ["path"], "additionalProperties": False},
-    trace_type="skill_resource_read",
-)
-async def _browser_read_selected_skill_resource(ctx: ToolContext) -> JsonDict:
-    from harness.skill_builder.resources import read_selected_resource
-    return read_selected_resource(ctx.agent.runtime, str(ctx.tool_input.get("path") or ""),
-        offset=ctx.tool_input.get("offset", 0), max_chars=ctx.tool_input.get("max_chars", 16000), task_id=ctx.agent.logger.task_id)
-
-
-@BROWSER_TOOLS.register(
-    name="execute_published_skill_workflow",
-    description=(
-        "Execute one immutable Workflow JSON file from the exact Skill version"
-        " explicitly selected by the user for this task. The live page and"
-        " variables are supplied separately; the file is never reconstructed"
-        " from model text. Returns actual WebCross and Harness receipts."
-    ),
-    input_schema={
-        "type": "object",
-        "properties": {
-            "path": {"type": "string", "description": "Relative Workflow JSON path inside selected Skill."},
-            "pageId": {"type": "string"},
-            "fleetId": {"type": "string"},
-            "variables": {"type": "object", "additionalProperties": True},
-        },
-        "required": ["path", "pageId", "fleetId", "variables"],
-        "additionalProperties": False,
-    },
-    contract_check=True,
-    trace_type="skill_workflow_invocation",
-)
-async def _browser_execute_published_skill_workflow(ctx: ToolContext) -> JsonDict:
-    if not workflow_execution_enabled(ctx.agent):
-        return workflow_execution_disabled_result(source="execute_published_skill_workflow")
-    config = getattr(getattr(ctx.agent, "runtime", None), "harness", None)
-    skill_id = str(getattr(config, "forced_skill_id", "") or "").strip()
-    skill_hash = str(getattr(config, "forced_skill_hash", "") or "").strip()
-    if not skill_id or not skill_hash:
-        return {"status": "permission_denied", "tool_was_executed": False,
-                "error": "此任务没有用户明确选择且绑定版本的 Skill"}
-    from harness.skill_builder.catalog import SkillCatalog
-    from harness.storage.factory import resolve_sqlite_path
-    from harness.workflow.workflow_projection import workflow_execution_facts
-
-    worktree = str(getattr(config, "worktree_dir", "worktree"))
-    catalog = SkillCatalog(
-        Path(__file__).resolve().parents[3] / "skills",
-        resolve_sqlite_path(getattr(config, "storage_sqlite_path", "harness.db"), worktree),
-        worktree_dir=Path(worktree),
-    )
-    invocation = None
-    invocation_open = False
-    try:
-        snapshot = catalog.pin_source(skill_id, skill_hash, task_id=ctx.agent.logger.task_id)
-        if snapshot is None:
-            return {"status": "skill_version_unavailable", "tool_was_executed": False,
-                    "skill": skill_id, "hash": skill_hash}
-        relative = Path(str(ctx.tool_input.get("path") or ""))
-        if (relative.is_absolute() or not relative.parts or ".." in relative.parts
-                or any(part.startswith(".") for part in relative.parts)
-                or relative.suffix != ".json"):
-            return {"status": "invalid_skill_path", "tool_was_executed": False}
-        path = snapshot / relative
-        if not path.is_file() or path.is_symlink() or not path.resolve().is_relative_to(snapshot.resolve()):
-            return {"status": "skill_workflow_missing", "tool_was_executed": False,
-                    "path": relative.as_posix()}
-        workflow = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(workflow, dict):
-            return {"status": "invalid_skill_workflow", "tool_was_executed": False}
-        variables = ctx.tool_input.get("variables")
-        if not isinstance(variables, dict):
-            return {"status": "invalid_variables", "tool_was_executed": False}
-        from harness.skill_builder.resources import workflow_entries
-        if relative.as_posix() not in {e["path"] for e in workflow_entries(snapshot)}:
-            return {"status": "not_skill_execution_entry", "tool_was_executed": False,
-                    "error": "Parameters and development probes are not formal Workflow entries"}
-        from harness.workflow.script_runtime import is_script_package, script_contract_available, workflow_payload
-        script = is_script_package(workflow)
-        if script_contract_available() and not script:
-            return {"status": "legacy_workflow_requires_rebuild", "tool_was_executed": False,
-                    "path": relative.as_posix(), "error": "Rebuild this selected version as a JS/TS source package; changing variables cannot migrate steps DSL."}
-        workflow = dict(workflow)
-        if not script:
-            workflow["initialVariables"] = {**(workflow.get("initialVariables") or {}), **variables}
-        page_id = str(ctx.tool_input.get("pageId") or "")
-        fleet_id = str(ctx.tool_input.get("fleetId") or "")
-        input_hash = hashlib.sha256(json.dumps(
-            {"workflow": relative.as_posix(), "variables": variables,
-             "pageId": page_id, "fleetId": fleet_id},
-            sort_keys=True, default=str,
-        ).encode()).hexdigest()
-        invocation = catalog.begin_invocation(
-            task_id=ctx.agent.logger.task_id, run_id=ctx.agent.logger.run_id,
-            skill_id=skill_id, content_hash=skill_hash, input_hash=input_hash,
-        )
-        invocation_open = True
-        ctx.agent.logger.write("skill.invocation.started", {
-            **invocation, "workflowPath": relative.as_posix(), "pageId": page_id,
-            "fleetId": fleet_id, "inputHash": input_hash,
-        })
-        result, _should_stop = await _bt()._execute_browser_capability_tool(
-            ctx.agent, "browser_call", {
-                "method": "Workflow.execute",
-                "params": workflow_payload(workflow, variables, page_id, fleet_id) if script else {
-                    "workflow": workflow, "binding": {"pageId": page_id, "fleetId": fleet_id}},
-                "reason": f"Execute selected Skill {skill_id} Workflow {relative.as_posix()}",
-            }, ctx.step, published_skill_workflow=True,
-        )
-        facts = workflow_execution_facts(result)
-        status = str(facts.get("status") or "unknown")
-        ctx.agent.logger.write("skill.invocation.result", {
-            "invocationId": invocation["invocationId"], "facts": facts,
-        })
-        catalog.finish_invocation(invocation["invocationId"], status=status,
-                                  result_ref="skill.invocation.result")
-        invocation_open = False
-        result["skillInvocation"] = {**invocation, "workflowPath": relative.as_posix(),
-                                     "status": status}
-        return result
-    except BaseException:
-        if invocation is not None and invocation_open:
-            try:
-                catalog.finish_invocation(invocation["invocationId"], status="unknown")
-            except Exception:
-                pass  # Preserve the original execution or persistence failure.
-        raise
-    finally:
-        catalog.close()
-
-
-@BROWSER_TOOLS.register(
     name="execute_browser_workflow",
     description=(
         "Execute a browser-only WebCross JS/TS source package with separate input and page/Fleet binding."
@@ -1352,7 +1217,7 @@ async def _browser_navigate_verified(ctx: ToolContext) -> JsonDict:
         "page_settled_after_hitl",
         "stale_pause_deadlock",
     }:
-        result = await _bt()._maybe_auto_hitl_for_challenge(
+        result = await _bt()._observe_challenge_signals(
             ctx.agent,
             "navigate_verified",
             {"pageId": ctx.tool_input.get("pageId")},
@@ -1502,6 +1367,13 @@ async def _browser_final_answer(ctx: ToolContext) -> JsonDict:
         "answer": answer,
         "artifacts": ctx.agent.artifacts,
     }
+    from harness.runtime.review_policy import reviewer_enabled
+    if getattr(ctx.agent, "standalone_browser_mode", False) and not reviewer_enabled(ctx.agent.runtime):
+        result["review"] = {"status": "skipped", "reason": "reviewer_disabled"}
+        if status == "incomplete":
+            ctx.agent._write_agent_event("browser.task_review.skipped", {
+                "phase": "final", "step": ctx.step, **result["review"],
+            })
     reason = ctx.tool_input.get("reason")
     if isinstance(reason, str) and reason.strip():
         result["reason"] = reason.strip()[:200]
@@ -1686,7 +1558,7 @@ async def _browser_local_fs_authorize(ctx: ToolContext) -> JsonDict:
 
 @BROWSER_TOOLS.register(
     name="local_fs_search",
-    description="Read-only search under an authorized directory; external roots require terminal confirmation. If multiple sibling directories or the full tree are needed, request the common parent explicitly first; a parent READ grant covers descendants, while a child grant covers neither siblings nor the parent. Supports glob, JSONL event-type filtering, and per-hit / total output caps.",
+    description="Read-only incremental search under an authorized directory. Each bounded batch pauses scanning and returns nextCursor plus coverage; stop requesting batches when the evidence is sufficient, or repeat the same query with cursor to continue. No background search runs between calls. Incomplete coverage or zero matches does not prove absence. Prefer an explicit path or narrow glob. External roots need task READ authorization; cursors do not grant access. Supports glob, regex, JSONL event-type filtering and output/scan budgets.",
     input_schema=_browser_schema_for("local_fs_search"),
     contract_check=True,
     progress_check=True,
@@ -1694,9 +1566,13 @@ async def _browser_local_fs_authorize(ctx: ToolContext) -> JsonDict:
 )
 async def _browser_local_fs_search(ctx: ToolContext) -> JsonDict:
     tool_input = ctx.tool_input
-    return local_fs_search(
+    return await local_fs_search_async(
         ctx.agent.logger,
         agent=ctx.agent,
+        cursor=tool_input.get("cursor"),
+        max_scan_entries=optional_int(tool_input.get("max_scan_entries"), 5000),
+        timeout_ms=optional_int(tool_input.get("timeout_ms"), 2000),
+        cancelled=ctx.cancelled,
         path=str(tool_input.get("path") or "."),
         glob_pattern=str(tool_input.get("glob") or "**/*"),
         pattern=(
@@ -1789,6 +1665,10 @@ async def _browser_request_goal_review(ctx: ToolContext) -> JsonDict:
     if not getattr(ctx.agent, "standalone_browser_mode", False):
         return {"status": "rejected", "reason": "standalone_browser_only",
                 "tool_was_executed": False}
+    from harness.runtime.review_policy import reviewer_enabled
+    if not reviewer_enabled(ctx.agent.runtime):
+        return {"status": "skipped", "reason": "reviewer_disabled",
+                "tool_was_executed": False}
     return {"status": "requested", "question": ctx.tool_input["question"][:2000],
             "tool_was_executed": True}
 
@@ -1853,10 +1733,10 @@ def build_browser_agent_tool_specs(
     capability_methods: Set[str],
     *,
     workflow_enabled: bool = False,
-    selected_skill_available: bool = False,
     step_extension_enabled: bool = False,
     multimodal_enabled: bool = False,
     standalone_review_enabled: bool = False,
+    review_enabled: bool = True,
 ) -> List[JsonDict]:
     # A live capability does not authorize Harness execution by itself. Both
     # the control-plane master switch and the ABCP capability must be present.
@@ -1873,17 +1753,14 @@ def build_browser_agent_tool_specs(
         and (standalone_review_enabled or spec.get("name") not in {
             "request_goal_review", "update_task_todo",
         })
+        and (review_enabled or spec.get("name") != "request_goal_review")
         and (
             workflow_visible
             or spec.get("name") not in {
-                "execute_published_skill_workflow",
                 "execute_browser_workflow",
                 "execute_saved_browser_workflow",
             }
         )
-        and (selected_skill_available or spec.get("name") != "execute_published_skill_workflow")
-        and (selected_skill_available and standalone_review_enabled
-             or spec.get("name") != "read_selected_skill_resource")
         # A multimodal BrowserAgent receives a bounded Page.screenshot image
         # attachment in the very next model request. Do not offer the old
         # second-model visual tool alongside it: that adds a network/model

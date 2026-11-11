@@ -1,5 +1,7 @@
 """Observation-only recovery shared by target actions, without replay policy."""
 
+from harness.observation.scroll_receipt import SCROLL_RECOVERY_FIELDS
+
 TARGET_FAILURE_CODES = frozenset({
     "stale-target", "pointer-target-stale", "target-preparation-failed",
     "target-not-found", "scroll-target-not-found", "scroll-container-not-found",
@@ -9,12 +11,14 @@ TARGET_FAILURE_CODES = frozenset({
 TARGET_RECOVERY_GUIDANCE = (
     "Inspect current target identity, value and reachability before choosing another action. "
     "A rect with positive dimensions does not prove visibility inside clipping/scroll "
-    "ancestors. If current evidence puts the target outside their visible region, reveal "
-    "it first and verify its new position. Read actualDistance and the requested scroll "
-    "surface: zero movement can mean a boundary or the wrong surface, not necessarily "
-    "a broken scroller. If viewport scrolling leaves the target unreachable, inspect its "
-    "scroll ancestors; use only an observed container id/selector. If structured tools "
-    "cannot supply required geometry, use the existing read-only diagnostic route. "
+    "ancestors. Locator actions handle target preparation; offscreen geometry alone "
+    "does not require a separate pre-scroll. For explicit scrolling, read input.completed, "
+    "observation.status and goal.status independently, then requestedDelta versus "
+    "observedDelta/totalDelta, layers and resolution. Missing or unavailable observations "
+    "remain unknown, not zero movement. Movement does not prove target visibility. "
+    "If the target remains unreachable, inspect current identity and scroll ancestors; "
+    "use only an observed container id/selector. Preserve target-resolution or execution "
+    "failures as such, rather than masking them with repeated input or script fallback. "
     "Check popup expanded state rather than mounted option nodes alone. For keyboard "
     "actions, use a verified target or confirm focus. Verify the resulting selected/displayed "
     "value; action success or menu closure alone does not prove selection. No automatic replay."
@@ -76,16 +80,17 @@ def attach_target_recovery(agent, method: str, params: dict, result: dict) -> No
         return
     response = result.get("response") or {}
     data = response.get("data") if isinstance(response, dict) else None
-    if method == "Input.scroll" and isinstance(data, dict) and "actualDistance" in data:
+    if method == "Input.scroll" and isinstance(data, dict) and any(
+        key in data for key in SCROLL_RECOVERY_FIELDS
+    ):
         result["scrollRecoveryObservation"] = {
-            key: data[key] for key in (
-                "mode", "completedReason", "requestedDistance", "actualDistance",
-                "position", "extent", "resolution", "layers",
-            ) if key in data
+            key: data[key] for key in SCROLL_RECOVERY_FIELDS if key in data
         }
         result["scrollRecoveryObservation"]["interpretation"] = (
-            "Movement of the requested surface only; does not prove the target is visible. "
-            "Zero distance can mean a boundary or an unsuitable scroll surface."
+            "Input completion, observation stability and goal attainment are independent. "
+            "Requested/sent deltas are not measured movement; missing or unavailable "
+            "observations remain unknown. Measured movement alone does not prove target "
+            "visibility. Confirmed zero movement can mean a boundary or an unsuitable scroll surface."
         )
     if code not in TARGET_FAILURE_CODES and not stale:
         return

@@ -13,12 +13,15 @@ import copy
 import json
 import re
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 
 from harness.tools.registry import ToolRegistry
 from harness.utils import JsonDict
+
+_ISSUE_LIMIT: ContextVar[int] = ContextVar("schema_issue_limit", default=12)
 
 
 @dataclass(frozen=True)
@@ -125,7 +128,7 @@ def apply_required_schema_defaults(value: JsonDict, schema: Optional[JsonDict]) 
     return prepared, applied
 
 
-def validate_schema(value: Any, schema: Any) -> List[SchemaIssue]:
+def validate_schema(value: Any, schema: Any, *, max_issues: int = 12) -> List[SchemaIssue]:
     """Validate the JSON-Schema vocabulary used by ABCP descriptors.
 
     This is intentionally dependency-free because the harness's supported
@@ -137,9 +140,14 @@ def validate_schema(value: Any, schema: Any) -> List[SchemaIssue]:
     """
     if not isinstance(schema, dict):
         return []
-    issues: List[SchemaIssue] = []
-    _validate(value, schema, schema, (), issues)
-    return issues[:12]
+    limit = max(1, min(int(max_issues), 1000))
+    token = _ISSUE_LIMIT.set(limit)
+    try:
+        issues: List[SchemaIssue] = []
+        _validate(value, schema, schema, (), issues)
+        return issues[:limit]
+    finally:
+        _ISSUE_LIMIT.reset(token)
 
 
 def tool_argument_error(
@@ -374,7 +382,7 @@ def _validate(
     path: Tuple[str, ...],
     issues: List[SchemaIssue],
 ) -> None:
-    if len(issues) >= 12 or schema is True or schema is None:
+    if len(issues) >= _ISSUE_LIMIT.get() or schema is True or schema is None:
         return
     if schema is False:
         _issue(issues, path, "falseSchema", "value is not allowed")
@@ -544,7 +552,7 @@ def _append_closest_branch_issues(
         ]
         if visible_pinned:
             for issue in visible_pinned:
-                if len(issues) >= 12:
+                if len(issues) >= _ISSUE_LIMIT.get():
                     return
                 if issue not in issues:
                     issues.append(issue)
@@ -573,7 +581,7 @@ def _append_closest_branch_issues(
         _issue(issues, path, keyword, "must satisfy an allowed shape")
         return
     for issue in closest:
-        if len(issues) >= 12:
+        if len(issues) >= _ISSUE_LIMIT.get():
             return
         if issue not in issues:
             issues.append(issue)
@@ -728,7 +736,7 @@ def _matches_format(value: str, fmt: str) -> bool:
 
 
 def _issue(issues: List[SchemaIssue], path: Tuple[str, ...], keyword: str, message: str) -> None:
-    if len(issues) < 12:
+    if len(issues) < _ISSUE_LIMIT.get():
         issues.append(SchemaIssue(path, keyword, message))
 
 

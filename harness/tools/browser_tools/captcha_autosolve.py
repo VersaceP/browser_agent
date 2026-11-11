@@ -134,49 +134,6 @@ async def _claim_auth_barrier(agent: Any, reason: str) -> Tuple[bool, JsonDict]:
     }
 
 
-def skill_forbids_autosolve(agent: Any) -> Optional[JsonDict]:
-    """Honor a bound skill's `allow_auto_captcha: false` declaration.
-
-    This is the enforcement point for that frontmatter flag. It used to live in
-    the skill dispatch gate; once the skill workflow path stopped choosing a VL
-    resolver, the flag had no executor anywhere, which silently turned a
-    site-level "do not auto-solve my challenges" declaration into dead metadata.
-    Default-deny is preserved: a worker bound to a skill may auto-solve only when
-    that skill opts in. A worker with no skill is governed by config alone.
-    """
-    config = getattr(getattr(agent, "runtime", None), "harness", None)
-    skill_id = str(getattr(config, "forced_skill_id", "") or "").strip()
-    skill_hash = str(getattr(config, "forced_skill_hash", "") or "").strip()
-    if not skill_id:
-        return None
-    try:
-        from pathlib import Path
-        from harness.skill_builder.catalog import SkillCatalog, inspect_skill
-        from harness.storage.factory import resolve_sqlite_path
-        catalog = SkillCatalog(
-            Path(__file__).resolve().parents[3] / "skills",
-            resolve_sqlite_path(config.storage_sqlite_path, config.worktree_dir),
-            worktree_dir=Path(config.worktree_dir),
-        )
-        try:
-            snapshot = catalog.pin_source(skill_id, skill_hash, task_id=agent.logger.task_id)
-            frontmatter = inspect_skill(snapshot)["metadata"] if snapshot else {}
-        finally:
-            catalog.close()
-    except Exception:
-        frontmatter = {}
-    if bool(frontmatter.get("allow_auto_captcha", False)):
-        return None
-    return {
-        "status": "skill_forbids_auto_captcha",
-        "reason": (
-            f"skill {skill_id!r} does not declare allow_auto_captcha: true;"
-            " its challenges are resolved by a human"
-        ),
-        "skillId": skill_id,
-    }
-
-
 def _episode_budget(agent: Any) -> Tuple[int, int]:
     vl_config = _vl_config(agent)
     raw = optional_int(getattr(vl_config, "captcha_solve_max_episodes_per_worker", 2), 2)
@@ -721,9 +678,6 @@ async def maybe_autosolve_captcha(
             "status": "disabled",
             "reason": "vl.enabled and vl.captcha_solve_enabled must both be on",
         }
-    forbidden = skill_forbids_autosolve(agent)
-    if forbidden is not None:
-        return {**receipt, **forbidden}
     if _page_is_blacklisted(agent, page_id):
         return {
             **receipt,

@@ -86,7 +86,7 @@ def _attach_overlay_observation(
 def _blocked_target_id(params: Any) -> str:
     if not isinstance(params, dict):
         return ""
-    for key in ("id", "nodeId", "targetId", "selector"):
+    for key in ("id", "nodeId", "targetId"):
         value = params.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
@@ -116,123 +116,6 @@ def _record_microloop_telemetry(
         )
 
 
-def _overlay_adjudication_state_key(agent: Any, page_id: str) -> tuple:
-    """Bind a cached VL verdict to one observed page state.
-
-    An occlusion failure happens before the pointer action dispatches, so a
-    second attempt in the same AXTree epoch has no new visual evidence. A fresh
-    AXTree observation increments the epoch and requires a new verdict.
-    """
-    return (
-        page_id,
-        str(getattr(agent, "axtree_page_id", "") or ""),
-        int(getattr(agent, "axtree_epoch", 0) or 0),
-        bool(getattr(agent, "axtree_invalidated", False)),
-    )
-
-
-async def _adjudicate_occluded_target(
-    agent: Any,
-    page_id: str,
-    method: str,
-    params: JsonDict,
-    step: int,
-) -> JsonDict:
-    """Use VL once to classify the cover currently blocking a target."""
-    harness = getattr(getattr(agent, "runtime", None), "harness", None)
-    vl_config = getattr(harness, "vl", None)
-    if vl_config is None or not getattr(vl_config, "enabled", False):
-        return {"status": "skipped", "reason": "vl_disabled", "reused": False}
-
-    cache = getattr(agent, "_overlay_vl_adjudications", None)
-    if not isinstance(cache, dict):
-        cache = {}
-        agent._overlay_vl_adjudications = cache
-    state_key = _overlay_adjudication_state_key(agent, page_id)
-    cached = cache.get(state_key)
-    if isinstance(cached, dict):
-        return {**cached, "reused": True}
-
-    target_id = _blocked_target_id(params)
-    agent.overlay_adjudicating = True
-    try:
-        verdict = await _bt()._visual_verify(
-            agent,
-            {
-                "pageId": page_id,
-                "selector": "",
-                "id": "",
-                "fullPage": False,
-                "mode": "overlay_adjudicate",
-                "_force": True,
-                "question": (
-                    "The current browser action was rejected as occluded."
-                    " Determine whether the visible surface blocks this target"
-                    " and whether automation can safely continue without a human."
-                ),
-                "expected": {
-                    "pageId": page_id,
-                    "triggerMethod": method,
-                    "blockedTargetId": target_id or None,
-                    "occlusionSignal": "browser_action_rejected",
-                },
-            },
-            step,
-        )
-    finally:
-        agent.overlay_adjudicating = False
-    if not isinstance(verdict, dict):
-        verdict = {"status": "failed", "error": "invalid_visual_verdict"}
-    if str(verdict.get("status") or "") == "done":
-        cache[state_key] = dict(verdict)
-    logger = getattr(agent, "logger", None)
-    if logger is not None:
-        logger.write(
-            "vl.overlay_adjudication",
-            {
-                "pageId": page_id,
-                "triggerMethod": method,
-                "blockedTargetId": target_id or None,
-                "state": {
-                    "axtreePageId": state_key[1] or None,
-                    "axtreeEpoch": state_key[2],
-                    "axtreeInvalidated": state_key[3],
-                },
-                "status": verdict.get("status"),
-                "surface": verdict.get("surface"),
-                "purpose": verdict.get("purpose"),
-                "targetAccess": verdict.get("targetAccess"),
-                "recommendedAction": verdict.get("recommendedAction"),
-            },
-        )
-    return {**verdict, "reused": False}
-
-
-def _overlay_recovery_action(adjudication: JsonDict) -> str:
-    """Accept a recovery only when the semantic verdict is self-consistent."""
-    if str(adjudication.get("status") or "") != "done":
-        # Keep the opt-in auto-intercept's existing safe-rung behavior when VL
-        # is unavailable. It never submits, signs in, or retries a sensitive
-        # control; an unavailable model is never treated as proof of a gate.
-        return "legacy_safe_recovery"
-    action = str(adjudication.get("recommendedAction") or "observe")
-    purpose = str(adjudication.get("purpose") or "unknown")
-    access = str(adjudication.get("targetAccess") or "uncertain")
-    continuation = str(adjudication.get("canContinueWithoutUserAction") or "uncertain")
-    if action == "hitl" and (
-        purpose in {"authentication", "verification"}
-        and access == "blocked"
-        and continuation == "no"
-    ):
-        return "hitl"
-    if action == "safe_dismiss" and (
-        purpose == "routine"
-        and access == "blocked"
-        and continuation == "yes"
-    ):
-        return "safe_dismiss"
-    return "observe"
-
 async def _maybe_auto_intercept_overlay(
     agent: Any,
     method: str,
@@ -240,19 +123,13 @@ async def _maybe_auto_intercept_overlay(
     result: JsonDict,
     step: int,
 ) -> JsonDict:
-    """Phase 7.2 auto-intercept. When an action is overlay-blocked and config
-    permits, run dismiss_overlay automatically (saving the model a step) instead
-    of only suggesting it, then fold an honest digest into the result.
+    """Return rejected-action occlusion to the model; keep opt-in P1 dismissal.
 
-    Triggers, by escalating config mode:
-      p0  -> P0: errorClassification == occlusion_blocked on this result
-      p0p1 -> also P1: an AXTree layer reports occlusionState == occluded
-    P2 (text soft-detect) and P3 (observation keywords) are never auto-run:
-    soft text has false positives, so they keep the suggest-only hint.
-
-    Auth/paywall login/provider/payment controls are still never auto-clicked;
-    dismiss_overlay runs only its safe rungs there and returns `policy_refused`
-    when they do not clear it, and the original error/hint is preserved."""
+    An occlusion error reports a target access failure, not the purpose of the
+    covering surface. It never triggers a VL call, pause or automatic dismissal.
+    In p0p1 mode, proactive layer observations retain the bounded safe-dismiss
+    path and its existing login/payment protections.
+    """
     if not isinstance(result, dict):
         return result
     mode = _auto_intercept_mode(agent)
@@ -272,6 +149,19 @@ async def _maybe_auto_intercept_overlay(
     if not page_id:
         return result
 
+    trigger = "occlusion_blocked" if p0 else "occluded_layers"
+    blocked_target = _blocked_target_id(params)
+    if p0:
+        # A rejected target establishes occlusion, not the cover's purpose.
+        # Return the evidence before any dismissal, retry or human interruption.
+        enriched = _attach_overlay_observation(agent, method, params, result)
+        enriched["autoIntercept"] = {
+            "trigger": trigger, "mode": mode, "action": "deferred",
+            "blockedTargetId": blocked_target or None,
+            "decisionOwner": "browser_agent",
+        }
+        return enriched
+
     counts = getattr(agent, "_auto_intercept_counts", None)
     if not isinstance(counts, dict):
         counts = {}
@@ -290,81 +180,6 @@ async def _maybe_auto_intercept_overlay(
         return enriched
     counts[page_id] = int(counts.get(page_id, 0)) + 1
 
-    trigger = "occlusion_blocked" if p0 else "occluded_layers"
-    blocked_target = _blocked_target_id(params)
-    if p0:
-        # P0 is a real rejected action with a target whose accessibility the VL
-        # can judge. P1 is merely a proactive AX-layer signal, so it retains the
-        # existing safe dismissal ladder and cannot synthesize an auth HITL.
-        adjudication = await _adjudicate_occluded_target(
-            agent, page_id, method, params, step,
-        )
-        recovery_action = _overlay_recovery_action(adjudication)
-    else:
-        adjudication = {"status": "skipped", "reason": "no_blocked_action"}
-        recovery_action = "legacy_safe_recovery"
-    if recovery_action == "hitl":
-        reason = str(adjudication.get("reason") or "").strip()
-        gate_purpose = str(adjudication.get("purpose") or "authentication")
-        auto_hitl = await _bt()._request_hitl_for_challenge(
-            agent,
-            page_id,
-            method,
-            step,
-            reason=(
-                reason or
-                "Visual adjudication found an authentication or verification"
-                " gate blocking the requested target."
-            ),
-            trigger_result=result,
-            gate_kind=gate_purpose,
-        )
-        enriched = dict(result)
-        enriched["overlayAdjudication"] = adjudication
-        enriched["autoHitl"] = auto_hitl
-        enriched["autoIntercept"] = {
-            "trigger": trigger,
-            "mode": mode,
-            "action": "hitl",
-            "blockedTargetId": blocked_target or None,
-            "vlReused": bool(adjudication.get("reused")),
-        }
-        enriched["next_instruction"] = (
-            "Visual adjudication found an authentication/verification gate"
-            " blocking the target and the harness requested HITL. Inspect"
-            " autoHitl.hitl_wait; do not retry the occluded action while the"
-            " page is paused."
-        )
-        _record_microloop_telemetry(
-            agent, "auto_intercept", "hitl",
-            {"pageId": page_id, "trigger": trigger, "purpose": gate_purpose},
-        )
-        return enriched
-    if recovery_action == "observe":
-        enriched = dict(result)
-        enriched["overlayAdjudication"] = adjudication
-        enriched["autoIntercept"] = {
-            "trigger": trigger,
-            "mode": mode,
-            "action": "deferred",
-            "blockedTargetId": blocked_target or None,
-            "vlReused": bool(adjudication.get("reused")),
-        }
-        existing = str(enriched.get("next_instruction") or "").strip()
-        instruction = (
-            "Visual adjudication could not establish a safe dismissal or a"
-            " human-required authentication/verification gate. Do not try"
-            " another equivalent target behind the cover; inspect the specific"
-            " uncertainty in overlayAdjudication before choosing the next step."
-        )
-        enriched["next_instruction"] = (
-            f"{existing} {instruction}".strip() if existing else instruction
-        )
-        _record_microloop_telemetry(
-            agent, "auto_intercept", "deferred",
-            {"pageId": page_id, "trigger": trigger},
-        )
-        return enriched
     # Only Input.click is auto-retry-safe; dismiss_overlay re-checks the target's
     # sensitivity before any retry and returns dismissed_pending_action otherwise.
     # The occlusion codes that arm this path (`occluded` / `target-occluded`) are
@@ -382,7 +197,8 @@ async def _maybe_auto_intercept_overlay(
     # returns dismissed_pending_action, which is the intended contract.
     dismiss = await _bt()._dismiss_overlay(
         agent,
-        {"pageId": page_id, "targetId": blocked_target, "targetMethod": method},
+        {"pageId": page_id, "targetId": blocked_target, "targetMethod": method,
+         "targetParams": {k: v for k, v in (params or {}).items() if k != "purpose"}},
         step,
     )
     dismiss_status = str(dismiss.get("status") or "")
@@ -460,6 +276,7 @@ async def _maybe_auto_intercept_overlay(
         "resolved": resolved,
         "cleared": cleared,
         "retried": bool(dismiss.get("retried")),
+        "originalAction": dismiss.get("originalAction"),
         "treeRefreshed": tree_refreshed,
         "overlay": dismiss.get("overlay"),
         "vlArbiter": dismiss.get("vlArbiter"),

@@ -429,18 +429,6 @@ async def _navigate_verified_impl(
                 }
                 attempts.append(attempt_receipt)
                 last_challenge_summary = _page_challenge_summary(agent, page_id)
-                if _challenge_score(last_challenge_summary) >= 80:
-                    return _navigate_challenge_blocked_result(
-                        page_id=page_id,
-                        attempt=attempt,
-                        last_state=last_state,
-                        attempts=attempts,
-                        state_resync_count=state_resync_count,
-                        challenge_summary=last_challenge_summary,
-                        expected_url_pattern=expected_url_pattern,
-                        expected_title_pattern=expected_title_pattern,
-                        trigger="verified_navigation_ax_refresh_failed_with_challenge",
-                    )
                 return {
                     "status": "navigation_verified_ax_refresh_failed",
                     "error": (
@@ -519,18 +507,6 @@ async def _navigate_verified_impl(
         break
     attempts.append({"attempt": attempt, "lastState": last_state})
 
-    if _challenge_score(last_challenge_summary) >= 80:
-        return _navigate_challenge_blocked_result(
-            page_id=page_id,
-            attempt=attempt,
-            last_state=attempts[-1].get("lastState", {}) if attempts else {},
-            attempts=attempts,
-            state_resync_count=state_resync_count,
-            challenge_summary=last_challenge_summary,
-            expected_url_pattern=expected_url_pattern,
-            expected_title_pattern=expected_title_pattern,
-            trigger="navigation_verification_exhausted_with_challenge",
-        )
 
     # Verification did not pass. "The page arrived but your pattern was wrong"
     # is only ONE of the reasons that can happen, and it is the only one that
@@ -1081,20 +1057,10 @@ def _content_completeness_upstream_blocker(
     if status in {"failed", "loadfailed", "error", "crashed"}:
         return f"lifecycle:{status}"
 
-    if isinstance(result.get("structuralChallenge"), dict):
-        return "challenge:structural"
+    # Challenge observations describe possible components, not task access.
     auto_hitl = result.get("autoHitl")
     if isinstance(auto_hitl, dict) and _auto_hitl_is_actionable(auto_hitl):
         return "challenge:hitl"
-    challenge = _page_challenge_summary(agent, page_id)
-    tracker = getattr(agent, "challenge_tracker", None)
-    threshold = int(getattr(tracker, "threshold", 70) or 70)
-    if (
-        challenge.get("structuralChallenge")
-        or challenge.get("highConfidenceHit")
-        or _challenge_score(challenge) >= threshold
-    ):
-        return "challenge:detected"
 
     overlay = detect_overlay_from_result(result, logger=getattr(agent, "logger", None))
     subtype = str((overlay or {}).get("subtype") or "")
@@ -1115,12 +1081,6 @@ def _content_completeness_upstream_blocker(
     if title_looks_like_auth_page(remembered_title):
         return "overlay:auth_prompt"
     return ""
-
-def _challenge_score(summary: JsonDict) -> int:
-    try:
-        return int(summary.get("suspicionScore") or 0)
-    except (TypeError, ValueError):
-        return 0
 
 def _clear_navigation_challenge_state(agent: Any, page_id: str) -> None:
     tracker = getattr(agent, "challenge_tracker", None)
@@ -1590,37 +1550,6 @@ async def _navigate_dispatch_failure_result(
         ),
     }
 
-def _navigate_challenge_blocked_result(
-    *,
-    page_id: str,
-    attempt: int,
-    last_state: JsonDict,
-    attempts: List[JsonDict],
-    state_resync_count: int,
-    challenge_summary: JsonDict,
-    expected_url_pattern: str,
-    expected_title_pattern: str,
-    trigger: str,
-) -> JsonDict:
-    return {
-        "status": "blocked_by_challenge",
-        "pageId": page_id,
-        "attempt": attempt,
-        "lastState": last_state,
-        "attempts": attempts,
-        "stateResyncCount": state_resync_count,
-        "expectedUrlPattern": expected_url_pattern,
-        "expectedTitlePattern": expected_title_pattern or None,
-        "suspectedChallenge": challenge_summary or None,
-        "trigger": trigger,
-        "next_instruction": (
-            "Navigation appears blocked by an anti-bot or challenge page after"
-            " bounded verification. Do not keep polling Page.getState; call"
-            " final_answer with status=\"blocked_by_challenge\", request HITL"
-            " if the workflow supports it, or let task owner pivot strategy."
-        ),
-    }
-
 def _result_has_auto_hitl(result: Any) -> bool:
     return isinstance(result, dict) and isinstance(result.get("autoHitl"), dict)
 
@@ -1629,11 +1558,9 @@ def _auto_hitl_is_actionable(auto: Any) -> bool:
     `Hitl.requestPause` actually ran. A skipped / not-executed adjudication is a
     no-op: the page was never paused, so a composite loop must NOT abort on it.
 
-    Post-97f105e the harness only writes result['autoHitl'] when it truly requests
-    HITL (skipped/cooldown/stale verdicts go to `suspected_challenge.adjudication`
-    instead), so in practice every autoHitl is actionable. This guard keeps
-    `_loop_interrupt_from_result` honest against a future short-circuit that could
-    attach a `tool_was_executed: False` / `status: "skipped*"` autoHitl.
+    Keep interpreting saved/composite receipts honestly even though component
+    observations no longer request automatic pauses. An observation or a
+    `tool_was_executed: False` receipt must not interrupt the model's work.
 
     The rule itself lives in harness.results.call_outcome so the shared verdict and this
     loop guard cannot drift apart; a second, weaker copy of it treated every

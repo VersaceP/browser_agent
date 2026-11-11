@@ -192,6 +192,10 @@ def _check_cross_task_memory_scope(
     }
 
 def _check_worker_contract(agent: Any, method_or_tool: str) -> Optional[JsonDict]:
+    from harness.workflow.access import write_denial
+    denied = write_denial(agent, method_or_tool)
+    if denied is not None:
+        return denied
     contract = getattr(agent, "worker_contract", None)
     if not isinstance(contract, dict) or not contract:
         contract = {}

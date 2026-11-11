@@ -3,29 +3,16 @@ harness.tools.local_fs - Read-only task worktree search/read tools.
 """
 
 import json
-import re
 from typing import List, Optional
 
 from runtime_config import DEFAULT_LOCAL_FS_READ_BYTES
-from harness.storage.base import glob_matches
 from harness.utils import (
     JsonDict,
     RunLogger,
-    json_size_bytes,
     optional_int,
     resolve_task_file,
     truncate_utf8_text,
 )
-
-
-def _search_excerpt(line, regex, max_bytes):
-    """Keep the actual regex hit visible even on a very long JSONL line."""
-    match = regex.search(line) if regex is not None else None
-    start = max(0, match.start() - min(80, max_bytes // 8)) if match else 0
-    snippet, truncated = truncate_utf8_text(line[start:].rstrip("\r\n"), max_bytes)
-    return {"snippet": snippet, "snippetTruncated": bool(start or truncated),
-            "snippetStartColumn": start + 1,
-            "matchColumn": match.start() + 1 if match else None}
 
 
 def local_fs_search(
@@ -39,268 +26,18 @@ def local_fs_search(
     max_results: int = 20,
     max_bytes_per_hit: int = 2000,
     max_total_bytes: int = 20000,
+    cursor: Optional[str] = None,
+    max_scan_entries: int = 5000,
+    timeout_ms: int = 2000,
+    cancelled=None,
 ) -> JsonDict:
-    from harness.tools.path_authorization import resolve_authorized_path, allowed
-    access = agent or logger
-    try:
-        root = resolve_authorized_path(access, path, mode="read")
-    except (OSError, ValueError) as exc:
-        return {"status": "failed", "error": str(exc)}
-    glob_pattern = glob_pattern or "**/*"
-    # Strict tool schemas force callers to always send event_type; models often
-    # emit the STRING "null" for "not needed", which would otherwise silently
-    # filter out every line of non-JSONL files (each line fails json.loads).
-    if event_type is not None:
-        event_type = str(event_type).strip()
-        if event_type.lower() in {"", "null", "none"}:
-            event_type = None
-    max_results = max(1, min(optional_int(max_results, 20) or 20, 100))
-    max_bytes_per_hit = max(200, min(optional_int(max_bytes_per_hit, 2000) or 2000, 20000))
-    max_total_bytes = max(
-        max_bytes_per_hit,
-        min(optional_int(max_total_bytes, 20000) or 20000, 200000),
-    )
-    # The same matcher the storage backends and the virtual view use, rather
-    # than Path.glob. They agreed with each other and disagreed with this
-    # branch, so the identical search returned different files in file mode
-    # and db mode - the switch is meant to be invisible.
-    from harness.storage.virtual_fs import db_authoritative_for, virtual_fs_for
-
-    task_root = logger.task_dir.resolve()
-    in_task = root.is_relative_to(task_root)
-    db_authoritative = in_task and db_authoritative_for(logger)
-    view = virtual_fs_for(logger) if in_task else None
-    virtual_files = []
-    for logical_path, size, approximate in view.list_files() if view is not None else []:
-        candidate = task_root / logical_path
-        if (candidate.is_relative_to(root) and candidate != root
-                and candidate.resolve() == candidate and allowed(access, candidate, "read")):
-            relative = str(candidate.relative_to(root))
-            virtual_files.append((logical_path, relative, size, approximate))
-    try:
-        if db_authoritative and not root.exists() and (root == task_root or virtual_files):
-            candidates = []
-        else:
-            candidates = sorted(
-                item for item in _walk_authorized(access, root, recursive=True)
-                if glob_matches(glob_pattern, str(item.relative_to(root)))
-            )
-    except (OSError, ValueError) as exc:
-        return {"status": "failed", "error": f"invalid glob: {exc}"}
-
-    regex = None
-    if pattern:
-        try:
-            regex = re.compile(pattern)
-        except re.error as exc:
-            return {"status": "failed", "error": f"invalid grep pattern: {exc}"}
-
-    virtual_paths = {relative for _, relative, _, _ in virtual_files}
-
-    results: List[JsonDict] = []
-    total_bytes = 0
-    truncated = False
-    for path in candidates:
-        if len(results) >= max_results:
-            truncated = True
-            break
-        try:
-            resolved = path.resolve()
-            resolved.relative_to(root)
-        except (OSError, ValueError):
-            continue
-        if not allowed(access, resolved, "read") or not resolved.is_file():
-            continue
-        rel = str(resolved.relative_to(root))
-        # In db mode, a logical row is the current source of truth. A file
-        # from a former dual run can remain for operator inspection but must
-        # not shadow it. Unregistered binaries (not listed by VirtualTaskFs)
-        # remain physical files.
-        if db_authoritative and rel in virtual_paths:
-            continue
-        size = resolved.stat().st_size
-        if regex is None and not event_type:
-            hit = {
-                "path": str(resolved),
-                "relativePath": rel,
-                "byteSize": size,
-                "storage": "file",
-            }
-            hit_bytes = json_size_bytes(hit)
-            if total_bytes + hit_bytes > max_total_bytes:
-                truncated = True
-                break
-            total_bytes += hit_bytes
-            results.append(hit)
-            continue
-        try:
-            with resolved.open("r", encoding="utf-8", errors="replace") as handle:
-                for line_no, line in enumerate(handle, start=1):
-                    if event_type:
-                        try:
-                            event = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if not isinstance(event, dict) or event.get("type") != event_type:
-                            continue
-                    if regex is None or regex.search(line):
-                        line_bytes = len(line.encode("utf-8"))
-                        excerpt = _search_excerpt(line, regex, max_bytes_per_hit)
-                        hit = {
-                            "path": str(resolved),
-                            "relativePath": rel,
-                            "byteSize": size,
-                            "storage": "file",
-                            "line": line_no,
-                            "bytes": line_bytes,
-                            **excerpt,
-                            "readHint": {"line_offset": max(0, line_no - 3), "line_limit": 5},
-                        }
-                        hit_bytes = json_size_bytes(hit)
-                        if total_bytes + hit_bytes > max_total_bytes:
-                            truncated = True
-                            return {
-                                "status": "done",
-                                "root": str(root),
-                                "glob": glob_pattern,
-                                "pattern": pattern,
-                                "eventType": event_type,
-                                "count": len(results),
-                                "truncated": truncated,
-                                "maxTotalBytes": max_total_bytes,
-                                "results": results,
-                            }
-                        total_bytes += hit_bytes
-                        results.append(hit)
-                        if len(results) >= max_results:
-                            truncated = True
-                            break
-            if len(results) >= max_results:
-                truncated = True
-                break
-        except OSError as exc:
-            hit = {
-                "path": str(resolved),
-                "relativePath": rel,
-                "storage": "file",
-                "error": str(exc),
-            }
-            hit_bytes = json_size_bytes(hit)
-            if total_bytes + hit_bytes > max_total_bytes:
-                truncated = True
-                break
-            total_bytes += hit_bytes
-            results.append(hit)
-
-    if in_task and not truncated and len(results) < max_results:
-        # DB-only rows are added after physical files. In db mode all logical
-        # DB paths were removed from the physical scan above; in dual/file
-        # mode the existing FileStore-primary behaviour remains unchanged.
-        seen = {str(hit.get("relativePath") or "") for hit in results}
-        results, total_bytes, truncated = _search_virtual_files(
-            logger,
-            virtual_files=virtual_files,
-            already_seen=seen,
-            results=results,
-            regex=regex,
-            event_type=event_type,
-            max_results=max_results,
-            max_bytes_per_hit=max_bytes_per_hit,
-            max_total_bytes=max_total_bytes,
-            total_bytes=total_bytes,
-            glob_pattern=glob_pattern,
-        )
-    return {
-        "status": "done",
-        "root": str(root),
-        "glob": glob_pattern,
-        "pattern": pattern,
-        "eventType": event_type,
-        "count": len(results),
-        "truncated": truncated,
-        "maxTotalBytes": max_total_bytes,
-        "results": results,
-    }
-
-
-def _search_virtual_files(
-    logger: RunLogger,
-    *,
-    virtual_files,
-    already_seen,
-    results: List[JsonDict],
-    regex,
-    event_type: Optional[str],
-    max_results: int,
-    max_bytes_per_hit: int,
-    max_total_bytes: int,
-    total_bytes: int,
-    glob_pattern: str,
-):
-    """Scan database-backed paths under the same budget as the file scan."""
-
-    from harness.storage.virtual_fs import virtual_fs_for
-
-    view = virtual_fs_for(logger)
-    if view is None:
-        return results, total_bytes, False
-
-    task_root = logger.task_dir.resolve()
-    truncated = False
-    for logical_path, relative, size, approximate in virtual_files:
-        if relative in already_seen or not glob_matches(glob_pattern, relative):
-            continue
-        if len(results) >= max_results:
-            return results, total_bytes, True
-        base: JsonDict = {
-            "path": str(task_root / logical_path),
-            "relativePath": relative,
-            "byteSize": size,
-            "storage": "sqlite",
-        }
-        if approximate:
-            base["byteSizeApproximate"] = True
-        if regex is None and not event_type:
-            # A glob-only query needs no content, and reading it is not free:
-            # iter_lines decompresses and splits the whole resource, so naming
-            # 46 observation files used to cost decompressing 37 MB to throw
-            # it away. The listing already restricts this loop to paths that
-            # have text, so skipping the read admits nothing extra.
-            hit_bytes = json_size_bytes(base)
-            if total_bytes + hit_bytes > max_total_bytes:
-                return results, total_bytes, True
-            total_bytes += hit_bytes
-            results.append(base)
-            continue
-        lines = view.iter_lines(logical_path)
-        if lines is None:
-            continue
-        for line_no, line in enumerate(lines, start=1):
-            if event_type:
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(event, dict) or event.get("type") != event_type:
-                    continue
-            if regex is not None and not regex.search(line):
-                continue
-            excerpt = _search_excerpt(line, regex, max_bytes_per_hit)
-            hit = dict(base)
-            hit.update({
-                "line": line_no,
-                "bytes": len(line.encode("utf-8")),
-                **excerpt,
-                "readHint": {"line_offset": max(0, line_no - 3), "line_limit": 5},
-            })
-            hit_bytes = json_size_bytes(hit)
-            if total_bytes + hit_bytes > max_total_bytes:
-                return results, total_bytes, True
-            total_bytes += hit_bytes
-            results.append(hit)
-            if len(results) >= max_results:
-                return results, total_bytes, True
-    return results, total_bytes, truncated
+    """Return one bounded search batch; continue only with its task-owned cursor."""
+    from harness.tools.local_search import search
+    return search(logger, agent=agent, path=path, glob_pattern=glob_pattern,
+                  pattern=pattern, event_type=event_type, max_results=max_results,
+                  max_bytes_per_hit=max_bytes_per_hit, max_total_bytes=max_total_bytes,
+                  cursor=cursor, max_scan_entries=max_scan_entries, timeout_ms=timeout_ms,
+                  cancelled=cancelled)
 
 
 def _walk_authorized(access, root, *, recursive):

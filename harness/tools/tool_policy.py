@@ -242,17 +242,36 @@ def redact_values(value: Any, secrets: Any) -> Any:
     return _redact_values(value, substring, exact, depth=0)
 
 
-# Network.readApi returns response bodies supplied by the site, including
-# credentials that did not appear in the Action's input. Mask declared
-# credential fields before either transport logging or model/offload delivery.
-# Request bodies are not needed to establish whether an upload was attempted
-# or accepted and may include form secrets or entire file payloads.
+# Current Network.readApi bodies are native capture descriptors; older replies
+# may inline site responses, including credentials absent from the Action's
+# input. Preserve descriptor metadata, but mask inline credential fields before
+# transport logging or model/offload delivery. Inline request bodies may include
+# form secrets or entire file payloads and remain withheld.
 NETWORK_CREDENTIAL_KEYS: FrozenSet[str] = frozenset({
     "accesstoken", "apikey", "auth", "authorization", "clientsecret",
     "cookie", "credential", "credentials", "idtoken", "password", "passwd",
     "pwd", "refreshtoken", "secret", "session", "sessionid",
     "setcookie", "sig", "signature", "token",
 })
+
+
+def _network_body_descriptor(value: Any) -> Optional[Dict[str, Any]]:
+    """Project the native readApi descriptor contract, never inline body data."""
+    fields = ("bodyId", "state", "bytes", "reason")
+    if not isinstance(value, dict) or not all(key in value for key in fields):
+        return None
+    if not isinstance(value["bodyId"], str) or not value["bodyId"]:
+        return None
+    if value["state"] not in ("pending", "available", "partial", "unavailable", "evicted"):
+        return None
+    byte_count = value["bytes"]
+    if byte_count is not None and (
+        type(byte_count) is not int or not 0 <= byte_count <= 9007199254740991
+    ):
+        return None
+    if value["reason"] is not None and not isinstance(value["reason"], str):
+        return None
+    return {key: value[key] for key in fields}
 
 
 def _network_safe_json(value: Any, *, depth: int = 0) -> Any:
@@ -273,6 +292,8 @@ def _network_safe_json(value: Any, *, depth: int = 0) -> Any:
         return out
     if isinstance(value, list):
         return [_network_safe_json(item, depth=depth + 1) for item in value]
+    if isinstance(value, str):
+        return redact_values(value, collect_sensitive_replacements(value))
     return value
 
 
@@ -281,10 +302,11 @@ def sanitize_network_read_api_response(
 ) -> Any:
     """Return the diagnostic response without raw request or credential bodies.
 
-    JSON responses retain business codes/messages and other noncredential
-    fields. Non-JSON text cannot be separated reliably into diagnostic facts
-    and secrets, so only its availability/HTTP metadata remains. Keep this at
-    the transport entry point so log, model, trace and offload see the same copy.
+    Native body descriptors retain handles and capture metadata for readBody.
+    Legacy JSON responses retain business codes/messages and noncredential
+    fields. Non-JSON inline text cannot be separated reliably into diagnostic
+    facts and secrets, so only its availability/HTTP metadata remains. Keep this
+    at the transport entry point so log, model, trace and offload see the same copy.
     """
     if not isinstance(response, dict):
         return response
@@ -295,7 +317,13 @@ def sanitize_network_read_api_response(
         if isinstance(value, dict):
             out = {}
             for key, item in value.items():
-                if key == "requestBody" and item is not None:
+                if key in {"requestBody", "responseBody"} and (
+                    descriptor := _network_body_descriptor(item)
+                ) is not None:
+                    # Metadata strings (notably reason) still cross the usual
+                    # credential redaction boundary; unknown fields do not.
+                    out[key] = visit(descriptor, depth=depth + 1)
+                elif key == "requestBody" and item is not None:
                     out[key] = "<redacted request body>"
                 elif key == "responseBody" and item:
                     if not isinstance(item, str):
@@ -306,7 +334,7 @@ def sanitize_network_read_api_response(
                         except (ValueError, TypeError):
                             out[key] = "<redacted non-JSON response body>"
                         else:
-                            if not isinstance(parsed, dict):
+                            if not isinstance(parsed, (dict, list)):
                                 out[key] = "<redacted non-object JSON response body>"
                             else:
                                 safe = _network_safe_json(parsed)

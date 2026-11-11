@@ -34,11 +34,13 @@ canonical file paths in Workflow input; a directory grant is not an upload manif
 """
 
 LOCAL_AUTHORIZATION_DESCRIPTION = (
-    "Request task-scoped READ or WRITE permission for explicit local files or directories, "
+    "Request Harness task-scoped READ or WRITE permission for explicit local files or directories, "
     "without reading or changing their contents. Batch paths share one terminal confirmation; "
     "a directory grant covers descendants for the same permission. Request the task's material "
     "or delivery directory once when multiple assets are needed. Only the human may approve "
-    "the displayed scope or directory alternative. Existing grants are reused, including after resume."
+    "the displayed scope or directory alternative. Existing grants are reused, including after resume. "
+    "Harness file authorization does not change WebCross directory authorization; "
+    "configure the latter in the WebCross GUI."
 )
 LOCAL_AUTHORIZATION_SCHEMA = {
     'type': 'object', 'properties': {
@@ -71,6 +73,36 @@ async def wait_for_local_authorization(value):
 _SENSITIVE = {'.git', '.ssh', '.gnupg', '.env', 'credentials', 'node_modules', '.local-file-permissions'}
 
 
+def builtin_protected_roots():
+    """WebCross installation, runtime and data: never readable or writable by an Agent.
+
+    The app bundle holds the platform's own code; its data and runtime
+    directories hold sessions, credentials and the Dispatcher descriptor.
+    Configuration can add roots (protected_local_roots) but not remove these.
+    """
+    home = Path.home()
+    app = Path(os.environ.get('WEBCROSS_APP') or '/Applications/WebCross.app')
+    roots = [app, Path('/Applications/WebCross.app'), home / 'Applications' / 'WebCross.app',
+             home / 'Library' / 'Application Support' / 'webcross',
+             home / 'Library' / 'Application Support' / 'WebCross',
+             home / '.webcross', home / '.local' / 'bin' / 'webcross']
+    result = []
+    for root in roots:
+        try:
+            resolved = str(root.expanduser().resolve(strict=False))
+        except OSError:
+            continue
+        if resolved not in result:
+            result.append(resolved)
+    return result
+
+
+def auto_approve(value):
+    """Trusted configuration; the model can neither read nor change it."""
+    cfg = getattr(getattr(owner(value), 'runtime', None), 'harness', None)
+    return bool(getattr(cfg, 'local_access_auto_approve', False))
+
+
 def owner(value):
     return value if hasattr(value, 'logger') else SimpleNamespace(logger=value)
 
@@ -88,30 +120,44 @@ def state(value):
         except (OSError, ValueError):
             data = {}
         _STATES[str(root)] = {'readRoots': data.get('readRoots', []),
-                              'writeRoots': data.get('writeRoots', []), 'denied': set(), 'protected': set()}
+                              'writeRoots': data.get('writeRoots', []), 'denied': set(),
+                              'protected': set(data.get('protectedRoots', []))}
     s = _STATES[str(root)]
     cfg = getattr(getattr(owner(value), 'runtime', None), 'harness', None)
     s['protected'].update(str(Path(p).expanduser().resolve())
                           for p in getattr(cfg, 'protected_local_roots', []) or [])
+    s['protected'].update(builtin_protected_roots())
     return s
 
 
-def inherit_read_permissions(grantor, grantee):
-    """Host-only transfer to a host-created owned trial; never a model tool.
+def inherit_permissions(grantor, grantee, *, modes=('read',)):
+    """Host-only transfer of exact approved scopes to an owned continuation.
 
-    Copy exact approved READ scopes. WRITE, denials and parent scopes never
-    transfer, and protected-root checks still apply at every later read.
+    Declarations, auto-approval and parent scopes are not grants. Denied and
+    protected overlaps never transfer. Package protection wins over broad grants.
     """
+    if any(mode not in {'read', 'write'} for mode in modes):
+        raise ValueError('permission mode must be read or write')
     destination = state(grantee)
-    for raw in state(grantor)["readRoots"]:
-        path = Path(raw)
-        if (not protected(grantor, path) and not protected(grantee, path)
-                and not _denied_overlap(grantee, path, 'read')
-                and raw not in destination["readRoots"]):
-            destination["readRoots"].append(raw)
+    transferred = {}
+    for mode in modes:
+        transferred[mode] = []
+        for raw in state(grantor)[mode + 'Roots']:
+            path = Path(raw)
+            if (not protected(grantor, path) and not protected(grantee, path)
+                    and not _denied_overlap(grantor, path, mode)
+                    and not _denied_overlap(grantee, path, mode)
+                    and raw not in destination[mode + 'Roots']):
+                destination[mode + 'Roots'].append(raw)
+                transferred[mode].append(raw)
     _persist(grantee)
     _log(grantee, 'local_path.authorization.inherited', {
-        'fromTaskId': task_root(grantor).name, 'mode': 'read', 'readRoots': destination['readRoots']})
+        'fromTaskId': task_root(grantor).name, 'scopes': transferred})
+
+
+def inherit_read_permissions(grantor, grantee):
+    """Compatibility helper for read-only author trials."""
+    inherit_permissions(grantor, grantee, modes=('read',))
 
 
 def inside(path, root):
@@ -138,7 +184,11 @@ def protected(value, p):
     s = state(value)
     if any(part.lower() in _SENSITIVE or part.lower().startswith('.env.') for part in p.parts):
         return True
-    if any(inside(p, Path(root)) for root in s['protected']):
+    # macOS volumes are case-insensitive by default: /applications/webcross.app
+    # names the same bundle as /Applications/WebCross.app.
+    folded = str(p).casefold()
+    if any(inside(p, Path(root)) or folded == root.casefold() or folded.startswith(root.casefold() + os.sep)
+           for root in s['protected']):
         return True
     # Task data is a deliberate exception to the built-in development install
     # root; explicit protected roots above always take precedence.
@@ -151,7 +201,7 @@ def protected(value, p):
     return False
 
 
-def allowed(value, p, mode):
+def allowed(value, p, mode, *, explicit_only=False):
     if protected(value, p):
         return False
     task = task_root(value)
@@ -160,7 +210,9 @@ def allowed(value, p, mode):
             return True
         rel = p.relative_to(task)
         return bool(rel.parts and rel.parts[0] in {'observations', 'deliverables', 'scratchpad'})
-    return any(inside(p, Path(root)) for root in state(value)[mode + 'Roots'])
+    if any(inside(p, Path(root)) for root in state(value)[mode + 'Roots']):
+        return True
+    return auto_approve(value) and not explicit_only
 
 
 def authorized_root_for(value, path, *, mode='read'):
@@ -191,6 +243,7 @@ def _persist(value):
     record = folder / (task.name + '.json')
     temporary = record.with_suffix('.tmp')
     data = {k: state(value)[k] for k in ('readRoots', 'writeRoots')}
+    data['protectedRoots'] = sorted(state(value)['protected'])
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, 'w') as stream:
         json.dump(data, stream)
@@ -281,7 +334,7 @@ async def _authorize_requests(value, requests):
             # Keep READ and WRITE decisions distinct, even for a mixed copy batch.
             for mode in dict.fromkeys(item[1] for item in entries):
                 paths = list(dict.fromkeys(p for _, m, _, p in entries
-                                         if m == mode and not allowed(value, p, mode)))
+                                         if m == mode and not allowed(value, p, mode, explicit_only=True)))
                 # Only remove scopes already covered by an explicitly supplied
                 # ancestor; do not synthesize a parent grant.
                 paths = [p for p in paths if not any(p != root and inside(p, root)
@@ -302,6 +355,17 @@ async def _authorize_requests(value, requests):
 
 
 async def _confirm_paths(value, paths, mode, entries):
+    if auto_approve(value):
+        error = _request_error(value, entries + [(str(p), mode, None, p) for p in paths])
+        if error:
+            return {'status': 'failed', 'code': error, 'tool_was_executed': False}
+        roots = state(value)[mode + 'Roots']
+        roots.extend(str(p) for p in paths if str(p) not in roots)
+        _persist(value)
+        for p in paths:
+            _log(value, 'local_path.authorization.granted', {
+                'path': str(p), 'mode': mode, 'authorizationId': None, 'selection': 'auto'})
+        return None
     from harness.runtime.hitl_input import read_terminal_input
     directory = _directory_option(value, paths, mode)
     authorization_id = uuid.uuid4().hex
@@ -372,6 +436,12 @@ def requests(call):
             yield (op.get('path'),
                    'read' if op.get('op') in {'stat', 'list'} else 'write',
                    op.get('base'))
+    elif name == 'run_local':
+        yield args.get('cwd'), 'read', None
+        for path in args.get('read_paths', []):
+            yield path, 'read', None
+        for path in args.get('write_paths', []):
+            yield path, 'write', None
     # Browser path-bearing calls, including nested workflow steps. Browser-side
     # sandboxing remains authoritative; this gate does not widen its roots.
     else:
@@ -464,3 +534,25 @@ async def authorize_tool_call(agent, call):
         return await _authorize_requests(agent, approvals + path_requests)
     except (OSError, ValueError) as exc:
         return {'status': 'failed', 'code': 'local_path_error', 'error': str(exc), 'tool_was_executed': False}
+
+
+def write_policy(value):
+    """Facts for an in-sandbox write guard (Download.start, DOM.getImg).
+
+    Guest code cannot call back into the host, so the guard receives the
+    decision inputs: with auto-approve every absolute path outside protected
+    roots and task control is writable; otherwise only granted WRITE roots and
+    the task's output folders. The guard checks the literal canonical path;
+    a symbolic link inside an allowed directory is not resolved there.
+    """
+    task = task_root(value)
+    s = state(value)
+    outputs = [str(task / d) for d in ('observations', 'deliverables', 'scratchpad')]
+    # Same order as allowed(): protected names and roots, then the task's own
+    # output folders, then the rest of the task and other tasks, then grants.
+    deny = set(s['protected']) | {str(task), str(Path(__file__).resolve().parents[2])}
+    if task.parent.name == 'worktree':
+        deny.add(str(task.parent.parent))
+    return {'auto': auto_approve(value), 'taskOutputs': outputs,
+            'allowRoots': sorted(set(s['writeRoots'])), 'denyRoots': sorted(deny),
+            'sensitive': sorted(_SENSITIVE)}

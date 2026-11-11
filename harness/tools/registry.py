@@ -21,6 +21,7 @@ class ToolContext:
     tool_call: JsonDict
     tool_input: JsonDict
     step: int = 0
+    cancelled: Optional[Callable[[], bool]] = None
 
 
 @dataclass(frozen=True)

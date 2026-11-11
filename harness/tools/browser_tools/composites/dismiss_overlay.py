@@ -262,6 +262,12 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
         return {"status": "failed", "error": "pageId is required"}
     target_id = str(tool_input.get("targetId") or "").strip()
     target_method = str(tool_input.get("targetMethod") or "").strip() or "Input.click"
+    target_params = tool_input.get("targetParams")
+    if isinstance(target_params, dict) and any(k in target_params for k in ("selector", "x", "y")):
+        # A selector/coordinate is not an AX node identity. Keep the original
+        # typed request for the caller; the ID-based sensitivity check cannot
+        # authorize an automatic replay of this target.
+        target_id = ""
     max_attempts = optional_int(tool_input.get("maxAttempts"), 0) or 0
     if max_attempts <= 0:
         max_attempts = DISMISS_OVERLAY_MAX_ATTEMPTS
@@ -446,6 +452,7 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
                 ),
                 "targetAccess": "unverified",
                 "reason": "auth_or_paywall_auto_dismiss_disallowed",
+                "originalAction": {"method": target_method, "params": target_params},
                 "occludedFrameCount": len(occluded_frames),
                 "attempts": attempts[-3:],
                 "vlArbiter": vl_arbiter_meta,
@@ -473,6 +480,7 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
             ),
             "targetAccess": "unverified",
             "occludedFrameCount": len(occluded_frames),
+            "originalAction": {"method": target_method, "params": target_params},
             "attempts": attempts[-3:],
             "vlArbiter": vl_arbiter_meta,
                 "backdrop": backdrop_meta,
@@ -492,6 +500,12 @@ async def _dismiss_overlay(agent: Any, tool_input: JsonDict, step: int) -> JsonD
         agent, page_id, target_id, target_method, step,
         already_performed=already_performed,
     )
+    if not target_id and target_params:
+        retry.update(status="dismissed_pending_action", retried=False,
+                     originalAction={"method": target_method, "params": target_params},
+                     reason="Original target has no AX identity for the automatic replay safety check",
+                     next_instruction="Overlay dismissed. Re-observe the original typed target and decide "
+                                      "whether to perform its action; it has not been replayed.")
     if retry.get("interrupt"):
         # The retried original action hit a HITL/challenge — do NOT report
         # dismissed_and_retried; surface human-needed.
