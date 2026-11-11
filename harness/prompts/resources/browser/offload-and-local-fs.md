@@ -1,7 +1,7 @@
 ---
 id: browser.offload-and-local-fs
 audience: browser
-version: "2026-09-15"
+version: "2026-10-26"
 description: Interpret offloaded observations and use bounded local file tools without confusing historical evidence with live page state.
 sources:
   - harness/context/offload.py
@@ -111,3 +111,22 @@ snippet is not the complete node/event. Use the returned readHint only if the
 surrounding lines answer a remaining question. Reuse unchanged evidence; do not
 repeat broad reads merely because a prior result was offloaded. A file search
 is historical evidence, never a refresh of the live page or transport.
+
+
+## Explicit materials for a later Workflow
+
+When the authorized delivery includes a reusable material set for a later
+Workflow, hand off an explicit JSON object:
+`{"schemaVersion":1,"files":[{"path":"/absolute/delivered/path","kind":"file","role":"source-document"}]}`.
+Include each metadata/source document as its own entry; assets can use
+`kind:"image"` or `kind:"file"` and caller-declared role/source strings. Use
+confirmed delivered paths, not browser-host artifact paths or guessed names.
+
+Write it with local_fs_batch in the authorized delivery scope and return its
+confirmed path/hash. In a Workflow author delegation, also return the JSON file
+inside the child task's artifacts so the parent can consume the copied object
+with prepare_materials(manifest_ref). The caller then explicitly consumes the
+returned files_ref during validation. Declarations carry no permissions, cached
+file facts or verified semantic mappings; the receiving task checks access and
+current files again. This portable declaration is separate from the automatic
+browser-file-manifest-v1 tool receipt, which records filesystem operations.

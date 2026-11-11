@@ -272,9 +272,17 @@ class ObservationChannel:
             return {"delivery": "unchanged", "version": version}
         return {"delivery": "full"}
 
-    def reset_consumer_view(self, consumer: str, page_id: str) -> None:
-        """Forget what a worker holds, so its next read is shown in full."""
-        self._cursors.pop((consumer, page_id), None)
+    def reset_consumer_view(self, consumer: str, page_id: Optional[str] = None) -> None:
+        """Forget delivered views after their owning model context is replaced.
+
+        Page evidence and watches remain valid; only the claim that this
+        consumer still has those bytes is reset.
+        """
+        if page_id is not None:
+            self._cursors.pop((consumer, page_id), None)
+            return
+        for key in [key for key in self._cursors if key[0] == consumer]:
+            del self._cursors[key]
 
     # -- watches -----------------------------------------------------------
 

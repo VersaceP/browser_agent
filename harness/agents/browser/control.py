@@ -1,10 +1,12 @@
 """Standalone task policy: TODO, review triggers and context restoration.
 
-The shared BrowserAgent engine only invokes these hooks; it does not plan or
-judge business completion. The independent reviewer retains that judgment.
+The shared BrowserAgent engine invokes these hooks. Independent review is
+controlled by the common runtime policy; otherwise the task owner judges delivery.
 """
 from __future__ import annotations
+import copy
 import json
+from harness.runtime.review_policy import reviewer_enabled
 from harness.utils import JsonDict
 
 
@@ -13,6 +15,11 @@ class StandaloneTaskControl:
         self.agent = agent
         self.pending = False
         self.question = ""
+        self.source_reads = {}
+
+    @property
+    def review_enabled(self) -> bool:
+        return reviewer_enabled(self.agent.runtime)
 
     def begin_turn(self):
         self.pending = False
@@ -24,6 +31,40 @@ class StandaloneTaskControl:
 
     def append_prompt(self, system_prompt):
         agent = self.agent
+        todo_start_guidance = (
+            " Before continuing execution, reconcile the restored checklist"
+            " with the ordered user amendments and save it with update_task_todo."
+            " Add or reopen affected items; if no checklist is available,"
+            " recreate a short draft with unverified details marked."
+            if getattr(agent, "standalone_resuming", False) else
+            " Start by saving a short draft from the original user request"
+            " with update_task_todo. Mark source-dependent details as unverified,"
+            " then read the needed materials and refine the checklist before"
+            " acting on them."
+        )
+        ready_guidance = (
+            " If the whole request is ready for final review, set"
+            " ready_for_final_review=true on update_task_todo and propose"
+            " final_answer(done) next. The final review covers that update."
+            if self.review_enabled else
+            " Independent review is disabled. Judge completion against the"
+            " original request and observed results, then call final_answer."
+            " No reviewer will verify your completion decision."
+        )
+        review_guidance = (
+            " Checklist writes save progress without triggering review. Once"
+            " needed sources are inspected and the initial execution plan is"
+            " formed, use request_goal_review once to check that plan against"
+            " the goal before carrying it out. During execution request a targeted review for a"
+            " material evidence conflict, doubtful direction or changed plan;"
+            " combine related concerns. Routine progress updates need no review."
+            " Reuse prior review history on resume/compaction; ask again when"
+            " the changed goal, plan or evidence warrants it. A done final_answer"
+            " is a completion proposal and ends only after independent verification."
+            " Do not treat a review opinion as authority to change the user goal or permissions."
+            if self.review_enabled else
+            " Checklist writes save progress without triggering review."
+        )
         system_prompt += (
             "\n\nStandalone /browser task: the original user request"
             " and attributed later user instructions define the goal."
@@ -41,13 +82,11 @@ class StandaloneTaskControl:
             " Ask through the existing pause channel only when"
             " information from the user is necessary."
             " Maintain a short Markdown checklist at"
-            f" {agent.logger.task_dir}/scratchpad/todo.md. Read needed"
-            " source materials before drafting it; call"
-            " update_task_todo with the full Markdown content for"
+            f" {agent.logger.task_dir}/scratchpad/todo.md."
+            f"{todo_start_guidance}"
+            " Call update_task_todo with the full Markdown content for"
             " each update. Check off an item only after verifying it."
-            " If the whole request is ready for final review, set"
-            " ready_for_final_review=true on update_task_todo and propose"
-            " final_answer(done) next. The final review covers that update."
+            f"{ready_guidance}"
             " Keep source details and unresolved items visible; add"
             " discovered requirements and reopen mistaken checks."
             " For each stage, briefly keep its intended outcome, verified"
@@ -66,17 +105,8 @@ class StandaloneTaskControl:
             " The original request, attributed later user instructions"
             " and designated materials, not your checklist, define"
             " completion. On resume, add or reopen checklist items"
-            " affected by the new instruction. Checklist writes save progress"
-            " without triggering review. Once needed sources are inspected and"
-            " the initial execution plan is formed, use request_goal_review once"
-            " to check that plan against the goal before carrying it out. During"
-            " execution request a targeted review for a material evidence conflict,"
-            " doubtful direction or changed plan; combine related concerns."
-            " Routine progress updates need no review. Reuse prior review history"
-            " on resume/compaction; ask again when the changed goal, plan or"
-            " evidence warrants it. A done final_answer is a completion proposal"
-            " and ends only after independent verification. Do not treat a review"
-            " opinion as authority to change the user goal or permissions."
+            " affected by the new instruction."
+            f"{review_guidance}"
             " Preserve unresolved requirements when rewriting todo.md;"
             " explain removed or reinterpreted items in the Markdown."
             " When new work invalidates a completed check, reopen the"
@@ -125,7 +155,17 @@ class StandaloneTaskControl:
         return system_prompt
 
     def configure_tools(self, tools):
+        completion_guidance = (
+            "Done proposes completion and requires independent evidence review"
+            " against the original goal and todo.md."
+            if self.review_enabled else
+            "Independent review is disabled; done ends the task based on your"
+            " evidence-grounded completion decision."
+        )
         for tool_spec in tools:
+            # Registry schemas are shared; per-task policy must not change
+            # another runtime's tool descriptions.
+            tool_spec["input_schema"] = copy.deepcopy(tool_spec["input_schema"])
             if tool_spec.get("name") == "browser_call":
                 policy = tool_spec["input_schema"]["properties"]["runtime_policy"]
                 policy["description"] = (
@@ -140,9 +180,8 @@ class StandaloneTaskControl:
             if tool_spec.get("name") == "final_answer":
                 tool_spec["description"] = (
                     "Report the standalone browser task's explicit"
-                    " terminal outcome. Done proposes completion and"
-                    " requires independent evidence review against"
-                    " the original goal and todo.md. Use incomplete for"
+                    " terminal outcome. Done requires a saved, readable, non-empty"
+                    f" task checklist. {completion_guidance} Use incomplete for"
                     " a concrete blocker. Partial saves a checkpoint"
                     " and the same BrowserAgent continues."
                 )
@@ -151,6 +190,10 @@ class StandaloneTaskControl:
                     " then only material gaps, needed user action and useful artifact links."
                     " Keep field inventories and routine verification in artifacts."
                     " Do not embed the worker receipt JSON."
+                )
+            if tool_spec.get("name") == "update_task_todo" and not self.review_enabled:
+                tool_spec["input_schema"]["properties"]["ready_for_final_review"]["description"] = (
+                    "Ignored while independent review is disabled; the checklist is still saved."
                 )
 
     def restore_initial_context(self, messages):
@@ -177,6 +220,8 @@ class StandaloneTaskControl:
                 + "\n</unresolved_browser_review>"
             )
         messages[0]["content"] += self._review_checkpoint(initial_todo)
+        from harness.agents.browser.resume import restore_resume_messages
+        restore_resume_messages(agent, messages)
 
     def restore_compacted_context(self, messages):
         agent = self.agent
@@ -218,22 +263,28 @@ class StandaloneTaskControl:
         agent = self.agent
         from harness.agents.browser.review.task import todo_snapshot
         current_todo = todo_snapshot(agent)
-        if not current_todo["exists"]:
-            todo_reason = str(current_todo.get("error") or "todo_missing")
+        if (current_todo.get("error") or not current_todo["exists"]
+                or not current_todo["content"].strip()):
+            todo_reason = str(current_todo.get("error") or (
+                "todo_empty" if current_todo["exists"] else "todo_missing"))
             review = {"status": "unavailable",
+                      "requirement": "persisted_task_todo",
                       "reason": todo_reason,
                       "suggestedNextAction": (
                           "Inspect the task storage and recover"
                           " the persisted checklist before finalizing."
                           if current_todo.get("error") else
-                          "Create scratchpad/todo.md from the"
+                          "Save a non-empty scratchpad/todo.md with"
+                          " update_task_todo from the"
                           " original goal and designated sources;"
                           " verify outcomes before checking items."
                       )}
-            agent._write_agent_event("browser.task_review.skipped", {
+            agent._write_agent_event("browser.task_todo.required", {
                 "phase": "final", "step": agent._current_step,
                 "reason": todo_reason,
             })
+        elif not self.review_enabled:
+            review = await self.review(phase="final", final_answer=proposed_answer)
         else:
             review = await agent._review_standalone_task(
                 phase="final", final_answer=proposed_answer, question=self.question,
@@ -243,6 +294,13 @@ class StandaloneTaskControl:
         return review
 
     def observe_tool_result(self, tool_call, result):
+        from harness.agents.browser.resume import source_read_fact
+        fact = source_read_fact(tool_call, result)
+        if fact:
+            key = tuple(fact.get(k) for k in ("path", "lineOffset", "linesRead", "readContentSha256"))
+            self.source_reads[key] = fact
+        if not self.review_enabled:
+            return
         if (tool_call.get("name") == "request_goal_review"
                 and isinstance(result, dict)
                 and result.get("status") == "requested"):
@@ -250,6 +308,9 @@ class StandaloneTaskControl:
             self.question = str(result.get("question") or "")
 
     async def review_boundary(self):
+        if not self.review_enabled:
+            self.pending = False
+            return []
         agent = self.agent
         tool_results = []
         if (self.pending
@@ -287,6 +348,12 @@ class StandaloneTaskControl:
     ) -> JsonDict:
         """Continue the task's independent Browser review without task owner planning."""
         agent = self.agent
+        if not self.review_enabled:
+            skipped = {"status": "skipped", "reason": "reviewer_disabled"}
+            agent._write_agent_event("browser.task_review.skipped", {
+                "phase": phase, "step": agent._current_step, **skipped,
+            })
+            return skipped
         from harness.agents.browser.review.task import (
             persist_review_state, review_browser_task, review_for_executor,
         )

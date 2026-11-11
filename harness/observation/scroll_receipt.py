@@ -16,6 +16,15 @@ from harness.utils import JsonDict
 # Ordered by specificity, not preference: a receipt carries one or the other.
 SCROLL_DELTA_FIELDS: Tuple[str, ...] = ("totalDelta", "observedDelta")
 
+# Preserve the same protocol facts at action recovery and worker handoff.
+# Legacy fields remain readable but are never translated into current states.
+SCROLL_RECOVERY_FIELDS: Tuple[str, ...] = (
+    "mode", "input", "observation", "goal", "completedReason",
+    "requestedDelta", "observedDelta", "totalDelta", "position", "extent",
+    "point", "frameDepth", "resolution", "layers", "targetVisible", "visibilityProof",
+    "requestedDistance", "actualDistance",
+)
+
 # Current builds answer `state-read`; older builds and fixtures used
 # `amount-zero`. Anything else means the call MOVED the page and is therefore
 # not a reading of it.

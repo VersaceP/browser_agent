@@ -75,8 +75,6 @@ class BrowserAgent:
         self.page_observer = PageObservationTracker()
         self.challenge_tracker = ChallengeTracker()
         self.content_completeness_tracker = ContentCompletenessTracker()
-        self.hitl_structural_challenges: Dict[str, JsonDict] = {}
-        self.hitl_no_repause_until: float = 0.0
         self.lifecycle = default_lifecycle_manager()
         # Typed lifecycle events. Built from the logger this agent was handed,
         # so a worker's events carry the worker identity the spawner bound,
@@ -741,6 +739,8 @@ class BrowserAgent:
 
     def _visible_capability_methods(self) -> Set[str]:
         visible = filter_capability_methods(self.capability_methods)
+        from harness.workflow.access import write_denial
+        visible = {method for method in visible if write_denial(self, method) is None}
         from harness.workflow.workflow_runtime import workflow_execution_enabled
         if not workflow_execution_enabled(self):
             visible.discard("Workflow.execute")

@@ -1124,6 +1124,30 @@ async def _read_tool(agent: Any, trace: list, name: str, raw: dict,
     return {"status": "rejected", "reason": "review_tool_forbidden"}, None
 
 
+def validate_terminal_decision(decision, verdict):
+    """Protocol/consistency only; do not infer business intent from prose."""
+    if not isinstance(verdict, str) or verdict not in {"needs_work", "needs_user", "insufficient_evidence", "complete"}:
+        raise ValueError("terminalDecision requires a valid final review verdict")
+    if (not isinstance(decision, dict) or not isinstance(decision.get("action"), str)
+            or decision["action"] not in {"continue", "ask_user", "stop"}):
+        raise ValueError("terminalDecision requires action=continue/ask_user/stop")
+    if not isinstance(decision.get("reason"), str) or not decision["reason"].strip():
+        raise ValueError("terminalDecision requires an evidence-based reason")
+    if decision.keys() - {"action", "reason", "question"}:
+        raise ValueError("Unknown terminalDecision fields")
+    action = decision["action"]
+    if verdict == "needs_user" and action != "ask_user":
+        raise ValueError("needs_user requires ask_user")
+    if action == "ask_user" and (verdict != "needs_user" or
+            not isinstance(decision.get("question"), str) or not decision["question"].strip()):
+        raise ValueError("ask_user requires needs_user and a nonempty question")
+    if verdict == "complete" and action != "stop":
+        raise ValueError("complete contradicts a pending continuation/decision")
+    if action != "ask_user" and decision.get("question"):
+        raise ValueError("A pending question requires ask_user")
+    return decision
+
+
 def _review_result(raw: dict, *, phase: str, goal_hash: str, todo_hash: str,
                    proposal_hash: str, evidence_ids: set[str],
                    fresh_evidence_ids: set[str] | None = None,
@@ -1134,7 +1158,6 @@ def _review_result(raw: dict, *, phase: str, goal_hash: str, todo_hash: str,
     errors = []
     terminal = {}
     if terminal_proposal:
-        from harness.skill_runtime.terminal import validate_terminal_decision
         try:
             terminal["terminalDecision"] = validate_terminal_decision(raw.get("terminalDecision"), verdict)
         except ValueError as exc:
@@ -1679,9 +1702,16 @@ async def _review_browser_task(*, agent: Any, original_goal: str,
 
 
 async def review_browser_task(**kwargs):
+    from harness.runtime.review_policy import reviewer_enabled
+    agent = kwargs["agent"]
+    if not reviewer_enabled(agent.runtime):
+        skipped = {"status": "skipped", "reason": "reviewer_disabled"}
+        agent.logger.write("browser.task_review.skipped", {
+            "phase": kwargs.get("phase"), **skipped,
+        })
+        return skipped
     from harness.runtime.steering import current_steering
     manager = current_steering()
-    agent = kwargs["agent"]
     role = manager.register(f"reviewer:{getattr(agent, 'worker_id', 'owner')}") if manager else None
     try:
         return await _review_browser_task(**kwargs, steering_role=role)

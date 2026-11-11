@@ -108,15 +108,13 @@ async def run_browser_agent(self, task: str) -> str:
         tools = build_browser_agent_tool_specs(
             self._visible_capability_methods(),
             workflow_enabled=workflow_execution_enabled(self),
-            selected_skill_available=bool(
-                getattr(self.runtime.harness, "forced_skill_id", "") and
-                getattr(self.runtime.harness, "forced_skill_hash", "")),
             step_extension_enabled=bool(
                 self.runtime.harness.browser_agent_step_extension_enabled
                 and control is None
             ),
             multimodal_enabled=multimodal_enabled,
             standalone_review_enabled=control is not None,
+            review_enabled=control.review_enabled if control is not None else False,
         )
         if control is not None:
             control.configure_tools(tools)
@@ -141,12 +139,21 @@ async def run_browser_agent(self, task: str) -> str:
                 "content": (
                     f"<user_task>\n{task}\n</user_task>\n\n"
                     f"<dynamic_context>\n{dynamic_context}\n</dynamic_context>\n\n"
-                    + ("Follow the explicitly selected Skill's orchestration, bind current inputs and prefer its applicable formal Workflow templates. Use the available tools to resolve gaps and verify the user's goal. Call final_answer when done."
-                     if control is not None and getattr(self.runtime.harness, "forced_skill_id", "")
-                     else "Plan autonomously and invoke browser_call to accomplish the task. Call final_answer when you are done.")
+                    + "Plan autonomously and invoke browser_call to accomplish the task. Call final_answer when you are done."
                 ),
             }
         ]
+        restore_conversation = getattr(self, "_restore_conversation", None)
+        if restore_conversation is not None:
+            prior = restore_conversation()
+            if prior:
+                messages[0]["content"] = (
+                    "Continue the previous Browser conversation under the following CURRENT assignment. "
+                    "Earlier receipts describe past effects, not current page state or permission. "
+                    "Use current user answers and refresh targets before editing; do not replay completed work.\n\n"
+                    + messages[0]["content"]
+                )
+                messages = [*prior, *messages]
         if control is not None:
             control.restore_initial_context(messages)
 
@@ -683,19 +690,26 @@ async def run_browser_agent(self, task: str) -> str:
                             "reason": "user_input_pending"}, False)
                     elif completion_proposal:
                         review = await control.completion_review(str(tool_call["input"].get("answer") or ""))
-                        if (review.get("status") == "reviewed"
-                                and review.get("verdict") == "complete"
-                                and not (steering_role and steering_role.pending)):
+                        completion_accepted = (
+                            review.get("status") == "reviewed" and review.get("verdict") == "complete"
+                            if control.review_enabled else
+                            review.get("status") == "skipped" and review.get("reason") == "reviewer_disabled"
+                        )
+                        if completion_accepted and not (steering_role and steering_role.pending):
                             rejected_completion_without_action_streak = 0
                             result, should_stop = await dispatch_tool(tool_call, step)
                         else:
                             rejected_completion_without_action_streak += 1
                             result, should_stop = ({
-                                "status": "completion_review_pending",
+                                "status": ("task_todo_required"
+                                           if review.get("requirement") == "persisted_task_todo"
+                                           else "completion_review_pending"),
                                 "tool_was_executed": False,
                                 "review": review,
                                 "next_instruction": (
-                                    "The browser transport disconnected during"
+                                    review["suggestedNextAction"]
+                                    if review.get("requirement") == "persisted_task_todo"
+                                    else "The browser transport disconnected during"
                                     " independent review. Do not infer page"
                                     " deletion or repeat side effects. Report"
                                     " the concrete connection blocker with"
@@ -1079,6 +1093,10 @@ async def run_browser_agent(self, task: str) -> str:
         raise
     except LLMRateLimitError as exc:
         incident = exc.to_payload()
+        recorder.message_failed(f"llm_{exc.kind}")
+        self.logger.record_llm_retries(
+            source="browser_agent", usage=retry_usage_from_attempts(exc.attempts),
+        )
         self._write_agent_event("agent.model_rate_limited", {
             "step": step,
             **incident,
@@ -1128,6 +1146,9 @@ async def run_browser_agent(self, task: str) -> str:
                 return final_answer
         raise
     finally:
+        # The Skill worker may persist this compacted conversation after a
+        # returned dispatch. New workers still bootstrap leases and grants.
+        self._conversation_messages = messages
         if steering_role: steering_role.close()
         recorder.close(
             status=str(self.final_status or final_status or "unknown"),
@@ -1156,6 +1177,7 @@ async def run_browser_agent(self, task: str) -> str:
                 messages=messages,
                 tools=tools,
                 metadata={
+                    "run_id": str(self.logger.run_id or ""),
                     "agent_id": self.runtime.agent_id,
                     "worker_id": self.worker_id,
                     "slot_id": self.slot_id,
@@ -1165,6 +1187,8 @@ async def run_browser_agent(self, task: str) -> str:
                     "final_status": self.final_status,
                     "final_answer": final_answer,
                     "artifacts": self.artifacts,
+                    **({"source_reads": list(control.source_reads.values())}
+                       if control is not None else {}),
                 },
                 run_id=str(
                     getattr(self.logger, "context_run_id", "") or ""

@@ -1,9 +1,9 @@
 """
 harness.observation.challenge_detector - Cheap challenge suspicion tracking.
 
-The detector is intentionally not a keyword wall. It accumulates behavior
-signals per page and only uses a tiny high-confidence keyword set as a fallback
-when visual adjudication is unavailable.
+The detector accumulates behavior and lexical signals per page for adjudication.
+Keyword matches are attributed suspicion, not proof that a task is blocked and
+not authority to pause when visual adjudication is unavailable.
 """
 
 from __future__ import annotations
@@ -113,9 +113,9 @@ def title_looks_like_challenge(title: str) -> bool:
     """True if a page title matches any known challenge/interstitial wording.
 
     Use for resume/clearance gates (e.g. the HITL verified-settlement title
-    fallback), NOT for challenge *detection* — detection stays behavioral with
-    only the small HIGH_CONFIDENCE_CHALLENGE_KEYWORDS fallback, while this
-    union is intentionally over-broad in the safe direction.
+    fallback), NOT as a task-blockage verdict. Detection collects behavioral,
+    structural and lexical evidence for adjudication; this title union is
+    intentionally over-broad in the safe direction for clearance checks.
     """
     title_lower = str(title or "").lower()
     return bool(title_lower and any(marker in title_lower for marker in CHALLENGE_TITLE_KEYWORDS))
@@ -175,184 +175,105 @@ class ChallengeSignal:
     step: int
     method: str
     kind: str
-    weight: int
     detail: str
+    evidence: Optional[JsonDict] = None
 
     def to_dict(self) -> JsonDict:
-        return {
-            "step": self.step,
-            "method": self.method,
-            "kind": self.kind,
-            "weight": self.weight,
-            "detail": self.detail[:500],
-        }
+        return {"step": self.step, "method": self.method, "kind": self.kind,
+                "detail": self.detail, "evidence": self.evidence}
 
 
 @dataclass
 class PageChallengeState:
     page_id: str
-    suspicion_score: int = 0
     recent_signals: List[ChallengeSignal] = field(default_factory=list)
     last_signal_step: int = 0
-    last_vl_step: Optional[int] = None
-    last_vl_verdict: str = ""
+    document_epoch: str = ""
+    observation_version: str = ""
     last_url: str = ""
     last_title: str = ""
     last_status: str = ""
     repeated_state_count: int = 0
-    lingering_title_count: int = 0
-    high_confidence_hit: bool = False
-    structural_challenge: bool = False
-    structural_evidence: Optional[JsonDict] = None
-    vl_attempts: int = 0
-
-    def add_signal(self, signal: ChallengeSignal) -> None:
-        weight = signal.weight
-        if (
-            self.last_vl_step is not None
-            and self.last_vl_verdict == "normal_loading"
-            and signal.step - self.last_vl_step < 5
-            and signal.kind not in {"high_confidence_keyword", "structural_challenge"}
-        ):
-            weight = max(1, weight // 3)
-            signal = ChallengeSignal(
-                step=signal.step,
-                method=signal.method,
-                kind=signal.kind,
-                weight=weight,
-                detail=f"{signal.detail} (VL normal_loading cooldown)",
-            )
-        self.suspicion_score += weight
-        self.last_signal_step = max(self.last_signal_step, signal.step)
-        if signal.kind in {"high_confidence_keyword", "structural_challenge"}:
-            self.high_confidence_hit = True
-        self.recent_signals.append(signal)
-        self.recent_signals = self.recent_signals[-12:]
-
-    def should_adjudicate(self, step: int, threshold: int = 70) -> bool:
-        if self.last_vl_step is not None and step - self.last_vl_step < 5:
-            return self.suspicion_score >= max(100, threshold + 30)
-        return self.suspicion_score >= threshold
-
-    def record_vl_verdict(self, step: int, verdict: str) -> None:
-        self.last_vl_step = step
-        self.last_vl_verdict = verdict
-        self.vl_attempts += 1
-        if verdict == "normal_loading":
-            self.suspicion_score = min(self.suspicion_score, 20)
-        elif verdict == "confirmed_challenge":
-            self.suspicion_score = max(self.suspicion_score, 100)
 
     def to_summary(self) -> JsonDict:
         return {
             "pageId": self.page_id,
-            "suspicionScore": self.suspicion_score,
-            "highConfidenceHit": self.high_confidence_hit,
-            "structuralChallenge": self.structural_challenge,
-            "structuralEvidence": self.structural_evidence,
-            "lastVlVerdict": self.last_vl_verdict or None,
-            "lastVlStep": self.last_vl_step,
-            "vlAttempts": self.vl_attempts,
-            "signals": [signal.to_dict() for signal in self.recent_signals[-5:]],
+            "documentEpoch": self.document_epoch or None,
+            "observationVersion": self.observation_version or None,
+            "observedAtStep": self.last_signal_step,
+            "signals": [signal.to_dict() for signal in self.recent_signals],
         }
 
 
 class ChallengeTracker:
-    def __init__(self, *, threshold: int = 70):
-        self.threshold = threshold
+    """Bound observations to a page/document; never classify task blockage."""
+
+    def __init__(self):
         self._per_page: Dict[str, PageChallengeState] = {}
 
-    def feed(
-        self,
-        *,
-        method: str,
-        params: Any,
-        result: Any,
-        step: int,
-    ) -> Optional[PageChallengeState]:
+    def feed(self, *, method: str, params: Any, result: Any,
+             step: int) -> Optional[PageChallengeState]:
         page_id = extract_page_id(params, result)
         if not page_id:
             return None
-        state = self._per_page.setdefault(page_id, PageChallengeState(page_id=page_id))
-        state.last_signal_step = max(state.last_signal_step, step)
-        if method == "Page.close":
-            self.on_page_closed(page_id)
+        if method in {"Page.close", "Page.navigate", "Page.reload", "Page.go"}:
+            self.clear_page(page_id)
             return None
-
         data = response_data(result)
-        title = str(data.get("title") or "")
+        observation = data.get("observation")
+        observation = observation if isinstance(observation, dict) else {}
+        component = _structural_challenge_receipt(result)
+        epoch = str(observation.get("documentEpoch") or data.get("documentEpoch")
+                    or (component or {}).get("documentEpoch") or "")
+        version = str(observation.get("version") or data.get("version")
+                      or (component or {}).get("observationVersion") or "")
         url = str(data.get("url") or "")
+        state = self._per_page.setdefault(page_id, PageChallengeState(page_id=page_id))
+        if ((epoch and state.document_epoch and epoch != state.document_epoch)
+                or (version and state.observation_version and version != state.observation_version)
+                or (url and state.last_url and url != state.last_url)):
+            state = PageChallengeState(page_id=page_id)
+            self._per_page[page_id] = state
+        state.document_epoch = epoch or state.document_epoch
+        state.observation_version = version or state.observation_version
+        signals: List[ChallengeSignal] = []
+        if component:
+            signals.append(ChallengeSignal(
+                step, method, "challenge_component",
+                "Challenge-related document and control facts; task access is unconfirmed",
+                component,
+            ))
+        keyword = _first_high_confidence_keyword(result)
+        if keyword:
+            signals.append(ChallengeSignal(step, method, "keyword_match",
+                                           "Text matched a challenge term", keyword))
+        title = str(data.get("title") or "")
         status = str(data.get("status") or "")
-
-        structural = _structural_challenge_receipt(result)
-        if structural:
-            state.structural_challenge = True
-            state.structural_evidence = structural
-            state.add_signal(ChallengeSignal(
-                step=step,
-                method=method,
-                kind="structural_challenge",
-                weight=100,
-                detail=(
-                    f"Embedded challenge frame {structural.get('rootLabel')!r}"
-                    f" exposed {len(structural.get('controls') or [])} verification control(s)"
-                ),
-            ))
-        elif _contains_high_confidence_keyword(result):
-            state.add_signal(ChallengeSignal(
-                step=step,
-                method=method,
-                kind="high_confidence_keyword",
-                weight=90,
-                detail="High-confidence CAPTCHA/challenge keyword detected",
-            ))
-
-        title_lower = title.lower()
-        if title and any(marker in title_lower for marker in LINGERING_LOADING_TITLES):
-            state.lingering_title_count += 1
-            weight = 35
-            state.add_signal(ChallengeSignal(
-                step=step,
-                method=method,
-                kind="title_lingers_non_target",
-                weight=weight,
-                detail=f"title={title!r}, url={url!r}, status={status!r}",
-            ))
-        elif title:
-            state.lingering_title_count = 0
-
-        current_key = (url, title, status)
-        last_key = (state.last_url, state.last_title, state.last_status)
-        if all(current_key) and current_key == last_key:
-            state.repeated_state_count += 1
-            if state.repeated_state_count >= 3:
-                state.add_signal(ChallengeSignal(
-                    step=step,
-                    method=method,
-                    kind="state_stagnant",
-                    weight=15,
-                    detail=f"Repeated page state {state.repeated_state_count} times",
-                ))
-        else:
-            state.repeated_state_count = 0
-            state.last_url, state.last_title, state.last_status = current_key
-
+        if is_lingering_loading_title(title):
+            signals.append(ChallengeSignal(step, method, "loading_title",
+                                           "Page title contains loading wording", {"title": title}))
+        current = (url, title, status)
+        previous = (state.last_url, state.last_title, state.last_status)
+        state.repeated_state_count = state.repeated_state_count + 1 if all(current) and current == previous else 0
+        if state.repeated_state_count >= 3:
+            signals.append(ChallengeSignal(step, method, "repeated_state",
+                "Repeated page state; no conclusion about its cause",
+                {"count": state.repeated_state_count, "url": url, "title": title, "status": status}))
+        state.last_url = url or state.last_url
+        state.last_title = title or state.last_title
+        state.last_status = status or state.last_status
+        # A fresh full tree replaces prior component facts even when it contains
+        # no match. A state read may retain the last tree's attributed witnesses.
+        if signals or method == "DOM.getAXTree":
+            state.recent_signals = signals
+            state.last_signal_step = step
         return state
-
-    def should_adjudicate(self, page_id: str, step: int) -> bool:
-        state = self.get_state(page_id)
-        return bool(state and state.should_adjudicate(step, threshold=self.threshold))
-
-    def record_vl_verdict(self, page_id: str, step: int, verdict: str) -> None:
-        state = self.get_state(page_id)
-        if state is not None:
-            state.record_vl_verdict(step, verdict)
 
     def get_state(self, page_id: str) -> Optional[PageChallengeState]:
         return self._per_page.get(page_id)
 
     def on_page_closed(self, page_id: str) -> None:
-        self._per_page.pop(page_id, None)
+        self.clear_page(page_id)
 
     def clear_page(self, page_id: str) -> None:
         self._per_page.pop(page_id, None)
@@ -360,14 +281,10 @@ class ChallengeTracker:
     def cleanup_stale(self, current_step: int, max_age_steps: int = 30) -> None:
         for page_id, state in list(self._per_page.items()):
             if current_step - state.last_signal_step > max_age_steps:
-                del self._per_page[page_id]
+                self.clear_page(page_id)
 
     def suspected_pages(self) -> List[JsonDict]:
-        return [
-            state.to_summary()
-            for state in self._per_page.values()
-            if state.suspicion_score > 0
-        ]
+        return [state.to_summary() for state in self._per_page.values() if state.recent_signals]
 
 
 def extract_page_id(params: Any, result: Any) -> str:
@@ -397,68 +314,61 @@ def response_data(result: Any) -> JsonDict:
     return data if isinstance(data, dict) else {}
 
 
+def _component_node_facts(node: JsonDict) -> JsonDict:
+    """Publish state facts without copying form values or asserting actionability."""
+    attrs = node.get("attrs") or {}
+    return {
+        "id": node["id"], "role": node["role"], "label": str(node.get("name") or "")[:200],
+        "visibility": node.get("visibility"), "flags": list(node.get("flags") or []),
+        "interactionSources": list(node.get("interactionSources") or []),
+        "rect": node.get("rect"),
+        "attributes": {key: attrs[key] for key in ("type", "hidden", "aria-hidden") if key in attrs},
+    }
+
+
 def detect_structural_challenge_from_lines(
-    lines: Any,
-    *,
-    source_method: str = "DOM.getAXTree",
+    lines: Any, *, source_method: str = "DOM.getAXTree", frames: Any = None,
 ) -> Optional[JsonDict]:
-    """Detect a visible embedded challenge frame from compact AXTree lines.
+    """Report component facts, including hidden nodes; never prove blockage.
 
-    A keyword anywhere on a normal page is not enough.  The evidence must be a
-    document root (``rootwebarea``) whose own label is challenge-like, plus an
-    actionable verification control inside that same document.  This catches
-    small or visually unobtrusive CAPTCHA iframes without treating
-    documentation text as a blocking challenge.
-
-    Node ids carry no frame, so "inside that document" is the node's nearest
-    rootwebarea ancestor (page_observation.node_document_roots).
+    Frame-local root visibility does not establish visibility through its owner.
+    Preserve both when frame identity is available, so the model can judge them.
     """
     if not isinstance(lines, list):
         return None
-    normalized = [str(line) for line in lines if isinstance(line, str)]
+    normalized = [line for line in lines if isinstance(line, str)]
     documents = node_document_roots(normalized)
     parsed = [parse_axtree_line(line) for line in normalized]
-    roots = [
-        index for index, node in enumerate(parsed)
-        if node is not None and node["role"] == "rootwebarea"
-    ]
-    for start in roots:
-        root = parsed[start]
-        root_line = normalized[start]
-        root_label = str(root.get("name") or "").strip()
-        root_haystack = f"{root_label} {root_line}".casefold()
-        if not any(
-            marker.casefold() in root_haystack
-            for marker in STRUCTURAL_CHALLENGE_ROOT_MARKERS
-        ):
+    nodes = {node["id"]: node for node in parsed if node is not None}
+    for start, root in enumerate(parsed):
+        if root is None or root["role"] != "rootwebarea":
             continue
-        if {"hidden", "off"} & set(root.get("flags") or []):
+        if not any(marker.casefold() in str(root.get("name") or "").casefold()
+                   for marker in STRUCTURAL_CHALLENGE_ROOT_MARKERS):
             continue
-        controls: List[JsonDict] = []
+        controls = []
         for index, node in enumerate(parsed):
-            if node is None or index == start:
+            if (node is None or documents.get(node["id"]) != root["id"]
+                    or node["role"] not in _STRUCTURAL_ACTION_ROLES):
                 continue
-            if documents.get(node["id"]) != root["id"]:
-                continue
-            if node["role"] not in _STRUCTURAL_ACTION_ROLES:
-                continue
-            label = str(node.get("name") or "").strip()
-            line_haystack = f"{label} {normalized[index]}".casefold()
-            if not any(
-                marker.casefold() in line_haystack
-                for marker in STRUCTURAL_CHALLENGE_CONTROL_MARKERS
-            ):
-                continue
-            controls.append({"id": node["id"], "role": node["role"], "label": label})
-
-        if controls:
-            return {
-                "kind": "embedded_challenge_frame",
-                "sourceMethod": source_method,
-                "rootId": root["id"],
-                "rootLabel": root_label,
-                "controls": controls[:5],
-            }
+            if any(marker.casefold() in normalized[index].casefold()
+                   for marker in STRUCTURAL_CHALLENGE_CONTROL_MARKERS):
+                controls.append({**_component_node_facts(node), "sourceLine": index + 1})
+        if not controls:
+            continue
+        frame = next((frame for frame in (frames if isinstance(frames, list) else [])
+                      if isinstance(frame, dict) and frame.get("rootId") == root["id"]), {})
+        owner = nodes.get(frame.get("ownerId"))
+        return {
+            "kind": "challenge_component", "sourceMethod": source_method,
+            "rootId": root["id"], "rootLabel": str(root.get("name") or "")[:200],
+            "root": _component_node_facts(root), "sourceLine": start + 1,
+            "frameId": frame.get("frameId"), "ownerId": frame.get("ownerId"),
+            "owner": _component_node_facts(owner) if owner else None,
+            "controls": controls[:5], "controlCount": len(controls),
+            "coverage": "first_matching_document",
+            "blockingStatus": "unconfirmed",
+        }
     return None
 
 
@@ -468,30 +378,47 @@ def detect_structural_challenge(method: str, response: Any) -> Optional[JsonDict
     payload = response.get("data")
     if not isinstance(payload, dict):
         return None
-    return detect_structural_challenge_from_lines(
-        payload.get("lines"), source_method=method
-    )
+    evidence = detect_structural_challenge_from_lines(
+        payload.get("lines"), source_method=method, frames=payload.get("frames"))
+    if evidence:
+        observation = payload.get("observation")
+        observation = observation if isinstance(observation, dict) else {}
+        evidence["pageId"] = payload.get("pageId")
+        evidence["documentEpoch"] = observation.get("documentEpoch") or payload.get("documentEpoch")
+        evidence["observationVersion"] = observation.get("version") or payload.get("version")
+    return evidence
 
 
 def _structural_challenge_receipt(result: Any) -> Optional[JsonDict]:
     if not isinstance(result, dict):
         return None
-    receipt = result.get("structuralChallenge")
-    if isinstance(receipt, dict) and receipt.get("kind") == "embedded_challenge_frame":
+    receipt = result.get("challengeComponent")
+    if isinstance(receipt, dict) and receipt.get("kind") == "challenge_component":
         return receipt
-    method = str(result.get("method") or "")
-    response = result.get("response")
-    return detect_structural_challenge(method, response)
+    return detect_structural_challenge(str(result.get("method") or ""), result.get("response"))
 
 
 def _contains_high_confidence_keyword(value: Any) -> bool:
-    parts: List[str] = []
+    return _first_high_confidence_keyword(value) is not None
+
+
+def _first_high_confidence_keyword(value: Any) -> Optional[JsonDict]:
+    """Return one bounded lexical witness, without interpreting its UI meaning."""
+    parts: List[tuple[str, str]] = []
     _collect_challenge_strings(value, parts, limit=80)
-    haystack = "\n".join(parts).lower()
-    return any(keyword.lower() in haystack for keyword in HIGH_CONFIDENCE_CHALLENGE_KEYWORDS)
+    for path, text in parts:
+        text_lower = text.lower()
+        for keyword in HIGH_CONFIDENCE_CHALLENGE_KEYWORDS:
+            index = text_lower.find(keyword.lower())
+            if index >= 0:
+                start = max(0, index - 100)
+                return {"keyword": keyword, "sourcePath": path, "excerpt": text[start:start + 400]}
+    return None
 
 
-def _collect_challenge_strings(value: Any, out: List[str], *, limit: int) -> None:
+def _collect_challenge_strings(
+    value: Any, out: List[tuple[str, str]], *, limit: int, path: str = "$",
+) -> None:
     if len(out) >= limit:
         return
     if isinstance(value, dict):
@@ -500,18 +427,18 @@ def _collect_challenge_strings(value: Any, out: List[str], *, limit: int) -> Non
             if key in CHALLENGE_SKIP_KEYS:
                 continue
             if isinstance(item, str) and key in CHALLENGE_TEXT_KEYS:
-                out.append(item[:2000])
+                out.append((f"{path}.{raw_key}", item[:2000]))
             elif isinstance(item, (dict, list)) and (
                 key in CHALLENGE_CONTAINER_KEYS or key in CHALLENGE_TEXT_KEYS
             ):
-                _collect_challenge_strings(item, out, limit=limit)
+                _collect_challenge_strings(item, out, limit=limit, path=f"{path}.{raw_key}")
             if len(out) >= limit:
                 break
     elif isinstance(value, list):
-        for item in value:
+        for index, item in enumerate(value):
             if isinstance(item, str):
-                out.append(item[:2000])
+                out.append((f"{path}[{index}]", item[:2000]))
             elif isinstance(item, (dict, list)):
-                _collect_challenge_strings(item, out, limit=limit)
+                _collect_challenge_strings(item, out, limit=limit, path=f"{path}[{index}]")
             if len(out) >= limit:
                 break

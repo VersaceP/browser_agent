@@ -36,6 +36,13 @@ class BrowserTaskRunner:
 
     def __init__(self, runtime, logger, *, resume=None, task_fleet_reference="",
                  pinned_browser_context=None):
+        # Browser continuations, including resumed author evidence tasks, do
+        # not inherit publishing authority from their parent or old prose.
+        import copy
+        from harness.workflow.access import READ_ONLY
+        runtime = copy.copy(runtime)
+        runtime.harness = copy.copy(runtime.harness)
+        runtime.harness._workshop_access = READ_ONLY
         self.runtime = runtime
         self.logger = logger
         self.resume = resume
@@ -69,9 +76,6 @@ class BrowserTaskRunner:
         contract["_user_context"] = user_context(self.logger, self.original_user_task)
         contract.pop("skill_id", None)
         contract.pop("skill_hash", None)
-        selected = self.runtime.harness
-        if selected.forced_skill_id and selected.forced_skill_hash:
-            contract.update(skill_id=selected.forced_skill_id, skill_hash=selected.forced_skill_hash)
         context = str(phase.get("context") or "")
         state = load_task_state(self.logger)
         attempts = ((state.get("phases") or {}).get(phase_id) or {}).get("attempts") or []
@@ -146,6 +150,12 @@ async def _run_browser_mode(
     BrowserTaskRunner owns dispatch, lifecycle and persistence. The single
     phase records the user request without a model-authored delegation.
     """
+    from harness.utils import load_task_json
+    from harness.workflow_mode.run_policy import completion_resume_error
+    retired = completion_resume_error(load_task_json(harness.logger, 'task_manifest.json'))
+    if retired:
+        return _browser_mode_failure(harness, code='workflow_completion_retired', error=retired,
+                                     tool_was_executed=False)
     if resume_context is not None:
         plan = resume_context.current_plan
         phases = plan.get("phases") if isinstance(plan, dict) else None
@@ -186,7 +196,7 @@ async def _run_browser_mode(
     fleet_reference = str(
         getattr(harness, "task_fleet_reference", "") or ""
     ).strip()
-    if not fleet_reference:
+    if not fleet_reference and harness.spawner.pinned_browser_context is None:
         fleet_reference, fleet_error = extract_fleet_reference(original_task)
         if fleet_error:
             return _browser_mode_failure(

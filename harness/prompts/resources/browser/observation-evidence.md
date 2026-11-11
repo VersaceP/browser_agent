@@ -73,6 +73,14 @@ live query does not refresh it; invalidation does not retire known document ids
 or invalidate current live-query facts. Choose a live query for known targets
 or a full read for discovery according to the unresolved question.
 
+find_in_axtree adds viewParentId and scrollAncestorIds, with deduplicated facts
+in relatedNodes. These follow the current view's depth and explicit scroll
+markers; they are not DOM-parent or business-row assertions. A depth gap leaves
+the direct parent unknown, and embedded documents have separate ancestry.
+Compare the relevant container's geometry and scroll facts before choosing a
+scroll target. A local match count or filtered/rendered subset is not a total;
+retain observed row/control identities when checking coverage across regions.
+
 ## Node lines
 
 ```
