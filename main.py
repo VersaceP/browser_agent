@@ -80,12 +80,10 @@ CLI_CANCELLED_EXIT_CODE = 130
 
 _INTERACTIVE_AGENT_MODES = {
     "/browser": "browser",
-    "/workflow": "workflow",
 }
 _AGENT_MODE_LABELS = {
     "browser": "direct BrowserAgent execution",
-    "skill": "Skill orchestration, continuous execution and recovery",
-    "workflow": "Develop, execute and validate reusable Workflows with one author",
+    "workflow": "Create, run and repair reusable Workshop packages",
 }
 
 
@@ -741,126 +739,6 @@ class ConsoleProgressReporter:
         )
 
 
-def _skill_catalog_for_runtime(runtime: Any):
-    from harness.skill_builder.catalog import SkillCatalog
-    from harness.storage.factory import resolve_sqlite_path
-    return SkillCatalog(
-        Path(__file__).resolve().parent / "skills",
-        resolve_sqlite_path(runtime.harness.storage_sqlite_path,
-                            runtime.harness.worktree_dir),
-        worktree_dir=Path(runtime.harness.worktree_dir),
-    )
-
-
-def _selected_skill_binding(runtime: Any, reference: str) -> "tuple[str, str]":
-    from harness.skill_builder.catalog import inspect_skill
-    from harness.skill_builder.references import SkillReferences
-    if reference.startswith("@"):
-        raise ValueError("Select a Skill by its name or Skill ID; use /resume for a task ID")
-    catalog = _skill_catalog_for_runtime(runtime)
-    try:
-        catalog.sync_existing()
-        row = SkillReferences(catalog, Path(runtime.harness.worktree_dir)).published(reference)
-        skill_id = row["skill_id"]
-        content_hash = str(row["current_hash"])
-        try:
-            current_hash = inspect_skill(catalog.root / skill_id)["hash"]
-        except Exception as exc:
-            raise ValueError(f"Skill {skill_id} published files cannot be read: {exc}") from exc
-        if current_hash != content_hash:
-            raise ValueError(f"Skill {skill_id} published files do not match the index")
-        if catalog.source_path(skill_id, content_hash) is None:
-            raise ValueError(f"Skill {skill_id} published source is unavailable")
-        return skill_id, content_hash
-    finally:
-        catalog.close()
-
-
-def _available_skill_lines(config_path: str = "config.json") -> List[str]:
-    runtime = load_runtime_config(config_path)
-    catalog = _skill_catalog_for_runtime(runtime)
-    try:
-        catalog.sync_existing()
-        return _skill_inventory_lines(catalog.list())
-    finally:
-        catalog.close()
-
-
-def _validate_resume_skill(runtime: Any, reference: str, saved_skill: str) -> None:
-    """Resolve the requested identity without replacing the saved version."""
-    if not reference or reference == saved_skill:
-        return
-    from harness.skill_builder.references import SkillReferences
-    catalog = _skill_catalog_for_runtime(runtime)
-    try:
-        catalog.sync_existing()
-        selected = SkillReferences(catalog, Path(runtime.harness.worktree_dir)).published(reference)
-        if selected["skill_id"] != saved_skill:
-            raise ResumeStateError("Cannot change the selected Skill when resuming a task")
-    finally:
-        catalog.close()
-
-
-def _skill_listing(row: Dict[str, Any]) -> str:
-    metadata = json.loads(row.get("metadata_json") or "{}")
-    return (f"Name: {metadata.get('name') or row['skill_id']} | Skill ID: {row['skill_id']}"
-            f" | Version: {row['current_version']}\n  Run: /{row['skill_id']} [@Fleet-ID] [task]")
-
-
-def _available_draft_lines(config_path: str = "config.json", reference: Optional[str] = None) -> List[str]:
-    from harness.skill_builder.references import SkillReferences
-    runtime = load_runtime_config(config_path)
-    catalog = _skill_catalog_for_runtime(runtime)
-    try:
-        catalog.sync_existing()
-        drafts = SkillReferences(catalog, Path(runtime.harness.worktree_dir)).drafts(reference)
-        if reference and not drafts:
-            raise ValueError(f"No Builder draft matches {reference!r}. Use /skill to list Skills and drafts.")
-        return _skill_draft_inventory_lines(drafts)
-    finally:
-        catalog.close()
-
-
-def _skill_inventory_lines(rows: List[Dict[str, Any]]) -> List[str]:
-    lines = ["Published Skills (available for execution):"]
-    lines.extend(_skill_listing(row) for row in rows)
-    if not rows:
-        lines.append("(none)")
-    return lines
-
-
-def _skill_draft_inventory_lines(drafts: List[Dict[str, Any]]) -> List[str]:
-    lines = ["Builder drafts:"]
-    if not drafts:
-        lines.append("(none)")
-    for draft in drafts:
-        lines.extend(_skill_draft_lines(draft))
-    return lines
-
-
-def _skill_draft_lines(draft: Dict[str, Any]) -> List[str]:
-    from harness.skill_builder.references import draft_skill_id
-    metadata = draft["metadata"]
-    skill_id = draft_skill_id(draft)
-    name = " ".join(str(metadata.get("name") or skill_id or "name not yet generated").split())
-    task_id = draft["builder_task_id"]
-    status = "active (build incomplete)" if draft["status"] == "active" else draft["status"]
-    lines = [f"Name: {name} | Skill ID: {skill_id or '(not assigned)'} | Draft task ID: {task_id}",
-             f"  Version: {metadata.get('version') or 'unversioned'} | Status: {status}",
-             f"  Directory: {draft.get('work_dir') or 'coding/builder'}",
-             f"  Continue: /resume {task_id} [advice]"]
-    publication = draft.get("publication") or {}
-    if publication.get("currentVersion"):
-        lines.append(f"  Published version: {publication['currentVersion']} | Publication: {publication.get('status')}")
-    if draft.get("file_error"):
-        lines.append(f"  File status: {' '.join(draft['file_error'].split())}")
-    if skill_id:
-        if draft["status"] == "finished" and not draft.get("file_error") and not draft.get("published_same_version"):
-            lines.append(f"  Publish: /skill-publish {shlex.quote(skill_id)}")
-        lines.append(f"  Delete: /skill-delete {shlex.quote(skill_id)}")
-    return lines
-
-
 _CJK_BOUNDARY_RE = re.compile(r"[　-〿㐀-鿿豈-﫿！-～]")
 
 
@@ -901,143 +779,45 @@ def _recover_task_path(positional: List[str]) -> "tuple[str, List[str]]":
     return positional[0], positional[1:]
 
 
-def _run_coro_blocking(coro: Any) -> Any:
-    """Run a coroutine from sync CLI code, even when an event loop is already
-    running (read_task's input() executes inside run_cli's loop): fall back to a
-    dedicated thread with its own loop."""
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)
-    import concurrent.futures
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, coro).result()
+def _split_command(line: str) -> "tuple[str, str]":
+    """First shell token and the untouched remainder of a command line."""
+    lexer = shlex.shlex(line.strip(), posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    command = lexer.get_token()
+    return command or "", line.strip()[lexer.instream.tell():].lstrip()
 
 
-def _handle_skill_builder_command(line: str, *, config_path: str = "config.json") -> int:
-    if sys.version_info < (3, 12):
-        print("Skill Builder requires Python 3.12+; current interpreter: " + sys.version.split()[0],
-              flush=True)
-        return 2
-    from harness.skill_builder.commands import execute
-    try:
-        return execute(line, config_path=config_path, run_blocking=_run_coro_blocking, skill_mode=True)
-    except Exception as exc:
-        print(f"Skill Builder failed: {type(exc).__name__}: {exc}", flush=True)
-        return 1
+_WORKFLOW_COMMANDS = frozenset({
+    "/workflow", "/workflow-create", "/workflow-edit", "/workflow-drafts",
+    "/workflow-publish", "/workflow-unpublish", "/workflow-rename", "/workflow-delete", "/workflow-stop",
+})
 
 
-def _handle_skill_command(line: str, args: argparse.Namespace, *, strict: bool = False) -> str:
-    """Enter Skill mode and show inventory; selection uses /<Skill>."""
-    if line.strip() != "/skill":
-        message = "Usage: /skill to enter and list; /<Skill-name-or-ID> [@Fleet-ID] [task] to select or execute"
-        if strict:
-            raise ValueError(message)
-        print(message)
-        return ""
-    runtime = load_runtime_config(getattr(args, "config", "config.json"))
-    catalog = _skill_catalog_for_runtime(runtime)
-    try:
-        catalog.sync_existing()
-        print("\n".join(_skill_inventory_lines(catalog.list())))
-        drafts = catalog.list_drafts(Path(runtime.harness.worktree_dir))
-        if drafts:
-            print("Builder drafts:")
-            for draft in drafts:
-                print("\n".join(_skill_draft_lines(draft)))
-    finally:
-        catalog.close()
-    args.agent_mode = "skill"
-    if getattr(args, "skill", ""):
-        print(f"Selected: {args.skill}")
-    print("Usage: /<Skill> [@Fleet-ID] [task]; /skill-create [Skill-name-or-ID] @<task-id> [request]; "
-          "/skill-publish <name-or-ID>; /skill-delete <name-or-ID>; /resume <task-id> [instruction]")
-    print("Switch mode: /browser or /workflow")
-    return ""
-
-
-def _handle_skill_run_command(line: str, args: argparse.Namespace) -> str:
-    from harness.skill_builder.commands import split_command
-    from harness.skill_builder.references import SkillReferences
-    name, task = split_command(line)
-    reference = name[1:]
-    if reference.startswith("@"):
-        raise ValueError("Select a Skill by its name or Skill ID")
-    fleet, error = extract_fleet_reference(task)
-    if error:
-        raise ValueError(error)
-    if task.startswith("--repair"):
-        raise ValueError("Use /resume <builder-task-id> [advice] to continue a draft")
-    runtime = load_runtime_config(getattr(args, "config", "config.json"))
-    catalog = _skill_catalog_for_runtime(runtime)
-    try:
-        catalog.sync_existing()
-        selected = SkillReferences(catalog, Path(runtime.harness.worktree_dir)).published(reference)
-    finally:
-        catalog.close()
-    args.skill = selected["skill_id"]
-    args.agent_mode = "skill"
-    print(f"Selected Skill: {args.skill} (version {selected['current_version']}; "
-          f"content hash {selected['current_hash']}; bound when the task starts)")
-    # A Fleet-only command selects the Skill; the next line supplies the goal.
-    if fleet and task.lower() == "@" + fleet:
-        args.skill_fleet_reference = "@" + fleet
-        return ""
-    args.skill_fleet_reference = ""
-    return task
-
-
-def _dispatch_skill_command(line: str, args: argparse.Namespace) -> "tuple[int, str]":
-    from harness.skill_builder.commands import command_kind
-    kind = command_kind(line)
-    if kind == "builder":
-        return _handle_skill_builder_command(line, config_path=getattr(args, "config", "config.json")), ""
-    try:
-        if kind == "skill":
-            return 0, _handle_skill_command(line, args, strict=True)
-        if kind == "skill-run":
-            return 0, _handle_skill_run_command(line, args)
-        if kind == "removed":
-            raise ValueError("This command was removed. Use /skill to list; /resume <task-id> "
-                             "to continue a draft; /skill-create @<task-id> to create; "
-                             "/skill-create <Skill-name-or-ID> @<task-id> [request] to update from evidence.")
-        if kind == "invalid":
-            raise ValueError("Invalid command quoting")
-    except Exception as exc:
-        print(f"Skill command failed: {type(exc).__name__}: {exc}", flush=True)
-        return CLI_INPUT_ERROR_EXIT_CODE, ""
-    return 0, ""
+def _is_workflow_command(line: str) -> bool:
+    """Syntax only; Browser tasks never import the Workflow package."""
+    first = str(line or "").strip().split(maxsplit=1)
+    return bool(first) and first[0].lower() in _WORKFLOW_COMMANDS
 
 
 def _handle_agent_mode_command(line: str, args: argparse.Namespace) -> bool:
-    """Handle a mode choice at the interactive task prompt.
+    """Handle /browser at the interactive prompt.
 
-    The choice is intentionally scoped to this invocation by mutating the
-    parsed arguments only.  It never rewrites config.json, and it is accepted
-    only before a task is submitted from ``read_task``.
+    The choice is scoped to this invocation by mutating the parsed arguments
+    only. It never rewrites config.json. Workflow commands are not a mode
+    switch: each /workflow* line is a complete command.
     """
     first = line.strip().split(maxsplit=1)
     if not first or first[0].lower() not in _INTERACTIVE_AGENT_MODES:
         return False
-    try:
-        tokens = shlex.split(line)
-    except ValueError as exc:
-        print(f"Invalid mode command arguments: {exc}")
-        return line.lstrip().startswith(("/browser", "/workflow"))
-    if not tokens or tokens[0].lower() not in _INTERACTIVE_AGENT_MODES:
-        return False
-    if len(tokens) != 1 and tokens[0].lower() != "/workflow":
-        print("Usage: /browser; submit the task after choosing a mode. /workflow [task] starts Workflow development.")
+    if len(first) != 1:
+        print("Usage: /browser, then submit the task.")
         return True
-    agent_mode = _INTERACTIVE_AGENT_MODES[tokens[0].lower()]
+    agent_mode = _INTERACTIVE_AGENT_MODES[first[0].lower()]
     args.agent_mode = agent_mode
-    # A prior Skill selection must not silently override a later mode choice.
-    args.skill = ""
-    args.skill_fleet_reference = ""
-    args.workflow_task = first[1] if agent_mode == "workflow" and len(first) > 1 else ""
     print(
         f"Selected {agent_mode}: {_AGENT_MODE_LABELS[agent_mode]}. "
-        "Enter a task, or use /skill or /resume."
+        "Enter a task, a /workflow command, or /resume."
     )
     return True
 
@@ -1059,46 +839,28 @@ def read_task(args: argparse.Namespace) -> str:
         selected_mode = ""
     if not selected_mode:
         print(
-            "Choose a mode: /browser (direct BrowserAgent execution), "
-            "/workflow (develop reusable programs), or /skill (Skill orchestration and commands)."
+            "Choose /browser (direct BrowserAgent execution), or use a Workflow command: "
+            "/workflow (list), /workflow <name> [task], /workflow-create <request>, "
+            "/workflow-edit, /workflow-drafts, /workflow-publish, /workflow-unpublish, /workflow-rename, "
+            "/workflow-delete, /workflow-stop."
         )
-        print(f"Configured default: {configured_mode}; choose a mode before entering a task.")
+        print(f"Configured default: {configured_mode}.")
     while True:
         prompt = f"[{selected_mode}]> " if selected_mode else "Choose mode> "
         line = input(prompt).strip()
-        from harness.skill_builder.commands import command_kind
-        kind = command_kind(line)
-        if kind in {"builder", "removed", "invalid"}:
-            args.agent_mode = selected_mode = "skill"
-            _dispatch_skill_command(line, args)
-            continue
+        if _is_workflow_command(line):
+            return line
         if _handle_agent_mode_command(line, args):
             selected_mode = str(getattr(args, "agent_mode", "") or "").strip().lower()
-            if getattr(args, "workflow_task", ""):
-                return args.workflow_task
-            continue
-        if kind in {"skill", "skill-run"}:
-            _, inline_task = _dispatch_skill_command(line, args)
-            selected_mode = str(getattr(args, "agent_mode", "") or "")
-            if inline_task:
-                return inline_task
-            continue
-        if not selected_mode:
-            print("Choose /browser, /workflow or /skill before submitting a task.")
             continue
         if line == "/resume" or line.startswith("/resume "):
             resumed = _handle_resume_command(line, args)
             if resumed is not None:
                 return resumed
             continue
-        fleet_reference = str(getattr(args, "skill_fleet_reference", "") or "")
-        if selected_mode == "skill" and fleet_reference and line:
-            fleet, error = extract_fleet_reference(line)
-            if error:
-                print(error)
-                continue
-            args.skill_fleet_reference = ""
-            return line if fleet else f"{fleet_reference} {line}"
+        if not selected_mode:
+            print("Choose /browser or enter a /workflow command before submitting a task.")
+            continue
         return line
 
 
@@ -1109,14 +871,11 @@ def _handle_resume_command(
     """Parse an interactive phase-level resume request without touching disk."""
 
     try:
-        from harness.skill_builder.commands import split_command
-        command, tail = split_command(line)
-        reference, instruction = split_command(tail)
+        command, tail = _split_command(line)
+        reference, instruction = _split_command(tail)
         if command == "/resume" and re.fullmatch(r"@?[0-9a-fA-F]{32}", reference):
             args.resume = reference
             args.resume_instruction = instruction
-            args.skill = ""
-            args.skill_fleet_reference = ""
             return instruction
         tokens = shlex.split(line)
     except ValueError as exc:
@@ -1128,14 +887,16 @@ def _handle_resume_command(
     path, rest = _recover_task_path(tokens[1:])
     args.resume = path
     args.resume_instruction = " ".join(rest).strip()
-    args.skill = ""
-    args.skill_fleet_reference = ""
     return args.resume_instruction
 
 
 def _validate_resume_mode(manifest: Optional[JsonDict], plan: JsonDict, selected: str) -> str:
     """Check before reconciliation writes. Old tasks fall back to plan shape."""
     startup = (manifest or {}).get("startup_args") or {}
+    from harness.workflow_mode.run_policy import completion_resume_error
+    retired = completion_resume_error(manifest)
+    if retired:
+        raise ResumeStateError(retired)
     recorded = startup.get("agent_mode") if isinstance(startup, dict) else None
     original = str(recorded or "").strip().lower()
     execution_mode = str(plan.get("execution_mode") or "").strip()
@@ -2079,7 +1840,7 @@ def _print_browser_mode_summary(result: JsonDict, task_dir: str, *, logger=None)
     # is missing").
     plan_path = Path(task_dir) / "task_plan.json" if task_dir else None
     from harness.utils import task_file_exists
-    plan_exists = (task_file_exists(logger, str(plan_path)) if logger is not None and plan_path is not None
+    plan_exists = (task_file_exists(logger, "task_plan.json") if logger is not None
                    else plan_path is not None and plan_path.is_file())
     if plan_exists:
         print(
@@ -2089,7 +1850,7 @@ def _print_browser_mode_summary(result: JsonDict, task_dir: str, *, logger=None)
         )
     else:
         print(
-            "\nThis run ended during planning; no saved plan is available for /resume."
+            "\nNo saved plan is available for /resume."
             "\nRevise the task using the reason above, then start a new run.",
             flush=True,
         )
@@ -2103,7 +1864,7 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
     runtime = load_runtime_config(args.config)
     configured_mode = str(getattr(runtime.harness, "agent_mode", "browser") or "browser").strip().lower()
     if configured_mode not in _AGENT_MODE_LABELS:
-        print("config.json harness.agent_mode must be browser, skill or workflow.")
+        print("config.json harness.agent_mode must be browser or workflow.")
         return CLI_INPUT_ERROR_EXIT_CODE
     args.configured_agent_mode = configured_mode
     # Resume helpers run before a logger exists; hand them the configuration
@@ -2116,47 +1877,25 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
     if args.agent_id:
         runtime.agent_id = args.agent_id
     if args.max_steps is not None:
-        print("--max-steps is deprecated and ignored; Workflow/Skill sessions have no model-turn cap.")
+        print("--max-steps is deprecated and ignored.")
     task = read_task(args)
+    resume_requested = bool(str(getattr(args, "resume", "") or "").strip())
+    if not resume_requested and _is_workflow_command(task):
+        from harness.workflow_mode.cli import run_command
+        return await run_command(runtime, args, task, host=sys.modules[__name__])
     requested_mode = str(getattr(args, "agent_mode", "") or "").strip().lower()
     if requested_mode:
         if requested_mode not in _AGENT_MODE_LABELS:
-            print("Interactive mode must be /browser, /workflow or /skill.")
+            print("Interactive mode must be /browser or a /workflow command.")
             return CLI_INPUT_ERROR_EXIT_CODE
         runtime.harness.agent_mode = requested_mode
     agent_mode = str(getattr(runtime.harness, "agent_mode", "browser") or "browser").strip().lower()
-    resume_requested = bool(str(getattr(args, "resume", "") or "").strip())
+    if agent_mode == "workflow" and not resume_requested:
+        print("Workflow tasks start with a /workflow command; plain tasks run in /browser.")
+        return CLI_INPUT_ERROR_EXIT_CODE
     if not task and not resume_requested:
         print("No task received.")
         return 2
-    selection_bound = bool(str(getattr(args, "skill", "") or "").strip())
-    if not resume_requested and not selection_bound and task.strip().split(maxsplit=1)[:1] == ["/workflow"]:
-        _handle_agent_mode_command(task, args)
-        task = getattr(args, "workflow_task", "")
-        if not task:
-            return 0
-    from harness.skill_builder.commands import command_kind
-    if not resume_requested and not selection_bound and command_kind(task) is not None:
-        command_code, task = _dispatch_skill_command(task, args)
-        if command_code or not task:
-            return command_code
-    # Explicit Skill commands choose a peer mode even when typed at another prompt.
-    agent_mode = str(getattr(args, "agent_mode", "") or agent_mode)
-    if str(getattr(args, "skill", "") or "") and not resume_requested:
-        agent_mode = "skill"
-    runtime.harness.agent_mode = agent_mode
-    # Explicit selection binds one immutable Skill version for this task.
-    forced_skill = str(getattr(args, "skill", "") or "").strip()
-    if forced_skill and not resume_requested:
-        try:
-            forced_skill, forced_hash = _selected_skill_binding(runtime, forced_skill)
-            args.skill = forced_skill
-        except ValueError as exc:
-            print(str(exc), flush=True)
-            return CLI_INPUT_ERROR_EXIT_CODE
-        runtime.harness.forced_skill_id = forced_skill
-        runtime.harness.forced_skill_hash = forced_hash
-        print(f"Selected Skill: {forced_skill}@{forced_hash[:12]}", flush=True)
 
     if resume_requested:
         directory = _resolve_resume_directory(args.resume)
@@ -2164,17 +1903,12 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
         configure_resume_storage(backend=runtime.harness.storage_backend,
                                  worktree_dir=runtime.harness.worktree_dir,
                                  sqlite_path=runtime.harness.storage_sqlite_path)
-        from harness.skill_builder.commands import builder_resume_record, resume_builder
-        builder_record = builder_resume_record(runtime, directory.name)
-        if builder_record is not None:
-            if sys.version_info < (3, 12):
-                print("Skill Builder requires Python 3.12+.", flush=True)
-                return CLI_INPUT_ERROR_EXIT_CODE
-            from harness.runtime.session_output import result as print_result
-            builder_result = await resume_builder(runtime, builder_record, task)
-            print_result("Skill Builder", builder_result)
-            return 0 if builder_result.get("status") == "draft_saved" else 1
         resume_manifest = load_task_manifest(directory)
+        from harness.workflow_mode.run_policy import completion_resume_error
+        retired = completion_resume_error(resume_manifest)
+        if retired:
+            print(retired)
+            return CLI_INPUT_ERROR_EXIT_CODE
         recorded_mode = str(
             ((resume_manifest or {}).get("startup_args") or {}).get("agent_mode") or ""
         ).strip().lower()
@@ -2187,9 +1921,9 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
         if recorded_mode in _AGENT_MODE_LABELS:
             args.agent_mode = recorded_mode
             agent_mode = runtime.harness.agent_mode = recorded_mode
-    if agent_mode in {"skill", "workflow"}:
-        from harness.skill_runtime.cli import run_skill_cli
-        return await run_skill_cli(runtime, args, task, host=sys.modules[__name__])
+    if agent_mode == "workflow":
+        from harness.workflow_mode.cli import resume_task
+        return await resume_task(runtime, args, task, host=sys.modules[__name__])
 
     logger: Optional[RunLogger] = None
     harness: Optional[BrowserTaskRunner] = None
@@ -2221,21 +1955,6 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                 manifest = load_task_manifest(task_dir)
                 if manifest is not None:
                     runtime.harness.worktree_dir = str(task_dir.parent)
-                    saved_skill = str(manifest.get("forced_skill_id") or "")
-                    saved_hash = str((manifest.get("startup_args") or {}).get("forced_skill_hash") or "")
-                    _validate_resume_skill(runtime, forced_skill, saved_skill)
-                    if saved_skill:
-                        if not saved_hash:
-                            raise ResumeStateError("Legacy task has no bound Skill version; cannot resume safely")
-                        catalog = _skill_catalog_for_runtime(runtime)
-                        try:
-                            if catalog.source_path(saved_skill, saved_hash, task_id=task_dir.name) is None:
-                                raise ResumeStateError("The resumed task Skill snapshot is unavailable")
-                        finally:
-                            catalog.close()
-                        runtime.harness.forced_skill_id = saved_skill
-                        runtime.harness.forced_skill_hash = saved_hash
-                        forced_skill = saved_skill
                 _validate_resume_mode(manifest, current_plan, agent_mode)
                 current_plan, plan_alias_recovery = reconcile_torn_plan_alias(
                     task_dir,
@@ -2329,7 +2048,6 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                         original_user_task=original_user_task,
                         task_id=logger.task_id,
                         config_path=args.config,
-                        forced_skill_id=forced_skill or None,
                         agent_id=runtime.agent_id,
                     )
 
@@ -2457,12 +2175,10 @@ async def _run_cli_impl(args: argparse.Namespace) -> int:
                 original_user_task=task,
                 task_id=logger.task_id,
                 config_path=args.config,
-                forced_skill_id=forced_skill or None,
                 agent_id=runtime.agent_id,
                 startup_args={
                     "max_steps": getattr(args, "max_steps", None),
                     "agent_mode": agent_mode,
-                    "forced_skill_hash": str(getattr(runtime.harness, "forced_skill_hash", "") or ""),
                 },
             )
             runtime.harness.runs_dir = str(logger.task_dir)
@@ -2807,52 +2523,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow interrupted phases to restart in non-interactive mode",
     )
-    parser.add_argument(
-        "--skill",
-        dest="skill",
-        default="",
-        help="Select a Skill by name (unique partial names accepted) or exact Skill ID for this run",
-    )
-    parser.add_argument(
-        "--list-skills",
-        action="store_true",
-        help="List published Skills and exit",
-    )
-    parser.add_argument("--list-skill-drafts", action="store_true",
-                        help="List saved Builder drafts and exit")
     return parser
 
 
 def _main_impl(argv: Optional[Sequence[str]] = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
-    if raw_argv[:1] == ["/workflow"]:
+    if raw_argv and _is_workflow_command(raw_argv[0]):
+        # A Workflow command is one complete line; argparse must not split it.
         config_args = []
-        if "--config" in raw_argv:
-            index = raw_argv.index("--config")
-            if index + 1 >= len(raw_argv):
-                raise ValueError("--config requires a path")
-            config_args = raw_argv[index:index + 2]
-            del raw_argv[index:index + 2]
-        argv = raw_argv = [*config_args, "--task", " ".join(raw_argv)]
-    from harness.skill_builder.commands import command_kind
-    if raw_argv and command_kind(raw_argv[0]) is not None:
-        config_path = "config.json"
         if "--config" in raw_argv:
             index = raw_argv.index("--config")
             if index + 1 >= len(raw_argv):
                 print("--config requires a configuration file path")
                 return CLI_INPUT_ERROR_EXIT_CODE
-            config_path = raw_argv[index + 1]
+            config_args = raw_argv[index:index + 2]
             del raw_argv[index:index + 2]
-        raw_line = " ".join([shlex.quote(raw_argv[0]), *raw_argv[1:]])
-        line = (raw_line if command_kind(raw_line) in {"skill", "skill-run"}
-                else " ".join(shlex.quote(part) for part in raw_argv))
-        command_args = argparse.Namespace(config=config_path, skill="")
-        command_code, task = _dispatch_skill_command(line, command_args)
-        if command_code or not task:
-            return command_code
-        raw_argv = ["--config", config_path, "--skill", command_args.skill, "--task", task]
-        argv = raw_argv
+        output_args = []
+        if "--output" in raw_argv:
+            index = raw_argv.index("--output")
+            if index + 1 < len(raw_argv):
+                output_args = raw_argv[index:index + 2]
+                del raw_argv[index:index + 2]
+        # Quote only arguments that the shell had to keep together.
+        line = " ".join([raw_argv[0], *(shlex.quote(part) if any(c.isspace() for c in part) else part
+                                        for part in raw_argv[1:])])
+        argv = raw_argv = [*config_args, *output_args, "--task", line]
     if raw_argv and raw_argv[0] == "/resume":
         config_args = []
         if "--config" in raw_argv:
@@ -2876,12 +2571,6 @@ def _main_impl(argv: Optional[Sequence[str]] = None) -> int:
 
     parser = build_arg_parser()
     args = parser.parse_args(argv)
-    if getattr(args, "list_skills", False):
-        print("\n".join(_available_skill_lines(args.config)))
-        return 0
-    if getattr(args, "list_skill_drafts", False):
-        print("\n".join(_available_draft_lines(args.config)))
-        return 0
     try:
         asyncio.get_running_loop()
     except RuntimeError:

@@ -8,6 +8,9 @@
     "llm_api_timeout_seconds": 240,
     "llm_timeout_max_retries": 2,
     "llm_timeout_retry_interval_seconds": 30,
+    "llm_rate_limit_max_retries": 3,
+    "llm_rate_limit_backoff_seconds": 5,
+    "llm_rate_limit_max_wait_seconds": 90,
     "extra_params": {
       "temperature": 0.5,
       "max_tokens": 8192,
@@ -38,20 +41,25 @@
     "jwt_token_env": "ABCP_JWT_TOKEN"
   },
   "harness": {
+    "reviewer_enabled": true,
     "worker_max_steps": 50,
     "workflow_execution_enabled": false,
     "max_task_fleets": 3,
-    "agent_mode": "browser"
+    "agent_mode": "browser",
+    "local_access_auto_approve": true
   },
-  "skill_orchestrator": {
+  "workflow_agent": {
     "provider": "anthropic",
     "api": "anthropic-messages",
-    "model_id": "YOUR_SKILL_ORCHESTRATOR_MODEL_ID",
+    "model_id": "YOUR_WORKFLOW_AGENT_MODEL_ID",
     "api_key": "YOUR_API_KEY",
     "base_url": "https://your-llm-endpoint.example",
     "llm_api_timeout_seconds": 240,
     "llm_timeout_max_retries": 2,
     "llm_timeout_retry_interval_seconds": 30,
+    "llm_rate_limit_max_retries": 3,
+    "llm_rate_limit_backoff_seconds": 5,
+    "llm_rate_limit_max_wait_seconds": 90,
     "extra_params": {
       "temperature": 0.5,
       "max_tokens": 8192,

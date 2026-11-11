@@ -125,6 +125,7 @@ class NotificationHub:
         self._waiters: List[_NotificationWaiter] = []
         self._subscribers: List[NotificationCallback] = []
         self._closed = False
+        self._workflow_result_paging_available = False
 
     def publish(self, message: JsonDict) -> None:
         if self._closed:
@@ -604,6 +605,8 @@ class ABCPClient:
             # versioned document plus a runtime binding.
             from harness.workflow.workflow_wire import to_platform_execute_params
             params = to_platform_execute_params(params)
+            if getattr(self, "_workflow_result_paging_available", False):
+                params = {**(params or {}), "resultDelivery": (params or {}).get("resultDelivery", "auto")}
         payload = self._build_payload(request_id, method, params or {})
         # Derived once from the request: the response has to be scrubbed with
         # the request's secrets, because the platform echoes typed values back
@@ -634,9 +637,14 @@ class ABCPClient:
                     # The source-package deadline includes pauses; the platform
                     # also has a bounded cleanup phase. This is a single call,
                     # not a retry or permission to replay dispatched effects.
-                    deadline_ms = package.get("timeoutMs", 600000)
-                    if isinstance(deadline_ms, int) and not isinstance(deadline_ms, bool) and 0 < deadline_ms <= 3600000:
-                        call_timeout = max(call_timeout, deadline_ms / 1000 + 10)
+                    from harness.workflow.script_runtime import execution_timeout_ms
+                    try:
+                        deadline_ms = execution_timeout_ms(package)
+                    except ValueError:
+                        # The request has already been sent. Preserve the
+                        # platform's validation response for invalid deadlines.
+                        deadline_ms = 0
+                    call_timeout = max(call_timeout, deadline_ms / 1000 + 10)
                 raw_response = await asyncio.wait_for(future, timeout=call_timeout)
             except asyncio.TimeoutError as exc:
                 raise ABCPTransportError(
@@ -690,10 +698,51 @@ class ABCPClient:
             )
             raise failure
         response = self._unwrap_response(raw_response)
+        logged_response = response
+        if method == "Workflow.readResult" and isinstance(response, dict):
+            # Base64 defeats normal secret scrubbing. Log only delivery metadata;
+            # verified decoded evidence is retained once by the caller's receipt store.
+            page = response.get("data", response)
+            if isinstance(page, dict):
+                safe_page = {key: page[key] for key in ("reference", "encoding", "offset", "nextCursor") if key in page}
+                logged_response = {"data": safe_page}
         self._emit(
-            "response", response, secrets,
+            "response", logged_response, secrets,
             already_redacted=method == "Network.readApi",
         )
+        if method == "System.getCapabilities" and isinstance(response, dict):
+            catalog = response.get("data", response)
+            self._workflow_result_paging_available = isinstance(catalog, dict) and any(
+                isinstance(action, dict) and action.get("method") == "Workflow.readResult"
+                for action in catalog.get("actions", [])
+            )
+        if method == "Workflow.execute" and isinstance(response, dict):
+            data = response.get("data", response)
+            delivery = data.get("delivery") if isinstance(data, dict) else None
+            if isinstance(delivery, dict) and delivery.get("mode") == "unavailable":
+                raise ABCPTransportError(
+                    "Workflow finished but result delivery is unavailable. Inspect this execution; do not replay its actions.",
+                    rpc_method=method, request_sent=True, request_id=request_id,
+                    transport_code="ABCP_RESULT_DELIVERY_FAILED",
+                    rpc_data={"workflowId": data.get("workflowId"), "status": data.get("status"), "delivery": delivery},
+                )
+            if isinstance(delivery, dict) and delivery.get("mode") == "reference":
+                # All callers, including Browser mode, receive verified complete evidence.
+                # Only read the original execution; a delivery failure never replays it.
+                from harness.workflow.result_delivery import read_retained_result
+                try:
+                    restored, receipt = await read_retained_result(self, data.get("workflowId"), delivery.get("reference"))
+                except (ABCPTransportError, ValueError, TypeError) as exc:
+                    raise ABCPTransportError(
+                        "Workflow finished but its retained result could not be verified. Read the same execution; do not replay its actions.",
+                        rpc_method=method, request_sent=True, request_id=request_id,
+                        transport_code="ABCP_RESULT_DELIVERY_FAILED",
+                        rpc_data={"workflowId": data.get("workflowId"), "status": data.get("status"),
+                                  "delivery": delivery, "causeType": type(exc).__name__},
+                    ) from exc
+                restored["delivery"] = {"mode": "inline", "reference": receipt["reference"]}
+                response = {**response, "data": restored, "resultDelivery": receipt} if "data" in response else restored
+                self._emit("workflow_result_delivery", receipt, secrets)
         if method in {"DOM.getAXTree", "DOM.getDetails"}:
             # The page view arrives as host artifact files that the platform
             # retires on its own schedule; read them now, for every caller,
@@ -1124,6 +1173,9 @@ class ABCPClient:
         """
         if not self.on_event:
             return
+        metrics = getattr(self.on_event, "abcp_metrics", None)
+        if metrics is not None:
+            metrics(event_type, payload)
         event_types = getattr(self.on_event, "abcp_event_types", None)
         if event_types is not None and event_type not in event_types:
             return

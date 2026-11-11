@@ -3,11 +3,11 @@ runtime_config.py - 全项目统一配置表（single source of truth）。
 
 config.json 的配置表全部定义在这一个文件里：
 
-    "worker"/"skill_orchestrator"         -> ModelConfig         （各自完整的 LLM 连接：provider=供应商、api=协议、
+    "worker"/"workflow_agent"         -> ModelConfig         （各自完整的 LLM 连接：provider=供应商、api=协议、
                                                     model_id/api_key/超时重试/extra_params；互不继承）
     "vl": {...}             -> VLConfig            （视觉模型连接 + 各 VL 角色开关）
     "browser": {...}        -> ABCPClientConfig    （ABCP WebSocket 连接）
-    "harness": {...}        -> HarnessConfig       （编排/步数预算/offload/HITL/skill 等运行时行为）
+    "harness": {...}        -> HarnessConfig       （编排/步数预算/offload/HITL/workflow 等运行时行为）
 
 内部阈值与恢复调参使用 HarnessConfig 的内置默认值，入门 config.json 无需重复填写。
 已有配置仍可显式覆写这些字段；运行默认值只在本文件维护。
@@ -63,6 +63,9 @@ DEFAULT_LOCAL_FS_READ_BYTES = 20000
 DEFAULT_LLM_API_TIMEOUT_SECONDS = 180.0
 DEFAULT_LLM_TIMEOUT_MAX_RETRIES = 1
 DEFAULT_LLM_TIMEOUT_BACKOFF_SECONDS = 1.0
+DEFAULT_LLM_RATE_LIMIT_MAX_RETRIES = 3
+DEFAULT_LLM_RATE_LIMIT_BACKOFF_SECONDS = 5.0
+DEFAULT_LLM_RATE_LIMIT_MAX_WAIT_SECONDS = 90.0
 MIN_SIMILAR_TASK_RUNNING_STALE_SECONDS = 60.0
 
 
@@ -199,9 +202,21 @@ def _validated_browser_agent_max_multimodal_image_bytes(value: Any) -> int:
 
 def _validated_agent_mode(value: Any) -> str:
     mode = str(value or "browser").strip().lower()
-    if mode not in {"browser", "skill", "workflow"}:
-        raise ValueError("harness.agent_mode must be 'browser', 'skill' or 'workflow'")
+    if mode not in {"browser", "workflow"}:
+        raise ValueError("harness.agent_mode must be 'browser' or 'workflow'")
     return mode
+
+
+def _strict_bool(value: Any, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a boolean; got {value!r}")
+    return value
+
+
+def _validated_reviewer_enabled(value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"harness.reviewer_enabled must be a boolean; got {value!r}")
+    return value
 
 
 def _validated_browser_agent_max_extension_steps(value: Any) -> int:
@@ -230,7 +245,7 @@ def _normalize_hitl_attendance(value: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 模型连接：ModelConfig（worker / skill_orchestrator 各自一段，互不继承）
+# 模型连接：ModelConfig（worker / workflow_agent 各自一段，互不继承）
 # ---------------------------------------------------------------------------
 
 # 这两个供应商名是兼容写法：表示官方服务，并隐含同名协议。
@@ -238,7 +253,7 @@ _PROTOCOL_IMPLIED_PROVIDERS = frozenset({"anthropic", "openai"})
 
 
 def require_model_connection(data: Any, *, section: str) -> None:
-    """worker / skill_orchestrator 必须各自写全连接，缺哪项点名哪项。"""
+    """worker / workflow_agent 必须各自写全连接，缺哪项点名哪项。"""
     if not isinstance(data, dict) or not data:
         raise ValueError(
             f"config.json is missing the {section} section; each model role requires "
@@ -291,6 +306,9 @@ class ModelConfig:
     llm_timeout_max_retries: int = DEFAULT_LLM_TIMEOUT_MAX_RETRIES
     llm_timeout_backoff_seconds: float = DEFAULT_LLM_TIMEOUT_BACKOFF_SECONDS
     llm_timeout_retry_interval_seconds: Optional[float] = None
+    llm_rate_limit_max_retries: int = DEFAULT_LLM_RATE_LIMIT_MAX_RETRIES
+    llm_rate_limit_backoff_seconds: float = DEFAULT_LLM_RATE_LIMIT_BACKOFF_SECONDS
+    llm_rate_limit_max_wait_seconds: float = DEFAULT_LLM_RATE_LIMIT_MAX_WAIT_SECONDS
 
     @classmethod
     def from_section(cls, data: Any, *, section: str) -> "ModelConfig":
@@ -331,6 +349,18 @@ class ModelConfig:
             llm_timeout_retry_interval_seconds=_optional_float_config(
                 data.get("llm_timeout_retry_interval_seconds"),
                 minimum=0.0,
+            ),
+            llm_rate_limit_max_retries=_int_config(
+                data.get("llm_rate_limit_max_retries", DEFAULT_LLM_RATE_LIMIT_MAX_RETRIES),
+                DEFAULT_LLM_RATE_LIMIT_MAX_RETRIES, minimum=0, maximum=10,
+            ),
+            llm_rate_limit_backoff_seconds=_float_config(
+                data.get("llm_rate_limit_backoff_seconds", DEFAULT_LLM_RATE_LIMIT_BACKOFF_SECONDS),
+                DEFAULT_LLM_RATE_LIMIT_BACKOFF_SECONDS, minimum=0.0,
+            ),
+            llm_rate_limit_max_wait_seconds=_float_config(
+                data.get("llm_rate_limit_max_wait_seconds", DEFAULT_LLM_RATE_LIMIT_MAX_WAIT_SECONDS),
+                DEFAULT_LLM_RATE_LIMIT_MAX_WAIT_SECONDS, minimum=0.0,
             ),
         )
 
@@ -497,8 +527,8 @@ class VLConfig:
     # CAPTCHA role off without giving up the other VL roles. Default True so an
     # existing deployment keeps today's behaviour (VL on ⇒ auto-solve on).
     # Read it through `captcha_autosolve_allowed()`, never on its own.
-    # The other independent controls are the per-skill `allow_auto_captcha`
-    # frontmatter flag, the confidence floors, and the budgets above.
+    # The other independent controls are the confidence floors and the
+    # budgets above.
     captcha_solve_enabled: bool = True
     # VL Role A (§13.2): locate a target the structured surfaces cannot name,
     # then PROMOTE the pixel back to a durable canonical id via bbox
@@ -512,11 +542,6 @@ class VLConfig:
     # above it. Turning this off makes `visual_verify` mode=visual_locate
     # answer `refused` instead of silently returning an unusable raw point.
     visual_locate_enabled: bool = True
-    # VL Role B (§13.3): after a skill's variable success_contract passes, judge the
-    # declared visual_checks (text_present / challenge_gone / ...) on a screenshot.
-    # Low-cost confirmation, default ON; only a definitive `violated` vetoes (VL is
-    # L4/weak — `uncertain` never overrides the passed variable contract).
-    contract_verify_enabled: bool = True
     # There is deliberately no `arbiter_enabled` and no per-framework select
     # coordinate lane here any more (removed 2026-09-01). Both auto-invoked a
     # recovery on the model's behalf from inside the browser_call hot path,
@@ -625,9 +650,6 @@ class VLConfig:
             visual_locate_enabled=bool(
                 data.get("visual_locate_enabled", cls.visual_locate_enabled)
             ),
-            contract_verify_enabled=bool(
-                data.get("contract_verify_enabled", cls.contract_verify_enabled)
-            ),
             reality_check_enabled=bool(
                 data.get("reality_check_enabled", cls.reality_check_enabled)
             ),
@@ -667,6 +689,9 @@ class VLConfig:
 @dataclass
 class HarnessConfig:
     agent_mode: str = "browser"
+    # Independent semantic review for Browser tasks.
+    # Permission, identity, protocol and program validation remain independent.
+    reviewer_enabled: bool = True
     worker_max_steps: int = 40
     # Experimental BrowserAgent continuation.  The current worker may ask for
     # one bounded extension near its step cap; harness guards remain
@@ -863,21 +888,24 @@ class HarnessConfig:
     # 8208ed49: data.results was 79% of all Workflow.execute receipt bytes.
     # The last step's result is always kept whole — that is the observation the
     # segment ended on and the model's next target comes from it.
+    workflow_parallelism: int = 2
     workflow_result_projection_enabled: bool = True
     workflow_result_inline_bytes: int = DEFAULT_WORKFLOW_INLINE_RESULT_BYTES
     local_fs_max_read_bytes: int = DEFAULT_LOCAL_FS_READ_BYTES
     # Trusted application configuration, never model-supplied. Packaged apps
     # must include the WebCross installation root as well as other private data.
     protected_local_roots: List[str] = field(default_factory=list)
+    # true: local READ/WRITE outside the task is granted without asking.
+    # Protected roots (WebCross installation and data, sensitive names, the
+    # Harness itself, other tasks) stay denied either way. false: ask per scope.
+    local_access_auto_approve: bool = True
     model_context_window_tokens: int = 262144
     context_compaction_threshold_ratio: float = 0.85
     # Complete initial message groups permanently retained before the
     # checkpoint.  In the one-shot harness the first group holds the only
     # verbatim user task, so this prevents summary-of-summary drift.
     context_compaction_keep_head_pairs: int = 1
-    context_compaction_keep_tail_pairs: int = 3
-    # Token budget retained from the newest complete turns.  The legacy tail
-    # pair count remains readable for existing config files; head pairs pin
+    # Token budget retained from the newest complete turns. Head pairs pin
     # the original task and therefore intentionally remain active.
     context_compaction_keep_recent_tokens: int = 24000
     # Separate bound for the checkpoint itself; otherwise accumulated facts
@@ -910,9 +938,6 @@ class HarnessConfig:
     #     cannot hand those 7 rows back;
     #   - no real-task A/B yet.
     workflow_execution_enabled: bool = False
-    # Runtime-only explicit Skill selection and immutable version binding.
-    forced_skill_id: str = ""
-    forced_skill_hash: str = ""
     hitl_poll_interval_seconds: float = 2.0
     # Whether a human is actually reachable for this deployment. There is no
     # platform signal to infer it from (ABCP exposes only Hitl.requestPause /
@@ -922,14 +947,8 @@ class HarnessConfig:
     #                terminal needs_human verdict immediately and leave the
     #                fleet gate untouched.
     hitl_attendance: str = "attended"
-    # Deprecated compatibility fields. Human questions are never rejected by
-    # these values; from_dict ignores old overrides. Protocol/state confirmation
-    # remains bounded independently of the time a person needs to answer.
-    hitl_wait_timeout_seconds: Optional[float] = None
-    hitl_max_pause_rounds_per_page: int = 0
-    hitl_max_pause_rounds_per_worker: int = 0
-    hitl_no_repause_cooldown_seconds: float = 8.0
-    hitl_post_resume_guard_seconds: float = 30.0
+    # Bounded read-only readiness confirmation after a human returns control.
+    # This never classifies a challenge or requests another pause.
     hitl_post_resume_confirm_max_rounds: int = 3
     # Event-driven page settlement gate. DOM probes wait for Page.loaded (or a
     # terminal lifecycle event); on timeout the dispatcher performs exactly one
@@ -1005,6 +1024,9 @@ class HarnessConfig:
         return cls(
             agent_mode=_validated_agent_mode(
                 data.get("agent_mode", cls.agent_mode)
+            ),
+            reviewer_enabled=_validated_reviewer_enabled(
+                data.get("reviewer_enabled", cls.reviewer_enabled)
             ),
             worker_max_steps=int(data.get("worker_max_steps", cls.worker_max_steps)),
             browser_agent_step_extension_enabled=(
@@ -1267,6 +1289,8 @@ class HarnessConfig:
             max_observation_chars=int(
                 data.get("max_observation_chars", cls.max_observation_chars)
             ),
+            workflow_parallelism=_optional_positive_int(
+                data.get("workflow_parallelism", cls.workflow_parallelism), name="harness.workflow_parallelism") or 2,
             workflow_result_projection_enabled=bool(
                 data.get(
                     "workflow_result_projection_enabled",
@@ -1292,6 +1316,8 @@ class HarnessConfig:
                 data.get("local_fs_max_read_bytes", cls.local_fs_max_read_bytes)
             ),
             protected_local_roots=[str(p) for p in data.get("protected_local_roots", [])],
+            local_access_auto_approve=_strict_bool(
+                data.get("local_access_auto_approve", True), "harness.local_access_auto_approve"),
             model_context_window_tokens=int(
                 data.get(
                     "model_context_window_tokens",
@@ -1328,12 +1354,6 @@ class HarnessConfig:
                     cls.context_compaction_keep_head_pairs,
                 )
             ),
-            context_compaction_keep_tail_pairs=int(
-                data.get(
-                    "context_compaction_keep_tail_pairs",
-                    cls.context_compaction_keep_tail_pairs,
-                )
-            ),
             context_compaction_keep_recent_tokens=int(
                 data.get(
                     "context_compaction_keep_recent_tokens",
@@ -1364,31 +1384,16 @@ class HarnessConfig:
             hitl_attendance=_normalize_hitl_attendance(
                 data.get("hitl_attendance", cls.hitl_attendance)
             ),
-            hitl_max_pause_rounds_per_page=0,
-            hitl_max_pause_rounds_per_worker=0,
-            page_settlement_timeout_seconds=float(
-                data.get(
-                    "page_settlement_timeout_seconds",
-                    cls.page_settlement_timeout_seconds,
-                )
-            ),
-            hitl_wait_timeout_seconds=None,
-            hitl_no_repause_cooldown_seconds=float(
-                data.get(
-                    "hitl_no_repause_cooldown_seconds",
-                    cls.hitl_no_repause_cooldown_seconds,
-                )
-            ),
-            hitl_post_resume_guard_seconds=float(
-                data.get(
-                    "hitl_post_resume_guard_seconds",
-                    cls.hitl_post_resume_guard_seconds,
-                )
-            ),
             hitl_post_resume_confirm_max_rounds=int(
                 data.get(
                     "hitl_post_resume_confirm_max_rounds",
                     cls.hitl_post_resume_confirm_max_rounds,
+                )
+            ),
+            page_settlement_timeout_seconds=float(
+                data.get(
+                    "page_settlement_timeout_seconds",
+                    cls.page_settlement_timeout_seconds,
                 )
             ),
             progress_local_fs_without_extraction_limit=int(
@@ -1472,19 +1477,19 @@ class RuntimeConfig:
     browser: ABCPClientConfig
     harness: HarnessConfig
     worker: ModelConfig
-    skill_orchestrator: Optional[ModelConfig] = None
+    workflow_agent: Optional[ModelConfig] = None
 
 
 # ---------------------------------------------------------------------------
 # 未知字段审计 + 装载入口
 # ---------------------------------------------------------------------------
 
-# 顶层只放各段和 agent_id 兜底；模型连接一律写在 worker / skill_orchestrator 段里。
+# 顶层只放各段和 agent_id 兜底；模型连接一律写在 worker / workflow_agent 段里。
 _TOP_LEVEL_KEYS = {
     "agent_id",
     "vl",
     "worker",
-    "skill_orchestrator",
+    "workflow_agent",
     "browser",
     "harness",
 }
@@ -1502,8 +1507,11 @@ _REMOVED_TOP_LEVEL_MODEL_KEYS = (
     "llm_timeout_max_retries",
     "llm_timeout_backoff_seconds",
     "llm_timeout_retry_interval_seconds",
+    "llm_rate_limit_max_retries",
+    "llm_rate_limit_backoff_seconds",
+    "llm_rate_limit_max_wait_seconds",
 )
-# worker / skill_orchestrator 段认识的键：ModelConfig 字段 + 两个环境变量间接键。
+# worker / workflow_agent 段认识的键：ModelConfig 字段 + 两个环境变量间接键。
 _MODEL_SECTION_KEYS = {"api_key_env", "base_url_env"}
 # browser 段里 agent_id 由 load_runtime_config 直接读取（不属于 ABCPClientConfig）。
 _BROWSER_EXTRA_KEYS = {"agent_id"}
@@ -1539,18 +1547,13 @@ def audit_config_keys(raw: JsonDict) -> List[str]:
     # runtime-only 字段不算“不认识”，下面单独给更准确的专属提示。
     check("harness", raw.get("harness"), _field_names(HarnessConfig) | {"max_steps"})
     check("vl", raw.get("vl"), _field_names(VLConfig) | _VL_ALIAS_KEYS)
-    for _role in ("worker", "skill_orchestrator"):
+    for _role in ("worker", "workflow_agent"):
         check(_role, raw.get(_role), _field_names(ModelConfig) | _MODEL_SECTION_KEYS)
 
     harness_raw = raw.get("harness")
     if isinstance(harness_raw, dict):
         if "max_steps" in harness_raw:
-            warnings.append("harness.max_steps is deprecated and ignored; Workflow, Skill and Builder have no fixed model-turn cap")
-        if "forced_skill_id" in harness_raw:
-            warnings.append(
-                "harness.forced_skill_id is set at runtime via --skill or /skill; "
-                "setting it in config has no effect"
-            )
+            warnings.append("harness.max_steps is deprecated and ignored; Workflow sessions have no fixed model-turn cap")
         if "vl" in harness_raw:
             warnings.append("Place vl at the config top level; harness.vl has no effect")
     return warnings
@@ -1561,7 +1564,7 @@ def _reject_top_level_model_keys(raw: JsonDict) -> None:
     if stale:
         raise ValueError(
             "Top-level model configuration is no longer supported; move " + ", ".join(stale)
-            + " into the worker or skill_orchestrator section; "
+            + " into the worker or workflow_agent section; "
             "these sections do not inherit from each other"
         )
 
@@ -1570,7 +1573,7 @@ def load_runtime_config(config_path: str, *, warn: bool = True) -> RuntimeConfig
     path = Path(config_path)
     if not path.exists():
         raise ValueError(
-            f"Configuration file not found: {path}; worker and any explicit skill_orchestrator section must each "
+            f"Configuration file not found: {path}; worker and any explicit workflow_agent section must each "
             "have a complete connection configuration"
         )
     raw = json.loads(path.read_text(encoding="utf-8"))
@@ -1596,8 +1599,8 @@ def load_runtime_config(config_path: str, *, warn: bool = True) -> RuntimeConfig
         browser=ABCPClientConfig.from_dict(browser_raw),
         harness=harness,
         worker=worker,
-        skill_orchestrator=(ModelConfig.from_section(raw["skill_orchestrator"], section="skill_orchestrator")
-                            if "skill_orchestrator" in raw else None),
+        workflow_agent=(ModelConfig.from_section(raw["workflow_agent"], section="workflow_agent")
+                        if "workflow_agent" in raw else None),
     )
 
 

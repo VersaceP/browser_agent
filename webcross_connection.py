@@ -61,8 +61,10 @@ class LocalControlSocket:
 
     def __init__(self, reader, writer, max_size):
         self.reader, self.writer = reader, writer
-        # Official local-control MAX_FRAME_BYTES, independent of the WS limit.
+        # Requests remain compatible with old hosts; response capacity is negotiated.
         self.max_size = min(max_size or 4 * 1024 * 1024, 4 * 1024 * 1024)
+        self.response_limit = self.max_size
+        self.requested_response_limit = min(max_size or 16 * 1024 * 1024, 16 * 1024 * 1024)
         self.bootstrap = deque()
         self.agent_id = None
         self.event_cursor = None
@@ -78,6 +80,8 @@ class LocalControlSocket:
         try:
             target["stage"] = "handshake"
             hello = {"type": "hello", "authMode": "unauthenticated", "clientKind": "cli"}
+            if socket.requested_response_limit >= 4 * 1024 * 1024:
+                hello["maxResponseFrameBytes"] = socket.requested_response_limit
             if agent_id:
                 hello["agentId"] = agent_id
             await socket.write(hello)
@@ -102,6 +106,11 @@ class LocalControlSocket:
                         or (agent_id and frame.get("agentId") != agent_id)
                         or type(cursor) is not int or cursor < 0):
                     raise ValueError("Invalid or stale WebCross local welcome/descriptor")
+                negotiated = frame.get("maxResponseFrameBytes", 4 * 1024 * 1024)
+                if (type(negotiated) is not int or negotiated < 4 * 1024 * 1024
+                        or negotiated > max(4 * 1024 * 1024, socket.requested_response_limit)):
+                    raise ValueError("Invalid WebCross response frame negotiation")
+                socket.response_limit = min(negotiated, socket.requested_response_limit)
                 socket.agent_id, socket.event_cursor = frame["agentId"], cursor
                 return socket
         except BaseException:
@@ -117,7 +126,7 @@ class LocalControlSocket:
 
     async def read(self):
         size = struct.unpack(">I", await self.reader.readexactly(4))[0]
-        if size > self.max_size:
+        if size > self.response_limit:
             raise ValueError("WebCross local frame exceeds maximum size")
         frame = json.loads(await self.reader.readexactly(size))
         if not isinstance(frame, dict):
