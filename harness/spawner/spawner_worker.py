@@ -20,6 +20,7 @@ from harness.diagnostics import status_category
 from harness.diagnostics.error_classification import attach_error_classification
 from harness.fleet.coordinator import FleetAssignment
 from harness.observation.browser_call import extract_page_id_from_values
+from harness.observation.scroll_receipt import SCROLL_RECOVERY_FIELDS
 from harness.evidence.extraction_artifacts import field_names_from_specs
 from harness.planning.fast_path import assess_fast_path_candidate
 from harness.results.row_ledger import row_identity
@@ -390,11 +391,6 @@ class SpawnerWorkerMixin:
             effective_context = context or "(none)"
             if slot_context:
                 effective_context = f"{effective_context}\n\n{slot_context}".strip()
-            from harness.skill_builder.selection import selected_skill_context
-            skill_context = ("" if worker_runtime.harness.agent_mode == "skill"
-                             else selected_skill_context(worker_runtime, task_id=self.logger.task_id))
-            if skill_context:
-                effective_context = f"{effective_context}\n\n{skill_context}".strip()
             prompt_worker_contract = _prompt_worker_contract(worker_contract)
             from harness.planning.context import user_context
             source_context = (worker_contract or {}).get("_user_context")
@@ -1352,10 +1348,8 @@ class SpawnerWorkerMixin:
                 scroll_recovery = receipt.get("scrollRecoveryObservation")
                 if isinstance(scroll_recovery, dict):
                     facts["scrollRecoveryObservation"] = {
-                        key: scroll_recovery[key] for key in (
-                            "mode", "completedReason", "requestedDistance",
-                            "actualDistance", "position", "extent", "resolution",
-                        ) if key in scroll_recovery
+                        key: scroll_recovery[key] for key in SCROLL_RECOVERY_FIELDS
+                        if key in scroll_recovery
                     }
                 for key in (
                     "selectIdentityRecovery", "selectIdentityRecoveryCleared",
