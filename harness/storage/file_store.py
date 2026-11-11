@@ -249,7 +249,7 @@ class FileStore(Storage):
         for record in self._runs.get(task_id, []):
             if record["run_id"] == run_id:
                 record["status"] = status
-                record["finished_at"] = _now_iso()
+                record["finished_at"] = datetime.now().astimezone().isoformat(timespec="microseconds")
                 if error:
                     record["error"] = error
 
@@ -557,7 +557,50 @@ class FileStore(Storage):
 
         path = self._resolve_inside_task(task_id, logical_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        if isinstance(content, bytes):
+        if resource_type in {"workflow_conversation_checkpoint", "workflow_conversation_object"}:
+            # The two conversation views share this one publication point.
+            # Child objects are immutable and saved before it; readers must
+            # see either complete head, including if writing/rename fails.
+            raw = (content if isinstance(content, bytes) else
+                   (content if isinstance(content, str) else
+                    json.dumps(content, ensure_ascii=False, indent=2, default=str)).encode("utf-8"))
+            temporary_name = ""
+            try:
+                with tempfile.NamedTemporaryFile(mode="wb", dir=str(path.parent),
+                        prefix=f".{path.name}.", suffix=".tmp", delete=False) as temporary:
+                    temporary_name = temporary.name
+                    temporary.write(raw)
+                    temporary.flush()
+                    os.fsync(temporary.fileno())
+                os.replace(temporary_name, path)
+                temporary_name = ""
+                # A durable head requires durable child bytes AND directory
+                # entries. Cover newly-created nested directories through the
+                # task root and its entry in the existing worktree directory.
+                boundary = self.task_dir(task_id).resolve(strict=False).parent
+                directory = path.parent.resolve(strict=False)
+                while True:
+                    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                    descriptor = os.open(str(directory), flags)
+                    try:
+                        os.fsync(descriptor)
+                    except OSError as exc:
+                        raise StorageError(
+                            f"Conversation resource was replaced but directory durability "
+                            f"is unconfirmed at {directory}: {exc}"
+                        ) from exc
+                    finally:
+                        os.close(descriptor)
+                    if directory == boundary:
+                        break
+                    directory = directory.parent
+            finally:
+                if temporary_name:
+                    try:
+                        Path(temporary_name).unlink()
+                    except FileNotFoundError:
+                        pass
+        elif isinstance(content, bytes):
             path.write_bytes(content)
         elif isinstance(content, str):
             path.write_text(content, encoding="utf-8")

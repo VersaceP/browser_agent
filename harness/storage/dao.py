@@ -218,7 +218,8 @@ def finish_run(
         connection.execute(
             "UPDATE task_runs SET status = ?, finished_at = ?, error_json = ?"
             " WHERE task_id = ? AND run_id = ?",
-            (status, now or utc_now_iso(), _dump(error) if error else None, task_id, run_id),
+            (status, now or datetime.now(timezone.utc).isoformat(timespec="microseconds"),
+             _dump(error) if error else None, task_id, run_id),
         )
         changed = connection.total_changes - before
     return changed == 1

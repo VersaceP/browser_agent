@@ -248,6 +248,18 @@ MIGRATION_0009_TASK_SKILL_SOURCES = Migration(
 )
 
 
+MIGRATION_0010_SKILL_NAMES = Migration(
+    version=10,
+    name="registered_skill_names",
+    statements=["""CREATE TABLE skill_names (
+        skill_id TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (skill_id) REFERENCES skill_index(skill_id) ON DELETE CASCADE
+    )"""],
+)
+
+
 MIGRATIONS: List[Migration] = [
     _load_initial_migration(),
     MIGRATION_0002_GIT_SHA,
@@ -258,6 +270,7 @@ MIGRATIONS: List[Migration] = [
     MIGRATION_0007_BUILDER_BINDINGS,
     MIGRATION_0008_CODING_OWNER,
     MIGRATION_0009_TASK_SKILL_SOURCES,
+    MIGRATION_0010_SKILL_NAMES,
 ]
 
 SCHEMA_VERSION = max(migration.version for migration in MIGRATIONS)
