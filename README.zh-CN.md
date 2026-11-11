@@ -6,7 +6,7 @@ ABCP Agent Harness 将 LLM 的 tool calling 接到 ABCP Browser 的 WebSocket �
 
 ## 环境要求
 
-- Browser 需要 Python 3.9 或更高版本；Skill Builder 需要 Python 3.12 或更高版本。
+- Browser 需要 Python 3.9 或更高版本；Workflow 模式在 Python 3.13 上测试。
 - 一个可通过 WebSocket 访问的 ABCP Browser 服务。
 - OpenAI-compatible 或 Anthropic API key。
 
@@ -25,7 +25,7 @@ ws://127.0.0.1:61168/ws
 ```
 
 首次配置时，将 [`config example.json`](config%20example.json) 复制为 `config.json`。
-填写 `worker` 及可选 `skill_orchestrator` 的模型连接，
+填写 `worker` 及可选 `workflow_agent` 的模型连接，
 确认 `browser.ws_url` 指向已启动的浏览器服务。模型接入说明见
 [供应商与模型配置指南](docs/provider-model-configuration.md)。
 
@@ -62,8 +62,8 @@ python main.py --config ./my-config.json --task "检查当前 Fleet 列表。"
 供应商、协议端点、凭据、各角色连接、推理强度、输出预算、缓存、配置示例和接入排错，
 统一见 [供应商与模型配置指南](docs/provider-model-configuration.md)。
 
-`worker` 及显式配置的 `skill_orchestrator` 各自填写完整连接；未配置后者时，
-Skill 和 Workflow 主 Agent 复用 `worker`。顶层不放任何模型字段（写了会启动报错）。`provider` 是供应商，`api` 是请求协议，
+`worker` 及显式配置的 `workflow_agent` 各自填写完整连接；未配置后者时，
+Workflow 的各 Agent 复用 `worker`。顶层不放任何模型字段（写了会启动报错）。`provider` 是供应商，`api` 是请求协议，
 命名供应商需显式指定 `api`。辅助模型有独立配置规则。
 配置说明只维护上述文档，避免多份示例互相矛盾。
 
@@ -104,6 +104,7 @@ WebSocket 连接分配；配置该值既不能认证，也不能恢复 WebCross 
 ```json
 {
   "harness": {
+    "reviewer_enabled": true,
     "worker_max_steps": 30,
     "max_browser_agents": 3,
     "max_task_fleets": 3,
@@ -112,24 +113,31 @@ WebSocket 连接分配；配置该值既不能认证，也不能恢复 WebCross 
 }
 ```
 
+- `reviewer_enabled`：Browser 任务的独立语义复核开关，默认 `true`。设为 `false` 后由任务执行者直接判断是否结束，结果记录跳过复核；权限、协议和程序验证仍然生效。
 - `worker_max_steps`：委派 Browser worker 的轮数上限；独立 `/browser` 不受此轮数限制。
 - `max_browser_agents` / `max_task_fleets`：并行 worker 数和单项任务的浏览器实例数。
 - `worktree_dir`：SQLite 数据库和交付文件的根目录。
 
 HITL 提问没有累计次数或自动等待超时，回答和运行中引导没有固定字符上限。
-旧 `hitl_wait_timeout_seconds`、`hitl_max_pause_rounds_per_page/worker` 配置兼容读取但不再生效；
 问题身份、显式 attendance、取消和权限校验继续保留。
 
-Browser、Workflow、Skill 运行时和 Skill Builder 共用本地文件授权。
-模型可通过 `local_fs_authorize` 一次申请材料目录或一批文件；读取和写入分别确认。
+Browser 和 Workflow 共用本地文件授权，由 `harness.local_access_auto_approve` 控制，默认 `true`：
+本地读写和 Workflow 的 Fleet 使用自动放行，不再询问，每次放行仍写审计事件。
+受保护位置始终拒绝：WebCross 安装包与其数据、运行目录（`/Applications/WebCross.app`、
+`~/Library/Application Support/webcross`、`~/.webcross`、`~/.local/bin/webcross`），`.ssh`、`.env`、`.git`、
+`credentials` 等敏感名称，Harness 安装目录、其它任务目录，以及 `protected_local_roots` 中追加的路径。
+设为 `false` 时恢复逐项确认：模型通过 `local_fs_authorize` 一次申请材料目录或一批文件，读取和写入分别确认；
 终端回复 `/answer <问题编号> yes` 批准列出的全部范围；如果显示了目录选项，
 回复 `/answer <问题编号> directory` 批准该确切目录及其子目录，`no` 拒绝。
-目录权限在本任务恢复后继续有效，并可供本任务的 Browser 和所属只读试运行复用。
+目录权限在本任务恢复后继续有效。
 引用历史来源任务不会自动继承其权限。上传仍须传入实际文件清单。
 已运行的 Python 进程不会热加载源码修改；升级后重启 Harness，再 `/resume <任务ID>`。
 
-独立 `/browser` 在同一份持久 TODO 中记录阶段进展、证据和下一步执行方式。保存待办不触发复核；Browser 读完所需资料并形成初始计划后，通过 `request_goal_review` 请求一次计划复核，执行中针对实质疑点再请求复核，提交完成时进行最终证据复核。
-任务完成必须通过最终复核。无需配置清单或复核的内部参数。
+独立 `/browser` 使用持久 TODO 记录环节进展、依据和下一步安排，保存清单不触发复核。
+开启 reviewer 时，Browser 在必要资料核实、初步方案形成后通过 `request_goal_review` 请求一次计划复核，
+执行中按具体疑问主动请求复核，提交完成时进行最终证据复核。
+默认情况下，任务完成必须通过最终复核。`reviewer_enabled: false` 保留 TODO，
+关闭进度、主动请求和最终复核。修改配置后需重启 Harness；恢复的任务也使用当前配置。
 部署策略、项目指令及详细参数见 [Harness 高级配置](docs/harness-advanced-configuration.md)。
 
 ## 运行任务
@@ -152,40 +160,66 @@ echo "打开 https://example.com 并总结页面。" | python main.py
 python main.py --agent-id demo-agent --task "检查当前 Fleet 列表。"
 ```
 
-交互启动后，先选择本次编排入口再输入任务：`/browser` 直达单个
-BrowserAgent；`/workflow` 开发并执行可复用程序；`/skill` 进入独立 Skill 编排及命令区。终端会确认本次选择，且不会修改
-`config.json`。
+交互启动后，输入 `/browser` 直达单个 BrowserAgent，或直接输入 `/workflow` 命令。
+本次选择不会修改 `config.json`。
 
 CLI 的固定提示、帮助和控制词统一使用英文。任务正文和原始证据可继续使用原语言。
-Skill 名称支持不区分大小写的包含匹配，精确 ID 和精确名称优先。
-唯一匹配自动选择；多个匹配列出全部名称和 ID，等待用户精确指定。
-`/skill` 显示正式 Skill 和草稿，随后使用简短的 `[skill]>` 提示。
 
-保留的操作为 `/<Skill名称或ID> [@FleetID] [需求]`、
-`/skill-create [Skill名称或ID] @<任务ID> [要求]`、`/skill-publish <名称或ID>`、
-`/skill-delete <名称或ID>`、`/resume <任务ID> [补充要求]`。
-创建和恢复的任务 ID 必填；Fleet 可省略。`/skill-create` 不带名称时新建，
-带名称时根据指定任务证据更新该 Skill，生成草稿后另行发布。发布和删除共用名称解析，
-同一个 Skill 有多个草稿或删除版本时展示版本供交互选择，不按时间默选；
-内容哈希和版本冲突由程序内部复核。`/resume` 自动按保存的模式恢复执行任务，也可继续 Builder 草稿，无需先切换模式。
-`/skill`、`/browser`、`/workflow` 保留为模式导航。
-详细用法见 [Skill 命令说明](skills/README.md)。
+### Workflow 模式
 
-Skill 模式与 Builder 要求 Python 3.12+。执行已发布 Skill 时启动独立 Orchestrator：
-绑定本轮变量，由 Harness 连续运行已决定的 JS/TS Workflow，
-在判断点或异常处交回模型。Browser 处理有界判断及恢复；程序缺陷记录后通过
-`/resume <Builder任务ID> 根据 @<执行任务ID> 优化` 另行处理。
-复用不启动后台重放或 Coding 修复循环；发布仍需用户命令，业务完成经过独立审查。
-当前不接入共享 Python/Shell。可选顶层 `skill_orchestrator` 单独配置模型；
-未配置时复用 `worker` 连接。
+Workflow 模式把用户目标做成可复用的 WebCross Workshop 包，并在复用时处理参数、
+执行证据和必要的修复。包执行已经明确的操作并返回结果事实；Agent 判断事实意味着什么、
+下一步怎么办；Harness 保证每次执行对应正确的目标、版本、页面与权限。
 
-`/workflow [@<Fleet ID> 需求]` 由主 Agent 直接编写、运行任务内文件并读取回执；
-同一个主 Agent 在独立测试页验证当前源码，测试检查点与主页面隔离。Browser 可承担有界语义操作或恢复，
-业务交付和程序验证分别审查。通过 `/skill-create @<Workflow任务ID> 需求` 将确切源码及
-执行证据导入 Builder 草稿，用户发布后由 `/skill` 换变量复用。开发、恢复与验收边界见
-[实施计划](docs/tau-skill-builder-agent-loop-plan.md)。
+```text
+/workflow                                查看 WebCross Workshop
+/workflow <名称|workshop-id> [需求]        查看或运行选定远端版本
+/workflow-drafts                         查看本地开发稿
+/workflow-create <需求>                   新建本地 draft
+/workflow-edit <draft|workshop-id|名称> <需求> 编辑本地稿或检出远端版本
+/workflow-rename <draft> <名称>           本地改名，下次 publish 同步远端
+/workflow-delete <draft> [--yes]          删除本地工作文件，保留历史
+/workflow-publish <draft> [--workshop <id>] 打包并上传／更新 Workshop
+/workflow-unpublish <名称|workshop-id>    下架远端记录，保留本地稿和源码历史
+/workflow-stop [任务ID|批次ID|all]         停止任务并取消其 WebCross 执行
+/resume <任务ID> [补充]                   续跑原任务及固定版本
+```
 
-Dispatcher 断线时，Browser、Workflow 和 Skill 共用默认 60 秒的自动重连窗口。
+WebCross Workshop 是唯一可执行市场。`/workflow` 先解析远端身份和完整 manifest，
+再固定版本并施加页面、文件与能力范围；不会自动改为运行未上传的本地稿。
+本地作者文件统一在 `workflows/<slug>/`，包含 `draft.json`、
+`history/versions/<hash>/`、文本差异和 `history/changes.jsonl`，用于开发与版本追踪。
+`/workflow-publish` 调用官方 CLI 打包，再通过 WebCross `Workflow.upsert` 上传；
+`/workflow-unpublish` 对应 `Workflow.remove`。当前 CLI 只接受 JSON 字面量参数，
+大包通过已配置的原生连接传输，避免命令行参数长度限制。上传与下架均读取远端结果核验，
+结果未知时不自动重放。更新前核对远端 revision/hash；平台没有条件更新参数，不能将读回说成原子 CAS。
+
+Browser 可通过 `browser_call` 调用 `Workflow.execute({workshopId,input,binding})`：
+Harness 读取完整 manifest，固定 revision/source hash，经权限包装后执行源码快照。
+返回的 `definitionRef/definitionHash` 可复用同一任务快照；Browser/run 无权 upsert/remove 远端记录。
+每个任务固定使用启动时的版本；每个运行任务绑定一个页面，
+包只作用于该页面，新标签页由 Agent 在 Harness 核对来源后绑定。验收要点由 Agent 从原始
+目标形成，Harness 检查引用与身份，Agent 判断业务是否满足。单项直接进入运行 Agent；独立业务项才按需拆分并发。运行时仅可委派只读观察，使用包已有的恢复入口；没有可用恢复路径时交付部分结果、剩余身份和证据。Browser 补完已停用，包修复交给 `/workflow-edit`。历史补完回执仍可读取，其 Browser 子任务不能继续恢复；独立 Browser 任务与作者探索保留原有能力。
+Workflow 记录四类 token、模型轮次、工具与平台 I/O，以及净时长（扣除可观测的人工等待，保留子任务执行时间），
+不设 token／时长上限，不询问追加预算。恢复任务时保留历史用量，旧 `harness.workflow_budget` 配置不再生效。详见[实施计划](docs/tau-skill-builder-agent-loop-plan.md)。
+
+本地稿保留独立作者任务、上下文与用量；`/workflow-edit` 和 `/resume` 沿用同一任务。
+远端工作流没有本地稿时先检出为本地稿。删除本地工作文件保留历史，不删除远端记录；
+下架远端前保留准确源码，并保留尚未上传的本地修改。历史运行使用当时固定的快照；
+已清理的旧作者分支应从当前开发稿继续，不能用最新远端源码伪造历史。
+详见 [Workshop 迁移说明](docs/workshop-only-20261110.md)。
+
+`/workflow-create` 先明确包的复用场景，业务范围不清楚时在实现前询问用户。新草稿包含
+`coverage.json`，记录范围内控件、前置条件、选项、依赖和代表性场景，包括首个样例没用到的
+可选分支，并区分已发现、已记录、已实现、已验证。动态候选保留读取与刷新条件；运行逻辑
+写入 `src/`，作者清单不会自动嵌入导出的 Workshop。旧包未提供清单时仍可使用。
+
+通用编写约定是：将有依据的确定性要求编入包，一次本地预检汇总独立缺项，
+让正常操作和读回在包内连续执行。新草稿含 `src/preflight.js` 纯检查入口；`validate_input`
+批量检查完整输入及显式素材清单，保留 unknown 和完整回执，不新增站点业务门禁。
+详见[创建与复用约定](docs/workflow-authoring-contract.md)和[阶段、报告与运行协议](docs/workflow-runtime-refactor-20261102.md)。
+
+Dispatcher 断线时，Browser 和 Workflow 共用默认 60 秒的自动重连窗口。
 恢复期间保留连接身份、事件订阅和任务上下文；已发送但丢失回执的动作返回“结果未知”，不会自动重放。
 Workflow 会保存中断阶段，并在已知原 `workflowId` 时查询其状态；状态查询不能代替丢失的执行输出。
 重连超时或身份、协议校验失败后，保留任务记录供 `/resume <task_id>` 恢复。
@@ -217,7 +251,7 @@ DB 模式根据 SQLite 任务记录恢复，不要求实体任务目录存在。
 
 ## 日志与 Artifacts
 
-Browser、Skill 和 Workflow 的任务记录均保存在 SQLite。DB 模式不预建任务目录或日志子目录；
+Browser 和 Workflow 的任务记录均保存在 SQLite。DB 模式不预建任务目录或日志子目录；
 运行锁存于公共控制目录，只有下载、截图、实际本地中间文件或交付文件需要时才创建任务目录：
 
 ```text
@@ -272,11 +306,10 @@ BrowserAgent 使用 `browser_call` 调用已声明的平台能力：
 
 ## 运行入口
 
-`/browser` 通过 BrowserTaskRunner 启动 BrowserAgent；`/skill` 启动独立
-Skill Orchestrator；`/workflow` 进入 Workflow 开发。三者共用浏览器工具、租约、
-权限、存储、证据及恢复模块。
+`/browser` 通过 BrowserTaskRunner 启动 BrowserAgent；`/workflow*` 命令在共享 Tau
+循环上启动 Workflow 任务、作者或调度 Agent（`harness/workflow_mode/`）。两者共用存储、
+权限、运行中引导和传输恢复。
 
-Lead 模式已删除。旧配置的 `lead` 模型连接应迁到 `skill_orchestrator`，保持
-Skill／Workflow 的模型选择；移除 `plan_validator`、`claim_extractor` 和
-Lead 专属 harness 参数，模式选择 `browser`、`skill` 或 `workflow`。历史
-Lead 记录保留，但无法继续通过已删除的运行时恢复。
+Lead 与 Skill 模式已删除。旧配置的 `skill_orchestrator` 模型段改名为 `workflow_agent`；
+`harness.agent_mode` 只接受 `browser` 或 `workflow`。历史 Lead、Skill 记录保留，
+但无法通过已删除的运行时恢复。

@@ -6,7 +6,7 @@
 
 ## 1. 最小配置与启动方式
 
-默认读取项目根目录 `config.json`，也可用 `--config` 指定文件。`worker` 必须完整配置；可选 `skill_orchestrator` 有独立连接，未配置时复用 `worker`；顶层不再放任何模型字段（写了会直接报错）。
+默认读取项目根目录 `config.json`，也可用 `--config` 指定文件。`worker` 必须完整配置；可选 `workflow_agent` 有独立连接，未配置时复用 `worker`；顶层不再放任何模型字段（写了会直接报错）。
 将下面的模型连接部分合并进现有配置，保留 `browser`、`harness` 等运行设置：
 
 ```json
@@ -24,7 +24,7 @@
       "cache_control_mode": "off"
     }
   },
-  "skill_orchestrator": {
+  "workflow_agent": {
     "provider": "juao",
     "api": "anthropic-messages",
     "model_id": "YOUR_ORCHESTRATOR_MODEL_ID",
@@ -128,7 +128,7 @@ Allinone 的部署地址与文档站不是同一地址；当前实现接受自�
 
 | 配置段 | 连接方式 | 输出预算位置与注意事项 |
 |---|---|---|
-| `skill_orchestrator` | 可选独立连接；未配置时复用 worker | `skill_orchestrator.extra_params.max_tokens` |
+| `workflow_agent` | 可选独立连接；未配置时复用 worker | `workflow_agent.extra_params.max_tokens` |
 | `worker` | 独立连接，必须完整配置，供 BrowserAgent 使用 | `worker.extra_params.max_tokens` |
 | `vl` | 独立连接 | `vl.extra_params.max_tokens`；普通视觉请求未指定时使用 800。连接只支持直接 `api_key` / `base_url`，不支持它们的 `_env` 字段 |
 
@@ -136,7 +136,7 @@ Allinone 的部署地址与文档站不是同一地址；当前实现接受自�
 某个参数，直接不写即可；不要写 `thinking: {"type": "disabled"}` 去"抵消"，那样仍会把
 `thinking` 字段发给服务端。
 
-角色分配示例（Skill Orchestrator 与 Worker 用不同供应商）：
+角色分配示例（Workflow Agent 与 Worker 用不同供应商）：
 
 ```json
 {
@@ -151,7 +151,7 @@ Allinone 的部署地址与文档站不是同一地址；当前实现接受自�
       "cache_control_mode": "off"
     }
   },
-  "skill_orchestrator": {
+  "workflow_agent": {
     "provider": "juao",
     "api": "anthropic-messages",
     "model_id": "YOUR_ORCHESTRATOR_MODEL_ID",
@@ -164,14 +164,14 @@ Allinone 的部署地址与文档站不是同一地址；当前实现接受自�
 }
 ```
 
-Browser 与 Skill 的角色配置默认补入 `tool_choice: required`，
+Browser 与 Workflow 的角色配置默认补入 `tool_choice: required`，
 显式填写的 `extra_params.tool_choice` 会保留。为这些角色选择支持其最终工具选择方式的模型模式。
 
 ## 4. 生成参数
 
 ### 输出上限与上下文窗口
 
-Skill Orchestrator/Worker 在 `extra_params.max_tokens` 配置原生输出上限；也支持相应 Chat 模型的
+Workflow Agent/Worker 在 `extra_params.max_tokens` 配置原生输出上限；也支持相应 Chat 模型的
 `max_completion_tokens`。不要同时填多个预算字段。两者均未提供时，适配器默认发送
 `max_tokens: 4096`。不同服务的预算含义和允许范围，以目标模型为准。
 
@@ -216,7 +216,7 @@ SDK 调用者还可使用中立 `GenerationOptions.total_output_tokens` / `answe
 }
 ```
 
-Skill Orchestrator、worker 和 VL 各自配置协议。服务端必须实际支持 `/responses`；不会自动降级到 Chat Completions。Allinone 可沿用其配置基址，其他兼容供应商请明确填写 Responses 基址，不推测套餐端点支持情况。
+Workflow Agent、worker 和 VL 各自配置协议。服务端必须实际支持 `/responses`；不会自动降级到 Chat Completions。Allinone 可沿用其配置基址，其他兼容供应商请明确填写 Responses 基址，不推测套餐端点支持情况。
 
 Responses 将 effort 编码为 `reasoning.effort`，显式关闭 thinking 编码为 `reasoning.effort: none`（支持档位由模型决定）。`thinking: enabled` 本身不指定档位，使用服务端默认值；不发送 Chat 专用的 `extra_body.thinking`。`max_output_tokens` 包含推理和答案 token；不支持独立 `answer_tokens` 或 thinking token budget。
 
@@ -246,7 +246,7 @@ Responses 将 effort 编码为 `reasoning.effort`，显式关闭 thinking 编码
 编码成功或服务返回 200 不证明推理强度实际生效。先核对目标协议，再用固定任务比较
 实际输出与工具结果，不依据模型名字机械转换能力。
 
-Skill Orchestrator/Worker 未配置工具选择时，角色模型配置默认补 `required`。Juao 的上述 thinking
+Workflow Agent/Worker 未配置工具选择时，角色模型配置默认补 `required`。Juao 的上述 thinking
 组合曾实测拒绝 required，因此应显式配置 `auto`：
 
 ```json
@@ -323,7 +323,7 @@ python -m probe_tests.provider_smoke --config config.json --provider juao --outp
 
 `--provider` 可重复指定，支持上表六个命名供应商。探测只发固定提示与本地 echo 回执，
 不启动浏览器任务；每个服务测试其登记的全部协议。它固定使用 max_tokens=2048、缓存 off，
-Qwen 另关闭 thinking，**不会照搬 Skill Orchestrator/Worker 的实际 extra_params**。
+Qwen 另关闭 thinking，**不会照搬 Workflow Agent/Worker 的实际 extra_params**。
 只选取配置中该服务第一份有有效凭据的模型，不逐一验收每个角色；自定义部署的地址处理
 也以探测脚本支持范围为准。返回码 0 表示所选检查通过，1 表示失败，2 表示缺少配置。
 
@@ -366,7 +366,7 @@ Qwen 另关闭 thinking，**不会照搬 Skill Orchestrator/Worker 的实际 ext
 | 实现 | 核对内容 |
 |---|---|
 | [runtime_config.py](../runtime_config.py) | 配置字段、环境变量及各角色的必填校验 |
-| [角色模型配置](../harness/runtime/model_config.py) | Skill Orchestrator/Worker 工具选择默认值 |
+| [角色模型配置](../harness/runtime/model_config.py) | Workflow Agent/Worker 工具选择默认值 |
 | [llm/profiles.py](../llm/profiles.py) | 内置端点、协议识别、图片兼容设置 |
 | [llm/adapters.py](../llm/adapters.py) / [llm/contracts.py](../llm/contracts.py) | 中立请求与编码转换 |
 | [llm/thinking.py](../llm/thinking.py) / [llm/cache_control.py](../llm/cache_control.py) | 推理映射、缓存策略 |

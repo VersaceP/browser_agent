@@ -1,14 +1,34 @@
 # Harness 高级配置 / Advanced configuration
 
 首次使用只需配置模型连接和浏览器连接。内部阈值、复用与恢复参数由
-[`HarnessConfig`](../runtime_config.py) 提供默认值，Browser、Skill 与 Workflow 共用。
+[`HarnessConfig`](../runtime_config.py) 提供默认值，Browser 与 Workflow 共用。
 需要部署调优时，仍可在 `config.json` 的 `harness` 段显式覆写；旧配置继续生效。
 
 For initial setup, configure the models and browser connection. Internal tuning
-uses `HarnessConfig` defaults for Browser, Skill and Workflow. Explicit `harness`
+uses `HarnessConfig` defaults for Browser and Workflow. Explicit `harness`
 overrides remain supported, including existing configurations.
 
 ## 内置默认值 / Internal defaults
+
+模型连接段（`worker` / `workflow_agent`）的短期 429 重试独立于超时重试：
+`llm_rate_limit_max_retries` 默认 **3**（设为 0 可关闭），
+`llm_rate_limit_backoff_seconds` 默认 **5**，无服务端时间提示时指数退避并增加
+最多 20% 的随机抖动；`llm_rate_limit_max_wait_seconds` 默认 **90**，限制单次
+模型调用内累计等待。优先遵守 `Retry-After` 秒数/HTTP 日期及可解析的 reset 时间；
+若服务端要求的等待超过剩余预算，保留回执并退出，不缩短等待后抢跑。
+正常请求及流解码后的非流回退共享此限流预算。额度耗尽不自动重试。
+等待可以取消，且只重发当前模型请求，不重放浏览器操作。
+失败请求的 request ID、原因、等待与尝试记录在回执中；缺少 usage 时不推算 token。
+
+Model sections use a separate bounded HTTP 429 budget: `llm_rate_limit_max_retries`
+defaults to **3**, `llm_rate_limit_backoff_seconds` to **5**, and
+`llm_rate_limit_max_wait_seconds` to **90** cumulative waiting seconds per model
+call. Without a provider hint, backoff doubles with up to 20% jitter. Retry-After
+seconds/HTTP dates and unambiguous reset times take precedence. Delays beyond the
+remaining budget stop recovery rather than being shortened. Normal requests and
+the reserved non-stream fallback share the budget. Exhausted quotas are not
+retried. Cancellation remains available; browser actions are never replayed.
+Receipts preserve attempt IDs, delays and errors without inventing missing usage.
 
 `browser.reconnect_timeout_seconds` 默认 **60**，允许 0–60 秒。原生连接的启动、
 运行中断线、Workflow 执行器和 HITL 通知读取共用恢复窗口；所有重连尝试、退避、
@@ -33,6 +53,7 @@ Workflow lifecycle status is recorded separately from missing execution output.
 
 | 配置项 / Option | 默认值 / Default | 说明 / Meaning |
 | --- | --- | --- |
+| `reviewer_enabled` | `true` | Browser 任务的独立语义复核；关闭后由任务执行者判断结束，保留权限、协议和程序验证。 / Independent semantic review for Browser tasks; disabling it leaves completion to the task owner while retaining permission, protocol and program validation. |
 | `similar_task_fleet_reuse_enabled` | `true` | 为相似任务尝试复用合格 Fleet，显式会话/隔离/恢复路由优先。 / Attempt eligible Fleet reuse; explicit routing takes precedence. |
 | `similar_task_reuse_threshold` | `0.78` | 相似任务候选阈值。 / Similar-task candidate threshold. |
 | `similar_task_running_stale_seconds` | `86400` | 正在运行的复用记录租约为 24 小时，存活 worker 刷新租约。 / Running reuse lease lasts 24 hours and is refreshed by live workers. |
@@ -102,7 +123,9 @@ or its compaction ratio.
 - `fleet_slot_reconnect_backoff_seconds`: 旧式连接槽的重连基础间隔；原生连接从 0.5 秒退避至最多 4 秒。
 - `fleet_slot_manual_reset_after_failures`: 连续恢复失败轮次达到该值后返回 `session_manual_reset_required`；只有 host/operator 能使用回执中的 fleet id 和 generation 显式重置。
 - `hitl_poll_interval_seconds`: HITL 解除后的页面状态确认间隔；等待人工回复本身由通知或终端输入驱动。
-- HITL 等待人工回复不限时、不按累计次数拒绝提问，回答及运行中引导不设固定字符上限。旧 `hitl_wait_timeout_seconds`、`hitl_max_pause_rounds_per_page/worker` 配置不再生效。协议请求和回复后的页面状态确认仍有界。
+- HITL 等待人工回复不限时、不按累计次数拒绝提问，回答及运行中引导不设固定字符上限。协议请求和回复后的页面状态确认仍有界。
+- 验证码关键词、隐藏控件和嵌入组件仅提供绑定页面及观测版本的事实，由 BrowserAgent 结合原始任务、动作回执和用户反馈决定是否调用 `Hitl.requestPause`。此链路不调用专属 VL 或自动解题，也不因组件仍存在而自动再次暂停。
+- 仅终端人工回复或匹配的 `Hitl.resumed` 通知交回控制；页面加载、标题变化和视觉判断不会自动解除暂停。恢复后的页面暂停状态及 Fleet 身份检查保留，业务是否可继续交由模型判断。旧的 `hitl_no_repause_cooldown_seconds`、`hitl_post_resume_guard_seconds` 设置已移除；`hitl_post_resume_confirm_max_rounds` 继续限定回复后的只读页面就绪检查。
 - `worktree_dir`: 运行日志和 artifacts 的根目录。
 - `context_file`: 兼容保留的单个静态 prompt 上下文文件。新配置优先使用 `project_context_files`。
 - `project_context_files`: 有序的静态项目指令文件；每项可为路径字符串，或 `{ "path": "...", "scope": "..." }`。Harness 会按顺序以转义后的 `<project_context><project_instructions ...>` XML 注入；重复文件只注入一次。只应放稳定文件。
@@ -115,6 +138,7 @@ Optional advanced configuration example:
 ```json
 {
   "harness": {
+    "reviewer_enabled": true,
     "worker_max_steps": 30,
     "max_browser_agent_instances": 3,
     "max_browser_agents": 3,
@@ -142,8 +166,13 @@ Optional advanced configuration example:
 }
 ```
 
+- `local_access_auto_approve`: default `true`. Local READ/WRITE outside the task and the Workflow Fleet confirmation are granted without asking; each grant is still logged (`local_path.authorization.granted` with `selection: auto`, `workflow.fleet.authorization`). Protected locations are denied either way: the WebCross installation, data and runtime directories (`/Applications/WebCross.app`, `~/Library/Application Support/webcross`, `~/.webcross`, `~/.local/bin/webcross`), sensitive names (`.ssh`, `.env`, `.git`, `credentials`, ...), the Harness installation, other tasks, and any `protected_local_roots`. `false` restores per-scope terminal confirmation. Workflow packages may call `Download.start`, `DOM.getImg` (file output), `Download.list/control`, `File.write`, `File.handleChooser` and `Network.readApi/readBody` without declaring them; write paths pass the same rules inside the sandbox. Only `Runtime.evaluate` needs a declaration.
+- `workflow_parallelism`: default `2`, positive integer. Bounds WorkflowPlatform executions for one endpoint in the current process/event loop. `execute_workflow_batch` reuses one Agent context, explicit work-item inputs and owned receipt slices; same-page executions serialize. Shared resource keys are explicit caller declarations. Native WebCross capacity still applies; other processes and Browser workers are outside this pool. Set to `1` for serial comparison. See [concurrency and recovery](workflow-concurrency-20261110.md).
+- `workflow_budget`: per-task cost guard for `/workflow*` sessions, default `{"run": {"tokens": 300000, "net_minutes": 20}, "author": {"tokens": 1500000, "net_minutes": 60}}`. Tokens count `uncached_input + cache_write + output` (cache_read is reported, not charged); net minutes exclude waiting for the user or HITL. On exhaustion the agent stops starting model turns after the running execution returns and asks the user to extend; non-interactive runs stop with `budget_exhausted`.
+- Workflow sessions expose `local_fs_batch` and `run_local` directly. Run/coordinator profiles accept only fixed local operations (`media_info`, `convert_media`) with data paths and a format; arbitrary commands/scripts are available only to the author profile. The shared macOS process backend enforces file scopes, denies network and package/control writes, and preserves receipts, timeout, cancellation and task stop. Run-mode Browser delegation is observation-only on the bound page; author exploration retains Browser actions. Completion is not an available mode or configuration switch. Historical completion child tasks cannot resume through /browser; resume their parent for supported package recovery. Existing completion receipts remain evidence. See [local processing and delivery](workflow-authoring-contract.md#主-agent-的本地处理与交付) for arguments and boundaries. Restart an already-running Harness process to load these changes; published Workshop packages and WebCross's exports policy are unchanged.
 - `worker_max_steps`: maximum rounds for a BrowserAgent delegated by a task owner. A standalone `/browser` task has no step limit and ends on an explicit completion or real blocker.
-- Standalone `/browser` maintains stage progress, evidence references and next execution steps at the logical task path `scratchpad/todo.md`, stored in SQLite by default. Saves do not trigger review. Browser requests an initial plan check through `request_goal_review` after inspecting needed sources; further progress checks are requested for concrete concerns or material plan/evidence changes. `final_answer(done)` triggers final evidence review and ends only after verification. `ready_for_final_review` is a save-time hint, not a deferred progress-review trigger. Resume/compaction retain prior review versions and findings without scheduling review merely for restoration. The reviewer can read authorized files and task-bound page observations but cannot change the page.
+- `reviewer_enabled`: defaults to `true` for Browser tasks and resumed tasks. With `false`, Browser keeps its TODO but does not run progress/final review or offer `request_goal_review`. Workflow tasks use their own acceptance checks. Endings record `review.status=skipped` and `reason=reviewer_disabled`, with no fabricated verdict or review approval reference. Permission, identity, protocol, structure/consistency and program validation still apply. Use JSON booleans, not strings. Restart the Harness to load a changed setting; setting it back to `true` restores review and retains historical evidence.
+- Standalone `/browser` maintains stage progress, evidence references and next execution steps at the logical task path `scratchpad/todo.md`, stored in SQLite by default. Saves do not trigger review. With review enabled, Browser requests an initial plan check through `request_goal_review` after inspecting needed sources; further progress checks are requested for concrete concerns or material plan/evidence changes. `final_answer(done)` triggers final evidence review and ends only after verification. `ready_for_final_review` is a save-time hint, not a deferred progress-review trigger. Resume/compaction retain prior review versions and findings without scheduling review merely for restoration. The reviewer can read authorized files and task-bound page observations but cannot change the page.
 - `max_browser_agent_instances`: target number of live BrowserAgent slots kept in the reusable pool. Idle slots keep their ABCP connection and page registry. The effective pool is raised to at least `max_browser_agents`.
 - `max_browser_agents`: authoritative maximum number of concurrently running browser workers.
 - `fleet_reuse_enabled`: deterministically assign each worker a fleet and force `Page.create` into it. Generic work may reuse an eligible slot fleet; a new `session_key` or isolated worker gets a fresh fleet. An existing Fleet is bound only when the original user task contains `@<full UUID or unique prefix>`; the runtime resolves it from authoritative inventory and never creates a replacement. Named/isolated fleets never become the generic slot default. Lost named sessions fail with `session_fleet_lost` instead of silently rebinding. Model-initiated `Fleet.create`/`Fleet.close` and out-of-assignment fleet ids fail closed; explicit page continuations may receive prior page candidates.
@@ -158,7 +187,9 @@ Optional advanced configuration example:
 - `fleet_slot_reconnect_backoff_seconds`: legacy slot backoff; native recovery backs off from 0.5 seconds to at most 4 seconds.
 - `fleet_slot_manual_reset_after_failures`: recovery cycles before spawn returns `session_manual_reset_required`. The binding remains fail-closed until a host/operator explicitly resets it with the reported fleet id and generation.
 - `hitl_poll_interval_seconds`: page-state confirmation interval after HITL release; human feedback is awaited through notifications or terminal input.
-- Human HITL waits have no time or cumulative-question quota; answers and live guidance have no fixed character cap. Legacy `hitl_wait_timeout_seconds` and `hitl_max_pause_rounds_per_page/worker` settings are ignored. Protocol calls and page confirmation after a reply remain bounded.
+- Human HITL waits have no time or cumulative-question quota; answers and live guidance have no fixed character cap. Protocol calls and page confirmation after a reply remain bounded.
+- Challenge keywords, hidden controls and embedded components are page/version-bound observations. The BrowserAgent decides whether to request HITL using the original goal, action receipts and human feedback. This path has no dedicated VL judge, CAPTCHA autosolver or component-driven re-pause loop.
+- Only terminal human feedback or a matching `Hitl.resumed` notification returns control. Page loads, title changes and visual verdicts do not release a pause. Protocol pause-state and Fleet identity checks remain; task accessibility is a model decision. The old `hitl_no_repause_cooldown_seconds`, `hitl_post_resume_guard_seconds` settings were removed; `hitl_post_resume_confirm_max_rounds` still bounds read-only readiness checks after human handoff.
 - `worktree_dir`: root directory for run logs and artifacts.
 - `context_file`: legacy optional single static prompt-context file. It remains supported; prefer `project_context_files` for new configuration.
 - `project_context_files`: ordered static project-instruction files. An item is either a path string or `{ "path": "...", "scope": "..." }`. The harness emits them as escaped `<project_context><project_instructions ...>` XML in that order; duplicate files are injected once. Use stable files only.
